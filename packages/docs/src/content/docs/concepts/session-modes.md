@@ -1,6 +1,6 @@
 ---
 title: Session modes
-description: The two effective modes Magic Context runs in: primary sessions and subagents.
+description: The two effective modes Magic Context runs in — primary sessions and subagents.
 ---
 
 Magic Context runs in two effective modes: **primary sessions** and **subagents**. The core tagging and cleanup plumbing stays on everywhere, while heavier features are reserved for primary sessions. The agent-facing reduce surface (`ctx_reduce`, `§N§` prefixes, and reduce nudges) is gated by the session's actual tool availability: if an agent's tool allow-list denies `ctx_reduce`, Magic Context omits the visible reduce surface for that session.

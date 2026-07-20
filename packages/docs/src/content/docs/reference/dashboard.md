@@ -119,6 +119,7 @@ Live **provider cache** telemetry: per-turn cache read/write, input tokens, and 
 - Severity per turn: `stable`, `info`, `warning`, `warming`, `bust`, `full_bust`. A **bust** means the cached prefix was largely invalidated, so expect higher fresh token use on the next call. Sessions whose provider does not report cache data show as `UNKNOWN`.
 - Click a bar to scroll to the matching turn in the list; expand a turn for step-level events and the bust cause recorded by the plugin.
 - A **recent sessions** strip (measurement-driven, equal-width cards) summarizes recent sessions; select one to focus the chart. The event-window size is selectable. Polling can be paused, and subagent sessions can be hidden.
+- **Claude Code and Codex sessions** appear in Cache Diagnostics with full cache hit/write timelines. Sessions managed by Magic Context are shown by default with a "Managed" badge; a toggle reveals unmanaged ones.
 
 <!-- screenshot: cache-timeline -->
 
@@ -140,7 +141,7 @@ Visual editor for Magic Context JSONC. Because both harnesses now read one share
 
 - Toggle and edit fields that mirror `magic-context.schema.json` (the editor links the schema URL and parses JSONC including comments and trailing commas; saves abort on a parse error so comments and sibling keys are preserved).
 - **Save** writes real files on disk via the Tauri backend, not a preview buffer.
-- Model pickers use cached provider model lists refreshed in the background.
+- Model pickers merge OpenCode and Pi model lists (with provider prefixes normalized), and you can always type a model id directly even when a discovered list is present — discovery is never exhaustive.
 
 Use [Configuration](/reference/configuration/) for the full generated key reference; use this section for day-to-day edits.
 
