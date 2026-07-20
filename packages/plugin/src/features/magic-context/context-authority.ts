@@ -821,13 +821,39 @@ function casMemoryResnapshotState(
 }
 
 function upgradeMemoryMirrorNeedsResnapshot(db: Database): boolean {
-    const live = db.prepare("SELECT COUNT(*) AS count FROM mirror_live_memory_rows").get() as {
-        count: number;
-    };
-    const identities = db
-        .prepare("SELECT COUNT(*) AS count FROM mirror_identity WHERE domain = 'memories'")
-        .get() as { count: number };
-    return live.count === 0 && identities.count > 0;
+    // A partially populated live view is just as unsafe as an empty one. Compare the
+    // identity sets, not only their counts, so an interrupted upgrade cannot mark a
+    // truncated mirror complete and leave classification candidates missing.
+    const missingLive = db
+        .prepare(
+            `SELECT 1
+               FROM mirror_identity identity
+              WHERE identity.domain = 'memories'
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM mirror_live_memory_rows live
+                     WHERE live.module_project = identity.module_project
+                       AND live.module_row_id = identity.module_row_id
+                )
+              LIMIT 1`,
+        )
+        .get();
+    if (missingLive) return true;
+    const orphanedLive = db
+        .prepare(
+            `SELECT 1
+               FROM mirror_live_memory_rows live
+              WHERE NOT EXISTS (
+                    SELECT 1
+                      FROM mirror_identity identity
+                     WHERE identity.domain = 'memories'
+                       AND identity.module_project = live.module_project
+                       AND identity.module_row_id = live.module_row_id
+              )
+              LIMIT 1`,
+        )
+        .get();
+    return Boolean(orphanedLive);
 }
 
 function stageLiveMemorySnapshotPage(

@@ -296,12 +296,23 @@ describe("createDreamTaskExecutor — classify-memories", () => {
             category: "PROJECT_RULES",
             content: "Use token sk-test-secret only on my localhost machine.",
         });
+        const contextMemories = [sensitive];
         for (let i = 0; i < 11; i += 1) {
-            insertMemory(db, {
-                projectPath: project,
-                category: "ARCHITECTURE",
-                content: `The cache-neutral classification path is module-owned (${i}).`,
-            });
+            contextMemories.push(
+                insertMemory(db, {
+                    projectPath: project,
+                    category: "ARCHITECTURE",
+                    content: `The cache-neutral classification path is module-owned (${i}).`,
+                }),
+            );
+        }
+        for (const [index, memory] of contextMemories.entries()) {
+            db.prepare(
+                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
+            ).run(project, 10000 + index, memory.id);
+            db.prepare(
+                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, ?, ?, ?)",
+            ).run(project, 10000 + index, memory.category, memory.normalizedHash);
         }
         const moduleCalls: Array<{ method: string; body: unknown }> = [];
         let authorityStatusCalls = 0;
@@ -341,7 +352,9 @@ describe("createDreamTaskExecutor — classify-memories", () => {
                         truncated: false,
                     };
                 }
-                return { accepted: [sensitive.id], rejected: [] };
+                const rows = (args.body as { arguments: { rows: Array<{ memory_id: number }> } })
+                    .arguments.rows;
+                return { accepted: rows.map((row) => row.memory_id), rejected: [] };
             }
         }
         const moduleClient = createDreamTimerModuleClient(new StatefulTimerModuleClient() as never);
@@ -367,20 +380,26 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         const applyBody = moduleCalls[1].body as {
             arguments: { rows: Array<{ memory_id: number; shareable: boolean }> };
         };
-        expect(
-            applyBody.arguments.rows.find((row) => row.memory_id === sensitive.id)?.shareable,
-        ).toBe(false);
+        expect(applyBody.arguments.rows.find((row) => row.memory_id === 10000)?.shareable).toBe(
+            false,
+        );
     });
     test("module failures are transient and never fall back to a TypeScript child", async () => {
         db = freshDb();
         const project = "/repo/rust-classify-failure";
         ensureContextStoreUuid(db);
         for (let i = 0; i < 12; i += 1) {
-            insertMemory(db, {
+            const memory = insertMemory(db, {
                 projectPath: project,
                 category: "ARCHITECTURE",
                 content: `Module classification failure fixture ${i}.`,
             });
+            db.prepare(
+                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
+            ).run(project, 11000 + i, memory.id);
+            db.prepare(
+                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, ?, ?, ?)",
+            ).run(project, 11000 + i, memory.category, memory.normalizedHash);
         }
 
         const client = {
@@ -407,9 +426,7 @@ describe("createDreamTaskExecutor — classify-memories", () => {
                 throw new Error("module transport unavailable");
             }
         }
-        const moduleClient = createDreamTimerModuleClient(
-            new FailingTimerModuleClient() as never,
-        );
+        const moduleClient = createDreamTimerModuleClient(new FailingTimerModuleClient() as never);
         const executor = createDreamTaskExecutor({
             client: client as never,
             sessionDirectory: project,

@@ -644,12 +644,23 @@ describe("magic-context hook", () => {
         const hook = requireHook(createMagicContextHook(deps));
         const db = openDatabase();
         ensureContextStoreUuid(db);
+        const memories = [];
         for (let i = 0; i < 12; i += 1) {
-            insertMemory(db, {
-                projectPath,
-                category: "ARCHITECTURE",
-                content: `Manual classify memory ${i}.`,
-            });
+            memories.push(
+                insertMemory(db, {
+                    projectPath,
+                    category: "ARCHITECTURE",
+                    content: `Manual classify memory ${i}.`,
+                }),
+            );
+        }
+        for (const [index, memory] of memories.entries()) {
+            db.prepare(
+                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
+            ).run(projectPath, 12000 + index, memory.id);
+            db.prepare(
+                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, ?, ?, ?)",
+            ).run(projectPath, 12000 + index, memory.category, memory.normalizedHash);
         }
 
         await expectSentinel(

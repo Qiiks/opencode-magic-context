@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash } from "node:crypto";
 
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
 import { isRustAuthorityDrainingError } from "../../../plugin/rust-tool-backends";
@@ -111,9 +111,101 @@ export interface ClassifyResult {
     stage: 1 | 2 | 3;
 }
 
-function toPromptMemory(m: Memory): ClassifyPromptMemory {
+interface ClassifyCandidate {
+    /** The context.db row used for mirrored prompt content and local identity. */
+    contextMemory: Memory;
+    /** The id and hash understood by the module authority, or the TS row values. */
+    id: number;
+    normalizedHash: string;
+}
+
+function isModuleRoute(args: ClassifyArgs): boolean {
+    return (
+        args.moduleClient !== undefined &&
+        args.moduleSessionId !== undefined &&
+        args.moduleProjectRoot !== undefined &&
+        args.moduleContextStoreUuid !== undefined &&
+        args.moduleAuthorityGeneration !== undefined
+    );
+}
+
+/**
+ * Build the classify pool in the authority's id space. The context rows are still the
+ * prompt source, but module classification must use the mirrored module id and hash.
+ * The live mirror hash is preferred over recomputing it in TypeScript because it is
+ * the exact value checked by memory.set_classification.
+ */
+function getClassifyCandidates(args: ClassifyArgs): ClassifyCandidate[] {
+    const active = getMemoriesByProject(args.db, args.projectIdentity);
+    if (!isModuleRoute(args) || active.length === 0) {
+        return active.map((memory) => ({
+            contextMemory: memory,
+            id: memory.id,
+            normalizedHash: memory.normalizedHash,
+        }));
+    }
+
+    const contextIds = active.map((memory) => memory.id);
+    const placeholders = contextIds.map(() => "?").join(", ");
+    const rows = args.db
+        .prepare(
+            `SELECT identity.context_row_id, identity.module_row_id, live.normalized_hash
+               FROM mirror_identity identity
+               LEFT JOIN mirror_live_memory_rows live
+                 ON live.module_project = identity.module_project
+                AND live.module_row_id = identity.module_row_id
+              WHERE identity.domain = 'memories'
+                AND identity.module_project = ?
+                AND identity.context_row_id IN (${placeholders})`,
+        )
+        .all(args.projectIdentity, ...contextIds) as Array<{
+        context_row_id?: number;
+        module_row_id?: number;
+        normalized_hash?: string | null;
+    }>;
+    const mappedByContextId = new Map(
+        rows
+            .filter(
+                (row) =>
+                    Number.isInteger(row.context_row_id) &&
+                    Number.isInteger(row.module_row_id) &&
+                    typeof row.normalized_hash === "string" &&
+                    row.normalized_hash.length > 0,
+            )
+            .map((row) => [
+                row.context_row_id as number,
+                {
+                    moduleId: row.module_row_id as number,
+                    normalizedHash: row.normalized_hash as string,
+                },
+            ]),
+    );
+    const candidates = active.flatMap((contextMemory) => {
+        const mapped = mappedByContextId.get(contextMemory.id);
+        return mapped
+            ? [{ contextMemory, id: mapped.moduleId, normalizedHash: mapped.normalizedHash }]
+            : [];
+    });
+    if (candidates.length !== active.length) {
+        const mappedContextIds = new Set(
+            rows
+                .filter((row) => Number.isInteger(row.context_row_id))
+                .map((row) => row.context_row_id as number),
+        );
+        const withoutIdentity = active.filter((memory) => !mappedContextIds.has(memory.id)).length;
+        const withoutLiveHash = active.length - candidates.length - withoutIdentity;
+        log(
+            `[dreamer] classify: excluded ${active.length - candidates.length} module candidates for ${args.projectIdentity}` +
+                ` (${withoutIdentity} without mirror_identity, ${withoutLiveHash} without live module hash)`,
+        );
+    }
+    return candidates;
+}
+
+function toPromptMemory(candidate: ClassifyCandidate): ClassifyPromptMemory {
+    const m = candidate.contextMemory;
     return {
-        id: m.id,
+        id: candidate.id,
         category: m.category,
         content: m.content,
         importance: m.importance ?? 50,
@@ -124,32 +216,34 @@ function toPromptMemory(m: Memory): ClassifyPromptMemory {
 
 /** Stratified sample of already-classified memories across importance bands, so
  *  Stage-3 anchors span the full distribution rather than clustering. */
-function stratifiedAnchors(classified: Memory[], count: number): ClassifyAnchorMemory[] {
+function stratifiedAnchors(classified: ClassifyCandidate[], count: number): ClassifyAnchorMemory[] {
     if (classified.length <= count) {
-        return classified.map((m) => ({
-            id: m.id,
-            category: m.category,
-            content: m.content,
-            importance: m.importance ?? 50,
+        return classified.map((candidate) => ({
+            id: candidate.id,
+            category: candidate.contextMemory.category,
+            content: candidate.contextMemory.content,
+            importance: candidate.contextMemory.importance ?? 50,
         }));
     }
-    const sorted = [...classified].sort((a, b) => (a.importance ?? 50) - (b.importance ?? 50));
+    const sorted = [...classified].sort(
+        (a, b) => (a.contextMemory.importance ?? 50) - (b.contextMemory.importance ?? 50),
+    );
     const step = sorted.length / count;
     const out: ClassifyAnchorMemory[] = [];
     for (let i = 0; i < count; i += 1) {
-        const m = sorted[Math.min(sorted.length - 1, Math.floor(i * step))];
+        const candidate = sorted[Math.min(sorted.length - 1, Math.floor(i * step))];
         out.push({
-            id: m.id,
-            category: m.category,
-            content: m.content,
-            importance: m.importance ?? 50,
+            id: candidate.id,
+            category: candidate.contextMemory.category,
+            content: candidate.contextMemory.content,
+            importance: candidate.contextMemory.importance ?? 50,
         });
     }
     return out;
 }
 
 export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
-    const active = getMemoriesByProject(args.db, args.projectIdentity);
+    const active = getClassifyCandidates(args);
 
     // Stage 1: too small a pool to score meaningfully.
     if (active.length < MIN_POOL_TO_CLASSIFY) {
@@ -157,7 +251,7 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
     }
 
     let stage: 2 | 3;
-    let toClassify: Memory[];
+    let toClassify: ClassifyCandidate[];
     let anchors: ClassifyAnchorMemory[] = [];
     if (active.length <= FULL_POOL_CEILING) {
         // Stage 2: classify the whole pool every run.
@@ -170,11 +264,13 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
         const unclassifiedIds = new Set(
             getUnclassifiedMemoryIds(
                 args.db,
-                active.map((m) => m.id),
+                active.map((candidate) => candidate.contextMemory.id),
             ),
         );
-        toClassify = active.filter((m) => unclassifiedIds.has(m.id));
-        const classified = active.filter((m) => !unclassifiedIds.has(m.id));
+        toClassify = active.filter((candidate) => unclassifiedIds.has(candidate.contextMemory.id));
+        const classified = active.filter(
+            (candidate) => !unclassifiedIds.has(candidate.contextMemory.id),
+        );
         anchors = stratifiedAnchors(classified, STAGE3_ANCHOR_COUNT);
     }
 
@@ -184,7 +280,7 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
         return result;
     }
 
-    const chunks: Memory[][] = [];
+    const chunks: ClassifyCandidate[][] = [];
     for (let i = 0; i < toClassify.length; i += CLASSIFY_CHUNK_SIZE) {
         chunks.push(toClassify.slice(i, i + CLASSIFY_CHUNK_SIZE));
     }
@@ -223,19 +319,14 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
 
 async function classifyOneChunk(
     args: ClassifyArgs,
-    chunk: Memory[],
+    chunk: ClassifyCandidate[],
     anchors: ClassifyAnchorMemory[],
     sliceMs: number,
     signal: AbortSignal,
 ): Promise<{ classified: number; changed: number }> {
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
-    const moduleRoute =
-        args.moduleClient !== undefined &&
-        args.moduleSessionId !== undefined &&
-        args.moduleProjectRoot !== undefined &&
-        args.moduleContextStoreUuid !== undefined &&
-        args.moduleAuthorityGeneration !== undefined;
+    const moduleRoute = isModuleRoute(args);
     try {
         const prompt = buildClassifyPrompt({
             projectPath: args.projectIdentity,
@@ -304,7 +395,11 @@ async function classifyOneChunk(
         );
 
         recordInvocation(args, startedAt, { status: "completed", messages: run.output });
-        return applyClassifications(args, chunk, run.validated);
+        return applyClassifications(
+            args,
+            chunk.map((candidate) => candidate.contextMemory),
+            run.validated,
+        );
     } catch (error) {
         const failure = moduleRoute ? new ClassifyModuleFailureError("module", error) : error;
         const desc = describeError(failure);
@@ -335,12 +430,12 @@ async function classifyOneChunk(
     }
 }
 
-/** Apply the manifest host-side: the manifest must cover exactly this chunk;
- *  shareable fails closed against sensitive text. setMemoryClassification stamps
- *  classified_at (the run-gate) and is cache-neutral. */
+/** Run the module classifier and apply its manifest in module id space. The
+ *  mirror-back changefeed refreshes the context rows, including classified_at;
+ *  this path must not write the context rows a second time. */
 async function runClassifyThroughModule(
     args: ClassifyArgs,
-    chunk: Memory[],
+    chunk: ClassifyCandidate[],
     anchors: ClassifyAnchorMemory[],
     signal: AbortSignal,
 ): Promise<{ classified: number; changed: number }> {
@@ -362,15 +457,15 @@ async function runClassifyThroughModule(
             // chunk's literal id list can exceed the module's 256-byte command-id cap,
             // so the membership rides as a digest.
             command_id: `classify:${args.moduleCommandId ?? Date.now()}:${createHash("sha256")
-                .update(chunk.map((m) => m.id).join(","))
+                .update(chunk.map((candidate) => candidate.id).join(","))
                 .digest("hex")
                 .slice(0, 24)}`,
             authority_generation: args.moduleAuthorityGeneration,
             payload: {
                 prompt_body: prompt,
-                items: chunk.map((memory) => ({
-                    memory_id: memory.id,
-                    content_hash: memory.normalizedHash,
+                items: chunk.map((candidate) => ({
+                    memory_id: candidate.id,
+                    content_hash: candidate.normalizedHash,
                 })),
             },
         },
@@ -387,21 +482,22 @@ async function runClassifyThroughModule(
     const parsed = parseClassifyManifest(manifestText);
     assertManifestCoversExactly(
         parsed.map((entry) => entry.id),
-        new Set(chunk.map((memory) => memory.id)),
+        new Set(chunk.map((candidate) => candidate.id)),
         "classify",
     );
     const rows = parsed.map((entry) => {
-        const memory = chunk.find((candidate) => candidate.id === entry.id);
-        if (!memory) throw new Error(`classify returned unknown memory ${entry.id}`);
+        const candidate = chunk.find((item) => item.id === entry.id);
+        if (!candidate) throw new Error(`classify returned unknown memory ${entry.id}`);
         return {
             memory_id: entry.id,
-            content_hash_at_prompt: memory.normalizedHash,
+            content_hash_at_prompt: candidate.normalizedHash,
             importance: entry.importance,
             scope: entry.scope,
             // The host forces shareable to false whenever the memory text is sensitive,
             // regardless of whether classification runs through the module or provider path.
             shareable:
-                entry.shareable === true && hasShareabilitySensitiveText(memory.content)
+                entry.shareable === true &&
+                hasShareabilitySensitiveText(candidate.contextMemory.content)
                     ? false
                     : entry.shareable,
         };
@@ -439,15 +535,42 @@ async function runClassifyThroughModule(
     const accepted = (applyResult as { accepted?: unknown }).accepted;
     if (!Array.isArray(accepted))
         throw new Error("module returned no classification acceptance list");
-    const stale = (applyResult as { rejected?: unknown }).rejected;
-    if (Array.isArray(stale)) {
-        const unexpected = stale.some(
-            (row) =>
-                row && typeof row === "object" && (row as { reason?: unknown }).reason !== "stale",
-        );
-        if (unexpected) throw new Error("module rejected classification for a non-stale reason");
+    const acceptedIds = accepted.map((id) => {
+        if (!Number.isInteger(id)) throw new Error("module returned an invalid accepted memory id");
+        return id as number;
+    });
+    const rejected = (applyResult as { rejected?: unknown }).rejected;
+    const rejectedRows = Array.isArray(rejected) ? rejected : [];
+    const rejectionCounts = new Map<string, number>();
+    for (const row of rejectedRows) {
+        const reason =
+            row &&
+            typeof row === "object" &&
+            typeof (row as { reason?: unknown }).reason === "string"
+                ? (row as { reason: string }).reason
+                : "unknown";
+        rejectionCounts.set(reason, (rejectionCounts.get(reason) ?? 0) + 1);
     }
-    return { classified: accepted.length, changed: accepted.length };
+    const nonStaleRejections = [...rejectionCounts].some(([reason]) => reason !== "stale");
+    if (nonStaleRejections) {
+        const knownReasons = ["not_found", "not_owned", "stale"];
+        const known = knownReasons.map((reason) => `${reason}=${rejectionCounts.get(reason) ?? 0}`);
+        const unknown = [...rejectionCounts]
+            .filter(([reason]) => !knownReasons.includes(reason))
+            .map(([reason, count]) => `${reason}=${count}`);
+        throw new Error(`module rejected classification (${[...known, ...unknown].join(", ")})`);
+    }
+
+    // Module ids are translated back only to identify the context rows whose
+    // mirror-back updates will satisfy the local classified_at run-gate. Do not
+    // call setMemoryClassification here: the authority feed owns that write.
+    const byModuleId = new Map(chunk.map((candidate) => [candidate.id, candidate]));
+    const acceptedContextIds = acceptedIds.map((moduleId) => {
+        const candidate = byModuleId.get(moduleId);
+        if (!candidate) throw new Error(`module accepted unknown memory ${moduleId}`);
+        return candidate.contextMemory.id;
+    });
+    return { classified: acceptedContextIds.length, changed: acceptedContextIds.length };
 }
 
 export function applyClassifications(
