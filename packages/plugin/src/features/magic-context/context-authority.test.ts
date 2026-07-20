@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import type { AuthorityModuleClient, AuthorityStatus, ChangefeedPage } from "./context-authority";
 import {
@@ -25,6 +28,14 @@ function db(): Database {
     initializeDatabase(value);
     runMigrations(value);
     return value;
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void;
+    const promise = new Promise<void>((done) => {
+        resolve = done;
+    });
+    return { promise, resolve };
 }
 
 function authority(state: AuthorityStatus["state"], generation: number): AuthorityStatus {
@@ -465,7 +476,7 @@ describe("memory authority protocol", () => {
                 DROP TABLE mirror_live_staging;
                 DROP TABLE mirror_resnapshot_state;
                 DROP TABLE mirror_live_memory_rows;
-                DELETE FROM schema_migrations WHERE version IN (58, 59);
+                DELETE FROM schema_migrations WHERE version IN (58, 59, 60);
             `);
             withPrivilegedWriter(database, () => {
                 database
@@ -559,7 +570,7 @@ describe("memory authority protocol", () => {
                 DROP TABLE mirror_live_staging;
                 DROP TABLE mirror_resnapshot_state;
                 DROP TABLE mirror_live_memory_rows;
-                DELETE FROM schema_migrations WHERE version IN (58, 59);
+                DELETE FROM schema_migrations WHERE version IN (58, 59, 60);
             `);
             withPrivilegedWriter(database, () => {
                 database
@@ -757,6 +768,253 @@ describe("memory authority protocol", () => {
         );
     });
 
+    test("a stale paged resnapshot cannot replace a newer completed generation", async () => {
+        const directory = mkdtempSync(join(tmpdir(), "mc-resnapshot-owner-"));
+        const path = join(directory, "context.db");
+        const first = new Database(path);
+        const second = new Database(path);
+        try {
+            initializeDatabase(first);
+            runMigrations(first);
+            initializeDatabase(second);
+            runMigrations(second);
+            first
+                .prepare(
+                    "UPDATE mirror_resnapshot_state SET status = 'resnapshotting', generation = 'bootstrap' WHERE domain = 'memories'",
+                )
+                .run();
+
+            const waitingForA2 = deferred();
+            const releaseA2 = deferred();
+            const snapshot = (project: string, id: number): ChangefeedPage["rows"][number] => ({
+                feed_seq: 0,
+                domain: "memories",
+                op: "insert",
+                module_row_id: id,
+                full_row_snapshot: {
+                    project_path: project,
+                    category: "CONSTRAINTS",
+                    normalized_hash: `${project}-hash`,
+                },
+                content_hash: `${project}-hash`,
+            });
+            const moduleA: AuthorityModuleClient = {
+                authorityStatus: async () => ({ authority: null }),
+                authorityPrepare: async () => ({ authority: authority("MODULE", 1) }),
+                mirrorPull: async (args) => {
+                    if (args.cursor === 0) {
+                        return {
+                            page: {
+                                domain: "memories",
+                                cursor: 0,
+                                next_cursor: 1,
+                                has_more: true,
+                                rows: [snapshot("A-1", 1)],
+                            },
+                        };
+                    }
+                    waitingForA2.resolve();
+                    await releaseA2.promise;
+                    return {
+                        page: {
+                            domain: "memories",
+                            cursor: 1,
+                            next_cursor: 2,
+                            has_more: false,
+                            rows: [snapshot("A-2", 2)],
+                        },
+                    };
+                },
+            };
+            const moduleB: AuthorityModuleClient = {
+                authorityStatus: async () => ({ authority: null }),
+                authorityPrepare: async () => ({ authority: authority("MODULE", 1) }),
+                mirrorPull: async () => ({
+                    page: {
+                        domain: "memories",
+                        cursor: 0,
+                        next_cursor: 2,
+                        has_more: false,
+                        rows: [snapshot("B-1", 1), snapshot("B-2", 2)],
+                    },
+                }),
+            };
+
+            const staleAttempt = ensureLiveMemoryResnapshot({
+                db: first,
+                module: moduleA,
+                limit: 1,
+            });
+            await waitingForA2.promise;
+            await ensureLiveMemoryResnapshot({ db: second, module: moduleB, limit: 2 });
+            releaseA2.resolve();
+            await staleAttempt;
+
+            expect(
+                first
+                    .prepare(
+                        "SELECT module_project FROM mirror_live_memory_rows ORDER BY module_row_id",
+                    )
+                    .all(),
+            ).toEqual([{ module_project: "B-1" }, { module_project: "B-2" }]);
+            expect(
+                first.prepare("SELECT status, generation FROM mirror_resnapshot_state").get(),
+            ).toEqual({
+                status: "complete",
+                generation: expect.any(String),
+            });
+            expect(
+                first.prepare("SELECT COUNT(*) AS count FROM mirror_live_staging").get(),
+            ).toEqual({ count: 0 });
+        } finally {
+            first.close();
+            second.close();
+            rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
+    test("pull and drain resnapshots honor the same file-backed generation owner", async () => {
+        const directory = mkdtempSync(join(tmpdir(), "mc-resnapshot-entrypoints-"));
+        const path = join(directory, "context.db");
+        const pullDb = new Database(path);
+        const drainDb = new Database(path);
+        try {
+            initializeDatabase(pullDb);
+            runMigrations(pullDb);
+            initializeDatabase(drainDb);
+            runMigrations(drainDb);
+            pullDb
+                .prepare(
+                    "UPDATE mirror_resnapshot_state SET status = 'resnapshotting', generation = 'bootstrap' WHERE domain = 'memories'",
+                )
+                .run();
+
+            const waitingForA2 = deferred();
+            const releaseA2 = deferred();
+            const snapshot = (project: string, id: number): ChangefeedPage["rows"][number] => ({
+                feed_seq: 0,
+                domain: "memories",
+                op: "insert",
+                module_row_id: id,
+                full_row_snapshot: {
+                    project_path: project,
+                    category: "CONSTRAINTS",
+                    normalized_hash: `${project}-hash`,
+                },
+                content_hash: `${project}-hash`,
+            });
+            const pullModule: AuthorityModuleClient = {
+                authorityStatus: async () => ({ authority: null }),
+                authorityPrepare: async () => ({ authority: authority("MODULE", 1) }),
+                mirrorPull: async (args) => {
+                    if (!args.live_only) {
+                        return {
+                            page: {
+                                domain: "memories",
+                                cursor: args.cursor,
+                                next_cursor: args.cursor,
+                                has_more: false,
+                                rows: [],
+                            },
+                        };
+                    }
+                    if (args.cursor === 0) {
+                        return {
+                            page: {
+                                domain: "memories",
+                                cursor: 0,
+                                next_cursor: 1,
+                                has_more: true,
+                                rows: [snapshot("A-1", 1)],
+                            },
+                        };
+                    }
+                    waitingForA2.resolve();
+                    await releaseA2.promise;
+                    return {
+                        page: {
+                            domain: "memories",
+                            cursor: 1,
+                            next_cursor: 2,
+                            has_more: false,
+                            rows: [snapshot("A-2", 2)],
+                        },
+                    };
+                },
+            };
+            let state: AuthorityStatus["state"] = "DRAINING";
+            const drainModule: AuthorityModuleClient = {
+                authorityStatus: async (args) => ({
+                    authority: {
+                        ...authority(args.domain === "memories" ? state : "TS", 3),
+                        domain: args.domain,
+                    },
+                }),
+                authorityPrepare: async () => ({ authority: authority("MODULE", 3) }),
+                mirrorPull: async (args) => ({
+                    page: args.live_only
+                        ? {
+                              domain: "memories",
+                              cursor: 0,
+                              next_cursor: 2,
+                              has_more: false,
+                              rows: [snapshot("B-1", 1), snapshot("B-2", 2)],
+                          }
+                        : {
+                              domain: "memories",
+                              cursor: args.cursor,
+                              next_cursor: args.cursor,
+                              has_more: false,
+                              rows: [],
+                          },
+                }),
+                authorityDrain: async (args) => {
+                    if (args.action === "finish") state = "TS";
+                    return {
+                        authority: {
+                            ...authority(state, 3),
+                            captured_upper_bound: 0,
+                            coordinator_token: "drain-owner",
+                        },
+                    };
+                },
+            };
+
+            const stalePull = pullAndApplyMirrorPage({
+                db: pullDb,
+                module: pullModule,
+                domain: "memories",
+                limit: 1,
+            });
+            await waitingForA2.promise;
+            const drained = await drainAuthority({
+                db: drainDb,
+                projectPath: "/repo",
+                domain: "memories",
+                module: drainModule,
+                checksum: "same",
+            });
+            releaseA2.resolve();
+            await stalePull;
+
+            expect(drained.state).toBe("TS");
+            expect(
+                pullDb
+                    .prepare(
+                        "SELECT module_project FROM mirror_live_memory_rows ORDER BY module_row_id",
+                    )
+                    .all(),
+            ).toEqual([{ module_project: "B-1" }, { module_project: "B-2" }]);
+            expect(pullDb.prepare("SELECT status FROM mirror_resnapshot_state").get()).toEqual({
+                status: "complete",
+            });
+        } finally {
+            pullDb.close();
+            drainDb.close();
+            rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
     test("re-captures and replays when drain finish reports a later feed head", async () => {
         const database = db();
         let begins = 0;
@@ -831,6 +1089,85 @@ describe("memory authority protocol", () => {
         expect(
             database.prepare("SELECT cursor FROM mirror_cursors WHERE domain = 'memories'").get(),
         ).toEqual({ cursor: 1 });
+    });
+
+    test("bounds steady drain contention and leaves a retryable durable DRAINING state", async () => {
+        const database = db();
+        let begins = 0;
+        let finishes = 0;
+        let keepContending = true;
+        let state: AuthorityStatus["state"] = "DRAINING";
+        const module: AuthorityModuleClient = {
+            authorityStatus: async (args) => ({
+                authority: { ...authority(state, 2), domain: args.domain },
+            }),
+            authorityPrepare: async () => ({ authority: authority("MODULE", 2) }),
+            mirrorPull: async (args) => ({
+                page: {
+                    domain: args.domain,
+                    cursor: args.cursor,
+                    next_cursor: args.cursor,
+                    has_more: false,
+                    rows: [],
+                },
+            }),
+            authorityDrain: async (args) => {
+                if (args.action === "begin") begins += 1;
+                if (args.action === "finish") {
+                    finishes += 1;
+                    if (keepContending) {
+                        const error = new Error("authority_feed_head_advanced") as Error & {
+                            code: string;
+                        };
+                        error.code = "authority_feed_head_advanced";
+                        throw error;
+                    }
+                    state = "TS";
+                }
+                return {
+                    authority: {
+                        ...authority(state, 2),
+                        captured_upper_bound: 0,
+                        coordinator_token: `token-${begins}`,
+                    },
+                };
+            },
+        };
+
+        const contended = await drainAuthority({
+            db: database,
+            projectPath: "/repo",
+            domain: "memories",
+            module,
+            checksum: "same",
+        });
+        expect(contended).toMatchObject({
+            code: "authority_drain_contended",
+            retryable: true,
+            state: "DRAINING",
+            attempts: 5,
+        });
+        expect({ begins, finishes }).toEqual({ begins: 6, finishes: 6 });
+        expect(
+            (
+                await module.authorityStatus({
+                    context_store_uuid: "store",
+                    project: "/repo",
+                    domain: "memories",
+                })
+            ).authority?.state,
+        ).toBe("DRAINING");
+
+        keepContending = false;
+        const resumed = await drainAuthority({
+            db: database,
+            projectPath: "/repo",
+            domain: "memories",
+            module,
+            checksum: "same",
+        });
+        expect(resumed.state).toBe("TS");
+        expect({ begins, finishes }).toEqual({ begins: 7, finishes: 7 });
     });
 
     test("drain finish removes the marker only after module ownership returns to TS", async () => {

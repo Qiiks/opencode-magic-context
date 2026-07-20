@@ -2348,6 +2348,13 @@ const MIGRATIONS: Migration[] = [
             `);
         },
     },
+    {
+        version: 60,
+        description: "persist the owning live memory resnapshot generation",
+        up(db: Database): void {
+            ensureColumn(db, "mirror_resnapshot_state", "generation", "TEXT");
+        },
+    },
 ];
 
 /**

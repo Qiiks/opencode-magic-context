@@ -3823,8 +3823,16 @@ impl McStore {
             .unwrap_or(0);
         self.inner
             .with_conn(|conn| {
+                // Age alone cannot prove that a root is dead: idle sessions still depend on
+                // their cache row after restart. Prune only aged lineage whose owning cache
+                // state has actually been deleted.
                 conn.execute(
-                    "DELETE FROM mc_transform_session_roots WHERE observed_at < ?1",
+                    "DELETE FROM mc_transform_session_roots AS roots
+                      WHERE roots.observed_at < ?1
+                        AND NOT EXISTS (
+                            SELECT 1 FROM mc_cache_state AS cache
+                             WHERE cache.session_id = roots.session_id
+                        )",
                     params![now_ms.saturating_sub(THIRTY_DAYS_MS)],
                 )?;
                 Ok(())
@@ -5744,9 +5752,11 @@ impl McStore {
                 // Durable root lineage is committed with the cache CAS, so a restart cannot
                 // authenticate a root that never produced the accepted session state.
                 tx.execute(
-                    "INSERT OR IGNORE INTO mc_transform_session_roots(
+                    "INSERT INTO mc_transform_session_roots(
                          session_id, project_root, observed_at
-                     ) VALUES (?1, ?2, ?3)",
+                     ) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(session_id, project_root) DO UPDATE SET
+                         observed_at = excluded.observed_at",
                     params![session_id, project_root, overlays.created_at_ms],
                 )?;
             }
@@ -8579,47 +8589,50 @@ impl McStore {
         resolution: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<StoredNote>, McStoreError> {
-        let current = self.get_note_by_id(project_path, session_id, note_id)?;
-        let current = current.filter(|note| {
-            matches!(
-                note.status.as_str(),
-                "active" | "pending" | "ready" | "surfacing" | "surfaced"
-            )
-        });
-        let Some(current) = current else {
+        if self
+            .get_note_by_id(project_path, session_id, note_id)?
+            .is_none()
+        {
             return Ok(None);
-        };
-        match self.dismiss_note_cas(
-            project_path,
-            note_id,
-            &current.status,
-            current.status_version,
-            resolution,
-            now_ms,
-        )? {
-            NoteCasOutcome::Applied(note) => {
-                if let Some(resolution) = resolution.filter(|value| !value.trim().is_empty()) {
-                    let content = format!("{}\n\nResolution: {}", note.content, resolution.trim());
-                    return match self.update_note_cas(
-                        project_path,
-                        note.id,
-                        "dismissed",
-                        note.status_version,
-                        Some(&content),
-                        None,
-                        now_ms,
-                    )? {
-                        NoteCasOutcome::Applied(updated) => Ok(Some(updated)),
-                        NoteCasOutcome::Conflict { .. } => Ok(Some(note)),
-                    };
-                }
-                Ok(Some(note))
-            }
-            NoteCasOutcome::Conflict {
-                current: Some(note),
-            } if note.status == "dismissed" => Ok(None),
-            NoteCasOutcome::Conflict { .. } => Ok(None),
         }
+        let resolution = resolution.map(str::trim).filter(|value| !value.is_empty());
+        self.with_note_conn_fenced(project_path, |tx| {
+            let Some(current) = load_note_tx(tx, note_id).optional()? else {
+                return Ok(None);
+            };
+            if current.project_path != project_path
+                || !matches!(
+                    current.status.as_str(),
+                    "active" | "pending" | "ready" | "surfacing" | "surfaced"
+                )
+            {
+                return Ok(None);
+            }
+            let content = resolution
+                .map(|value| format!("{}\n\nResolution: {value}", current.content))
+                .unwrap_or_else(|| current.content.clone());
+            let changed = tx.execute(
+                "UPDATE mc_notes
+                    SET status = 'dismissed', content = ?1,
+                        status_version = status_version + 1, updated_at_ms = ?2,
+                        dismissed_at = ?2, dismissal_resolution = ?3
+                  WHERE id = ?4 AND project_path = ?5
+                    AND status = ?6 AND status_version = ?7",
+                params![
+                    content,
+                    now_ms,
+                    resolution,
+                    note_id,
+                    project_path,
+                    current.status,
+                    current.status_version,
+                ],
+            )?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            Ok(Some(load_note_tx(tx, note_id)?))
+        })
     }
 
     /// Dismissal is a status CAS. It wins over a later surfacing claim, but never rewrites
@@ -11382,38 +11395,64 @@ mod tests {
     fn transform_session_root_lineage_is_cache_committed_and_pruned_on_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
-        let loaded = store.load("ses").unwrap();
-        store
-            .commit_transform(
-                "ses",
-                TransformCommit {
-                    expected: loaded.row_version,
-                    core: &loaded.core,
-                    meta: &loaded.meta,
-                    consumed_drop_ids: &[],
-                    first_applied_command_ids: &[],
-                    memory_revision: None,
-                    project_root: Some("/root-a"),
-                    overlays: TransformOverlayBatch {
-                        created_at_ms: 1,
-                        ..Default::default()
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+
+        let commit_root = |session_id: &str, expected: Option<u64>, observed_at: i64| {
+            let loaded = store.load(session_id).unwrap();
+            store
+                .commit_transform(
+                    session_id,
+                    TransformCommit {
+                        expected,
+                        core: &loaded.core,
+                        meta: &loaded.meta,
+                        consumed_drop_ids: &[],
+                        first_applied_command_ids: &[],
+                        memory_revision: None,
+                        project_root: Some("/root-a"),
+                        overlays: TransformOverlayBatch {
+                            created_at_ms: observed_at,
+                            ..Default::default()
+                        },
                     },
-                },
-            )
+                )
+                .unwrap()
+        };
+
+        commit_root("refreshed", None, 1);
+        commit_root("refreshed", Some(1), now_ms);
+        commit_root("idle-live", None, 1);
+        commit_root("deleted", None, 1);
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM mc_cache_state WHERE session_id = 'deleted'",
+                    [],
+                )?;
+                Ok(())
+            })
             .unwrap();
-        assert!(store
-            .knows_transform_session_root("ses", "/root-a")
-            .unwrap());
-        assert!(!store
-            .knows_transform_session_root("ses", "/root-b")
-            .unwrap());
         drop(store);
 
         let reopened = McStore::open(&descriptor(dir.path())).unwrap();
-        assert!(!reopened
-            .knows_transform_session_root("ses", "/root-a")
+        assert!(reopened
+            .knows_transform_session_root("refreshed", "/root-a")
             .unwrap());
-        assert!(reopened.has_cache_state("ses").unwrap());
+        assert!(!reopened
+            .knows_transform_session_root("refreshed", "/root-b")
+            .unwrap());
+        assert!(reopened
+            .knows_transform_session_root("idle-live", "/root-a")
+            .unwrap());
+        assert!(reopened.has_cache_state("idle-live").unwrap());
+        assert!(!reopened
+            .knows_transform_session_root("deleted", "/root-a")
+            .unwrap());
+        assert!(!reopened.has_cache_state("deleted").unwrap());
     }
 
     #[test]
@@ -13996,12 +14035,23 @@ mod tests {
                 .id,
             first.id
         );
+        let before_dismiss = store
+            .get_note_by_id("git:proj", "ses", first.id)
+            .unwrap()
+            .unwrap();
+        let feed_before_dismiss = store.pull_changefeed("notes", 0, 100).unwrap().next_cursor;
         let dismissed = store
             .dismiss_note("git:proj", "ses", first.id, Some("done in v2"), 40)
             .unwrap()
             .unwrap();
         assert_eq!(dismissed.status, "dismissed");
         assert!(dismissed.content.contains("done in v2"));
+        assert_eq!(dismissed.status_version, before_dismiss.status_version + 1);
+        let dismissal_feed = store
+            .pull_changefeed("notes", feed_before_dismiss, 100)
+            .unwrap();
+        assert_eq!(dismissal_feed.rows.len(), 1);
+        assert_eq!(dismissal_feed.rows[0].module_row_id, first.id);
         assert_eq!(store.read_notes("git:proj", "ses", 25, 0).unwrap().len(), 1);
         assert!(store
             .search_notes_like("git:other", "ses", "pagination")

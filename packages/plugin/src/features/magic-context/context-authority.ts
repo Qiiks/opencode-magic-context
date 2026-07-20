@@ -31,6 +31,16 @@ export interface AuthorityStatus {
     checksum_ok?: number | boolean | null;
 }
 
+export interface AuthorityDrainContended {
+    code: "authority_drain_contended";
+    retryable: true;
+    state: "DRAINING";
+    attempts: number;
+    authority: AuthorityStatus;
+}
+
+export type AuthorityDrainResult = AuthorityStatus | AuthorityDrainContended;
+
 export interface AuthorityModuleClient {
     authorityStatus(args: {
         context_store_uuid: string;
@@ -585,6 +595,8 @@ function authorityDrainErrorCode(error: unknown): string | null {
         : null;
 }
 
+const MAX_DRAIN_RECAPTURE_ATTEMPTS = 5;
+
 export async function drainAuthority(args: {
     db: Database;
     projectPath: string;
@@ -592,7 +604,7 @@ export async function drainAuthority(args: {
     module: AuthorityModuleClient;
     checksum: string | (() => string);
     limit?: number;
-}): Promise<AuthorityStatus> {
+}): Promise<AuthorityDrainResult> {
     if (!args.module.authorityDrain) {
         throw new Error("authority drain is unavailable on this module client");
     }
@@ -601,6 +613,7 @@ export async function drainAuthority(args: {
     }
     const contextStoreUuid = ensureContextStoreUuid(args.db);
     const limit = Math.max(1, Math.min(args.limit ?? 100, 1000));
+    let recaptureAttempts = 0;
 
     while (true) {
         const leaseStartedAt = Date.now();
@@ -681,6 +694,19 @@ export async function drainAuthority(args: {
             ).authority;
         } catch (error) {
             if (authorityDrainErrorCode(error) === "authority_feed_head_advanced") {
+                if (recaptureAttempts >= MAX_DRAIN_RECAPTURE_ATTEMPTS) {
+                    // Historian publication and state sync legitimately remain writable while
+                    // DRAINING. They are bursty, so a later scheduled drain normally converges;
+                    // bounding this coordinator prevents a steady producer from livelocking it.
+                    return {
+                        code: "authority_drain_contended",
+                        retryable: true,
+                        state: "DRAINING",
+                        attempts: recaptureAttempts,
+                        authority: status,
+                    };
+                }
+                recaptureAttempts += 1;
                 // A non-facade writer may append after the prior bound. Beginning the next
                 // attempt captures a fresh head; replay remains bounded to that captured head.
                 continue;
@@ -764,19 +790,34 @@ function rowNullableString(row: Record<string, unknown>, key: string): string | 
 
 type MirrorResnapshotStatus = "pending_check" | "resnapshotting" | "complete";
 
-function memoryResnapshotStatus(db: Database): MirrorResnapshotStatus | null {
-    const row = db
-        .prepare("SELECT status FROM mirror_resnapshot_state WHERE domain = 'memories'")
-        .get() as { status?: MirrorResnapshotStatus } | undefined;
-    return row?.status ?? null;
+interface MirrorResnapshotState {
+    status: MirrorResnapshotStatus;
+    generation: string | null;
 }
 
-function setMemoryResnapshotStatus(db: Database, status: MirrorResnapshotStatus): void {
-    db.prepare(
-        `INSERT INTO mirror_resnapshot_state(domain, status, updated_at)
-         VALUES ('memories', ?, ?)
-         ON CONFLICT(domain) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at`,
-    ).run(status, Date.now());
+function memoryResnapshotState(db: Database): MirrorResnapshotState | null {
+    const row = db
+        .prepare("SELECT status, generation FROM mirror_resnapshot_state WHERE domain = 'memories'")
+        .get() as MirrorResnapshotState | undefined;
+    return row ?? null;
+}
+
+function casMemoryResnapshotState(
+    db: Database,
+    observed: MirrorResnapshotState,
+    status: MirrorResnapshotStatus,
+    generation: string | null,
+): boolean {
+    const result = db
+        .prepare(
+            `UPDATE mirror_resnapshot_state
+                SET status = ?, generation = ?, updated_at = ?
+              WHERE domain = 'memories'
+                AND status = ?
+                AND generation IS ?`,
+        )
+        .run(status, generation, Date.now(), observed.status, observed.generation);
+    return result.changes === 1;
 }
 
 function upgradeMemoryMirrorNeedsResnapshot(db: Database): boolean {
@@ -793,7 +834,18 @@ function stageLiveMemorySnapshotPage(
     db: Database,
     generation: string,
     rows: readonly ChangefeedRow[],
-): void {
+): boolean {
+    const owned = db
+        .prepare(
+            `SELECT 1
+               FROM mirror_resnapshot_state
+              WHERE domain = 'memories'
+                AND status = 'resnapshotting'
+                AND generation = ?`,
+        )
+        .get(generation);
+    if (!owned) return false;
+
     const insert = db.prepare(
         `INSERT INTO mirror_live_staging(
             generation, module_project, module_row_id, category, normalized_hash
@@ -814,9 +866,21 @@ function stageLiveMemorySnapshotPage(
             normalizedHash,
         );
     }
+    return true;
 }
 
-function installStagedLiveMemorySnapshot(db: Database, generation: string): void {
+function installStagedLiveMemorySnapshot(db: Database, generation: string): boolean {
+    const owned = db
+        .prepare(
+            `SELECT 1
+               FROM mirror_resnapshot_state
+              WHERE domain = 'memories'
+                AND status = 'resnapshotting'
+                AND generation = ?`,
+        )
+        .get(generation);
+    if (!owned) return false;
+
     db.prepare("DELETE FROM mirror_live_memory_rows").run();
     db.prepare(
         `INSERT INTO mirror_live_memory_rows(
@@ -826,7 +890,20 @@ function installStagedLiveMemorySnapshot(db: Database, generation: string): void
            FROM mirror_live_staging
           WHERE generation = ?`,
     ).run(generation);
-    db.prepare("DELETE FROM mirror_live_staging").run();
+    const completed = db
+        .prepare(
+            `UPDATE mirror_resnapshot_state
+                SET status = 'complete', updated_at = ?
+              WHERE domain = 'memories'
+                AND status = 'resnapshotting'
+                AND generation = ?`,
+        )
+        .run(Date.now(), generation);
+    if (completed.changes !== 1) {
+        throw new Error("live memory resnapshot ownership changed inside its install transaction");
+    }
+    db.prepare("DELETE FROM mirror_live_staging WHERE generation = ?").run(generation);
+    return true;
 }
 
 function mirrorIdentity(
@@ -1183,16 +1260,27 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
     let nextCursor = durableCursor;
     withPrivilegedWriter(db, () => {
         db.transaction(() => {
+            const resnapshotState = page.domain === "memories" ? memoryResnapshotState(db) : null;
             let resnapshotStatus =
-                page.domain === "memories" ? memoryResnapshotStatus(db) : "complete";
+                page.domain === "memories" ? (resnapshotState?.status ?? null) : "complete";
             if (
                 page.domain === "memories" &&
                 durableCursor === 0 &&
+                resnapshotState &&
                 resnapshotStatus !== "complete"
             ) {
                 // A cursor-zero replay observes every insert before its tombstone, so it is
                 // equivalent to a live resnapshot and may safely enable destructive cleanup.
-                setMemoryResnapshotStatus(db, "complete");
+                if (
+                    !casMemoryResnapshotState(
+                        db,
+                        resnapshotState,
+                        "complete",
+                        resnapshotState.generation,
+                    )
+                ) {
+                    throw new Error("memory mirror resnapshot ownership changed during replay");
+                }
                 resnapshotStatus = "complete";
             }
             if (
@@ -1234,34 +1322,62 @@ export async function ensureLiveMemoryResnapshot(args: {
     module: AuthorityModuleClient;
     limit: number;
 }): Promise<void> {
-    const initialStatus = memoryResnapshotStatus(args.db);
-    if (!initialStatus || initialStatus === "complete") return;
-    if (initialStatus === "pending_check" && !upgradeMemoryMirrorNeedsResnapshot(args.db)) {
+    let generation: string;
+    while (true) {
+        const observed = memoryResnapshotState(args.db);
+        if (!observed || observed.status === "complete") return;
+        if (observed.status === "pending_check" && !upgradeMemoryMirrorNeedsResnapshot(args.db)) {
+            let completed = false;
+            withPrivilegedWriter(args.db, () => {
+                args.db
+                    .transaction(() => {
+                        completed = casMemoryResnapshotState(
+                            args.db,
+                            observed,
+                            "complete",
+                            observed.generation,
+                        );
+                        if (completed) {
+                            args.db
+                                .prepare(
+                                    "DELETE FROM mirror_live_staging WHERE generation IS NOT ?",
+                                )
+                                .run(observed.generation);
+                        }
+                    })
+                    .immediate();
+            });
+            if (completed) return;
+            continue;
+        }
+        if (!args.module.mirrorPull) {
+            throw new Error("memory mirror resnapshot requires the mirror.pull module route");
+        }
+
+        generation = `${Date.now().toString(36)}:${crypto.randomUUID()}`;
+        let claimed = false;
         withPrivilegedWriter(args.db, () => {
             args.db
                 .transaction(() => {
-                    args.db.prepare("DELETE FROM mirror_live_staging").run();
-                    setMemoryResnapshotStatus(args.db, "complete");
+                    // The state row is the cross-process owner lease. Every attempt must win this
+                    // compare-and-swap before it can stage or install, so an older paged caller
+                    // cannot publish after a newer caller has taken ownership and completed.
+                    claimed = casMemoryResnapshotState(
+                        args.db,
+                        observed,
+                        "resnapshotting",
+                        generation,
+                    );
+                    if (claimed) {
+                        args.db
+                            .prepare("DELETE FROM mirror_live_staging WHERE generation != ?")
+                            .run(generation);
+                    }
                 })
                 .immediate();
         });
-        return;
+        if (claimed) break;
     }
-    if (!args.module.mirrorPull) {
-        throw new Error("memory mirror resnapshot requires the mirror.pull module route");
-    }
-
-    const generation = `${Date.now().toString(36)}:${crypto.randomUUID()}`;
-    withPrivilegedWriter(args.db, () => {
-        args.db
-            .transaction(() => {
-                // Each attempt owns one generation. Removing prior generations here keeps a
-                // crashed scan from accumulating alongside its replacement while live rows stay intact.
-                args.db.prepare("DELETE FROM mirror_live_staging").run();
-                setMemoryResnapshotStatus(args.db, "resnapshotting");
-            })
-            .immediate();
-    });
 
     let cursor = 0;
     while (true) {
@@ -1275,11 +1391,15 @@ export async function ensureLiveMemoryResnapshot(args: {
         if (page.domain !== "memories" || page.cursor !== cursor) {
             throw new Error("live memory resnapshot returned a mismatched page");
         }
+        let staged = false;
         withPrivilegedWriter(args.db, () => {
             args.db
-                .transaction(() => stageLiveMemorySnapshotPage(args.db, generation, page.rows))
+                .transaction(() => {
+                    staged = stageLiveMemorySnapshotPage(args.db, generation, page.rows);
+                })
                 .immediate();
         });
+        if (!staged) return;
         if (!page.has_more) break;
         if (page.next_cursor <= cursor) {
             throw new Error("live memory resnapshot did not advance its cursor");
@@ -1291,7 +1411,6 @@ export async function ensureLiveMemoryResnapshot(args: {
         args.db
             .transaction(() => {
                 installStagedLiveMemorySnapshot(args.db, generation);
-                setMemoryResnapshotStatus(args.db, "complete");
             })
             .immediate();
     });

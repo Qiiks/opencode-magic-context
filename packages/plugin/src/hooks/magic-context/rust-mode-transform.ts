@@ -433,7 +433,7 @@ async function prepareRustMemoryAuthority(args: {
         const current = statuses.get(domain);
         if (current?.state !== "DRAINING") continue;
         resumedDrain = true;
-        await drainAuthority({
+        const drained = await drainAuthority({
             db,
             projectPath,
             domain,
@@ -448,6 +448,11 @@ async function prepareRustMemoryAuthority(args: {
                         .filter(isRecord),
                 ),
         });
+        if ("code" in drained) {
+            throw new MemoryAuthorityUnavailableError(
+                `${drained.code}; the next scheduled transform will resume the drain`,
+            );
+        }
         statuses.set(domain, null);
     }
 

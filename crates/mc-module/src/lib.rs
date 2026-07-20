@@ -1734,6 +1734,8 @@ pub struct McHandler {
     unknown_module_retry_delay: Mutex<Option<Duration>>,
     #[cfg(test)]
     status_snapshot_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    classification_before_apply_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     connect_failure_commit_hook: ConnectFailureCommitHook,
     #[cfg(test)]
     publication_fence_write_hook: ConnectFailureCommitHook,
@@ -2126,6 +2128,8 @@ impl McHandler {
             unknown_module_retry_delay: Mutex::new(None),
             #[cfg(test)]
             status_snapshot_hook: Mutex::new(None),
+            #[cfg(test)]
+            classification_before_apply_hook: Mutex::new(None),
             connect_failure_commit_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
@@ -2194,6 +2198,7 @@ impl McHandler {
             wrapup_operation_budget: Mutex::new(None),
             unknown_module_retry_delay: Mutex::new(None),
             status_snapshot_hook: Mutex::new(None),
+            classification_before_apply_hook: Mutex::new(None),
             connect_failure_commit_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
@@ -7514,6 +7519,15 @@ impl McHandler {
                 shareable: row.get("shareable").and_then(Value::as_bool),
             });
         }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .classification_before_apply_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            hook();
+        }
         match store.with_facade_mutation(&route_root, "memories", || {
             store.set_memory_classification(
                 context_store_uuid,
@@ -7532,6 +7546,9 @@ impl McHandler {
                     code: "authority_generation_mismatch".to_string(),
                     message: format!("authority generation is {found}, request used {expected}"),
                 }
+            }
+            Err(McStoreError::AuthorityStateMismatch { found, .. }) if found == "DRAINING" => {
+                authority_draining_error("memories")
             }
             Err(McStoreError::AuthorityStateMismatch { expected, found }) => {
                 HandlerOutcome::Error {
@@ -13804,6 +13821,87 @@ mod tests {
             .rows
             .iter()
             .any(|row| row.op == "update" && row.module_row_id == fresh_id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raced_classification_drain_returns_the_transition_specific_code() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let route_root = project.to_str().unwrap();
+        let identity = "git:classification-race";
+        handler.bind_route(7, binding(route_root, "token"));
+        activate_module_authority(&store, "context", identity, route_root, "memories");
+        let memory_id = insert_memory(&store, identity, "CONSTRAINTS", "classify me", 1);
+        let before = store.get_memory_full(memory_id).unwrap().unwrap();
+        let generation = store
+            .authority_status("context", identity, "memories")
+            .unwrap()
+            .unwrap()
+            .generation;
+        let feed_head = store
+            .pull_changefeed("memories", 0, 100)
+            .unwrap()
+            .next_cursor;
+        let hook_store = Arc::clone(&store);
+        *handler
+            .classification_before_apply_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(move || {
+            hook_store
+                .authority_begin_drain(
+                    "context",
+                    identity,
+                    "memories",
+                    "classification-race",
+                    i64::MAX,
+                    2,
+                )
+                .unwrap();
+        }));
+
+        let outcome = call_facade(
+            &handler,
+            "memory.set_classification",
+            json!({
+                "memory_project": identity,
+                "context_store_uuid": "context",
+                "authority_generation": generation,
+                "rows": [{
+                    "memory_id": memory_id,
+                    "content_hash_at_prompt": before.normalized_hash.clone(),
+                    "importance": 99
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(error_code(outcome), "authority_draining");
+        assert_eq!(
+            store
+                .get_memory_full(memory_id)
+                .unwrap()
+                .unwrap()
+                .importance,
+            before.importance
+        );
+        assert_eq!(
+            store
+                .pull_changefeed("memories", 0, 100)
+                .unwrap()
+                .next_cursor,
+            feed_head
+        );
+        assert_eq!(
+            store
+                .authority_status("context", identity, "memories")
+                .unwrap()
+                .unwrap()
+                .state,
+            "DRAINING"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
