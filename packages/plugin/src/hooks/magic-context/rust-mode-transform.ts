@@ -397,19 +397,20 @@ async function prepareRustMemoryAuthority(args: {
         );
     }
 
-    const authorityStatus = module.authorityStatus;
-    const authorityPrepare = module.authorityPrepare;
-    const authoritySeed = module.authoritySeed;
-    const authorityDrain = module.authorityDrain;
-    const mirrorPull = module.mirrorPull;
+    // Call through the module object on every invocation: these may be real class
+    // methods whose implementations depend on their instance, so detaching them into
+    // locals would sever `this` and only fail at runtime (test fakes are object
+    // literals and cannot catch the difference).
     const authorityModule: AuthorityModuleClient = {
-        authorityStatus: (request) => authorityStatus({ ...request, projectRoot }),
-        authorityPrepare: (request) => authorityPrepare({ ...request, projectRoot }),
-        authoritySeed: (request) => authoritySeed({ ...request, projectRoot }),
-        authorityDrain: authorityDrain
-            ? (request) => authorityDrain({ ...request, projectRoot })
+        authorityStatus: (request) => module.authorityStatus!({ ...request, projectRoot }),
+        authorityPrepare: (request) => module.authorityPrepare!({ ...request, projectRoot }),
+        authoritySeed: (request) => module.authoritySeed!({ ...request, projectRoot }),
+        authorityDrain: module.authorityDrain
+            ? (request) => module.authorityDrain!({ ...request, projectRoot })
             : undefined,
-        mirrorPull: mirrorPull ? (request) => mirrorPull({ ...request, projectRoot }) : undefined,
+        mirrorPull: module.mirrorPull
+            ? (request) => module.mirrorPull!({ ...request, projectRoot })
+            : undefined,
     };
     const contextStoreUuid = ensureContextStoreUuid(db);
     const domains = ["memories", "notes"] as const;
