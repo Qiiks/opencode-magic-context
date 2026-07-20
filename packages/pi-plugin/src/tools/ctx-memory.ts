@@ -361,7 +361,14 @@ export function createCtxMemoryTool(
 			_onUpdate,
 			ctx,
 		) {
-			params = unwrapImitatedReducedArgs(params, ["action"]);
+			params = unwrapImitatedReducedArgs(params, ["action"], {
+				action: { type: "enum", values: ALL_ACTIONS },
+				content: "string",
+				category: { type: "enum", values: V2_MEMORY_CATEGORIES },
+				ids: { type: "array", items: "number", maxItems: 100 },
+				limit: "number",
+				reason: "string",
+			});
 			if (params.action === undefined) {
 				return err("Error: Action 'undefined' is not allowed in this context.");
 			}

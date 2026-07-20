@@ -2306,6 +2306,23 @@ const MIGRATIONS: Migration[] = [
             }
         },
     },
+    {
+        version: 58,
+        description: "track live module memory identities during mirror replay",
+        up(db: Database): void {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS mirror_live_memory_rows (
+                    module_project TEXT NOT NULL,
+                    module_row_id INTEGER NOT NULL,
+                    category TEXT NOT NULL,
+                    normalized_hash TEXT NOT NULL,
+                    PRIMARY KEY(module_project, module_row_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_mirror_live_memory_content
+                    ON mirror_live_memory_rows(module_project, category, normalized_hash);
+            `);
+        },
+    },
 ];
 
 /**

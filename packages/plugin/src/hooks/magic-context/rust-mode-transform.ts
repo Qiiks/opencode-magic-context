@@ -79,6 +79,7 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
         domain: "memories" | "notes";
         cursor: number;
         limit: number;
+        projectRoot?: string;
     }): Promise<{ page: import("../../features/magic-context/context-authority").ChangefeedPage }>;
     closeSession?(sessionId: string): void;
     getCompartmentsAfter?(
@@ -103,6 +104,7 @@ interface RustSessionState extends ModuleStateSyncState {
     lastObservedUserMessageId: string | null;
     syntheticLoopBreakerLogged: boolean;
     memoryAuthorityProject: string | null;
+    memoryAuthorityRoot: string | null;
     memoryAuthorityReady: boolean;
 }
 
@@ -259,6 +261,7 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             lastObservedUserMessageId: null,
             syntheticLoopBreakerLogged: false,
             memoryAuthorityProject: null,
+            memoryAuthorityRoot: null,
             memoryAuthorityReady: false,
         };
         states.set(sessionId, state);
@@ -367,14 +370,23 @@ async function prepareRustMemoryAuthority(args: {
     db: TransformDeps["db"];
     module: RustModeModuleClient;
     projectPath: string;
+    projectRoot: string;
     state: RustSessionState;
     allowProtocolBypassForTests?: boolean;
     /** Fires after authority is ready so hosts can register per-project services. */
     onProjectPrepared?: (projectPath: string) => void;
 }): Promise<void> {
-    const { db, module, projectPath, state } = args;
-    if (state.memoryAuthorityProject === projectPath && state.memoryAuthorityReady) return;
+    const { db, module, projectPath, projectRoot, state } = args;
+    if (
+        state.memoryAuthorityProject === projectPath &&
+        state.memoryAuthorityRoot === projectRoot &&
+        state.memoryAuthorityReady
+    ) {
+        return;
+    }
     state.memoryAuthorityProject = projectPath;
+    state.memoryAuthorityRoot = projectRoot;
+    state.memoryAuthorityReady = false;
     if (!module.authorityStatus || !module.authorityPrepare || !module.authoritySeed) {
         if (args.allowProtocolBypassForTests === true) {
             state.memoryAuthorityReady = true;
@@ -385,12 +397,19 @@ async function prepareRustMemoryAuthority(args: {
         );
     }
 
+    const authorityStatus = module.authorityStatus;
+    const authorityPrepare = module.authorityPrepare;
+    const authoritySeed = module.authoritySeed;
+    const authorityDrain = module.authorityDrain;
+    const mirrorPull = module.mirrorPull;
     const authorityModule: AuthorityModuleClient = {
-        authorityStatus: module.authorityStatus.bind(module),
-        authorityPrepare: module.authorityPrepare.bind(module),
-        authoritySeed: module.authoritySeed.bind(module),
-        authorityDrain: module.authorityDrain?.bind(module),
-        mirrorPull: module.mirrorPull?.bind(module),
+        authorityStatus: (request) => authorityStatus({ ...request, projectRoot }),
+        authorityPrepare: (request) => authorityPrepare({ ...request, projectRoot }),
+        authoritySeed: (request) => authoritySeed({ ...request, projectRoot }),
+        authorityDrain: authorityDrain
+            ? (request) => authorityDrain({ ...request, projectRoot })
+            : undefined,
+        mirrorPull: mirrorPull ? (request) => mirrorPull({ ...request, projectRoot }) : undefined,
     };
     const contextStoreUuid = ensureContextStoreUuid(db);
     const domains = ["memories", "notes"] as const;
@@ -399,7 +418,7 @@ async function prepareRustMemoryAuthority(args: {
         Awaited<ReturnType<NonNullable<RustModeModuleClient["authorityStatus"]>>>["authority"]
     >();
     for (const domain of domains) {
-        const current = await module.authorityStatus({
+        const current = await authorityModule.authorityStatus({
             context_store_uuid: contextStoreUuid,
             project: projectPath,
             domain,
@@ -437,7 +456,7 @@ async function prepareRustMemoryAuthority(args: {
         for (const domain of domains) {
             const current = statuses.get(domain);
             if (current?.state !== "PREPARING") continue;
-            await module.authorityPrepare({
+            await authorityModule.authorityPrepare({
                 method: "authority.prepare",
                 phase: "abort",
                 context_store_uuid: contextStoreUuid,
@@ -786,6 +805,7 @@ export function createRustModeTransform(
                 db: deps.db,
                 module: options.moduleClient,
                 projectPath: memoryProjectPath ?? projectRoot,
+                projectRoot,
                 state,
                 allowProtocolBypassForTests: options.allowAuthorityProtocolBypassForTests,
                 onProjectPrepared: options.onProjectPrepared,

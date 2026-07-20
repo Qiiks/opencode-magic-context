@@ -98,7 +98,12 @@ export function createCtxExpandTool(
 			_onUpdate,
 			ctx,
 		) {
-			params = unwrapImitatedReducedArgs(params, ["message", "start"]);
+			params = unwrapImitatedReducedArgs(params, ["message", "start"], {
+				start: "number",
+				end: "number",
+				verbose: "boolean",
+				message: "number",
+			});
 			const sessionId = ctx.sessionManager.getSessionId();
 			if (!sessionId) {
 				return err("Error: no active Pi session.");

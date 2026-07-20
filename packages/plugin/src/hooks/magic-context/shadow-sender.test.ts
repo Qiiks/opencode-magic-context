@@ -2399,6 +2399,109 @@ describe("shadow sender", () => {
         await expect(first).rejects.toThrow("test complete");
     });
 
+    it("opens distinct cached routes for one identity across two filesystem roots", async () => {
+        const transport = new __shadowSenderTest.SubcShadowTransport(
+            "/unused/connection.json",
+            "magic-context",
+            500,
+            "",
+        );
+        const openedRoots: string[] = [];
+        let nextRoute = 1;
+        const fakeClient = {
+            routeOpen: async (_target: unknown, identity: { project_root: string }) => {
+                openedRoots.push(identity.project_root);
+                return { channel: nextRoute++, epoch: 1 };
+            },
+            request: async () => ({ ok: true }),
+            closeRoute: async () => undefined,
+        };
+        const internals = transport as unknown as {
+            client: unknown;
+            ensureConnected: () => Promise<typeof fakeClient>;
+        };
+        internals.client = fakeClient;
+        internals.ensureConnected = async () => fakeClient;
+
+        for (const projectRoot of ["/worktree/a", "/worktree/b", "/worktree/a"]) {
+            await transport.call({
+                sessionId: "git:identity",
+                projectRoot,
+                method: "authority.status",
+                body: { method: "authority.status" },
+            });
+        }
+        expect(openedRoots).toEqual(["/worktree/a", "/worktree/b"]);
+    });
+
+    it("keeps correctness FIFO moving when an aborted head waiter never enters the active section", async () => {
+        const transport = new __shadowSenderTest.SubcShadowTransport(
+            "/unused/connection.json",
+            "magic-context",
+            500,
+        );
+        let releaseFirst: (() => void) | undefined;
+        const firstGate = new Promise<void>((resolve) => {
+            releaseFirst = resolve;
+        });
+        const requestOrder: number[] = [];
+        const internals = transport as unknown as {
+            ensureRoute: () => Promise<{
+                client: {
+                    request: (
+                        route: number,
+                        body: { call: number },
+                        options: unknown,
+                    ) => Promise<unknown>;
+                };
+                route: number;
+            }>;
+        };
+        internals.ensureRoute = async () => ({
+            route: 1,
+            client: {
+                request: async (_route, body) => {
+                    requestOrder.push(body.call);
+                    if (body.call === 1) await firstGate;
+                    return { call: body.call };
+                },
+            },
+        });
+
+        const first = transport.call({
+            sessionId: "first",
+            projectRoot: "/repo",
+            method: "transform",
+            body: { call: 1 },
+        });
+        const second = transport.call({
+            sessionId: "second",
+            projectRoot: "/repo",
+            method: "ctx_memory",
+            body: { call: 2 },
+            signal: AbortSignal.timeout(10),
+        });
+        const third = transport.call({
+            sessionId: "third",
+            projectRoot: "/repo",
+            method: "transform",
+            body: { call: 3 },
+        });
+        await expect(second).rejects.toThrow();
+        expect(requestOrder).toEqual([1]);
+        releaseFirst?.();
+        await expect(first).resolves.toEqual({ call: 1 });
+        await expect(
+            Promise.race([
+                third,
+                new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error("third waiter stranded")), 100),
+                ),
+            ]),
+        ).resolves.toEqual({ call: 3 });
+        expect(requestOrder).toEqual([1, 3]);
+    });
+
     it("keeps sender exceptions off the transform hot path", () => {
         const throwingSender = createShadowSender({
             transport: {

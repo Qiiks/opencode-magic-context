@@ -35,6 +35,7 @@ export interface AuthorityModuleClient {
     authorityStatus(args: {
         context_store_uuid: string;
         project: string;
+        projectRoot?: string;
         domain: AuthorityDomain;
     }): Promise<{ authority: AuthorityStatus | null }>;
     authorityPrepare(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }>;
@@ -46,6 +47,7 @@ export interface AuthorityModuleClient {
         domain: AuthorityDomain;
         cursor: number;
         limit: number;
+        projectRoot?: string;
     }): Promise<{ page: ChangefeedPage }>;
 }
 
@@ -805,6 +807,9 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
     const moduleProject = rowString(row, "project_path");
     if (!moduleProject) throw new Error("memory feed snapshot has no project_path");
     if (feed.op === "tombstone") {
+        db.prepare(
+            "DELETE FROM mirror_live_memory_rows WHERE module_project = ? AND module_row_id = ?",
+        ).run(moduleProject, feed.module_row_id);
         // Drop pending refs even when the tombstoned module row was never mapped
         // locally; otherwise a forward reference to a never-seen target leaks forever.
         db.prepare(
@@ -823,10 +828,53 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
         // A cleanup tombstone for one legacy twin must not delete the context row
         // still owned by another module identity for the same source memory.
         if (shared) return;
+        const contextRow = db
+            .prepare("SELECT project_path, category, normalized_hash FROM memories WHERE id = ?")
+            .get(mapped.context_row_id) as
+            | { project_path?: string; category?: string; normalized_hash?: string }
+            | undefined;
+        if (contextRow?.project_path && contextRow.category && contextRow.normalized_hash) {
+            const liveMatches = db
+                .prepare(
+                    `SELECT module_project, module_row_id FROM mirror_live_memory_rows
+                     WHERE module_project = ? AND category = ? AND normalized_hash = ?
+                     ORDER BY module_row_id LIMIT 2`,
+                )
+                .all(
+                    contextRow.project_path,
+                    contextRow.category,
+                    contextRow.normalized_hash,
+                ) as Array<{ module_project: string; module_row_id: number }>;
+            if (liveMatches.length === 1 && liveMatches[0]) {
+                // Feed inserts can race for the mirror's one identity slot. Rechecking live
+                // content after removing the tombstoned owner preserves the canonical row
+                // without weakening the one-context-row/one-module-row invariant.
+                rememberIdentity(
+                    db,
+                    feed.domain,
+                    liveMatches[0].module_project,
+                    liveMatches[0].module_row_id,
+                    mapped.context_row_id,
+                );
+                return;
+            }
+        }
         db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(mapped.context_row_id);
         db.prepare("DELETE FROM memories WHERE id = ?").run(mapped.context_row_id);
         return;
     }
+    db.prepare(
+        `INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(module_project, module_row_id) DO UPDATE SET
+             category = excluded.category,
+             normalized_hash = excluded.normalized_hash`,
+    ).run(
+        moduleProject,
+        feed.module_row_id,
+        rowString(row, "category", "CONSTRAINTS"),
+        rowString(row, "normalized_hash"),
+    );
     const contextId = contextMemoryId(db, feed.domain, moduleProject, row, feed.module_row_id);
     const previous = db
         .prepare("SELECT normalized_hash FROM memories WHERE id = ?")
