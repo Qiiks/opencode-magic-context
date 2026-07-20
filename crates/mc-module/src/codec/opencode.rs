@@ -800,7 +800,7 @@ fn output_status_text(output: &CkToolOutput) -> (&'static str, String) {
                 .clone()
                 .unwrap_or_else(|| "Execution denied".to_string()),
         ),
-        CkOutputKind::Content { blocks } => {
+        CkOutputKind::Content { blocks } | CkOutputKind::ErrorContent { blocks } => {
             let text = blocks
                 .iter()
                 .filter_map(|block| match &block.kind {
@@ -809,7 +809,12 @@ fn output_status_text(output: &CkToolOutput) -> (&'static str, String) {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            ("completed", text)
+            let status = if matches!(&output.kind, CkOutputKind::ErrorContent { .. }) {
+                "error"
+            } else {
+                "completed"
+            };
+            (status, text)
         }
     }
 }

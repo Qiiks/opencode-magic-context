@@ -300,6 +300,9 @@ pub enum CkOutputKind {
     ErrorJson { value: Value },
     ExecutionDenied { reason: Option<String> },
     Content { blocks: Vec<ResultBlock> },
+    // Error-flagged content arrays keep their own variant so failure state survives
+    // decode/encode; errors are output variants here, never a sibling flag.
+    ErrorContent { blocks: Vec<ResultBlock> },
 }
 
 impl CkOutputKind {
@@ -311,6 +314,7 @@ impl CkOutputKind {
             CkOutputKind::ErrorJson { .. } => "error_json",
             CkOutputKind::ExecutionDenied { .. } => "execution_denied",
             CkOutputKind::Content { .. } => "content",
+            CkOutputKind::ErrorContent { .. } => "error_content",
         }
     }
 }

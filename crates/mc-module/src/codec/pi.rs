@@ -852,7 +852,7 @@ fn render_tool_result_content(output: &CkToolOutput) -> Vec<Value> {
             "type": "text",
             "text": reason.clone().unwrap_or_else(|| "Execution denied".to_string())
         })],
-        CkOutputKind::Content { blocks } => blocks
+        CkOutputKind::Content { blocks } | CkOutputKind::ErrorContent { blocks } => blocks
             .iter()
             .map(|block| match &block.kind {
                 ResultBlockKind::Text { text } => json!({ "type": "text", "text": text }),
@@ -870,7 +870,7 @@ fn output_text(output: &CkToolOutput) -> String {
         CkOutputKind::ExecutionDenied { reason } => reason
             .clone()
             .unwrap_or_else(|| "Execution denied".to_string()),
-        CkOutputKind::Content { blocks } => blocks
+        CkOutputKind::Content { blocks } | CkOutputKind::ErrorContent { blocks } => blocks
             .iter()
             .filter_map(|block| match &block.kind {
                 ResultBlockKind::Text { text } => Some(text.as_str()),

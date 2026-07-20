@@ -2801,7 +2801,8 @@ fn taggable_source(block: &FlatBlock) -> Option<(TaggableKind, &str)> {
             ck_wire::CkOutputKind::Text { text } | ck_wire::CkOutputKind::ErrorText { text } => {
                 Some((TaggableKind::ToolResult, text))
             }
-            ck_wire::CkOutputKind::Content { blocks } => blocks.iter().find_map(|block| {
+            ck_wire::CkOutputKind::Content { blocks }
+            | ck_wire::CkOutputKind::ErrorContent { blocks } => blocks.iter().find_map(|block| {
                 if let ck_wire::ResultBlockKind::Text { text } = &block.kind {
                     Some((TaggableKind::ToolResult, text.as_str()))
                 } else {
@@ -3038,7 +3039,8 @@ fn prepend_tag_to_tool_output(output: &mut ck_wire::CkToolOutput, tag_number: i6
                 return true;
             }
         }
-        ck_wire::CkOutputKind::Content { blocks } => {
+        ck_wire::CkOutputKind::Content { blocks }
+        | ck_wire::CkOutputKind::ErrorContent { blocks } => {
             for block in blocks {
                 if let ck_wire::ResultBlockKind::Text { text } = &mut block.kind {
                     let next = prepend_tag(tag_number, text);
@@ -3094,7 +3096,8 @@ fn append_channel1_to_output(output: &mut ck_wire::CkToolOutput, reminder: &str)
                 return true;
             }
         }
-        ck_wire::CkOutputKind::Content { blocks } => {
+        ck_wire::CkOutputKind::Content { blocks }
+        | ck_wire::CkOutputKind::ErrorContent { blocks } => {
             for block in blocks {
                 if let ck_wire::ResultBlockKind::Text { text } = &mut block.kind {
                     if !text.ends_with(reminder) {
@@ -4112,7 +4115,8 @@ fn tool_result_can_carry_channel1(block: &CkWireBlock) -> bool {
     match &block.kind {
         ck_wire::CkKind::ToolResult { output, .. } => match &output.kind {
             ck_wire::CkOutputKind::Text { .. } | ck_wire::CkOutputKind::ErrorText { .. } => true,
-            ck_wire::CkOutputKind::Content { blocks } => blocks
+            ck_wire::CkOutputKind::Content { blocks }
+            | ck_wire::CkOutputKind::ErrorContent { blocks } => blocks
                 .iter()
                 .any(|block| matches!(block.kind, ck_wire::ResultBlockKind::Text { .. })),
             ck_wire::CkOutputKind::Json { .. }
@@ -9144,13 +9148,16 @@ mod tests {
             ck_wire::CkKind::ToolResult { output, .. } => match &output.kind {
                 ck_wire::CkOutputKind::Text { text }
                 | ck_wire::CkOutputKind::ErrorText { text } => Some(text.as_str()),
-                ck_wire::CkOutputKind::Content { blocks } => blocks.iter().find_map(|block| {
-                    if let ck_wire::ResultBlockKind::Text { text } = &block.kind {
-                        Some(text.as_str())
-                    } else {
-                        None
-                    }
-                }),
+                ck_wire::CkOutputKind::Content { blocks }
+                | ck_wire::CkOutputKind::ErrorContent { blocks } => {
+                    blocks.iter().find_map(|block| {
+                        if let ck_wire::ResultBlockKind::Text { text } = &block.kind {
+                            Some(text.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                }
                 _ => None,
             },
             _ => None,
