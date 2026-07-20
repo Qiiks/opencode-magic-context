@@ -88,6 +88,21 @@ Not currently. The database is local to one machine. Memories, compartments, and
 
 If you work across machines, you can manually copy `~/.local/share/cortexkit/magic-context/context.db` between them — they share the same schema and project identity (git root hash), so memories written on one machine will appear on the other after a copy. There is no automatic sync.
 
+## Can I move a session from OpenCode to Pi?
+
+Yes. `doctor migrate` converts an existing OpenCode session into a Pi session file, carrying messages, compartments, and session facts with it. Project memories are already shared (same database, no migration needed).
+
+```bash
+npx @cortexkit/magic-context@latest doctor migrate \
+  --from opencode --to pi --session <session-id>
+```
+
+Add `--dry-run` to preview without writing, or `--max-messages N` to migrate only the most recent N messages. See [Migrating between harnesses](/getting-started/migrating-between-harnesses/) for the full walkthrough. Migration currently supports OpenCode → Pi only.
+
+## The dashboard shows no models / I'm on OpenCode Desktop only
+
+The dashboard's model pickers merge cached provider model lists refreshed in the background. Discovery is never exhaustive — you can always type a model id directly even when a discovered list is present. On OpenCode Desktop-only installs (no CLI alongside), the model list may be empty until you run a session once; type the model id (e.g. `claude-sonnet-4-6`) directly into the picker.
+
 ## Do memories from OpenCode appear in Pi?
 
 Yes. Project memories are stored in the shared database scoped by project identity (git root commit hash), not by harness. A memory written in an OpenCode session appears in the next Pi session for the same project, and vice versa.

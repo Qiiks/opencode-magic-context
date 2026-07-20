@@ -186,11 +186,16 @@ ctx_memory(action="write", category="ARCHITECTURE", content="Event sourcing for 
 
 *What sleep does for memory.* An optional **dreamer** agent runs overnight to keep memory quality high, spinning up ephemeral child sessions for each task:
 
+- **Map memories**: map each memory to the project files that back it (or mark it file-independent), so verify knows what to re-check. Mostly a one-time backfill.
 - **Verify**: incrementally check memories against the current codebase (paths, configs, patterns) and fix/remove stale facts.
+- **Verify broad**: re-verify the entire file-mapped pool against code, ignoring the change gate, to catch drift the incremental pass can't see.
 - **Curate**: scan the whole memory pool to merge duplicates, tighten wording, and archive low-value or redundant entries.
 - **Classify**: score each memory's importance, scope, and safe shareability without disturbing the live prompt cache.
+- **Retrospective**: learn from moments you had to correct or re-explain, and record the durable lesson.
 - **Maintain docs**: keep `ARCHITECTURE.md` and `STRUCTURE.md` current from codebase changes.
 - **User memories**: promote recurring observations about how you work (communication style, review focus, working patterns) into a `<user-profile>` that travels with every session.
+- **Promote primers**: promote recurring standing questions the historian noticed into durable primers.
+- **Refresh primers**: re-investigate stale primers against current code and refresh their answers.
 - **Smart notes**: evaluate deferred notes whose `surface_condition` has come true and surface the ready ones.
 
 Because it runs during idle time, the dreamer pairs well with local models, even slow ones. Nobody is waiting. Trigger a run any time with `/ctx-dream`.
@@ -201,7 +206,7 @@ Because it runs during idle time, the dreamer pairs well with local models, even
 
 *The right memory at the right moment.* Every turn, active project memories and the compacted session history are injected automatically and cache-stably. On demand, the agent reaches for:
 
-- **`ctx_search`**: one query across three layers at once: project **memories**, raw **conversation** history, and indexed **git commits**. Semantic embeddings with full-text fallback.
+- **`ctx_search`**: one query across project **memories**, raw **conversation** history, indexed **git commits**, parked **notes**, and promoted **primers**. Semantic embeddings with full-text fallback.
 
   ```
   ctx_search(query="why did we pick event sourcing for orders")
@@ -212,7 +217,7 @@ Because it runs during idle time, the dreamer pairs well with local models, even
 
 Recall works **across sessions** (a new session inherits everything) and **across harnesses** (write a memory in OpenCode, retrieve it in Pi).
 
-> **Auto search hints** *(on by default)* run a background `ctx_search` each turn and whisper a "vague recall" when something relevant exists — like almost remembering a note you took. It appends only compact fragments, never full content; set `memory.auto_search.enabled: false` to turn it off. **Git commit indexing** *(opt-in)* makes your project history semantically searchable as a fourth `ctx_search` source — enable with `memory.git_commit_indexing.enabled: true`.
+> **Auto search hints** *(on by default)* run a background `ctx_search` each turn and whisper a "vague recall" when something relevant exists — like almost remembering a note you took. It appends only compact fragments, never full content; set `memory.auto_search.enabled: false` to turn it off. **Git commit indexing** *(opt-in)* makes your project history semantically searchable as an additional `ctx_search` source — enable with `memory.git_commit_indexing.enabled: true`.
 
 ### Agent tools at a glance
 
@@ -220,7 +225,7 @@ Recall works **across sessions** (a new session inherits everything) and **acros
 |------|-------|-------------|
 | `ctx_reduce` | Context | Queue stale tagged content for removal, cache-aware |
 | `ctx_memory` | Capture | Write or delete durable cross-session memories |
-| `ctx_search` | Recall | Search memories, conversation history, and git commits |
+| `ctx_search` | Recall | Search memories, conversation history, git commits, notes, and primers |
 | `ctx_expand` | Recall | Decompress a history range back to the transcript |
 | `ctx_note` | Recall | Deferred intentions and dreamer-evaluated smart notes |
 
@@ -237,6 +242,7 @@ Recall works **across sessions** (a new session inherits everything) and **acros
 | `/ctx-session-upgrade` | Upgrade this session to the latest history format: rebuild compartments and migrate project memories |
 | `/ctx-aug` | Run sidekick augmentation on a prompt: retrieve relevant memories via a separate model |
 | `/ctx-dream` | Run dreamer maintenance on demand: maintain memory, docs, smart notes, and user-profile review |
+| `/ctx-embed` | Embedding status, or start/pause history compartment embedding (`start` \| `pause`) |
 
 ---
 
