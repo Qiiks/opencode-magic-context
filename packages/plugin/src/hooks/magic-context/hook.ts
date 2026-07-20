@@ -1011,6 +1011,13 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 }),
             userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreaming),
             language: deps.config.language,
+            transformMode: deps.config.transform_mode,
+            // Scheduled/message-triggered runs must share the same direct
+            // authority.status transport as the transform path. The
+            // executor uses the live MODULE verdict, not transform state
+            // cached in a session, so a cold process cannot fall back to
+            // the guarded TypeScript child path.
+            moduleClient: rustModeModuleClient,
         });
         void runDueTasksForProject({
             db,
@@ -1124,6 +1131,11 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               userMemoryCollectionEnabled:
                                   userMemoryCollectionEnabled(dreamerConfig),
                               language: deps.config.language,
+                              transformMode: deps.config.transform_mode,
+                              // Manual /ctx-dream uses the same live authority
+                              // lookup and module transport as scheduled runs.
+                              // Do not rely on a transform-populated cache.
+                              moduleClient: rustModeModuleClient,
                           }),
                           task,
                       }),

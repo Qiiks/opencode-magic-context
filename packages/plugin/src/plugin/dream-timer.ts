@@ -97,6 +97,7 @@ interface ProjectRegistration {
     primerRawProviderFactory?: (
         sessionId: string,
     ) => Promise<RawMessageProvider | null> | RawMessageProvider | null;
+    transformMode?: "ts" | "rust";
     moduleClient?: ClassifyModuleClient & {
         authorityStatus?: (args: {
             context_store_uuid: string;
@@ -409,6 +410,7 @@ async function sweepProject(
             userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreamerConfig),
             ensureProjectRegistered: reg.ensureRegistered,
             language: reg.language,
+            transformMode: reg.transformMode,
             moduleClient: reg.moduleClient,
         });
         const ran = await runDueTasksForProject({

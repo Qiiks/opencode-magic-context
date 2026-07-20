@@ -261,6 +261,7 @@ const server: Plugin = async (ctx) => {
             client: ctx.client,
             dreamerConfig: dreamerRunnable ? pluginConfig.dreamer : undefined,
             language: pluginConfig.language,
+            transformMode: pluginConfig.transform_mode,
             embeddingConfig: pluginConfig.embedding,
             memoryEnabled: pluginConfig.memory?.enabled === true,
             gitCommitIndexing: pluginConfig.memory.git_commit_indexing?.enabled

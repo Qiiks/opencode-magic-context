@@ -27,7 +27,11 @@ import {
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
 import { getActiveUserMemories } from "../user-memory/storage-user-memory";
-import { type ClassifyModuleClient, runClassify } from "./classify";
+import {
+    ClassifyModuleFailureError,
+    type ClassifyModuleClient,
+    runClassify,
+} from "./classify";
 import { evaluateSmartNotes } from "./evaluate-smart-notes";
 import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import {
@@ -91,6 +95,8 @@ export interface DreamTaskExecutorDeps {
         sessionId: string,
     ) => Promise<RawMessageProvider | null> | RawMessageProvider | null;
     language?: string;
+    /** Resolved project transform mode; an explicit TS mode always stays on TS. */
+    transformMode?: "ts" | "rust";
     /** Rust-mode module transport; classify uses it only after MODULE authority is confirmed. */
     moduleClient?: ClassifyModuleClient & {
         authorityStatus?: (args: {
@@ -109,8 +115,13 @@ function classifyFailure(error: unknown): { transient: boolean; brief: string } 
     const described = describeError(error);
     const brief = described.brief;
     const name = error instanceof Error ? error.name : "";
+    const explicitTransient =
+        error !== null &&
+        typeof error === "object" &&
+        (error as { transient?: unknown }).transient === true;
     const combined = `${name} ${brief}`.toLowerCase();
     const transient =
+        explicitTransient ||
         name === "AbortError" ||
         /abort|lease|timeout|timed out|econn|socket|network|rate.?limit|429|503|overloaded|sqlite_busy|database is locked/.test(
             combined,
@@ -336,22 +347,33 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                           | "moduleCommandId"
                       >
                     | undefined;
-                const moduleTransport = deps.moduleClient;
+                const moduleTransport =
+                    deps.transformMode === "ts" ? undefined : deps.moduleClient;
                 if (moduleTransport?.authorityStatus) {
                     const contextStoreUuid = getContextStoreUuid(db);
                     if (!contextStoreUuid) {
                         throw new Error("Rust classify requires a context store identity");
                     }
-                    const authority = await moduleTransport.authorityStatus({
-                        context_store_uuid: contextStoreUuid,
-                        project: projectIdentity,
-                        projectRoot: deps.sessionDirectory,
-                        domain: "memories",
-                    });
+                    let authority: {
+                        authority: { state?: string; generation?: number } | null;
+                    };
+                    try {
+                        authority = await moduleTransport.authorityStatus({
+                            context_store_uuid: contextStoreUuid,
+                            project: projectIdentity,
+                            projectRoot: deps.sessionDirectory,
+                            domain: "memories",
+                        });
+                    } catch (error) {
+                        throw new ClassifyModuleFailureError("authority.status", error);
+                    }
                     if (authority.authority?.state === "MODULE") {
                         const generation = authority.authority.generation;
                         if (typeof generation !== "number") {
-                            throw new Error("Rust classify authority response omitted generation");
+                            throw new ClassifyModuleFailureError(
+                                "authority.status",
+                                new Error("response omitted generation"),
+                            );
                         }
                         const moduleClient: ClassifyModuleClient = {
                             call: (callArgs) => moduleTransport.call(callArgs),

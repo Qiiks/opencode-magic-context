@@ -66,6 +66,22 @@ export interface ClassifyModuleClient {
     call(args: ClassifyModuleCallArgs): Promise<unknown>;
 }
 
+/**
+ * A module-backed classification failure must reach the task scheduler as a
+ * transient error. The TypeScript child path is intentionally not a fallback:
+ * when MODULE owns memories, writing through the child would violate the
+ * authority boundary (or hide a module outage behind a misleading success).
+ */
+export class ClassifyModuleFailureError extends Error {
+    readonly transient = true;
+
+    constructor(operation: string, cause: unknown) {
+        super(`Rust classify ${operation} failed: ${getErrorMessage(cause)}`);
+        this.name = "ClassifyModuleFailureError";
+        (this as Error & { cause?: unknown }).cause = cause;
+    }
+}
+
 export interface ClassifyArgs {
     db: Database;
     client: PluginContext["client"];
@@ -212,19 +228,19 @@ async function classifyOneChunk(
 ): Promise<{ classified: number; changed: number }> {
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
+    const moduleRoute =
+        args.moduleClient !== undefined &&
+        args.moduleSessionId !== undefined &&
+        args.moduleProjectRoot !== undefined &&
+        args.moduleContextStoreUuid !== undefined &&
+        args.moduleAuthorityGeneration !== undefined;
     try {
         const prompt = buildClassifyPrompt({
             projectPath: args.projectIdentity,
             memories: chunk.map(toPromptMemory),
             anchors,
         });
-        if (
-            args.moduleClient &&
-            args.moduleSessionId &&
-            args.moduleProjectRoot &&
-            args.moduleContextStoreUuid &&
-            args.moduleAuthorityGeneration !== undefined
-        ) {
+        if (moduleRoute) {
             const run = await runClassifyThroughModule(args, chunk, anchors, signal);
             recordInvocation(args, startedAt, { status: "completed" });
             return run;
@@ -288,13 +304,17 @@ async function classifyOneChunk(
         recordInvocation(args, startedAt, { status: "completed", messages: run.output });
         return applyClassifications(args, chunk, run.validated);
     } catch (error) {
-        const desc = describeError(error);
+        const failure = moduleRoute ? new ClassifyModuleFailureError("module", error) : error;
+        const desc = describeError(failure);
         log(
             `[dreamer] classify chunk failed: ${desc.brief}`,
             desc.stackHead ? { stackHead: desc.stackHead } : undefined,
         );
-        recordInvocation(args, startedAt, { status: "failed", error });
-        if (signal.aborted) throw error;
+        recordInvocation(args, startedAt, { status: "failed", error: failure });
+        // A MODULE-authority failure is not safe to downgrade to the guarded
+        // TypeScript child path. Surface it so the scheduler records a
+        // transient failure and retries the same task instead.
+        if (moduleRoute || signal.aborted) throw failure;
         return { classified: 0, changed: 0 };
     } finally {
         // Delete on success AND failure (the failed child still holds the
