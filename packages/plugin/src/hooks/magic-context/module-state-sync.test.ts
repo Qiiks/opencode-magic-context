@@ -142,6 +142,44 @@ function syntheticWireMessage(
     };
 }
 
+describe("module state authority direction", () => {
+    it("omits module-owned memory sections from the TypeScript sender payload", async () => {
+        const db = createContextDb();
+        db.prepare(
+            `INSERT INTO memories
+                (project_path, category, content, normalized_hash, first_seen_at, created_at,
+                 updated_at, last_seen_at, classified_at)
+             VALUES (?, 'CONSTRAINTS', 'module-owned fact', 'hash', 0, 0, 0, 0, 1234)`,
+        ).run("/tmp/project");
+        const calls: unknown[] = [];
+        const state = syncState();
+
+        await syncModuleState({
+            client: {
+                async call(args) {
+                    calls.push(args.body);
+                    return { result: { shadow_seq: 1, memories_skipped: true } };
+                },
+            },
+            state,
+            pass: {
+                db,
+                sessionId: "ses-authority-direction",
+                projectPath: "/tmp/project",
+                nowMs: 1,
+            },
+            projectRoot: "/tmp/project",
+            force: true,
+            options: { authority: true, authorityState: "MODULE" },
+        });
+
+        const body = calls[0] as Record<string, unknown>;
+        expect(body).not.toHaveProperty("memories");
+        expect(body).not.toHaveProperty("memory_mutations");
+        expect(state.authorityMemorySyncSkipLogged).toBe(true);
+    });
+});
+
 describe("module compartment ordinal serialization", () => {
     it("uses canonical ordinals when stored boundaries include a summary row", async () => {
         useTempDataHome("module-state-sync-ordinal-basis-");

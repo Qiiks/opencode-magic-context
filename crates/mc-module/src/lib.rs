@@ -6532,6 +6532,7 @@ impl McHandler {
                 "shadow_generation": result.shadow_generation,
                 "shadow_seq": result.shadow_seq,
                 "row_version": result.row_version,
+                "memories_skipped": result.memories_skipped,
             })),
             Err(ShadowStateSyncError::GenerationMismatch { expected, found }) => {
                 HandlerOutcome::Error {
@@ -18743,15 +18744,20 @@ mod tests {
             )
             .await;
         assert!(matches!(absent, HandlerOutcome::Response(_)), "{absent:?}");
-        assert_eq!(
-            store.load_active_memories("git:identity", 0).unwrap()[0].content,
-            "resolved owner"
-        );
+        let absent_response = match &absent {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(bytes).unwrap(),
+            HandlerOutcome::Error { .. } | HandlerOutcome::Streamed => Value::Null,
+        };
+        assert_eq!(absent_response["memories_skipped"], json!(true));
+        assert!(store
+            .load_active_memories("git:identity", 0)
+            .unwrap()
+            .is_empty());
         assert_eq!(
             store
                 .max_memory_mutation_id(&["git:identity".to_string()])
                 .unwrap(),
-            1
+            0
         );
         assert_eq!(
             store
@@ -18793,15 +18799,19 @@ mod tests {
             )
             .await;
         assert!(matches!(workspace, HandlerOutcome::Response(_)));
+        let workspace_response = match &workspace {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(bytes).unwrap(),
+            HandlerOutcome::Error { .. } | HandlerOutcome::Streamed => Value::Null,
+        };
+        assert_eq!(workspace_response["memories_skipped"], json!(true));
         assert!(store
             .load_active_memories("git:identity", 0)
             .unwrap()
-            .iter()
-            .any(|memory| memory.content == "workspace owner"));
-        assert_eq!(
-            store.load_active_memories("git:foreign", 0).unwrap()[0].content,
-            "workspace foreign"
-        );
+            .is_empty());
+        assert!(store
+            .load_active_memories("git:foreign", 0)
+            .unwrap()
+            .is_empty());
         assert!(store
             .load_active_memories(route_project_root, 0)
             .unwrap()

@@ -254,8 +254,8 @@ interface ShadowStateSyncPayload {
         seed_complete?: boolean;
         seed_boundary_id?: string | null;
         compartments: unknown[];
-        memories: unknown[];
-        memory_mutations: unknown[];
+        memories?: unknown[];
+        memory_mutations?: unknown[];
         user_profile: string[];
         workspace?: ShadowWorkspacePayload | null;
         last_todo_state?: string;
