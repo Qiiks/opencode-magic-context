@@ -56,12 +56,17 @@ const STAGE3_ANCHOR_COUNT = 30; // calibration anchors shown in Stage 3
 // >100 to-classify Stage-3 backlog splits into chunks of this size.
 const CLASSIFY_CHUNK_SIZE = 100;
 
+// Module-side classify awaits a full broca producer run (CLASSIFY_AWAIT_TIMEOUT is
+// 600s in the module); the transport request must outlive it plus dispatch slack.
+const CLASSIFY_MODULE_RUN_TIMEOUT_MS = 660_000;
+
 export interface ClassifyModuleCallArgs {
     sessionId: string;
     projectRoot: string;
     method: string;
     body: unknown;
     signal?: AbortSignal;
+    timeoutMs?: number;
 }
 
 export interface ClassifyModuleClient {
@@ -470,6 +475,9 @@ async function runClassifyThroughModule(
             },
         },
         signal,
+        // The module drives a full producer run (model call included) before replying,
+        // so this request carries the classify slice budget, not the transport default.
+        timeoutMs: CLASSIFY_MODULE_RUN_TIMEOUT_MS,
     });
     const result = (response as { result?: unknown } | null)?.result ?? response;
     if (!result || typeof result !== "object")

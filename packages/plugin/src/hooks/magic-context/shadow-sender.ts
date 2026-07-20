@@ -1669,9 +1669,13 @@ export class SubcShadowTransport implements ShadowTransport {
             | "ctx_memory"
             | "note.evaluate"
             | "transform.ack"
-            | "transform.nack";
+            | "transform.nack"
+            | "dreamer.run_task"
+            | "memory.set_classification";
         body: unknown;
         signal?: AbortSignal;
+        /** Producer-backed calls (dreamer.run_task) outlive the default transport budget. */
+        timeoutMs?: number;
     }): Promise<unknown> {
         // Shadow mirror traffic is best-effort: each waiting closure would retain its
         // complete pass payload, so concurrent shadow work is dropped to keep transport
@@ -1689,7 +1693,7 @@ export class SubcShadowTransport implements ShadowTransport {
             throw error;
         }
 
-        const deadlineMs = Date.now() + this.requestTimeoutMs;
+        const deadlineMs = Date.now() + (args.timeoutMs ?? this.requestTimeoutMs);
         const releaseLane = shadowLane
             ? (() => {
                   this.activeSession = args.sessionId;
