@@ -1548,7 +1548,24 @@ const MIGRATIONS: &[Migration] = &[
         "#,
     },
     Migration {
-        version: 30,
+        version: 31,
+        // Classify retries must replay the recorded module outcome instead of sending the
+        // memory pool to a provider twice. This ledger is separate from cache revisions because
+        // classification changes only metadata and must not create a new cache revision.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_dream_task_commands (
+            session_id   TEXT NOT NULL,
+            command_id   TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            created_at   INTEGER NOT NULL,
+            PRIMARY KEY (session_id, command_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_dream_task_commands_created
+            ON mc_dream_task_commands(session_id, created_at, command_id);
+    ",
+    },
+    Migration {
+        version: 32,
         // Bindings may have been stored before the route became authority-owned or before
         // facade rows were written. Normalize every stored binding during upgrade by removing
         // duplicate memory rows and rekeying the remaining route, mutation, and note rows,
@@ -2750,6 +2767,33 @@ pub struct ChangefeedPage {
     pub rows: Vec<ChangefeedRow>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DreamTaskCommandRow {
+    pub response_json: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassificationUpdate {
+    pub memory_id: i64,
+    pub content_hash_at_prompt: String,
+    pub importance: Option<i32>,
+    pub scope: Option<String>,
+    pub shareable: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassificationRejected {
+    pub memory_id: i64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassificationApplyResult {
+    pub accepted: Vec<i64>,
+    pub rejected: Vec<ClassificationRejected>,
+}
+
 /// A context row used by the crash-idempotent authority seed. The JSON payload is
 /// intentionally opaque here; the module persists the fields it owns and verifies
 /// the host-provided content hash separately.
@@ -3178,6 +3222,12 @@ enum MemoryMutationOutcome {
     NotFound,
     Applied(Box<Option<StoredMemoryFull>>),
     Duplicate(i64),
+}
+
+enum ClassificationTxnOutcome {
+    Applied(ClassificationApplyResult),
+    AuthorityStateMismatch(String),
+    AuthorityGenerationMismatch(u64),
 }
 
 enum CommitOutcome {
@@ -4699,6 +4749,179 @@ impl McStore {
                 },
             )
         })?)
+    }
+
+    /// Return a recorded dream-task result for command-id retry deduplication.
+    pub fn load_dream_task_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<Option<DreamTaskCommandRow>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT response_json, created_at
+                   FROM mc_dream_task_commands
+                  WHERE session_id = ?1 AND command_id = ?2",
+                params![session_id, command_id],
+                |row| {
+                    Ok(DreamTaskCommandRow {
+                        response_json: row.get(0)?,
+                        created_at: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+        })?)
+    }
+
+    /// Record the first terminal dream-task response. INSERT OR IGNORE makes a response-loss
+    /// retry replay the original provider outcome instead of executing a second child session.
+    pub fn record_dream_task_command(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        response_json: &str,
+        created_at: i64,
+    ) -> Result<DreamTaskCommandRow, McStoreError> {
+        Ok(self.inner.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT OR IGNORE INTO mc_dream_task_commands
+                     (session_id, command_id, response_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![session_id, command_id, response_json, created_at],
+            )?;
+            tx.query_row(
+                "SELECT response_json, created_at
+                   FROM mc_dream_task_commands
+                  WHERE session_id = ?1 AND command_id = ?2",
+                params![session_id, command_id],
+                |row| {
+                    Ok(DreamTaskCommandRow {
+                        response_json: row.get(0)?,
+                        created_at: row.get(1)?,
+                    })
+                },
+            )
+        })?)
+    }
+
+    /// Apply classifier metadata under the memories authority, updating each row only when its
+    /// content hash still matches the supplied hash. Classification does not append to the
+    /// mutation log because importance, scope, and shareability are cache-neutral metadata;
+    /// the feed trigger still mirrors the full updated row for module-owned consumers.
+    pub fn set_memory_classification(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        authority_generation: u64,
+        rows: &[ClassificationUpdate],
+        now_ms: i64,
+    ) -> Result<ClassificationApplyResult, McStoreError> {
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            let authority: Option<(String, u64)> = tx
+                .query_row(
+                    "SELECT state, generation FROM mc_authority
+                       WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
+                    params![context_store_uuid, project],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((state, generation)) = authority else {
+                return Ok(ClassificationTxnOutcome::AuthorityStateMismatch(
+                    "missing memories authority".to_string(),
+                ));
+            };
+            if state != "MODULE" {
+                return Ok(ClassificationTxnOutcome::AuthorityStateMismatch(state));
+            }
+            if generation != authority_generation {
+                return Ok(ClassificationTxnOutcome::AuthorityGenerationMismatch(
+                    generation,
+                ));
+            }
+
+            let mut accepted = Vec::new();
+            let mut rejected = Vec::new();
+            for update in rows {
+                let Some(memory) = load_memory_full_tx(tx, update.memory_id)? else {
+                    rejected.push(ClassificationRejected {
+                        memory_id: update.memory_id,
+                        reason: "not_found".to_string(),
+                    });
+                    continue;
+                };
+                if memory.project_path != project {
+                    rejected.push(ClassificationRejected {
+                        memory_id: update.memory_id,
+                        reason: "not_owned".to_string(),
+                    });
+                    continue;
+                }
+                if memory.normalized_hash != update.content_hash_at_prompt {
+                    rejected.push(ClassificationRejected {
+                        memory_id: update.memory_id,
+                        reason: "stale".to_string(),
+                    });
+                    continue;
+                }
+                if let Some(scope) = update.scope.as_deref() {
+                    if !matches!(scope, "project" | "ecosystem" | "universe") {
+                        rejected.push(ClassificationRejected {
+                            memory_id: update.memory_id,
+                            reason: "invalid_scope".to_string(),
+                        });
+                        continue;
+                    }
+                }
+                let mut assignments = Vec::new();
+                let mut values: Vec<rusqlite::types::Value> = Vec::new();
+                if let Some(importance) = update.importance {
+                    assignments.push("importance = ?".to_string());
+                    values.push(rusqlite::types::Value::Integer(i64::from(
+                        importance.clamp(1, 100),
+                    )));
+                }
+                if let Some(scope) = update.scope.as_deref() {
+                    assignments.push("scope = ?".to_string());
+                    values.push(rusqlite::types::Value::Text(scope.to_string()));
+                }
+                if let Some(shareable) = update.shareable {
+                    assignments.push("shareable = ?".to_string());
+                    values.push(rusqlite::types::Value::Integer(if shareable {
+                        1
+                    } else {
+                        0
+                    }));
+                }
+                assignments.push("classified_at = ?".to_string());
+                values.push(rusqlite::types::Value::Integer(now_ms));
+                values.push(rusqlite::types::Value::Integer(update.memory_id));
+                let sql = format!(
+                    "UPDATE mc_memories SET {} WHERE id = ?",
+                    assignments.join(", ")
+                );
+                tx.execute(&sql, rusqlite::params_from_iter(values.iter()))?;
+                accepted.push(update.memory_id);
+            }
+            Ok(ClassificationTxnOutcome::Applied(
+                ClassificationApplyResult { accepted, rejected },
+            ))
+        })?;
+        match outcome {
+            ClassificationTxnOutcome::Applied(result) => Ok(result),
+            ClassificationTxnOutcome::AuthorityStateMismatch(found) => {
+                Err(McStoreError::AuthorityStateMismatch {
+                    expected: "MODULE".to_string(),
+                    found,
+                })
+            }
+            ClassificationTxnOutcome::AuthorityGenerationMismatch(found) => {
+                Err(McStoreError::AuthorityGenerationMismatch {
+                    expected: authority_generation,
+                    found,
+                })
+            }
+        }
     }
 
     /// Record a terminal wrapup outcome only while the cache row still matches the

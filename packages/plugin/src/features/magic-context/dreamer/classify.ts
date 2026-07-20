@@ -53,6 +53,18 @@ const STAGE3_ANCHOR_COUNT = 30; // calibration anchors shown in Stage 3
 // >100 to-classify Stage-3 backlog splits into chunks of this size.
 const CLASSIFY_CHUNK_SIZE = 100;
 
+export interface ClassifyModuleCallArgs {
+    sessionId: string;
+    projectRoot: string;
+    method: string;
+    body: unknown;
+    signal?: AbortSignal;
+}
+
+export interface ClassifyModuleClient {
+    call(args: ClassifyModuleCallArgs): Promise<unknown>;
+}
+
 export interface ClassifyArgs {
     db: Database;
     client: PluginContext["client"];
@@ -64,6 +76,13 @@ export interface ClassifyArgs {
     deadline: number;
     model?: string;
     fallbackModels?: readonly string[];
+    /** Present only for rust-mode projects whose memories authority is MODULE. */
+    moduleClient?: ClassifyModuleClient;
+    moduleSessionId?: string;
+    moduleProjectRoot?: string;
+    moduleContextStoreUuid?: string;
+    moduleAuthorityGeneration?: number;
+    moduleCommandId?: string;
 }
 
 export interface ClassifyResult {
@@ -193,6 +212,23 @@ async function classifyOneChunk(
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     try {
+        const prompt = buildClassifyPrompt({
+            projectPath: args.projectIdentity,
+            memories: chunk.map(toPromptMemory),
+            anchors,
+        });
+        if (
+            args.moduleClient &&
+            args.moduleSessionId &&
+            args.moduleProjectRoot &&
+            args.moduleContextStoreUuid &&
+            args.moduleAuthorityGeneration !== undefined
+        ) {
+            const run = await runClassifyThroughModule(args, chunk, anchors, signal);
+            recordInvocation(args, startedAt, { status: "completed" });
+            return run;
+        }
+
         const createResponse = await args.client.session.create({
             body: {
                 ...(args.parentSessionId ? { parentID: args.parentSessionId } : {}),
@@ -210,11 +246,6 @@ async function classifyOneChunk(
         agentSessionId = typeof created?.id === "string" ? created.id : null;
         if (!agentSessionId) throw new Error("Could not create classify session.");
 
-        const prompt = buildClassifyPrompt({
-            projectPath: args.projectIdentity,
-            memories: chunk.map(toPromptMemory),
-            anchors,
-        });
         const run = await shared.promptSyncWithValidatedOutputRetry(
             args.client,
             {
@@ -284,6 +315,101 @@ async function classifyOneChunk(
 /** Apply the manifest host-side: the manifest must cover exactly this chunk;
  *  shareable fails closed against sensitive text. setMemoryClassification stamps
  *  classified_at (the run-gate) and is cache-neutral. */
+async function runClassifyThroughModule(
+    args: ClassifyArgs,
+    chunk: Memory[],
+    anchors: ClassifyAnchorMemory[],
+    signal: AbortSignal,
+): Promise<{ classified: number; changed: number }> {
+    const prompt = buildClassifyPrompt({
+        projectPath: args.projectIdentity,
+        memories: chunk.map(toPromptMemory),
+        anchors,
+    });
+    const response = await args.moduleClient?.call({
+        sessionId: args.moduleSessionId as string,
+        projectRoot: args.moduleProjectRoot as string,
+        method: "dreamer.run_task",
+        body: {
+            method: "dreamer.run_task",
+            v: 1,
+            session_id: args.moduleSessionId,
+            task: "classify",
+            command_id: `classify:${args.moduleCommandId ?? Date.now()}:${chunk.map((m) => m.id).join(",")}`,
+            authority_generation: args.moduleAuthorityGeneration,
+            payload: {
+                prompt_body: prompt,
+                items: chunk.map((memory) => ({
+                    memory_id: memory.id,
+                    content_hash: memory.normalizedHash,
+                })),
+            },
+        },
+        signal,
+    });
+    const result = (response as { result?: unknown } | null)?.result ?? response;
+    if (!result || typeof result !== "object")
+        throw new Error("module returned invalid classify result");
+    const manifestText = (result as { manifest_text?: unknown }).manifest_text;
+    if (typeof manifestText !== "string") throw new Error("module returned no classify manifest");
+    if ((result as { truncated?: unknown }).truncated === true) {
+        throw new Error("classify returned length-capped output");
+    }
+    const parsed = parseClassifyManifest(manifestText);
+    assertManifestCoversExactly(
+        parsed.map((entry) => entry.id),
+        new Set(chunk.map((memory) => memory.id)),
+        "classify",
+    );
+    const rows = parsed.map((entry) => {
+        const memory = chunk.find((candidate) => candidate.id === entry.id);
+        if (!memory) throw new Error(`classify returned unknown memory ${entry.id}`);
+        return {
+            memory_id: entry.id,
+            content_hash_at_prompt: memory.normalizedHash,
+            importance: entry.importance,
+            scope: entry.scope,
+            // The host forces shareable to false whenever the memory text is sensitive,
+            // regardless of whether classification runs through the module or provider path.
+            shareable:
+                entry.shareable === true && hasShareabilitySensitiveText(memory.content)
+                    ? false
+                    : entry.shareable,
+        };
+    });
+    const applied = await args.moduleClient?.call({
+        sessionId: args.moduleSessionId as string,
+        projectRoot: args.moduleProjectRoot as string,
+        method: "memory.set_classification",
+        body: {
+            name: "memory.set_classification",
+            arguments: {
+                memory_project: args.projectIdentity,
+                context_store_uuid: args.moduleContextStoreUuid,
+                authority_generation: args.moduleAuthorityGeneration,
+                rows,
+            },
+        },
+        signal,
+    });
+    const applyResult = (applied as { result?: unknown } | null)?.result ?? applied;
+    if (!applyResult || typeof applyResult !== "object") {
+        throw new Error("module returned invalid classification apply result");
+    }
+    const accepted = (applyResult as { accepted?: unknown }).accepted;
+    if (!Array.isArray(accepted))
+        throw new Error("module returned no classification acceptance list");
+    const stale = (applyResult as { rejected?: unknown }).rejected;
+    if (Array.isArray(stale)) {
+        const unexpected = stale.some(
+            (row) =>
+                row && typeof row === "object" && (row as { reason?: unknown }).reason !== "stale",
+        );
+        if (unexpected) throw new Error("module rejected classification for a non-stale reason");
+    }
+    return { classified: accepted.length, changed: accepted.length };
+}
+
 export function applyClassifications(
     args: ClassifyArgs,
     chunk: Memory[],

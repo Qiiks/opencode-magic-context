@@ -9,6 +9,7 @@ import { loadPluginConfig } from "./config";
 import { isDreamerRunnable } from "./config/agent-disable";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
+import type { ClassifyModuleCallArgs } from "./features/magic-context/dreamer/classify";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
 import { resolveProjectIdentityOrFallback } from "./features/magic-context/memory/project-identity";
@@ -253,6 +254,21 @@ const server: Plugin = async (ctx) => {
     // so overnight dreaming works even when the user isn't chatting.
     if (pluginConfig.enabled) {
         const dreamerRunnable = isDreamerRunnable(pluginConfig);
+        const authorityStatus = rustModeModuleClient?.authorityStatus;
+        const classifyModuleClient = rustModeModuleClient
+            ? {
+                  authorityStatus: authorityStatus
+                      ? (statusArgs: Parameters<NonNullable<typeof authorityStatus>>[0]) =>
+                            authorityStatus.call(rustModeModuleClient, statusArgs)
+                      : undefined,
+                  call: (callArgs: ClassifyModuleCallArgs) =>
+                      (
+                          rustModeModuleClient.call as unknown as (
+                              args: ClassifyModuleCallArgs,
+                          ) => Promise<unknown>
+                      )(callArgs),
+              }
+            : undefined;
         const timerRegistration = {
             directory: ctx.directory,
             projectIdentity: resolveProjectIdentityOrFallback(ctx.directory),
@@ -269,6 +285,7 @@ const server: Plugin = async (ctx) => {
                   }
                 : undefined,
             ensureRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+            moduleClient: classifyModuleClient,
         };
         // Fail OPEN: the dream timer is best-effort background maintenance and must
         // never abort the plugin load. This block is awaited and runs BEFORE the

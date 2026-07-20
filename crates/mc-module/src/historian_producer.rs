@@ -579,6 +579,26 @@ impl HistorianProducer {
         prompt: &str,
         model: &str,
     ) -> Result<RunHandle, HistorianProducerError> {
+        self.start_with_generation(
+            session_id,
+            system,
+            prompt,
+            model,
+            HISTORIAN_MAX_OUTPUT_TOKENS,
+            HISTORIAN_TEMPERATURE,
+        )
+        .await
+    }
+
+    pub async fn start_with_generation(
+        &mut self,
+        session_id: &str,
+        system: &str,
+        prompt: &str,
+        model: &str,
+        max_output_tokens: u32,
+        temperature: f64,
+    ) -> Result<RunHandle, HistorianProducerError> {
         self.bind_session(session_id.to_string());
         let route = self.ensure_command_route().await?;
         // The route identity is the session. Keeping `session` out of this body avoids
@@ -612,8 +632,8 @@ impl HistorianProducer {
         params.insert(
             "generation".into(),
             json!({
-                "max_output_tokens": HISTORIAN_MAX_OUTPUT_TOKENS,
-                "temperature": HISTORIAN_TEMPERATURE,
+                "max_output_tokens": max_output_tokens,
+                "temperature": temperature,
             }),
         );
         if !system.is_empty() {
@@ -643,16 +663,32 @@ impl HistorianProducer {
         &mut self,
         run_id: &str,
     ) -> Result<ProducerOutput, HistorianProducerError> {
-        self.subscribe_from_start(run_id, self.config.await_timeout)
+        self.await_output_with_timeout(run_id, self.config.await_timeout)
             .await
+    }
+
+    pub async fn await_output_with_timeout(
+        &mut self,
+        run_id: &str,
+        timeout: Duration,
+    ) -> Result<ProducerOutput, HistorianProducerError> {
+        self.subscribe_from_start(run_id, timeout).await
     }
 
     pub async fn redrain_output(
         &mut self,
         run_id: &str,
     ) -> Result<ProducerOutput, HistorianProducerError> {
-        self.subscribe_from_start(run_id, RECOVERY_REDRAIN_TIMEOUT)
+        self.redrain_output_with_timeout(run_id, RECOVERY_REDRAIN_TIMEOUT)
             .await
+    }
+
+    pub async fn redrain_output_with_timeout(
+        &mut self,
+        run_id: &str,
+        timeout: Duration,
+    ) -> Result<ProducerOutput, HistorianProducerError> {
+        self.subscribe_from_start(run_id, timeout).await
     }
 
     pub async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError> {
@@ -674,6 +710,18 @@ impl HistorianProducer {
                 json!({ "method": "run.cancel", "params": { "run_id": run_id } }),
             )
             .await?;
+        Ok(())
+    }
+
+    /// Delete the bound provider session before releasing its routes. Dreamer
+    /// sessions contain memory-pool snapshots, so retention settings never apply.
+    pub async fn purge_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
+        self.bind_session(session_id.to_string());
+        let route = self.ensure_command_route().await?;
+        let _ = self
+            .unary_json(route, json!({ "method": "session.delete", "params": {} }))
+            .await?;
+        self.close().await;
         Ok(())
     }
 
