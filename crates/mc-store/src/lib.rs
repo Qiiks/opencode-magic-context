@@ -4755,6 +4755,9 @@ impl McStore {
     /// Mint tag rows for newly-observed block ids and return every requested row.
     /// Existing rows keep their original numbers; fresh rows consume the next numbers
     /// in the caller's order inside one transaction.
+    // Production callers live module-side behind the test-support seeds; without that
+    // feature only in-crate tests reach these write paths, so silence the lint there.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub(crate) fn mint_or_get_tags(
         &self,
         session_id: &str,
@@ -4849,6 +4852,7 @@ impl McStore {
     }
 
     /// Insert one Channel-1 append row if this block has not already received one.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub(crate) fn append_channel1_nudge(
         &self,
         session_id: &str,
