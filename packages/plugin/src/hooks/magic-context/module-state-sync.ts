@@ -18,6 +18,7 @@ import {
     resolveWorkspaceShareCategories,
 } from "../../features/magic-context/workspaces";
 import { getHarness } from "../../shared/harness";
+import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import { MODULE_PAGE_MAX_BYTES, moduleWireBodyBytes } from "./module-wire";
 import {
@@ -53,8 +54,8 @@ export interface ModuleStateSyncPayload {
         seed_complete?: boolean;
         seed_boundary_id?: string | null;
         compartments: unknown[];
-        memories: unknown[];
-        memory_mutations: unknown[];
+        memories?: unknown[];
+        memory_mutations?: unknown[];
         user_profile: string[];
         workspace?: ModuleWorkspacePayload | null;
         last_todo_state?: string;
@@ -72,6 +73,7 @@ export interface ModuleStateSyncState {
     idOrdinalMemoGeneration: number;
     idOrdinalMemo: Map<string, number>;
     seedPassPending?: boolean;
+    authorityMemorySyncSkipLogged?: boolean;
 }
 
 export interface ModuleStateSyncPass {
@@ -85,6 +87,8 @@ export interface ModuleStateSyncOptions {
     beforeSerializeCompartment?: () => void;
     yieldEveryCompartments?: number;
     shouldAbortSeed?: () => boolean;
+    /** Cached authority state used only to avoid sending rows the module already owns. */
+    authorityState?: "TS" | "PREPARING" | "MODULE" | "DRAINING";
     /** Enable the authority sender's one-time durable-sequence adoption. */
     authority?: boolean;
     /** Share adoption state across every authority sync attempt in one transform pass. */
@@ -458,11 +462,16 @@ export function buildPagedModuleStateSyncPayloads(args: {
     workspace: ModuleWorkspacePayload | null;
     lastTodoState: string;
     watermarks: ModuleWatermarks;
+    omitAuthorityMemorySections?: boolean;
 }): ModuleStateSyncPayload[] {
     const items: SeedItem[] = [
         ...args.compartments.map((value) => ({ kind: "compartment", value }) as const),
-        ...args.memories.map((value) => ({ kind: "memory", value }) as const),
-        ...args.memoryMutations.map((value) => ({ kind: "memory_mutation", value }) as const),
+        ...(args.omitAuthorityMemorySections
+            ? []
+            : args.memories.map((value) => ({ kind: "memory", value }) as const)),
+        ...(args.omitAuthorityMemorySections
+            ? []
+            : args.memoryMutations.map((value) => ({ kind: "memory_mutation", value }) as const)),
         ...args.userProfile.map((value) => ({ kind: "user_profile", value }) as const),
     ];
     const makePayload = (input: {
@@ -484,8 +493,12 @@ export function buildPagedModuleStateSyncPayloads(args: {
             seed_batch_total: input.total,
             seed_complete: input.complete,
             compartments: input.compartments,
-            memories: input.memories,
-            memory_mutations: input.memoryMutations,
+            ...(args.omitAuthorityMemorySections
+                ? {}
+                : {
+                      memories: input.memories,
+                      memory_mutations: input.memoryMutations,
+                  }),
             user_profile: input.userProfile,
             ...(input.complete
                 ? {
@@ -626,6 +639,9 @@ export async function buildModuleStateSyncPayload(args: {
     ModuleStateSyncPayload | null | "m0_mutation" | "mismatch" | "unresolved" | "seed_budget"
 > {
     const workspace = resolveModuleWorkspaceContext(args.pass.db, args.pass.projectPath);
+    // One authority pool has one writer. While MODULE owns memories, this sender only mirrors
+    // module changes back to TypeScript and must not send the TypeScript view in the other direction.
+    const omitAuthorityMemorySections = args.options?.authorityState === "MODULE";
     const currentWatermarks = loadModuleWatermarks({
         db: args.pass.db,
         sessionId: args.pass.sessionId,
@@ -686,23 +702,24 @@ export async function buildModuleStateSyncPayload(args: {
         }
     }
 
-    const allMemories = args.pass.projectPath
-        ? workspace.workspace
-            ? getMemoriesByProjects(
-                  args.pass.db,
-                  workspace.expandedIdentities,
-                  ["active", "permanent"],
-                  args.pass.nowMs,
-                  workspace.ownIdentities,
-                  workspace.shareCategories,
-              )
-            : getMemoriesByProject(
-                  args.pass.db,
-                  args.pass.projectPath,
-                  ["active", "permanent"],
-                  args.pass.nowMs,
-              )
-        : [];
+    const allMemories =
+        !omitAuthorityMemorySections && args.pass.projectPath
+            ? workspace.workspace
+                ? getMemoriesByProjects(
+                      args.pass.db,
+                      workspace.expandedIdentities,
+                      ["active", "permanent"],
+                      args.pass.nowMs,
+                      workspace.ownIdentities,
+                      workspace.shareCategories,
+                  )
+                : getMemoriesByProject(
+                      args.pass.db,
+                      args.pass.projectPath,
+                      ["active", "permanent"],
+                      args.pass.nowMs,
+                  )
+            : [];
     const memories = allMemories
         .filter((memory) => memory.id > acked.memory_id)
         .map((memory) => ({
@@ -733,23 +750,24 @@ export async function buildModuleStateSyncPayload(args: {
         }));
     const renderedMemoryIds = allMemories.map((memory) => memory.id);
     const userProfile = getActiveUserMemories(args.pass.db).map((memory) => memory.content);
-    const memoryMutations = args.pass.projectPath
-        ? getMemoryMutationsForRenderByProjects(
-              args.pass.db,
-              workspace.expandedIdentities,
-              acked.memory_mutation_id,
-              renderedMemoryIds,
-          ).map((row) => ({
-              id: row.id,
-              project_path: row.projectPath,
-              mutation_type: row.mutationType,
-              target_memory_id: row.targetMemoryId,
-              superseded_by_id: row.supersededById,
-              category: row.category,
-              new_content: row.newContent,
-              queued_at: row.queuedAt,
-          }))
-        : [];
+    const memoryMutations =
+        !omitAuthorityMemorySections && args.pass.projectPath
+            ? getMemoryMutationsForRenderByProjects(
+                  args.pass.db,
+                  workspace.expandedIdentities,
+                  acked.memory_mutation_id,
+                  renderedMemoryIds,
+              ).map((row) => ({
+                  id: row.id,
+                  project_path: row.projectPath,
+                  mutation_type: row.mutationType,
+                  target_memory_id: row.targetMemoryId,
+                  superseded_by_id: row.supersededById,
+                  category: row.category,
+                  new_content: row.newContent,
+                  queued_at: row.queuedAt,
+              }))
+            : [];
     const sessionMeta = getOrCreateSessionMeta(args.pass.db, args.pass.sessionId);
     const payloadArgs = {
         shadowGeneration: args.state.shadowGeneration,
@@ -766,6 +784,7 @@ export async function buildModuleStateSyncPayload(args: {
         workspace: workspace.workspace,
         lastTodoState: sessionMeta.lastTodoState ?? "",
         watermarks: currentWatermarks,
+        omitAuthorityMemorySections,
     };
     if (args.force) {
         const wireBatches = buildPagedModuleStateSyncPayloads(payloadArgs);
@@ -777,8 +796,7 @@ export async function buildModuleStateSyncPayload(args: {
             shadow_generation: args.state.shadowGeneration,
             expected_shadow_seq: args.state.lastAckedSeq,
             compartments,
-            memories,
-            memory_mutations: memoryMutations,
+            ...(omitAuthorityMemorySections ? {} : { memories, memory_mutations: memoryMutations }),
             user_profile: userProfile,
             workspace: workspace.workspace,
             last_todo_state: sessionMeta.lastTodoState ?? "",
@@ -809,6 +827,11 @@ export interface ModuleStateSyncClient {
         body: unknown;
         signal?: AbortSignal;
     }): Promise<unknown>;
+}
+
+function responseMemoriesSkipped(response: unknown): boolean {
+    const value = isRecord(response) && isRecord(response.result) ? response.result : response;
+    return isRecord(value) && value.memories_skipped === true;
 }
 
 function readAuthoritySeqMismatch(error: unknown): number | null {
@@ -878,7 +901,7 @@ export async function syncModuleState(args: {
         try {
             const batches = payload.wireBatches ?? [payload];
             for (const batch of batches) {
-                await args.client.call({
+                const response = await args.client.call({
                     sessionId: args.pass.sessionId,
                     projectRoot: args.projectRoot,
                     method: "state_sync",
@@ -887,6 +910,17 @@ export async function syncModuleState(args: {
                         ...batch.params,
                     },
                 });
+                if (
+                    args.options?.authority === true &&
+                    responseMemoriesSkipped(response) &&
+                    !args.state.authorityMemorySyncSkipLogged
+                ) {
+                    args.state.authorityMemorySyncSkipLogged = true;
+                    sessionLog(
+                        args.pass.sessionId,
+                        "authority state sync skipped module-owned memory sections",
+                    );
+                }
             }
         } catch (error) {
             const durableSeq = args.options?.authority ? readAuthoritySeqMismatch(error) : null;

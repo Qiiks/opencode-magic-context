@@ -3078,6 +3078,8 @@ pub struct ShadowStateSyncResult {
     pub shadow_generation: u64,
     pub shadow_seq: u64,
     pub row_version: u64,
+    /// True when incoming memory sections were skipped because the module owns memories.
+    pub memories_skipped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5992,6 +5994,7 @@ impl McStore {
             for compartment in request.compartments {
                 upsert_compartment_tx(tx, request.session_id, compartment)?;
             }
+            let mut memories_skipped = false;
             if shadow_lane {
                 replace_workspace_tx(tx, request.shadow_project_path, request.workspace)?;
                 replace_shadow_memories_tx(tx, request.memories)?;
@@ -5999,16 +6002,39 @@ impl McStore {
                 replace_shadow_user_profile_tx(tx, request.shadow_project_path, request.user_profile)?;
             } else {
                 replace_workspace_tx(tx, request.shadow_project_path, request.workspace)?;
-                replace_authority_memories_tx(
-                    tx,
-                    request.shadow_project_path,
-                    request.memories,
-                )?;
-                replace_authority_memory_mutations_tx(
-                    tx,
-                    request.shadow_project_path,
-                    request.memory_mutations,
-                )?;
+                // Each authority pool has exactly one writer. When the module owns memories, this
+                // state-sync lane can only mirror module changes back to TypeScript; applying the
+                // TypeScript view here would let a stale sender overwrite module-authored fields.
+                let memories_authority_state: Option<String> = tx
+                    .query_row(
+                        "SELECT authority.state
+                           FROM mc_authority_route_bindings binding
+                           JOIN mc_authority authority
+                             ON authority.context_store_uuid = binding.context_store_uuid
+                            AND authority.project = binding.project
+                          WHERE binding.route_project_root = ?1
+                            AND authority.domain = 'memories'",
+                        params![request.shadow_project_path],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if matches!(
+                    memories_authority_state.as_deref(),
+                    Some("PREPARING" | "MODULE" | "DRAINING")
+                ) {
+                    memories_skipped = true;
+                } else {
+                    replace_authority_memories_tx(
+                        tx,
+                        request.shadow_project_path,
+                        request.memories,
+                    )?;
+                    replace_authority_memory_mutations_tx(
+                        tx,
+                        request.shadow_project_path,
+                        request.memory_mutations,
+                    )?;
+                }
                 replace_authority_user_profile_tx(tx, request.user_profile)?;
             }
 
@@ -6039,6 +6065,7 @@ impl McStore {
                 shadow_generation: meta.shadow_generation,
                 shadow_seq: meta.shadow_seq,
                 row_version: next,
+                memories_skipped,
             }))
         })?;
 
@@ -15325,6 +15352,176 @@ mod shadow_tests {
     }
 
     #[test]
+    fn authority_state_sync_fences_module_owned_memory_rows() {
+        for authority_state in ["PREPARING", "MODULE", "DRAINING"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let route_project_root = "/worktrees/repo";
+            let identity = "git:identity";
+            store
+                .inner
+                .with_conn_fenced(|tx| {
+                    tx.execute(
+                        "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
+                         VALUES ('context', ?1, 'memories', ?2)",
+                        params![identity, authority_state],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO mc_authority_route_bindings(route_project_root, context_store_uuid, project)
+                         VALUES (?1, 'context', ?2)",
+                        params![route_project_root, identity],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO mc_memories
+                             (id, project_path, category, content, normalized_hash, importance, status,
+                              first_seen_at, created_at, updated_at, last_seen_at, classified_at,
+                              context_store_uuid, context_row_id)
+                         VALUES (8214, ?1, 'CONFIG_VALUES', 'module fact', 'same-hash', 85, 'active',
+                                 0, 0, 0, 0, 1234, 'context', 9395)",
+                        params![identity],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+
+            let mut incoming = memory(9395, "module fact");
+            incoming.project_path = identity.to_string();
+            incoming.category = "CONFIG_VALUES".to_string();
+            incoming.normalized_hash = "same-hash".to_string();
+            incoming.importance = Some(50);
+            incoming.classified_at = None;
+
+            let result = store
+                .apply_authority_state_sync(ShadowStateSyncRequest {
+                    session_id: "authority-session",
+                    shadow_project_path: route_project_root,
+                    shadow_generation: 0,
+                    expected_shadow_seq: 0,
+                    seed_boundary_id: None,
+                    compartments: &[],
+                    memories: &[incoming],
+                    memory_mutations: &[],
+                    user_profile: &[],
+                    workspace: None,
+                    last_todo_state: None,
+                    acked_watermarks: serde_json::Value::Null,
+                })
+                .unwrap();
+
+            assert!(
+                result.memories_skipped,
+                "state {authority_state} must fence TS rows"
+            );
+            let row = store
+                .inner
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT importance, classified_at FROM mc_memories WHERE id = 8214",
+                        [],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+                    )
+                })
+                .unwrap();
+            assert_eq!(row, (85, Some(1234)));
+        }
+    }
+
+    #[test]
+    fn authority_state_sync_replaces_memory_rows_for_ts_and_unbound_routes() {
+        for authority_state in [None, Some("TS")] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let route_project_root = "/worktrees/repo";
+            let identity = "git:identity";
+            store
+                .inner
+                .with_conn_fenced(|tx| {
+                    if let Some(state) = authority_state {
+                        tx.execute(
+                            "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
+                             VALUES ('context', ?1, 'memories', ?2)",
+                            params![identity, state],
+                        )?;
+                        tx.execute(
+                            "INSERT INTO mc_authority_route_bindings(route_project_root, context_store_uuid, project)
+                             VALUES (?1, 'context', ?2)",
+                            params![route_project_root, identity],
+                        )?;
+                    }
+                    tx.execute(
+                        "INSERT INTO mc_memories
+                             (id, project_path, category, content, normalized_hash, importance, status,
+                              first_seen_at, created_at, updated_at, last_seen_at, classified_at,
+                              context_store_uuid, context_row_id)
+                         VALUES (8214, ?1, 'CONFIG_VALUES', 'module fact', 'same-hash', 85, 'active',
+                                 0, 0, 0, 0, 1234, 'context', 9395)",
+                        params![identity],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+
+            let mut incoming = memory(
+                if authority_state.is_some() {
+                    9395
+                } else {
+                    8214
+                },
+                "updated fact",
+            );
+            incoming.project_path = identity.to_string();
+            incoming.category = "CONFIG_VALUES".to_string();
+            incoming.normalized_hash = "updated-hash".to_string();
+            incoming.importance = Some(50);
+            incoming.classified_at = None;
+
+            let result = store
+                .apply_authority_state_sync(ShadowStateSyncRequest {
+                    session_id: "authority-session",
+                    shadow_project_path: route_project_root,
+                    shadow_generation: 0,
+                    expected_shadow_seq: 0,
+                    seed_boundary_id: None,
+                    compartments: &[],
+                    memories: &[incoming],
+                    memory_mutations: &[],
+                    user_profile: &[],
+                    workspace: None,
+                    last_todo_state: None,
+                    acked_watermarks: serde_json::Value::Null,
+                })
+                .unwrap();
+
+            assert!(!result.memories_skipped);
+            let row = store
+                .inner
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT content, importance, classified_at FROM mc_memories WHERE id = 8214",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, Option<i64>>(2)?,
+                            ))
+                        },
+                    )
+                })
+                .unwrap();
+            assert_eq!(row, ("updated fact".to_string(), 50, None));
+            assert!(store
+                .pull_changefeed("memories", 0, 100)
+                .unwrap()
+                .rows
+                .iter()
+                .any(|row| {
+                    row.op == "update" && row.full_row_snapshot["classified_at"].is_null()
+                }));
+        }
+    }
+
+    #[test]
     fn authority_route_binding_rejects_path_vocabulary_writes() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -15433,6 +15630,65 @@ mod shadow_tests {
         assert_eq!(page.rows[0].op, "update");
         assert_eq!(page.rows[1].op, "update");
         assert_eq!(page.rows[2].op, "tombstone");
+
+        let classified_id = store
+            .insert_memory(InsertMemoryInput {
+                project_path: "feed-project",
+                route_project_root: None,
+                category: "CONSTRAINTS",
+                content: "classified fact",
+                source_session_id: None,
+                source_type: Some("dreamer"),
+                importance: Some(50),
+                expires_at: None,
+                metadata_json: None,
+                now_ms: 2,
+            })
+            .unwrap();
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
+                     VALUES ('store-uuid', 'feed-project', 'memories', 'MODULE')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let classified_hash = store
+            .get_memory_full(classified_id)
+            .unwrap()
+            .unwrap()
+            .normalized_hash;
+        let classification_start = store
+            .pull_changefeed("memories", page.next_cursor, 100)
+            .unwrap()
+            .next_cursor;
+        store
+            .set_memory_classification(
+                "store-uuid",
+                "feed-project",
+                0,
+                &[ClassificationUpdate {
+                    memory_id: classified_id,
+                    content_hash_at_prompt: classified_hash,
+                    importance: Some(77),
+                    scope: None,
+                    shareable: None,
+                }],
+                4242,
+            )
+            .unwrap();
+        let classification_page = store
+            .pull_changefeed("memories", classification_start, 100)
+            .unwrap();
+        assert_eq!(classification_page.rows.len(), 1);
+        assert_eq!(classification_page.rows[0].op, "update");
+        assert_eq!(
+            classification_page.rows[0].full_row_snapshot["classified_at"],
+            serde_json::json!(4242)
+        );
 
         let note = serde_json::json!({
             "id": 12,

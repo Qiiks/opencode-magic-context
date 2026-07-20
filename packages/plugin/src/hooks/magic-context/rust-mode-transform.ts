@@ -107,6 +107,7 @@ interface RustSessionState extends ModuleStateSyncState {
     memoryAuthorityProject: string | null;
     memoryAuthorityRoot: string | null;
     memoryAuthorityReady: boolean;
+    authorityMemorySyncSkipLogged?: boolean;
 }
 
 export interface RustModeTransformOptions {
@@ -264,6 +265,7 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             memoryAuthorityProject: null,
             memoryAuthorityRoot: null,
             memoryAuthorityReady: false,
+            authorityMemorySyncSkipLogged: false,
         };
         states.set(sessionId, state);
     }
@@ -837,7 +839,11 @@ export function createRustModeTransform(
                 pass: syncPass,
                 projectRoot,
                 force: !state.initialized,
-                options: { authority: true, authoritySeqAdoption },
+                options: {
+                    authority: true,
+                    authorityState: state.memoryAuthorityReady ? "MODULE" : undefined,
+                    authoritySeqAdoption,
+                },
             });
             const body = buildTransformBody({
                 sessionId,
@@ -878,7 +884,11 @@ export function createRustModeTransform(
                     pass: syncPass,
                     projectRoot,
                     force: true,
-                    options: { authority: true, authoritySeqAdoption },
+                    options: {
+                        authority: true,
+                        authorityState: state.memoryAuthorityReady ? "MODULE" : undefined,
+                        authoritySeqAdoption,
+                    },
                 });
                 response = undefined;
                 for (const page of buildPagedModuleTransformPayloads(body)) {
