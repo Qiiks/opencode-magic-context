@@ -5654,7 +5654,7 @@ mod tests {
     fn ck_wire_golden_bytes_match_cross_repo_pin() {
         use sha2::{Digest, Sha256};
         const GOLDEN_SHA256: &str =
-            "e6143e10762f3f1b33a2a2bc32860e8fcd51dece00d7af67e7c2245c309db192";
+            "0a63fc82b79c169402a8ed02a254c954360bd374f04fc44ba75c401219c4a6b0";
         let bytes = include_bytes!("../testdata/ck_wire_golden.json");
         let actual = format!("{:x}", Sha256::digest(bytes));
         assert_eq!(

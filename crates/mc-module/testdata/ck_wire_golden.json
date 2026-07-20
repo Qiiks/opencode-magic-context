@@ -269,5 +269,49 @@
       }
     ],
     "meta": {}
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "kind": {
+          "type": "tool_call",
+          "id": "toolu_err_content",
+          "name": "run_build",
+          "input": {
+            "target": "release"
+          },
+          "provider_executed": false
+        }
+      }
+    ],
+    "meta": {}
+  },
+  {
+    "role": "tool",
+    "content": [
+      {
+        "kind": {
+          "type": "tool_result",
+          "id": "toolu_err_content",
+          "tool_name": "run_build",
+          "output": {
+            "kind": {
+              "type": "error_content",
+              "blocks": [
+                {
+                  "kind": {
+                    "type": "text",
+                    "text": "build failed: exit 1"
+                  }
+                }
+              ]
+            }
+          },
+          "provider_executed": false
+        }
+      }
+    ],
+    "meta": {}
   }
 ]
