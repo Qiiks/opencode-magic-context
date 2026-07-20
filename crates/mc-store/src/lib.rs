@@ -5431,6 +5431,25 @@ impl McStore {
         rows: &[VerificationUpdate],
         now_ms: i64,
     ) -> Result<VerificationApplyResult, McStoreError> {
+        let authority = self.authority_status(context_store_uuid, project, "memories")?;
+        let Some(authority) = authority else {
+            return Err(McStoreError::AuthorityStateMismatch {
+                expected: "MODULE".into(),
+                found: "missing".into(),
+            });
+        };
+        if authority.state != "MODULE" {
+            return Err(McStoreError::AuthorityStateMismatch {
+                expected: "MODULE".into(),
+                found: authority.state,
+            });
+        }
+        if authority.generation != authority_generation {
+            return Err(McStoreError::AuthorityGenerationMismatch {
+                expected: authority_generation,
+                found: authority.generation,
+            });
+        }
         self.inner.with_conn_fenced(|tx| {
             let authority: (String, u64) = tx.query_row(
                 "SELECT state, generation FROM mc_authority WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
@@ -5487,6 +5506,25 @@ impl McStore {
         rows: &[MappingUpdate],
         now_ms: i64,
     ) -> Result<MappingApplyResult, McStoreError> {
+        let authority = self.authority_status(context_store_uuid, project, "memories")?;
+        let Some(authority) = authority else {
+            return Err(McStoreError::AuthorityStateMismatch {
+                expected: "MODULE".into(),
+                found: "missing".into(),
+            });
+        };
+        if authority.state != "MODULE" {
+            return Err(McStoreError::AuthorityStateMismatch {
+                expected: "MODULE".into(),
+                found: authority.state,
+            });
+        }
+        if authority.generation != authority_generation {
+            return Err(McStoreError::AuthorityGenerationMismatch {
+                expected: authority_generation,
+                found: authority.generation,
+            });
+        }
         self.inner.with_conn_fenced(|tx| {
             let authority: (String, u64) = tx.query_row(
                 "SELECT state, generation FROM mc_authority WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
@@ -10236,6 +10274,16 @@ impl McStore {
                         AND source_context_row_id = ?3",
                     params![context_store_uuid, project, source],
                 )?;
+            }
+            if let Some(mapping) = object.get("mapping") {
+                let mapped_files_json = serde_json::to_string(mapping)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                tx.execute(
+                    "INSERT INTO mc_memory_mappings(memory_id, project_path, mapped_files_json, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(memory_id) DO UPDATE SET project_path = excluded.project_path, mapped_files_json = excluded.mapped_files_json, updated_at = excluded.updated_at",
+                    params![id, project, mapped_files_json, integer("updated_at").unwrap_or(0)],
+                )?;
+            } else {
+                tx.execute("DELETE FROM mc_memory_mappings WHERE memory_id = ?1", params![id])?;
             }
             tx.execute(
                 "INSERT INTO mc_authority_seed_rows(context_store_uuid, project, domain, source_row_id, snapshot_json) VALUES (?1, ?2, 'memories', ?3, ?4) ON CONFLICT(context_store_uuid, project, domain, source_row_id) DO UPDATE SET snapshot_json = excluded.snapshot_json",
@@ -16502,5 +16550,134 @@ mod shadow_tests {
             store.load_compartments(session).unwrap()[0].end_message_id,
             "first#0"
         );
+    }
+
+    #[test]
+    fn set_memory_verification_and_mapping_fence_rows_and_append_feed_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let prepared = store
+            .authority_begin_prepare("context", "git:applies", "memories")
+            .unwrap();
+        let authority = store
+            .authority_finish_prepare(
+                "context",
+                "git:applies",
+                "memories",
+                prepared.generation,
+                "digest",
+                "digest",
+                true,
+            )
+            .unwrap();
+        store
+            .seed_memory(1, "git:applies", "CONSTRAINTS", "one", 1)
+            .unwrap();
+        store
+            .seed_memory(2, "git:applies", "CONSTRAINTS", "two", 1)
+            .unwrap();
+        store
+            .seed_memory(3, "git:other", "CONSTRAINTS", "three", 1)
+            .unwrap();
+        let hash = |id| store.get_memory_full(id).unwrap().unwrap().normalized_hash;
+        let result = store
+            .set_memory_verification(
+                "context",
+                "git:applies",
+                authority.generation,
+                &[
+                    VerificationUpdate {
+                        memory_id: 1,
+                        content_hash_at_prompt: hash(1),
+                        verification_status: "verified".into(),
+                        updated_content: None,
+                        archive_reason: None,
+                    },
+                    VerificationUpdate {
+                        memory_id: 2,
+                        content_hash_at_prompt: "stale".into(),
+                        verification_status: "verified".into(),
+                        updated_content: None,
+                        archive_reason: None,
+                    },
+                    VerificationUpdate {
+                        memory_id: 99,
+                        content_hash_at_prompt: "missing".into(),
+                        verification_status: "verified".into(),
+                        updated_content: None,
+                        archive_reason: None,
+                    },
+                    VerificationUpdate {
+                        memory_id: 3,
+                        content_hash_at_prompt: hash(3),
+                        verification_status: "verified".into(),
+                        updated_content: None,
+                        archive_reason: None,
+                    },
+                ],
+                0,
+            )
+            .unwrap();
+        assert_eq!(result.accepted, vec![1]);
+        assert_eq!(
+            result
+                .rejected
+                .iter()
+                .map(|row| row.reason.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stale", "not_found", "not_owned"]
+        );
+        let updated = store
+            .set_memory_verification(
+                "context",
+                "git:applies",
+                authority.generation,
+                &[VerificationUpdate {
+                    memory_id: 2,
+                    content_hash_at_prompt: hash(2),
+                    verification_status: "update".into(),
+                    updated_content: Some("two changed".into()),
+                    archive_reason: None,
+                }],
+                2,
+            )
+            .unwrap();
+        assert_eq!(updated.accepted, vec![2]);
+        let archived = store
+            .set_memory_verification(
+                "context",
+                "git:applies",
+                authority.generation,
+                &[VerificationUpdate {
+                    memory_id: 1,
+                    content_hash_at_prompt: hash(1),
+                    verification_status: "archive".into(),
+                    updated_content: None,
+                    archive_reason: Some("obsolete".into()),
+                }],
+                3,
+            )
+            .unwrap();
+        assert_eq!(archived.accepted, vec![1]);
+        let mapping = store
+            .set_memory_mapping(
+                "context",
+                "git:applies",
+                authority.generation,
+                &[MappingUpdate {
+                    memory_id: 2,
+                    content_hash_at_prompt: hash(2),
+                    mapped_files: Some(vec!["src/lib.rs".into()]),
+                }],
+                4,
+            )
+            .unwrap();
+        assert_eq!(mapping.accepted, vec![2]);
+        assert!(store
+            .pull_changefeed("memories", 0, 100)
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.full_row_snapshot.get("mapping").is_some()));
     }
 }

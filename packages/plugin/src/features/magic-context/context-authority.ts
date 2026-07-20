@@ -1149,6 +1149,21 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
     if (previous?.normalized_hash !== feed.content_hash) {
         db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(contextId);
     }
+    // Store mapping changes in the regular memory feed so maps owned by this module are preserved
+    // when data is synchronized back into the database. Rows without a `mapping` property are
+    // ordinary memory updates and must not create mapping verification records.
+    if (Object.prototype.hasOwnProperty.call(row, "mapping")) {
+        const files = Array.isArray(row.mapping)
+            ? [...new Set(row.mapping.filter((file): file is string => typeof file === "string").sort())]
+            : [""];
+        db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(contextId);
+        const insert = db.prepare(
+            "INSERT INTO memory_verifications(memory_id, file_path, verified_at, mapped_at) VALUES (?, ?, 0, ?)",
+        );
+        for (const file of files.length > 0 ? files : [""]) {
+            insert.run(contextId, file, rowNumber(row, "updated_at", Date.now()));
+        }
+    }
 }
 
 function contextNoteId(db: Database, feed: ChangefeedRow, moduleProject: string): number {

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { DREAMER_MEMORY_MAPPER_AGENT } from "../../../agents/dreamer";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
@@ -283,7 +285,7 @@ export async function applyBatchMappings(
         });
         let response: unknown;
         try {
-            response = await args.moduleRoute.moduleClient.call({ sessionId: args.moduleRoute.moduleSessionId, projectRoot: args.moduleRoute.moduleProjectRoot, method: "memory.set_mapping", body: { name: "memory.set_mapping", arguments: { memory_project: args.projectIdentity, context_store_uuid: args.moduleRoute.moduleContextStoreUuid, authority_generation: args.moduleRoute.moduleAuthorityGeneration, command_id: args.moduleRoute.moduleCommandId, rows } } });
+            response = await args.moduleRoute.moduleClient.call({ sessionId: args.moduleRoute.moduleSessionId, projectRoot: args.moduleRoute.moduleProjectRoot, method: "memory.set_mapping", body: { name: "memory.set_mapping", arguments: { memory_project: args.projectIdentity, context_store_uuid: args.moduleRoute.moduleContextStoreUuid, authority_generation: args.moduleRoute.moduleAuthorityGeneration, command_id: `${args.moduleRoute.moduleCommandId}:${createHash("sha256").update(rows.map((row) => row.memory_id).join(",")).digest("hex").slice(0, 16)}`, rows } } });
         } catch (error) { throw new DreamerModuleFailureError("memory.set_mapping", error); }
         const result = ((response as { result?: unknown })?.result ?? response) as { accepted?: unknown };
         if (!Array.isArray(result?.accepted)) throw new DreamerModuleFailureError("memory.set_mapping", new Error("invalid response"));

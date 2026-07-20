@@ -7590,6 +7590,16 @@ impl McHandler {
         let Some(store) = self.store.get() else {
             return store_unavailable_error();
         };
+        let command_id = args
+            .get("command_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        if let Some(command_id) = command_id {
+            if let Ok(Some(recorded)) = store.load_dream_task_command(&binding.session, command_id)
+            {
+                return replay_dream_task_response(&recorded.response_json);
+            }
+        }
         let Some(context_store_uuid) = args.get("context_store_uuid").and_then(Value::as_str)
         else {
             return invalid_params_error("memory.set_verification requires context_store_uuid");
@@ -7638,9 +7648,25 @@ impl McHandler {
                 now_ms(),
             )
         }) {
-            Ok(result) => respond(
-                json!({ "accepted": result.accepted, "rejected": result.rejected.iter().map(|row| json!({"memory_id": row.memory_id, "reason": row.reason})).collect::<Vec<_>>() }),
-            ),
+            Ok(result) => {
+                let response = json!({ "ok": true, "accepted": result.accepted, "rejected": result.rejected.iter().map(|row| json!({"memory_id": row.memory_id, "reason": row.reason})).collect::<Vec<_>>() });
+                if let Some(command_id) = command_id {
+                    match store.record_dream_task_command(
+                        &binding.session,
+                        command_id,
+                        &response.to_string(),
+                        now_ms(),
+                    ) {
+                        Ok(recorded) => replay_dream_task_response(&recorded.response_json),
+                        Err(error) => HandlerOutcome::Error {
+                            code: "dreamer_ledger_failed".into(),
+                            message: error.to_string(),
+                        },
+                    }
+                } else {
+                    respond(response)
+                }
+            }
             Err(McStoreError::AuthorityGenerationMismatch { expected, found }) => {
                 HandlerOutcome::Error {
                     code: "authority_generation_mismatch".into(),
@@ -7675,6 +7701,16 @@ impl McHandler {
         let Some(store) = self.store.get() else {
             return store_unavailable_error();
         };
+        let command_id = args
+            .get("command_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        if let Some(command_id) = command_id {
+            if let Ok(Some(recorded)) = store.load_dream_task_command(&binding.session, command_id)
+            {
+                return replay_dream_task_response(&recorded.response_json);
+            }
+        }
         let Some(context_store_uuid) = args.get("context_store_uuid").and_then(Value::as_str)
         else {
             return invalid_params_error("memory.set_mapping requires context_store_uuid");
@@ -7723,9 +7759,25 @@ impl McHandler {
                 now_ms(),
             )
         }) {
-            Ok(result) => respond(
-                json!({ "accepted": result.accepted, "rejected": result.rejected.iter().map(|row| json!({"memory_id": row.memory_id, "reason": row.reason})).collect::<Vec<_>>() }),
-            ),
+            Ok(result) => {
+                let response = json!({ "ok": true, "accepted": result.accepted, "rejected": result.rejected.iter().map(|row| json!({"memory_id": row.memory_id, "reason": row.reason})).collect::<Vec<_>>() });
+                if let Some(command_id) = command_id {
+                    match store.record_dream_task_command(
+                        &binding.session,
+                        command_id,
+                        &response.to_string(),
+                        now_ms(),
+                    ) {
+                        Ok(recorded) => replay_dream_task_response(&recorded.response_json),
+                        Err(error) => HandlerOutcome::Error {
+                            code: "dreamer_ledger_failed".into(),
+                            message: error.to_string(),
+                        },
+                    }
+                } else {
+                    respond(response)
+                }
+            }
             Err(McStoreError::AuthorityGenerationMismatch { expected, found }) => {
                 HandlerOutcome::Error {
                     code: "authority_generation_mismatch".into(),
@@ -14001,6 +14053,131 @@ mod tests {
             .rows
             .iter()
             .any(|row| row.op == "update" && row.module_row_id == fresh_id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn verification_and_mapping_facades_are_fenced_hash_guarded_and_idempotent() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let route_root = project.to_str().unwrap();
+        let identity = "git:dreamer-applies";
+        handler.bind_route(7, binding(route_root, "token"));
+        activate_module_authority(&store, "context", identity, route_root, "memories");
+        let verified_id = insert_memory(&store, identity, "CONSTRAINTS", "verified", 1);
+        let updated_id = insert_memory(&store, identity, "CONSTRAINTS", "updated", 1);
+        let archived_id = insert_memory(&store, identity, "CONSTRAINTS", "archived", 1);
+        let foreign_id = insert_memory(&store, "git:other", "CONSTRAINTS", "foreign", 1);
+        let generation = store
+            .authority_status("context", identity, "memories")
+            .unwrap()
+            .unwrap()
+            .generation;
+        let hash = |id: i64| store.get_memory_full(id).unwrap().unwrap().normalized_hash;
+        let before_verified =
+            crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
+        let verified = call_facade(&handler, "memory.set_verification", json!({
+            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
+            "command_id": "verify-once", "rows": [
+                {"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "verification_status": "verified"},
+                {"memory_id": updated_id, "content_hash_at_prompt": "stale", "verification_status": "verified"},
+                {"memory_id": 999999, "content_hash_at_prompt": "missing", "verification_status": "verified"},
+                {"memory_id": foreign_id, "content_hash_at_prompt": hash(foreign_id), "verification_status": "verified"}
+            ]
+        })).await;
+        let verified_body = match verified {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("verification facade failed: {other:?}"),
+        };
+        assert_eq!(verified_body["accepted"], json!([verified_id]));
+        assert_eq!(verified_body["rejected"].as_array().unwrap().len(), 3);
+        let after_verified =
+            crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
+        assert_eq!(
+            before_verified, after_verified,
+            "verification stamps are cache-neutral"
+        );
+        let replay = call_facade(&handler, "memory.set_verification", json!({
+            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
+            "command_id": "verify-once", "rows": [{"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "verification_status": "verified"}]
+        })).await;
+        let replay_body = match replay {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("verification replay failed: {other:?}"),
+        };
+        assert_eq!(
+            replay_body, verified_body,
+            "command replay must not append another mutation"
+        );
+
+        let before_update =
+            crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
+        let update = call_facade(&handler, "memory.set_verification", json!({
+            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
+            "rows": [{"memory_id": updated_id, "content_hash_at_prompt": hash(updated_id), "verification_status": "update", "updated_content": "updated by verifier"}]
+        })).await;
+        let update_body = match update {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("update facade failed: {other:?}"),
+        };
+        let after_update =
+            crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
+        assert_eq!(update_body["accepted"], json!([updated_id]));
+        assert_ne!(
+            after_update, before_update,
+            "content updates advance the m1 mutation signal"
+        );
+
+        let before_archive =
+            crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
+        let archive = call_facade(&handler, "memory.set_verification", json!({
+            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
+            "rows": [{"memory_id": archived_id, "content_hash_at_prompt": hash(archived_id), "verification_status": "archive", "archive_reason": "obsolete"}]
+        })).await;
+        assert!(matches!(archive, HandlerOutcome::Response(_)));
+        let after_archive =
+            crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
+        assert!(
+            after_archive > before_archive,
+            "archives advance the m1 mutation signal"
+        );
+
+        let mapping = call_facade(&handler, "memory.set_mapping", json!({
+            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
+            "command_id": "mapping-once", "rows": [{"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "mapped_files": ["src/lib.rs", "src/lib.rs"]}]
+        })).await;
+        assert!(matches!(mapping, HandlerOutcome::Response(_)));
+        let mapping_replay = call_facade(&handler, "memory.set_mapping", json!({
+            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
+            "command_id": "mapping-once", "rows": [{"memory_id": verified_id, "content_hash_at_prompt": "stale", "mapped_files": null}]
+        })).await;
+        assert!(
+            matches!(mapping_replay, HandlerOutcome::Response(_)),
+            "mapping command replay must be idempotent"
+        );
+        let feed = store.pull_changefeed("memories", 0, 1000).unwrap();
+        assert!(feed
+            .rows
+            .iter()
+            .any(|row| row.full_row_snapshot.get("mapping").is_some()));
+        let generation_error = call_facade(&handler, "memory.set_mapping", json!({
+            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation - 1,
+            "rows": []
+        })).await;
+        assert_eq!(
+            error_code(generation_error),
+            "authority_generation_mismatch"
+        );
+        store
+            .authority_begin_drain("context", identity, "memories", "test-drain", 9_999_999, 1)
+            .unwrap();
+        let draining = call_facade(&handler, "memory.set_verification", json!({
+            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
+            "rows": []
+        })).await;
+        assert_eq!(error_code(draining), "authority_draining");
     }
 
     #[tokio::test(flavor = "current_thread")]

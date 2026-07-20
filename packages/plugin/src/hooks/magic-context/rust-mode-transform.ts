@@ -10,6 +10,7 @@ import {
     reconcileAuthorityProject,
 } from "../../features/magic-context/context-authority";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
+import { getMemoryVerifications } from "../../features/magic-context/memory/storage-memory-verifications";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import {
     casChannel2NudgeState,
@@ -360,13 +361,20 @@ function authoritySeedRows(
                         ORDER BY n.id ASC`,
                   )
                   .all(projectPath, projectPath);
-    return snapshots.filter(isRecord).map((snapshot) => ({
-        source_row_id: snapshot.id,
-        snapshot:
-            domain === "notes" && snapshot.project_path == null
+    const memoryRows = snapshots.filter(isRecord);
+    const mappings = domain === "memories"
+        ? getMemoryVerifications(db, memoryRows.map((row) => Number(row.id)))
+        : new Map<number, { files: string[]; hasSentinel: boolean }>();
+    return memoryRows.map((snapshot) => {
+        const id = Number(snapshot.id);
+        const mapping = mappings.get(id);
+        const seededSnapshot = domain === "memories" && mapping
+            ? { ...snapshot, mapping: mapping.hasSentinel ? null : mapping.files }
+            : domain === "notes" && snapshot.project_path == null
                 ? { ...snapshot, project_path: projectPath }
-                : snapshot,
-    }));
+                : snapshot;
+        return { source_row_id: snapshot.id, snapshot: seededSnapshot };
+    });
 }
 
 async function prepareRustMemoryAuthority(args: {

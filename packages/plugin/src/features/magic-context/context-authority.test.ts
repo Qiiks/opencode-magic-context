@@ -18,7 +18,8 @@ import {
     reconcileAuthorityProject,
     registerModuleNoteEvaluationBridge,
 } from "./context-authority";
-import { getMemoriesByProjects } from "./memory/storage-memory";
+import { getMemoriesByProjects, insertMemory } from "./memory/storage-memory";
+import { getMemoryVerifications } from "./memory/storage-memory-verifications";
 import { runMigrations } from "./migrations";
 import { resolveMemoriesByIdsForSearch, unifiedSearch } from "./search";
 import { initializeDatabase } from "./storage-db";
@@ -76,6 +77,42 @@ function protocol(seedCalls: { bytes: number[] }): AuthorityModuleClient {
 }
 
 describe("memory authority protocol", () => {
+    test("mapping feed rows round-trip into the verification side table", () => {
+        const database = db();
+        const contextMemory = insertMemory(database, {
+            projectPath: "/repo",
+            category: "CONSTRAINTS",
+            content: "mapped memory",
+            sourceSessionId: "session",
+            sourceType: "dreamer",
+        });
+        const page: ChangefeedPage = {
+            domain: "memories",
+            cursor: 0,
+            next_cursor: 1,
+            has_more: false,
+            rows: [{
+                feed_seq: 1,
+                domain: "memories",
+                op: "update",
+                module_row_id: 41,
+                content_hash: "module-hash",
+                full_row_snapshot: {
+                    id: 41,
+                    project_path: "/repo",
+                    category: "CONSTRAINTS",
+                    content: "mapped memory",
+                    normalized_hash: "module-hash",
+                    status: "active",
+                    mapping: ["src/lib.rs", "src/lib.rs"],
+                    context_store_uuid: "store",
+                    context_row_id: contextMemory.id,
+                },
+            }],
+        };
+        applyMirrorPage({ db: database, page });
+        expect(getMemoryVerifications(database, [contextMemory.id]).get(contextMemory.id)?.files).toEqual(["src/lib.rs"]);
+    });
     test("bounds authority seed frames below the management frame cap", async () => {
         const database = db();
         const seedCalls = { bytes: [] as number[] };

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { DREAMER_MEMORY_MAPPER_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import type { PluginContext } from "../../../plugin/types";
@@ -303,7 +305,7 @@ export async function applyVerifyManifest(
         });
         let response: unknown;
         try {
-            response = await args.moduleRoute.moduleClient.call({ sessionId: args.moduleRoute.moduleSessionId, projectRoot: args.moduleRoute.moduleProjectRoot, method: "memory.set_verification", body: { name: "memory.set_verification", arguments: { memory_project: args.projectIdentity, context_store_uuid: args.moduleRoute.moduleContextStoreUuid, authority_generation: args.moduleRoute.moduleAuthorityGeneration, command_id: args.moduleRoute.moduleCommandId, rows } } });
+            response = await args.moduleRoute.moduleClient.call({ sessionId: args.moduleRoute.moduleSessionId, projectRoot: args.moduleRoute.moduleProjectRoot, method: "memory.set_verification", body: { name: "memory.set_verification", arguments: { memory_project: args.projectIdentity, context_store_uuid: args.moduleRoute.moduleContextStoreUuid, authority_generation: args.moduleRoute.moduleAuthorityGeneration, command_id: `${args.moduleRoute.moduleCommandId}:${createHash("sha256").update(rows.map((row) => row.memory_id).join(",")).digest("hex").slice(0, 16)}`, rows } } });
         } catch (error) { throw new DreamerModuleFailureError("memory.set_verification", error); }
         const result = ((response as { result?: unknown })?.result ?? response) as { accepted?: unknown };
         if (!Array.isArray(result?.accepted)) throw new DreamerModuleFailureError("memory.set_verification", new Error("invalid response"));
