@@ -1,4 +1,5 @@
 import { createHash, createHmac } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { join } from "node:path";
 import {
     AdmissionClass,
@@ -1522,6 +1523,7 @@ export class SubcShadowTransport implements ShadowTransport {
     private readonly routeSessionPrefix: string;
     private client: SubcClient | null = null;
     private routes = new Map<string, RouteHandle>();
+    private canonicalRootCache = new Map<string, string>();
     private activeSession: string | null = null;
     private nextProbeMs = 0;
     private laneReleaseCallbacks: SerialLaneWaiter[] = [];
@@ -1873,8 +1875,15 @@ export class SubcShadowTransport implements ShadowTransport {
 
     private async ensureRoute(
         sessionId: string,
-        projectRoot: string,
+        rawProjectRoot: string,
     ): Promise<{ client: SubcClient; route: RouteHandle }> {
+        // The transform and tool lanes can observe the same directory under different
+        // spellings when the project is reached through a symlink (OpenCode reports the
+        // launch spelling on one lane and the resolved target on the other). The module
+        // pairs (session, root) for lineage, and it canonicalizes on ITS filesystem —
+        // which cannot see this process's mount/symlink namespace. Converge here, where
+        // the paths are resolvable, so both lanes bind the same route root.
+        const projectRoot = this.canonicalRoot(rawProjectRoot);
         // One identity may legitimately have multiple filesystem routes (for example,
         // worktrees). Reusing a route across roots would bind authority to the wrong tree.
         const routeKey = `${sessionId}\0${projectRoot}`;
@@ -1901,6 +1910,21 @@ export class SubcShadowTransport implements ShadowTransport {
         }
         this.routes.set(routeKey, route);
         return { client, route };
+    }
+
+    /** Resolve symlinks with per-instance memoization; keep the input spelling when the
+     *  path is gone (canonicalization must never fail a request). */
+    private canonicalRoot(root: string): string {
+        const cached = this.canonicalRootCache.get(root);
+        if (cached !== undefined) return cached;
+        let resolved = root;
+        try {
+            resolved = realpathSync.native(root);
+        } catch {
+            // Gone or unreadable roots keep their observed spelling.
+        }
+        this.canonicalRootCache.set(root, resolved);
+        return resolved;
     }
 
     private async ensureConnected(): Promise<SubcClient> {
