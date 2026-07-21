@@ -278,6 +278,13 @@ pub struct TransformRequest {
     /// its CK ingress does not carry TS tag numbers.
     #[serde(default = "default_clear_reasoning_age")]
     pub clear_reasoning_age: u64,
+    /// TS-resolved per-model TTL (session_meta.cacheTtl). None when the consumer does
+    /// not resolve TTLs (CC leg); the module's own config resolves then. Until this
+    /// field existed the adapter's value was silently dropped by serde, leaving every
+    /// rust-mode session on the 5m default (spurious idle-TTL HARD on a still-warm
+    /// provider cache).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<String>,
     /// Whether deterministic caveman compression is enabled for this primary session.
     #[serde(default)]
     pub caveman_enabled: bool,
@@ -384,6 +391,8 @@ struct TransformRequestWire {
     #[serde(default = "default_clear_reasoning_age")]
     clear_reasoning_age: u64,
     #[serde(default)]
+    cache_ttl: Option<String>,
+    #[serde(default)]
     caveman_enabled: bool,
     #[serde(default = "default_caveman_min_chars")]
     caveman_min_chars: usize,
@@ -445,6 +454,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             provider_id: wire.provider_id,
             model_key: wire.model_key,
             clear_reasoning_age: wire.clear_reasoning_age,
+            cache_ttl: wire.cache_ttl,
             caveman_enabled: wire.caveman_enabled,
             caveman_min_chars: wire.caveman_min_chars,
             tool_present: wire.tool_present,

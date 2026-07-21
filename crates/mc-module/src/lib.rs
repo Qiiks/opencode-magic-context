@@ -1281,8 +1281,10 @@ struct ShadowPassInputs {
     caveman_enabled: bool,
     #[serde(default = "default_caveman_min_chars")]
     caveman_min_chars: usize,
-    #[serde(default = "default_cache_ttl")]
-    cache_ttl: String,
+    /// TS-resolved per-model TTL from the adapter (session_meta.cacheTtl). None when
+    /// the consumer does not resolve TTLs (CC leg); the module config resolves then.
+    #[serde(default)]
+    cache_ttl: Option<String>,
     #[serde(default)]
     provider_error: Option<String>,
     /// True only for shadow passes whose newest assistant is still streaming.
@@ -5991,7 +5993,11 @@ impl McHandler {
                 now_ms: pass_now,
                 execute_threshold_percentage: binding.config.execute_threshold_percentage,
                 smart_drops: binding.config.smart_drops,
-                cache_ttl: binding.config.cache_ttl.clone(),
+                cache_ttl: parsed.cache_ttl.clone().unwrap_or_else(|| {
+                    binding
+                        .config
+                        .resolve_cache_ttl(binding.model_key.as_deref())
+                }),
                 model_key: binding.model_key.clone(),
                 observed_last_response_at_ms: self
                     .observed_last_response_at_ms(&store, &parsed.session_id),
@@ -7472,6 +7478,7 @@ impl McHandler {
         let transform_request = TransformRequest {
             kind: "transform".to_string(),
             v: 2,
+            cache_ttl: parsed.pass_inputs.cache_ttl.clone(),
             serializer_profile,
             session_id: binding.session.clone(),
             render_config: parsed.render_config.clone().unwrap_or_default(),
@@ -7518,7 +7525,11 @@ impl McHandler {
             now_ms: parsed.pass_inputs.now_ms,
             execute_threshold_percentage: parsed.pass_inputs.effective_execute_threshold,
             smart_drops: binding.config.smart_drops,
-            cache_ttl: parsed.pass_inputs.cache_ttl.clone(),
+            cache_ttl: parsed.pass_inputs.cache_ttl.clone().unwrap_or_else(|| {
+                binding
+                    .config
+                    .resolve_cache_ttl(parsed.pass_inputs.model_key.as_deref())
+            }),
             model_key: parsed.pass_inputs.model_key.clone(),
             observed_last_response_at_ms: None,
             guidance_date: Some(self.guidance_date_line_for_ms(parsed.pass_inputs.now_ms)),

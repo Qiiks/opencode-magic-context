@@ -101,6 +101,14 @@ interface RustWireCache {
     rawLastId: string | null;
     rawLastSignature: string | null;
     rawLastVisible: boolean;
+    /** Light per-message signatures for the WHOLE raw array (field reads only, no
+     * serialization). Delta passes re-verify the prefix against these so an in-place
+     * mutation of an older message (a background tool completing late, a reminder
+     * wrapper) forces a full send instead of riding a stale-prefix delta. A mutation
+     * that changes none of the observed fields (id, part count/types, text lengths,
+     * tool status) is invisible until the next natural full send; strong hashing here
+     * would reintroduce the O(session-bytes) per-pass cost this cache exists to kill. */
+    rawLightSignatures: string[];
     ckFingerprint: string;
     ckPrefixFingerprintBeforeLast: string;
     nativeFingerprint: string;
@@ -169,6 +177,38 @@ function messageInfo(value: unknown): Record<string, unknown> {
 function messageIdOf(message: MessageLike): string | null {
     const id = messageInfo(message).id;
     return typeof id === "string" && id.length > 0 ? id : null;
+}
+
+/** Cheap per-message mutation sentinel: field reads only, never serializes content. */
+function lightMessageSignature(message: MessageLike): string {
+    const parts = Array.isArray(message.parts) ? message.parts : [];
+    let acc = `${messageIdOf(message) ?? ""}:${parts.length}`;
+    for (const part of parts as Array<Record<string, unknown>>) {
+        const text = typeof part.text === "string" ? part.text.length : 0;
+        const state = part.state as Record<string, unknown> | undefined;
+        const status = state && typeof state.status === "string" ? state.status : "";
+        const output = state && typeof state.output === "string" ? state.output.length : 0;
+        acc += `|${String(part.type ?? "")}:${text}:${status}:${output}`;
+    }
+    return acc;
+}
+
+function lightSignaturesFor(messages: readonly MessageLike[]): string[] {
+    return messages.map(lightMessageSignature);
+}
+
+function prefixLightSignaturesMatch(
+    messages: readonly MessageLike[],
+    cache: RustWireCache,
+    prefixLength: number,
+): boolean {
+    if (prefixLength > cache.rawLightSignatures.length) return false;
+    for (let index = 0; index < prefixLength; index += 1) {
+        if (lightMessageSignature(messages[index]) !== cache.rawLightSignatures[index]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 function messageCacheSignature(message: MessageLike): string {

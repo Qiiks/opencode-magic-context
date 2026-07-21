@@ -61,6 +61,10 @@ pub struct McModuleConfig {
     pub temporal_awareness: bool,
     pub smart_drops: bool,
     pub cache_ttl: String,
+    /// Per-model TTL overrides from the object config shape; keys are full
+    /// provider/model keys or bare model ids, mirroring the TS resolveCacheTtl
+    /// precedence (exact key, then bare id, then default).
+    pub cache_ttl_by_model: std::collections::BTreeMap<String, String>,
     /// Kill switch for the shadow byte-compare lane, honored module-side so a
     /// runaway shadow loop can be stopped by a config flip plus module bounce
     /// without restarting any harness process (plugin senders are constructed
@@ -84,7 +88,27 @@ impl Default for McModuleConfig {
             smart_drops: false,
             shadow_enabled: true,
             cache_ttl: "5m".to_string(),
+            cache_ttl_by_model: std::collections::BTreeMap::new(),
         }
+    }
+}
+
+impl McModuleConfig {
+    /// Resolve the effective cache TTL for a model, mirroring the TS adapter's
+    /// resolveCacheTtl precedence: exact provider/model key, then the bare model id
+    /// (config written without the provider prefix), then the default.
+    pub fn resolve_cache_ttl(&self, model_key: Option<&str>) -> String {
+        if let Some(key) = model_key {
+            if let Some(ttl) = self.cache_ttl_by_model.get(key) {
+                return ttl.clone();
+            }
+            if let Some((_, bare)) = key.split_once('/') {
+                if let Some(ttl) = self.cache_ttl_by_model.get(bare) {
+                    return ttl.clone();
+                }
+            }
+        }
+        self.cache_ttl.clone()
     }
 }
 
@@ -239,10 +263,31 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         if let Some(enabled) = user.pointer("/temporal_awareness").and_then(Value::as_bool) {
             cfg.temporal_awareness = enabled;
         }
-        if let Some(cache_ttl) = user.pointer("/cache_ttl").and_then(Value::as_str) {
-            if !cache_ttl.trim().is_empty() {
-                cfg.cache_ttl = cache_ttl.trim().to_string();
+        match user.pointer("/cache_ttl") {
+            Some(Value::String(cache_ttl)) => {
+                if !cache_ttl.trim().is_empty() {
+                    cfg.cache_ttl = cache_ttl.trim().to_string();
+                }
             }
+            // Per-model map: { "default": "5m", "anthropic/claude-opus-4-8": "300m", ... }.
+            // Silently ignoring this shape left the module on the 5m default while the
+            // user had configured 300m for Anthropic models (a spurious idle-TTL HARD on
+            // a still-warm provider cache).
+            Some(Value::Object(map)) => {
+                for (key, value) in map {
+                    let Some(ttl) = value.as_str() else { continue };
+                    if ttl.trim().is_empty() {
+                        continue;
+                    }
+                    if key == "default" {
+                        cfg.cache_ttl = ttl.trim().to_string();
+                    } else {
+                        cfg.cache_ttl_by_model
+                            .insert(key.clone(), ttl.trim().to_string());
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -399,6 +444,52 @@ pub fn strip_jsonc(input: &str) -> String {
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod cache_ttl_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn per_model_cache_ttl_object_shape_parses_and_resolves() {
+        let user = json!({
+            "cache_ttl": {
+                "default": "10m",
+                "anthropic/claude-opus-4-8": "300m",
+                "gpt-5.6-sol": "30m"
+            }
+        });
+        let cfg = merge_tiers(Some(&user), None);
+        assert_eq!(cfg.cache_ttl, "10m");
+        assert_eq!(
+            cfg.resolve_cache_ttl(Some("anthropic/claude-opus-4-8")),
+            "300m"
+        );
+        // Bare model id matches a provider-prefixed request key.
+        assert_eq!(cfg.resolve_cache_ttl(Some("openai/gpt-5.6-sol")), "30m");
+        assert_eq!(cfg.resolve_cache_ttl(Some("unknown/model")), "10m");
+        assert_eq!(cfg.resolve_cache_ttl(None), "10m");
+    }
+
+    #[test]
+    fn string_cache_ttl_shape_still_parses() {
+        let user = json!({ "cache_ttl": "45m" });
+        let cfg = merge_tiers(Some(&user), None);
+        assert_eq!(cfg.cache_ttl, "45m");
+        assert_eq!(
+            cfg.resolve_cache_ttl(Some("anthropic/claude-opus-4-8")),
+            "45m"
+        );
+    }
+
+    #[test]
+    fn project_tier_cannot_set_cache_ttl() {
+        let project = json!({ "cache_ttl": { "default": "600m" } });
+        let cfg = merge_tiers(None, Some(&project));
+        assert_eq!(cfg.cache_ttl, "5m");
+        assert!(cfg.cache_ttl_by_model.is_empty());
+    }
 }
 
 #[cfg(test)]
