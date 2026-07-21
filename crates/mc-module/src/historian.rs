@@ -9,9 +9,10 @@ use std::fmt;
 use std::time::Duration;
 
 use mc_store::{
-    FactCandidate, HistorianChunkRange, HistorianDurableState, HistorianPhase,
-    HistorianPublishError, HistorianPublishPredicate, HistorianPublishRequest,
-    HistorianPublishResult, McStore, McStoreError, StoredCompartment,
+    FactCandidate, HistorianChunkRange, HistorianDurableState, HistorianEventCandidate,
+    HistorianPhase, HistorianPrimerCandidate, HistorianPublishError, HistorianPublishPredicate,
+    HistorianPublishRequest, HistorianPublishResult, HistorianUserMemoryCandidate, McStore,
+    McStoreError, StoredCompartment,
 };
 
 use crate::historian_producer::{
@@ -67,6 +68,76 @@ fn to_store_fact(f: &crate::historian_validate::FactCandidate) -> FactCandidate 
         importance: None,
         expires_at: None,
         source_session_id: None,
+    }
+}
+
+fn source_compartment(
+    compartments: &[crate::historian_validate::ValidatedCompartment],
+    origin: Option<u64>,
+) -> Option<&crate::historian_validate::ValidatedCompartment> {
+    origin
+        .and_then(|index| index.checked_sub(1))
+        .and_then(|index| compartments.get(index as usize))
+}
+
+fn to_store_event(
+    event: &crate::historian_validate::ParsedEvent,
+    compartments: &[crate::historian_validate::ValidatedCompartment],
+    created_at: i64,
+) -> HistorianEventCandidate {
+    HistorianEventCandidate {
+        kind: event.kind.clone(),
+        at_compartment: event.at_compartment,
+        compartment_id: source_compartment(compartments, event.at_compartment)
+            .map(|compartment| compartment.sequence),
+        fields_json: serde_json::to_string(&event.fields).unwrap_or_else(|_| "{}".to_string()),
+        created_at,
+        harness: "module".to_string(),
+    }
+}
+
+fn to_store_primer(
+    candidate: &crate::historian_validate::PrimerCandidate,
+    session_id: &str,
+    project_path: &str,
+    compartments: &[crate::historian_validate::ValidatedCompartment],
+    created_at: i64,
+) -> HistorianPrimerCandidate {
+    let source = source_compartment(compartments, candidate.origin_compartment_index);
+    let start = source.or_else(|| compartments.first());
+    let end = source.or_else(|| compartments.last());
+    HistorianPrimerCandidate {
+        project_path: project_path.to_string(),
+        session_id: session_id.to_string(),
+        question: candidate.question.clone(),
+        source_compartment_start: start.map(|compartment| compartment.start_message),
+        source_compartment_end: end.map(|compartment| compartment.end_message),
+        source_start_message_id: start
+            .map(|compartment| compartment.start_message_id.clone())
+            .unwrap_or_default(),
+        source_end_message_id: end
+            .map(|compartment| compartment.end_message_id.clone())
+            .unwrap_or_default(),
+        source_message_time: created_at,
+        created_at,
+    }
+}
+
+fn to_store_user_observation(
+    observation: &crate::historian_validate::UserObservationCandidate,
+    session_id: &str,
+    compartments: &[crate::historian_validate::ValidatedCompartment],
+    created_at: i64,
+) -> HistorianUserMemoryCandidate {
+    let source = source_compartment(compartments, observation.origin_compartment_index);
+    let start = source.or_else(|| compartments.first());
+    let end = source.or_else(|| compartments.last());
+    HistorianUserMemoryCandidate {
+        content: observation.content.clone(),
+        session_id: session_id.to_string(),
+        source_compartment_start: start.map(|compartment| compartment.start_message),
+        source_compartment_end: end.map(|compartment| compartment.end_message),
+        created_at,
     }
 }
 
@@ -335,6 +406,10 @@ pub struct ValidatedPublishRequest<'a> {
     pub predicate: &'a HistorianPublishPredicate,
     pub observed_chunk_fingerprint: &'a str,
     pub validated: &'a ValidatedChunk,
+    /// Facts are dropped when either memory.enabled or memory.auto_promote is off.
+    pub promote_facts: bool,
+    /// User observations are stored only when the privacy collection gate is enabled.
+    pub collect_user_memory_candidates: bool,
     pub publication_floor_ordinal: u64,
     pub chunk_transcript: &'a str,
     /// Creation timestamp stamped on the appended compartment rows.
@@ -376,7 +451,55 @@ pub fn publish_validated_chunk(
         .iter()
         .map(|c| to_stored_compartment(c, request.created_at_ms))
         .collect();
-    let facts: Vec<FactCandidate> = request.validated.facts.iter().map(to_store_fact).collect();
+    let facts: Vec<FactCandidate> = if request.promote_facts {
+        request.validated.facts.iter().map(to_store_fact).collect()
+    } else {
+        Vec::new()
+    };
+    let events: Vec<HistorianEventCandidate> = request
+        .validated
+        .events
+        .iter()
+        .map(|event| {
+            to_store_event(
+                event,
+                &request.validated.compartments,
+                request.created_at_ms,
+            )
+        })
+        .collect();
+    let primer_candidates: Vec<HistorianPrimerCandidate> = request
+        .validated
+        .primer_candidates
+        .iter()
+        .map(|candidate| {
+            to_store_primer(
+                candidate,
+                request.session_id,
+                request.project_path,
+                &request.validated.compartments,
+                request.created_at_ms,
+            )
+        })
+        .collect();
+    let user_memory_candidates: Vec<HistorianUserMemoryCandidate> =
+        if request.collect_user_memory_candidates {
+            request
+                .validated
+                .user_observations
+                .iter()
+                .map(|observation| {
+                    to_store_user_observation(
+                        observation,
+                        request.session_id,
+                        &request.validated.compartments,
+                        request.created_at_ms,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
     let publish_request = HistorianPublishRequest {
         session_id: request.session_id,
@@ -386,6 +509,10 @@ pub fn publish_validated_chunk(
         project_path: request.project_path,
         compartments: &compartments,
         facts: &facts,
+        promote_facts: request.promote_facts,
+        events: &events,
+        primer_candidates: &primer_candidates,
+        user_memory_candidates: &user_memory_candidates,
         publication_floor_ordinal: request.publication_floor_ordinal,
         chunk_transcript: Some(request.chunk_transcript),
     };
@@ -1443,6 +1570,8 @@ fn publish_output_from_awaiting(
             predicate: &predicate,
             observed_chunk_fingerprint,
             validated: &validated,
+            promote_facts: validate_options.memory_enabled && validate_options.auto_promote,
+            collect_user_memory_candidates: validate_options.user_memory_collection_enabled,
             publication_floor_ordinal: validated.unprocessed_from,
             chunk_transcript,
             created_at_ms,
@@ -1692,6 +1821,10 @@ mod tests {
         ValidateOptions {
             sequence_offset: 1,
             in_emergency: true,
+            memory_enabled: true,
+            auto_promote: true,
+            user_memory_collection_enabled: false,
+            force_keep_last_compartment: false,
         }
     }
 
@@ -3124,6 +3257,10 @@ mod tests {
 <p4 />
 </compartment>
 </compartments>
+<facts><ARCHITECTURE>* [at_compartment=1] Publish facts in the same flow.</ARCHITECTURE></facts>
+<events><causal_incident at_compartment="1"><summary>event survives</summary></causal_incident></events>
+<primer_candidates><primer at_compartment="1">What did this publish preserve?</primer></primer_candidates>
+<user_observations>* [at_compartment=1] The user prefers durable history.</user_observations>
 <meta><messages_processed>2-3</messages_processed><unprocessed_from>4</unprocessed_from></meta>
 </output>"#;
         let chunk = HistorianChunk {
@@ -3160,6 +3297,10 @@ mod tests {
             ValidateOptions {
                 sequence_offset: 1,
                 in_emergency: true, // skip discard-last so the single compartment persists
+                memory_enabled: true,
+                auto_promote: true,
+                user_memory_collection_enabled: true,
+                force_keep_last_compartment: false,
             },
         )
         .expect("validation succeeds");
@@ -3204,6 +3345,8 @@ mod tests {
                 predicate: &predicate,
                 observed_chunk_fingerprint: "fp",
                 validated: &validated,
+                promote_facts: true,
+                collect_user_memory_candidates: true,
                 publication_floor_ordinal: 4,
                 chunk_transcript: "U: transcript",
                 created_at_ms: 123,
@@ -3220,11 +3363,92 @@ mod tests {
         assert_eq!(after.meta.publication_floor_ordinal, Some(4));
         let comps = store.load_compartments("ses").unwrap();
         assert_eq!(comps.len(), 2, "C1 preserved, C2 appended");
+        assert_eq!(store.load_compartment_events("ses").unwrap().len(), 1);
+        assert_eq!(store.load_primer_candidates("ses").unwrap().len(), 1);
+        assert_eq!(store.load_user_memory_candidates("ses").unwrap().len(), 1);
         let c2 = comps.last().unwrap();
         assert_eq!(c2.end_message_id, "m3#0");
         assert_eq!(c2.p1.as_deref(), Some("second arc full and exact"));
         assert_eq!(c2.legacy, 0);
         assert_eq!(c2.created_at, 123);
+    }
+
+    #[test]
+    fn publish_gates_facts_when_memory_or_auto_promote_is_off() {
+        use std::collections::BTreeMap;
+
+        for (session_id, memory_enabled, auto_promote) in
+            [("memory-off", false, true), ("auto-off", true, false)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let loaded = store
+                .commit(
+                    session_id,
+                    None,
+                    &mc_core::CoreState::default(),
+                    &mc_store::ModuleMeta {
+                        historian: publishing_state(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let state = store.load(session_id).unwrap();
+            let predicate = publish_predicate(&state.meta.historian).unwrap();
+            let validated = ValidatedChunk {
+                facts: vec![crate::historian_validate::FactCandidate {
+                    category: "ARCHITECTURE".into(),
+                    content: "gated fact".into(),
+                    origin_compartment_index: None,
+                }],
+                events: vec![crate::historian_validate::ParsedEvent {
+                    kind: "causal_incident".into(),
+                    at_compartment: None,
+                    fields: BTreeMap::from([("summary".into(), "event".into())]),
+                }],
+                primer_candidates: vec![crate::historian_validate::PrimerCandidate {
+                    question: "What was preserved?".into(),
+                    origin_compartment_index: None,
+                }],
+                user_observations: vec![crate::historian_validate::UserObservationCandidate {
+                    content: "private observation".into(),
+                    origin_compartment_index: None,
+                }],
+                unprocessed_from: 1,
+                ..Default::default()
+            };
+            publish_validated_chunk(
+                &store,
+                ValidatedPublishRequest {
+                    session_id,
+                    project_path: "git:proj",
+                    expected_row_version: Some(loaded),
+                    expected_revert_epoch: 0,
+                    predicate: &predicate,
+                    observed_chunk_fingerprint: "fp",
+                    validated: &validated,
+                    promote_facts: memory_enabled && auto_promote,
+                    collect_user_memory_candidates: false,
+                    publication_floor_ordinal: 1,
+                    chunk_transcript: "U: transcript",
+                    created_at_ms: 123,
+                    failure_backoff_at_ms: 0,
+                    publication_fence: None,
+                },
+            )
+            .expect("gated publication succeeds without promoting facts");
+
+            assert!(store
+                .load_active_memories("git:proj", 0)
+                .unwrap()
+                .is_empty());
+            assert_eq!(store.load_compartment_events(session_id).unwrap().len(), 1);
+            assert_eq!(store.load_primer_candidates(session_id).unwrap().len(), 1);
+            assert!(store
+                .load_user_memory_candidates(session_id)
+                .unwrap()
+                .is_empty());
+        }
     }
 
     #[test]
@@ -3324,6 +3548,8 @@ mod tests {
                 predicate: &predicate,
                 observed_chunk_fingerprint: "different-fingerprint",
                 validated: &ValidatedChunk::default(),
+                promote_facts: true,
+                collect_user_memory_candidates: false,
                 publication_floor_ordinal: 5,
                 chunk_transcript: "U: transcript",
                 created_at_ms: 0,
@@ -3396,6 +3622,8 @@ mod tests {
                 predicate: &predicate,
                 observed_chunk_fingerprint: "fp",
                 validated: &ValidatedChunk::default(),
+                promote_facts: true,
+                collect_user_memory_candidates: false,
                 publication_floor_ordinal: 5,
                 chunk_transcript: "U: transcript",
                 created_at_ms: 0,
@@ -3527,6 +3755,10 @@ mod tests {
                 project_path: "git:proj",
                 compartments: &[comp(1, 2, 4, "m4", "summary")],
                 facts: &[],
+                promote_facts: true,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
                 publication_floor_ordinal: 5,
                 chunk_transcript: Some("U: transcript"),
             })
@@ -3591,6 +3823,10 @@ mod tests {
                     content: "existing fact".into(),
                     ..Default::default()
                 }],
+                promote_facts: true,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
                 publication_floor_ordinal: 3,
                 chunk_transcript: None,
             })

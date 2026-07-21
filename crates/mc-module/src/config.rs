@@ -3,9 +3,9 @@
 //! This intentionally reads user and project tiers directly instead of depending on a
 //! daemon config plane. Per-leaf trust policy is enforced during the read: model choice
 //! is user-tier only because it affects spend; project config may only raise the execute
-//! threshold (fire less often), and may override the benign memory toggle. This is
-//! stricter than the current TypeScript side for `historian.model`; align that side at
-//! plugin cutover/shadow mode rather than weakening the module leg.
+//! threshold (fire less often), and may override memory, promotion, privacy, and context-limit
+//! settings. The Rust module intentionally keeps stricter model-selection policy than the current
+//! TypeScript implementation until both implementations are deliberately aligned.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,12 +19,34 @@ pub const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 65.0;
 /// Maximum execute threshold percentage (80.0). The Rust module reads config without the
 /// plugin, so this must stay identical to packages/plugin/src/config/schema/magic-context.ts.
 const MAX_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 80.0;
+/// Minimum historian producer chunk size. The derived budget is one quarter of the model
+/// context limit, but it is never allowed to fall below 8,000 tokens.
+pub const MIN_HISTORIAN_CHUNK_TOKENS: usize = 8_000;
+/// Maximum historian producer chunk size. The derived budget is one quarter of the model
+/// context limit, but it is never allowed to exceed 50,000 tokens.
+pub const MAX_HISTORIAN_CHUNK_TOKENS: usize = 50_000;
+/// No module-side model catalog exposes historian context limits yet. Keep the fallback
+/// explicit and configurable instead of silently assuming the session model's limit.
+pub const DEFAULT_HISTORIAN_CONTEXT_LIMIT_TOKENS: usize = 32_000;
+
+/// Derive the historian producer budget from its own context window, as the TS runner does.
+pub fn derive_historian_chunk_tokens(context_limit_tokens: usize) -> usize {
+    (((context_limit_tokens as f64) * 0.25).round() as usize)
+        .clamp(MIN_HISTORIAN_CHUNK_TOKENS, MAX_HISTORIAN_CHUNK_TOKENS)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct McModuleConfig {
     pub model_chain: Vec<String>,
     pub execute_threshold_percentage: f64,
     pub memory_enabled: bool,
+    /// Mirrors the TS auto-promote switch. Facts are dropped when this is false.
+    pub auto_promote: bool,
+    /// Privacy gate controlling whether historian user observations may be collected for later
+    /// review and promotion.
+    pub user_memory_collection_enabled: bool,
+    /// Historian model context limit; configurable until the module has a model catalog.
+    pub historian_context_limit_tokens: usize,
     pub smart_drops: bool,
     pub cache_ttl: String,
     /// Kill switch for the shadow byte-compare lane, honored module-side so a
@@ -40,6 +62,9 @@ impl Default for McModuleConfig {
             model_chain: Vec::new(),
             execute_threshold_percentage: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
             memory_enabled: true,
+            auto_promote: true,
+            user_memory_collection_enabled: false,
+            historian_context_limit_tokens: DEFAULT_HISTORIAN_CONTEXT_LIMIT_TOKENS,
             smart_drops: false,
             shadow_enabled: true,
             cache_ttl: "5m".to_string(),
@@ -163,6 +188,18 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
             cfg.memory_enabled = enabled;
         }
         if let Some(enabled) = user
+            .pointer("/memory/auto_promote")
+            .and_then(Value::as_bool)
+        {
+            cfg.auto_promote = enabled;
+        }
+        if let Some(enabled) = user_memory_collection_at(user) {
+            cfg.user_memory_collection_enabled = enabled;
+        }
+        if let Some(limit) = positive_usize_at(user, "/historian/context_limit_tokens") {
+            cfg.historian_context_limit_tokens = limit;
+        }
+        if let Some(enabled) = user
             .pointer("/shadow_transform/enabled")
             .and_then(Value::as_bool)
         {
@@ -187,6 +224,18 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         if let Some(enabled) = project.pointer("/memory/enabled").and_then(Value::as_bool) {
             cfg.memory_enabled = enabled;
         }
+        if let Some(enabled) = project
+            .pointer("/memory/auto_promote")
+            .and_then(Value::as_bool)
+        {
+            cfg.auto_promote = enabled;
+        }
+        if let Some(enabled) = user_memory_collection_at(project) {
+            cfg.user_memory_collection_enabled = enabled;
+        }
+        if let Some(limit) = positive_usize_at(project, "/historian/context_limit_tokens") {
+            cfg.historian_context_limit_tokens = limit;
+        }
         if let Some(enabled) = project.pointer("/smart_drops").and_then(Value::as_bool) {
             cfg.smart_drops = enabled;
         }
@@ -197,6 +246,26 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         .clamp(1.0, MAX_EXECUTE_THRESHOLD_PERCENTAGE);
     cfg.model_chain.dedup();
     cfg
+}
+
+fn user_memory_collection_at(value: &Value) -> Option<bool> {
+    if let Some(schedule) = value
+        .pointer("/dreamer/tasks/review-user-memories/schedule")
+        .and_then(Value::as_str)
+    {
+        return Some(!schedule.trim().is_empty());
+    }
+    value
+        .pointer("/user_memories/enabled")
+        .and_then(Value::as_bool)
+}
+
+fn positive_usize_at(value: &Value, pointer: &str) -> Option<usize> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .filter(|v| *v > 0)
 }
 
 fn number_at(value: &Value, pointer: &str) -> Option<f64> {
@@ -331,6 +400,38 @@ mod tests {
     fn default_threshold_matches_typescript_schema() {
         let cfg = merge_tiers(None, None);
         assert_eq!(cfg.execute_threshold_percentage, 65.0);
+    }
+
+    #[test]
+    fn historian_budget_derivation_clamps_at_both_bounds() {
+        assert_eq!(derive_historian_chunk_tokens(1), 8_000);
+        assert_eq!(derive_historian_chunk_tokens(32_000), 8_000);
+        assert_eq!(derive_historian_chunk_tokens(128_000), 32_000);
+        assert_eq!(derive_historian_chunk_tokens(200_000), 50_000);
+        assert_eq!(derive_historian_chunk_tokens(400_000), 50_000);
+    }
+
+    #[test]
+    fn historian_gates_and_context_limit_parse_from_user_and_project_tiers() {
+        let user = serde_json::json!({
+            "memory": { "auto_promote": false },
+            "dreamer": { "tasks": { "review-user-memories": { "schedule": "daily" } } },
+            "historian": { "context_limit_tokens": 128000 }
+        });
+        let project = serde_json::json!({
+            "memory": { "auto_promote": true },
+            "user_memories": { "enabled": false },
+            "historian": { "context_limit_tokens": 64000 }
+        });
+        assert!(user_memory_collection_at(&user).unwrap());
+        let cfg = merge_tiers(Some(&user), Some(&project));
+        assert!(cfg.auto_promote);
+        assert!(!cfg.user_memory_collection_enabled);
+        assert_eq!(cfg.historian_context_limit_tokens, 64_000);
+        let legacy_disabled = serde_json::json!({
+            "user_memories": { "enabled": false }
+        });
+        assert!(!user_memory_collection_at(&legacy_disabled).unwrap());
     }
 
     #[test]

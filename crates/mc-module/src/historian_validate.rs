@@ -68,7 +68,7 @@ pub struct StoredCompartmentRange {
 }
 
 /// Options that are known by the runner but are not present in the historian XML.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidateOptions {
     /// Sequence number to assign to the first emitted compartment in this publish.
     #[serde(default)]
@@ -77,6 +77,35 @@ pub struct ValidateOptions {
     /// highest-quality final boundary for the newest compartment.
     #[serde(default)]
     pub in_emergency: bool,
+    /// Memory promotion is disabled when the durable memory feature is off.
+    #[serde(default = "default_true")]
+    pub memory_enabled: bool,
+    /// Facts are also gated by the explicit auto-promote switch.
+    #[serde(default = "default_true")]
+    pub auto_promote: bool,
+    /// Privacy gate for historian user-behavior observations.
+    #[serde(default)]
+    pub user_memory_collection_enabled: bool,
+    /// Explicit wrapup runs retain their final compartment instead of deleting it during cleanup.
+    #[serde(default)]
+    pub force_keep_last_compartment: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for ValidateOptions {
+    fn default() -> Self {
+        Self {
+            sequence_offset: 0,
+            in_emergency: false,
+            memory_enabled: true,
+            auto_promote: true,
+            user_memory_collection_enabled: false,
+            force_keep_last_compartment: false,
+        }
+    }
 }
 
 /// A parsed compartment before endpoint ids are resolved.
@@ -485,7 +514,7 @@ pub fn validate_historian_output(
     let mut compartments = emitted;
     let emitted_count = compartments.len();
     let mut discarded_last = false;
-    if !options.in_emergency && compartments.len() >= 2 {
+    if !options.in_emergency && !options.force_keep_last_compartment && compartments.len() >= 2 {
         let last_end = compartments
             .last()
             .map(|c| c.end_message)
@@ -519,27 +548,39 @@ pub fn validate_historian_output(
         .facts
         .into_iter()
         .filter(|fact| {
-            keep_side_channel(
-                fact.origin_compartment_index,
-                persisted_count,
-                discarded_last,
-            )
+            !options.force_keep_last_compartment
+                && keep_side_channel(
+                    fact.origin_compartment_index,
+                    persisted_count,
+                    discarded_last,
+                )
         })
         .collect();
+    // A discarded lookahead compartment invalidates the whole producer output's anchors.
+    // Keeping any side channel here would make a later re-read double-store it. A forced final
+    // wrapup chunk has the same weak lookahead for promotions, while retaining earlier anchored
+    // events that do not point at the final compartment.
     let events = parsed
         .events
         .into_iter()
-        .filter(|event| keep_side_channel(event.at_compartment, persisted_count, false))
+        .filter(|event| {
+            if options.force_keep_last_compartment {
+                matches!(event.at_compartment, Some(index) if (1..persisted_count).contains(&index))
+            } else {
+                keep_side_channel(event.at_compartment, persisted_count, discarded_last)
+            }
+        })
         .collect();
     let primer_candidates = parsed
         .primer_candidates
         .into_iter()
         .filter(|candidate| {
-            keep_side_channel(
-                candidate.origin_compartment_index,
-                persisted_count,
-                discarded_last,
-            )
+            !options.force_keep_last_compartment
+                && keep_side_channel(
+                    candidate.origin_compartment_index,
+                    persisted_count,
+                    discarded_last,
+                )
         })
         .take(1)
         .collect();
@@ -547,11 +588,12 @@ pub fn validate_historian_output(
         .user_observations
         .into_iter()
         .filter(|observation| {
-            keep_side_channel(
-                observation.origin_compartment_index,
-                persisted_count,
-                discarded_last,
-            )
+            !options.force_keep_last_compartment
+                && keep_side_channel(
+                    observation.origin_compartment_index,
+                    persisted_count,
+                    discarded_last,
+                )
         })
         .collect();
 
@@ -969,6 +1011,9 @@ fn keep_side_channel(
     persisted_count: u64,
     discarded_last: bool,
 ) -> bool {
+    if discarded_last {
+        return false;
+    }
     match origin_compartment_index {
         Some(index) => (1..=persisted_count).contains(&index),
         None => !discarded_last,
@@ -1518,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn discarded_last_filters_anchored_tail_side_channels_but_keeps_earlier_ones() {
+    fn discarded_last_suppresses_every_side_channel_for_the_whole_run() {
         let extra = r#"
 <facts>
 <PROJECT_RULES>
@@ -1545,37 +1590,31 @@ mod tests {
                 .expect("discard-last should still make forward progress");
 
         assert!(result.discarded_last);
-        assert_eq!(
-            result
-                .facts
-                .iter()
-                .map(|f| f.content.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Keep the earlier rule."]
-        );
-        assert_eq!(
-            result
-                .user_observations
-                .iter()
-                .map(|o| o.content.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Keep the earlier observation."]
-        );
-        assert_eq!(
-            result
-                .primer_candidates
-                .iter()
-                .map(|p| p.question.as_str())
-                .collect::<Vec<_>>(),
-            vec!["How does the kept subsystem work?"]
-        );
-        assert_eq!(
-            result
-                .events
-                .iter()
-                .map(|e| e.kind.as_str())
-                .collect::<Vec<_>>(),
-            vec!["causal_incident"]
-        );
+        assert!(result.facts.is_empty());
+        assert!(result.events.is_empty());
+        assert!(result.user_observations.is_empty());
+        assert!(result.primer_candidates.is_empty());
+    }
+
+    #[test]
+    fn force_keep_last_preserves_final_compartment_and_side_channels() {
+        let extra = r#"
+<events>
+<trajectory_correction at_compartment="1"><summary>earlier event</summary></trajectory_correction>
+<trajectory_correction at_compartment="2"><summary>final event</summary></trajectory_correction>
+</events>
+"#;
+        let text = xml(&[(1, 2, "first"), (3, 4, "final")], 5, extra);
+        let options = ValidateOptions {
+            force_keep_last_compartment: true,
+            ..ValidateOptions::default()
+        };
+        let result = validate_historian_output(&text, &chunk(1, 4), &[], options)
+            .expect("force-keep wrapup output should validate");
+
+        assert!(!result.discarded_last);
+        assert_eq!(result.compartments.len(), 2);
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.events[0].at_compartment, Some(1));
     }
 }
