@@ -27,7 +27,9 @@ use subc_protocol::{BindIdentity, RouteTarget};
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const MODULE_ID: &str = "magic-context";
-const START_TIMEOUT: Duration = Duration::from_secs(10);
+// Cold daemon startup takes ~7s on an idle machine (measured); under CI or
+// sibling-build load it can exceed 10s, which failed this suite spuriously.
+const START_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---- process lifecycle ----
 
