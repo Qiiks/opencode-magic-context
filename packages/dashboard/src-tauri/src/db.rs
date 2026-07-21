@@ -218,6 +218,16 @@ pub struct PrimerCandidate {
 }
 
 #[derive(Debug, Serialize, Clone)]
+pub struct MuralManifest {
+    pub project_path: String,
+    pub image: Vec<u8>,
+    pub rendered_at: i64,
+    pub token_estimate: i64,
+    pub width: i64,
+    pub height: i64,
+}
+
+#[derive(Debug, Serialize, Clone)]
 pub struct CategoryCount {
     pub category: String,
     pub count: i64,
@@ -3519,6 +3529,45 @@ pub fn get_primer_candidates(
     } else {
         stmt.query_map([], map_row)?.collect()
     }
+}
+
+/// Read the latest project-scoped memory mural without requiring the dashboard
+/// to migrate the plugin database. Older databases simply have no mural row.
+pub fn get_mural(
+    conn: &Connection,
+    project: Option<&str>,
+) -> Result<Option<MuralManifest>, rusqlite::Error> {
+    let Some(project) = project else {
+        return Ok(None);
+    };
+    if !table_exists(conn, "mural_manifest") {
+        return Ok(None);
+    }
+
+    // The mural has a fixed size, so use 1,521 as its fallback vision-token
+    // estimate. Older databases may not have a token_estimate column; if a newer
+    // database does, use its value instead.
+    let token_estimate = if table_has_column(conn, "mural_manifest", "token_estimate") {
+        "COALESCE(token_estimate, 1521)"
+    } else {
+        "1521"
+    };
+    let sql = format!(
+        "SELECT project_path, image, rendered_at, {token_estimate} AS token_estimate, width, height
+         FROM mural_manifest
+         WHERE project_path = ?1"
+    );
+    conn.query_row(&sql, params![project], |row| {
+        Ok(MuralManifest {
+            project_path: row.get(0)?,
+            image: row.get(1)?,
+            rendered_at: row.get(2)?,
+            token_estimate: row.get(3)?,
+            width: row.get(4)?,
+            height: row.get(5)?,
+        })
+    })
+    .optional()
 }
 
 fn table_exists(conn: &Connection, table: &str) -> bool {

@@ -14,6 +14,7 @@ import type {
   LogEntry,
   Memory,
   MemoryStats,
+  MuralManifest,
   Note,
   OpencodeInstallState,
   PagedSessions,
@@ -71,6 +72,10 @@ export async function getMemoryStats(params?: {
     project: params?.project ?? null,
     workspaceId: params?.workspaceId ?? null,
   });
+}
+
+export async function getMural(project?: string): Promise<MuralManifest | null> {
+  return invoke("get_mural", { project: project ?? null });
 }
 
 export async function getPrimers(project?: string): Promise<Primer[]> {

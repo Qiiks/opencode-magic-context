@@ -59,6 +59,12 @@ export const TASKS: TaskMeta[] = [
     defaultSchedule: "0 4 * * 0",
   },
   {
+    name: "render-mural",
+    label: "Render memory mural",
+    description: "Renders the memory mural — a single image of overflow memories",
+    defaultSchedule: "0 4 * * 0",
+  },
+  {
     name: "classify-memories",
     label: "Classify memories",
     description: "Scores memory importance, scope, and shareability",
