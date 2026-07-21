@@ -1867,6 +1867,56 @@ const MIGRATIONS: &[Migration] = &[
          WHERE last_activity_at = 0;
         "#,
     },
+    Migration {
+        version: 36,
+        // The module has no direct reader for these TS-owned side channels yet. Keep the
+        // module rows structurally compatible for a later mirror; `compartment_id` stores the
+        // module's (session_id, sequence) surrogate because mc_compartments has no row id.
+        // Clear-session and re-cut operations explicitly remove session-scoped rows.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_compartment_events (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id            TEXT NOT NULL,
+            compartment_id        INTEGER,
+            at_compartment        INTEGER,
+            kind                  TEXT NOT NULL,
+            fields_json           TEXT NOT NULL DEFAULT '{}',
+            created_at             INTEGER NOT NULL DEFAULT 0,
+            harness                TEXT NOT NULL DEFAULT 'module'
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_compartment_events_session
+            ON mc_compartment_events(session_id, id);
+
+        CREATE TABLE IF NOT EXISTS mc_primer_candidates (
+            id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_path             TEXT NOT NULL,
+            harness                  TEXT NOT NULL DEFAULT 'module',
+            session_id               TEXT NOT NULL,
+            question                 TEXT NOT NULL,
+            normalized_question      TEXT NOT NULL,
+            source_compartment_start INTEGER,
+            source_compartment_end   INTEGER,
+            source_start_message_id  TEXT NOT NULL DEFAULT '',
+            source_end_message_id    TEXT NOT NULL DEFAULT '',
+            source_message_time      INTEGER NOT NULL DEFAULT 0,
+            created_at               INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(project_path, harness, session_id, source_start_message_id, source_end_message_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_primer_candidates_project
+            ON mc_primer_candidates(project_path, created_at, id);
+
+        CREATE TABLE IF NOT EXISTS mc_user_memory_candidates (
+            id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+            content                  TEXT NOT NULL,
+            session_id               TEXT NOT NULL,
+            source_compartment_start INTEGER,
+            source_compartment_end   INTEGER,
+            created_at               INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_user_memory_candidates_session
+            ON mc_user_memory_candidates(session_id, created_at, id);
+    ",
+    },
 ];
 
 /// Apply the route-to-identity vocabulary law inside the caller's fenced transaction.
@@ -2092,6 +2142,45 @@ pub struct FactCandidate {
     pub source_session_id: Option<String>,
 }
 
+/// A historian event retained for a future module-to-TS mirror. `at_compartment` keeps the
+/// producer's one-based anchor even when the module-side compartment surrogate is unavailable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistorianEventCandidate {
+    pub kind: String,
+    pub at_compartment: Option<u64>,
+    pub compartment_id: Option<u64>,
+    pub fields_json: String,
+    pub created_at: i64,
+    pub harness: String,
+}
+
+/// A primer candidate records a question that should remain available across sessions, along with
+/// the project, session, and source-compartment information needed to trace where it came from.
+/// Its fields match the corresponding TypeScript primer record.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistorianPrimerCandidate {
+    pub project_path: String,
+    pub session_id: String,
+    pub question: String,
+    pub source_compartment_start: Option<u64>,
+    pub source_compartment_end: Option<u64>,
+    pub source_start_message_id: String,
+    pub source_end_message_id: String,
+    pub source_message_time: i64,
+    pub created_at: i64,
+}
+
+/// A privacy-gated user observation candidate. It is intentionally not a project memory:
+/// the TS review task owns promotion after the user opts into collection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistorianUserMemoryCandidate {
+    pub content: String,
+    pub session_id: String,
+    pub source_compartment_start: Option<u64>,
+    pub source_compartment_end: Option<u64>,
+    pub created_at: i64,
+}
+
 /// A newly promoted project-memory row, returned so post-commit embedding can target
 /// exactly the additive rows created by the publication transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2141,6 +2230,10 @@ pub struct HistorianPublishRequest<'a> {
     pub project_path: &'a str,
     pub compartments: &'a [StoredCompartment],
     pub facts: &'a [FactCandidate],
+    pub promote_facts: bool,
+    pub events: &'a [HistorianEventCandidate],
+    pub primer_candidates: &'a [HistorianPrimerCandidate],
+    pub user_memory_candidates: &'a [HistorianUserMemoryCandidate],
     pub publication_floor_ordinal: u64,
     pub chunk_transcript: Option<&'a str>,
 }
@@ -3792,6 +3885,9 @@ fn session_has_durable_state(
              UNION ALL SELECT 1 FROM mc_recomp_commands WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_pass_trace WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_chunk_transcripts WHERE session_id = ?1
+             UNION ALL SELECT 1 FROM mc_compartment_events WHERE session_id = ?1
+             UNION ALL SELECT 1 FROM mc_primer_candidates WHERE session_id = ?1
+             UNION ALL SELECT 1 FROM mc_user_memory_candidates WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_notes WHERE session_id = ?1
          )",
         params![session_id],
@@ -7077,6 +7173,18 @@ impl McStore {
                 "DELETE FROM mc_compartments WHERE session_id = ?1",
                 params![session_id],
             )?;
+            tx.execute(
+                "DELETE FROM mc_compartment_events WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            tx.execute(
+                "DELETE FROM mc_primer_candidates WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            tx.execute(
+                "DELETE FROM mc_user_memory_candidates WHERE session_id = ?1",
+                params![session_id],
+            )?;
             let next_version = current as u64 + 1;
             tx.execute(
                 "UPDATE mc_cache_state
@@ -7206,6 +7314,25 @@ impl McStore {
             tx.execute(
                 "DELETE FROM mc_compartments WHERE session_id = ?1 AND sequence > ?2",
                 params![session_id, keep_through_seq],
+            )?;
+            tx.execute(
+                "DELETE FROM mc_compartment_events
+                  WHERE session_id = ?1 AND compartment_id > ?2",
+                params![session_id, keep_through_seq],
+            )?;
+            tx.execute(
+                "DELETE FROM mc_primer_candidates
+                  WHERE session_id = ?1
+                    AND source_compartment_start > COALESCE(
+                        (SELECT MAX(end_message) FROM mc_compartments WHERE session_id = ?1), -1)",
+                params![session_id],
+            )?;
+            tx.execute(
+                "DELETE FROM mc_user_memory_candidates
+                  WHERE session_id = ?1
+                    AND source_compartment_start > COALESCE(
+                        (SELECT MAX(end_message) FROM mc_compartments WHERE session_id = ?1), -1)",
+                params![session_id],
             )?;
             let next = current as u64 + 1;
             tx.execute(
@@ -7847,7 +7974,14 @@ impl McStore {
                     transcript,
                 )?;
             }
-            let promoted_refs = promote_facts_tx(tx, request.project_path, request.facts)?;
+            let promoted_refs = if request.promote_facts {
+                promote_facts_tx(tx, request.project_path, request.facts)?
+            } else {
+                Vec::new()
+            };
+            // TS writes extracted events as part of the compartment transaction. Keep the
+            // insert best-effort so a malformed side-channel row cannot strand the publish.
+            let _ = insert_historian_events_tx(tx, session_id, request.events);
 
             meta.publication_floor_ordinal = Some(
                 meta.publication_floor_ordinal
@@ -7874,7 +8008,15 @@ impl McStore {
         })?;
 
         match outcome {
-            PublishTxnOutcome::Committed(result) => Ok(result),
+            PublishTxnOutcome::Committed(result) => {
+                // Primers and user observations are post-commit side channels in the TS
+                // publisher. Separate transactions preserve that atomicity boundary.
+                let _ = self.persist_historian_side_channels(
+                    request.primer_candidates,
+                    request.user_memory_candidates,
+                );
+                Ok(result)
+            }
             PublishTxnOutcome::CasConflict { found, reason } => {
                 Err(HistorianPublishError::CasConflict {
                     expected: expected_row_version,
@@ -7891,6 +8033,163 @@ impl McStore {
             }
             PublishTxnOutcome::Serde(e) => Err(HistorianPublishError::Serde(e)),
         }
+    }
+
+    /// Persist the TS publisher's post-commit side channels. Each table gets its own
+    /// transaction because observations and primers are intentionally not coupled to the
+    /// compartment CAS transaction on the reference path.
+    fn persist_historian_side_channels(
+        &self,
+        primers: &[HistorianPrimerCandidate],
+        observations: &[HistorianUserMemoryCandidate],
+    ) -> Result<(), McStoreError> {
+        if !primers.is_empty() {
+            self.inner.with_conn_fenced(|tx| {
+                for candidate in primers {
+                    let question = candidate.question.trim();
+                    if question.is_empty() {
+                        continue;
+                    }
+                    let normalized = question
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .to_lowercase();
+                    tx.execute(
+                        "INSERT INTO mc_primer_candidates
+                           (project_path, harness, session_id, question, normalized_question,
+                            source_compartment_start, source_compartment_end,
+                            source_start_message_id, source_end_message_id,
+                            source_message_time, created_at)
+                         VALUES (?1, 'module', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                         ON CONFLICT(project_path, harness, session_id,
+                                     source_start_message_id, source_end_message_id)
+                         DO UPDATE SET question = excluded.question,
+                                       normalized_question = excluded.normalized_question,
+                                       source_compartment_start = excluded.source_compartment_start,
+                                       source_compartment_end = excluded.source_compartment_end,
+                                       source_message_time = excluded.source_message_time,
+                                       created_at = MIN(mc_primer_candidates.created_at,
+                                                        excluded.created_at)",
+                        params![
+                            candidate.project_path,
+                            candidate.session_id,
+                            question,
+                            normalized,
+                            candidate.source_compartment_start.map(|v| v as i64),
+                            candidate.source_compartment_end.map(|v| v as i64),
+                            candidate.source_start_message_id,
+                            candidate.source_end_message_id,
+                            candidate.source_message_time,
+                            candidate.created_at,
+                        ],
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+        if !observations.is_empty() {
+            self.inner.with_conn_fenced(|tx| {
+                for candidate in observations {
+                    let content = candidate.content.trim();
+                    if content.is_empty() {
+                        continue;
+                    }
+                    tx.execute(
+                        "INSERT INTO mc_user_memory_candidates
+                           (content, session_id, source_compartment_start,
+                            source_compartment_end, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            content,
+                            candidate.session_id,
+                            candidate.source_compartment_start.map(|v| v as i64),
+                            candidate.source_compartment_end.map(|v| v as i64),
+                            candidate.created_at,
+                        ],
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn load_compartment_events(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<HistorianEventCandidate>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT kind, at_compartment, compartment_id, fields_json, created_at, harness
+                   FROM mc_compartment_events
+                  WHERE session_id = ?1 ORDER BY id",
+            )?;
+            let rows = stmt.query_map(params![session_id], |row| {
+                Ok(HistorianEventCandidate {
+                    kind: row.get(0)?,
+                    at_compartment: row.get::<_, Option<i64>>(1)?.map(|v| v as u64),
+                    compartment_id: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                    fields_json: row.get(3)?,
+                    created_at: row.get(4)?,
+                    harness: row.get(5)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?)
+    }
+
+    pub fn load_primer_candidates(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<HistorianPrimerCandidate>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT project_path, session_id, question, source_compartment_start,
+                        source_compartment_end, source_start_message_id, source_end_message_id,
+                        source_message_time, created_at
+                   FROM mc_primer_candidates
+                  WHERE session_id = ?1 ORDER BY id",
+            )?;
+            let rows = stmt.query_map(params![session_id], |row| {
+                Ok(HistorianPrimerCandidate {
+                    project_path: row.get(0)?,
+                    session_id: row.get(1)?,
+                    question: row.get(2)?,
+                    source_compartment_start: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                    source_compartment_end: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                    source_start_message_id: row.get(5)?,
+                    source_end_message_id: row.get(6)?,
+                    source_message_time: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?)
+    }
+
+    pub fn load_user_memory_candidates(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<HistorianUserMemoryCandidate>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT content, session_id, source_compartment_start,
+                        source_compartment_end, created_at
+                   FROM mc_user_memory_candidates
+                  WHERE session_id = ?1 ORDER BY id",
+            )?;
+            let rows = stmt.query_map(params![session_id], |row| {
+                Ok(HistorianUserMemoryCandidate {
+                    content: row.get(0)?,
+                    session_id: row.get(1)?,
+                    source_compartment_start: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                    source_compartment_end: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                    created_at: row.get(4)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?)
     }
 
     /// Load a project's render-eligible memories: `active` + `permanent`, excluding
@@ -11271,6 +11570,29 @@ fn insert_compartment_tx(
     Ok(())
 }
 
+fn insert_historian_events_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    events: &[HistorianEventCandidate],
+) -> rusqlite::Result<()> {
+    for event in events {
+        tx.execute(
+            "INSERT INTO mc_compartment_events
+               (session_id, compartment_id, at_compartment, kind, fields_json, created_at, harness)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'module')",
+            params![
+                session_id,
+                event.compartment_id.map(|v| v as i64),
+                event.at_compartment.map(|v| v as i64),
+                event.kind,
+                event.fields_json,
+                event.created_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn append_compartments_tx(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
@@ -13229,7 +13551,7 @@ mod tests {
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=35).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=36).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -14573,6 +14895,10 @@ mod tests {
                     content: "published fact".into(),
                     ..Default::default()
                 }],
+                promote_facts: true,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
             })
@@ -14588,6 +14914,10 @@ mod tests {
                 project_path: "git:proj",
                 compartments: &[publish_compartment()],
                 facts: &[],
+                promote_facts: true,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
             })
@@ -14621,6 +14951,10 @@ mod tests {
                 project_path: "git:proj",
                 compartments: &[publish_compartment()],
                 facts: &[],
+                promote_facts: true,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: Some("U: hello\nA: world"),
             })
@@ -14650,6 +14984,10 @@ mod tests {
                 project_path: "git:proj",
                 compartments: &[publish_compartment()],
                 facts: &[],
+                promote_facts: true,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: Some("U: orphan"),
             })
@@ -14684,6 +15022,10 @@ mod tests {
                 project_path: "git:proj",
                 compartments: &[publish_compartment()],
                 facts: &[],
+                promote_facts: true,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: Some(&transcript),
             })
@@ -15067,6 +15409,10 @@ mod tests {
                     content: "should not insert".into(),
                     ..Default::default()
                 }],
+                promote_facts: true,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
             })
@@ -15098,6 +15444,10 @@ mod tests {
                 project_path: "git:proj",
                 compartments: &[publish_compartment()],
                 facts: &[],
+                promote_facts: true,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
             })
@@ -15212,6 +15562,10 @@ mod tests {
                 project_path: "git:proj",
                 compartments: &[publish_compartment()],
                 facts: &[],
+                promote_facts: true,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
             })
@@ -16017,7 +16371,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=35).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=36).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)

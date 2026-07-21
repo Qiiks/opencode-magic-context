@@ -54,11 +54,11 @@ use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, Storag
 use mc_store::{
     canonical_root, validate_state_import_compartments, HistorianPhase, InsertMemoryInput,
     MappingUpdate, McStore, McStoreError, NoteCasOutcome, NoteEvaluationInput, NoteInput,
-    NoteWriteInput, RecordWrapupCommandOutcome, ShadowDivergenceRecord, ShadowDropSeedRow,
-    ShadowMemoryMutationRow, ShadowMemoryRow, ShadowStateSyncError, ShadowStateSyncRequest,
-    ShadowWorkspaceMemberRow, ShadowWorkspaceRow, StateImportError, StateImportPreflight,
-    StateImportValidationError, StoredChunkTranscript, StoredCompartment, StoredMemoryMutation,
-    StoredNote, TodoStateSetOutcome, VerificationUpdate, WrapupCommandRecord,
+    NoteWriteInput, PendingAgentDrop, RecordWrapupCommandOutcome, ShadowDivergenceRecord,
+    ShadowDropSeedRow, ShadowMemoryMutationRow, ShadowMemoryRow, ShadowStateSyncError,
+    ShadowStateSyncRequest, ShadowWorkspaceMemberRow, ShadowWorkspaceRow, StateImportError,
+    StateImportPreflight, StateImportValidationError, StoredChunkTranscript, StoredCompartment,
+    StoredMemoryMutation, StoredNote, TodoStateSetOutcome, VerificationUpdate, WrapupCommandRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -73,7 +73,7 @@ use classify::{
     CLASSIFY_RECOVERY_TIMEOUT, CLASSIFY_SYSTEM_PROMPT, CLASSIFY_TASK, CLASSIFY_TEMPERATURE,
     MAX_CLASSIFY_PROMPT_BYTES,
 };
-use config::{ConfigCache, McModuleConfig};
+use config::{derive_historian_chunk_tokens, ConfigCache, McModuleConfig};
 use healing::{tail_reclaim, SerializerProfile};
 use historian::{reattach_historian_producer, run_historian_firing, HistorianProducerDriver};
 use historian_chunk::{
@@ -216,8 +216,9 @@ const CTX_REDUCE_ACKNOWLEDGEMENT: &str = "Queued for context compaction.";
 const DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED: bool = true;
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.min_clusters default.
 const DEFAULT_MIN_COMMIT_CLUSTERS: usize = 3;
-/// Mirrors packages/plugin/src/hooks/magic-context/derive-budgets.ts with the default
-/// 128K historian context fallback: clamp(128_000 × 0.25, 8_000, 50_000) = 32_000.
+/// Legacy test fixture budget. Production assembly derives this from the configured
+/// historian context limit; the config fallback is intentionally explicit in config.rs.
+#[cfg(test)]
 const DEFAULT_HISTORIAN_CHUNK_TOKENS: usize = 32_000;
 /// Secondary assembler guard; TS trigger sizing is authoritative, this only rejects tiny chunks.
 const DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS: usize = 512;
@@ -2173,6 +2174,9 @@ impl McHandler {
                 model_chain: vec!["test/model".to_string()],
                 execute_threshold_percentage: 65.0,
                 memory_enabled: true,
+                auto_promote: true,
+                user_memory_collection_enabled: false,
+                historian_context_limit_tokens: 128_000,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
                 shadow_enabled: true,
@@ -2479,7 +2483,15 @@ impl McHandler {
                     trigger_budget: None,
                     fold_is_only_reclaim,
                 },
-                projected_post_drop_percentage: None,
+                projected_post_drop_percentage: projected_post_drop_percentage(
+                    &boundary_messages,
+                    &store
+                        .load_pending_agent_drops(&parsed.session_id)
+                        .unwrap_or_default(),
+                    &loaded.core.frozen_units,
+                    input_tokens,
+                    context_limit,
+                ),
                 compartment_in_progress: loaded.meta.historian.state != HistorianPhase::Idle,
                 commit_cluster_trigger_enabled: DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED,
                 min_commit_clusters: DEFAULT_MIN_COMMIT_CLUSTERS,
@@ -2868,10 +2880,12 @@ impl McHandler {
         store: Arc<McStore>,
         parsed: &TransformRequest,
         snapshot_generation: u64,
-        project_path: String,
+        binding: &SessionBinding,
         projection: &crate::ck_wire::FlatProjection,
         now: i64,
     ) -> Option<&'static str> {
+        let project_path = binding.project_root.to_string_lossy().to_string();
+        let config = self.effective_config(&binding.project_root);
         let Ok(loaded) = store.load(&parsed.session_id) else {
             return Some("recovery_load_failed");
         };
@@ -2931,7 +2945,7 @@ impl McHandler {
                     parsed.messages.as_slice(),
                     &live,
                     range.from_ordinal,
-                    DEFAULT_HISTORIAN_CHUNK_TOKENS,
+                    derive_historian_chunk_tokens(config.historian_context_limit_tokens),
                     range.to_ordinal.saturating_add(1),
                 );
                 let prior_compartments = match store.load_compartments(&session_id) {
@@ -2977,6 +2991,11 @@ impl McHandler {
                                 validate_options: historian_validate::ValidateOptions {
                                     sequence_offset: prior_compartments.len() as u64 + 1,
                                     in_emergency: false,
+                                    memory_enabled: config.memory_enabled,
+                                    auto_promote: config.auto_promote,
+                                    user_memory_collection_enabled: config
+                                        .user_memory_collection_enabled,
+                                    force_keep_last_compartment: false,
                                 },
                                 publication_floor_ordinal: range.to_ordinal,
                                 now_ms: now,
@@ -3064,13 +3083,14 @@ impl McHandler {
                 completion,
             };
         }
+        let cfg = self.effective_config(&binding.project_root);
         if loaded.meta.historian.state != HistorianPhase::Idle {
             let no_fire = self
                 .maybe_spawn_reattach(
                     Arc::clone(&store),
                     parsed,
                     snapshot_generation,
-                    project_path.to_string(),
+                    binding,
                     projection,
                     now,
                 )
@@ -3084,7 +3104,6 @@ impl McHandler {
                 last_failure,
             });
         }
-        let cfg = self.effective_config(&binding.project_root);
         let boundary_messages = boundary_messages(parsed, projection);
         let last_compartment_end_ordinal = store
             .load_compartments(&parsed.session_id)
@@ -3109,7 +3128,15 @@ impl McHandler {
                     trigger_budget: None,
                     fold_is_only_reclaim,
                 },
-                projected_post_drop_percentage: None,
+                projected_post_drop_percentage: projected_post_drop_percentage(
+                    &boundary_messages,
+                    &store
+                        .load_pending_agent_drops(&parsed.session_id)
+                        .unwrap_or_default(),
+                    &loaded.core.frozen_units,
+                    input_tokens,
+                    context_limit,
+                ),
                 compartment_in_progress: loaded.meta.historian.state != HistorianPhase::Idle,
                 commit_cluster_trigger_enabled: DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED,
                 min_commit_clusters: DEFAULT_MIN_COMMIT_CLUSTERS,
@@ -3224,11 +3251,14 @@ impl McHandler {
                 project_path: project_path.to_string(),
                 project_slug: project_slug.clone(),
                 model_chain: cfg.model_chain.clone(),
-                token_budget: DEFAULT_HISTORIAN_CHUNK_TOKENS,
+                token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
                 boundary,
                 memory_enabled: cfg.memory_enabled,
+                auto_promote: cfg.auto_promote,
+                user_memory_collection_enabled: cfg.user_memory_collection_enabled,
                 extraction_free: false,
                 in_emergency: usage_percentage >= 95.0,
+                force_keep_last_compartment: false,
                 fold_is_only_reclaim,
                 failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
                 min_chunk_tokens: DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS,
@@ -3376,11 +3406,14 @@ impl McHandler {
                 project_path: project_path.clone(),
                 project_slug: project_slug.clone(),
                 model_chain: cfg.model_chain,
-                token_budget: DEFAULT_HISTORIAN_CHUNK_TOKENS,
+                token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
                 boundary: boundary.clone(),
                 memory_enabled: cfg.memory_enabled,
+                auto_promote: cfg.auto_promote,
+                user_memory_collection_enabled: cfg.user_memory_collection_enabled,
                 extraction_free: false,
                 in_emergency: false,
+                force_keep_last_compartment: false,
                 // Explicit wrapup is the only reclaim mechanism on this surface, so a
                 // small final chunk must not be rejected by the substance floor.
                 fold_is_only_reclaim: true,
@@ -3390,7 +3423,13 @@ impl McHandler {
             now,
         );
         let firing = match assemble {
-            Ok(AssembleHistorianFiringOutcome::Fire(firing)) => *firing,
+            Ok(AssembleHistorianFiringOutcome::Fire(firing)) => {
+                let mut firing = *firing;
+                // Only the final wrapup chunk has no lookahead; intermediate chunks still
+                // need discard-last healing so the next round can re-read their tail.
+                firing.validate_options.force_keep_last_compartment = !firing.chunk.has_more;
+                firing
+            }
             Ok(AssembleHistorianFiringOutcome::NoFire(reason)) => {
                 return PreparedWrapupAction::Nothing(format!("{reason:?}"))
             }
@@ -10762,6 +10801,71 @@ fn usage_numbers(usage: Option<&mc_store::ModuleUsage>) -> (f64, f64, f64) {
     (limit, input, pct)
 }
 
+/// Estimate pressure after the currently queued agent drops apply. The queue stores flat
+/// block ids while frozen reductions store replacement bytes, so using only raw input bytes
+/// would overstate reclaim after a prior reduction and leave the 75%-relative suppression
+/// gate ineffective.
+fn projected_post_drop_percentage(
+    messages: &[BoundaryMsg],
+    pending_drops: &[PendingAgentDrop],
+    frozen_units: &[mc_core::FrozenUnit],
+    input_tokens: f64,
+    context_limit: f64,
+) -> Option<f64> {
+    if context_limit <= 0.0 {
+        return None;
+    }
+
+    let frozen_sizes = frozen_units
+        .iter()
+        .filter_map(|unit| {
+            unit.key.strip_prefix("red:").map(|target| {
+                (
+                    target.to_string(),
+                    mc_tokenizer::estimate_tokens(&unit.frozen_payload),
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    let mut current_sizes = HashMap::<String, f64>::new();
+    for message in messages {
+        for block in &message.blocks {
+            let raw = mc_tokenizer::estimate_tokens(&block.original) as f64;
+            current_sizes.insert(
+                block.id.clone(),
+                frozen_sizes
+                    .get(&block.id)
+                    .copied()
+                    .map(|tokens| tokens as f64)
+                    .unwrap_or(raw),
+            );
+        }
+    }
+    // A frozen unit can outlive the exact input block during a provider replay. Include its
+    // replacement size so a pending queue row still has an honest denominator.
+    for (target, tokens) in &frozen_sizes {
+        current_sizes
+            .entry(target.clone())
+            .or_insert(*tokens as f64);
+    }
+    let active_tokens: f64 = current_sizes.values().sum();
+    if active_tokens <= 0.0 {
+        return None;
+    }
+    let pending_ids = pending_drops
+        .iter()
+        .map(|drop| drop.target_id.as_str())
+        .collect::<HashSet<_>>();
+    let pending_tokens: f64 = pending_ids
+        .into_iter()
+        .filter_map(|target| current_sizes.get(target))
+        .copied()
+        .sum();
+    let drop_ratio = (pending_tokens / active_tokens).clamp(0.0, 1.0);
+    let projected_input = (input_tokens * (1.0 - drop_ratio)).max(0.0);
+    Some(projected_input / context_limit * 100.0)
+}
+
 fn project_slug(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -11061,6 +11165,7 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
     use crate::ck_wire::{
         CkIngressMessage, CkKind, CkOutputKind, CkToolOutput, CkWireBlock, CkWireMessage,
         HarnessMeta, ProviderExtras,
@@ -11068,8 +11173,8 @@ mod tests {
     use historian_producer::{ProducerOutput, RunHandle, RunState};
     use mc_core::CoreState;
     use mc_store::{
-        HistorianChunkRange, HistorianDurableState, ModuleMeta, ModuleUsage, StoredCompartment,
-        TagMintInput,
+        HistorianChunkRange, HistorianDurableState, ModuleMeta, ModuleUsage, PendingAgentDrop,
+        StoredCompartment, TagMintInput,
     };
     use tokio::sync::Notify;
 
@@ -11098,6 +11203,101 @@ mod tests {
         let (limit, _, pct) = usage_numbers(Some(&one_m));
         assert_eq!(limit, 1_000_000.0);
         assert!((pct - 80.0).abs() < 0.01, "pct={pct}");
+    }
+
+    #[test]
+    fn projected_post_drop_pressure_uses_pending_blocks_and_frozen_replacements() {
+        let messages = vec![BoundaryMsg {
+            message_ordinal: 1,
+            message_id: "m1".to_string(),
+            role: Role::User,
+            blocks: vec![BoundaryBlock {
+                id: "drop#0".to_string(),
+                ordinal: 0,
+                kind: SelKind::Text,
+                provider_executed: false,
+                byte_size: 400,
+                arc_id: None,
+                original: "x".repeat(400),
+                rendered: None,
+                ignored: false,
+            }],
+        }];
+        let pending = vec![PendingAgentDrop {
+            id: 1,
+            target_id: "drop#0".to_string(),
+            queued_at_ms: 0,
+            command_id: None,
+            command_first_applied_at_ms: None,
+        }];
+        let frozen = [mc_core::FrozenUnit {
+            key: "red:drop#0".to_string(),
+            kind: "drop".to_string(),
+            frozen_payload: "[dropped]".to_string(),
+            durability_class: mc_core::DurabilityClass::Lineage,
+            reset_rule: String::new(),
+        }];
+        let projected =
+            projected_post_drop_percentage(&messages, &pending, &frozen, 60_000.0, 100_000.0)
+                .expect("live blocks provide a denominator");
+        assert!(projected.abs() < f64::EPSILON, "projected={projected}");
+    }
+
+    #[test]
+    fn trigger_suppresses_fire_when_projected_drops_hit_relative_target() {
+        let block = |id: &str, text: &str| BoundaryBlock {
+            id: id.to_string(),
+            ordinal: 0,
+            kind: SelKind::Text,
+            provider_executed: false,
+            byte_size: text.len(),
+            arc_id: None,
+            original: text.to_string(),
+            rendered: None,
+            ignored: false,
+        };
+        let mut messages = Vec::new();
+        for ordinal in 1..=5 {
+            messages.push(BoundaryMsg {
+                message_ordinal: ordinal,
+                message_id: format!("assistant-{ordinal}"),
+                role: Role::Assistant,
+                blocks: vec![block(
+                    &format!("assistant-{ordinal}#0"),
+                    &"alpha beta gamma delta epsilon ".repeat(400),
+                )],
+            });
+        }
+        messages.push(BoundaryMsg {
+            message_ordinal: 6,
+            message_id: "user-6".to_string(),
+            role: Role::User,
+            blocks: vec![block("user-6#0", "keep this prompt")],
+        });
+        let boundary = BoundaryContext {
+            context_limit: 1_000.0,
+            execute_threshold_percentage: 65.0,
+            usage_percentage: 70.0,
+            usage_input_tokens: 700.0,
+            last_compartment_end_ordinal: None,
+            prior_boundary_ordinal: 0,
+            migration_floor_active: false,
+            emergency_tail_scale: None,
+            trigger_budget: Some(10_000.0),
+            fold_is_only_reclaim: false,
+        };
+        let mut context = TriggerContext {
+            boundary,
+            projected_post_drop_percentage: None,
+            compartment_in_progress: false,
+            commit_cluster_trigger_enabled: false,
+            min_commit_clusters: 2,
+        };
+        let initial = boundary::check_compartment_trigger(&messages, &context);
+        assert!(initial.fire, "initial trigger decision: {initial:?}");
+        context.projected_post_drop_percentage = Some(48.75);
+        let projected = boundary::check_compartment_trigger(&messages, &context);
+        assert!(!projected.fire, "projected trigger decision: {projected:?}");
     }
 
     #[test]
@@ -11910,6 +12110,9 @@ mod tests {
             model_chain: vec!["test/model".to_string()],
             execute_threshold_percentage: 65.0,
             memory_enabled: true,
+            auto_promote: true,
+            user_memory_collection_enabled: false,
+            historian_context_limit_tokens: 128_000,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
             shadow_enabled: true,
@@ -12867,6 +13070,10 @@ mod tests {
                 project_path: project.to_str().unwrap(),
                 compartments: &[stored_comp(1, 10, 12, "m12#0", "summary")],
                 facts: &[],
+                promote_facts: true,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
                 publication_floor_ordinal: 12,
                 chunk_transcript: Some("U: exact prompt text\nA: exact answer"),
             })

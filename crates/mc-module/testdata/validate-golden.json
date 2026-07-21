@@ -1053,21 +1053,8 @@
           }
         ],
         "facts": [],
-        "events": [
-          {
-            "kind": "causal_incident",
-            "at_compartment": 1,
-            "fields": {
-              "summary": "Earlier event."
-            }
-          }
-        ],
-        "primer_candidates": [
-          {
-            "question": "How does the kept compartment work?",
-            "origin_compartment_index": 1
-          }
-        ],
+        "events": [],
+        "primer_candidates": [],
         "user_observations": [],
         "unprocessed_from": 3,
         "discarded_last": true
