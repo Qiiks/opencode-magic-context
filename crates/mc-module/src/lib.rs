@@ -1477,10 +1477,6 @@ struct FacadeScope {
     memory_enabled: bool,
 }
 
-fn default_cache_ttl() -> String {
-    "5m".to_string()
-}
-
 fn default_clear_reasoning_age() -> u64 {
     50
 }
@@ -2259,6 +2255,7 @@ impl McHandler {
         Self::with_producer_factory_and_config(
             factory,
             McModuleConfig {
+                cache_ttl_by_model: std::collections::BTreeMap::new(),
                 model_chain: vec!["test/model".to_string()],
                 execute_threshold_percentage: 65.0,
                 memory_enabled: true,
@@ -2441,7 +2438,7 @@ impl McHandler {
             return false;
         }
         let mut messages = request.messages[..replace_from].to_vec();
-        messages.extend(parsed.messages.drain(..));
+        messages.append(&mut parsed.messages);
         let mut native_messages = previous_native[..native_replace_from].to_vec();
         native_messages.extend(current_native);
         parsed.messages = messages;
@@ -12493,6 +12490,7 @@ mod tests {
 
     fn default_test_config() -> McModuleConfig {
         McModuleConfig {
+            cache_ttl_by_model: std::collections::BTreeMap::new(),
             model_chain: vec!["test/model".to_string()],
             execute_threshold_percentage: 65.0,
             memory_enabled: true,

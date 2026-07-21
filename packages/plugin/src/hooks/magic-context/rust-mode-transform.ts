@@ -1068,6 +1068,16 @@ export function createRustModeTransform(
             if (previousWireCache && messages.length >= previousWireCache.rawCount) {
                 const appending = messages.length > previousWireCache.rawCount;
                 const lastMessage = messages.at(-1);
+                // Delta transport is only sound when the prefix the module would reuse is
+                // byte-identical to what OpenCode holds NOW. Count/last-signature checks
+                // cover the tail; this covers in-place mutation of an older message (an
+                // ephemeral reminder wrapper, a late tool completion) which must force a
+                // full send instead of riding a stale-prefix delta.
+                const prefixIntact = prefixLightSignaturesMatch(
+                    messages,
+                    previousWireCache,
+                    Math.max(0, previousWireCache.rawCount - 1),
+                );
                 const lastChanged =
                     !appending && lastMessage !== undefined
                         ? messageCacheSignature(lastMessage) !== previousWireCache.rawLastSignature
@@ -1094,7 +1104,7 @@ export function createRustModeTransform(
                         : rawStart === previousWireCache.rawCount
                           ? previousWireCache.nativeFingerprint
                           : undefined;
-                if (ckAfter !== undefined && nativeAfter !== undefined) {
+                if (prefixIntact && ckAfter !== undefined && nativeAfter !== undefined) {
                     wireDelta = {
                         rawStart,
                         wireStart,
@@ -1232,6 +1242,7 @@ export function createRustModeTransform(
                         nativeFingerprint: nativeFingerprint.fingerprint,
                         nativePrefixFingerprintBeforeLast:
                             nativeFingerprint.prefixFingerprintBeforeLast,
+                        rawLightSignatures: lightSignaturesFor(messages),
                         fingerprint: `${ckFingerprint.fingerprint}|${nativeFingerprint.fingerprint}`,
                     };
                 }
@@ -1266,6 +1277,7 @@ export function createRustModeTransform(
                     ckPrefixFingerprintBeforeLast,
                     nativeFingerprint,
                     nativePrefixFingerprintBeforeLast,
+                    rawLightSignatures: lightSignaturesFor(messages),
                     fingerprint: `${ckFingerprint}|${nativeFingerprint}`,
                 };
             })();
@@ -1388,6 +1400,7 @@ export function createRustModeTransform(
                         nativeFingerprint: retryNativeFingerprint.fingerprint,
                         nativePrefixFingerprintBeforeLast:
                             retryNativeFingerprint.prefixFingerprintBeforeLast,
+                        rawLightSignatures: lightSignaturesFor(messages),
                         fingerprint: `${retryCkFingerprint.fingerprint}|${retryNativeFingerprint.fingerprint}`,
                     };
                     const retryWireBuildStartedAt = performance.now();

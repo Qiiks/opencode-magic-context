@@ -7090,6 +7090,7 @@ mod tests {
 
     fn req(session: &str, cfg: &str, messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
+            cache_ttl: None,
             kind: "transform".to_string(),
             v: 2,
             serializer_profile: "owned-llmrunner".to_string(),

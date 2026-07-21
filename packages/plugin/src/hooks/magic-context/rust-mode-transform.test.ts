@@ -1240,3 +1240,84 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
         ).toThrow("managed by the Rust module");
     });
 });
+
+describe("delta prefix-mutation guard", () => {
+    it("in-place mutation of an older message forces a full send instead of a delta", async () => {
+        const sessionId = `rust-prefix-guard-${Date.now()}`;
+        sessions.push(sessionId);
+        const rows = Array.from({ length: 4 }, (_, index) => ({
+            id: `m-${index + 1}`,
+            timeCreated: index + 1,
+            contributesOrdinal: true,
+            hasValidInfo: true,
+        }));
+        unregisters.push(
+            setRawMessageProvider(sessionId, {
+                readMessages: () => rows,
+                readMessageOrdinalPage: (after, limit) =>
+                    rows
+                        .filter(
+                            (row) =>
+                                !after ||
+                                row.timeCreated > after.timeCreated ||
+                                (row.timeCreated === after.timeCreated && row.id > after.id),
+                        )
+                        .slice(0, limit),
+                getStoredMessageCount: () => rows.length,
+            }),
+        );
+        const db = makeDb();
+        const requestBodies: Array<Record<string, unknown>> = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform") requestBodies.push(body as Record<string, unknown>);
+                return method === "transform" ? { native_messages: [] } : { ok: true };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const buildMessages = (count: number, mutatePrefix = false): MessageLike[] =>
+            rows.slice(0, count).map((row, index) => ({
+                info: { id: row.id, role: "user", sessionID: sessionId },
+                parts: [
+                    {
+                        type: "text",
+                        text:
+                            mutatePrefix && index === 0
+                                ? "message m-1 MUTATED IN PLACE"
+                                : `message ${row.id}`,
+                    },
+                ],
+            }));
+
+        const first = buildMessages(3);
+        await transform.run(sessionId, first, { messages: [...first] }, makeMeta(db, sessionId));
+        // Steady-state control: an appended tail rides a delta.
+        const appended = buildMessages(4);
+        await transform.run(
+            sessionId,
+            appended,
+            { messages: [...appended] },
+            makeMeta(db, sessionId),
+        );
+        expect(requestBodies).toHaveLength(2);
+        expect(requestBodies[1]?.tail_delta).toEqual({
+            after: expect.any(String),
+            replace_from: expect.any(Number),
+            native_replace_from: expect.any(Number),
+        });
+        // Mutate an OLD message in place (the ephemeral reminder-wrapper class): the
+        // pass must abandon the delta and full-send, because the prefix the module
+        // would reuse no longer matches what OpenCode holds.
+        const mutated = buildMessages(4, true);
+        await transform.run(
+            sessionId,
+            mutated,
+            { messages: [...mutated] },
+            makeMeta(db, sessionId),
+        );
+        expect(requestBodies).toHaveLength(3);
+        expect(requestBodies[2]?.tail_delta).toBeUndefined();
+        expect(requestBodies[2]?.messages).toHaveLength(4);
+        expect(requestBodies[2]?.native_messages).toHaveLength(4);
+    });
+});
