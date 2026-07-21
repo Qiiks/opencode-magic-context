@@ -885,6 +885,11 @@ fn transform_decision_reason_label(reason: &str) -> Option<&'static str> {
         "pressure_refold" => Some("Compaction pressure"),
         "upgrade_state" => Some("Session upgrade"),
         "cached_m1_missing" => Some("Cache rebuild"),
+        "m1_delta" => Some("M1 delta"),
+        "ttl_expiry" => Some("TTL expiry"),
+        "epoch_change" => Some("Epoch change"),
+        "coverage_fold" => Some("Coverage fold"),
+        "profile_transition" => Some("Profile transition"),
         _ => None,
     }
 }
@@ -895,9 +900,11 @@ fn transform_decision_cause(decision: Option<&TransformDecisionCause>) -> Option
         return Some("Compaction pressure".to_string());
     }
     if let Some(reason) = decision.materialize_reason.as_deref() {
-        if let Some(label) = transform_decision_reason_label(reason) {
-            return Some(label.to_string());
-        }
+        return Some(
+            transform_decision_reason_label(reason)
+                .unwrap_or(reason)
+                .to_string(),
+        );
     }
     if decision.decision == "execute" {
         return Some("Execute pass (reclaimed tool output)".to_string());
@@ -7468,6 +7475,34 @@ mod cache_turn_tests {
         let events = build_db_cache_events_with_decisions(rows, true, Some(decisions));
         assert_eq!(events[1].severity, "full_bust");
         assert_eq!(events[1].cause.as_deref(), Some("Manual flush"));
+    }
+
+    #[test]
+    fn rust_module_reasons_are_labeled_and_unknown_reasons_are_preserved() {
+        for (reason, label) in [
+            ("m1_delta", "M1 delta"),
+            ("ttl_expiry", "TTL expiry"),
+            ("epoch_change", "Epoch change"),
+            ("coverage_fold", "Coverage fold"),
+            ("profile_transition", "Profile transition"),
+        ] {
+            let cause = TransformDecisionCause {
+                decision: "execute".to_string(),
+                materialize_reason: Some(reason.to_string()),
+                emergency: false,
+            };
+            assert_eq!(transform_decision_cause(Some(&cause)).as_deref(), Some(label));
+        }
+
+        let unknown = TransformDecisionCause {
+            decision: "execute".to_string(),
+            materialize_reason: Some("future_module_reason".to_string()),
+            emergency: false,
+        };
+        assert_eq!(
+            transform_decision_cause(Some(&unknown)).as_deref(),
+            Some("future_module_reason")
+        );
     }
 
     #[test]

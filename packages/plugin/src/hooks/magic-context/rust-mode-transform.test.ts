@@ -270,6 +270,79 @@ describe("Rust mode authority adapter", () => {
         expect(body.history_budget_tokens).toBe(42_000);
     });
 
+    it("keeps the rust pass line grep-compatible", () => {
+        expect(
+            __rustModeTransformTest.formatRustPassLog({
+                decision: "HARD",
+                reason: "first_render",
+                servedFrom: "transform",
+                inputCount: 4,
+                outputCount: 3,
+                applied: true,
+                elapsedMs: 12.345,
+                moduleElapsedMs: 8.765,
+            }),
+        ).toBe(
+            "rust pass: decision=HARD reason=first_render served_from=transform in=4 out=3 applied=true elapsed=12.3 ms module=8.8 ms",
+        );
+    });
+
+    it("writes one dashboard decision row for each Rust classifier decision", async () => {
+        const sessionId = `rust-decisions-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const responses = [
+            { decision: "HARD", materialize_reason: "first_render" },
+            { decision: "SOFT", materialize_reason: "m1_delta" },
+            { decision: "SOFT+" },
+        ];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? { ...responses.shift(), native_messages: [] }
+                    : { ok: true },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.contextUsageMap.set(sessionId, {
+            usage: { inputTokens: 123, percentage: 1 },
+            updatedAt: Date.now(),
+        });
+        const transform = createRustModeTransform(deps, { moduleClient });
+
+        for (let index = 0; index < 3; index += 1) {
+            const messages: MessageLike[] = [
+                {
+                    info: { id: `turn-${index}`, role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "hello" }],
+                },
+            ];
+            await transform.run(sessionId, messages, { messages }, makeMeta(db, sessionId));
+        }
+
+        expect(
+            db
+                .prepare(
+                    "SELECT decision, materialized, materialize_reason, input_tokens FROM transform_decisions WHERE session_id = ? ORDER BY ts_ms, rowid",
+                )
+                .all(sessionId),
+        ).toEqual([
+            {
+                decision: "execute",
+                materialized: 1,
+                materialize_reason: "first_render",
+                input_tokens: 123,
+            },
+            {
+                decision: "execute",
+                materialized: 0,
+                materialize_reason: "m1_delta",
+                input_tokens: 123,
+            },
+            { decision: "defer", materialized: 0, materialize_reason: null, input_tokens: 123 },
+        ]);
+    });
+
     it("adopts a durable sequence from a fresh process and retries the sync", async () => {
         const sessionId = `rust-adopt-${Date.now()}`;
         sessions.push(sessionId);

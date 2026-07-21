@@ -42,6 +42,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
+use std::time::Instant;
 
 use crate::ck_wire::{
     duplicate_ids, project_messages, reduced_block, split_block_id, CkIngressMessage, CkWireBlock,
@@ -418,6 +419,30 @@ pub struct HostDirectives {
     pub channel2_nudge: Option<Channel2NudgeDirective>,
 }
 
+/// Per-stage transform timings, in floating-point milliseconds.
+///
+/// The values measure the existing seams in `apply_once` and `build_output`; they are
+/// diagnostic timings, so stages that do not run on a pass remain zero.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TransformTimings {
+    #[serde(default)]
+    pub total: f64,
+    #[serde(default)]
+    pub decide: f64,
+    #[serde(default)]
+    pub seed_or_sync: f64,
+    #[serde(default)]
+    pub compose_m0m1: f64,
+    #[serde(default)]
+    pub selection: f64,
+    #[serde(default)]
+    pub todo: f64,
+    #[serde(default)]
+    pub build_output: f64,
+    #[serde(default)]
+    pub store_commit: f64,
+}
+
 /// A transform pass result. Diagnostics remain alongside the CK array, but the response
 /// messages themselves are bare CK messages: no request-only `mid` or `ordinal` sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -427,6 +452,17 @@ pub struct TransformResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_array_fingerprint: Option<String>,
     pub action: String,
+    /// The classifier decision, duplicated from `action` for telemetry consumers that do not
+    /// need to interpret the legacy action field.
+    #[serde(default)]
+    pub decision: String,
+    /// The classifier's raw cause for a HARD/SOFT decision. Unknown future causes are retained.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub materialize_reason: Option<String>,
+    /// Optional diagnostic timings. Omitted only by compatibility constructors and on old
+    /// responses; normal module transform passes include this object.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub timings: Option<TransformTimings>,
     pub boundary_id: String,
     pub reconcile_pending: bool,
     pub version: u64,
@@ -472,6 +508,9 @@ impl TransformResponse {
             served_from: ServedFrom::Transform,
             full_array_fingerprint,
             action: "NEED_FULL_SYNC".to_string(),
+            decision: "NEED_FULL_SYNC".to_string(),
+            materialize_reason: None,
+            timings: None,
             boundary_id: String::new(),
             reconcile_pending: false,
             version: 0,
@@ -496,6 +535,9 @@ impl TransformResponse {
             served_from: ServedFrom::Transform,
             full_array_fingerprint,
             action: "PASSTHROUGH".to_string(),
+            decision: "PASSTHROUGH".to_string(),
+            materialize_reason: None,
+            timings: None,
             boundary_id: String::new(),
             reconcile_pending: false,
             version: 0,
@@ -834,6 +876,8 @@ fn apply_once(
     ctx: &ProducerContext<'_>,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Result<TransformWithProjection, TransformError> {
+    let total_started_at = Instant::now();
+    let mut timings = TransformTimings::default();
     // --- ingress: CK messages -> flat blocks, then strip synthetic before cache logic ---
     let projection = project_messages(&req.messages)?;
     if let Some(id) = duplicate_ids(&projection.blocks) {
@@ -865,7 +909,9 @@ fn apply_once(
     let cc_u1_active = crate::cc_u1_active(serializer_profile, req.tool_present);
     let tagging_surface_requested =
         crate::tagging_surface_active(serializer_profile, req.tool_present);
+    let seed_or_sync_started_at = Instant::now();
     let transform_snapshot = store.load_transform_snapshot(&req.session_id)?;
+    timings.seed_or_sync = elapsed_ms(seed_or_sync_started_at);
     let loaded = transform_snapshot.loaded;
     let overlay_frontier = transform_snapshot.overlay_frontier;
     // Legacy sessions stored the CC latch before the generic surface latch existed.
@@ -989,15 +1035,18 @@ fn apply_once(
             let passthrough_overlay = tagging_active.then(|| {
                 tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends)
             });
-            return Ok(pending_passthrough_result(
+            return Ok(pending_passthrough_result(PendingPassthroughArgs {
                 projection,
                 req,
-                loaded.row_version.unwrap_or(0),
-                false,
+                row_version: loaded.row_version.unwrap_or(0),
+                committed: false,
                 trim_mismatch,
-                passthrough_overlay.as_ref(),
+                tag_overlay: passthrough_overlay.as_ref(),
                 surface_state,
-            ));
+                timings,
+                materialize_reason: Some("pending_rewrite".to_string()),
+                total_started_at,
+            }));
         }
 
         let core = loaded.core.clone();
@@ -1030,15 +1079,18 @@ fn apply_once(
         );
         let passthrough_overlay = tagging_active
             .then(|| tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends));
-        return Ok(pending_passthrough_result(
+        return Ok(pending_passthrough_result(PendingPassthroughArgs {
             projection,
             req,
             row_version,
-            true,
+            committed: true,
             trim_mismatch,
-            passthrough_overlay.as_ref(),
+            tag_overlay: passthrough_overlay.as_ref(),
             surface_state,
-        ));
+            timings,
+            materialize_reason: Some("pending_rewrite".to_string()),
+            total_started_at,
+        }));
     }
 
     let clear_pending_rewrite_on_present =
@@ -1084,6 +1136,7 @@ fn apply_once(
     } else {
         0.0
     };
+    let decide_scheduler_started_at = Instant::now();
     let mut scheduler_outcome = scheduler::decide(&SchedulerInputs {
         config: scheduler_config(ctx.execute_threshold_percentage),
         usage: ContextUsage {
@@ -1113,6 +1166,7 @@ fn apply_once(
         drain_latch: latch_from_meta(&loaded.meta),
         overflow_error_text: req.provider_error.clone(),
     });
+    timings.decide += elapsed_ms(decide_scheduler_started_at);
     // A flush requests work on the next pass, not a new m0 fold. Promote only a normal
     // defer to Execute; mandatory bootstrap, epoch, and pressure decisions retain priority.
     if loaded.meta.soft_refresh_pending && scheduler_outcome.pass == scheduler::PassDecision::Defer
@@ -1216,6 +1270,7 @@ fn apply_once(
                 .map(|block| block.id.clone()),
         );
     }
+    let selection_started_at = Instant::now();
     let selected_reductions = if producer_gate {
         let frozen = frozen_red_targets(&loaded.core);
         // No per-request gate here: producer_gate already requires
@@ -1270,6 +1325,7 @@ fn apply_once(
     } else {
         Vec::new()
     };
+    timings.selection = elapsed_ms(selection_started_at);
     #[cfg(test)]
     let selected_reductions = if ctx.injected_reductions.is_empty() {
         selected_reductions
@@ -1288,6 +1344,7 @@ fn apply_once(
         &live,
         loaded.meta.coverage_ordinal,
     );
+    let classify_started_at = Instant::now();
     let plan = classify(&ClassifierInput {
         initialized: loaded.meta.initialized,
         is_legacy_baseline: is_legacy_baseline(&loaded.core),
@@ -1298,6 +1355,24 @@ fn apply_once(
         reconcile_pending: loaded.core.reconcile_pending,
         m1_revision_changed: current_m1_digest != loaded.meta.m1_revision
             || loaded.meta.soft_refresh_pending,
+        reductions_pending: reductions_pending_now,
+    });
+    timings.decide += elapsed_ms(classify_started_at);
+    let profile_transition = !loaded.meta.last_serializer_profile.is_empty()
+        && loaded.meta.last_serializer_profile != req.serializer_profile;
+    let materialize_reason = classify_materialize_reason(MaterializeReasonInputs {
+        plan,
+        bootstrap_due: !loaded.meta.initialized,
+        legacy_baseline: is_legacy_baseline(&loaded.core),
+        render_config_changed,
+        profile_transition,
+        first_fold_due,
+        ttl_expired: scheduler_outcome.idle_ttl_fired,
+        coverage_fold_due: system_absorb_hard_due,
+        reconcile_hard_due,
+        coverage_delta: compartment_seq_changed_since_meta,
+        m1_delta: current_m1_digest != loaded.meta.m1_revision,
+        explicit_flush: loaded.meta.soft_refresh_pending,
         reductions_pending: reductions_pending_now,
     });
 
@@ -1351,12 +1426,16 @@ fn apply_once(
             meta.guidance_date = guidance_date.clone();
         }
     }
+    let mut todo_ms = 0.0;
     let tail_for_capture = tail_for_selection.clone();
     if is_bust_pass && tail_reclaim_enabled {
+        let todo_started_at = Instant::now();
         capture_todo_state_on_bust(&mut meta, &tail_for_capture, true);
+        todo_ms += elapsed_ms(todo_started_at);
     }
 
     let mut coverage_shrunk_on_bust = false;
+    let compose_m0m1_started_at = Instant::now();
     let mut commit_memory_revision = None;
     let mut note_deliveries: Vec<NoteDelivery> = Vec::new();
 
@@ -1559,8 +1638,10 @@ fn apply_once(
             coverage_shrunk_on_bust =
                 coverage_shrank(loaded.meta.coverage_ordinal, comp.coverage_ordinal);
             if coverage_shrunk_on_bust && tail_reclaim_enabled {
+                let todo_started_at = Instant::now();
                 let post_truncate_tail = tail_sel_items(&live, comp.coverage_ordinal);
                 capture_todo_state_on_bust(&mut meta, &post_truncate_tail, true);
+                todo_ms += elapsed_ms(todo_started_at);
             }
             meta.coverage_ordinal = comp.coverage_ordinal;
             meta.coverage_start_ordinal = comp.first_covered_ordinal;
@@ -1670,6 +1751,7 @@ fn apply_once(
             }
         }
     }
+    timings.compose_m0m1 = elapsed_ms(compose_m0m1_started_at);
 
     // The two-pass watermark advances on EVERY scheduler execute-class decision
     // (Execute/Force85/Emergency95), not only on passes that froze reductions: this
@@ -1697,6 +1779,7 @@ fn apply_once(
     }
 
     if tail_reclaim_enabled {
+        let todo_started_at = Instant::now();
         advance_synthetic_todo(
             &mut meta,
             is_bust_pass,
@@ -1704,7 +1787,9 @@ fn apply_once(
             coverage_shrunk_on_bust,
             req,
         )?;
+        todo_ms += elapsed_ms(todo_started_at);
     }
+    timings.todo = todo_ms;
 
     let result_action = action_str(&plan, &core);
 
@@ -1735,6 +1820,7 @@ fn apply_once(
         }
     }
 
+    let build_output_started_at = Instant::now();
     let ck_messages = build_output(
         &core,
         &meta,
@@ -1744,6 +1830,7 @@ fn apply_once(
         tail_reclaim_enabled,
         mutation_exempt_mid,
     )?;
+    timings.build_output = elapsed_ms(build_output_started_at);
 
     // Build the output before committing so a missing synthetic-todo anchor cannot
     // persist an unusable frozen pair. Pending rows are classified from the final plan:
@@ -1763,6 +1850,7 @@ fn apply_once(
     }
     let commit_required =
         state_changed || !consumed_drop_ids.is_empty() || !pending_overlays.is_empty();
+    let store_commit_started_at = Instant::now();
     let row_version = if commit_required {
         store.commit_transform(
             &req.session_id,
@@ -1787,6 +1875,7 @@ fn apply_once(
     } else {
         loaded.row_version.unwrap_or(0)
     };
+    timings.store_commit = elapsed_ms(store_commit_started_at);
     let host_directives = channel2_directive(Channel2DirectiveInput {
         profile: serializer_profile,
         core: &core,
@@ -1799,6 +1888,7 @@ fn apply_once(
         execute_threshold_percentage: ctx.execute_threshold_percentage,
     });
 
+    timings.total = elapsed_ms(total_started_at);
     Ok(TransformWithProjection {
         projection,
         scheduler_pass: scheduler_outcome.pass,
@@ -1808,7 +1898,10 @@ fn apply_once(
             status: TransformStatus::Ok,
             served_from: ServedFrom::Transform,
             full_array_fingerprint: req.full_array_fingerprint.clone(),
-            action: result_action,
+            action: result_action.clone(),
+            decision: result_action,
+            materialize_reason,
+            timings: Some(timings),
             boundary_id: core.boundary_id.clone(),
             reconcile_pending: core.reconcile_pending,
             version: core.version,
@@ -2656,15 +2749,32 @@ fn pending_rewrite_detail(session_id: &str, fingerprint: &str, ambiguous: bool) 
     )
 }
 
-fn pending_passthrough_result(
+struct PendingPassthroughArgs<'a> {
     projection: FlatProjection,
-    req: &TransformRequest,
+    req: &'a TransformRequest,
     row_version: u64,
     committed: bool,
     trim_mismatch: Option<TrimMismatch>,
-    tag_overlay: Option<&TagOverlayState>,
+    tag_overlay: Option<&'a TagOverlayState>,
     surface_state: SurfaceState,
-) -> TransformWithProjection {
+    timings: TransformTimings,
+    materialize_reason: Option<String>,
+    total_started_at: Instant,
+}
+
+fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWithProjection {
+    let PendingPassthroughArgs {
+        projection,
+        req,
+        row_version,
+        committed,
+        trim_mismatch,
+        tag_overlay,
+        surface_state,
+        mut timings,
+        materialize_reason,
+        total_started_at,
+    } = args;
     let mutation_exempt_mid = latest_assistant_mutation_exempt_mid(
         &req.messages,
         SerializerProfile::parse(&req.serializer_profile),
@@ -2694,6 +2804,9 @@ fn pending_passthrough_result(
     response.row_version = row_version;
     response.surface_state = surface_state;
     response.committed = committed;
+    response.materialize_reason = materialize_reason;
+    timings.total = elapsed_ms(total_started_at);
+    response.timings = Some(timings);
     TransformWithProjection {
         projection,
         scheduler_pass: scheduler::PassDecision::Defer,
@@ -4743,6 +4856,80 @@ fn projection_blocks_by_mid(projection: &FlatProjection) -> BTreeMap<&str, Vec<&
     by_mid
 }
 
+fn elapsed_ms(started_at: Instant) -> f64 {
+    started_at.elapsed().as_secs_f64() * 1_000.0
+}
+
+struct MaterializeReasonInputs {
+    plan: PassPlan,
+    bootstrap_due: bool,
+    legacy_baseline: bool,
+    render_config_changed: bool,
+    profile_transition: bool,
+    first_fold_due: bool,
+    ttl_expired: bool,
+    coverage_fold_due: bool,
+    reconcile_hard_due: bool,
+    coverage_delta: bool,
+    m1_delta: bool,
+    explicit_flush: bool,
+    reductions_pending: bool,
+}
+
+fn classify_materialize_reason(input: MaterializeReasonInputs) -> Option<String> {
+    let MaterializeReasonInputs {
+        plan,
+        bootstrap_due,
+        legacy_baseline,
+        render_config_changed,
+        profile_transition,
+        first_fold_due,
+        ttl_expired,
+        coverage_fold_due,
+        reconcile_hard_due,
+        coverage_delta,
+        m1_delta,
+        explicit_flush,
+        reductions_pending,
+    } = input;
+    let reason = match plan {
+        PassPlan::Hard | PassPlan::MigrateHard => {
+            if bootstrap_due {
+                "first_render"
+            } else if legacy_baseline {
+                "legacy_migration"
+            } else if profile_transition {
+                "profile_transition"
+            } else if render_config_changed {
+                "epoch_change"
+            } else if coverage_fold_due || first_fold_due {
+                "coverage_fold"
+            } else if ttl_expired {
+                "ttl_expiry"
+            } else if reconcile_hard_due {
+                "reconcile"
+            } else {
+                "hard_trigger"
+            }
+        }
+        PassPlan::Soft => {
+            if explicit_flush {
+                "explicit_flush"
+            } else if coverage_delta {
+                "coverage_fold"
+            } else if m1_delta {
+                "m1_delta"
+            } else if reductions_pending {
+                "selection"
+            } else {
+                "m1_delta"
+            }
+        }
+        PassPlan::Defer | PassPlan::Reject(_) => return None,
+    };
+    Some(reason.to_string())
+}
+
 fn action_str(plan: &PassPlan, _core: &CoreState) -> String {
     match plan {
         PassPlan::Hard | PassPlan::MigrateHard => "HARD",
@@ -4799,6 +4986,45 @@ mod tests {
             },
         })
         .unwrap()
+    }
+
+    #[test]
+    fn timings_are_present_and_old_responses_deserialize_without_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let response = run(
+            &store,
+            &req("timings", "", vec![item("m1", 0, "hello")]),
+            &[],
+        );
+        let timings = response
+            .timings
+            .as_ref()
+            .expect("normal responses include timings");
+        assert!(timings.total >= 0.0);
+        assert!(timings.seed_or_sync >= 0.0);
+        assert!(timings.decide >= 0.0);
+        assert!(timings.compose_m0m1 >= 0.0);
+        assert!(timings.selection >= 0.0);
+        assert!(timings.todo >= 0.0);
+        assert!(timings.build_output >= 0.0);
+        assert!(timings.store_commit >= 0.0);
+        assert_eq!(response.decision, "HARD");
+        assert_eq!(response.materialize_reason.as_deref(), Some("first_render"));
+
+        let mut old_wire = serde_json::to_value(&response).unwrap();
+        let object = old_wire.as_object_mut().unwrap();
+        object.remove("decision");
+        object.remove("materialize_reason");
+        object.remove("timings");
+        let old_response: TransformResponse = serde_json::from_value(old_wire).unwrap();
+        assert_eq!(old_response.decision, "");
+        assert_eq!(old_response.materialize_reason, None);
+        assert_eq!(old_response.timings, None);
+        assert_eq!(
+            serde_json::from_value::<TransformTimings>(json!({})).unwrap(),
+            TransformTimings::default()
+        );
     }
 
     fn run_active_surface_test<T>(f: impl FnOnce() -> T) -> T {
@@ -5460,6 +5686,12 @@ mod tests {
         let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
         ctx.injected_reductions = d.to_vec();
         transform(s, req, &ctx).unwrap()
+    }
+
+    fn comparable_response(response: TransformResponse) -> Value {
+        let mut wire = serde_json::to_value(response).unwrap();
+        wire.as_object_mut().unwrap().remove("timings");
+        wire
     }
 
     fn synthetic_text(r: &TransformResponse, index: usize) -> &str {
@@ -11286,8 +11518,8 @@ mod tests {
                 let right_response = run(&right, &explicit, &spine());
                 assert_eq!(left_response.action, expected_action, "{profile:?}");
                 assert_eq!(
-                    serde_json::to_value(left_response).unwrap(),
-                    serde_json::to_value(right_response).unwrap(),
+                    comparable_response(left_response),
+                    comparable_response(right_response),
                     "{profile:?}"
                 );
             }
@@ -11299,8 +11531,8 @@ mod tests {
             let right_soft = run(&right, &explicit, &spine());
             assert_eq!(left_soft.action, "SOFT", "{profile:?}");
             assert_eq!(
-                serde_json::to_value(left_soft).unwrap(),
-                serde_json::to_value(right_soft).unwrap(),
+                comparable_response(left_soft),
+                comparable_response(right_soft),
                 "{profile:?}"
             );
 
@@ -11316,8 +11548,8 @@ mod tests {
             let right_fold = run(&right, &explicit_fold, &spine());
             assert_eq!(left_fold.action, "HARD", "{profile:?}");
             assert_eq!(
-                serde_json::to_value(left_fold).unwrap(),
-                serde_json::to_value(right_fold).unwrap(),
+                comparable_response(left_fold),
+                comparable_response(right_fold),
                 "{profile:?}"
             );
             assert_eq!(

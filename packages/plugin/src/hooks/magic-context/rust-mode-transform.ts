@@ -18,6 +18,7 @@ import {
     getOverflowState,
     isEmergencyRecoveryArmed,
 } from "../../features/magic-context/storage-meta-persisted";
+import { writeRustTransformDecision } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
 import { maybeDeliverChannel2 } from "./channel2-delivery";
@@ -158,6 +159,28 @@ function newestUserMessage(messages: MessageLike[]): MessageLike | undefined {
         if (messageInfo(messages[index]).role === "user") return messages[index];
     }
     return undefined;
+}
+
+function newestAssistantOrUserMessageId(messages: MessageLike[]): string | null {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const info = messageInfo(messages[index]);
+        if (info.role !== "assistant" && info.role !== "user") continue;
+        if (typeof info.id === "string" && info.id.length > 0) return info.id;
+    }
+    return null;
+}
+
+function formatRustPassLog(args: {
+    decision: string;
+    reason: string;
+    servedFrom: string;
+    inputCount: number;
+    outputCount: number;
+    applied: boolean;
+    elapsedMs: number;
+    moduleElapsedMs: number;
+}): string {
+    return `rust pass: decision=${args.decision} reason=${args.reason} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms`;
 }
 
 function isSyntheticUserMessage(message: MessageLike | undefined): boolean {
@@ -707,6 +730,7 @@ export function createRustModeTransform(
         output: { messages: unknown[] },
         sessionMeta: ReturnType<typeof getOrCreateSessionMeta>,
     ): Promise<void> => {
+        const passStartedAt = performance.now();
         const state = ensureState(states, sessionId);
         state.passCount += 1;
         const syntheticTurn = observeSyntheticTurn(state, messages);
@@ -719,13 +743,49 @@ export function createRustModeTransform(
             );
         }
         const inputCount = messages.length;
+        let requestInputTokens = 0;
+        const newestMessageId = newestAssistantOrUserMessageId(messages);
         let decision = "error";
+        let materializeReason = "none";
         let servedFrom = "none";
+        let moduleElapsedMs = 0;
+        let appliedAt: number | undefined;
         const finishPass = (applied: boolean): void => {
+            const elapsedAt = applied && appliedAt !== undefined ? appliedAt : performance.now();
+            const elapsedMs = Math.max(0, elapsedAt - passStartedAt);
             sessionLog(
                 sessionId,
-                `rust pass: decision=${decision} served_from=${servedFrom} in=${inputCount} out=${output.messages.length} applied=${applied}`,
+                formatRustPassLog({
+                    decision,
+                    reason: materializeReason,
+                    servedFrom,
+                    inputCount,
+                    outputCount: output.messages.length,
+                    applied,
+                    elapsedMs,
+                    moduleElapsedMs,
+                }),
             );
+        };
+        const captureResponseTelemetry = (response: Record<string, unknown>): void => {
+            decision =
+                typeof response.decision === "string"
+                    ? response.decision
+                    : typeof response.action === "string"
+                      ? response.action
+                      : typeof response.status === "string"
+                        ? response.status
+                        : "unknown";
+            servedFrom =
+                typeof response.served_from === "string" ? response.served_from : "unknown";
+            materializeReason =
+                typeof response.materialize_reason === "string" &&
+                response.materialize_reason.length > 0
+                    ? response.materialize_reason
+                    : "none";
+            const timings = isRecord(response.timings) ? response.timings : undefined;
+            const total = timings?.total;
+            moduleElapsedMs = typeof total === "number" && Number.isFinite(total) ? total : 0;
         };
         if (state.parked) {
             state.passesSincePark += 1;
@@ -756,6 +816,7 @@ export function createRustModeTransform(
             const modelKey = model ? resolveModelKey(model.providerID, model.modelID) : null;
             if (model) deps.liveModelBySession?.set(sessionId, model);
             const usage = loadContextUsage(deps.contextUsageMap, deps.db, sessionId);
+            requestInputTokens = Math.max(0, Math.floor(usage.inputTokens));
             const resolvedContextLimit = model
                 ? resolveTrustedContextLimit(model.providerID, model.modelID, {
                       db: deps.db,
@@ -889,14 +950,7 @@ export function createRustModeTransform(
                 );
             }
             if (!response) throw new Error("rust module returned no transform response");
-            decision =
-                typeof response.action === "string"
-                    ? response.action
-                    : typeof response.status === "string"
-                      ? response.status
-                      : "unknown";
-            servedFrom =
-                typeof response.served_from === "string" ? response.served_from : "unknown";
+            captureResponseTelemetry(response);
             if (isNeedFullSync(response)) {
                 state.initialized = false;
                 await syncModuleState({
@@ -923,14 +977,17 @@ export function createRustModeTransform(
                     );
                 }
                 if (!response) throw new Error("rust module returned no retry transform response");
-                decision =
-                    typeof response.action === "string"
-                        ? response.action
-                        : typeof response.status === "string"
-                          ? response.status
-                          : "unknown";
-                servedFrom =
-                    typeof response.served_from === "string" ? response.served_from : "unknown";
+                captureResponseTelemetry(response);
+            }
+            if (newestMessageId) {
+                writeRustTransformDecision({
+                    db: deps.db,
+                    sessionId,
+                    messageId: newestMessageId,
+                    decision,
+                    materializeReason: materializeReason === "none" ? null : materializeReason,
+                    inputTokens: requestInputTokens,
+                });
             }
             const deliveryPassIds = noteDeliveryPassIds(response);
             const sendNoteDeliveryDisposition = async (
@@ -957,6 +1014,7 @@ export function createRustModeTransform(
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {
                     assertNativeBoundary(appliedMessages, sessionId, boundaryId);
                 }
+                appliedAt = performance.now();
             } catch (error) {
                 try {
                     await sendNoteDeliveryDisposition("transform.nack");
@@ -1086,6 +1144,7 @@ export async function runRustModeTransform(
 export const __rustModeTransformTest = {
     applyNativeMessagesVerbatim,
     buildTransformBody,
+    formatRustPassLog,
     createRustModeTransform,
     directiveTextOf,
     prepareRustMemoryAuthority,

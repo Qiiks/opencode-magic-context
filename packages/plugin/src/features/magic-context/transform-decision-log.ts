@@ -25,7 +25,12 @@ export type CanonicalMaterializeReason =
     | "upgrade_state"
     | "cached_m1_missing"
     | "project_change"
-    | "compartment_render_epoch";
+    | "compartment_render_epoch"
+    | "m1_delta"
+    | "ttl_expiry"
+    | "epoch_change"
+    | "coverage_fold"
+    | "profile_transition";
 
 export interface PendingTransformDecision {
     tsMs: number;
@@ -64,6 +69,11 @@ const canonicalReasons = new Set<string>([
     "cached_m1_missing",
     "project_change",
     "compartment_render_epoch",
+    "m1_delta",
+    "ttl_expiry",
+    "epoch_change",
+    "coverage_fold",
+    "profile_transition",
 ]);
 
 const piReasonAliases: Record<string, CanonicalMaterializeReason> = {
@@ -112,6 +122,56 @@ export function normalizeMaterializeReason(
     // mustMaterialize().reason. Pi records the same path as "drift" above, but
     // keep this fallback for cross-harness parity and future callers.
     return rematerialized ? "pressure_refold" : null;
+}
+
+/**
+ * Record a Rust module pass immediately. Rust has already classified the pass, so there is
+ * no TypeScript post-transform pending state to wait for; the caller supplies the newest
+ * message id currently visible to the wrapper.
+ */
+export function writeRustTransformDecision(args: {
+    db: Database;
+    sessionId: string;
+    messageId: string;
+    decision: string;
+    materializeReason: string | null;
+    inputTokens: number;
+    tsMs?: number;
+}): void {
+    if (args.messageId.length === 0) return;
+    const mapped =
+        args.decision === "HARD"
+            ? { decision: "execute" as const, materialized: true }
+            : args.decision === "SOFT"
+              ? { decision: "execute" as const, materialized: false }
+              : args.decision === "SOFT+"
+                ? { decision: "defer" as const, materialized: false }
+                : null;
+    if (!mapped) return;
+    const row: TransformDecisionRow = {
+        sessionId: args.sessionId,
+        harness: "opencode",
+        messageId: args.messageId,
+        tsMs: args.tsMs ?? Date.now(),
+        decision: mapped.decision,
+        materialized: mapped.materialized,
+        materializeReason: args.materializeReason as CanonicalMaterializeReason | null,
+        emergency: false,
+        droppedTokens: 0,
+        droppedCount: 0,
+        inputTokens: args.inputTokens,
+        bustedThisPass: true,
+    };
+    const dbPath = getDatabasePath(args.db);
+    if (dbPath) {
+        writeTransformDecisionBestEffort(dbPath, row);
+        return;
+    }
+    try {
+        writeTransformDecisionRowOnDatabase(args.db, row, false);
+    } catch {
+        // Best-effort telemetry only. Never throw into the transform hook.
+    }
 }
 
 export function clearOpenCodePendingTransformDecision(sessionId: string): void {
@@ -325,32 +385,43 @@ function writeTransformDecisionBestEffort(dbPath: string, row: TransformDecision
 function writeTransformDecisionRow(dbPath: string, row: TransformDecisionRow): void {
     const db = new Database(dbPath);
     try {
-        db.exec("PRAGMA busy_timeout=0");
-        db.prepare(
-            `INSERT OR REPLACE INTO transform_decisions (
+        writeTransformDecisionRowOnDatabase(db, row, true);
+    } finally {
+        closeQuietly(db);
+    }
+}
+
+function writeTransformDecisionRowOnDatabase(
+    db: Database,
+    row: TransformDecisionRow,
+    configureBusyTimeout: boolean,
+): void {
+    if (configureBusyTimeout) db.exec("PRAGMA busy_timeout=0");
+    db.prepare(
+        `INSERT OR REPLACE INTO transform_decisions (
                 session_id, harness, message_id, ts_ms, decision, materialized,
                 materialize_reason, emergency, dropped_tokens, dropped_count, input_tokens
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(
-            row.sessionId,
-            row.harness,
-            row.messageId,
-            row.tsMs,
-            row.decision,
-            row.materialized ? 1 : 0,
-            row.materializeReason,
-            row.emergency ? 1 : 0,
-            Math.max(0, Math.floor(row.droppedTokens)),
-            Math.max(0, Math.floor(row.droppedCount)),
-            Math.max(0, Math.floor(row.inputTokens)),
-        );
-        // Enforce the per-(session,harness) retention cap so a long session's
-        // cache-affecting passes can't grow this telemetry table unbounded (the
-        // dashboard loads all matching rows for cause attribution). Keep the
-        // newest TRANSFORM_DECISIONS_RETENTION rows by (ts_ms, rowid). Best-effort
-        // on the same non-blocking handle; a failure just defers the prune.
-        db.prepare(
-            `DELETE FROM transform_decisions
+    ).run(
+        row.sessionId,
+        row.harness,
+        row.messageId,
+        row.tsMs,
+        row.decision,
+        row.materialized ? 1 : 0,
+        row.materializeReason,
+        row.emergency ? 1 : 0,
+        Math.max(0, Math.floor(row.droppedTokens)),
+        Math.max(0, Math.floor(row.droppedCount)),
+        Math.max(0, Math.floor(row.inputTokens)),
+    );
+    // Enforce the per-(session,harness) retention cap so a long session's
+    // cache-affecting passes can't grow this telemetry table unbounded (the
+    // dashboard loads all matching rows for cause attribution). Keep the
+    // newest TRANSFORM_DECISIONS_RETENTION rows by (ts_ms, rowid). Best-effort
+    // on the same non-blocking handle; a failure just defers the prune.
+    db.prepare(
+        `DELETE FROM transform_decisions
              WHERE session_id = ? AND harness = ?
                AND rowid NOT IN (
                  SELECT rowid FROM transform_decisions
@@ -358,16 +429,13 @@ function writeTransformDecisionRow(dbPath: string, row: TransformDecisionRow): v
                  ORDER BY ts_ms DESC, rowid DESC
                  LIMIT ?
                )`,
-        ).run(
-            row.sessionId,
-            row.harness,
-            row.sessionId,
-            row.harness,
-            retentionOverrideForTests ?? TRANSFORM_DECISIONS_RETENTION,
-        );
-    } finally {
-        closeQuietly(db);
-    }
+    ).run(
+        row.sessionId,
+        row.harness,
+        row.sessionId,
+        row.harness,
+        retentionOverrideForTests ?? TRANSFORM_DECISIONS_RETENTION,
+    );
 }
 
 export const __test = {
