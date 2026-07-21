@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
+use chrono::{Local, TimeZone};
 use mc_store::{McStore, StoredCompartment};
 use mc_tokenizer::estimate_tokens;
 use regex::Regex;
@@ -329,6 +330,7 @@ pub fn build_historian_chunk(
     let tool_call_summaries = build_tool_call_summary_lookup(blocks);
     let mut builder = Builder::new(token_budget, start, tool_call_summaries);
     let blocks_by_mid = grouped_blocks_by_mid(blocks);
+    let mut highest_scanned_ordinal = end_placeholder(start);
     for message in messages.iter().filter(|message| !message.ck.meta.synthetic) {
         if message.ordinal >= eligible_end_ordinal {
             continue;
@@ -351,10 +353,22 @@ pub fn build_historian_chunk(
         if !builder.push_message(&flat_message) {
             break;
         }
+        if builder.current_block.is_none() {
+            highest_scanned_ordinal = highest_scanned_ordinal.max(
+                builder
+                    .pending_noise_meta
+                    .last()
+                    .map(|meta| meta.ordinal)
+                    .unwrap_or(highest_scanned_ordinal),
+            );
+        }
     }
     let _ = builder.flush_current_block();
     let tool_only_ranges = merge_tool_only_ranges(&builder.tool_only_ranges);
     let end = builder.last_ordinal;
+    // Filtering removes some scanned messages from the chunk text, but they still advance
+    // the reader. TS uses the furthest scanned ordinal for has_more rather than the last
+    // rendered line, otherwise a filtered tail is repeatedly offered to the historian.
     let present_ordinals = input_ordinals;
     let snapshot = blocks
         .iter()
@@ -382,7 +396,8 @@ pub fn build_historian_chunk(
         snapshot,
         end_message_id: builder.last_message_id,
         token_estimate: builder.total_tokens,
-        has_more: end < eligible_end_ordinal.saturating_sub(1).min(total_count),
+        has_more: end.max(highest_scanned_ordinal)
+            < eligible_end_ordinal.saturating_sub(1).min(total_count),
         commit_cluster_count: builder.commit_cluster_count,
     }
 }
@@ -435,6 +450,8 @@ pub struct AssembledHistorianFiring {
     pub to_ordinal: u64,
     pub now_ms: i64,
     pub failure_backoff_at_ms: i64,
+    /// Native message ids mapped to local YYYY-MM-DD dates for temporal headings.
+    pub boundary_dates: BTreeMap<String, String>,
 }
 
 impl AssembledHistorianFiring {
@@ -463,6 +480,7 @@ impl AssembledHistorianFiring {
             observed_chunk_fingerprint: &self.chunk_fingerprint,
             validation_chunk: &self.chunk.chunk,
             chunk_transcript: &self.chunk.text,
+            boundary_dates: &self.boundary_dates,
             prior_compartments: &self.prior_compartments,
             validate_options: self.validate_options,
             now_ms: self.now_ms,
@@ -564,6 +582,7 @@ pub fn assemble_historian_firing(
         ));
     }
 
+    let boundary_dates = native_boundary_dates(messages);
     let reference_blocks = build_reference_blocks_from_stored(
         &config.session_id,
         chunk.chunk.start_index as i64,
@@ -612,6 +631,7 @@ pub fn assemble_historian_firing(
             },
             now_ms,
             failure_backoff_at_ms: config.failure_backoff_at_ms,
+            boundary_dates,
             chunk,
         },
     )))
@@ -625,17 +645,18 @@ pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> S
         return input.to_string();
     }
 
-    // TypeScript slices by UTF-16 code units. Rust strings cannot be sliced at
-    // arbitrary UTF-16 offsets, so this port uses Unicode scalar-value indices
-    // while preserving the marker bytes, `<=` budget checks, and midpoint math.
+    // TypeScript slices by UTF-16 code units. Keep the same search space rather than
+    // treating an astral character as one scalar; a cut through a surrogate pair is
+    // represented by the replacement scalar Rust can safely emit for that lone unit.
+    let input_units: Vec<u16> = input.encode_utf16().collect();
     let mut lo = 0usize;
-    let mut hi = input.chars().count();
+    let mut hi = input_units.len();
     let mut best = 0usize;
     while lo <= hi {
         let mid = (lo + hi) >> 1;
         let candidate = format!(
             "{}{}",
-            input.chars().take(mid).collect::<String>(),
+            utf16_prefix(&input_units, mid),
             HISTORIAN_TRUNCATION_MARKER
         );
         if estimate_tokens(&candidate) <= token_budget {
@@ -650,9 +671,42 @@ pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> S
 
     format!(
         "{}{}",
-        input.chars().take(best).collect::<String>(),
+        utf16_prefix(&input_units, best),
         HISTORIAN_TRUNCATION_MARKER
     )
+}
+
+fn utf16_prefix(units: &[u16], requested: usize) -> String {
+    let mut end = requested.min(units.len());
+    if end > 0 && (0xD800..=0xDBFF).contains(&units[end - 1]) {
+        end -= 1;
+    }
+    String::from_utf16_lossy(&units[..end])
+}
+
+fn end_placeholder(start: u64) -> u64 {
+    start.saturating_sub(1)
+}
+
+pub(crate) fn native_boundary_dates(messages: &[CkIngressMessage]) -> BTreeMap<String, String> {
+    messages
+        .iter()
+        .filter_map(|message| {
+            message
+                .ck
+                .meta
+                .created_at_ms
+                .and_then(format_native_date)
+                .map(|date| (message.mid.clone(), date))
+        })
+        .collect()
+}
+
+fn format_native_date(timestamp_ms: i64) -> Option<String> {
+    Local
+        .timestamp_millis_opt(timestamp_ms)
+        .single()
+        .map(|date| date.format("%Y-%m-%d").to_string())
 }
 
 pub(crate) fn stored_range(c: &StoredCompartment) -> StoredCompartmentRange {

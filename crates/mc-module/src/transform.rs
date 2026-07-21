@@ -70,7 +70,7 @@ const PENDING_REWRITE_AMBIGUOUS_EDGE_THRESHOLD: u32 = 5;
 const CHANNEL1_FLOOR_TOKENS: i64 = 10_000;
 const CHANNEL1_REFIRE_FLOOR_TOKENS: i64 = 10_000;
 const CHANNEL1_PRESSURE_FLOOR: f64 = 0.8;
-const CHANNEL1_USABLE_FRACTION: f64 = 1.0 / 3.0;
+const CHANNEL1_GENTLE_FRACTION: f64 = 0.2;
 const CHANNEL2_MIN_RECLAIMABLE: i64 = 10_000;
 const CHANNEL2_USABLE_FRACTION: f64 = 1.0 / 3.0;
 const TEMPORAL_AWARENESS_THRESHOLD_MS: i64 = 5 * 60 * 1_000;
@@ -194,6 +194,10 @@ pub struct ProducerContext<'a> {
     /// this pass already rewrites cached context; updating wall-clock text during an
     /// otherwise stable pass would make the date itself a reason to rewrite again.
     pub guidance_date: Option<String>,
+    /// True while this process has a historian firing/awaiting/validation/publish lease.
+    /// Ordinary reductions and deferred m1 consumption yield so publication is coalesced
+    /// into the next materializing pass.
+    pub historian_active: bool,
     #[cfg(test)]
     pub injected_reductions: Vec<ReductionDecision>,
 }
@@ -725,6 +729,10 @@ struct ActiveTagForNudge {
     tag_number: i64,
     kind: String,
     token_count: i64,
+    /// The three token columns used by the TypeScript tag aggregate. Legacy module rows
+    /// store their combined weight in token_count and leave the split lanes at zero.
+    input_token_count: i64,
+    reasoning_token_count: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1261,17 +1269,6 @@ fn apply_once(
         overflow_error_text: req.provider_error.clone(),
     });
     timings.decide += elapsed_ms(decide_scheduler_started_at);
-    if req.is_subagent
-        && matches!(
-            scheduler_outcome.pass,
-            scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95
-        )
-    {
-        // Subagent passes must not use the primary session's Force85 or Emergency95
-        // materialization path; they keep the normal execute/drop cadence at those pressures.
-        scheduler_outcome.pass = scheduler::PassDecision::Execute;
-        scheduler_outcome.drain_latch = LatchState::default();
-    }
     // A flush requests work on the next pass, not a new m0 fold. Promote only a normal
     // defer to Execute; mandatory bootstrap, epoch, and pressure decisions retain priority.
     if loaded.meta.soft_refresh_pending && scheduler_outcome.pass == scheduler::PassDecision::Defer
@@ -1348,13 +1345,21 @@ fn apply_once(
         || project_memory_epoch_hard_due;
     // Bust-opportunity table (the deferred-work invariant): bootstrap/legacy/reconcile/shape
     // repair, render-config or epoch HARD, requested HARD, TTL/system HARD, refresh/flush,
-    // Force/Emergency drives, and first reduction application are opportunities. An ordinary
-    // Execute with zero selected reductions is not; the pending m1 delta remains the final
-    // fallback and cannot manufacture a provider-visible bust.
+    // Force/Emergency drives, first reduction application, and every ordinary Execute are
+    // opportunities. An active historian vetoes only the ordinary-pass arms so publication
+    // can be coalesced into the next materializing pass.
     let emergency_arm_engaged = matches!(
         scheduler_outcome.pass,
         scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95
     ) || scheduler_outcome.drain_latch.is_active();
+    let ordinary_historian_veto = ctx.historian_active
+        && scheduler_outcome.pass == scheduler::PassDecision::Execute
+        && !hard_fold_requested
+        && !emergency_arm_engaged
+        && !loaded.meta.soft_refresh_pending
+        && !render_config_changed
+        && !reconcile_hard_due
+        && loaded.meta.initialized;
     let pass_already_busting = !loaded.meta.initialized
         || render_config_changed
         || hard_fold_requested
@@ -1374,7 +1379,7 @@ fn apply_once(
                 || reconcile_hard_due
                 || hard_fold_requested,
         );
-    let selection_class = if producer_gate {
+    let selection_class = if producer_gate && !ordinary_historian_veto {
         selection_pass_class(scheduler_outcome.pass)
     } else {
         PassClass::Defer
@@ -1491,10 +1496,13 @@ fn apply_once(
         m1_revision_changed: current_m1_digest != loaded.meta.m1_revision
             || loaded.meta.soft_refresh_pending,
         reductions_pending: reductions_pending_now,
-        // A plain Execute with zero selected reductions is byte-identical and must still
-        // defer a pending in-session delta. First reduction application, explicit refresh,
-        // hard/force/emergency arms, and bootstrap are genuine render opportunities.
-        bust_opportunity: pass_already_busting || reductions_pending_now,
+        // Scheduler Execute is a genuine deferred-work consumption opportunity even when
+        // no reduction was selected. An active historian is the one ordinary-pass veto;
+        // hard/force/emergency arms bypass it.
+        bust_opportunity: (matches!(scheduler_outcome.pass, scheduler::PassDecision::Execute)
+            && !ordinary_historian_veto)
+            || pass_already_busting
+            || reductions_pending_now,
     });
     timings.decide += elapsed_ms(classify_started_at);
     if req.is_subagent {
@@ -1653,6 +1661,7 @@ fn apply_once(
                         memory_budget_tokens: ctx.memory_budget_tokens,
                         user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                         inject_docs: ctx.inject_docs,
+                        temporal_awareness: ctx.temporal_awareness,
                     },
                     estimate_tokens,
                 )?;
@@ -1747,6 +1756,7 @@ fn apply_once(
                                     memory_budget_tokens: ctx.memory_budget_tokens,
                                     user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                                     inject_docs: ctx.inject_docs,
+                                    temporal_awareness: ctx.temporal_awareness,
                                 },
                                 estimate_tokens,
                             )?;
@@ -1870,6 +1880,7 @@ fn apply_once(
                     ctx.now_ms,
                 )?;
                 meta.m1_revision = applied_m1_signal.revision;
+                meta.m1_user_profile_version = loaded.meta.user_profile_version;
                 meta.m1_external_revision = applied_m1_signal.external_revision;
                 meta.project_memory_epoch_pending = false;
                 meta.m1_pending_since_ms = None;
@@ -1889,7 +1900,10 @@ fn apply_once(
                     &req.session_id,
                     &meta,
                     meta.expiry_cutoff_ms,
+                    ctx.memory_enabled,
                     ctx.memory_budget_tokens,
+                    ctx.user_profile_budget_tokens,
+                    ctx.temporal_awareness,
                     mc_tokenizer::estimate_tokens,
                 )?;
                 note_deliveries = m1.note_deliveries.clone();
@@ -1935,6 +1949,7 @@ fn apply_once(
                             memory_budget_tokens: ctx.memory_budget_tokens,
                             user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                             inject_docs: ctx.inject_docs,
+                            temporal_awareness: ctx.temporal_awareness,
                         },
                         estimate_tokens,
                     )?;
@@ -1968,6 +1983,7 @@ fn apply_once(
                     meta.max_memory_id = comp.max_memory_id;
                     meta.expiry_cutoff_ms = ctx.now_ms;
                     meta.m1_revision = m1_signal.revision;
+                    meta.m1_user_profile_version = loaded.meta.user_profile_version;
                     meta.m1_external_revision = m1_signal.external_revision;
                     meta.project_memory_epoch_pending = false;
                     meta.m1_pending_since_ms = None;
@@ -2054,7 +2070,12 @@ fn apply_once(
                         loaded.meta.user_profile_version,
                         ctx.now_ms,
                     )?;
-                    meta.m1_revision = applied_m1_signal.revision;
+                    if m1_has_content {
+                        meta.m1_revision = applied_m1_signal.revision;
+                    }
+                    if m1.profile_rendered {
+                        meta.m1_user_profile_version = loaded.meta.user_profile_version;
+                    }
                     meta.m1_pending_since_ms = None;
                 }
             }
@@ -2224,9 +2245,7 @@ fn apply_once(
         loaded.row_version.unwrap_or(0)
     };
     timings.store_commit = elapsed_ms(store_commit_started_at);
-    let host_directives = if req.is_subagent {
-        None
-    } else {
+    let host_directives = {
         channel2_directive(Channel2DirectiveInput {
             profile: serializer_profile,
             core: &core,
@@ -4380,13 +4399,13 @@ fn maybe_append_channel1_nudge(
         / 100.0)
         .round()
         .max(0.0) as i64;
-    let reclaimable_tokens = reclaimable_older_than_working_window(
-        &active_tags,
-        working_window_tokens,
-        input.protected_tags,
-    );
+    let undropped_tokens = active_tags
+        .iter()
+        .filter(|tag| tag.kind == "tool_result")
+        .map(|tag| tag.token_count.max(0))
+        .sum::<i64>();
     let decision = decide_channel1(
-        reclaimable_tokens,
+        undropped_tokens,
         live_tail_tokens,
         working_window_tokens,
         input.context_limit_tokens,
@@ -4441,10 +4460,14 @@ fn active_tags_for_nudge(
             && mutation_exempt_mid != Some(block.mid.as_str())
     }) {
         if let Some(row) = tag_by_block.get(block.id.as_str()) {
+            let (input_token_count, reasoning_token_count) =
+                channel2_extra_token_lanes(block, projection);
             out.push(ActiveTagForNudge {
                 tag_number: row.tag_number,
                 kind: row.kind.clone(),
                 token_count: row.token_count.max(0),
+                input_token_count,
+                reasoning_token_count,
             });
         }
     }
@@ -4477,14 +4500,46 @@ fn active_tags_for_channel2(
         let Some((kind, source)) = taggable_source(block) else {
             continue;
         };
+        let (input_token_count, reasoning_token_count) =
+            channel2_extra_token_lanes(block, projection);
         derived.push(ActiveTagForNudge {
             tag_number: next_tag,
             kind: kind.as_store_kind().to_string(),
             token_count: mc_tokenizer::estimate_tokens(source) as i64,
+            input_token_count,
+            reasoning_token_count,
         });
         next_tag = next_tag.saturating_add(1);
     }
     derived
+}
+
+fn channel2_extra_token_lanes(
+    block: &crate::ck_wire::FlatBlock,
+    projection: &FlatProjection,
+) -> (i64, i64) {
+    if block.kind_tag != "tool_result" {
+        return (0, 0);
+    }
+    let Some(arc_id) = block.arc_id.as_deref() else {
+        return (0, 0);
+    };
+    let input_tokens = projection
+        .blocks
+        .iter()
+        .filter(|candidate| candidate.arc_id.as_deref() == Some(arc_id))
+        .filter(|candidate| candidate.kind_tag == "tool_call")
+        .filter_map(|candidate| candidate.tool_input.as_ref())
+        .map(|input| mc_tokenizer::estimate_tokens(&input.to_string()) as i64)
+        .sum();
+    let reasoning_tokens = projection
+        .blocks
+        .iter()
+        .filter(|candidate| candidate.arc_id.as_deref() == Some(arc_id))
+        .filter(|candidate| candidate.kind_tag == "reasoning")
+        .map(|candidate| mc_tokenizer::estimate_tokens(&candidate.bytes) as i64)
+        .sum();
+    (input_tokens, reasoning_tokens)
 }
 
 struct Channel2DirectiveInput<'a> {
@@ -4562,12 +4617,19 @@ fn channel2_token_aggregate(
         .iter()
         .filter(|tag| tag.kind == "tool_result")
         .filter(|tag| protected_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff))
-        .map(|tag| tag.token_count.max(0))
+        .map(|tag| {
+            tag.token_count.max(0) + tag.input_token_count.max(0) + tag.reasoning_token_count.max(0)
+        })
         .sum();
     // The usable range includes the full live tail, including tool results. Only
     // tool-result bytes are reclaimable; excluding them here would make the ceiling
     // predicate fire early compared with the host aggregate (conversation + tool I/O).
-    let live_tail = active_tags.iter().map(|tag| tag.token_count.max(0)).sum();
+    let live_tail = active_tags
+        .iter()
+        .map(|tag| {
+            tag.token_count.max(0) + tag.input_token_count.max(0) + tag.reasoning_token_count.max(0)
+        })
+        .sum();
     (reclaimable, live_tail)
 }
 
@@ -4594,35 +4656,9 @@ fn build_channel2_reminder(reclaimable_tokens: i64, hint: &[(i64, String)]) -> S
     )
 }
 
-fn reclaimable_older_than_working_window(
-    active_tags: &[ActiveTagForNudge],
-    working_window_tokens: i64,
-    protected_tags: usize,
-) -> i64 {
-    let mut protected = HashSet::new();
-    let mut sum = 0i64;
-    for tag in active_tags.iter().rev() {
-        if sum >= working_window_tokens.max(0) {
-            break;
-        }
-        protected.insert(tag.tag_number);
-        sum += tag.token_count.max(0);
-    }
-    let configured_cutoff = protected_tag_cutoff(active_tags, protected_tags);
-    active_tags
-        .iter()
-        .filter(|tag| {
-            tag.kind == "tool_result"
-                && !protected.contains(&tag.tag_number)
-                && configured_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff)
-        })
-        .map(|tag| tag.token_count.max(0))
-        .sum()
-}
-
 fn decide_channel1(
     reclaimable_tokens: i64,
-    live_tail_tokens: i64,
+    _live_tail_tokens: i64,
     working_window_tokens: i64,
     context_limit_tokens: f64,
     input_tokens: f64,
@@ -4660,27 +4696,18 @@ fn decide_channel1(
         return quiet(last_nudge, last_level_string(last_level));
     }
     let pressure = if context_limit_tokens > 0.0 && execute_threshold_percentage > 0.0 {
-        ((input_tokens / context_limit_tokens) * 100.0 / execute_threshold_percentage)
-            .clamp(0.0, 1.0)
+        (input_tokens / context_limit_tokens * 100.0 / execute_threshold_percentage).clamp(0.0, 1.0)
     } else {
         0.0
     };
     if pressure < CHANNEL1_PRESSURE_FLOOR {
         return quiet(last_nudge, last_level_string(last_level));
     }
-    let execute_threshold_tokens =
-        context_limit_tokens * execute_threshold_percentage.clamp(1.0, 100.0) / 100.0;
-    let usable_tokens =
-        (execute_threshold_tokens - input_tokens + live_tail_tokens as f64).max(0.0);
-    if usable_tokens > 0.0 && (reclaimable_tokens as f64) < usable_tokens * CHANNEL1_USABLE_FRACTION
-    {
+    let estimated_input_tokens = input_tokens.max(1.0);
+    let severity = (reclaimable_tokens as f64 / estimated_input_tokens).clamp(0.0, 1.0);
+    if severity < CHANNEL1_GENTLE_FRACTION {
         return quiet(last_nudge, last_level_string(last_level));
     }
-    let severity = if working_window_tokens > 0 {
-        (reclaimable_tokens as f64 / working_window_tokens as f64).min(1.0)
-    } else {
-        1.0
-    };
     let level = if severity >= 0.65 {
         Channel1Level::Urgent
     } else if severity >= 0.4 {
@@ -4989,9 +5016,9 @@ fn message_strip_unit<'a>(core: &'a CoreState, kind: &str, mid: &str) -> Option<
 }
 
 fn message_tag_number(message: &CkIngressMessage, tag_numbers: &BTreeMap<String, u64>) -> u64 {
-    if tag_numbers.is_empty() {
-        return message.ordinal;
-    }
+    // A missing tag has unknown age. Ordinals are a separate identity space and must never
+    // be substituted here: clearing an untagged message would make a partial tag snapshot
+    // destructively appear older than it is.
     tag_numbers.get(&message.mid).copied().unwrap_or(0)
 }
 
@@ -5022,12 +5049,7 @@ fn tag_number_by_message(tags: &[McTagRow]) -> BTreeMap<String, u64> {
 }
 
 fn tag_age_cutoff(req: &TransformRequest, tag_numbers: &BTreeMap<String, u64>) -> Option<u64> {
-    let max_tag = req
-        .messages
-        .iter()
-        .filter(|message| !message.ck.meta.synthetic)
-        .map(|message| message_tag_number(message, tag_numbers))
-        .max()?;
+    let max_tag = tag_numbers.values().copied().max()?;
     let cutoff = max_tag.saturating_sub(req.clear_reasoning_age);
     (cutoff > 0).then_some(cutoff)
 }
@@ -5108,7 +5130,10 @@ fn new_frozen_strip_units(
         }
         if has_assistant_response
             && request_accepts_empty_content(req)
-            && age_cutoff.is_some_and(|cutoff| message_tag_number(message, tag_numbers) <= cutoff)
+            && age_cutoff.is_some_and(|cutoff| {
+                let tag = message_tag_number(message, tag_numbers);
+                tag > 0 && tag <= cutoff
+            })
             && blocks.iter().any(image_block_is_large)
         {
             let marker = strip_unit("processed_image", &message.mid, &sentinel);
@@ -5154,7 +5179,8 @@ fn apply_surface_strips(
 
     let stale_reduce = message_strip_unit(core, "stale_reduce", &message.mid).is_some();
     let image_seed = message_strip_unit(core, "processed_image", &message.mid).is_some();
-    let aged = message_tag_number(message, tag_numbers) <= reasoning_watermark;
+    let message_tag = message_tag_number(message, tag_numbers);
+    let aged = message_tag > 0 && message_tag <= reasoning_watermark;
     let mut touched = false;
     for block in blocks {
         let index = block.block_index;
@@ -5688,15 +5714,7 @@ fn reasoning_clear_cutoff_with_tags(
         return None;
     }
 
-    let max_tag = if tag_numbers.is_empty() {
-        req.messages
-            .iter()
-            .filter(|message| !message.ck.meta.synthetic)
-            .map(|message| message.ordinal)
-            .max()?
-    } else {
-        tag_numbers.values().copied().max()?
-    };
+    let max_tag = tag_numbers.values().copied().max()?;
     let cutoff = max_tag.saturating_sub(req.clear_reasoning_age);
     if cutoff == 0 {
         return None;
@@ -5705,9 +5723,10 @@ fn reasoning_clear_cutoff_with_tags(
     req.messages
         .iter()
         .filter(|message| {
-            !message.ck.meta.synthetic
-                && message.ck.role == "assistant"
-                && message_tag_number(message, tag_numbers) <= cutoff
+            !message.ck.meta.synthetic && message.ck.role == "assistant" && {
+                let tag = message_tag_number(message, tag_numbers);
+                tag > 0 && tag <= cutoff
+            }
         })
         .any(|message| {
             message
@@ -6679,6 +6698,7 @@ mod tests {
             model_key: None,
             observed_last_response_at_ms: None,
             guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
+            historian_active: false,
             injected_reductions: Vec::new(),
         }
     }
@@ -7655,7 +7675,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_in_session_delta_defers_across_execute_passes_until_flush() {
+    fn pending_in_session_delta_is_consumed_on_execute_but_deferred_passes_replay() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -7666,26 +7686,26 @@ mod tests {
         let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
         let boot = run(&s, &execute_req, &spine());
         assert_eq!(boot.action, "HARD");
-        let frozen = serde_json::to_vec(&boot.ck_messages).unwrap();
         s.update_memory_content("git:proj", memory_id, "pending rule", 1)
             .unwrap();
 
+        let consumed =
+            transform(&s, &execute_req, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
+        assert_eq!(consumed.action, "SOFT");
+        assert!(m1_bytes(&consumed).contains("pending rule"));
+        let consumed_bytes = serde_json::to_vec(&consumed.ck_messages).unwrap();
+
+        let defer_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 10, 100);
         for _ in 0..3 {
             let deferred =
-                transform(&s, &execute_req, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
+                transform(&s, &defer_req, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
+            assert_eq!(deferred.action, "SOFT+");
             assert_eq!(
-                deferred.action, "SOFT+",
-                "zero-drop Execute is defer-shaped"
+                serde_json::to_vec(&deferred.ck_messages).unwrap(),
+                consumed_bytes
             );
-            assert_eq!(serde_json::to_vec(&deferred.ck_messages).unwrap(), frozen);
-            assert!(!m1_bytes(&deferred).contains("pending rule"));
+            assert!(m1_bytes(&deferred).contains("pending rule"));
         }
-
-        s.arm_soft_refresh("ses").unwrap();
-        let folded =
-            transform(&s, &execute_req, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
-        assert_eq!(folded.action, "SOFT");
-        assert!(m1_bytes(&folded).contains("pending rule"));
     }
 
     #[test]
@@ -8231,7 +8251,7 @@ mod tests {
                 .unwrap()
                 .meta
                 .reasoning_cleared_through_ordinal,
-            5
+            0
         );
         assert!(first.committed);
 
@@ -8244,8 +8264,8 @@ mod tests {
                 .unwrap()
                 .meta
                 .reasoning_cleared_through_ordinal,
-            5,
-            "defer must replay a persisted boundary instead of moving it"
+            0,
+            "untagged reasoning has unknown age and must remain uncleared"
         );
         assert!(!second.committed);
     }

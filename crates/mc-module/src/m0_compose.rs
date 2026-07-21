@@ -105,6 +105,8 @@ pub struct M0ComposeInputs<'a> {
     pub user_profile_budget_tokens: f64,
     /// Whether the TypeScript materializer would include the project-docs block.
     pub inject_docs: bool,
+    /// Gate temporal heading dates at render time, including rows persisted by a prior pass.
+    pub temporal_awareness: bool,
 }
 
 fn memory_selection_order(
@@ -256,7 +258,7 @@ pub(crate) fn trim_memories_to_budget(
     selected
 }
 
-fn trim_user_profile_to_budget(
+pub(crate) fn trim_user_profile_to_budget(
     profile: Vec<String>,
     budget_tokens: f64,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
@@ -355,7 +357,14 @@ pub fn compose_m0_from_store(
     // their candidates. History keeps its existing decay-pressure fit in this same render.
     let decay_compartments: Vec<DecayRenderCompartment> = compartments
         .iter()
-        .map(DecayRenderCompartment::from)
+        .map(|compartment| {
+            let mut rendered = DecayRenderCompartment::from(compartment);
+            if !inputs.temporal_awareness {
+                rendered.start_date = None;
+                rendered.end_date = None;
+            }
+            rendered
+        })
         .collect();
     let m0_bytes = render_m0(
         &M0Inputs {
@@ -444,6 +453,7 @@ mod tests {
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
+            temporal_awareness: true,
         };
         let m0 = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
 
@@ -474,6 +484,7 @@ mod tests {
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: false,
+            temporal_awareness: true,
         };
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         assert!(!composed.m0_bytes.contains("secret docs"));
@@ -535,6 +546,7 @@ mod tests {
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
+            temporal_awareness: true,
         };
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         assert_eq!(
@@ -561,6 +573,7 @@ mod tests {
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
+            temporal_awareness: true,
         };
         let m0 = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
 
@@ -600,6 +613,7 @@ mod tests {
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
+            temporal_awareness: true,
         };
 
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
@@ -633,6 +647,7 @@ mod tests {
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
+            temporal_awareness: true,
         };
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         assert_eq!(composed.coverage_ordinal, Some(30));
@@ -660,6 +675,7 @@ mod tests {
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
+            temporal_awareness: true,
         };
         let a = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         let b = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
