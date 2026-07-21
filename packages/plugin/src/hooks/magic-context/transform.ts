@@ -2219,6 +2219,10 @@ export function createTransform(deps: TransformDeps) {
                         },
                         effective_execute_threshold: boundaryExecuteThreshold,
                         history_budget_tokens: historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+                        caveman_enabled:
+                            !sessionMeta.isSubagent &&
+                            deps.cavemanTextCompression?.enabled === true,
+                        caveman_min_chars: deps.cavemanTextCompression?.minChars ?? 500,
                         cache_ttl: sessionMeta.cacheTtl,
                         mid_turn: midTurn,
                         is_subagent: sessionMeta.isSubagent,

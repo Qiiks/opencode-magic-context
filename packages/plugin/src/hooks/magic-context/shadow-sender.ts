@@ -89,6 +89,8 @@ export interface ShadowPassInputs {
     };
     effective_execute_threshold: number;
     history_budget_tokens: number;
+    caveman_enabled?: boolean;
+    caveman_min_chars?: number;
     cache_ttl: string;
     provider_error?: string;
     /** True when the newest assistant message is still streaming. */

@@ -625,6 +625,8 @@ function buildTransformBody(args: {
         effective_execute_threshold: args.passInputs.effective_execute_threshold,
         history_budget_tokens: args.passInputs.history_budget_tokens,
         clear_reasoning_age: args.passInputs.clear_reasoning_age,
+        caveman_enabled: args.passInputs.caveman_enabled === true,
+        caveman_min_chars: args.passInputs.caveman_min_chars ?? 500,
         cache_ttl: args.passInputs.cache_ttl,
         pass_inputs: args.passInputs,
         declared_trim: args.declaredTrim,
@@ -885,6 +887,9 @@ export function createRustModeTransform(
                 effective_execute_threshold: threshold,
                 history_budget_tokens: historyBudgetTokens,
                 clear_reasoning_age: deps.clearReasoningAge,
+                caveman_enabled:
+                    !sessionMeta.isSubagent && deps.cavemanTextCompression?.enabled === true,
+                caveman_min_chars: deps.cavemanTextCompression?.minChars ?? 500,
                 cache_ttl: sessionMeta.cacheTtl,
                 mid_turn: midTurn,
                 is_subagent: sessionMeta.isSubagent,

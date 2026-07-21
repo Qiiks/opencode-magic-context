@@ -63,6 +63,8 @@ const SYNTH_REGION_KIND: &str = "synthesized-region";
 /// Frozen-unit key prefix for a tail reduction (a reduced tool output / superseded edit).
 /// `red:<target_id>` — the target is the real tail item whose bytes are replaced.
 const RED_KEY_PREFIX: &str = "red:";
+/// Frozen text-compression units. The suffix is the stable CK text-block id.
+const CAV_KEY_PREFIX: &str = "cav:";
 /// Repeated pending/raw ↔ present interleaving should be impossible with correctly
 /// separated upstream session keys. Five edges corresponds to three arm/clear cycles
 /// when the initial arm is not counted as evidence of multiplexing by itself.
@@ -83,6 +85,7 @@ const USER_HINT_RESULT_LIMIT: usize = 3;
 const USER_HINT_MIN_MATCHED_TOKENS: usize = 2;
 const USER_HINT_NORMALIZED_SCORE_FLOOR: f64 = 0.35;
 const DEFAULT_CLEAR_REASONING_AGE: u64 = 50;
+const DEFAULT_CAVEMAN_MIN_CHARS: usize = 500;
 const M1_PENDING_LOG_THRESHOLDS_MS: [i64; 3] =
     [5 * 60 * 1_000, 30 * 60 * 1_000, 2 * 60 * 60 * 1_000];
 static M1_PENDING_LOG_BUCKETS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
@@ -275,6 +278,12 @@ pub struct TransformRequest {
     /// its CK ingress does not carry TS tag numbers.
     #[serde(default = "default_clear_reasoning_age")]
     pub clear_reasoning_age: u64,
+    /// Whether deterministic caveman compression is enabled for this primary session.
+    #[serde(default)]
+    pub caveman_enabled: bool,
+    /// Minimum source byte length for an eligible caveman text block.
+    #[serde(default = "default_caveman_min_chars")]
+    pub caveman_min_chars: usize,
     /// Whether this request advertises the canonical reduction tool. Missing input is
     /// deliberately false so older callers stay on the dormant byte path.
     #[serde(default)]
@@ -339,6 +348,10 @@ fn default_clear_reasoning_age() -> u64 {
     DEFAULT_CLEAR_REASONING_AGE
 }
 
+fn default_caveman_min_chars() -> usize {
+    DEFAULT_CAVEMAN_MIN_CHARS
+}
+
 fn default_protected_tags() -> usize {
     20
 }
@@ -367,6 +380,10 @@ struct TransformRequestWire {
     model_key: Option<String>,
     #[serde(default = "default_clear_reasoning_age")]
     clear_reasoning_age: u64,
+    #[serde(default)]
+    caveman_enabled: bool,
+    #[serde(default = "default_caveman_min_chars")]
+    caveman_min_chars: usize,
     #[serde(default)]
     tool_present: bool,
     #[serde(default)]
@@ -425,6 +442,8 @@ impl<'de> Deserialize<'de> for TransformRequest {
             provider_id: wire.provider_id,
             model_key: wire.model_key,
             clear_reasoning_age: wire.clear_reasoning_age,
+            caveman_enabled: wire.caveman_enabled,
+            caveman_min_chars: wire.caveman_min_chars,
             tool_present: wire.tool_present,
             serve_native: wire.serve_native,
             native_messages: wire.native_messages,
@@ -1192,7 +1211,11 @@ fn apply_once(
         provisional_tail_mid,
     )?;
     let mut pending_overlays = PendingOverlayDecisions::default();
-    if tagging_active
+    // When caveman tagging is requested, compute tag rows from the persisted tag order even if
+    // the provider response has no visible §N§ tags. Creating these rows does not change rendered
+    // output; create the corresponding caveman units only during a bust pass.
+    let caveman_tagging_requested = req.caveman_enabled && !req.is_subagent;
+    if (tagging_active || caveman_tagging_requested)
         && !loaded.core.reconcile_pending
         && (loaded.meta.pending_rewrite.is_none() || clear_pending_rewrite_on_present)
     {
@@ -1599,6 +1622,14 @@ fn apply_once(
         meta.reasoning_cleared_through_ordinal = meta.reasoning_cleared_through_ordinal.max(cutoff);
     }
     let new_strip_units = new_frozen_strip_units(&loaded.core, req, &tag_numbers, is_bust_pass);
+    let new_caveman_units = new_caveman_units(
+        &loaded.core,
+        req,
+        &tag_rows,
+        &live,
+        loaded.meta.coverage_ordinal,
+        is_bust_pass,
+    );
     if loaded.meta.soft_refresh_pending && is_bust_pass {
         meta.soft_refresh_pending = false;
     }
@@ -1812,6 +1843,12 @@ fn apply_once(
                 let survivors = surviving_red_units(&effective, &live, comp.coverage_ordinal);
                 let mut strip_survivors = surviving_strip_units(&core, req);
                 strip_survivors.extend(new_strip_units.clone());
+                let caveman_survivors = surviving_caveman_units(
+                    &core,
+                    &new_caveman_units,
+                    &live,
+                    comp.coverage_ordinal,
+                );
                 core.frozen_units.clear();
                 core.pending_changes.clear();
                 let (note_body, hard_note_deliveries) = claim_and_render_notes(
@@ -1831,6 +1868,7 @@ fn apply_once(
                 let mut rendered = vec![synth_region("m0", comp.m0_bytes), m1_unit];
                 rendered.extend(survivors);
                 rendered.extend(strip_survivors);
+                rendered.extend(caveman_survivors);
 
                 // A HARD re-composes m0 fully from the store, so the boundary ALWAYS reflects
                 // the current coverage — set it unconditionally (empty when no compartments,
@@ -1991,6 +2029,12 @@ fn apply_once(
                     let survivors = surviving_red_units(&effective, &live, comp.coverage_ordinal);
                     let mut strip_survivors = surviving_strip_units(&core, req);
                     strip_survivors.extend(new_strip_units.clone());
+                    let caveman_survivors = surviving_caveman_units(
+                        &core,
+                        &new_caveman_units,
+                        &live,
+                        comp.coverage_ordinal,
+                    );
                     core.frozen_units.clear();
                     core.pending_changes.clear();
                     // Post-fold m1 parity with the ordinary HARD arm: everything except the
@@ -2005,6 +2049,7 @@ fn apply_once(
                     let mut rendered = vec![synth_region("m0", comp.m0_bytes), refold_m1_unit];
                     rendered.extend(survivors);
                     rendered.extend(strip_survivors);
+                    rendered.extend(caveman_survivors);
                     core.step(PassInput {
                         proposed: Some(mc_core::Action::Hard),
                         boundary_present: boundary_token,
@@ -2047,6 +2092,7 @@ fn apply_once(
                         loaded.meta.coverage_ordinal,
                     ));
                     rendered.extend(new_strip_units.clone());
+                    rendered.extend(new_caveman_units.clone());
                     // A coverage-extending SOFT advances the boundary anchor (the bound core
                     // primitive); a memory-only SOFT leaves it put (None).
                     let new_boundary_id = m1.new_coverage.as_ref().map(|(id, _)| id.clone());
@@ -2109,6 +2155,7 @@ fn apply_once(
                         // bloat — and a later re-decide of that target with different bytes
                         // would false-fire the monotonicity conflict guard.
                         prune_covered_red_units(&mut core, &live, meta.coverage_ordinal);
+                        prune_covered_caveman_units(&mut core, &live, meta.coverage_ordinal);
                     } else if compartment_seq_changed_since_meta {
                         meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
                     }
@@ -2594,10 +2641,12 @@ fn is_legacy_baseline(core: &CoreState) -> bool {
 fn cached_m1_missing(core: &CoreState) -> bool {
     let m0 = core.frozen_units.iter().filter(|u| u.key == "m0").count();
     let m1 = core.frozen_units.iter().filter(|u| u.key == "m1").count();
-    let rest_ok = core
-        .frozen_units
-        .iter()
-        .all(|u| u.key == "m0" || u.key.starts_with(RED_KEY_PREFIX) || u.key.starts_with("strip:"));
+    let rest_ok = core.frozen_units.iter().all(|u| {
+        u.key == "m0"
+            || u.key.starts_with(RED_KEY_PREFIX)
+            || u.key.starts_with("strip:")
+            || u.key.starts_with(CAV_KEY_PREFIX)
+    });
     m0 == 1 && m1 == 0 && rest_ok
 }
 
@@ -2609,8 +2658,198 @@ fn valid_m0m1_shape(core: &CoreState) -> bool {
             || u.key == "m1"
             || u.key.starts_with(RED_KEY_PREFIX)
             || u.key.starts_with("strip:")
+            || u.key.starts_with(CAV_KEY_PREFIX)
     });
     m0 == 1 && m1 == 1 && rest_ok
+}
+
+fn caveman_depth(unit: &FrozenUnit) -> u8 {
+    if !unit.key.starts_with(CAV_KEY_PREFIX) {
+        return 0;
+    }
+    unit.reset_rule
+        .parse::<u8>()
+        .ok()
+        .filter(|depth| (1..=3).contains(depth))
+        .unwrap_or(0)
+}
+
+fn caveman_payload<'a>(core: &'a CoreState, block_id: &str) -> Option<&'a FrozenUnit> {
+    let key = format!("{CAV_KEY_PREFIX}{block_id}");
+    core.frozen_units.iter().find(|unit| unit.key == key)
+}
+
+fn caveman_unit(block_id: &str, depth: u8, payload: &str) -> FrozenUnit {
+    FrozenUnit {
+        key: format!("{CAV_KEY_PREFIX}{block_id}"),
+        kind: "caveman".to_string(),
+        frozen_payload: payload.to_string(),
+        durability_class: mc_core::DurabilityClass::Lineage,
+        // The shared core intentionally treats reset_rule as opaque. The module uses it as the
+        // durable depth because a deeper bust must compare against the prior tier without
+        // re-deriving that tier from the current request.
+        reset_rule: depth.to_string(),
+    }
+}
+
+fn caveman_level(depth: u8) -> Option<crate::caveman::CavemanLevel> {
+    match depth {
+        1 => Some(crate::caveman::CavemanLevel::Lite),
+        2 => Some(crate::caveman::CavemanLevel::Full),
+        3 => Some(crate::caveman::CavemanLevel::Ultra),
+        _ => None,
+    }
+}
+
+fn caveman_target_depth(position: usize, total: usize) -> u8 {
+    if total == 0 {
+        return 0;
+    }
+    let fraction = position as f64 / total as f64;
+    if fraction < 0.2 {
+        3
+    } else if fraction < 0.4 {
+        2
+    } else if fraction < 0.6 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Select and render new/deeper caveman units on bust passes only. The original tag source is
+/// authoritative, so a later tier shift never compresses an already-compressed payload.
+fn new_caveman_units(
+    core: &CoreState,
+    req: &TransformRequest,
+    tag_rows: &[McTagRow],
+    live: &[&FlatBlock],
+    coverage: Option<u64>,
+    is_bust_pass: bool,
+) -> Vec<FrozenUnit> {
+    if !is_bust_pass || !req.caveman_enabled || req.is_subagent {
+        return Vec::new();
+    }
+
+    let max_tag = tag_rows.iter().map(|row| row.tag_number).max().unwrap_or(0);
+    let protected_cutoff = max_tag.saturating_sub(req.protected_tags as i64);
+    let tags_by_block = tag_rows
+        .iter()
+        .filter(|row| row.kind == "message")
+        .map(|row| (row.block_id.as_str(), row))
+        .collect::<HashMap<_, _>>();
+    let frozen_red = frozen_red_targets(core);
+    let mut candidates = live
+        .iter()
+        .filter_map(|block| {
+            if block.synthetic
+                || !is_tail(block.ordinal, coverage)
+                || frozen_red.contains(&block.id)
+                || !matches!(block.role.as_str(), "user" | "assistant")
+                || !matches!(&block.wire.kind, ck_wire::CkKind::Text { .. })
+            {
+                return None;
+            }
+            let row = tags_by_block.get(block.id.as_str())?;
+            if row.tag_number > protected_cutoff || row.source_bytes.len() < req.caveman_min_chars {
+                return None;
+            }
+            let source = String::from_utf8(row.source_bytes.clone()).ok()?;
+            (!source.is_empty()).then_some((row.tag_number, block.id.clone(), source))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    let total = candidates.len();
+    let mut units = Vec::new();
+    for (position, (_tag_number, block_id, source)) in candidates.into_iter().enumerate() {
+        let target_depth = caveman_target_depth(position, total);
+        if target_depth == 0 {
+            continue;
+        }
+        let existing = caveman_payload(core, &block_id);
+        let existing_depth = existing.map(caveman_depth).unwrap_or(0);
+        if target_depth <= existing_depth {
+            continue;
+        }
+        let level = caveman_level(target_depth).expect("nonzero caveman depth has a level");
+        let compressed = crate::caveman::compress(&source, level);
+        if compressed.is_empty() {
+            continue;
+        }
+        let payload = if let Some(existing) = existing {
+            // A deeper tier is allowed to replace bytes only when it does not grow the frozen
+            // payload. Equal-size output still advances depth, matching TS's persisted depth
+            // behavior for text with no additional removable material.
+            assert!(
+                compressed.len() <= existing.frozen_payload.len(),
+                "caveman deeper tier grew frozen payload for {block_id}"
+            );
+            if compressed.len() < existing.frozen_payload.len() {
+                compressed.as_str()
+            } else {
+                existing.frozen_payload.as_str()
+            }
+        } else {
+            compressed.as_str()
+        };
+        units.push(caveman_unit(&block_id, target_depth, payload));
+    }
+    units
+}
+
+/// Keep caveman units that still point at live tail text after a HARD rebuild, plus the deeper
+/// units selected by this bust. The map merge preserves replacement semantics for same-key units.
+fn prune_covered_caveman_units(core: &mut CoreState, live: &[&FlatBlock], coverage: Option<u64>) {
+    let live_ord = live
+        .iter()
+        .map(|block| (block.id.as_str(), block.ordinal))
+        .collect::<HashMap<_, _>>();
+    core.frozen_units.retain(|unit| {
+        let Some(target) = unit.key.strip_prefix(CAV_KEY_PREFIX) else {
+            return true;
+        };
+        live_ord
+            .get(target)
+            .is_none_or(|ordinal| is_tail(*ordinal, coverage))
+    });
+}
+
+fn surviving_caveman_units(
+    core: &CoreState,
+    new_units: &[FrozenUnit],
+    live: &[&FlatBlock],
+    coverage: Option<u64>,
+) -> Vec<FrozenUnit> {
+    let live_tail = live
+        .iter()
+        .filter(|block| is_tail(block.ordinal, coverage))
+        .map(|block| block.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut by_key = BTreeMap::<String, FrozenUnit>::new();
+    for unit in core
+        .frozen_units
+        .iter()
+        .filter(|unit| unit.key.starts_with(CAV_KEY_PREFIX))
+    {
+        if unit
+            .key
+            .strip_prefix(CAV_KEY_PREFIX)
+            .is_some_and(|target| live_tail.contains(target))
+        {
+            by_key.insert(unit.key.clone(), unit.clone());
+        }
+    }
+    for unit in new_units {
+        if unit
+            .key
+            .strip_prefix(CAV_KEY_PREFIX)
+            .is_some_and(|target| live_tail.contains(target))
+        {
+            by_key.insert(unit.key.clone(), unit.clone());
+        }
+    }
+    by_key.into_values().collect()
 }
 
 // --- reduction helpers (the tail-reducer mechanics) ---
@@ -5482,6 +5721,27 @@ fn build_output_with_tags(
                         );
                     }
                 }
+            } else if !req.is_subagent
+                && req.caveman_enabled
+                && matches!(msg.ck.role.as_str(), "user" | "assistant")
+            {
+                for block in blocks {
+                    if is_reasoning_block(&block.wire) {
+                        continue;
+                    }
+                    let key = format!("{CAV_KEY_PREFIX}{}", block.id);
+                    let Some(unit) = core.frozen_units.iter().find(|unit| unit.key == key) else {
+                        continue;
+                    };
+                    if !matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }) {
+                        continue;
+                    }
+                    rebuilt.content[block.block_index].kind = ck_wire::CkKind::Text {
+                        text: unit.frozen_payload.clone(),
+                    };
+                    rebuilt.content[block.block_index].mark_modified();
+                    rebuilt.mark_modified();
+                }
             }
             if !mutation_exempt {
                 apply_surface_strips(
@@ -6062,8 +6322,8 @@ mod tests {
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
     use mc_store::{
-        InsertMemoryInput, ModuleUsage, NoteCasOutcome, NoteEvaluationInput, NoteWriteInput,
-        ShadowDropSeedRow, ShadowStateSyncRequest, StoredCompartment,
+        InsertMemoryInput, McTagRow, ModuleUsage, NoteCasOutcome, NoteEvaluationInput,
+        NoteWriteInput, ShadowDropSeedRow, ShadowStateSyncRequest, StoredCompartment,
     };
 
     #[test]
@@ -6669,6 +6929,8 @@ mod tests {
             provider_id: None,
             model_key: None,
             clear_reasoning_age: DEFAULT_CLEAR_REASONING_AGE,
+            caveman_enabled: false,
+            caveman_min_chars: DEFAULT_CAVEMAN_MIN_CHARS,
             tool_present: false,
             serve_native: false,
             native_messages: None,
@@ -13893,6 +14155,175 @@ mod tests {
         let second = transform_with_projection(&store, &request, &ctx).unwrap();
         assert_eq!(second.response.action, "SOFT+");
         assert_eq!(first.response.ck_messages, second.response.ck_messages);
+    }
+
+    #[test]
+    fn caveman_selection_is_bust_only_and_replays_frozen_payload() {
+        let source = "I just really wanted to basically explain the implementation clearly, and in order to understand it, we need to consider the context. ".repeat(8);
+        let mut request = req("caveman-selection", "cfg", vec![item("m1", 1, &source)]);
+        request.caveman_enabled = true;
+        request.caveman_min_chars = 1;
+        request.protected_tags = 0;
+        let projection = project_messages(&request.messages).unwrap();
+        let live = projection
+            .blocks
+            .iter()
+            .filter(|block| !block.synthetic)
+            .collect::<Vec<_>>();
+        let tags = vec![McTagRow {
+            tag_number: 1,
+            block_id: "m1#0".to_string(),
+            kind: "message".to_string(),
+            token_count: 10,
+            created_at_ms: 0,
+            source_bytes: source.as_bytes().to_vec(),
+        }];
+        let no_units =
+            new_caveman_units(&CoreState::default(), &request, &tags, &live, None, false);
+        assert!(no_units.is_empty(), "defer must not mint a cav unit");
+
+        let units = new_caveman_units(&CoreState::default(), &request, &tags, &live, None, true);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].key, "cav:m1#0");
+        assert_eq!(units[0].reset_rule, "3");
+        assert_eq!(
+            units[0].frozen_payload,
+            crate::caveman::compress(&source, crate::caveman::CavemanLevel::Ultra)
+        );
+
+        let mut core = CoreState {
+            frozen_units: vec![
+                synth_region("m0", "m0".to_string()),
+                render_m1_placeholder(),
+            ],
+            ..CoreState::default()
+        };
+        core.frozen_units.extend(units);
+        let output = build_output(
+            &core,
+            &ModuleMeta::default(),
+            &projection,
+            &request,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let replayed = match &output.last().unwrap().content[0].kind {
+            ck_wire::CkKind::Text { text } => text,
+            other => panic!("unexpected replay block: {other:?}"),
+        };
+        assert_eq!(replayed, &core.frozen_units[2].frozen_payload);
+    }
+
+    #[test]
+    fn caveman_depth_deepens_from_source_without_regrowth() {
+        let source = "I just really wanted to basically explain the implementation clearly, and in order to understand it, we need to consider the context. ".repeat(8);
+        let request = {
+            let mut value = req("caveman-depth", "cfg", vec![item("m1", 1, &source)]);
+            value.caveman_enabled = true;
+            value.caveman_min_chars = 1;
+            value.protected_tags = 0;
+            value
+        };
+        let projection = project_messages(&request.messages).unwrap();
+        let live = projection
+            .blocks
+            .iter()
+            .filter(|block| !block.synthetic)
+            .collect::<Vec<_>>();
+        let lite = crate::caveman::compress(&source, crate::caveman::CavemanLevel::Lite);
+        let old = caveman_unit("m1#0", 1, &lite);
+        let core = CoreState {
+            frozen_units: vec![old],
+            ..CoreState::default()
+        };
+        let tags = vec![McTagRow {
+            tag_number: 1,
+            block_id: "m1#0".to_string(),
+            kind: "message".to_string(),
+            token_count: 10,
+            created_at_ms: 0,
+            source_bytes: source.as_bytes().to_vec(),
+        }];
+        let units = new_caveman_units(&core, &request, &tags, &live, None, true);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].reset_rule, "3");
+        assert!(units[0].frozen_payload.len() <= lite.len());
+        assert_eq!(
+            units[0].frozen_payload,
+            crate::caveman::compress(&source, crate::caveman::CavemanLevel::Ultra)
+        );
+    }
+
+    #[test]
+    fn caveman_gates_subagents_reasoning_and_protected_tail() {
+        let source = "I just really wanted to basically explain this long text. ".repeat(8);
+        let mut subagent = req("caveman-gates", "cfg", vec![item("m1", 1, &source)]);
+        subagent.caveman_enabled = true;
+        subagent.caveman_min_chars = 1;
+        subagent.is_subagent = true;
+        let projection = project_messages(&subagent.messages).unwrap();
+        let live = projection
+            .blocks
+            .iter()
+            .filter(|block| !block.synthetic)
+            .collect::<Vec<_>>();
+        let tag = McTagRow {
+            tag_number: 1,
+            block_id: "m1#0".to_string(),
+            kind: "message".to_string(),
+            token_count: 10,
+            created_at_ms: 0,
+            source_bytes: source.as_bytes().to_vec(),
+        };
+        assert!(new_caveman_units(
+            &CoreState::default(),
+            &subagent,
+            std::slice::from_ref(&tag),
+            &live,
+            None,
+            true
+        )
+        .is_empty());
+
+        let mut reasoning = req("caveman-reasoning", "cfg", vec![item("m1", 1, &source)]);
+        reasoning.caveman_enabled = true;
+        reasoning.caveman_min_chars = 1;
+        reasoning.messages[0].ck.content[0].kind = ck_wire::CkKind::Reasoning {
+            text: source.clone(),
+            signature: None,
+        };
+        let projection = project_messages(&reasoning.messages).unwrap();
+        let live = projection
+            .blocks
+            .iter()
+            .filter(|block| !block.synthetic)
+            .collect::<Vec<_>>();
+        assert!(new_caveman_units(
+            &CoreState::default(),
+            &reasoning,
+            std::slice::from_ref(&tag),
+            &live,
+            None,
+            true
+        )
+        .is_empty());
+
+        let mut protected = req("caveman-protected", "cfg", vec![item("m1", 1, &source)]);
+        protected.caveman_enabled = true;
+        protected.caveman_min_chars = 1;
+        protected.protected_tags = 1;
+        let projection = project_messages(&protected.messages).unwrap();
+        let live = projection
+            .blocks
+            .iter()
+            .filter(|block| !block.synthetic)
+            .collect::<Vec<_>>();
+        assert!(
+            new_caveman_units(&CoreState::default(), &protected, &[tag], &live, None, true)
+                .is_empty()
+        );
     }
 
     #[test]

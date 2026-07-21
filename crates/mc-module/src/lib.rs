@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 pub mod boundary;
+pub mod caveman;
 pub mod ck_wire;
 pub mod classify;
 pub mod codec;
@@ -1276,6 +1277,10 @@ struct ShadowPassInputs {
     history_budget_tokens: Option<f64>,
     #[serde(default = "default_clear_reasoning_age")]
     clear_reasoning_age: u64,
+    #[serde(default)]
+    caveman_enabled: bool,
+    #[serde(default = "default_caveman_min_chars")]
+    caveman_min_chars: usize,
     #[serde(default = "default_cache_ttl")]
     cache_ttl: String,
     #[serde(default)]
@@ -1475,6 +1480,10 @@ fn default_cache_ttl() -> String {
 
 fn default_clear_reasoning_age() -> u64 {
     50
+}
+
+fn default_caveman_min_chars() -> usize {
+    500
 }
 
 fn default_importance() -> i32 {
@@ -7406,6 +7415,8 @@ impl McHandler {
             provider_id: parsed.pass_inputs.provider_id.clone(),
             model_key: parsed.pass_inputs.model_key.clone(),
             clear_reasoning_age: parsed.pass_inputs.clear_reasoning_age,
+            caveman_enabled: parsed.pass_inputs.caveman_enabled,
+            caveman_min_chars: parsed.pass_inputs.caveman_min_chars,
             tool_present: false,
             serve_native: false,
             native_messages: None,

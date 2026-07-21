@@ -270,6 +270,21 @@ describe("Rust mode authority adapter", () => {
         expect(body.history_budget_tokens).toBe(42_000);
     });
 
+    it("copies caveman settings onto the authority wire", () => {
+        const body = __rustModeTransformTest.buildTransformBody({
+            sessionId: "caveman-wire",
+            input: [],
+            nativeMessages: [],
+            passInputs: { caveman_enabled: true, caveman_min_chars: 240 },
+            usage: {},
+            modelKey: null,
+            providerId: null,
+            midTurn: false,
+        });
+        expect(body.caveman_enabled).toBe(true);
+        expect(body.caveman_min_chars).toBe(240);
+    });
+
     it("keeps the rust pass line grep-compatible", () => {
         expect(
             __rustModeTransformTest.formatRustPassLog({

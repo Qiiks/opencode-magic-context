@@ -1730,6 +1730,8 @@ mod tests {
             provider_id: None,
             model_key: None,
             clear_reasoning_age: 50,
+            caveman_enabled: false,
+            caveman_min_chars: 500,
             tool_present: false,
             serve_native: false,
             native_messages: None,
