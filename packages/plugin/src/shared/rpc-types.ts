@@ -125,6 +125,8 @@ export interface StatusDetail extends SidebarSnapshot {
     compressionUsage: string | null;
     /** Effective configured toast duration in ms after config resolution. */
     toastDurationMs: number;
+    /** One-line status data for the experimental memory mural. */
+    mural?: { present: boolean; ageMs: number | null };
 }
 
 /** Embedding coverage for `/ctx-embed` status (mirrors getEmbeddingCoverageStatus). */

@@ -75,6 +75,8 @@ interface ProjectRegistration {
         max_commits: number;
     };
     memoryEnabled?: boolean;
+    memoryInjectionBudgetTokens?: number;
+    experimentalMural?: { enabled: boolean; model?: string };
     embeddingConfig?: { provider?: string };
     ensureRegistered: (directory: string, db: Database) => Promise<void>;
     /**
@@ -410,6 +412,9 @@ async function sweepProject(
             userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreamerConfig),
             ensureProjectRegistered: reg.ensureRegistered,
             language: reg.language,
+            dreamerModel: dreamerConfig.model,
+            experimentalMural: reg.experimentalMural,
+            memoryInjectionBudgetTokens: reg.memoryInjectionBudgetTokens,
             transformMode: reg.transformMode,
             moduleClient: reg.moduleClient,
         });

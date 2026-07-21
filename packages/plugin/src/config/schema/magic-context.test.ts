@@ -46,6 +46,7 @@ describe("MagicContextConfigSchema", () => {
         it("parses an enabled config without stale reduction-specific keys", () => {
             const input = {
                 enabled: true,
+                experimental: { mural: { enabled: false } },
                 transform_mode: "ts",
                 auto_update: false,
                 toast_duration_ms: 5000,

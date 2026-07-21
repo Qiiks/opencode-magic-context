@@ -117,6 +117,11 @@ export function evaluateTaskGate(task: DreamTaskName, ctx: TaskGateContext): boo
             // taking the shared memory lease.
             return countActiveMemories(db, project) > 0;
 
+        case "render-mural":
+            // This gate only checks for active memories; the executor separately
+            // determines which memories exceed its limit and applies the 20-memory threshold.
+            return countActiveMemories(db, project) > 0;
+
         case "classify-memories":
             // Classification scores the active project memory pool directly. It has
             // no file gate, watermark, or completeness prerequisites.

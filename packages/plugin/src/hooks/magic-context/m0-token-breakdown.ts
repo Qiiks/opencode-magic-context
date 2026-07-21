@@ -28,6 +28,8 @@ export interface M0BlockTokens {
     docsTokens: number;
     profileTokens: number;
     memoryTokens: number;
+    /** Anthropic vision cost for the 1092x1092 mural image. */
+    muralTokens: number;
     compartmentTokens: number;
     /** Always 0 in v2 (facts promoted to memories); kept for shape stability. */
     factTokens: number;
@@ -66,6 +68,8 @@ export function computeM0BlockTokens(
         memoryTokens = estimateTokens(memoryBlock);
         memoryFromM0 = true;
     }
+
+    const muralTokens = m0Text.includes("<memory-mural>") ? 1_521 : 0;
 
     let compartmentTokens = 0;
     const historyBlock = extractM0Block(m0Text, "session-history");
@@ -123,5 +127,12 @@ export function computeM0BlockTokens(
         }
     }
 
-    return { docsTokens, profileTokens, memoryTokens, compartmentTokens, factTokens: 0 };
+    return {
+        docsTokens,
+        profileTokens,
+        memoryTokens,
+        muralTokens,
+        compartmentTokens,
+        factTokens: 0,
+    };
 }

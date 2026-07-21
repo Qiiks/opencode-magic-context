@@ -58,6 +58,8 @@ interface CachedModelMetadata {
     limit?: number;
     /** Provider-enforced prompt cap. Undefined when only a combined context window is known. */
     inputLimit?: number;
+    /** Provider metadata says the model accepts image input. Unknown is false. */
+    vision?: boolean;
 }
 
 /**
@@ -94,16 +96,18 @@ function loadPersistedApiCacheOnce(): void {
         const raw = readFileSync(persistFilePath(), "utf-8");
         const obj = JSON.parse(raw) as Record<
             string,
-            number | { limit?: number; inputLimit?: number }
+            number | { limit?: number; inputLimit?: number; vision?: boolean }
         >;
         const map = new Map<string, CachedModelMetadata>();
         for (const [key, persisted] of Object.entries(obj)) {
             const limit = typeof persisted === "number" ? persisted : persisted.limit;
             const inputLimit = typeof persisted === "number" ? undefined : persisted.inputLimit;
+            const vision = typeof persisted === "number" ? false : persisted.vision === true;
             if (isSaneLimit(limit)) {
                 map.set(key, {
                     limit,
                     inputLimit: isSaneLimit(inputLimit) ? inputLimit : undefined,
+                    vision,
                 });
             }
         }
@@ -130,6 +134,7 @@ function persistApiCache(): void {
             obj[key] = {
                 limit: value.limit,
                 inputLimit: isSaneLimit(value.inputLimit) ? value.inputLimit : undefined,
+                vision: value.vision === true,
             };
         }
     }
@@ -170,6 +175,10 @@ function setCachedModelMetadata(
         | {
               limit?: { context?: number; input?: number };
               experimental?: { modes?: Record<string, unknown> };
+              capabilities?: unknown;
+              modalities?: unknown;
+              input?: unknown;
+              attachment?: unknown;
           }
         | undefined,
 ): void {
@@ -183,9 +192,20 @@ function setCachedModelMetadata(
         return;
     }
 
+    const values = [model?.capabilities, model?.modalities, model?.input, model?.attachment];
+    const vision = values.some(
+        (value) =>
+            JSON.stringify(value ?? "")
+                .toLowerCase()
+                .includes("image") ||
+            JSON.stringify(value ?? "")
+                .toLowerCase()
+                .includes("vision"),
+    );
     const value: CachedModelMetadata = {
         limit,
         inputLimit: isSaneLimit(inputLimit) ? inputLimit : undefined,
+        vision,
     };
     cache.set(key, value);
 
@@ -357,6 +377,18 @@ export function getSdkContextLimit(providerID: string, modelID: string): number 
  * Return only a provider-declared input cap. A combined context window is useful
  * for scheduling but is not safe as a fail-closed prompt boundary.
  */
+/** Resolve image-input support from the same models.dev metadata cache as limits. */
+export function modelSupportsVision(providerID: string, modelID: string): boolean {
+    loadPersistedApiCacheOnce();
+    if (!apiCache) return false;
+    const exact = apiCache.get(`${providerID}/${modelID}`);
+    if (exact?.vision === true) return true;
+    const colon = modelID.lastIndexOf(":");
+    return colon > 0
+        ? apiCache.get(`${providerID}/${modelID.slice(0, colon)}`)?.vision === true
+        : false;
+}
+
 export function getSdkInputLimit(providerID: string, modelID: string): number | undefined {
     loadPersistedApiCacheOnce();
     if (!apiCache) return undefined;

@@ -24,14 +24,11 @@ import {
     getMemoryVerifications,
     type Memory,
 } from "../memory";
+import { renderMuralTask } from "../mural/mural-task";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
 import { getActiveUserMemories } from "../user-memory/storage-user-memory";
-import {
-    ClassifyModuleFailureError,
-    type ClassifyModuleClient,
-    runClassify,
-} from "./classify";
+import { type ClassifyModuleClient, ClassifyModuleFailureError, runClassify } from "./classify";
 import { evaluateSmartNotes } from "./evaluate-smart-notes";
 import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import {
@@ -39,6 +36,11 @@ import {
     snapshotMaintainDocsFiles,
 } from "./maintain-docs-protected-enforcement";
 import { mapMemories } from "./map-memories";
+import {
+    DreamerModuleFailureError,
+    type DreamerModuleRoute,
+    resolveDreamerModuleRoute,
+} from "./module-apply";
 import { promotePrimers } from "./promote-primers";
 import { refreshPrimers } from "./refresh-primers";
 import {
@@ -68,10 +70,8 @@ import {
     RETROSPECTIVE_SYSTEM_PROMPT,
     type RetrospectivePromptEvent,
 } from "./task-prompts";
-
 import type { DreamTaskRuntimeConfig, TaskExecOutcome, TaskExecutor } from "./task-scheduler";
 import { runVerify } from "./verify";
-import { DreamerModuleFailureError, resolveDreamerModuleRoute, type DreamerModuleRoute } from "./module-apply";
 
 export interface DreamTaskExecutorDeps {
     client: PluginContext["client"];
@@ -100,6 +100,9 @@ export interface DreamTaskExecutorDeps {
     /** Resolved project transform mode; an explicit TS mode always stays on TS. */
     transformMode?: "ts" | "rust";
     /** Rust-mode module transport; classify uses it only after MODULE authority is confirmed. */
+    dreamerModel?: string;
+    experimentalMural?: { enabled: boolean; model?: string };
+    memoryInjectionBudgetTokens?: number;
     moduleClient?: ClassifyModuleClient & {
         authorityStatus?: (args: {
             context_store_uuid: string;
@@ -212,9 +215,21 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         const deadline = startedAt + config.timeoutMinutes * 60 * 1000;
         const parent = await resolveParentSessionId();
         let moduleRoute: Awaited<ReturnType<typeof resolveDreamerModuleRoute>>;
-        if (config.task === "map-memories" || config.task === "verify" || config.task === "verify-broad" || config.task === "retrospective") {
+        if (
+            config.task === "map-memories" ||
+            config.task === "verify" ||
+            config.task === "verify-broad" ||
+            config.task === "retrospective"
+        ) {
             try {
-                moduleRoute = await resolveDreamerModuleRoute({ db, projectIdentity, projectRoot: deps.sessionDirectory, transformMode: deps.transformMode, moduleClient: deps.moduleClient, commandId: `${startedAt}:${holderId}:${config.task}` });
+                moduleRoute = await resolveDreamerModuleRoute({
+                    db,
+                    projectIdentity,
+                    projectRoot: deps.sessionDirectory,
+                    transformMode: deps.transformMode,
+                    moduleClient: deps.moduleClient,
+                    commandId: `${startedAt}:${holderId}:${config.task}`,
+                });
             } catch (error) {
                 throw new DreamerModuleFailureError("authority.status", error);
             }
@@ -280,6 +295,31 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         }
 
         try {
+            if (config.task === "render-mural") {
+                if (deps.experimentalMural?.enabled !== true) {
+                    recordRun("completed", null);
+                    return { status: "completed" };
+                }
+                const result = await renderMuralTask({
+                    db,
+                    client: deps.client,
+                    projectIdentity,
+                    projectDirectory: deps.sessionDirectory,
+                    holderId,
+                    leaseKey,
+                    deadline,
+                    model: config.model ?? deps.experimentalMural.model ?? deps.dreamerModel,
+                    configuredModel: deps.experimentalMural.model,
+                    fallbackModels: config.fallbackModels,
+                    memoryBudgetTokens: deps.memoryInjectionBudgetTokens,
+                });
+                recordRun("completed", null);
+                log(
+                    `[dreamer] render-mural: ${result.status}${result.reason ? ` (${result.reason})` : ""}`,
+                );
+                return { status: "completed" };
+            }
+
             if (config.task === "review-user-memories") {
                 const result = await reviewUserMemories({
                     db,
@@ -359,8 +399,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                           | "moduleCommandId"
                       >
                     | undefined;
-                const moduleTransport =
-                    deps.transformMode === "ts" ? undefined : deps.moduleClient;
+                const moduleTransport = deps.transformMode === "ts" ? undefined : deps.moduleClient;
                 if (moduleTransport?.authorityStatus) {
                     const contextStoreUuid = getContextStoreUuid(db);
                     if (!contextStoreUuid) {
@@ -843,12 +882,15 @@ async function runRetrospectiveTask(
             flagged[0]?.sessionId ?? userMessages[0]?.sessionId ?? "retrospective";
         const learnings = parseRetrospectiveLearnings(deepenRun.validated);
         let moduleMemoryWritten = 0;
-        let moduleRejected: Array<{ content: string; reason: string }> = [];
+        const moduleRejected: Array<{ content: string; reason: string }> = [];
         let hostLearnings = learnings;
         if (helpers.moduleRoute) {
             const moduleLearnings = learnings.filter((learning) => {
                 if (learning.route !== "memory") return false;
-                const reason = validateRetrospectiveLearningText(learning.content, userMessages.map((message) => message.text ?? ""));
+                const reason = validateRetrospectiveLearningText(
+                    learning.content,
+                    userMessages.map((message) => message.text ?? ""),
+                );
                 if (reason || !learning.category) {
                     if (reason) moduleRejected.push({ content: learning.content, reason });
                     return false;
@@ -862,10 +904,23 @@ async function runRetrospectiveTask(
                         sessionId: helpers.moduleRoute.moduleSessionId,
                         projectRoot: helpers.moduleRoute.moduleProjectRoot,
                         method: "ctx_memory",
-                        body: { name: "ctx_memory", arguments: { action: "write", memory_project: projectIdentity, category: learning.category, content: learning.content, command_id: `${helpers.moduleRoute.moduleCommandId}:${moduleMemoryWritten}` } },
+                        body: {
+                            name: "ctx_memory",
+                            arguments: {
+                                action: "write",
+                                memory_project: projectIdentity,
+                                category: learning.category,
+                                content: learning.content,
+                                command_id: `${helpers.moduleRoute.moduleCommandId}:${moduleMemoryWritten}`,
+                            },
+                        },
                     });
-                    const body = ((response as { result?: unknown })?.result ?? response) as { ok?: unknown; error?: unknown };
-                    if (body?.ok === false || body?.error) throw new Error("module rejected retrospective memory");
+                    const body = ((response as { result?: unknown })?.result ?? response) as {
+                        ok?: unknown;
+                        error?: unknown;
+                    };
+                    if (body?.ok === false || body?.error)
+                        throw new Error("module rejected retrospective memory");
                     moduleMemoryWritten += 1;
                 } catch (error) {
                     throw new DreamerModuleFailureError("ctx_memory retrospective write", error);

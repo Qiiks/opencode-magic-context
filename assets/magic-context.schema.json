@@ -10,6 +10,34 @@
       "description": "Enable magic context (default: true)",
       "type": "boolean"
     },
+    "experimental": {
+      "default": {
+        "mural": {
+          "enabled": false
+        }
+      },
+      "description": "Experimental feature switches. User and project configuration are both accepted.",
+      "type": "object",
+      "properties": {
+        "mural": {
+          "default": {
+            "enabled": false
+          },
+          "description": "Experimental mural: a single rendered image of project memories that did not fit the context budget.",
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "default": false,
+              "type": "boolean"
+            },
+            "model": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    },
     "transform_mode": {
       "default": "ts",
       "description": "Experimental: routes the entire Magic Context runtime for the project through the ck-mc Rust module over subc (requires user-level `subc` config); \"ts\" is the current TypeScript pipeline.",
@@ -371,6 +399,10 @@
               "schedule": "0 4 * * 0",
               "timeout_minutes": 20
             },
+            "render-mural": {
+              "schedule": "0 4 * * 0",
+              "timeout_minutes": 20
+            },
             "classify-memories": {
               "schedule": "0 6 * * *",
               "timeout_minutes": 20
@@ -555,6 +587,56 @@
               }
             },
             "curate": {
+              "default": {
+                "schedule": "0 4 * * 0",
+                "timeout_minutes": 20
+              },
+              "type": "object",
+              "properties": {
+                "schedule": {
+                  "default": "",
+                  "type": "string",
+                  "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "model": {
+                  "description": "Per-task model override (inherits dreamer.model)",
+                  "type": "string"
+                },
+                "fallback_models": {
+                  "description": "Per-task fallback chain (inherits dreamer.fallback_models)",
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  ]
+                },
+                "thinking_level": {
+                  "description": "Pi only: per-task thinking level",
+                  "type": "string",
+                  "enum": [
+                    "off",
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh"
+                  ]
+                },
+                "timeout_minutes": {
+                  "default": 20,
+                  "description": "Minutes allowed for this task before it is aborted",
+                  "type": "number",
+                  "minimum": 5
+                }
+              }
+            },
+            "render-mural": {
               "default": {
                 "schedule": "0 4 * * 0",
                 "timeout_minutes": 20

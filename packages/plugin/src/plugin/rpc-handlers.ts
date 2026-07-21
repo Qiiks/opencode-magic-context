@@ -5,6 +5,7 @@
 import type { MagicContextConfig } from "../config/schema/magic-context";
 import { getMostRecentTaskRunAt } from "../features/magic-context/dreamer/storage-task-schedule";
 import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
+import { getMural } from "../features/magic-context/mural/storage-mural";
 import { getEmbeddingCoverageStatus } from "../features/magic-context/project-embedding-registry";
 import {
     type ContextDatabase as Database,
@@ -580,9 +581,19 @@ export function buildStatusDetail(
         compressionBudget: null,
         compressionUsage: null,
         toastDurationMs: 5000,
+        mural: undefined,
     };
 
     try {
+        const muralConfig = (config?.experimental as { mural?: { enabled?: boolean } } | undefined)
+            ?.mural;
+        if (muralConfig?.enabled && base.projectIdentity) {
+            const row = getMural(db, base.projectIdentity);
+            detail.mural = {
+                present: row !== null,
+                ageMs: row ? Math.max(0, Date.now() - row.renderedAt) : null,
+            };
+        }
         const meta = db
             .prepare<[string], Record<string, unknown>>(
                 "SELECT * FROM session_meta WHERE session_id = ?",

@@ -104,6 +104,7 @@ const DEFAULT_TASK_SCHEDULES: Record<DreamTaskName, string> = {
     verify: "0 3 * * *",
     "verify-broad": "0 4 * * 0",
     curate: "0 4 * * 0",
+    "render-mural": "0 4 * * 0",
     "classify-memories": "0 6 * * *",
     retrospective: "0 5 * * *",
     "maintain-docs": "",
@@ -138,6 +139,9 @@ export const DreamTasksSchema = z
         ),
         curate: DreamTaskBaseConfigSchema.default(() =>
             DreamTaskBaseConfigSchema.parse(defaultTaskConfig("curate")),
+        ),
+        "render-mural": DreamTaskBaseConfigSchema.default(() =>
+            DreamTaskBaseConfigSchema.parse(defaultTaskConfig("render-mural")),
         ),
         "classify-memories": DreamTaskBaseConfigSchema.default(() =>
             DreamTaskBaseConfigSchema.parse(defaultTaskConfig("classify-memories")),
@@ -351,8 +355,18 @@ export interface ShadowEmbeddingConfig {
     enabled: boolean;
 }
 
+export interface ExperimentalMuralConfig {
+    enabled: boolean;
+    model?: string;
+}
+
+export interface ExperimentalConfig {
+    mural: ExperimentalMuralConfig;
+}
+
 export interface MagicContextConfig {
     enabled: boolean;
+    experimental: ExperimentalConfig;
     /** Selects the runtime implementation for this project. Rust mode is experimental and requires user-level subc configuration. */
     transform_mode: "ts" | "rust";
     /** Auto-update the cached OpenCode plugin wrapper when a newer npm version is available.
@@ -493,6 +507,22 @@ export interface MagicContextConfig {
 export const MagicContextConfigSchema = z
     .object({
         enabled: z.boolean().default(true).describe("Enable magic context (default: true)"),
+        experimental: z
+            .object({
+                mural: z
+                    .object({
+                        enabled: z.boolean().default(false),
+                        model: z.string().trim().min(1).optional(),
+                    })
+                    .default({ enabled: false })
+                    .describe(
+                        "Experimental mural: a single rendered image of project memories that did not fit the context budget.",
+                    ),
+            })
+            .default({ mural: { enabled: false } })
+            .describe(
+                "Experimental feature switches. User and project configuration are both accepted.",
+            ),
         transform_mode: z
             .enum(["ts", "rust"])
             .default("ts")

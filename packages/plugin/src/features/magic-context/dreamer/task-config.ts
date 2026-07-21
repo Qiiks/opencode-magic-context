@@ -24,7 +24,10 @@ export function buildDreamTaskRuntimeConfigs(
         }) as DreamTaskConfig;
         // Per-task model override falls back to the dreamer-level model. Fallback
         // chain: per-task list if set, else the dreamer-level list (resolved/deduped).
-        const model = t.model ?? dreamer.model;
+        // Mural has a separate experimental model fallback. Leave its primary
+        // model empty here so the executor can apply task override → mural model
+        // → dreamer model in that order.
+        const model = task === "render-mural" ? t.model : (t.model ?? dreamer.model);
         const fallbackModels = resolveFallbackChain(t.fallback_models ?? dreamer.fallback_models);
         const thinkingLevel = t.thinking_level ?? dreamer.thinking_level;
         return {

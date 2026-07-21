@@ -22,6 +22,7 @@ import {
     readNewMemoriesForM1Union,
 } from "../../features/magic-context/memory/storage-memory";
 import type { Memory } from "../../features/magic-context/memory/types";
+import { getMural, muralDataUrl } from "../../features/magic-context/mural/storage-mural";
 import {
     computeProjectDocsHash,
     GLOBAL_USER_PROFILE_PROJECT_PATH,
@@ -574,6 +575,8 @@ export interface M0SnapshotMarkers {
     systemHash: string;
     modelKey: string;
     projectIdentity?: string | null;
+    /** Hash of the image identity folded into this m0 baseline. */
+    muralHash?: string | null;
 }
 
 /**
@@ -619,6 +622,10 @@ export interface M0M1State {
     cachedM0ModelKey: string | null;
     cachedM0ProjectIdentity?: string | null;
     snapshotMarkers?: M0SnapshotMarkers | null;
+    /** Keep a regenerated mural image unchanged for the current cached M0 prompt;
+     * replace it only when the next normal hard cache fold rebuilds that prompt. */
+    cachedM0MuralDataUrl?: string | null;
+    cachedM0MuralHash?: string | null;
 }
 
 export interface M0M1RenderOptions {
@@ -634,6 +641,9 @@ export interface M0M1RenderOptions {
     historyBudgetTokens?: number;
     userProfileBudgetTokens?: number;
     temporalAwareness?: boolean;
+    /** Experimental image injection. The caller resolves model capability from
+     * the models.dev metadata; unknown capability means no image is injected. */
+    mural?: { enabled: boolean; supportsVision: boolean; dataUrl?: string; contentHash?: string };
     isCacheBustingPass?: boolean;
     /** Provider-side cache-eviction signals for HARD-bust detection. */
     hardSignals?: M0HardSignals;
@@ -1472,6 +1482,7 @@ export function renderM0(args: {
     compartments: M0Compartment[];
     memories: Memory[];
     facts: SessionFact[];
+    mural?: { enabled: boolean; supportsVision: boolean; dataUrl?: string };
     memoryRenderOptions?: MemoryRenderOptions;
     historyBudgetTokens?: number;
     userProfileBudgetTokens?: number;
@@ -1508,6 +1519,9 @@ export function renderM0(args: {
         args.memoryRenderOptions,
     );
     if (memoriesBlock) sections.push(memoriesBlock);
+    if (args.mural?.enabled && args.mural.supportsVision && args.mural.dataUrl) {
+        sections.push("<memory-mural>\nThe project memory mural image follows.\n</memory-mural>");
+    }
     return sections.join("\n\n").trim();
 }
 
@@ -1669,6 +1683,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         historyBudgetTokens: options.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
         userProfileBudgetTokens: options.userProfileBudgetTokens,
         decayPressureMultiplier,
+        mural: options.mural,
     });
 
     let attempts = 0;
@@ -1685,12 +1700,22 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             historyBudgetTokens: budget,
             userProfileBudgetTokens: options.userProfileBudgetTokens,
             decayPressureMultiplier,
+            mural: options.mural,
         });
         attempts += 1;
     }
 
     if (m0Text.length === 0) m0Text = M0_EMPTY_BODY;
     const m0Bytes = Buffer.from(m0Text, "utf8");
+    options.state.cachedM0MuralDataUrl =
+        options.mural?.enabled && options.mural.supportsVision
+            ? (options.mural.dataUrl ?? null)
+            : null;
+    options.state.cachedM0MuralHash =
+        options.mural?.enabled && options.mural.supportsVision
+            ? (options.mural.contentHash ?? null)
+            : null;
+    snapshotMarkers.muralHash = options.state.cachedM0MuralHash;
     snapshotMarkers.materializedAt = foldMaterializedAt;
     const renderedMemoryIds = trimmed.renderOrder.map((m) => m.id);
     const phase3ProjectDocsHash = readProjectDocsForM0(
@@ -2257,6 +2282,7 @@ function prependM0M1Messages(
     messages: MessageLike[],
     m0Text: string,
     m1Text: string,
+    mural?: { enabled: boolean; supportsVision: boolean; dataUrl?: string },
 ): void {
     // `syntheticHead` identifies the injected m0 and m1 message positions for
     // marker placement; `synthetic: true` marks their parts as injected context,
@@ -2270,6 +2296,10 @@ function prependM0M1Messages(
     // session's auto-title (issue #129). Must NOT use `ignored` here — that
     // would strip the history
     // injection from the real model call.
+    const muralImage =
+        mural?.enabled && mural.supportsVision && mural.dataUrl
+            ? { type: "file", mime: "image/png", url: mural.dataUrl, synthetic: true }
+            : null;
     messages.unshift(
         {
             info: { role: "user", sessionID: sessionId, syntheticHead: true },
@@ -2279,6 +2309,7 @@ function prependM0M1Messages(
                     text: m0Text.length > 0 ? m0Text : M0_EMPTY_BODY,
                     synthetic: true,
                 },
+                ...(muralImage ? [muralImage] : []),
             ],
         },
         {
@@ -2386,6 +2417,7 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
         historyBudgetTokens: budget,
         userProfileBudgetTokens: options.userProfileBudgetTokens,
         decayPressureMultiplier,
+        mural: options.mural,
     });
     let attempts = 0;
     while (budget > 0 && historySliceTokens(m0Text) > budget * 1.05 && attempts < 3) {
@@ -2400,10 +2432,20 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
             historyBudgetTokens: budget,
             userProfileBudgetTokens: options.userProfileBudgetTokens,
             decayPressureMultiplier,
+            mural: options.mural,
         });
         attempts += 1;
     }
     if (m0Text.length === 0) m0Text = M0_EMPTY_BODY;
+    options.state.cachedM0MuralDataUrl =
+        options.mural?.enabled && options.mural.supportsVision
+            ? (options.mural.dataUrl ?? null)
+            : null;
+    options.state.cachedM0MuralHash =
+        options.mural?.enabled && options.mural.supportsVision
+            ? (options.mural.contentHash ?? null)
+            : null;
+    snapshotMarkers.muralHash = options.state.cachedM0MuralHash;
     return {
         m0Bytes: Buffer.from(m0Text, "utf8"),
         snapshotMarkers,
@@ -2412,6 +2454,21 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
 }
 
 export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
+    if (
+        options.state.cachedM0Bytes &&
+        options.state.cachedM0MuralDataUrl === undefined &&
+        options.projectPath
+    ) {
+        const cachedText = decodeM0Bytes(options.state.cachedM0Bytes) ?? "";
+        const row = getMural(options.db, options.projectPath);
+        if (cachedText.includes("<memory-mural>") && row) {
+            options.state.cachedM0MuralDataUrl = muralDataUrl(row);
+            options.state.cachedM0MuralHash = row.contentHash;
+        } else {
+            options.state.cachedM0MuralDataUrl = null;
+            options.state.cachedM0MuralHash = null;
+        }
+    }
     if (!options.workspaceIdentitySet && options.projectPath) {
         options = {
             ...options,
@@ -2591,7 +2648,15 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
     }
 
     if (options.messages) {
-        prependM0M1Messages(options.sessionId, options.messages, m0Text, m1Text);
+        const muralForWire = options.state.cachedM0MuralDataUrl
+            ? {
+                  enabled: true,
+                  supportsVision: true,
+                  dataUrl: options.state.cachedM0MuralDataUrl,
+                  contentHash: options.state.cachedM0MuralHash ?? undefined,
+              }
+            : undefined;
+        prependM0M1Messages(options.sessionId, options.messages, m0Text, m1Text, muralForWire);
     }
 
     return {

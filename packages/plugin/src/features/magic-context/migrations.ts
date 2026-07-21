@@ -2424,6 +2424,28 @@ const MIGRATIONS: Migration[] = [
             }
         },
     },
+    {
+        version: 64,
+        description: "store project-scoped rendered memory mural",
+        up(db: Database): void {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS mural_manifest (
+                    project_path TEXT PRIMARY KEY,
+                    image BLOB NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    rendered_at INTEGER NOT NULL,
+                    model TEXT,
+                    memory_ids_json TEXT NOT NULL DEFAULT '[]',
+                    width INTEGER NOT NULL DEFAULT 1092,
+                    height INTEGER NOT NULL DEFAULT 1092
+                );
+            `);
+            ensureColumn(db, "mural_manifest", "model", "TEXT");
+            ensureColumn(db, "mural_manifest", "memory_ids_json", "TEXT NOT NULL DEFAULT '[]'");
+            ensureColumn(db, "mural_manifest", "width", "INTEGER NOT NULL DEFAULT 1092");
+            ensureColumn(db, "mural_manifest", "height", "INTEGER NOT NULL DEFAULT 1092");
+        },
+    },
 ];
 
 /**
