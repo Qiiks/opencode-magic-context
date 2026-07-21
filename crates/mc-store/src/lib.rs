@@ -1917,6 +1917,12 @@ const MIGRATIONS: &[Migration] = &[
             ON mc_user_memory_candidates(session_id, created_at, id);
     ",
     },
+    Migration {
+        version: 37,
+        // Visibility corrections are delivered as m1 removed deltas. Removing the old
+        // eager epoch trigger keeps expiry and archival changes out of workspace identity.
+        statements: "DROP TRIGGER IF EXISTS mc_memories_visibility_epoch;",
+    },
 ];
 
 /// Apply the route-to-identity vocabulary law inside the caller's fenced transaction.
@@ -2416,6 +2422,16 @@ pub struct ModuleMeta {
     /// The render-config fingerprint as of the last Hard fold; an incoming pass whose
     /// fingerprint differs is an epoch change → Hard.
     pub last_render_config: String,
+    /// Provider/model/system/upgrade identity observations used to adopt legacy rows without
+    /// treating the first non-empty observation as a cache eviction.
+    #[serde(default)]
+    pub last_provider_id: String,
+    #[serde(default)]
+    pub last_model_key: String,
+    #[serde(default)]
+    pub last_system_prompt_hash: String,
+    #[serde(default)]
+    pub last_upgrade_state: String,
     /// The terminal covered ordinal as of the last baseline. Monotonic-absolute,
     /// never positional; can DECREASE on a revert-Hard.
     pub coverage_ordinal: Option<u64>,
@@ -8472,14 +8488,15 @@ impl McStore {
     /// so no value forges a boundary. A nondeterministic fingerprint over a STABLE
     /// workspace would false-HARD every pass (the over-bust the m0/m1 split exists to
     /// avoid). Empty string when the project is in no workspace (the single-project state —
-    /// a stable "no workspace" marker). A nondeterministic fingerprint would make a
-    /// stable workspace appear to change on every check, breaking cache consistency. The
-    /// fingerprint includes each member's visibility epoch so revocation invalidates all
-    /// affected caches in the same deterministic change.
+    /// a stable "no workspace" marker). The workspace fingerprint must be deterministic; otherwise
+    /// a stable workspace appears to
+    /// change on every check and repeatedly invalidates the cache. Visibility corrections use the
+    /// m1 removed-delta lane, and expiry is frozen at materialization time rather than included in
+    /// workspace identity.
     pub fn workspace_fingerprint(
         &self,
         project_path: &str,
-        now_ms: i64,
+        _now_ms: i64,
     ) -> Result<String, McStoreError> {
         let Some(m) = self.resolve_workspace_membership(project_path)? else {
             return Ok(String::new());
@@ -8492,89 +8509,15 @@ impl McStore {
         for id in &m.union_identities {
             out.push_str(&format!("m:{}:{};", id.len(), id));
         }
-        let epochs = self.inner.with_conn(|conn| {
-            m.union_identities
-                .iter()
-                .map(|id| {
-                    conn.query_row(
-                        "SELECT COALESCE((SELECT epoch FROM mc_memory_visibility_epoch WHERE project_path = ?1), 0)",
-                        params![id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                })
-                .collect::<Result<Vec<i64>, _>>()
-        })?;
-        out.push_str("|epochs:");
-        for (id, epoch) in m.union_identities.iter().zip(epochs) {
-            out.push_str(&format!("{}:{}:{};", id.len(), id, epoch));
-        }
         out.push_str("|share:");
         for cat in &shared {
             out.push_str(&format!("{}:{};", cat.len(), cat));
         }
-        // Earliest still-unexpired foreign expires_at is part of the fingerprint so that
-        // when time alone drops a foreign row from visibility, the fingerprint changes and
-        // forces exactly one full baseline recompute; after that pass the min advances or
-        // clears and the fingerprint stays stable again.
-        let earliest_foreign_expiry = self.earliest_unexpired_foreign_expires_at(&m, now_ms)?;
-        out.push_str(&format!(
-            "|exp:{}",
-            earliest_foreign_expiry
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_string())
-        ));
+        // Expiry is frozen at the last materialization timestamp and therefore is
+        // intentionally absent from workspace identity. Time passing alone must ride
+        // the next natural HARD, not evict the provider cache eagerly.
         out.push(']');
         Ok(out)
-    }
-
-    fn earliest_unexpired_foreign_expires_at(
-        &self,
-        membership: &WorkspaceMembership,
-        now_ms: i64,
-    ) -> Result<Option<i64>, McStoreError> {
-        let foreign: Vec<&str> = membership
-            .union_identities
-            .iter()
-            .map(String::as_str)
-            .filter(|path| *path != membership.own_identity.as_str())
-            .collect();
-        if foreign.is_empty() || membership.share_categories.is_empty() {
-            return Ok(None);
-        }
-        let path_placeholders = std::iter::repeat_n("?", foreign.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let cat_placeholders = std::iter::repeat_n("?", membership.share_categories.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT MIN(expires_at) FROM mc_memories
-              WHERE project_path IN ({path_placeholders})
-                AND status IN ('active','permanent')
-                AND shareable = 1
-                AND scope IN ('project','ecosystem','universe')
-                AND category IN ({cat_placeholders})
-                AND expires_at IS NOT NULL
-                AND expires_at > ?"
-        );
-        let mut binds: Vec<rusqlite::types::Value> = foreign
-            .iter()
-            .map(|path| rusqlite::types::Value::from((*path).to_string()))
-            .collect();
-        binds.extend(
-            membership
-                .share_categories
-                .iter()
-                .map(|cat| rusqlite::types::Value::from(cat.clone())),
-        );
-        binds.push(rusqlite::types::Value::from(now_ms));
-        self.inner
-            .with_conn(|conn| {
-                conn.query_row(&sql, rusqlite::params_from_iter(binds.iter()), |row| {
-                    row.get::<_, Option<i64>>(0)
-                })
-            })
-            .map_err(Into::into)
     }
 
     /// Load render-eligible memories across a workspace UNION: every member's `active` +
@@ -14162,7 +14105,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_shareable_revocation_bumps_visibility_epoch_and_fingerprint() {
+    fn foreign_shareable_revocation_stays_on_m1_lane() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let own = "git:epoch-own";
@@ -14191,22 +14134,22 @@ mod tests {
             })
             .unwrap();
         let after = store.workspace_fingerprint(own, 0).unwrap();
-        assert_ne!(before, after);
-        assert_eq!(
-            store
-                .inner
-                .with_conn(|conn| conn.query_row(
+        assert_eq!(before, after);
+        assert!(store
+            .inner
+            .with_conn(|conn| conn
+                .query_row(
                     "SELECT epoch FROM mc_memory_visibility_epoch WHERE project_path = ?1",
                     params![foreign],
                     |row| row.get::<_, i64>(0),
-                ))
-                .unwrap(),
-            1
-        );
+                )
+                .optional()
+                .map(|value| value.is_none()))
+            .unwrap());
     }
 
     #[test]
-    fn foreign_expiry_transition_bumps_visibility_epoch_exactly_once() {
+    fn foreign_expiry_transition_does_not_bump_visibility_epoch() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let own = "git:expiry-own";
@@ -14246,10 +14189,10 @@ mod tests {
                     params![foreign],
                     |row| row.get::<_, i64>(0),
                 )
+                .optional()
             })
             .unwrap();
-        // expires_at and shareable each bump once; the final no-op does not.
-        assert_eq!(epoch, 2);
+        assert_eq!(epoch, None);
     }
 
     #[test]
@@ -17406,7 +17349,7 @@ mod shadow_tests {
     }
 
     #[test]
-    fn natural_foreign_expiry_changes_workspace_fingerprint_once() {
+    fn natural_foreign_expiry_does_not_change_workspace_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let own = "git:exp-own";
@@ -17437,15 +17380,18 @@ mod shadow_tests {
         let before = store.workspace_fingerprint(own, deadline - 1).unwrap();
         let at_deadline = store.workspace_fingerprint(own, deadline).unwrap();
         let after = store.workspace_fingerprint(own, deadline + 1).unwrap();
-        assert_ne!(before, at_deadline, "crossing expiry must HARD once");
+        assert_eq!(
+            before, at_deadline,
+            "crossing expiry must not change identity"
+        );
         assert_eq!(
             at_deadline, after,
-            "fingerprint must not oscillate after the expiry HARD"
+            "fingerprint remains stable while expiry is handled by the next natural HARD"
         );
     }
 
     #[test]
-    fn same_second_visibility_revocation_bumps_epoch_without_sqlite_clock() {
+    fn same_second_visibility_revocation_does_not_bump_epoch() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let own = "git:same-sec-own";
@@ -17484,12 +17430,10 @@ mod shadow_tests {
                     params![foreign],
                     |row| row.get::<_, i64>(0),
                 )
+                .optional()
             })
             .unwrap();
-        assert!(
-            epoch >= 1,
-            "same-second revocation must bump visibility epoch"
-        );
+        assert_eq!(epoch, None);
     }
 
     #[test]

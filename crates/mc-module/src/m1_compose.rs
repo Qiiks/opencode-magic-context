@@ -20,6 +20,7 @@ use mc_store::{McStore, McStoreError, ModuleMeta, NoteDelivery, StoredNote};
 
 use crate::compartment_coverage::{partition_by_folded_seq, resolve_coverage, CoverageGap};
 use crate::decay_render::DecayRenderCompartment;
+use crate::m0_compose::trim_memories_to_budget;
 use crate::memory_render::{
     assemble_m1, render_memory_block, render_memory_updates, render_new_compartments,
     workspace_source_names, M1_PLACEHOLDER,
@@ -166,6 +167,8 @@ pub fn m1_revision_signal_parts_for_pass(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct M1Composition {
     pub body: String,
+    /// Number of memory corrections represented in the m1 body, for the pressure backstop.
+    pub memory_update_count: usize,
     pub new_coverage: Option<(String, u64)>,
     pub note_deliveries: Vec<NoteDelivery>,
 }
@@ -221,6 +224,7 @@ fn render_note_delta(notes: &[StoredNote]) -> String {
 /// EXPENSIVE bust-only: compose the m1 delta body from the store against the watermarks
 /// the last HARD froze in `meta`. `now_ms` is the frozen expiry cutoff (same as the m0
 /// compose). Reads compartments + memories; never call on a defer.
+#[allow(clippy::too_many_arguments)]
 pub fn compose_m1_from_store(
     store: &McStore,
     project_path: &str,
@@ -228,6 +232,8 @@ pub fn compose_m1_from_store(
     session_id: &str,
     meta: &ModuleMeta,
     now_ms: i64,
+    memory_budget_tokens: f64,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Result<M1Composition, M1ComposeError> {
     // Resolve the workspace membership ONCE from the calling project (mirrors the m0
     // compose). Re-resolving from a union path is WRONG: the union list is sorted, so its
@@ -285,6 +291,13 @@ pub fn compose_m1_from_store(
         .as_ref()
         .map(|workspace| workspace_source_names(&new_memories, workspace))
         .unwrap_or_default();
+    let new_memories = trim_memories_to_budget(
+        new_memories,
+        membership.as_ref(),
+        &source_name_by_id,
+        (memory_budget_tokens.max(1.0) * 0.25).floor().max(1.0),
+        estimate_tokens,
+    );
     let new_memories_block = render_memory_block(&new_memories, "new-memories", &source_name_by_id);
 
     // NOTE: <new-user-profile> is deferred in this slice — it gates on a profile-version
@@ -313,6 +326,7 @@ pub fn compose_m1_from_store(
 
     Ok(M1Composition {
         body,
+        memory_update_count: mutations.len(),
         new_coverage,
         note_deliveries,
     })
@@ -347,6 +361,10 @@ mod tests {
     use super::*;
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
     use mc_store::{InsertMemoryInput, StoredCompartment};
+
+    fn no_estimate(_: &str) -> usize {
+        0
+    }
 
     fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
         StorageDescriptor {
@@ -435,7 +453,17 @@ mod tests {
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         // a HARD folded everything (folded_seq covers all, no new memories/mutations)
         let meta = meta_after_hard(5, Some(50), 100, 9, vec![1, 2]);
-        let m1 = compose_m1_from_store(&store, "git:proj", "git:proj", "ses", &meta, 0).unwrap();
+        let m1 = compose_m1_from_store(
+            &store,
+            "git:proj",
+            "git:proj",
+            "ses",
+            &meta,
+            0,
+            8_000.0,
+            no_estimate,
+        )
+        .unwrap();
         assert_eq!(m1.body, M1_PLACEHOLDER, "no delta → the placeholder body");
         assert_eq!(m1.new_coverage, None);
     }
@@ -449,7 +477,17 @@ mod tests {
             .replace_compartments("ses", &[comp(1, 1, 10, "m10"), comp(2, 11, 20, "m20")])
             .unwrap();
         let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
-        let m1 = compose_m1_from_store(&store, "git:proj", "git:proj", "ses", &meta, 0).unwrap();
+        let m1 = compose_m1_from_store(
+            &store,
+            "git:proj",
+            "git:proj",
+            "ses",
+            &meta,
+            0,
+            8_000.0,
+            no_estimate,
+        )
+        .unwrap();
 
         // C2 rides m1 at P1, and coverage extends 10 → 20 (the SOFT advances the anchor)
         assert!(m1.body.contains("<new-compartments>"), "{}", m1.body);
@@ -471,7 +509,17 @@ mod tests {
             .unwrap();
         // meta: folded_seq=1, coverage=10 (matches the only compartment), folded max_mem=0
         let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
-        let m1 = compose_m1_from_store(&store, "git:proj", "git:proj", "ses", &meta, 0).unwrap();
+        let m1 = compose_m1_from_store(
+            &store,
+            "git:proj",
+            "git:proj",
+            "ses",
+            &meta,
+            0,
+            8_000.0,
+            no_estimate,
+        )
+        .unwrap();
 
         assert!(m1.body.contains("<new-memories>"), "{}", m1.body);
         assert!(m1.body.contains("new mem"));
@@ -535,7 +583,17 @@ mod tests {
                 "{case} must move the m1 signal"
             );
             let meta = meta_after_hard(1, Some(10), max_mem, cursor, manifest);
-            let m1 = compose_m1_from_store(&store, project, project, "ses", &meta, 0).unwrap();
+            let m1 = compose_m1_from_store(
+                &store,
+                project,
+                project,
+                "ses",
+                &meta,
+                0,
+                8_000.0,
+                no_estimate,
+            )
+            .unwrap();
             assert!(m1.body.contains("<memory-updates>"), "{case}: {}", m1.body);
             assert_eq!(
                 m1.new_coverage, None,
@@ -570,7 +628,17 @@ mod tests {
             "additive inserts do not write the mutation log"
         );
         let meta = meta_after_hard(1, Some(10), 0, cursor, vec![]);
-        let m1 = compose_m1_from_store(&store, project, project, "ses", &meta, 0).unwrap();
+        let m1 = compose_m1_from_store(
+            &store,
+            project,
+            project,
+            "ses",
+            &meta,
+            0,
+            8_000.0,
+            no_estimate,
+        )
+        .unwrap();
         assert!(m1.body.contains("<new-memories>"), "{}", m1.body);
         assert!(m1.body.contains("brand new"), "{}", m1.body);
     }
@@ -602,7 +670,8 @@ mod tests {
             .unwrap();
 
         let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
-        let m1 = compose_m1_from_store(&store, own, own, "ses", &meta, 0).unwrap();
+        let m1 =
+            compose_m1_from_store(&store, own, own, "ses", &meta, 0, 8_000.0, no_estimate).unwrap();
         assert!(
             m1.body.contains("own arch rule"),
             "the calling project's own non-shared new memory must ride m1 even when it is \

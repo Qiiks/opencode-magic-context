@@ -2177,6 +2177,8 @@ impl McHandler {
                 auto_promote: true,
                 user_memory_collection_enabled: false,
                 historian_context_limit_tokens: 128_000,
+                memory_budget_tokens: 8_000.0,
+                user_profile_budget_tokens: 4_000.0,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
                 shadow_enabled: true,
@@ -5818,6 +5820,8 @@ impl McHandler {
                     .filter(|budget| budget.is_finite() && *budget >= 0.0)
                     .unwrap_or(binding.history_budget_tokens),
                 memory_enabled: binding.config.memory_enabled,
+                memory_budget_tokens: binding.config.memory_budget_tokens,
+                user_profile_budget_tokens: binding.config.user_profile_budget_tokens,
                 now_ms: pass_now,
                 execute_threshold_percentage: binding.config.execute_threshold_percentage,
                 smart_drops: binding.config.smart_drops,
@@ -5866,7 +5870,16 @@ impl McHandler {
         {
             hook();
         }
-        let diagnostics = if result.scheduler_pass == scheduler::PassDecision::Emergency95 {
+        let diagnostics = if parsed.is_subagent {
+            HistorianDiagnostics {
+                fired: false,
+                reason: Some("subagent_session".to_string()),
+                no_fire: Some("subagent_session".to_string()),
+                state: "disabled".to_string(),
+                progress: None,
+                last_failure: None,
+            }
+        } else if result.scheduler_pass == scheduler::PassDecision::Emergency95 {
             match self.prepare_historian_fire(
                 Arc::clone(&store),
                 &parsed,
@@ -5983,7 +5996,7 @@ impl McHandler {
         // inline drive); if the floor moved past what this request's transform saw,
         // re-run once so the response carries the published fold instead of pre-fold
         // bytes.
-        if result.scheduler_pass == scheduler::PassDecision::Emergency95 {
+        if !parsed.is_subagent && result.scheduler_pass == scheduler::PassDecision::Emergency95 {
             let floor_advanced = store
                 .load(&parsed.session_id)
                 .map(|state| state.meta.publication_floor_ordinal != emergency_pre_floor)
@@ -7161,6 +7174,10 @@ impl McHandler {
             serializer_profile,
             session_id: binding.session.clone(),
             render_config: parsed.render_config.clone().unwrap_or_default(),
+            system_prompt_hash: String::new(),
+            upgrade_state: String::new(),
+            is_subagent: false,
+            protected_tags: 20,
             provider_id: parsed.pass_inputs.provider_id.clone(),
             model_key: parsed.pass_inputs.model_key.clone(),
             clear_reasoning_age: parsed.pass_inputs.clear_reasoning_age,
@@ -7189,6 +7206,8 @@ impl McHandler {
                 .history_budget_tokens
                 .unwrap_or(binding.history_budget_tokens),
             memory_enabled: binding.config.memory_enabled,
+            memory_budget_tokens: binding.config.memory_budget_tokens,
+            user_profile_budget_tokens: binding.config.user_profile_budget_tokens,
             now_ms: parsed.pass_inputs.now_ms,
             execute_threshold_percentage: parsed.pass_inputs.effective_execute_threshold,
             smart_drops: binding.config.smart_drops,
@@ -12113,6 +12132,8 @@ mod tests {
             auto_promote: true,
             user_memory_collection_enabled: false,
             historian_context_limit_tokens: 128_000,
+            memory_budget_tokens: 8_000.0,
+            user_profile_budget_tokens: 4_000.0,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
             shadow_enabled: true,
@@ -14865,6 +14886,8 @@ mod tests {
             "ses",
             &before_transition.meta,
             before_transition.meta.expiry_cutoff_ms,
+            8_000.0,
+            |_| 0,
         )
         .unwrap();
         assert!(
@@ -18163,6 +18186,8 @@ mod tests {
                 note_project_path: &baseline_project_path,
                 project_directory: &baseline_project_path,
                 history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+                memory_budget_tokens: 8_000.0,
+                user_profile_budget_tokens: 4_000.0,
                 memory_enabled: true,
                 now_ms: now_ms(),
                 execute_threshold_percentage: 65.0,
@@ -18837,6 +18862,8 @@ mod tests {
                 note_project_path: &project_path_string,
                 project_directory: &project_path_string,
                 history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+                memory_budget_tokens: 8_000.0,
+                user_profile_budget_tokens: 4_000.0,
                 memory_enabled: true,
                 now_ms: now_ms(),
                 execute_threshold_percentage: 65.0,
@@ -20076,6 +20103,8 @@ mod tests {
                 history_budget_tokens: 60_000.0,
                 covered_system_messages: &[],
                 memory_enabled: true,
+                memory_budget_tokens: 8_000.0,
+                user_profile_budget_tokens: 4_000.0,
             },
             |_| 0,
         )
@@ -20154,6 +20183,8 @@ mod tests {
                 history_budget_tokens: 60_000.0,
                 covered_system_messages: &[],
                 memory_enabled: true,
+                memory_budget_tokens: 8_000.0,
+                user_profile_budget_tokens: 4_000.0,
             },
             |_| 0,
         )

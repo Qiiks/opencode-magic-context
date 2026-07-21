@@ -164,6 +164,10 @@ pub struct ProducerContext<'a> {
     /// stable model limit and may refresh it after a config change; the route binding
     /// supplies a fallback for older callers. A cache-busting render pass freezes the selected value in m0.
     pub history_budget_tokens: f64,
+    /// Project-memory block budget resolved from the module config.
+    pub memory_budget_tokens: f64,
+    /// User-profile block budget resolved from the module config.
+    pub user_profile_budget_tokens: f64,
     /// Whether memory tools and m0 memory rendering are enabled for this binding.
     pub memory_enabled: bool,
     /// The wall-clock now (ms) for THIS pass. Used only to SET `meta.expiry_cutoff_ms` on
@@ -235,6 +239,20 @@ pub struct TransformRequest {
     pub serializer_profile: String,
     pub session_id: String,
     pub render_config: String,
+    /// Hash of the rendered Magic Context system prompt. Empty means unknown and is adopted
+    /// without forcing a fold on legacy sessions.
+    #[serde(default)]
+    pub system_prompt_hash: String,
+    /// Identity of the materializer's upgrade state, stored so a change is detected as a
+    /// render-configuration change consistently with the TypeScript materializer.
+    #[serde(default)]
+    pub upgrade_state: String,
+    /// Primary sessions compose the cache prefix; subagents retain only reduction plumbing.
+    #[serde(default)]
+    pub is_subagent: bool,
+    /// Number of newest active tag rows protected from emergency reduction.
+    #[serde(default = "default_protected_tags")]
+    pub protected_tags: usize,
     /// Canonical provider id used by the native serializer gate. Empty sentinels are
     /// safe only for the OpenCode Anthropic adapter, matching TS `modelAcceptsEmptyContent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -306,6 +324,10 @@ fn default_clear_reasoning_age() -> u64 {
     DEFAULT_CLEAR_REASONING_AGE
 }
 
+fn default_protected_tags() -> usize {
+    20
+}
+
 #[derive(Deserialize)]
 struct TransformRequestWire {
     #[serde(default)]
@@ -316,6 +338,14 @@ struct TransformRequestWire {
     serializer_profile: Option<String>,
     session_id: String,
     render_config: String,
+    #[serde(default)]
+    system_prompt_hash: String,
+    #[serde(default)]
+    upgrade_state: String,
+    #[serde(default)]
+    is_subagent: bool,
+    #[serde(default = "default_protected_tags")]
+    protected_tags: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -369,6 +399,10 @@ impl<'de> Deserialize<'de> for TransformRequest {
             serializer_profile: wire.serializer_profile.unwrap_or_default(),
             session_id: wire.session_id,
             render_config: wire.render_config,
+            system_prompt_hash: wire.system_prompt_hash,
+            upgrade_state: wire.upgrade_state,
+            is_subagent: wire.is_subagent,
+            protected_tags: wire.protected_tags,
             provider_id: wire.provider_id,
             model_key: wire.model_key,
             clear_reasoning_age: wire.clear_reasoning_age,
@@ -975,10 +1009,10 @@ fn apply_once(
         epoch => format!("tfe{epoch}"),
     };
     let effective_render_config = fold_m0_content_epoch(
-        &req.render_config,
+        &render_identity_base(req),
         &M0ContentEpoch {
             workspace_fingerprint: store.workspace_fingerprint(ctx.project_path, ctx.now_ms)?,
-            upgrade_state: String::new(),
+            upgrade_state: req.upgrade_state.clone(),
             memory_content_epoch: String::new(),
             memory_render_epoch,
             compartment_render_epoch,
@@ -1197,12 +1231,23 @@ fn apply_once(
             .map(deferred_from_meta),
         boundary_bypass: BoundaryBypass {
             explicit_bust: loaded.meta.soft_refresh_pending,
-            subagent: false,
+            subagent: req.is_subagent,
         },
         drain_latch: latch_from_meta(&loaded.meta),
         overflow_error_text: req.provider_error.clone(),
     });
     timings.decide += elapsed_ms(decide_scheduler_started_at);
+    if req.is_subagent
+        && matches!(
+            scheduler_outcome.pass,
+            scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95
+        )
+    {
+        // Subagent passes must not use the primary session's Force85 or Emergency95
+        // materialization path; they keep the normal execute/drop cadence at those pressures.
+        scheduler_outcome.pass = scheduler::PassDecision::Execute;
+        scheduler_outcome.drain_latch = LatchState::default();
+    }
     // A flush requests work on the next pass, not a new m0 fold. Promote only a normal
     // defer to Execute; mandatory bootstrap, epoch, and pressure decisions retain priority.
     if loaded.meta.soft_refresh_pending && scheduler_outcome.pass == scheduler::PassDecision::Defer
@@ -1230,8 +1275,31 @@ fn apply_once(
     } else {
         false
     };
-    let render_config_changed =
-        loaded.meta.initialized && effective_render_config != loaded.meta.last_render_config;
+    // A legacy/first-observation row has no stored identity. Adopt the current identity
+    // without folding; only a change from a non-empty durable value is a HARD trigger.
+    let identity_observed = !loaded.meta.last_provider_id.is_empty()
+        || !loaded.meta.last_model_key.is_empty()
+        || !loaded.meta.last_system_prompt_hash.is_empty()
+        || !loaded.meta.last_upgrade_state.is_empty();
+    let coordinator_identity = req.render_config.contains("provider:")
+        || req.render_config.contains("model:")
+        || req.provider_id.is_some()
+        || req.model_key.is_some()
+        || !req.system_prompt_hash.is_empty()
+        || !req.upgrade_state.is_empty();
+    let render_config_changed = loaded.meta.initialized
+        && if identity_observed || !coordinator_identity {
+            effective_render_config != loaded.meta.last_render_config
+        } else if loaded.meta.last_render_config.is_empty() {
+            false
+        } else if render_config_base(&loaded.meta.last_render_config).is_empty() {
+            // Older rows stored no provider identity in the base. Adopt the first provider
+            // identity without folding, while still honoring a real module render-epoch change.
+            render_epoch_suffix(&effective_render_config, true)
+                != render_epoch_suffix(&loaded.meta.last_render_config, true)
+        } else {
+            effective_render_config != loaded.meta.last_render_config
+        };
     let reconcile_hard_due = loaded.core.reconcile_pending && !boundary_present;
     // If Claude-code coverage advances over system messages, force a HARD render so the
     // messages move into the m0 prefix before the byte-splice profile suppresses their
@@ -1295,6 +1363,7 @@ fn apply_once(
             &projection,
             &tag_rows,
             mutation_exempt_mid,
+            req.protected_tags,
         )
     } else {
         HashSet::new()
@@ -1342,7 +1411,10 @@ fn apply_once(
                 ceiling_tokens: context_limit_tokens
                     * ctx.execute_threshold_percentage.clamp(1.0, 100.0)
                     / 100.0,
-                protected_cutoff_ordinal: 0,
+                protected_cutoff_ordinal: protected_tail_cutoff_ordinal(
+                    &projection,
+                    &protected_block_ids,
+                ),
                 last_execute_ordinal: if loaded.core.reconcile_pending {
                     0
                 } else {
@@ -1383,7 +1455,7 @@ fn apply_once(
         loaded.meta.coverage_ordinal,
     );
     let classify_started_at = Instant::now();
-    let plan = classify(&ClassifierInput {
+    let mut plan = classify(&ClassifierInput {
         initialized: loaded.meta.initialized,
         is_legacy_baseline: is_legacy_baseline(&loaded.core),
         valid_m0m1_shape: valid_m0m1_shape(&loaded.core),
@@ -1400,9 +1472,16 @@ fn apply_once(
         bust_opportunity: pass_already_busting || reductions_pending_now,
     });
     timings.decide += elapsed_ms(classify_started_at);
+    if req.is_subagent {
+        plan = if matches!(scheduler_outcome.pass, scheduler::PassDecision::Defer) {
+            PassPlan::Defer
+        } else {
+            PassPlan::Soft
+        };
+    }
     let profile_transition = !loaded.meta.last_serializer_profile.is_empty()
         && loaded.meta.last_serializer_profile != req.serializer_profile;
-    let materialize_reason = classify_materialize_reason(MaterializeReasonInputs {
+    let mut materialize_reason = classify_materialize_reason(MaterializeReasonInputs {
         plan,
         bootstrap_due: !loaded.meta.initialized,
         legacy_baseline: is_legacy_baseline(&loaded.core),
@@ -1421,6 +1500,26 @@ fn apply_once(
     let mut core = loaded.core.clone();
     log_reasoning_drop_seed_skips(&core, &live, &req.session_id);
     let mut meta = loaded.meta.clone();
+    if !identity_observed && coordinator_identity {
+        // Persist the first provider/model/system/upgrade observation without folding. This
+        // lets an already-materialized session adopt the coordinator's identity safely.
+        meta.last_provider_id = req.provider_id.clone().unwrap_or_default();
+        meta.last_model_key = req.model_key.clone().unwrap_or_default();
+        meta.last_system_prompt_hash = req.system_prompt_hash.clone();
+        meta.last_upgrade_state = req.upgrade_state.clone();
+        meta.last_render_config = effective_render_config.clone();
+    }
+    if !req.is_subagent
+        && matches!(
+            scheduler_outcome.pass,
+            scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95
+        )
+    {
+        // The emergency selector latches every acting input sample, including zero
+        // removals, so repeated pressure observations do not re-bust unchanged bytes.
+        meta.last_emergency_input_sample = usage_input_tokens;
+        meta.has_prior_emergency_drop = true;
+    }
     let mut commit_expected = loaded.row_version;
     if clear_pending_rewrite_on_present {
         meta.pending_rewrite = None;
@@ -1448,10 +1547,11 @@ fn apply_once(
     }
     apply_scheduler_meta(&mut meta, &scheduler_outcome);
 
-    let is_bust_pass = matches!(
-        plan,
-        PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
-    );
+    let is_bust_pass = !req.is_subagent
+        && matches!(
+            plan,
+            PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
+        );
     if let Some(cutoff) = reasoning_clear_cutoff(
         req,
         serializer_profile,
@@ -1481,347 +1581,460 @@ fn apply_once(
     let mut commit_memory_revision = None;
     let mut note_deliveries: Vec<NoteDelivery> = Vec::new();
 
-    match plan {
-        PassPlan::Reject(m) => return Err(TransformError::UnknownShape(m)),
-        PassPlan::Hard | PassPlan::MigrateHard => {
-            // EXPENSIVE bust-only: compose the m0 baseline from the store. now_ms freezes
-            // the expiry cutoff into meta so every later in-epoch SOFT/defer reads the
-            // SAME memory set (a memory expiring mid-epoch stays rendered until the next
-            // HARD re-freezes the cutoff — the byte-stability tradeoff).
-            let compartments_for_live_coverage = store.load_compartments(&req.session_id)?;
-            let coverage_bounds =
-                coverage_bounds_from_compartments(&compartments_for_live_coverage)?;
-            let covered_system_messages = covered_system_messages_for_coverage(
-                req,
-                coverage_bounds.map(|(_, end)| end),
-                coverage_bounds.map(|(start, _)| start),
-                serializer_profile,
-            );
-            let mut comp = compose_m0_from_store(
-                store,
-                &crate::m0_compose::M0ComposeInputs {
-                    session_id: &req.session_id,
-                    project_path: ctx.project_path,
-                    project_directory: ctx.project_directory,
-                    now_ms: ctx.now_ms,
-                    history_budget_tokens: ctx.history_budget_tokens,
-                    covered_system_messages: &covered_system_messages,
-                    memory_enabled: ctx.memory_enabled,
-                },
-                estimate_tokens,
-            )?;
+    if req.is_subagent {
+        if !matches!(scheduler_outcome.pass, scheduler::PassDecision::Defer) {
+            core.step(PassInput {
+                proposed: Some(mc_core::Action::Soft),
+                boundary_present: boundary_token,
+                rendered_units: new_reduction_units(&core, &selected_reductions, &live, None),
+                new_boundary_id: None,
+                queued: Vec::new(),
+                run_started: false,
+            });
+        }
+    } else {
+        match plan {
+            PassPlan::Reject(m) => return Err(TransformError::UnknownShape(m)),
+            PassPlan::Hard | PassPlan::MigrateHard => {
+                // EXPENSIVE bust-only: compose the m0 baseline from the store. now_ms freezes
+                // the expiry cutoff into meta so every later in-epoch SOFT/defer reads the
+                // SAME memory set (a memory expiring mid-epoch stays rendered until the next
+                // HARD re-freezes the cutoff — the byte-stability tradeoff).
+                let compartments_for_live_coverage = store.load_compartments(&req.session_id)?;
+                let coverage_bounds =
+                    coverage_bounds_from_compartments(&compartments_for_live_coverage)?;
+                let covered_system_messages = covered_system_messages_for_coverage(
+                    req,
+                    coverage_bounds.map(|(_, end)| end),
+                    coverage_bounds.map(|(start, _)| start),
+                    serializer_profile,
+                );
+                let mut comp = compose_m0_from_store(
+                    store,
+                    &crate::m0_compose::M0ComposeInputs {
+                        session_id: &req.session_id,
+                        project_path: ctx.project_path,
+                        project_directory: ctx.project_directory,
+                        now_ms: ctx.now_ms,
+                        history_budget_tokens: ctx.history_budget_tokens,
+                        covered_system_messages: &covered_system_messages,
+                        memory_enabled: ctx.memory_enabled,
+                        memory_budget_tokens: ctx.memory_budget_tokens,
+                        user_profile_budget_tokens: ctx.user_profile_budget_tokens,
+                    },
+                    estimate_tokens,
+                )?;
 
-            // Live coverage guard: store-pure validation allows sparse coordinate
-            // gaps because consumer producers can retire ordinal numbers permanently.
-            // Once the live array is available, every present non-system block at or
-            // below the coverage end must fall inside some compartment range; otherwise
-            // build_output would trim unsummarized raw bytes from the tail.
-            if let Some(stray) = first_uncovered_live_block(
-                &compartments_for_live_coverage,
-                &live,
-                comp.coverage_ordinal,
-            ) {
-                return Err(TransformError::CoverageGap(format!(
+                // Live coverage guard: store-pure validation allows sparse coordinate
+                // gaps because consumer producers can retire ordinal numbers permanently.
+                // Once the live array is available, every present non-system block at or
+                // below the coverage end must fall inside some compartment range; otherwise
+                // build_output would trim unsummarized raw bytes from the tail.
+                if let Some(stray) = first_uncovered_live_block(
+                    &compartments_for_live_coverage,
+                    &live,
+                    comp.coverage_ordinal,
+                ) {
+                    return Err(TransformError::CoverageGap(format!(
                     "coverage gap: live item {} (ordinal {}) sits at or below coverage end {:?} \
                      but no compartment covers it; composing m0 would silently drop it from the tail",
                     stray.id(),
                     stray.ordinal(),
                     comp.coverage_ordinal
                 )));
-            }
+                }
 
-            // Mint-absent guard: when this fold takes its anchor from a compartment
-            // (coverage present), the minted boundary must be a block id that exists in
-            // the live input THIS pass — the anchor is the last covered block, which the
-            // producer always sends (trimming happens in our OUTPUT, and a producer-side
-            // coverage trim keeps ordinals >= coverage_ordinal, so the boundary block
-            // itself is never trimmed away). An empty or absent mint means either the
-            // compartment's end_message_id is empty or in the wrong vocabulary (it must
-            // be the flat block id `<mid>#<index>`, not a bare message id), or the store
-            // still covers messages a revert removed and has not been re-cut. Committing
-            // such an anchor makes presence impossible on every later pass, so reconcile
-            // can never clear and every pass re-materializes — an unbounded phantom-HARD
-            // loop serving summaries of content that may no longer exist. Fail loud
-            // instead, on EVERY hard including a reconcile-rematerialize: a rematerialize
-            // that cannot mint a presentable anchor has no path to clearing reconcile
-            // either, and the loud error repeats until the store is re-cut. A revert that
-            // clears the compartments entirely stays legitimate: coverage is then None
-            // and the fold mints the reserved empty anchor without entering this guard.
-            if comp.coverage_ordinal.is_some() {
-                let minted = comp.boundary_id.as_str();
-                if minted.is_empty()
-                    || !boundary_available(
-                        minted,
-                        &live,
-                        &boundary_state,
-                        req.declared_trim.as_ref(),
-                    )
-                {
-                    if loaded.core.reconcile_pending {
-                        let compartments = store.load_compartments(&req.session_id)?;
-                        let keep_through_seq = surviving_revert_prefix_seq(&compartments, &live);
-                        let outcome = store.truncate_compartments_for_revert(
-                            &req.session_id,
-                            keep_through_seq,
-                            commit_expected,
-                        )?;
-                        commit_expected = Some(outcome.row_version);
-                        meta.revert_epoch = outcome.revert_epoch;
-                        meta.last_recut = outcome.last_recut;
-                        m1_signal = m1_revision_signal_parts_for_pass(
-                            store,
-                            ctx.project_path,
-                            ctx.note_project_path,
-                            &req.session_id,
-                            loaded.meta.user_profile_version,
-                            ctx.now_ms,
-                        )?;
-                        current_m1_digest = m1_signal.revision;
-                        let recut_compartments = store.load_compartments(&req.session_id)?;
-                        let recut_coverage_bounds =
-                            coverage_bounds_from_compartments(&recut_compartments)?;
-                        let recut_covered_system_messages = covered_system_messages_for_coverage(
-                            req,
-                            recut_coverage_bounds.map(|(_, end)| end),
-                            recut_coverage_bounds.map(|(start, _)| start),
-                            serializer_profile,
-                        );
-                        comp = compose_m0_from_store(
-                            store,
-                            &crate::m0_compose::M0ComposeInputs {
-                                session_id: &req.session_id,
-                                project_path: ctx.project_path,
-                                project_directory: ctx.project_directory,
-                                now_ms: ctx.now_ms,
-                                history_budget_tokens: ctx.history_budget_tokens,
-                                covered_system_messages: &recut_covered_system_messages,
-                                memory_enabled: ctx.memory_enabled,
-                            },
-                            estimate_tokens,
-                        )?;
-                        meta.last_execute_ordinal = meta
-                            .last_execute_ordinal
-                            .min(comp.coverage_ordinal.unwrap_or(0));
-
-                        if let Some(stray) = first_uncovered_live_block(
-                            &recut_compartments,
+                // Mint-absent guard: when this fold takes its anchor from a compartment
+                // (coverage present), the minted boundary must be a block id that exists in
+                // the live input THIS pass — the anchor is the last covered block, which the
+                // producer always sends (trimming happens in our OUTPUT, and a producer-side
+                // coverage trim keeps ordinals >= coverage_ordinal, so the boundary block
+                // itself is never trimmed away). An empty or absent mint means either the
+                // compartment's end_message_id is empty or in the wrong vocabulary (it must
+                // be the flat block id `<mid>#<index>`, not a bare message id), or the store
+                // still covers messages a revert removed and has not been re-cut. Committing
+                // such an anchor makes presence impossible on every later pass, so reconcile
+                // can never clear and every pass re-materializes — an unbounded phantom-HARD
+                // loop serving summaries of content that may no longer exist. Fail loud
+                // instead, on EVERY hard including a reconcile-rematerialize: a rematerialize
+                // that cannot mint a presentable anchor has no path to clearing reconcile
+                // either, and the loud error repeats until the store is re-cut. A revert that
+                // clears the compartments entirely stays legitimate: coverage is then None
+                // and the fold mints the reserved empty anchor without entering this guard.
+                if comp.coverage_ordinal.is_some() {
+                    let minted = comp.boundary_id.as_str();
+                    if minted.is_empty()
+                        || !boundary_available(
+                            minted,
                             &live,
-                            comp.coverage_ordinal,
-                        ) {
-                            return Err(TransformError::CoverageGap(format!(
+                            &boundary_state,
+                            req.declared_trim.as_ref(),
+                        )
+                    {
+                        if loaded.core.reconcile_pending {
+                            let compartments = store.load_compartments(&req.session_id)?;
+                            let keep_through_seq =
+                                surviving_revert_prefix_seq(&compartments, &live);
+                            let outcome = store.truncate_compartments_for_revert(
+                                &req.session_id,
+                                keep_through_seq,
+                                commit_expected,
+                            )?;
+                            commit_expected = Some(outcome.row_version);
+                            meta.revert_epoch = outcome.revert_epoch;
+                            meta.last_recut = outcome.last_recut;
+                            m1_signal = m1_revision_signal_parts_for_pass(
+                                store,
+                                ctx.project_path,
+                                ctx.note_project_path,
+                                &req.session_id,
+                                loaded.meta.user_profile_version,
+                                ctx.now_ms,
+                            )?;
+                            current_m1_digest = m1_signal.revision;
+                            let recut_compartments = store.load_compartments(&req.session_id)?;
+                            let recut_coverage_bounds =
+                                coverage_bounds_from_compartments(&recut_compartments)?;
+                            let recut_covered_system_messages =
+                                covered_system_messages_for_coverage(
+                                    req,
+                                    recut_coverage_bounds.map(|(_, end)| end),
+                                    recut_coverage_bounds.map(|(start, _)| start),
+                                    serializer_profile,
+                                );
+                            comp = compose_m0_from_store(
+                                store,
+                                &crate::m0_compose::M0ComposeInputs {
+                                    session_id: &req.session_id,
+                                    project_path: ctx.project_path,
+                                    project_directory: ctx.project_directory,
+                                    now_ms: ctx.now_ms,
+                                    history_budget_tokens: ctx.history_budget_tokens,
+                                    covered_system_messages: &recut_covered_system_messages,
+                                    memory_enabled: ctx.memory_enabled,
+                                    memory_budget_tokens: ctx.memory_budget_tokens,
+                                    user_profile_budget_tokens: ctx.user_profile_budget_tokens,
+                                },
+                                estimate_tokens,
+                            )?;
+                            meta.last_execute_ordinal = meta
+                                .last_execute_ordinal
+                                .min(comp.coverage_ordinal.unwrap_or(0));
+
+                            if let Some(stray) = first_uncovered_live_block(
+                                &recut_compartments,
+                                &live,
+                                comp.coverage_ordinal,
+                            ) {
+                                return Err(TransformError::CoverageGap(format!(
                                 "coverage gap after re-cut: live item {} (ordinal {}) is below coverage end {:?} but uncovered",
                                 stray.id(),
                                 stray.ordinal(),
                                 comp.coverage_ordinal
                             )));
-                        }
+                            }
 
-                        if comp.coverage_ordinal.is_some() {
-                            let reminted = comp.boundary_id.as_str();
-                            if reminted.is_empty()
-                                || !boundary_available(
-                                    reminted,
-                                    &live,
-                                    &boundary_state,
-                                    req.declared_trim.as_ref(),
-                                )
-                            {
-                                return Err(TransformError::BoundaryNotPresent(format!(
+                            if comp.coverage_ordinal.is_some() {
+                                let reminted = comp.boundary_id.as_str();
+                                if reminted.is_empty()
+                                    || !boundary_available(
+                                        reminted,
+                                        &live,
+                                        &boundary_state,
+                                        req.declared_trim.as_ref(),
+                                    )
+                                {
+                                    return Err(TransformError::BoundaryNotPresent(format!(
                                     "re-cut kept compartments through sequence {keep_through_seq}, \
                                      but the fold still minted absent anchor {reminted:?}; \
                                      the publisher must write flat end_message_id block ids"
                                 )));
+                                }
                             }
-                        }
-                    } else {
-                        return Err(TransformError::BoundaryNotPresent(format!(
-                            "fold minted anchor {minted:?} from the folded compartment's \
+                        } else {
+                            return Err(TransformError::BoundaryNotPresent(format!(
+                                "fold minted anchor {minted:?} from the folded compartment's \
                              end_message_id, but no live block carries that id; the anchor \
                              must be the flat block id (`<mid>#<index>`) of the last covered \
                              block; check the publisher's end_message_id"
-                        )));
+                            )));
+                        }
                     }
                 }
-            }
 
-            // The reductions that SURVIVE the fold: m0 is now a compartment SUMMARY (not
-            // covered raw bytes), so a reduction on a now-covered item simply drops with
-            // it (no "fold reduced bytes into m0"); a target still in the new tail is kept;
-            // a reverted-away target is an orphan. apply_units can't delete → rebuild.
-            let effective = effective_reductions(&core, &selected_reductions);
-            let survivors = surviving_red_units(&effective, &live, comp.coverage_ordinal);
-            core.frozen_units.clear();
-            core.pending_changes.clear();
-            let (note_body, hard_note_deliveries) = claim_and_render_notes(
-                store,
-                ctx.note_project_path,
-                &req.session_id,
-                &format!("m1:{}:{}", current_m1_digest, ctx.now_ms),
-                &format!("m1:{}:{}", current_m1_digest, ctx.now_ms),
-                ctx.now_ms,
-            )?;
-            note_deliveries = hard_note_deliveries;
-            let m1_unit = if note_body.is_empty() {
-                render_m1_placeholder()
-            } else {
-                render_m1_body(&note_body)
-            };
-            let mut rendered = vec![synth_region("m0", comp.m0_bytes), m1_unit];
-            rendered.extend(survivors);
+                // Keep reductions whose targets remain in the new tail; discard reductions covered
+                // by the new m0 summary or orphaned by a revert. Because apply_units cannot remove
+                // those obsolete units in place, rebuild the frozen unit set.
+                let effective = effective_reductions(&core, &selected_reductions);
+                let survivors = surviving_red_units(&effective, &live, comp.coverage_ordinal);
+                core.frozen_units.clear();
+                core.pending_changes.clear();
+                let (note_body, hard_note_deliveries) = claim_and_render_notes(
+                    store,
+                    ctx.note_project_path,
+                    &req.session_id,
+                    &format!("m1:{}:{}", current_m1_digest, ctx.now_ms),
+                    &format!("m1:{}:{}", current_m1_digest, ctx.now_ms),
+                    ctx.now_ms,
+                )?;
+                note_deliveries = hard_note_deliveries;
+                let m1_unit = if note_body.is_empty() {
+                    render_m1_placeholder()
+                } else {
+                    render_m1_body(&note_body)
+                };
+                let mut rendered = vec![synth_region("m0", comp.m0_bytes), m1_unit];
+                rendered.extend(survivors);
 
-            // A HARD re-composes m0 fully from the store, so the boundary ALWAYS reflects
-            // the current coverage — set it unconditionally (empty when no compartments,
-            // keeping boundary_id + coverage_ordinal consistent). The core only SETS on
-            // Some, so mapping empty→None would leave a stale prior anchor alongside a
-            // None coverage_ordinal — an inconsistent state.
-            core.step(PassInput {
-                proposed: Some(mc_core::Action::Hard),
-                boundary_present: boundary_token,
-                rendered_units: rendered,
-                new_boundary_id: Some(comp.boundary_id.clone()),
-                queued: Vec::new(),
-                run_started: false,
-            });
-            meta.initialized = true;
-            meta.last_render_config = effective_render_config;
-            coverage_shrunk_on_bust =
-                coverage_shrank(loaded.meta.coverage_ordinal, comp.coverage_ordinal);
-            if coverage_shrunk_on_bust && tail_reclaim_enabled {
-                let todo_started_at = Instant::now();
-                let post_truncate_tail = tail_sel_items(&live, comp.coverage_ordinal);
-                capture_todo_state_on_bust(&mut meta, &post_truncate_tail, true);
-                todo_ms += elapsed_ms(todo_started_at);
+                // A HARD re-composes m0 fully from the store, so the boundary ALWAYS reflects
+                // the current coverage — set it unconditionally (empty when no compartments,
+                // keeping boundary_id + coverage_ordinal consistent). The core only SETS on
+                // Some, so mapping empty→None would leave a stale prior anchor alongside a
+                // None coverage_ordinal — an inconsistent state.
+                core.step(PassInput {
+                    proposed: Some(mc_core::Action::Hard),
+                    boundary_present: boundary_token,
+                    rendered_units: rendered,
+                    new_boundary_id: Some(comp.boundary_id.clone()),
+                    queued: Vec::new(),
+                    run_started: false,
+                });
+                meta.initialized = true;
+                meta.last_render_config = effective_render_config;
+                meta.last_provider_id = req.provider_id.clone().unwrap_or_default();
+                meta.last_model_key = req.model_key.clone().unwrap_or_default();
+                meta.last_system_prompt_hash = req.system_prompt_hash.clone();
+                meta.last_upgrade_state = req.upgrade_state.clone();
+                coverage_shrunk_on_bust =
+                    coverage_shrank(loaded.meta.coverage_ordinal, comp.coverage_ordinal);
+                if coverage_shrunk_on_bust && tail_reclaim_enabled {
+                    let todo_started_at = Instant::now();
+                    let post_truncate_tail = tail_sel_items(&live, comp.coverage_ordinal);
+                    capture_todo_state_on_bust(&mut meta, &post_truncate_tail, true);
+                    todo_ms += elapsed_ms(todo_started_at);
+                }
+                meta.coverage_ordinal = comp.coverage_ordinal;
+                meta.coverage_start_ordinal = comp.first_covered_ordinal;
+                meta.coverage_compartment_seq = Some(comp.folded_compartment_seq);
+                meta.folded_compartment_seq = comp.folded_compartment_seq;
+                commit_memory_revision = Some(comp.memory_revision.clone());
+                meta.rendered_memory_ids = comp.rendered_memory_ids;
+                meta.memory_mutation_cursor = comp.memory_mutation_cursor;
+                meta.max_memory_id = comp.max_memory_id;
+                meta.expiry_cutoff_ms = ctx.now_ms; // FROZEN here, atomic with the m0 bytes
+                                                    // The post-fold m1 baseline digest — NOT 0. After folding up to the current
+                                                    // watermarks, "no delta" == "watermarks unchanged since this digest"; setting
+                                                    // 0 would make the next pass's non-zero digest read as a phantom SOFT.
+                let applied_m1_signal = m1_revision_signal_parts_for_pass(
+                    store,
+                    ctx.project_path,
+                    ctx.note_project_path,
+                    &req.session_id,
+                    loaded.meta.user_profile_version,
+                    ctx.now_ms,
+                )?;
+                meta.m1_revision = applied_m1_signal.revision;
+                meta.m1_external_revision = applied_m1_signal.external_revision;
+                meta.project_memory_epoch_pending = false;
+                meta.m1_pending_since_ms = None;
             }
-            meta.coverage_ordinal = comp.coverage_ordinal;
-            meta.coverage_start_ordinal = comp.first_covered_ordinal;
-            meta.coverage_compartment_seq = Some(comp.folded_compartment_seq);
-            meta.folded_compartment_seq = comp.folded_compartment_seq;
-            commit_memory_revision = Some(comp.memory_revision.clone());
-            meta.rendered_memory_ids = comp.rendered_memory_ids;
-            meta.memory_mutation_cursor = comp.memory_mutation_cursor;
-            meta.max_memory_id = comp.max_memory_id;
-            meta.expiry_cutoff_ms = ctx.now_ms; // FROZEN here, atomic with the m0 bytes
-                                                // The post-fold m1 baseline digest — NOT 0. After folding up to the current
-                                                // watermarks, "no delta" == "watermarks unchanged since this digest"; setting
-                                                // 0 would make the next pass's non-zero digest read as a phantom SOFT.
-            let applied_m1_signal = m1_revision_signal_parts_for_pass(
-                store,
-                ctx.project_path,
-                ctx.note_project_path,
-                &req.session_id,
-                loaded.meta.user_profile_version,
-                ctx.now_ms,
-            )?;
-            meta.m1_revision = applied_m1_signal.revision;
-            meta.m1_external_revision = applied_m1_signal.external_revision;
-            meta.project_memory_epoch_pending = false;
-            meta.m1_pending_since_ms = None;
-        }
-        PassPlan::Soft => {
-            commit_memory_revision =
-                Some(memory_revision_fence(store, ctx.project_path, &m1_signal)?);
-            // EXPENSIVE bust-only: compose the m1 delta body from the store against the
-            // watermarks the last HARD froze (incl. the FROZEN expiry cutoff). A
-            // reduction-only SOFT recomposes byte-identical m1 (watermarks unchanged), so
-            // the m1 unit stays stable; a new compartment extends coverage → advance the
-            // boundary anchor in this same commit.
-            let m1 = compose_m1_from_store(
-                store,
-                ctx.project_path,
-                ctx.note_project_path,
-                &req.session_id,
-                &meta,
-                meta.expiry_cutoff_ms,
-            )?;
-            note_deliveries = m1.note_deliveries.clone();
-            let mut rendered = vec![render_m1_body(&m1.body)];
-            rendered.extend(new_reduction_units(
-                &core,
-                &selected_reductions,
-                &live,
-                loaded.meta.coverage_ordinal,
-            ));
-            // A coverage-extending SOFT advances the boundary anchor (the bound core
-            // primitive); a memory-only SOFT leaves it put (None).
-            let new_boundary_id = m1.new_coverage.as_ref().map(|(id, _)| id.clone());
-            if let Some((_, coverage_end)) = &m1.new_coverage {
-                let compartments_for_live_coverage = store.load_compartments(&req.session_id)?;
-                if let Some(stray) = first_uncovered_live_block(
-                    &compartments_for_live_coverage,
-                    &live,
-                    Some(*coverage_end),
-                ) {
-                    return Err(TransformError::CoverageGap(format!(
+            PassPlan::Soft => {
+                commit_memory_revision =
+                    Some(memory_revision_fence(store, ctx.project_path, &m1_signal)?);
+                // EXPENSIVE bust-only: compose the m1 delta body from the store against the
+                // watermarks the last HARD froze (incl. the FROZEN expiry cutoff). A
+                // reduction-only SOFT recomposes byte-identical m1 (watermarks unchanged), so
+                // the m1 unit stays stable; a new compartment extends coverage → advance the
+                // boundary anchor in this same commit.
+                let m1 = compose_m1_from_store(
+                    store,
+                    ctx.project_path,
+                    ctx.note_project_path,
+                    &req.session_id,
+                    &meta,
+                    meta.expiry_cutoff_ms,
+                    ctx.memory_budget_tokens,
+                    mc_tokenizer::estimate_tokens,
+                )?;
+                note_deliveries = m1.note_deliveries.clone();
+                let m0_tokens = core
+                    .frozen_units
+                    .iter()
+                    .find(|unit| unit.key == "m0")
+                    .map(|unit| mc_tokenizer::estimate_tokens(&unit.frozen_payload))
+                    .unwrap_or(0);
+                let m1_has_content = m1.body != M1_PLACEHOLDER;
+                let m1_tokens = if m1_has_content {
+                    mc_tokenizer::estimate_tokens(&m1.body)
+                } else {
+                    0
+                };
+                let pressure_refold = m1.memory_update_count > 40
+                    || (m1_has_content
+                        && m1_tokens as f64 > (ctx.history_budget_tokens * 0.20)
+                        && ctx.history_budget_tokens > 0.0)
+                    || (m1_has_content
+                        && m0_tokens >= 500
+                        && m1_tokens as f64 > m0_tokens as f64 * 0.15);
+                if pressure_refold {
+                    let compartments_for_fold = store.load_compartments(&req.session_id)?;
+                    let coverage_bounds =
+                        coverage_bounds_from_compartments(&compartments_for_fold)?;
+                    let covered_system_messages = covered_system_messages_for_coverage(
+                        req,
+                        coverage_bounds.map(|(_, end)| end),
+                        coverage_bounds.map(|(start, _)| start),
+                        serializer_profile,
+                    );
+                    let comp = compose_m0_from_store(
+                        store,
+                        &crate::m0_compose::M0ComposeInputs {
+                            session_id: &req.session_id,
+                            project_path: ctx.project_path,
+                            project_directory: ctx.project_directory,
+                            now_ms: ctx.now_ms,
+                            history_budget_tokens: ctx.history_budget_tokens,
+                            covered_system_messages: &covered_system_messages,
+                            memory_enabled: ctx.memory_enabled,
+                            memory_budget_tokens: ctx.memory_budget_tokens,
+                            user_profile_budget_tokens: ctx.user_profile_budget_tokens,
+                        },
+                        estimate_tokens,
+                    )?;
+                    let effective = effective_reductions(&core, &selected_reductions);
+                    let survivors = surviving_red_units(&effective, &live, comp.coverage_ordinal);
+                    core.frozen_units.clear();
+                    core.pending_changes.clear();
+                    let mut rendered =
+                        vec![synth_region("m0", comp.m0_bytes), render_m1_placeholder()];
+                    rendered.extend(survivors);
+                    core.step(PassInput {
+                        proposed: Some(mc_core::Action::Hard),
+                        boundary_present: boundary_token,
+                        rendered_units: rendered,
+                        new_boundary_id: Some(comp.boundary_id.clone()),
+                        queued: Vec::new(),
+                        run_started: false,
+                    });
+                    plan = PassPlan::Hard;
+                    materialize_reason = Some("pressure_refold".to_string());
+                    meta.initialized = true;
+                    meta.coverage_ordinal = comp.coverage_ordinal;
+                    meta.coverage_start_ordinal = comp.first_covered_ordinal;
+                    meta.coverage_compartment_seq = Some(comp.folded_compartment_seq);
+                    meta.folded_compartment_seq = comp.folded_compartment_seq;
+                    meta.rendered_memory_ids = comp.rendered_memory_ids;
+                    meta.memory_mutation_cursor = comp.memory_mutation_cursor;
+                    meta.max_memory_id = comp.max_memory_id;
+                    meta.expiry_cutoff_ms = ctx.now_ms;
+                    meta.m1_revision = m1_signal.revision;
+                    meta.m1_external_revision = m1_signal.external_revision;
+                    meta.project_memory_epoch_pending = false;
+                    meta.m1_pending_since_ms = None;
+                    commit_memory_revision = Some(comp.memory_revision);
+                } else {
+                    let mut rendered = vec![render_m1_body(&m1.body)];
+                    rendered.extend(new_reduction_units(
+                        &core,
+                        &selected_reductions,
+                        &live,
+                        loaded.meta.coverage_ordinal,
+                    ));
+                    // A coverage-extending SOFT advances the boundary anchor (the bound core
+                    // primitive); a memory-only SOFT leaves it put (None).
+                    let new_boundary_id = m1.new_coverage.as_ref().map(|(id, _)| id.clone());
+                    if let Some((_, coverage_end)) = &m1.new_coverage {
+                        let compartments_for_live_coverage =
+                            store.load_compartments(&req.session_id)?;
+                        if let Some(stray) = first_uncovered_live_block(
+                            &compartments_for_live_coverage,
+                            &live,
+                            Some(*coverage_end),
+                        ) {
+                            return Err(TransformError::CoverageGap(format!(
                         "coverage gap: live item {} (ordinal {}) sits at or below coverage end {} \
                          but no compartment covers it; composing m1 would silently drop it from the tail",
                         stray.id(),
                         stray.ordinal(),
                         coverage_end
                     )));
-                }
-            }
-            // Mint-absent guard, SOFT arm (same invariant as the fold's guard above): an
-            // advanced anchor must exist in the live input this pass, or presence can
-            // never hold afterward and the session decays into a reconcile-HARD loop. A
-            // SOFT can only reach here with reconcile clear (the classifier routes a
-            // pending reconcile to defer/HARD), so every advance is a fresh mint and the
-            // check is unconditional.
-            if let Some(id) = &new_boundary_id {
-                if id.is_empty()
-                    || !boundary_available(id, &live, &boundary_state, req.declared_trim.as_ref())
-                {
-                    return Err(TransformError::BoundaryNotPresent(format!(
-                        "coverage-extending delta advanced the anchor to {id:?}, but no \
+                        }
+                    }
+                    // Mint-absent guard, SOFT arm (same invariant as the fold's guard above): an
+                    // advanced anchor must exist in the live input this pass, or presence can
+                    // never hold afterward and the session decays into a reconcile-HARD loop. A
+                    // SOFT can only reach here with reconcile clear (the classifier routes a
+                    // pending reconcile to defer/HARD), so every advance is a fresh mint and the
+                    // check is unconditional.
+                    if let Some(id) = &new_boundary_id {
+                        if id.is_empty()
+                            || !boundary_available(
+                                id,
+                                &live,
+                                &boundary_state,
+                                req.declared_trim.as_ref(),
+                            )
+                        {
+                            return Err(TransformError::BoundaryNotPresent(format!(
+                                "coverage-extending delta advanced the anchor to {id:?}, but no \
                          live block carries that id; the anchor must be the flat block id \
                          (`<mid>#<index>`) of the last covered block"
-                    )));
+                            )));
+                        }
+                    }
+                    core.step(PassInput {
+                        proposed: Some(mc_core::Action::Soft),
+                        boundary_present: boundary_token,
+                        rendered_units: rendered,
+                        new_boundary_id,
+                        queued: Vec::new(),
+                        run_started: false,
+                    });
+                    // coverage_ordinal advances ATOMICALLY with the anchor (two views of one
+                    // coverage end — they must not desync).
+                    if let Some((_, ord)) = m1.new_coverage {
+                        meta.coverage_ordinal = Some(ord);
+                        meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
+                        // A coverage advance folds items out of the tail, so frozen red:*
+                        // units targeting them must go WITH the coverage. Only the HARD arm
+                        // rebuilds the frozen set (surviving_red_units); without this prune a
+                        // covered reduction would survive a coverage-extending SOFT as silent
+                        // bloat — and a later re-decide of that target with different bytes
+                        // would false-fire the monotonicity conflict guard.
+                        prune_covered_red_units(&mut core, &live, meta.coverage_ordinal);
+                    } else if compartment_seq_changed_since_meta {
+                        meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
+                    }
+                    let applied_m1_signal = m1_revision_signal_parts_for_pass(
+                        store,
+                        ctx.project_path,
+                        ctx.note_project_path,
+                        &req.session_id,
+                        loaded.meta.user_profile_version,
+                        ctx.now_ms,
+                    )?;
+                    meta.m1_revision = applied_m1_signal.revision;
+                    meta.m1_pending_since_ms = None;
                 }
             }
-            core.step(PassInput {
-                proposed: Some(mc_core::Action::Soft),
-                boundary_present: boundary_token,
-                rendered_units: rendered,
-                new_boundary_id,
-                queued: Vec::new(),
-                run_started: false,
-            });
-            // coverage_ordinal advances ATOMICALLY with the anchor (two views of one
-            // coverage end — they must not desync).
-            if let Some((_, ord)) = m1.new_coverage {
-                meta.coverage_ordinal = Some(ord);
-                meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
-                // A coverage advance folds items out of the tail, so frozen red:*
-                // units targeting them must go WITH the coverage. Only the HARD arm
-                // rebuilds the frozen set (surviving_red_units); without this prune a
-                // covered reduction would survive a coverage-extending SOFT as silent
-                // bloat — and a later re-decide of that target with different bytes
-                // would false-fire the monotonicity conflict guard.
-                prune_covered_red_units(&mut core, &live, meta.coverage_ordinal);
-            } else if compartment_seq_changed_since_meta {
-                meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
-            }
-            let applied_m1_signal = m1_revision_signal_parts_for_pass(
-                store,
-                ctx.project_path,
-                ctx.note_project_path,
-                &req.session_id,
-                loaded.meta.user_profile_version,
-                ctx.now_ms,
-            )?;
-            meta.m1_revision = applied_m1_signal.revision;
-            meta.m1_pending_since_ms = None;
-        }
-        PassPlan::Defer => {
-            if current_m1_digest != loaded.meta.m1_revision {
-                log_pending_m1_delta(&req.session_id, ctx.now_ms, loaded.meta.m1_pending_since_ms);
-            }
-            core.step(PassInput {
-                proposed: Some(mc_core::Action::SoftPlus),
-                boundary_present: boundary_token,
-                ..Default::default()
-            });
-            if compartment_seq_changed_since_meta && current_m1_digest == loaded.meta.m1_revision {
-                meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
+            PassPlan::Defer => {
+                if current_m1_digest != loaded.meta.m1_revision {
+                    log_pending_m1_delta(
+                        &req.session_id,
+                        ctx.now_ms,
+                        loaded.meta.m1_pending_since_ms,
+                    );
+                }
+                core.step(PassInput {
+                    proposed: Some(mc_core::Action::SoftPlus),
+                    boundary_present: boundary_token,
+                    ..Default::default()
+                });
+                if compartment_seq_changed_since_meta
+                    && current_m1_digest == loaded.meta.m1_revision
+                {
+                    meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
+                }
             }
         }
     }
@@ -1847,7 +2060,10 @@ fn apply_once(
             .unwrap_or(0)
             .max(meta.last_execute_ordinal);
     }
-    if is_bust_pass && reductions_pending_now && selection_class == PassClass::EmergencyForce {
+    if is_bust_pass && selection_class == PassClass::EmergencyForce {
+        // An emergency selector pass consumes the current provider sample even when
+        // protection filtered every candidate; otherwise the same stale sample would
+        // repeatedly re-arm and re-bust the session.
         meta.last_emergency_input_sample = usage_input_tokens;
         meta.has_prior_emergency_drop = true;
     }
@@ -1901,7 +2117,7 @@ fn apply_once(
         &projection,
         req,
         tagging_active.then_some(&tag_overlay),
-        tail_reclaim_enabled,
+        tail_reclaim_enabled && !req.is_subagent,
         mutation_exempt_mid,
     )?;
     timings.build_output = elapsed_ms(build_output_started_at);
@@ -1951,17 +2167,21 @@ fn apply_once(
         loaded.row_version.unwrap_or(0)
     };
     timings.store_commit = elapsed_ms(store_commit_started_at);
-    let host_directives = channel2_directive(Channel2DirectiveInput {
-        profile: serializer_profile,
-        core: &core,
-        meta: &meta,
-        projection: &projection,
-        tag_rows: &tag_rows,
-        mutation_exempt_mid,
-        context_limit_tokens,
-        input_tokens: usage_input_tokens,
-        execute_threshold_percentage: ctx.execute_threshold_percentage,
-    });
+    let host_directives = if req.is_subagent {
+        None
+    } else {
+        channel2_directive(Channel2DirectiveInput {
+            profile: serializer_profile,
+            core: &core,
+            meta: &meta,
+            projection: &projection,
+            tag_rows: &tag_rows,
+            mutation_exempt_mid,
+            context_limit_tokens,
+            input_tokens: usage_input_tokens,
+            execute_threshold_percentage: ctx.execute_threshold_percentage,
+        })
+    };
 
     timings.total = elapsed_ms(total_started_at);
     Ok(TransformWithProjection {
@@ -2106,6 +2326,45 @@ fn memory_revision_fence(
         max_memory_id: signal.max_memory_id,
         mutation_cursor: signal.max_memory_mutation_id,
     })
+}
+
+fn render_config_base(render_config: &str) -> &str {
+    render_config
+        .split_once("|m0epoch[")
+        .map(|(base, _)| base)
+        .unwrap_or(render_config)
+}
+
+fn render_identity_base(req: &TransformRequest) -> String {
+    let mut parts = Vec::new();
+    if !req.render_config.is_empty() {
+        parts.push(req.render_config.clone());
+    }
+    if let Some(provider) = req.provider_id.as_deref().filter(|value| !value.is_empty()) {
+        parts.push(format!("provider:{provider}"));
+    }
+    if let Some(model) = req.model_key.as_deref().filter(|value| !value.is_empty()) {
+        parts.push(format!("model:{model}"));
+    }
+    if !req.system_prompt_hash.is_empty() {
+        parts.push(format!("system:{}", req.system_prompt_hash));
+    }
+    parts.join("|")
+}
+
+fn render_epoch_suffix(render_config: &str, ignore_upgrade: bool) -> String {
+    let suffix = render_config
+        .split_once("|m0epoch[")
+        .map(|(_, suffix)| suffix)
+        .unwrap_or("");
+    if !ignore_upgrade {
+        return suffix.to_string();
+    }
+    suffix
+        .split(';')
+        .filter(|part| !part.starts_with("upg:"))
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 fn scheduler_config(execute_threshold_percentage: f64) -> SchedulerConfig {
@@ -3054,9 +3313,8 @@ fn newest_active_tag_block_ids(
     projection: &FlatProjection,
     tag_rows: &[McTagRow],
     mutation_exempt_mid: Option<&str>,
+    protected_tags: usize,
 ) -> HashSet<String> {
-    const PROTECTED_TAG_COUNT: usize = 20;
-
     let block_by_id = projection
         .blocks
         .iter()
@@ -3088,9 +3346,22 @@ fn newest_active_tag_block_ids(
     });
     active
         .into_iter()
-        .take(PROTECTED_TAG_COUNT)
+        .take(protected_tags)
         .map(|row| row.block_id.clone())
         .collect()
+}
+
+fn protected_tail_cutoff_ordinal(
+    projection: &FlatProjection,
+    protected_block_ids: &HashSet<String>,
+) -> u64 {
+    projection
+        .blocks
+        .iter()
+        .filter(|block| protected_block_ids.contains(&block.id))
+        .map(|block| block.ordinal)
+        .min()
+        .unwrap_or(0)
 }
 
 fn tag_overlay_state(
@@ -4422,14 +4693,23 @@ fn build_output(
     mutation_exempt_mid: Option<&str>,
 ) -> Result<Vec<CkWireMessage>, TransformError> {
     let mut out = Vec::with_capacity(4 + req.messages.len());
-    if let Some(u) = core.frozen_units.iter().find(|u| u.key == "m0") {
-        out.push(CkWireMessage::synthetic_user_text(u.frozen_payload.clone()));
-    }
-    if let Some(u) = core.frozen_units.iter().find(|u| u.key == "m1") {
-        out.push(CkWireMessage::synthetic_user_text(u.frozen_payload.clone()));
+    if !req.is_subagent {
+        if let Some(u) = core.frozen_units.iter().find(|u| u.key == "m0") {
+            out.push(CkWireMessage::synthetic_user_text(u.frozen_payload.clone()));
+        }
+        if let Some(u) = core.frozen_units.iter().find(|u| u.key == "m1") {
+            out.push(CkWireMessage::synthetic_user_text(u.frozen_payload.clone()));
+        }
     }
 
     let blocks_by_mid = projection_blocks_by_mid(projection);
+    // Subagents do not emit a synthetic m0/m1 prefix, so previously covered input
+    // remains ordinary live history instead of being filtered by a primary cache watermark.
+    let output_coverage = if req.is_subagent {
+        None
+    } else {
+        meta.coverage_ordinal
+    };
 
     // A synthetic-todo pair with no message anchor (anchor_mid == None) was composed when
     // the tail was empty (every live message folded under coverage). It is frozen
@@ -4465,7 +4745,7 @@ fn build_output(
         let keep_leading_system = serializer_profile
             != Some(SerializerProfile::ClaudeCodeAnthropic)
             && is_uncovered_leading_system(msg, meta);
-        if !is_tail(msg.ordinal, meta.coverage_ordinal) && !keep_leading_system {
+        if !is_tail(msg.ordinal, output_coverage) && !keep_leading_system {
             continue;
         }
         let mutation_exempt = mutation_exempt_mid == Some(msg.mid.as_str());
@@ -5638,6 +5918,10 @@ mod tests {
             serializer_profile: "owned-llmrunner".to_string(),
             session_id: session.to_string(),
             render_config: cfg.to_string(),
+            system_prompt_hash: String::new(),
+            upgrade_state: String::new(),
+            is_subagent: false,
+            protected_tags: 20,
             provider_id: None,
             model_key: None,
             clear_reasoning_age: DEFAULT_CLEAR_REASONING_AGE,
@@ -5706,6 +5990,8 @@ mod tests {
             note_project_path: project,
             project_directory: dir,
             history_budget_tokens: 60_000.0,
+            memory_budget_tokens: 8_000.0,
+            user_profile_budget_tokens: 4_000.0,
             memory_enabled: true,
             now_ms,
             execute_threshold_percentage: 65.0,
