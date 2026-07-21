@@ -283,25 +283,36 @@ struct CompiledPattern {
 /// Parse a cache idle TTL string into milliseconds.
 pub fn parse_cache_ttl(ttl: &str) -> Result<u64, CacheTtlParseError> {
     let normalized = ttl.trim();
-    if !normalized.is_empty() && normalized.chars().all(|c| c.is_ascii_digit()) {
-        return normalized.parse().map_err(|_| CacheTtlParseError);
-    }
-
-    let Some(unit) = normalized.chars().last() else {
-        return Err(CacheTtlParseError);
-    };
-    let number = &normalized[..normalized.len().saturating_sub(unit.len_utf8())];
+    let (number, multiplier) =
+        if !normalized.is_empty() && normalized.chars().all(|c| c.is_ascii_digit()) {
+            (normalized, 1.0)
+        } else {
+            let Some(unit) = normalized.chars().last() else {
+                return Err(CacheTtlParseError);
+            };
+            let number = &normalized[..normalized.len().saturating_sub(unit.len_utf8())];
+            let multiplier = match unit {
+                's' => 1_000.0,
+                'm' => 60.0 * 1_000.0,
+                'h' => 60.0 * 60.0 * 1_000.0,
+                _ => return Err(CacheTtlParseError),
+            };
+            (number, multiplier)
+        };
     if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
         return Err(CacheTtlParseError);
     }
-    let value = number.parse::<u64>().map_err(|_| CacheTtlParseError)?;
-    let multiplier = match unit {
-        's' => 1000,
-        'm' => 60 * 1000,
-        'h' => 60 * 60 * 1000,
-        _ => return Err(CacheTtlParseError),
-    };
-    value.checked_mul(multiplier).ok_or(CacheTtlParseError)
+    // JavaScript's Number() accepts the syntactically valid digit sequence and yields
+    // Infinity on overflow. Saturating to u64::MAX preserves that value's practical
+    // scheduler behavior (no finite elapsed time can exceed it) instead of rejecting it.
+    let milliseconds = number.parse::<f64>().map_err(|_| CacheTtlParseError)? * multiplier;
+    Ok(
+        if !milliseconds.is_finite() || milliseconds >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            milliseconds as u64
+        },
+    )
 }
 
 /// Return the scheduler's strict idle predicate (`elapsed > ttl`).
@@ -309,9 +320,10 @@ pub fn ttl_execute_fired(now_ms: u64, last_response_time_ms: u64, ttl_ms: u64) -
     now_ms.saturating_sub(last_response_time_ms) > ttl_ms
 }
 
-/// Return the hard cache-expiry idle predicate (`last_response_time > 0 && elapsed >= ttl`).
+/// Return the hard cache-expiry idle predicate (`last_response_time > 0 && elapsed > ttl`).
+/// The scheduler and TypeScript both defer at the exact TTL boundary.
 pub fn ttl_hard_expired(now_ms: u64, last_response_time_ms: u64, ttl_ms: u64) -> bool {
-    last_response_time_ms > 0 && now_ms.saturating_sub(last_response_time_ms) >= ttl_ms
+    last_response_time_ms > 0 && now_ms.saturating_sub(last_response_time_ms) > ttl_ms
 }
 
 /// Resolve the effective execute threshold percentage for a model and context limit.
@@ -1132,7 +1144,7 @@ mod tests {
         let mut inputs = base_inputs();
         inputs.session.last_response_time_ms = 1_000;
         inputs.session.cache_ttl = "5m".to_string();
-        inputs.now_ms = 1_000 + DEFAULT_CACHE_TTL_MS;
+        inputs.now_ms = 1_000 + DEFAULT_CACHE_TTL_MS + 1;
         let boundary = decide(&inputs);
         assert!(boundary.idle_ttl_fired);
         assert_eq!(boundary.pass, PassDecision::Execute);

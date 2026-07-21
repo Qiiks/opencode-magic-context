@@ -58,6 +58,10 @@ pub struct HarnessMeta {
     pub errored: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish: Option<String>,
+    /// Native message creation time, when the harness provides it. Used for temporal
+    /// compartment heading dates without making dates part of message identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2529,6 +2533,11 @@ pub struct ModuleMeta {
     /// in-session m1 signal and therefore defers until a genuine bust opportunity.
     #[serde(default)]
     pub user_profile_version: u64,
+    /// The profile version whose rows were actually rendered into m0 or m1. Keeping this
+    /// separate from the current state-sync version prevents an empty/budget-trimmed profile
+    /// delta from being acknowledged before its body reaches the provider.
+    #[serde(default)]
+    pub m1_user_profile_version: u64,
     /// Best-effort durable start of the currently pending in-session delta. It is populated
     /// by state-sync watermark edges, not by a pure defer transform, so defer remains a
     /// zero-write replay path.

@@ -2794,6 +2794,21 @@ impl McHandler {
             .effective_for_project(project_root)
     }
 
+    fn historian_active(&self, store: &McStore, session_id: &str) -> bool {
+        if self
+            .live_historian_sessions
+            .lock()
+            .expect("live historian mutex")
+            .contains_key(session_id)
+        {
+            return true;
+        }
+        store
+            .load(session_id)
+            .map(|state| state.meta.historian.state != HistorianPhase::Idle)
+            .unwrap_or(false)
+    }
+
     fn observed_last_response_at_ms(&self, store: &McStore, session_id: &str) -> Option<i64> {
         let mut observations = self
             .scheduler_observations
@@ -3028,6 +3043,7 @@ impl McHandler {
                         .collect::<Vec<_>>(),
                     Err(_) => Vec::new(),
                 };
+                let boundary_dates = historian_chunk::native_boundary_dates(&parsed.messages);
                 let fingerprint_items: Vec<_> =
                     chunk.snapshot.iter().map(|item| item.as_item()).collect();
                 let observed = historian::compute_chunk_fingerprint(&fingerprint_items);
@@ -3060,6 +3076,7 @@ impl McHandler {
                                 observed_chunk_fingerprint: &observed,
                                 validation_chunk: &chunk.chunk,
                                 chunk_transcript: &chunk.text,
+                                boundary_dates: &boundary_dates,
                                 prior_compartments: &prior_compartments,
                                 validate_options: historian_validate::ValidateOptions {
                                     sequence_offset: prior_compartments.len() as u64 + 1,
@@ -5903,6 +5920,7 @@ impl McHandler {
                 observed_last_response_at_ms: self
                     .observed_last_response_at_ms(&store, &parsed.session_id),
                 guidance_date: Some(self.guidance_date_for_transform(&parsed.session_id, pass_now)),
+                historian_active: self.historian_active(&store, &parsed.session_id),
                 #[cfg(test)]
                 injected_reductions: self
                     .reduction_injection
@@ -7426,6 +7444,7 @@ impl McHandler {
             model_key: parsed.pass_inputs.model_key.clone(),
             observed_last_response_at_ms: None,
             guidance_date: Some(self.guidance_date_line_for_ms(parsed.pass_inputs.now_ms)),
+            historian_active: false,
             #[cfg(test)]
             injected_reductions: self
                 .reduction_injection
@@ -12907,8 +12926,8 @@ mod tests {
                 .unwrap()
                 .meta
                 .reasoning_cleared_through_ordinal,
-            50,
-            "the attach load must observe the watermark committed by this pass"
+            0,
+            "untagged reasoning has unknown age and must remain uncleared"
         );
         let old = response["native_messages"]
             .as_array()
@@ -12917,9 +12936,9 @@ mod tests {
             .find(|message| message["info"]["id"] == json!("assistant-old"))
             .expect("served assistant must retain its harness id");
         assert_eq!(
-            old["parts"][0],
-            json!({ "type": "reasoning", "text": "" }),
-            "clear preserves the typed reasoning shell while dropping signed metadata"
+            old["parts"][0]["text"],
+            json!("signed historical thinking"),
+            "untagged reasoning has unknown age and remains byte-preserved"
         );
     }
 
@@ -15154,7 +15173,10 @@ mod tests {
             "ses",
             &before_transition.meta,
             before_transition.meta.expiry_cutoff_ms,
+            true,
             8_000.0,
+            4_000.0,
+            true,
             |_| 0,
         )
         .unwrap();
@@ -18466,6 +18488,7 @@ mod tests {
                 model_key: None,
                 observed_last_response_at_ms: None,
                 guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
+                historian_active: false,
                 injected_reductions: Vec::new(),
             },
         )
@@ -19144,6 +19167,7 @@ mod tests {
                 model_key: None,
                 observed_last_response_at_ms: None,
                 guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
+                historian_active: false,
                 injected_reductions: Vec::new(),
             },
         )
@@ -20400,6 +20424,7 @@ mod tests {
                 memory_budget_tokens: 8_000.0,
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: true,
+                temporal_awareness: true,
             },
             |_| 0,
         )
@@ -20481,6 +20506,7 @@ mod tests {
                 memory_budget_tokens: 8_000.0,
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: true,
+                temporal_awareness: true,
             },
             |_| 0,
         )

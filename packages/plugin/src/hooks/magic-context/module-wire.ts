@@ -629,6 +629,11 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
                     summary: info.summary === true,
                     errored: info.error !== undefined && info.error !== null,
                     ...(typeof info.finish === "string" ? { finish: info.finish } : {}),
+                    ...(typeof info.time_created === "number"
+                        ? { created_at_ms: info.time_created }
+                        : typeof info.timeCreated === "number"
+                          ? { created_at_ms: info.timeCreated }
+                          : {}),
                 },
             },
         };

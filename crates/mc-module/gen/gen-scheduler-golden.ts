@@ -284,7 +284,7 @@ const ttl_predicate_cases = [
     ...c,
     expected_execute_fired: c.now_ms - c.last_response_time_ms > c.ttl_ms,
     expected_hard_expired:
-        c.last_response_time_ms > 0 && c.now_ms - c.last_response_time_ms >= c.ttl_ms,
+        c.last_response_time_ms > 0 && c.now_ms - c.last_response_time_ms > c.ttl_ms,
 }));
 
 const overflowInputs: Array<[string, unknown]> = [

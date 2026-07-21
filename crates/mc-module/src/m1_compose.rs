@@ -20,10 +20,10 @@ use mc_store::{McStore, McStoreError, ModuleMeta, NoteDelivery, StoredNote};
 
 use crate::compartment_coverage::{partition_by_folded_seq, resolve_coverage, CoverageGap};
 use crate::decay_render::DecayRenderCompartment;
-use crate::m0_compose::trim_memories_to_budget;
+use crate::m0_compose::{trim_memories_to_budget, trim_user_profile_to_budget};
 use crate::memory_render::{
     assemble_m1, render_memory_block, render_memory_updates, render_new_compartments,
-    workspace_source_names, M1_PLACEHOLDER,
+    render_user_profile_block, workspace_source_names, M1_PLACEHOLDER,
 };
 
 /// Why composing the SOFT m1 from the store failed.
@@ -171,6 +171,8 @@ pub struct M1Composition {
     pub memory_update_count: usize,
     pub new_coverage: Option<(String, u64)>,
     pub note_deliveries: Vec<NoteDelivery>,
+    /// True only when the pending profile version produced a non-empty, budgeted block.
+    pub profile_rendered: bool,
 }
 
 pub fn claim_and_render_notes(
@@ -232,7 +234,10 @@ pub fn compose_m1_from_store(
     session_id: &str,
     meta: &ModuleMeta,
     now_ms: i64,
+    memory_enabled: bool,
     memory_budget_tokens: f64,
+    user_profile_budget_tokens: f64,
+    temporal_awareness: bool,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Result<M1Composition, M1ComposeError> {
     // Resolve the workspace membership ONCE from the calling project (mirrors the m0
@@ -255,7 +260,14 @@ pub fn compose_m1_from_store(
     let (_folded, new_comps) = partition_by_folded_seq(&compartments, meta.folded_compartment_seq);
     let new_comp_decay: Vec<DecayRenderCompartment> = new_comps
         .iter()
-        .map(|c| DecayRenderCompartment::from(*c))
+        .map(|c| {
+            let mut rendered = DecayRenderCompartment::from(*c);
+            if !temporal_awareness {
+                rendered.start_date = None;
+                rendered.end_date = None;
+            }
+            rendered
+        })
         .collect();
     let new_comp_refs: Vec<&DecayRenderCompartment> = new_comp_decay.iter().collect();
     let new_compartments_block = render_new_compartments(&new_comp_refs);
@@ -293,16 +305,32 @@ pub fn compose_m1_from_store(
         .unwrap_or_default();
     let new_memories = trim_memories_to_budget(
         new_memories,
-        membership.as_ref(),
+        None,
         &source_name_by_id,
         (memory_budget_tokens.max(1.0) * 0.25).floor().max(1.0),
         estimate_tokens,
     );
     let new_memories_block = render_memory_block(&new_memories, "new-memories", &source_name_by_id);
 
-    // NOTE: <new-user-profile> is deferred in this slice — it gates on a profile-version
-    // marker that has no mc_* source yet (the same no-source-inert bucket as
-    // project_memory_epoch). It lands with the writer relocation.
+    // Profile rows and their version arrive together through state sync. Render the block only
+    // after a version change, and leave the applied version behind when trimming leaves no body
+    // to send; that makes the next real render consume the pending delta instead of losing it.
+    let (new_user_profile_block, profile_rendered) = if memory_enabled
+        && meta.user_profile_version != meta.m1_user_profile_version
+    {
+        let profile_rows = if project_path.starts_with("shadow:") {
+            store.load_shadow_user_profile(project_path)?
+        } else {
+            store.load_active_user_memories()?
+        };
+        let profile =
+            trim_user_profile_to_budget(profile_rows, user_profile_budget_tokens, estimate_tokens);
+        let block = render_user_profile_block(&profile, "new-user-profile");
+        let rendered = !block.is_empty();
+        (block, rendered)
+    } else {
+        (String::new(), false)
+    };
 
     // Notes intentionally do not participate in m1_revision_signal: a condition can
     // become true during a defer, but it must ride the next natural bust rather than
@@ -316,11 +344,16 @@ pub fn compose_m1_from_store(
         &format!("m1:{}:{}", meta.m1_revision, now_ms),
         now_ms,
     )?;
+    let profile_and_notes = [new_user_profile_block.as_str(), notes_block.as_str()]
+        .into_iter()
+        .filter(|block| !block.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
     let body = assemble_m1(
         &memory_updates_block,
         &new_compartments_block,
         &new_memories_block,
-        &notes_block, // project-owned notes share the existing m1 delta slot
+        &profile_and_notes, // profile and project-owned notes share the existing m1 delta slot
         M1_PLACEHOLDER,
     );
 
@@ -329,6 +362,7 @@ pub fn compose_m1_from_store(
         memory_update_count: mutations.len(),
         new_coverage,
         note_deliveries,
+        profile_rendered,
     })
 }
 
@@ -460,7 +494,10 @@ mod tests {
             "ses",
             &meta,
             0,
+            true,
             8_000.0,
+            4_000.0,
+            true,
             no_estimate,
         )
         .unwrap();
@@ -484,7 +521,10 @@ mod tests {
             "ses",
             &meta,
             0,
+            true,
             8_000.0,
+            4_000.0,
+            true,
             no_estimate,
         )
         .unwrap();
@@ -516,7 +556,10 @@ mod tests {
             "ses",
             &meta,
             0,
+            true,
             8_000.0,
+            4_000.0,
+            true,
             no_estimate,
         )
         .unwrap();
@@ -590,7 +633,10 @@ mod tests {
                 "ses",
                 &meta,
                 0,
+                true,
                 8_000.0,
+                4_000.0,
+                true,
                 no_estimate,
             )
             .unwrap();
@@ -635,7 +681,10 @@ mod tests {
             "ses",
             &meta,
             0,
+            true,
             8_000.0,
+            4_000.0,
+            true,
             no_estimate,
         )
         .unwrap();
@@ -670,8 +719,20 @@ mod tests {
             .unwrap();
 
         let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
-        let m1 =
-            compose_m1_from_store(&store, own, own, "ses", &meta, 0, 8_000.0, no_estimate).unwrap();
+        let m1 = compose_m1_from_store(
+            &store,
+            own,
+            own,
+            "ses",
+            &meta,
+            0,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
         assert!(
             m1.body.contains("own arch rule"),
             "the calling project's own non-shared new memory must ride m1 even when it is \

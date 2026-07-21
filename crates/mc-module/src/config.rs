@@ -31,9 +31,9 @@ pub const MIN_HISTORIAN_CHUNK_TOKENS: usize = 8_000;
 /// Maximum historian producer chunk size. The derived budget is one quarter of the model
 /// context limit, but it is never allowed to exceed 50,000 tokens.
 pub const MAX_HISTORIAN_CHUNK_TOKENS: usize = 50_000;
-/// No module-side model catalog exposes historian context limits yet. Keep the fallback
-/// explicit and configurable instead of silently assuming the session model's limit.
-pub const DEFAULT_HISTORIAN_CONTEXT_LIMIT_TOKENS: usize = 32_000;
+/// Matches the TypeScript historian fallback when no model catalog value is available.
+/// The explicit config override still wins when a binding supplies one.
+pub const DEFAULT_HISTORIAN_CONTEXT_LIMIT_TOKENS: usize = 128_000;
 
 /// Derive the historian producer budget from its own context window, as the TS runner does.
 pub fn derive_historian_chunk_tokens(context_limit_tokens: usize) -> usize {

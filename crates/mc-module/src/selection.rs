@@ -658,7 +658,10 @@ fn select_emergency(
     let fixed_floor = (ctx.current_total_input_tokens - all_active_reclaim_tokens).max(0.0);
     let working_span = (ctx.ceiling_tokens - fixed_floor).max(0.0);
     let target = fixed_floor + TARGET_FRACTION * working_span;
-    let reclaim_tokens = ctx.current_total_input_tokens - target;
+    // TS rounds the scalar target reclaim before applying the re-arm floor. Keep the
+    // comparison on that rounded value; comparing the raw float can fire for a
+    // sub-threshold fractional remainder at the boundary.
+    let reclaim_tokens = (ctx.current_total_input_tokens - target).round();
     if reclaim_tokens <= EMERGENCY_REARM_MIN_TOKENS {
         return HashSet::new();
     }
