@@ -56,10 +56,10 @@ use mc_store::{
     MappingUpdate, McStore, McStoreError, NoteCasOutcome, NoteEvaluationInput, NoteInput,
     NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop, PendingAgentDropSeedRow,
     RecordWrapupCommandOutcome, ShadowDivergenceRecord, ShadowDropSeedRow, ShadowMemoryMutationRow,
-    ShadowMemoryRow, ShadowStateSyncError, ShadowStateSyncRequest, ShadowWorkspaceMemberRow,
-    ShadowWorkspaceRow, StateImportError, StateImportPreflight, StateImportValidationError,
-    StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
-    TodoStateSetOutcome, UserHintSeedRow, VerificationUpdate, WrapupCommandRecord,
+    ShadowMemoryRow, ShadowStateSyncError, ShadowStateSyncRequest, ShadowStripSeedRow,
+    ShadowWorkspaceMemberRow, ShadowWorkspaceRow, StateImportError, StateImportPreflight,
+    StateImportValidationError, StoredChunkTranscript, StoredCompartment, StoredMemoryMutation,
+    StoredNote, TodoStateSetOutcome, UserHintSeedRow, VerificationUpdate, WrapupCommandRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -334,6 +334,12 @@ struct ShadowStateSyncWire {
     todo_synthetic_anchor: Option<Option<TodoSyntheticAnchorSeedWire>>,
     #[serde(default)]
     emergency_latches: Option<EmergencyLatchSeedWire>,
+    #[serde(default)]
+    strip_seeds: Vec<ShadowStripSeedWire>,
+    #[serde(default)]
+    strip_seed_skipped: usize,
+    #[serde(default)]
+    reasoning_cleared_through_tag: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -380,6 +386,12 @@ struct EmergencyLatchSeedWire {
     last_input_sample: f64,
     has_prior_drop: bool,
     last_execute_ordinal: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ShadowStripSeedWire {
+    message_id: String,
+    strip_kind: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6067,9 +6079,35 @@ impl McHandler {
         response.historian = Some(diagnostics);
         let reasoning_watermark = store
             .load(&parsed.session_id)
-            .map(|state| state.meta.reasoning_cleared_through_ordinal)
+            .map(|state| {
+                state
+                    .meta
+                    .reasoning_cleared_through_tag
+                    .max(state.meta.reasoning_cleared_through_ordinal)
+            })
             .unwrap_or(0);
-        attach_native_messages(&mut response, &parsed, reasoning_watermark);
+        let tag_numbers = store
+            .load_transform_snapshot(&parsed.session_id)
+            .map(|snapshot| {
+                let mut by_message = std::collections::BTreeMap::new();
+                for tag in snapshot.tags {
+                    let message_id = tag
+                        .block_id
+                        .split_once('#')
+                        .map(|(message_id, _)| message_id)
+                        .unwrap_or(tag.block_id.as_str())
+                        .to_string();
+                    by_message
+                        .entry(message_id)
+                        .and_modify(|number: &mut u64| {
+                            *number = (*number).max(tag.tag_number as u64)
+                        })
+                        .or_insert(tag.tag_number as u64);
+                }
+                by_message
+            })
+            .unwrap_or_default();
+        attach_native_messages_with_tags(&mut response, &parsed, reasoning_watermark, &tag_numbers);
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
         self.record_response_observation(&parsed.session_id, now_ms());
         // Management requests carry identity but not raw history. A successful full pass
@@ -6617,6 +6655,16 @@ impl McHandler {
                 seed.last_execute_ordinal,
             )
         });
+        let strip_seeds: Vec<ShadowStripSeedRow> = parsed
+            .strip_seeds
+            .into_iter()
+            .map(|seed| ShadowStripSeedRow {
+                message_id: seed.message_id,
+                strip_kind: seed.strip_kind,
+            })
+            .collect();
+        let strip_seed_skipped = parsed.strip_seed_skipped;
+        let reasoning_cleared_through_tag = parsed.reasoning_cleared_through_tag;
         let compartments: Vec<StoredCompartment> = parsed
             .compartments
             .into_iter()
@@ -6733,6 +6781,9 @@ impl McHandler {
                 todo_synthetic_anchor: todo_synthetic_anchor.as_ref(),
                 todo_synthetic_anchor_present,
                 emergency_latches,
+                strip_seeds: &strip_seeds,
+                strip_seed_skipped,
+                reasoning_cleared_through_tag,
                 compartments: &compartments,
                 memories: &memories,
                 memory_mutations: &memory_mutations,
@@ -6760,6 +6811,9 @@ impl McHandler {
                 todo_synthetic_anchor: todo_synthetic_anchor.as_ref(),
                 todo_synthetic_anchor_present,
                 emergency_latches,
+                strip_seeds: &strip_seeds,
+                strip_seed_skipped,
+                reasoning_cleared_through_tag,
                 compartments: &compartments,
                 memories: &memories,
                 memory_mutations: &memory_mutations,
@@ -6786,6 +6840,7 @@ impl McHandler {
                 "note_nudge_anchors_seeded": result.note_nudge_anchors_seeded,
                 "todo_synthetic_anchor_seeded": result.todo_synthetic_anchor_seeded,
                 "emergency_latches_seeded": result.emergency_latches_seeded,
+                "strip_seeds_skipped": result.strip_seeds_skipped,
             })),
             Err(ShadowStateSyncError::GenerationMismatch { expected, found }) => {
                 HandlerOutcome::Error {
@@ -9254,6 +9309,20 @@ fn attach_native_messages(
     request: &TransformRequest,
     reasoning_watermark: u64,
 ) {
+    attach_native_messages_with_tags(
+        response,
+        request,
+        reasoning_watermark,
+        &std::collections::BTreeMap::new(),
+    );
+}
+
+fn attach_native_messages_with_tags(
+    response: &mut transform::TransformResponse,
+    request: &TransformRequest,
+    reasoning_watermark: u64,
+    tag_numbers: &std::collections::BTreeMap<String, u64>,
+) {
     if !request.serve_native {
         return;
     }
@@ -9269,7 +9338,7 @@ fn attach_native_messages(
         Some(&request.session_id),
     );
     if let Some(profile) = SerializerProfile::parse(&request.serializer_profile) {
-        transform::clear_served_native_reasoning(
+        transform::clear_served_native_reasoning_with_tags(
             profile,
             transform::request_accepts_empty_content(request),
             &mut native_messages,
@@ -9277,6 +9346,7 @@ fn attach_native_messages(
             &request.messages,
             reasoning_watermark,
             request.mid_turn,
+            tag_numbers,
         );
     }
     response.native_messages = Some(native_messages);
@@ -9539,6 +9609,7 @@ fn assemble_shadow_seed(
     let mut auto_search_hint_decisions = Vec::new();
     let mut note_nudge_anchors = Vec::new();
     let mut note_nudge_anchors_present = false;
+    let mut strip_seeds = Vec::new();
     let mut user_profile = Vec::new();
     for mut batch in batches {
         compartments.append(&mut batch.compartments);
@@ -9551,6 +9622,7 @@ fn assemble_shadow_seed(
             note_nudge_anchors_present = true;
             note_nudge_anchors.extend(anchors);
         }
+        strip_seeds.append(&mut batch.strip_seeds);
         user_profile.append(&mut batch.user_profile);
     }
     compartments.append(&mut final_batch.compartments);
@@ -9563,6 +9635,7 @@ fn assemble_shadow_seed(
         note_nudge_anchors_present = true;
         note_nudge_anchors.extend(anchors);
     }
+    strip_seeds.append(&mut final_batch.strip_seeds);
     user_profile.append(&mut final_batch.user_profile);
     ShadowStateSyncWire {
         session_id: final_batch.session_id,
@@ -9592,6 +9665,9 @@ fn assemble_shadow_seed(
         auto_search_hint_skipped: final_batch.auto_search_hint_skipped,
         todo_synthetic_anchor: final_batch.todo_synthetic_anchor,
         emergency_latches: final_batch.emergency_latches,
+        strip_seeds,
+        strip_seed_skipped: final_batch.strip_seed_skipped,
+        reasoning_cleared_through_tag: final_batch.reasoning_cleared_through_tag,
     }
 }
 
@@ -19071,6 +19147,7 @@ mod tests {
         last_todo_state: String,
         project_memory_epoch: u64,
         user_profile_version: u64,
+        reasoning_cleared_through_tag: u64,
         acked_watermarks: StrictShadowWatermarks,
     }
 
@@ -19242,6 +19319,7 @@ mod tests {
         last_todo_state_hash: String,
         project_memory_epoch: u64,
         project_user_profile_version: u64,
+        reasoning_cleared_through_tag: u64,
     }
 
     #[test]
@@ -20827,6 +20905,9 @@ mod tests {
                 seed_boundary_id: None,
                 drop_seeds: &[],
                 drop_seed_skipped: 0,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],

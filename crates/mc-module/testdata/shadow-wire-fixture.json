@@ -146,14 +146,16 @@
       "memory_mutation_id": 1,
       "last_todo_state_hash": "1d9122e1b8a66758890684eba25ec2577a82b9c66407a55a903de3b5132bd905",
       "project_memory_epoch": 0,
-      "project_user_profile_version": 0
+      "project_user_profile_version": 0,
+      "reasoning_cleared_through_tag": 0
     },
     "todo_synthetic_anchor": null,
     "emergency_latches": {
       "last_input_sample": 0,
       "has_prior_drop": false,
       "last_execute_ordinal": 0
-    }
+    },
+    "reasoning_cleared_through_tag": 0
   },
   "shadow_transform": {
     "method": "shadow_transform",
@@ -275,6 +277,7 @@
     "memory_mutation_id": 1,
     "last_todo_state_hash": "1d9122e1b8a66758890684eba25ec2577a82b9c66407a55a903de3b5132bd905",
     "project_memory_epoch": 0,
-    "project_user_profile_version": 0
+    "project_user_profile_version": 0,
+    "reasoning_cleared_through_tag": 0
   }
 }

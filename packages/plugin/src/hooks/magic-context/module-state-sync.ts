@@ -5,7 +5,13 @@ import {
     getMemoriesByProjects,
 } from "../../features/magic-context/memory/storage-memory";
 import type { ContextDatabase } from "../../features/magic-context/storage";
-import { getCompartments, getOrCreateSessionMeta } from "../../features/magic-context/storage";
+import {
+    getCompartments,
+    getOrCreateSessionMeta,
+    getProcessedImageStrippedIds,
+    getStaleReduceStrippedIds,
+    getStrippedPlaceholderIds,
+} from "../../features/magic-context/storage";
 import {
     getMaxMemoryMutationIdForProjects,
     getMemoryMutationsForRenderByProjects,
@@ -49,6 +55,7 @@ export interface ModuleWatermarks {
     last_todo_state_hash: string;
     project_memory_epoch: number;
     project_user_profile_version: number;
+    reasoning_cleared_through_tag?: number;
 }
 
 export interface ModuleWorkspacePayload {
@@ -95,6 +102,18 @@ export interface ModuleEmergencyLatchSeed {
     last_execute_ordinal: number;
 }
 
+export type ModuleStripKind =
+    | "placeholder"
+    | "system_injected"
+    | "stale_reduce"
+    | "processed_image";
+
+/** TypeScript-owned message strips to replay while the module warms up. */
+export interface ModuleStripSeed {
+    message_id: string;
+    strip_kind: ModuleStripKind;
+}
+
 export interface ModuleStateSyncPayload {
     method: "state_sync";
     params: {
@@ -125,6 +144,9 @@ export interface ModuleStateSyncPayload {
         auto_search_hint_skipped?: number;
         todo_synthetic_anchor?: ModuleTodoSyntheticAnchorSeed | null;
         emergency_latches?: ModuleEmergencyLatchSeed;
+        strip_seeds?: ModuleStripSeed[];
+        strip_seed_skipped?: number;
+        reasoning_cleared_through_tag?: number;
     };
     watermarks: ModuleWatermarks;
     wireBatches?: ModuleStateSyncPayload[];
@@ -351,6 +373,7 @@ export function loadModuleWatermarks(args: {
         project_user_profile_version:
             getProjectState(args.db, GLOBAL_USER_PROFILE_PROJECT_PATH)?.projectUserProfileVersion ??
             0,
+        reasoning_cleared_through_tag: sessionMeta.clearedReasoningThroughTag ?? 0,
     };
 }
 
@@ -366,7 +389,8 @@ export function moduleWatermarksEqual(
         left.memory_mutation_id === right.memory_mutation_id &&
         left.last_todo_state_hash === right.last_todo_state_hash &&
         left.project_memory_epoch === right.project_memory_epoch &&
-        left.project_user_profile_version === right.project_user_profile_version
+        left.project_user_profile_version === right.project_user_profile_version &&
+        (left.reasoning_cleared_through_tag ?? 0) === (right.reasoning_cleared_through_tag ?? 0)
     );
 }
 
@@ -663,6 +687,29 @@ function buildAutoSearchHintSeeds(args: {
     };
 }
 
+function buildStripSeeds(args: { db: ContextDatabase; sessionId: string }): ModuleStripSeed[] {
+    const byKey = new Map<string, ModuleStripSeed>();
+    const add = (messageId: string, stripKind: ModuleStripKind): void => {
+        if (messageId.length === 0) return;
+        const seed = { message_id: messageId, strip_kind: stripKind } satisfies ModuleStripSeed;
+        byKey.set(`${stripKind}:${messageId}`, seed);
+    };
+    // The placeholder table intentionally includes both dropped shells and internal
+    // notifications; both are whole-message neutralization decisions on the wire.
+    for (const messageId of getStrippedPlaceholderIds(args.db, args.sessionId)) {
+        add(messageId, "placeholder");
+    }
+    for (const messageId of getStaleReduceStrippedIds(args.db, args.sessionId)) {
+        add(messageId, "stale_reduce");
+    }
+    for (const messageId of getProcessedImageStrippedIds(args.db, args.sessionId)) {
+        add(messageId, "processed_image");
+    }
+    return [...byKey.values()].sort((left, right) =>
+        canonicalSeedJson(left).localeCompare(canonicalSeedJson(right)),
+    );
+}
+
 type SeedItem =
     | { kind: "compartment"; value: unknown }
     | { kind: "memory"; value: unknown }
@@ -671,6 +718,7 @@ type SeedItem =
     | { kind: "pending_agent_drop"; value: ModulePendingDropSeed }
     | { kind: "note_nudge_anchor"; value: ModuleNoteNudgeAnchorSeed }
     | { kind: "auto_search_hint"; value: ModuleAutoSearchHintSeed }
+    | { kind: "strip_seed"; value: ModuleStripSeed }
     | { kind: "user_profile"; value: string };
 
 export function buildPagedModuleStateSyncPayloads(args: {
@@ -690,6 +738,9 @@ export function buildPagedModuleStateSyncPayloads(args: {
     autoSearchHintSkipped?: number;
     todoSyntheticAnchor?: ModuleTodoSyntheticAnchorSeed | null;
     emergencyLatches?: ModuleEmergencyLatchSeed;
+    stripSeeds?: ModuleStripSeed[];
+    stripSeedSkipped?: number;
+    reasoningClearedThroughTag?: number;
     userProfile: string[];
     workspace: ModuleWorkspacePayload | null;
     lastTodoState: string;
@@ -714,6 +765,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
         ...(args.autoSearchHintSeeds ?? []).map(
             (value) => ({ kind: "auto_search_hint", value }) as const,
         ),
+        ...(args.stripSeeds ?? []).map((value) => ({ kind: "strip_seed", value }) as const),
         ...args.userProfile.map((value) => ({ kind: "user_profile", value }) as const),
     ];
     const makePayload = (input: {
@@ -731,6 +783,8 @@ export function buildPagedModuleStateSyncPayloads(args: {
         dropSeedSkipped?: number;
         pendingDropSkipped?: number;
         autoSearchHintSkipped?: number;
+        stripSeeds?: ModuleStripSeed[];
+        stripSeedSkipped?: number;
     }): ModuleStateSyncPayload => ({
         method: "state_sync",
         params: {
@@ -759,6 +813,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
             ...(args.autoSearchHintSeeds !== undefined
                 ? { auto_search_hint_decisions: input.autoSearchHintDecisions }
                 : {}),
+            ...(args.stripSeeds !== undefined ? { strip_seeds: input.stripSeeds } : {}),
             ...(input.complete
                 ? {
                       seed_boundary_id: args.seedBoundaryId,
@@ -782,6 +837,14 @@ export function buildPagedModuleStateSyncPayloads(args: {
                       ...(args.emergencyLatches !== undefined
                           ? { emergency_latches: args.emergencyLatches }
                           : {}),
+                      ...(args.stripSeedSkipped !== undefined
+                          ? { strip_seed_skipped: args.stripSeedSkipped }
+                          : {}),
+                      ...(args.reasoningClearedThroughTag !== undefined
+                          ? {
+                                reasoning_cleared_through_tag: args.reasoningClearedThroughTag,
+                            }
+                          : {}),
                   }
                 : {}),
         },
@@ -796,6 +859,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
             pendingAgentDrops: ModulePendingDropSeed[];
             noteNudgeAnchors: ModuleNoteNudgeAnchorSeed[];
             autoSearchHintDecisions: ModuleAutoSearchHintSeed[];
+            stripSeeds: ModuleStripSeed[];
             userProfile: string[];
         },
         item: SeedItem,
@@ -807,6 +871,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
         else if (item.kind === "pending_agent_drop") batch.pendingAgentDrops.push(item.value);
         else if (item.kind === "note_nudge_anchor") batch.noteNudgeAnchors.push(item.value);
         else if (item.kind === "auto_search_hint") batch.autoSearchHintDecisions.push(item.value);
+        else if (item.kind === "strip_seed") batch.stripSeeds.push(item.value);
         else batch.userProfile.push(item.value);
     };
 
@@ -821,6 +886,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
             pendingAgentDrops: [],
             noteNudgeAnchors: [],
             autoSearchHintDecisions: [],
+            stripSeeds: [],
             userProfile: [],
         } as {
             compartments: unknown[];
@@ -830,6 +896,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
             pendingAgentDrops: ModulePendingDropSeed[];
             noteNudgeAnchors: ModuleNoteNudgeAnchorSeed[];
             autoSearchHintDecisions: ModuleAutoSearchHintSeed[];
+            stripSeeds: ModuleStripSeed[];
             userProfile: string[];
         };
         for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
@@ -841,6 +908,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
                 pendingAgentDrops: [...current.pendingAgentDrops],
                 noteNudgeAnchors: [...current.noteNudgeAnchors],
                 autoSearchHintDecisions: [...current.autoSearchHintDecisions],
+                stripSeeds: [...current.stripSeeds],
                 userProfile: [...current.userProfile],
             };
             appendItem(candidate, items[itemIndex]);
@@ -879,6 +947,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
                 pendingAgentDrops: [],
                 noteNudgeAnchors: [],
                 autoSearchHintDecisions: [],
+                stripSeeds: [],
                 userProfile: [],
             };
             appendItem(current, items[itemIndex]);
@@ -918,6 +987,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
                         pendingAgentDrops: [],
                         noteNudgeAnchors: [],
                         autoSearchHintDecisions: [],
+                        stripSeeds: [],
                         userProfile: [],
                     };
                 }
@@ -980,6 +1050,7 @@ export async function buildModuleStateSyncPayload(args: {
               last_todo_state_hash: "",
               project_memory_epoch: 0,
               project_user_profile_version: 0,
+              reasoning_cleared_through_tag: 0,
           }
         : (args.state.lastAckedWatermarks ?? {
               compartment_sequence: -1,
@@ -989,6 +1060,7 @@ export async function buildModuleStateSyncPayload(args: {
               last_todo_state_hash: "",
               project_memory_epoch: 0,
               project_user_profile_version: 0,
+              reasoning_cleared_through_tag: 0,
           });
     const rawById = new Map<string, RawMessageParts | null>();
     const readRawById = (messageId: string): RawMessageParts | null => {
@@ -1129,6 +1201,9 @@ export async function buildModuleStateSyncPayload(args: {
     const dropSeedState = args.force
         ? buildDropSeeds({ db: args.pass.db, sessionId: args.pass.sessionId, readRawById })
         : null;
+    const stripSeeds = args.force
+        ? buildStripSeeds({ db: args.pass.db, sessionId: args.pass.sessionId })
+        : undefined;
     const payloadArgs = {
         shadowGeneration: args.state.shadowGeneration,
         expectedShadowSeq: args.state.lastAckedSeq,
@@ -1167,6 +1242,9 @@ export async function buildModuleStateSyncPayload(args: {
                 : undefined,
         todoSyntheticAnchor,
         emergencyLatches,
+        stripSeeds: stripSeeds && stripSeeds.length > 0 ? stripSeeds : undefined,
+        stripSeedSkipped: undefined,
+        reasoningClearedThroughTag: sessionMeta.clearedReasoningThroughTag,
         userProfile,
         workspace: workspace.workspace,
         lastTodoState: sessionMeta.lastTodoState ?? "",

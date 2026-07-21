@@ -157,7 +157,18 @@ pub fn decode_opencode_with_sidecar(
                         "subtask",
                     );
                 }
-                "step-finish" | "snapshot" | "patch" | "agent" | "retry" => {}
+                "step-finish" => {
+                    let block = opaque_block("step-finish", part.clone(), None);
+                    push_block(
+                        &mut content,
+                        &mut block_metas,
+                        block,
+                        part_index,
+                        part,
+                        "step-finish",
+                    );
+                }
+                "snapshot" | "patch" | "agent" | "retry" => {}
                 _ => {
                     let block = opaque_block(&part_type, part.clone(), opaque_arc(part));
                     push_block(
