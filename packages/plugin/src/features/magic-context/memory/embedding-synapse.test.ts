@@ -164,23 +164,18 @@ describe("recommended batch policy", () => {
                                 },
                             };
                         }
-                        const items = (params as { items: { id: string; content: string }[] })
-                            .items;
-                        calls.push(items.map((item) => item.content.length));
+                        const items = (params as { items: { id: string; text: string }[] }).items;
+                        calls.push(items.map((item) => item.text.length));
                         return {
-                            result: {
-                                model_id: "gte-modernbert-base-f16",
+                            items: items.map((item) => ({
+                                id: item.id,
+                                embedding: [0.5, 0.5],
+                                content_sha256: createHash("sha256")
+                                    .update(item.text)
+                                    .digest("hex"),
                                 fingerprint: "fp1",
                                 table_epoch: 0,
-                                dims: 2,
-                                vectors: items.map((item) => ({
-                                    id: item.id,
-                                    vector: [0.5, 0.5],
-                                    content_sha256: createHash("sha256")
-                                        .update(item.content)
-                                        .digest("hex"),
-                                })),
-                            },
+                            })),
                         };
                     },
                     close() {},
@@ -223,23 +218,18 @@ describe("recommended batch policy", () => {
                                 },
                             };
                         }
-                        const items = (params as { items: { id: string; content: string }[] })
-                            .items;
+                        const items = (params as { items: { id: string; text: string }[] }).items;
                         calls.push(items.length);
                         return {
-                            result: {
-                                model_id: "gte-modernbert-base-f16",
+                            items: items.map((item) => ({
+                                id: item.id,
+                                embedding: [0.5, 0.5],
+                                content_sha256: createHash("sha256")
+                                    .update(item.text)
+                                    .digest("hex"),
                                 fingerprint: "fp1",
                                 table_epoch: 0,
-                                dims: 2,
-                                vectors: items.map((item) => ({
-                                    id: item.id,
-                                    vector: [0.5, 0.5],
-                                    content_sha256: createHash("sha256")
-                                        .update(item.content)
-                                        .digest("hex"),
-                                })),
-                            },
+                            })),
                         };
                     },
                     close() {},
@@ -279,23 +269,18 @@ describe("recommended batch policy", () => {
                                 },
                             };
                         }
-                        const items = (params as { items: { id: string; content: string }[] })
-                            .items;
+                        const items = (params as { items: { id: string; text: string }[] }).items;
                         calls.push(items.length);
                         return {
-                            result: {
-                                model_id: "gte-modernbert-base-f16",
+                            items: items.map((item) => ({
+                                id: item.id,
+                                embedding: [0.5, 0.5],
+                                content_sha256: createHash("sha256")
+                                    .update(item.text)
+                                    .digest("hex"),
                                 fingerprint: "fp1",
                                 table_epoch: 0,
-                                dims: 2,
-                                vectors: items.map((item) => ({
-                                    id: item.id,
-                                    vector: [0.5, 0.5],
-                                    content_sha256: createHash("sha256")
-                                        .update(item.content)
-                                        .digest("hex"),
-                                })),
-                            },
+                            })),
                         };
                     },
                     close() {},
