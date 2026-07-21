@@ -16,6 +16,12 @@ use serde_json::Value;
 /// Default execute threshold percentage (65.0). The Rust module reads config without the
 /// plugin, so this must stay identical to packages/plugin/src/config/schema/magic-context.ts.
 pub const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 65.0;
+/// Default token budget for project-memory injection. It must remain 8,000 tokens so the Rust
+/// module and the TypeScript renderer use the same default.
+pub const DEFAULT_MEMORY_BUDGET_TOKENS: f64 = 8_000.0;
+/// Default token budget for user-profile injection. It must remain 4,000 tokens so the Rust
+/// module and the TypeScript renderer use the same default.
+pub const DEFAULT_USER_PROFILE_BUDGET_TOKENS: f64 = 4_000.0;
 /// Maximum execute threshold percentage (80.0). The Rust module reads config without the
 /// plugin, so this must stay identical to packages/plugin/src/config/schema/magic-context.ts.
 const MAX_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 80.0;
@@ -25,6 +31,8 @@ pub struct McModuleConfig {
     pub model_chain: Vec<String>,
     pub execute_threshold_percentage: f64,
     pub memory_enabled: bool,
+    pub memory_budget_tokens: f64,
+    pub user_profile_budget_tokens: f64,
     pub smart_drops: bool,
     pub cache_ttl: String,
     /// Kill switch for the shadow byte-compare lane, honored module-side so a
@@ -40,6 +48,8 @@ impl Default for McModuleConfig {
             model_chain: Vec::new(),
             execute_threshold_percentage: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
             memory_enabled: true,
+            memory_budget_tokens: DEFAULT_MEMORY_BUDGET_TOKENS,
+            user_profile_budget_tokens: DEFAULT_USER_PROFILE_BUDGET_TOKENS,
             smart_drops: false,
             shadow_enabled: true,
             cache_ttl: "5m".to_string(),
@@ -162,6 +172,12 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         if let Some(enabled) = user.pointer("/memory/enabled").and_then(Value::as_bool) {
             cfg.memory_enabled = enabled;
         }
+        if let Some(budget) = number_at(user, "/memory/budget_tokens") {
+            cfg.memory_budget_tokens = budget.max(1.0);
+        }
+        if let Some(budget) = number_at(user, "/memory/user_profile_budget_tokens") {
+            cfg.user_profile_budget_tokens = budget.max(1.0);
+        }
         if let Some(enabled) = user
             .pointer("/shadow_transform/enabled")
             .and_then(Value::as_bool)
@@ -186,6 +202,12 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         }
         if let Some(enabled) = project.pointer("/memory/enabled").and_then(Value::as_bool) {
             cfg.memory_enabled = enabled;
+        }
+        if let Some(budget) = number_at(project, "/memory/budget_tokens") {
+            cfg.memory_budget_tokens = budget.max(1.0);
+        }
+        if let Some(budget) = number_at(project, "/memory/user_profile_budget_tokens") {
+            cfg.user_profile_budget_tokens = budget.max(1.0);
         }
         if let Some(enabled) = project.pointer("/smart_drops").and_then(Value::as_bool) {
             cfg.smart_drops = enabled;

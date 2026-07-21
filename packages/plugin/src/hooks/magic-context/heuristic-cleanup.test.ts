@@ -205,7 +205,7 @@ describe("applyHeuristicCleanup", () => {
                 emergency: { currentTotalInputTokens: 10_000, ceilingTokens: 6_000 },
             });
 
-            //#then oldest tags drop first (T3 bash), all full-drop, newest 2 protected.
+            //#then the oldest tags drop first, including the bash tool at tag 3, while the newest protected window retains its persisted skeleton.
             expect(result.droppedTools).toBeGreaterThan(0);
             const tags = getTagsBySession(db, SESSION);
             const dropped = tags
@@ -218,7 +218,7 @@ describe("applyHeuristicCleanup", () => {
             // oldest dropped first.
             expect(dropped[0]).toBe(1);
             expect(
-                tags.filter((t) => t.status === "dropped").every((t) => t.dropMode === "full"),
+                tags.filter((t) => t.status === "dropped").every((t) => t.dropMode === "truncated"),
             ).toBe(true);
         });
 

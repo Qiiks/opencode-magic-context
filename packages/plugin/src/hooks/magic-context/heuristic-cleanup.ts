@@ -120,32 +120,38 @@ export function applyHeuristicCleanup(
         });
         if (plan.shouldDrop) {
             const toDrop = new Set(plan.tagNumbers);
+            const newestEmergencyTags = new Set(
+                droppableTags
+                    .slice()
+                    .sort((left, right) => right.tagNumber - left.tagNumber)
+                    .slice(0, 20)
+                    .map((tag) => tag.tagNumber),
+            );
             db.transaction(() => {
                 for (const tag of tags) {
                     if (!toDrop.has(tag.tagNumber)) continue;
                     if (tag.status !== "active" || tag.type !== "tool") continue;
                     const target = targets.get(tag.tagNumber);
-                    const result = target?.drop?.() ?? "absent";
+                    const recent = newestEmergencyTags.has(tag.tagNumber);
+                    const result = recent
+                        ? (target?.truncate?.() ?? target?.drop?.() ?? "absent")
+                        : (target?.drop?.() ?? "absent");
                     if (result === "removed" || result === "truncated") {
                         updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
-                        updateTagDropMode(db, sessionId, tag.tagNumber, "full");
+                        updateTagDropMode(db, sessionId, tag.tagNumber, recent ? "truncated" : "full");
                         droppedTools++;
                         emergencyDroppedTools++;
                         emergencyReclaimedTokens += estimateEmergencyDropReclaimTokens(tag);
                     }
                 }
-                // Latch the usage sample on any ACTING pass — even if zero tags
-                // were actually removed (targets out of sync) — so the next ≥85%
-                // pass on this same stale sample no-ops instead of re-busting the
-                // cache. Dropped tags leave status='active' (re-selection guard);
-                // the sample is what stops over-dropping the remaining tail. The
-                // 95% block backstops genuine "nothing left to drop".
-                setEmergencyDropSample(db, sessionId, emergency.currentTotalInputTokens);
             })();
             sessionLog(sessionId, `emergency tiered drop: ${plan.reason}`);
         } else {
             sessionLog(sessionId, `emergency tiered drop skipped: ${plan.reason}`);
         }
+        // Record every acting emergency sample, including a pass where the selector
+        // found no eligible target. This prevents repeated cache busts on stale input.
+        setEmergencyDropSample(db, sessionId, emergency.currentTotalInputTokens);
     }
 
     db.transaction(() => {
@@ -232,9 +238,8 @@ export function applyHeuristicCleanup(
                 for (let i = 0; i < group.length - 1; i++) {
                     const tag = group[i];
                     const target = targets.get(tag.tagNumber);
-                    // Always full-drop: Phase 2 removed truncate-mode entirely
-                    // (the emergency path full-drops for max reclaim, and dedup
-                    // drops are redundant duplicates with nothing to preserve).
+                    // Deduplication remains a full drop; only the emergency newest-window
+                    // arm preserves skeleton bytes.
                     const result = target?.drop?.() ?? "absent";
                     if (result === "incomplete") continue;
                     updateTagDropMode(db, sessionId, tag.tagNumber, "full");

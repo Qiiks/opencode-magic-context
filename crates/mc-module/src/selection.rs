@@ -413,31 +413,50 @@ enum ArcShape {
     EditMarker,
 }
 
-/// Clamp every ToolCall input value to a short skeleton hint (mirrors the TS
-/// `truncate()` 5-char arg clamp), canonical-serialized. Pure fn of the input.
+/// Clamp ToolCall input values exactly like the TypeScript drop target: inputs at or
+/// below 500 JSON bytes remain intact; larger object values keep short strings while
+/// arrays and nested objects become compact summaries. The result is frozen at selection.
 fn skeleton_payload(input: &serde_json::Value) -> String {
+    const INPUT_CLAMP_BYTES: usize = 500;
     const SKELETON_ARG_LEN: usize = 5;
-    let mut obj = match input.as_object() {
-        Some(o) => o.clone(),
-        None => return DROPPED_PLACEHOLDER.to_string(),
-    };
-    for value in obj.values_mut() {
-        if let serde_json::Value::String(s) = value {
-            if s.chars().count() > SKELETON_ARG_LEN {
-                let byte_len = s
-                    .char_indices()
-                    .nth(SKELETON_ARG_LEN)
-                    .map(|(i, _)| i)
-                    .unwrap_or(s.len());
-                *value = serde_json::Value::String(format!(
-                    "{}{}",
-                    safe_prefix(s, byte_len),
-                    TRUNCATION_SENTINEL
-                ));
+    let serialized_len = serde_json::to_string(input)
+        .map(|value| value.len())
+        .unwrap_or(0);
+    if serialized_len <= INPUT_CLAMP_BYTES {
+        return canonical_json(input);
+    }
+    let clamp_object = |object: &serde_json::Map<String, serde_json::Value>| {
+        let mut output = object.clone();
+        for value in output.values_mut() {
+            match value {
+                serde_json::Value::String(s) if s.chars().count() > SKELETON_ARG_LEN => {
+                    let byte_len = s
+                        .char_indices()
+                        .nth(SKELETON_ARG_LEN)
+                        .map(|(i, _)| i)
+                        .unwrap_or(s.len());
+                    *value = serde_json::Value::String(format!(
+                        "{}{}",
+                        safe_prefix(s, byte_len),
+                        TRUNCATION_SENTINEL
+                    ));
+                }
+                serde_json::Value::Array(items) => {
+                    *value = serde_json::Value::String(format!("[{} items]", items.len()));
+                }
+                serde_json::Value::Object(_) => {
+                    *value = serde_json::Value::String("[object]".to_string());
+                }
+                _ => {}
             }
         }
+        canonical_json(&serde_json::Value::Object(output))
+    };
+    match input {
+        serde_json::Value::Object(object) => clamp_object(object),
+        serde_json::Value::Array(items) => format!("[{} items]", items.len()),
+        _ => canonical_json(input),
     }
-    canonical_json(&serde_json::Value::Object(obj))
 }
 
 /// Expand a reduced arc into its per-block [`ReductionDecision`]s (arc-atomic): the

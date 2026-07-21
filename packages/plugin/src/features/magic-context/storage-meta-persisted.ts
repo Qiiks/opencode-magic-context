@@ -834,11 +834,9 @@ export function getEmergencyInputSample(db: Database, sessionId: string): number
 }
 
 /**
- * Latch the usage sample after an emergency pass ACTED (plan.shouldDrop), even
- * when zero tags were actually removed (every target out of sync). Latching on
- * any acting pass — not only `droppedTools > 0` — stops a zero-reclaim pass from
- * re-busting the cache every ≥85% pass on the same stale sample; the 95% block
- * remains the backstop for genuine "nothing left to drop".
+ * Latch the usage sample on every emergency acting pass, including when the
+ * selector finds no eligible target. This stops repeated cache busts on the same
+ * stale sample; the 95% block remains the backstop for genuine "nothing left to drop".
  */
 export function setEmergencyDropSample(db: Database, sessionId: string, inputSample: number): void {
     db.transaction(() => {

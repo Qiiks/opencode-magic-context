@@ -18,6 +18,7 @@ import {
     getOverflowState,
     isEmergencyRecoveryArmed,
 } from "../../features/magic-context/storage-meta-persisted";
+import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
 import { writeRustTransformDecision } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
@@ -326,6 +327,15 @@ function getSessionDirectory(
     });
 }
 
+function readUpgradeState(db: TransformDeps["db"], sessionId: string): string {
+    const row = db
+        .prepare(
+            "SELECT COUNT(*) AS count FROM compartments WHERE session_id = ? AND legacy = 1",
+        )
+        .get(sessionId) as { count?: number } | undefined;
+    return (row?.count ?? 0) > 0 ? "legacy" : "ready";
+}
+
 function passUsage(usage: ContextUsage, limit: number): Record<string, number> {
     return {
         input_tokens: usage.inputTokens,
@@ -571,6 +581,8 @@ function buildTransformBody(args: {
     usage: Record<string, number>;
     modelKey: string | null;
     providerId: string | null;
+    systemPromptHash: string;
+    upgradeState: string;
     midTurn: boolean;
     declaredTrim?: unknown;
 }): Record<string, unknown> {
@@ -581,7 +593,20 @@ function buildTransformBody(args: {
         serializer_profile: "opencode-aisdk",
         serve_native: true,
         session_id: args.sessionId,
-        render_config: "",
+        // Model/provider and system-prompt changes are provider-cache eviction signals;
+        // send the same identity inputs used by the TypeScript materializer instead of
+        // leaving the native identity blank.
+        render_config: [
+            args.providerId ? `provider:${args.providerId}` : "",
+            args.modelKey ? `model:${args.modelKey}` : "",
+            args.systemPromptHash ? `system:${args.systemPromptHash}` : "",
+        ]
+            .filter(Boolean)
+            .join("|"),
+        system_prompt_hash: args.systemPromptHash,
+        upgrade_state: args.upgradeState,
+        is_subagent: args.passInputs.is_subagent === true,
+        protected_tags: args.passInputs.protected_tags ?? DEFAULT_PROTECTED_TAGS,
         messages: args.input,
         native_messages: args.nativeMessages,
         usage: args.usage,
@@ -594,7 +619,6 @@ function buildTransformBody(args: {
         history_budget_tokens: args.passInputs.history_budget_tokens,
         clear_reasoning_age: args.passInputs.clear_reasoning_age,
         cache_ttl: args.passInputs.cache_ttl,
-        is_subagent: args.passInputs.is_subagent,
         pass_inputs: args.passInputs,
         declared_trim: args.declaredTrim,
     };
@@ -855,7 +879,10 @@ export function createRustModeTransform(
                 cache_ttl: sessionMeta.cacheTtl,
                 mid_turn: midTurn,
                 is_subagent: sessionMeta.isSubagent,
+                system_prompt_hash: sessionMeta.systemPromptHash ?? "",
+                upgrade_state: readUpgradeState(deps.db, sessionId),
                 tool_present: toolPresent,
+                protected_tags: DEFAULT_PROTECTED_TAGS,
             };
             const resolved = await resolveOrdinalsForModule({
                 sessionId,
@@ -935,6 +962,8 @@ export function createRustModeTransform(
                 usage: passUsage(usage, contextLimit),
                 modelKey: modelKey ?? null,
                 providerId: model?.providerID ?? null,
+                systemPromptHash: sessionMeta.systemPromptHash ?? "",
+                upgradeState: String(passInputs.upgrade_state ?? ""),
                 midTurn,
             });
             const pages = buildPagedModuleTransformPayloads(body);
