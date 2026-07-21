@@ -1371,13 +1371,15 @@ fn apply_once(
     // retains the exact pre-capability behavior without changing the global profile table.
     let tail_reclaim_enabled = serializer_profile
         .is_none_or(|profile| healing::tail_reclaim(profile) || tagging_surface_requested);
+    let cached_m1_missing_due = cached_m1_missing(&loaded.core);
     let producer_gate = tail_reclaim_enabled
         && producer_gate(
             scheduler_outcome.pass,
             !loaded.meta.initialized
                 || render_config_changed
                 || reconcile_hard_due
-                || hard_fold_requested,
+                || hard_fold_requested
+                || cached_m1_missing_due,
         );
     let selection_class = if producer_gate && !ordinary_historian_veto {
         selection_pass_class(scheduler_outcome.pass)
@@ -1488,7 +1490,7 @@ fn apply_once(
         initialized: loaded.meta.initialized,
         is_legacy_baseline: is_legacy_baseline(&loaded.core),
         valid_m0m1_shape: valid_m0m1_shape(&loaded.core),
-        cached_m1_missing: cached_m1_missing(&loaded.core),
+        cached_m1_missing: cached_m1_missing_due,
         render_config_changed,
         hard_fold_requested,
         boundary_present,
@@ -1542,12 +1544,10 @@ fn apply_once(
         meta.last_upgrade_state = req.upgrade_state.clone();
         meta.last_render_config = effective_render_config.clone();
     }
-    if !req.is_subagent
-        && matches!(
-            scheduler_outcome.pass,
-            scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95
-        )
-    {
+    if matches!(
+        scheduler_outcome.pass,
+        scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95
+    ) {
         // The emergency selector latches every acting input sample, including zero
         // removals, so repeated pressure observations do not re-bust unchanged bytes.
         meta.last_emergency_input_sample = usage_input_tokens;
@@ -1953,6 +1953,40 @@ fn apply_once(
                         },
                         estimate_tokens,
                     )?;
+
+                    if let Some(stray) = first_uncovered_live_block(
+                        &compartments_for_fold,
+                        &live,
+                        comp.coverage_ordinal,
+                    ) {
+                        return Err(TransformError::CoverageGap(format!(
+                             "coverage gap: live item {} (ordinal {}) sits at or below coverage end {:?} \
+                              but no compartment covers it; composing m0 would silently drop it from the tail",
+                             stray.id(),
+                             stray.ordinal(),
+                             comp.coverage_ordinal
+                         )));
+                    }
+
+                    if comp.coverage_ordinal.is_some() {
+                        let minted = comp.boundary_id.as_str();
+                        if minted.is_empty()
+                            || !boundary_available(
+                                minted,
+                                &live,
+                                &boundary_state,
+                                req.declared_trim.as_ref(),
+                            )
+                        {
+                            return Err(TransformError::BoundaryNotPresent(format!(
+                                "fold minted anchor {minted:?} from the folded compartment's \
+                              end_message_id, but no live block carries that id; the anchor \
+                              must be the flat block id (`<mid>#<index>`) of the last covered \
+                              block; check the publisher's end_message_id"
+                            )));
+                        }
+                    }
+
                     let effective = effective_reductions(&core, &selected_reductions);
                     let survivors = surviving_red_units(&effective, &live, comp.coverage_ordinal);
                     let mut strip_survivors = surviving_strip_units(&core, req);
@@ -1960,7 +1994,7 @@ fn apply_once(
                     core.frozen_units.clear();
                     core.pending_changes.clear();
                     let mut rendered =
-                        vec![synth_region("m0", comp.m0_bytes), render_m1_placeholder()];
+                        vec![synth_region("m0", comp.m0_bytes), render_m1_body(&m1.body)];
                     rendered.extend(survivors);
                     rendered.extend(strip_survivors);
                     core.step(PassInput {
@@ -1982,9 +2016,17 @@ fn apply_once(
                     meta.memory_mutation_cursor = comp.memory_mutation_cursor;
                     meta.max_memory_id = comp.max_memory_id;
                     meta.expiry_cutoff_ms = ctx.now_ms;
-                    meta.m1_revision = m1_signal.revision;
+                    let applied_m1_signal = m1_revision_signal_parts_for_pass(
+                        store,
+                        ctx.project_path,
+                        ctx.note_project_path,
+                        &req.session_id,
+                        loaded.meta.user_profile_version,
+                        ctx.now_ms,
+                    )?;
+                    meta.m1_revision = applied_m1_signal.revision;
                     meta.m1_user_profile_version = loaded.meta.user_profile_version;
-                    meta.m1_external_revision = m1_signal.external_revision;
+                    meta.m1_external_revision = applied_m1_signal.external_revision;
                     meta.project_memory_epoch_pending = false;
                     meta.m1_pending_since_ms = None;
                     commit_memory_revision = Some(comp.memory_revision);
@@ -6012,8 +6054,8 @@ mod tests {
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
     use mc_store::{
-        InsertMemoryInput, ModuleUsage, ShadowDropSeedRow, ShadowStateSyncRequest,
-        StoredCompartment,
+        InsertMemoryInput, ModuleUsage, NoteCasOutcome, NoteEvaluationInput, NoteWriteInput,
+        ShadowDropSeedRow, ShadowStateSyncRequest, StoredCompartment,
     };
 
     #[test]
@@ -7546,6 +7588,94 @@ mod tests {
             .frozen_units
             .iter()
             .any(|unit| unit.key == "red:hard_old#0"));
+    }
+
+    #[test]
+    fn cached_m1_missing_hard_advisory_drains_pending_drop_on_defer() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let messages = vec![item("a", 1, "raw"), item("tail", 2, "pending drop")];
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        run(&s, &req("ses", "cfg0", messages.clone()), &spine());
+
+        let loaded = s.load("ses").unwrap();
+        let mut core = loaded.core.clone();
+        core.frozen_units.retain(|unit| unit.key != "m1");
+        s.commit("ses", loaded.row_version, &core, &loaded.meta)
+            .unwrap();
+        s.append_pending_agent_drops("ses", &["tail#0".to_string()], 1)
+            .unwrap();
+
+        let repaired = transform_with_projection(
+            &s,
+            &with_usage(req("ses", "cfg0", messages), 10, 100),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap();
+        assert_eq!(repaired.scheduler_pass, scheduler::PassDecision::Defer);
+        assert_eq!(repaired.response.action, "HARD");
+        assert!(s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "red:tail#0"));
+        assert!(
+            s.load_pending_agent_drops("ses").unwrap().is_empty(),
+            "a cached-m1 repair HARD must consume the queued drop"
+        );
+    }
+
+    #[test]
+    fn subagent_emergency_sample_latch_prevents_repeat_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let huge = "x".repeat(50_000);
+        let messages = vec![
+            item("head", 1, "raw"),
+            assistant_tool_call("old", 2, "old_call"),
+            tool_result("old_result", 3, "old_call", &huge),
+            assistant_tool_call("new", 4, "new_call"),
+            tool_result("new_result", 5, "new_call", &huge),
+        ];
+        let mut request = with_usage(req("subagent", "cfg0", messages), 90_000, 100_000);
+        request.is_subagent = true;
+        let context = pctx("git:proj", "/nonexistent-docs", 0);
+
+        let first = transform(&s, &request, &context).unwrap();
+        assert_eq!(first.action, "SOFT");
+        let first_red = s
+            .load("subagent")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .filter(|unit| unit.key.starts_with("red:"))
+            .map(|unit| unit.key.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            !first_red.is_empty(),
+            "the first emergency pass should select drops"
+        );
+        let first_bytes = serde_json::to_vec(&first.ck_messages).unwrap();
+
+        let second = transform(&s, &request, &context).unwrap();
+        let second_red = s
+            .load("subagent")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .filter(|unit| unit.key.starts_with("red:"))
+            .map(|unit| unit.key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(second_red, first_red);
+        assert_eq!(
+            serde_json::to_vec(&second.ck_messages).unwrap(),
+            first_bytes
+        );
     }
 
     #[test]
@@ -10625,6 +10755,33 @@ mod tests {
         run(s, &req("ses", "cfg0", vec![item("a", 1, "raw")]), &spine());
     }
 
+    fn seed_pressure_memory(s: &McStore) -> Vec<i64> {
+        (1..=41)
+            .inspect(|&id| {
+                s.seed_memory(
+                    id,
+                    "git:proj",
+                    "ARCHITECTURE",
+                    &format!("initial rule {id}"),
+                    70,
+                )
+                .unwrap();
+            })
+            .collect()
+    }
+
+    fn add_pressure_memory_updates(s: &McStore, memory_ids: &[i64]) {
+        for (revision, memory_id) in memory_ids.iter().enumerate() {
+            s.update_memory_content(
+                "git:proj",
+                *memory_id,
+                &format!("updated rule {revision}"),
+                revision as i64 + 1,
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     fn tagging_gate_off_preserves_unreduced_golden_messages() {
         let dir = tempfile::tempdir().unwrap();
@@ -12958,6 +13115,163 @@ mod tests {
         assert!(!after.committed);
         assert_eq!(m1_bytes(&after), m1_bytes(&r));
         assert_eq!(tail_bytes(&after, "t2"), "[dropped 1]");
+    }
+
+    #[test]
+    fn pressure_refold_renders_ready_note_and_ack_prevents_redelivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let memory_ids = seed_pressure_memory(&s);
+        let messages = vec![item("a", 1, "raw")];
+        let boot = run(&s, &req("ses", "cfg0", messages.clone()), &spine());
+        assert_eq!(boot.action, "HARD");
+
+        let note = s
+            .insert_project_note(NoteWriteInput {
+                project_path: "git:proj",
+                route_project_root: None,
+                session_id: Some("writer"),
+                content: "ready note survives pressure refold",
+                surface_condition: Some("condition true"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            s.write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: note.status_version,
+                verdict: true,
+                compiled_check: None,
+                manifest_json: None,
+                check_hash: None,
+                next_due_at: None,
+                now_ms: 2,
+            })
+            .unwrap(),
+            NoteCasOutcome::Applied(note) if note.status == "ready"
+        ));
+        add_pressure_memory_updates(&s, &memory_ids);
+
+        let pressure = transform(
+            &s,
+            &with_usage(req("ses", "cfg0", messages.clone()), 70, 100),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap();
+        assert_eq!(pressure.action, "HARD");
+        assert_eq!(
+            pressure.materialize_reason.as_deref(),
+            Some("pressure_refold")
+        );
+        assert!(
+            m1_bytes(&pressure).contains("ready note survives pressure refold"),
+            "pressure refold must retain the composed m1 body"
+        );
+        let deliveries = pressure.note_deliveries.clone().expect("note delivery");
+        assert_eq!(deliveries.len(), 1);
+
+        let stable = transform(
+            &s,
+            &with_usage(req("ses", "cfg0", messages.clone()), 10, 100),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap();
+        assert_eq!(stable.action, "SOFT+");
+        assert_eq!(m1_bytes(&stable), m1_bytes(&pressure));
+
+        let delivery = &deliveries[0];
+        assert_eq!(
+            s.ack_note_delivery("git:proj", "ses", &delivery.transform_pass_id, 3,)
+                .unwrap(),
+            1
+        );
+        let next_bust = transform(
+            &s,
+            &with_usage(req("ses", "cfg1", messages), 10, 100),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap();
+        assert_eq!(next_bust.action, "HARD");
+        assert!(next_bust.note_deliveries.is_none());
+        assert!(!m1_bytes(&next_bust).contains("ready note survives pressure refold"));
+    }
+
+    #[test]
+    fn pressure_refold_rejects_sparse_coverage_like_ordinary_hard() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let messages = vec![
+            item("a", 1, "raw a"),
+            item("gap", 2, "uncovered live"),
+            item("tail", 3, "raw tail"),
+        ];
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "S1")])
+            .unwrap();
+        let memory_ids = seed_pressure_memory(&s);
+        run(&s, &req("ses", "cfg0", messages.clone()), &spine());
+        add_pressure_memory_updates(&s, &memory_ids);
+        s.replace_compartments(
+            "ses",
+            &[comp(1, 1, 1, "a", "S1"), comp(2, 3, 3, "tail", "S2")],
+        )
+        .unwrap();
+
+        let pressure = transform(
+            &s,
+            &with_usage(req("ses", "cfg0", messages.clone()), 70, 100),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap_err();
+        assert!(matches!(pressure, TransformError::CoverageGap(_)));
+
+        let ordinary = transform(
+            &s,
+            &with_usage(req("ses", "cfg1", messages), 10, 100),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap_err();
+        assert!(matches!(ordinary, TransformError::CoverageGap(_)));
+    }
+
+    #[test]
+    fn pressure_refold_rejects_absent_anchor_like_ordinary_hard() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let messages = vec![item("a", 1, "raw a"), item("tail", 2, "raw tail")];
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "S1")])
+            .unwrap();
+        let memory_ids = seed_pressure_memory(&s);
+        run(&s, &req("ses", "cfg0", messages.clone()), &spine());
+        add_pressure_memory_updates(&s, &memory_ids);
+        s.replace_compartments(
+            "ses",
+            &[
+                comp(1, 1, 1, "a", "S1"),
+                comp(2, 2, 2, "missing-anchor", "S2"),
+            ],
+        )
+        .unwrap();
+
+        let pressure = transform(
+            &s,
+            &with_usage(req("ses", "cfg0", messages.clone()), 70, 100),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap_err();
+        assert!(matches!(pressure, TransformError::BoundaryNotPresent(_)));
+
+        let ordinary = transform(
+            &s,
+            &with_usage(req("ses", "cfg1", messages), 10, 100),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap_err();
+        assert!(matches!(ordinary, TransformError::BoundaryNotPresent(_)));
     }
 
     #[test]
