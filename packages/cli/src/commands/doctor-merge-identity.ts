@@ -1,13 +1,14 @@
 import { join } from "node:path";
-import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
-import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import {
     type IdentityMergeReport,
     mergeProjectIdentities,
 } from "@magic-context/core/features/magic-context/storage-identity-merge";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import type { Database } from "@magic-context/core/shared/sqlite";
-import { openExistingContextDatabase } from "../lib/database-access";
+import {
+    openExistingContextDatabase,
+    openExistingContextDatabaseForMutation,
+} from "../lib/database-access";
 
 export interface MergeIdentityCliOptions {
     from: string;
@@ -69,12 +70,12 @@ function printReport(report: IdentityMergeReport): void {
 }
 
 function openMergeDatabase(path: string, mutate: boolean): Database {
-    const db = openExistingContextDatabase(path, { readonly: !mutate });
+    // Do not run schema migrations here: a running OpenCode/Pi process may
+    // enforce an older maximum schema version, so a doctor write must use the current schema or stop.
+    const db = mutate
+        ? openExistingContextDatabaseForMutation(path)
+        : openExistingContextDatabase(path, { readonly: true });
     if (!db) throw new Error(`Context database does not exist: ${path}`);
-    if (mutate) {
-        initializeDatabase(db);
-        runMigrations(db);
-    }
     return db;
 }
 

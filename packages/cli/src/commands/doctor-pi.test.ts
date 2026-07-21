@@ -162,7 +162,6 @@ function baseOptions(root: string, cwd: string, prompts: MockPrompts): RunDoctor
     const storageDir = join(root, ".local", "share", "cortexkit", "magic-context");
     mkdirSync(storageDir, { recursive: true });
     writeFileSync(join(storageDir, "context.db"), "mock");
-    let currentDb: Database | null = null;
     return {
         cwd,
         prompts,
@@ -174,11 +173,6 @@ function baseOptions(root: string, cwd: string, prompts: MockPrompts): RunDoctor
             getPiVersion: () => "0.74.0",
             getLatestNpmVersion: () => "0.1.0",
             openExistingContextDatabase: () => createMockDb(),
-            openDatabase: () => {
-                currentDb = createMockDb();
-                return currentDb;
-            },
-            closeDatabase: () => currentDb?.close(),
             now: () => new Date("2026-04-28T12:34:56Z"),
             execFileSync: () => {
                 throw new Error("gh unavailable");

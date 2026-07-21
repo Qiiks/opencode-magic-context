@@ -1,10 +1,16 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LATEST_SUPPORTED_VERSION } from "@magic-context/core/features/magic-context/storage-db";
 import { Database } from "@magic-context/core/shared/sqlite";
-import { openExistingContextDatabase, UnsupportedSchemaVersionError } from "./database-access";
+import {
+    CLI_SCHEMA_FLOOR_VERSION,
+    OutdatedSchemaVersionError,
+    openExistingContextDatabase,
+    openExistingContextDatabaseForMutation,
+    UnsupportedSchemaVersionError,
+} from "./database-access";
 
 const tempDirs: string[] = [];
 
@@ -47,7 +53,21 @@ describe("CLI context database access", () => {
         expect(existsSync(path)).toBe(false);
     });
 
-    it("opens the current supported schema normally for reads and migration writes", () => {
+    it("refuses live mutations against an older schema without writing the file", () => {
+        const path = join(tempDir(), "context.db");
+        createVersionedDatabase(path, CLI_SCHEMA_FLOOR_VERSION - 1);
+        const before = readFileSync(path);
+
+        expect(() => openExistingContextDatabaseForMutation(path)).toThrow(
+            OutdatedSchemaVersionError,
+        );
+        expect(() => openExistingContextDatabaseForMutation(path)).toThrow(
+            `database schema v${CLI_SCHEMA_FLOOR_VERSION - 1} is behind this CLI's schema floor v${CLI_SCHEMA_FLOOR_VERSION}`,
+        );
+        expect(readFileSync(path)).toEqual(before);
+    });
+
+    it("opens the current supported schema normally for reads and mutation writes", () => {
         const path = join(tempDir(), "context.db");
         createVersionedDatabase(path, LATEST_SUPPORTED_VERSION);
 
