@@ -48,6 +48,19 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(warnings.some((w) => w.includes("sqlite"))).toBe(true);
     });
 
+    it("strips Pi subagent extension allowlists from project config", () => {
+        const raw: Record<string, unknown> = {
+            pi: { subagent_extensions: ["./repo-controlled-extension.ts"] },
+            dreamer: { model: "x" },
+        };
+
+        const warnings = stripUnsafeProjectConfigFields(raw);
+
+        expect(raw.pi).toEqual({});
+        expect(raw.dreamer).toEqual({ model: "x" });
+        expect(warnings.some((w) => w.includes("pi.subagent_extensions"))).toBe(true);
+    });
+
     it("strips embedding destination fields from project config but keeps tuning fields", () => {
         const raw: Record<string, unknown> = {
             embedding: {

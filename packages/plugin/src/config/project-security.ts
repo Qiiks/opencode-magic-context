@@ -206,6 +206,8 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *    requires trusted user-level `subc` configuration before Rust can activate.
  *  - `historian.model` / `historian.fallback_models` — historian model spend is
  *    user-level only; a cloned repo cannot force extra compaction cost.
+ *  - `pi.subagent_extensions` — a cloned repo must not choose which extensions
+ *    the user's Pi child processes load.
  *  - hidden-agent `prompt`/`permission`/`tools` — a repo must not reprogram or
  *    re-permission the historian/dreamer/sidekick.
  */
@@ -238,6 +240,14 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         delete projectRaw.shadow_transform;
         warnings.push(
             "Ignoring shadow_transform from project config (security: this developer-only mirror lane is user-level only).",
+        );
+    }
+
+    const pi = projectRaw.pi;
+    if (isPlainObject(pi) && "subagent_extensions" in pi) {
+        delete pi.subagent_extensions;
+        warnings.push(
+            "Ignoring pi.subagent_extensions from project config (security: only user-level config may choose extensions loaded by Pi subagent children).",
         );
     }
 

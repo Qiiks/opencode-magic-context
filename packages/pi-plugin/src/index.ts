@@ -142,6 +142,7 @@ import { readPiSessionMessages } from "./read-session-pi";
 import { registerStatusLine, updateStatusLine } from "./status-line";
 import { stripTagPrefixFromAssistantMessage } from "./strip-tag-prefix";
 import {
+	configurePiSubagentExtensions,
 	MAGIC_CONTEXT_PI_SUBAGENT_ENV,
 	PiSubagentRunner,
 } from "./subagent-runner";
@@ -721,6 +722,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const { config, warnings, loadedFromPaths } = loadPiConfig({
 		cwd: projectDir,
 	});
+	// The allowlist is user-tier only, so configure all child runners once at
+	// boot. Project config is stripped before this merged config is returned.
+	configurePiSubagentExtensions(config.pi?.subagent_extensions);
 	logPiConfigLoad({
 		dir: projectDir,
 		loadedFromPaths,

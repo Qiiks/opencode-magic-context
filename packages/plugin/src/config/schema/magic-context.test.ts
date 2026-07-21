@@ -39,6 +39,7 @@ describe("MagicContextConfigSchema", () => {
             expect(result.historian).toBeUndefined();
             expect(result.dreamer).toBeUndefined();
             expect(result.sidekick).toBeUndefined();
+            expect(result.pi).toBeUndefined();
         });
     });
 
@@ -106,6 +107,9 @@ describe("MagicContextConfigSchema", () => {
                         since_days: 365,
                         max_commits: 2000,
                     },
+                },
+                pi: {
+                    subagent_extensions: ["@example/provider", "./extensions/local.ts"],
                 },
                 sidekick: {
                     disable: false,
@@ -183,6 +187,14 @@ describe("MagicContextConfigSchema", () => {
             expect(MagicContextConfigSchema.parse({ auto_update: true }).auto_update).toBe(true);
         });
 
+        it("accepts an explicitly configured Pi subagent extension allowlist", () => {
+            expect(
+                MagicContextConfigSchema.parse({
+                    pi: { subagent_extensions: ["provider-package", "./local.ts"] },
+                }).pi,
+            ).toEqual({ subagent_extensions: ["provider-package", "./local.ts"] });
+        });
+
         it("accepts and normalizes 2-letter ISO 639-1 language codes", () => {
             expect(MagicContextConfigSchema.parse({ language: "tr" }).language).toBe("tr");
             expect(MagicContextConfigSchema.parse({ language: "  ES " }).language).toBe("es");
@@ -207,6 +219,12 @@ describe("MagicContextConfigSchema", () => {
     describe("validation", () => {
         it("rejects an unknown transform mode", () => {
             expect(() => MagicContextConfigSchema.parse({ transform_mode: "wasm" })).toThrow();
+        });
+
+        it("rejects empty Pi subagent extension entries", () => {
+            expect(() =>
+                MagicContextConfigSchema.parse({ pi: { subagent_extensions: ["  "] } }),
+            ).toThrow();
         });
 
         it("rejects protected_tags greater than 100", () => {

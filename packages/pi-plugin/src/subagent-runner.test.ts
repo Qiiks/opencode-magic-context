@@ -1,7 +1,8 @@
 import { describe, expect, it, mock, spyOn } from "bun:test";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, join } from "node:path";
 import { PassThrough } from "node:stream";
 import * as loggerModule from "@magic-context/core/shared/logger";
 import type { SubagentRunOptions } from "@magic-context/core/shared/subagent-runner";
@@ -110,10 +111,12 @@ function runnerWith(
 		piBinary = "pi-test",
 		platform,
 		extraArgs,
+		subagentExtensions,
 	}: {
 		piBinary?: string;
 		platform?: NodeJS.Platform;
 		extraArgs?: readonly string[];
+		subagentExtensions?: readonly string[];
 	} = {},
 ) {
 	const remainingChildren = Array.isArray(childOrChildren)
@@ -129,6 +132,7 @@ function runnerWith(
 		piBinary,
 		platform,
 		extraArgs,
+		subagentExtensions,
 		spawnImpl: spawnImpl as never,
 	});
 	return { runner, spawnImpl };
@@ -250,6 +254,40 @@ describe("subagent-runner pure helpers", () => {
 				"/tmp/subagent-entry.js",
 			]),
 		);
+	});
+
+	it("uses the configured extension allowlist in order and resolves relative paths from Pi settings", () => {
+		const args = buildArgsForTest(
+			{ ...baseOptions, model: "anthropic/claude-sonnet" },
+			{
+				subagentExtensions: [
+					"provider-package",
+					"./extensions/provider.ts",
+					"../shared/provider.ts",
+				],
+			},
+		);
+
+		const firstExtension = args.indexOf("--extension");
+		expect(args.slice(firstExtension, firstExtension + 6)).toEqual([
+			"--extension",
+			join(homedir(), ".pi/agent/provider-package"),
+			"--extension",
+			join(homedir(), ".pi/agent/extensions/provider.ts"),
+			"--extension",
+			join(homedir(), ".pi/shared/provider.ts"),
+		]);
+		expect(args).toContain("--no-extensions");
+	});
+
+	it("keeps the current all-extension argv shape when no allowlist is configured", () => {
+		const args = buildArgsForTest({
+			...baseOptions,
+			model: "anthropic/claude-sonnet",
+		});
+
+		expect(args).not.toContain("--no-extensions");
+		expect(args).not.toContain("--extension");
 	});
 
 	it("disables project context files so hidden subagents see only our prompt", () => {
@@ -1352,6 +1390,45 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		);
 	});
 
+	it("does not start a retry loop when the allowlist already disables discovery", async () => {
+		const first = createMockChild();
+		const { runner, spawnImpl } = runnerWith(first, {
+			subagentExtensions: ["provider-package", "./provider.ts"],
+		});
+		const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
+			() => {},
+		);
+
+		try {
+			const resultPromise = runner.run({
+				...baseOptions,
+				model: "anthropic/primary",
+			});
+			first.writeStderr(COLLISION_STDERR);
+			first.emitClose(1);
+
+			const result = await resultPromise;
+			expect(result.ok).toBe(false);
+			expect(spawnImpl).toHaveBeenCalledTimes(1);
+			const args = spawnImpl.mock.calls[0]?.[1] as string[];
+			expect(args.filter((arg) => arg === "--no-extensions")).toHaveLength(1);
+			const firstExtension = args.indexOf("--extension");
+			expect(args.slice(firstExtension, firstExtension + 4)).toEqual([
+				"--extension",
+				join(homedir(), ".pi/agent/provider-package"),
+				"--extension",
+				join(homedir(), ".pi/agent/provider.ts"),
+			]);
+			expect(
+				logSpy.mock.calls.some(
+					(call) => call[1] === ISOLATED_RETRY_LOG_MESSAGE,
+				),
+			).toBe(false);
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
 	it("does not start a retry loop when the spawn already disables extensions", async () => {
 		const first = createMockChild();
 		const second = createMockChild();
@@ -1564,6 +1641,36 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			| { env?: NodeJS.ProcessEnv }
 			| undefined;
 		expect(spawnOptions?.env).not.toBe(process.env);
+	});
+
+	it("keeps the Magic Context env guard when the extension allowlist is active", async () => {
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, {
+			subagentExtensions: ["provider-package"],
+		});
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "anthropic/model",
+		});
+		child.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "allowlisted" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		child.emitClose(0);
+		await resultPromise;
+
+		const spawnOptions = spawnImpl.mock.calls[0]?.[2] as
+			| { env?: NodeJS.ProcessEnv }
+			| undefined;
+		expect(spawnOptions?.env).toEqual(
+			expect.objectContaining({ MAGIC_CONTEXT_PI_SUBAGENT: "1" }),
+		);
 	});
 
 	it("does not let a post-terminal child signal override captured success", async () => {

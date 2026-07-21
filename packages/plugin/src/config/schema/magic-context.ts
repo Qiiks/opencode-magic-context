@@ -39,6 +39,20 @@ export const PiThinkingLevelSchema = z
     .optional();
 export type PiThinkingLevel = z.infer<typeof PiThinkingLevelSchema>;
 
+/** Pi-only child-process controls. This block is intentionally optional so an
+ * absent allowlist preserves Pi's normal extension discovery behavior. */
+export const PiConfigSchema = z
+    .object({
+        subagent_extensions: z
+            .array(z.string().trim().min(1))
+            .optional()
+            .describe(
+                "User-only allowlist of Pi extensions for Magic Context subagent children. When set, children use --no-extensions and load only these entries (plus Magic Context's scoped child extension where applicable). Relative paths resolve from ~/.pi/agent, matching Pi's settings.json package location. Unset preserves normal Pi extension discovery.",
+            ),
+    })
+    .optional();
+export type PiConfig = NonNullable<z.infer<typeof PiConfigSchema>>;
+
 /** A 5-field cron expression, or "" to disable the task. */
 const CronScheduleSchema = z
     .string()
@@ -432,6 +446,8 @@ export interface MagicContextConfig {
         enabled: boolean;
         overlay: boolean;
     };
+    /** Pi-only child-process extension controls. */
+    pi?: PiConfig;
     /** Content-aware reclaim of tool output that a later call supersedes, added
      *  to the normal age-based auto-drop: superseded todowrite/ctx_reduce/meta
      *  outputs are dropped, and older edits to a file are compressed to a marker
@@ -756,6 +772,9 @@ export const MagicContextConfigSchema = z
             .describe(
                 "Pi-only todowrite tool and overlay controls. Pi registers tools and widgets at extension boot, so changing this after /cd requires /reload or restart.",
             ),
+        pi: PiConfigSchema.describe(
+            "Pi-only child-process extension controls. This setting is user-level only; project configuration cannot choose which extensions a user's subagent children load.",
+        ),
         smart_drops: z
             .boolean()
             .default(false)

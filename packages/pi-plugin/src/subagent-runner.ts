@@ -1,8 +1,14 @@
 import * as childProcess from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve as resolvePath } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import {
+	basename,
+	dirname,
+	isAbsolute,
+	join,
+	resolve as resolvePath,
+} from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { openDatabase } from "@magic-context/core/features/magic-context/storage";
@@ -165,6 +171,30 @@ const SUBAGENT_ENTRY_PATH = resolveSubagentEntryPath();
 const TERMINAL_DRAIN_GRACE_MS = 2_000;
 
 export const MAGIC_CONTEXT_PI_SUBAGENT_ENV = "MAGIC_CONTEXT_PI_SUBAGENT";
+
+// Pi resolves local entries in its user settings package list from the
+// settings directory, not from the spawned child's project cwd. Keep the same
+// base for explicit --extension entries; the installed Pi package is not
+// available in every development worktree to import its resolver directly.
+// Pi's current resolver treats bare names as local paths too; npm packages
+// should use the explicit `npm:` source form.
+const PI_AGENT_SETTINGS_DIR = join(homedir(), ".pi", "agent");
+let configuredSubagentExtensions: readonly string[] | undefined;
+
+/** Configure the user-tier extension allowlist used by new Pi child runners. */
+export function configurePiSubagentExtensions(
+	extensions: readonly string[] | undefined,
+): void {
+	configuredSubagentExtensions = extensions?.slice();
+}
+
+function resolveSubagentExtensionEntry(entry: string): string {
+	const trimmed = entry.trim();
+	const isNpmSource = trimmed.startsWith("npm:");
+	return !isNpmSource && !isAbsolute(trimmed)
+		? resolvePath(PI_AGENT_SETTINGS_DIR, trimmed)
+		: trimmed;
+}
 
 const PI_READ_ONLY_BUILTINS = ["read", "grep", "find", "ls"] as const;
 const PI_AFT_READ_TOOLS = ["aft_outline", "aft_zoom", "aft_search"] as const;
@@ -396,12 +426,16 @@ export class PiSubagentRunner implements SubagentRunner {
 	private readonly spawnImpl: typeof childProcess.spawn;
 	private readonly platform: NodeJS.Platform;
 	private readonly extraArgs: readonly string[];
+	/** `undefined` means preserve Pi's normal extension discovery behavior. */
+	private readonly subagentExtensions: readonly string[] | undefined;
 
 	constructor(
 		options: {
 			piBinary?: string;
 			platform?: NodeJS.Platform;
 			extraArgs?: readonly string[];
+			/** User-tier explicit extension allowlist; an empty list disables all discovered extensions. */
+			subagentExtensions?: readonly string[];
 			/** Test seam for subprocess lifecycle tests. Production uses child_process.spawn. */
 			spawnImpl?: typeof childProcess.spawn;
 		} = {},
@@ -412,6 +446,8 @@ export class PiSubagentRunner implements SubagentRunner {
 		this.spawnImpl = options.spawnImpl ?? childProcess.spawn;
 		this.platform = options.platform ?? process.platform;
 		this.extraArgs = options.extraArgs ?? [];
+		this.subagentExtensions =
+			options.subagentExtensions ?? configuredSubagentExtensions;
 	}
 
 	async run(options: SubagentRunOptions): Promise<SubagentRunResult> {
@@ -483,6 +519,7 @@ export class PiSubagentRunner implements SubagentRunner {
 	private spawnUsesNoExtensions(runMode: PiRunMode): boolean {
 		return (
 			runMode.disableDiscoveredExtensions ||
+			this.subagentExtensions !== undefined ||
 			hasNoExtensionsArg([...this.invocation.prefixArgs, ...this.extraArgs])
 		);
 	}
@@ -621,6 +658,7 @@ export class PiSubagentRunner implements SubagentRunner {
 		}
 		const args = buildArgs(options, {
 			disableDiscoveredExtensions: runMode.disableDiscoveredExtensions,
+			subagentExtensions: this.subagentExtensions,
 			omitPositionalMessage: deliverViaStdin,
 			systemPromptPath,
 		});
@@ -1226,6 +1264,7 @@ export function buildArgs(
 	options: SubagentRunOptions,
 	opts?: {
 		disableDiscoveredExtensions?: boolean;
+		subagentExtensions?: readonly string[];
 		omitPositionalMessage?: boolean;
 		subagentEntryPath?: string;
 		systemPromptPath?: string;
@@ -1245,13 +1284,13 @@ export function buildArgs(
 		// historian etc. stay invisible to the user even though they're
 		// real LLM rounds the user pays for.
 		"--no-session",
-		// Leave extension discovery enabled in child processes so provider
-		// extensions can register their models and the Pi extension can expose
-		// optional read tools. Prevent recursive startup by setting
-		// MAGIC_CONTEXT_PI_SUBAGENT=1 in the child environment, which makes the
-		// main entry exit early before registering hooks, tools, or timers. Disable
-		// skills and prompt templates because subagents only need a minimal startup
-		// path.
+		// Extension discovery is enabled by default so provider extensions can
+		// register their models. A configured user allowlist adds --no-extensions
+		// below and explicitly loads only its entries. Prevent recursive startup by
+		// setting MAGIC_CONTEXT_PI_SUBAGENT=1 in the child environment, which makes
+		// the main entry exit early before registering hooks, tools, or timers.
+		// Disable skills and prompt templates because subagents only need a minimal
+		// startup path.
 		"--no-skills",
 		"--no-prompt-templates",
 		// Hidden one-shot subagents must receive EXACTLY the system prompt we built.
@@ -1262,18 +1301,25 @@ export function buildArgs(
 		// Every known Magic Context child gets an explicit --tools allow-list so Pi's
 		// discovered extension registry cannot leak unrelated tools into subagents.
 	];
-	if (opts?.disableDiscoveredExtensions) {
-		// When a discovered extension starts a turn during startup, the child's
-		// first prompt can fail before Magic Context sends its own prompt. For that
-		// isolated retry, disable auto-discovered extensions with
-		// `--no-extensions`, but still allow explicit `--extension` entries so the
-		// lightweight ctx_* extension can load.
+	if (
+		opts?.disableDiscoveredExtensions ||
+		opts?.subagentExtensions !== undefined
+	) {
+		// When an allowlist is active, or when the collision retry asks for an
+		// isolated child, disable auto-discovered extensions. Explicit entries are
+		// added below in their configured order.
 		args.push("--no-extensions");
 	}
 
+	if (opts?.subagentExtensions !== undefined) {
+		for (const extension of opts.subagentExtensions) {
+			args.push("--extension", resolveSubagentExtensionEntry(extension));
+		}
+	}
+
 	// Load Magic Context's lean subagent extension entry in children that need the
-	// scoped ctx_* tools. Discovered extensions are now intentionally enabled so
-	// provider/AFT extensions can register, while the full Magic Context entry sees
+	// scoped ctx_* tools. With no allowlist, discovered extensions remain enabled
+	// so provider and other auto-discovered extensions can register, while the full Magic Context entry sees
 	// MAGIC_CONTEXT_PI_SUBAGENT=1 and returns before wiring recursive hooks. The
 	// lean entry is explicitly loaded via --extension and is NOT guarded; it only
 	// registers subagent-scoped tools and never historian/dreamer/event handlers.
