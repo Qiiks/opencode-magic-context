@@ -309,6 +309,10 @@ struct ShadowStateSyncWire {
     #[serde(default)]
     last_todo_state: Option<String>,
     #[serde(default)]
+    project_memory_epoch: Option<u64>,
+    #[serde(default)]
+    user_profile_version: Option<u64>,
+    #[serde(default)]
     acked_watermarks: Option<Value>,
     #[serde(default)]
     drop_seeds: Vec<ShadowDropSeedWire>,
@@ -4194,7 +4198,7 @@ impl McHandler {
     }
 
     fn handle_session_status_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let (session_id, _binding) =
+        let (session_id, binding) =
             match self.management_binding(channel, request, "session.status") {
                 Ok(scope) => scope,
                 Err(outcome) => return outcome,
@@ -4292,21 +4296,46 @@ impl McHandler {
         let age = format_traffic_age(newest_pass_at, now_ms());
         // Status can outlive the caller's current lineage. Naming the subject and its
         // durable traffic age makes a stale read visible instead of silently ambiguous.
+        // Structured fields accompany the prose so reconciliation code can determine
+        // completion without parsing the summary or issuing another operation: a retained
+        // delivered-command record includes its coverage, row version, and current wrapup state.
+        let m1_signal = match crate::m1_compose::m1_revision_signal_parts_for_pass(
+            store,
+            &binding.project_root.to_string_lossy(),
+            &binding.project_root.to_string_lossy(),
+            &session_id,
+            loaded.meta.user_profile_version,
+            now_ms(),
+        ) {
+            Ok(signal) => Some(signal),
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let pending_m1_delta = loaded.meta.initialized
+            && m1_signal
+                .as_ref()
+                .is_some_and(|signal| signal.revision != loaded.meta.m1_revision);
+        let pending_m1_age_ms = pending_m1_delta
+            .then(|| now_ms().saturating_sub(loaded.meta.m1_pending_since_ms.unwrap_or(now_ms())));
         let summary = sanitize_status_text(
             &format!(
-                "session {short_session} (last active {age}): {} {}, coverage ordinal {coverage}, boundary {boundary}, {} pending {}, {} {}, last historian: {historian}, surface {surface}",
+                "session {short_session} (last active {age}): {} {}, coverage ordinal {coverage}, boundary {boundary}, {} pending {}, {} {}, pending m1 delta {}, last historian: {historian}, surface {surface}",
                 compartment_count,
                 plural_word(compartment_count, "compartment"),
                 pending_drop_count,
                 plural_word(pending_drop_count, "drop"),
                 tag_count,
                 plural_word(tag_count, "tag"),
+                pending_m1_age_ms
+                    .map(|age| format!("true age_ms={age}"))
+                    .unwrap_or_else(|| "false".to_string()),
             ),
             500,
         );
-        // Structured fields beside the prose: reconcilers must never parse summary
-        // text, and a retained delivered-command row needs coverage/row_version plus
-        // the live wrapup latch to decide completion without a second op.
         let wrapup_active = wrapup_latch.map(|(_, rounds)| rounds);
         let mut response = json!({
             "ok": true,
@@ -4319,6 +4348,8 @@ impl McHandler {
             "compartment_count": compartment_count,
             "compartment_tokens": compartment_tokens,
             "pending_drop_count": pending_drop_count,
+            "pending_m1_delta": pending_m1_delta,
+            "pending_m1_age_ms": pending_m1_age_ms,
             "usage": {
                 "current_total_input_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.current_total_input_tokens),
                 "context_limit_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.context_limit_tokens),
@@ -6548,6 +6579,8 @@ impl McHandler {
                 user_profile: &parsed.user_profile,
                 workspace: workspace.as_ref(),
                 last_todo_state: parsed.last_todo_state,
+                project_memory_epoch: parsed.project_memory_epoch,
+                user_profile_version: parsed.user_profile_version,
                 acked_watermarks,
             })
         } else {
@@ -6565,6 +6598,8 @@ impl McHandler {
                 user_profile: &parsed.user_profile,
                 workspace: workspace.as_ref(),
                 last_todo_state: parsed.last_todo_state,
+                project_memory_epoch: parsed.project_memory_epoch,
+                user_profile_version: parsed.user_profile_version,
                 acked_watermarks,
             })
         };
@@ -9348,6 +9383,8 @@ fn assemble_shadow_seed(
         user_profile,
         workspace: final_batch.workspace,
         last_todo_state: final_batch.last_todo_state,
+        project_memory_epoch: final_batch.project_memory_epoch,
+        user_profile_version: final_batch.user_profile_version,
         acked_watermarks: final_batch.acked_watermarks,
         drop_seeds,
         drop_seed_skipped: final_batch.drop_seed_skipped,
@@ -15965,6 +16002,8 @@ mod tests {
         let mut meta = loaded.meta.clone();
         meta.coverage_ordinal = Some(10);
         meta.cc_u1_active = true;
+        meta.initialized = true;
+        meta.m1_revision = 1;
         meta.last_committed_pass_at_ms = now_ms() - 125_000;
         meta.historian.firing_seq = 3;
         store
@@ -15972,6 +16011,9 @@ mod tests {
             .unwrap();
         store
             .append_pending_agent_drops(session_id, &["m8#0".to_string()], 2)
+            .unwrap();
+        store
+            .seed_memory(5, project.to_str().unwrap(), "ARCHITECTURE", "pending", 70)
             .unwrap();
         store
             .seed_tags_for_test(
@@ -16006,7 +16048,10 @@ mod tests {
         assert!(summary.contains("boundary present"));
         assert!(summary.contains("1 pending drop"));
         assert!(summary.contains("2 tags"));
+        assert!(summary.contains("pending m1 delta true age_ms=0"));
         assert!(summary.contains("last historian: published seq 3"));
+        assert_eq!(body["pending_m1_delta"], json!(true));
+        assert_eq!(body["pending_m1_age_ms"], json!(0));
         assert!(summary.ends_with("surface active"));
     }
 
@@ -20386,6 +20431,8 @@ mod tests {
                 user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: Value::Null,
             })
             .unwrap();

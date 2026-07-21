@@ -1,21 +1,17 @@
-//! The store → m1 delta producer for the SOFT branch, in TWO tiers (the
-//! compose-on-bust-only discipline):
+//! The store → m1 delta producer for bust arms, in TWO tiers (the
+//! compose-on-opportunity discipline):
 //!
-//!  - [`m1_revision_signal`] is the CHEAP per-pass read: a stable digest over the
-//!    watermark triple (max memory id, max mutation-log id, max compartment seq). It runs
-//!    EVERY pass to feed the classifier's "did m1 change?" gate WITHOUT composing the
-//!    body. Monotonic: every byte-affecting m1 change advances one leg of the triple (the
-//!    mutation log is append-only, so even a same-id memory edit creates a new row → the
-//!    triple moves), so the signal never MISSES a real change. It can rarely over-fire (a
-//!    mutation targeting a memory not in the rendered manifest advances the triple without
-//!    changing the body) → a SOFT that re-renders byte-identical m1 → no provider bust,
-//!    just a redundant commit. Safe direction: never a missed bust, only a benign extra.
+//!  - [`m1_revision_signal`] is the CHEAP per-pass read: split in-session and external
+//!    fingerprints run EVERY pass to tell the classifier whether work is pending and whether
+//!    a render-config HARD is due, WITHOUT composing the body. In-session changes are allowed
+//!    to remain pending so ordinary turns replay frozen bytes; external workspace changes stay
+//!    eager-HARD.
 //!  - [`compose_m1_from_store`] is the EXPENSIVE bust-only read: it composes the actual m1
 //!    delta body (memory-updates + new-compartments + new-memories) from the store and
-//!    reports whether a newly-published compartment EXTENDS coverage (so the SOFT must
-//!    advance the boundary anchor). Runs ONLY on a bust arm — never on a defer (a defer
-//!    replays the frozen m1 verbatim; re-composing from the now-possibly-mutated store on
-//!    a defer would change bytes on a defer, the cache-break the whole design forbids).
+//!    reports whether a newly-published compartment EXTENDS coverage (so the bust must
+//!    advance the boundary anchor). Runs ONLY on a bust opportunity — never on a defer (a
+//!    defer replays the frozen m1 verbatim; re-composing from the now-possibly-mutated store
+//!    on a defer would change bytes on a defer, violating the deferred-work invariant).
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -62,47 +58,38 @@ fn union_paths(store: &McStore, project_path: &str) -> Result<Vec<String>, McSto
     })
 }
 
-/// The CHEAP per-pass m1 revision signal: a stable digest over the watermark triple.
+/// The cheap per-pass revision signal, split into two lanes:
 ///
-/// COMPLETENESS INVARIANT (load-bearing — a gap here silently serves stale m1): every
-/// possible change to a live m1-rendered component must be caught by EITHER this m1-SOFT
-/// digest (→ a SOFT recomposes the body) OR a HARD trigger (→ m0 recomposes from scratch).
-/// No change may fall through both. This is NOT "one digest leg per render component" — a
-/// change that correctly routes to the HARD path needs no m1 leg.
+/// * `revision` is the IN-SESSION lane. Memory inserts/updates, the mutation log, note
+///   surfacing, profile-version lines, and ordinary compartment publication all become
+///   pending work. A mismatch is intentionally deferred until an independent render.
+/// * `external_revision` is the EXTERNAL lane. Workspace membership/visibility changes
+///   remain eager-HARD because they change the m0 memory universe; project memory epochs
+///   are carried by state-sync and arm the same HARD path in durable metadata.
 ///
-/// The three live render components and how each component's changes are caught:
-///   <memory-updates>   ← max_memory_mutation_id (append-only log; any correction = new row)
-///   <new-memories>     ← max_memory_id (a new memory = a higher id)
-///   <new-compartments> ← max_compartment_seq, AND this is the subtle one:
-///       - ADD a compartment (new sequence) → max_seq moves → SOFT. Covered here.
-///       - MUTATE a compartment row (recomp rewrites p1/title/range, same sequence) →
-///         rebuilds m0's baseline source → a STRUCTURE-EPOCH HARD (m0 recomposes; the
-///         mutated compartment folds in with new bytes), regardless of whether it was
-///         folded or still riding m1. NOT an m1-SOFT event, so max_seq need not catch it.
-///     So max_seq is the COMPLETE m1-SOFT leg for compartments. This rests on TWO premises:
-///       (i)  the unfolded <new-compartments> render is ROW-PURE — render_compartment_at_tier
-///            at a hardcoded tier with no clock/age/pressure input (see decay_render.rs +
-///            render_new_compartments), so its bytes are a pure function of the row fields.
-///       (ii) PREMISE PIN: if anyone ever adds an age/pressure/decay input to the UNFOLDED
-///            compartment render (bytes varying without a row change), max_seq stops being
-///            complete and this leg MUST be re-evaluated. A reminder is pinned at the render
-///            site (render_new_compartments) so that change trips it.
-/// `<new-user-profile>` is NOT rendered yet (no profile-version source), so it has no
-/// component and no leg; when its render + source land, its change-signal must be added
-/// here in the same change (either as a leg or, if it routes to a HARD, as a HARD trigger).
+/// This table is the ordering contract for the module's bust opportunity gate:
 ///
-/// Over-coverage is benign (a watermark moving without a body change → a SOFT that
-/// recomposes byte-identical m1 → no provider bust); under-coverage is a missed bust.
+/// | input | lane | no independent render | independent render |
+/// | memory/profile/note/compartment signal | in-session | defer, preserve frozen bytes | fold in HARD/SOFT |
+/// | workspace fingerprint | external | HARD | HARD |
+/// | project memory epoch | external | HARD on next pass | HARD |
+/// | flush/refresh, Force/Emergency, first reduction | opportunity | fold pending delta | fold pending delta |
 ///
-/// 0 is reserved for "no delta" (the placeholder), so a real signal is never 0 — fold a
-/// constant in and force the low bit set, keeping 0 exclusively the empty marker.
+/// The signal only identifies pending work; it never authorizes a bust by itself. This is the
+/// deferred-work invariant: a provider cache must not be invalidated merely because a store
+/// watermark moved between ordinary turns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct M1RevisionSignal {
+    /// Applied-revision comparison for the in-session lane.
     pub revision: u64,
-    /// Highest compartment sequence read while computing `revision`. The transform reuses
-    /// this scalar to decide whether it needs to load full compartment rows for rare
-    /// system-message absorption checks.
+    /// External workspace lane; changes route to HARD, never SOFT.
+    pub external_revision: u64,
+    /// Highest compartment sequence read while computing `revision`.
     pub max_compartment_seq: i64,
+    pub max_memory_id: i64,
+    pub max_memory_mutation_id: i64,
+    pub note_status_version: i64,
+    pub user_profile_version: u64,
 }
 
 pub fn m1_revision_signal(
@@ -118,20 +105,55 @@ pub fn m1_revision_signal_parts(
     project_path: &str,
     session_id: &str,
 ) -> Result<M1RevisionSignal, McStoreError> {
+    m1_revision_signal_parts_for_pass(store, project_path, project_path, session_id, 0, 0)
+}
+
+/// Read both signal lanes for a transform pass. The extra context is supplied by the
+/// already-loaded transform route so note/profile changes are covered without rendering.
+pub fn m1_revision_signal_parts_for_pass(
+    store: &McStore,
+    project_path: &str,
+    note_project_path: &str,
+    session_id: &str,
+    user_profile_version: u64,
+    now_ms: i64,
+) -> Result<M1RevisionSignal, McStoreError> {
     let paths = union_paths(store, project_path)?;
     let max_memory_id = store.max_memory_id(&paths)?;
-    let max_mutation_id = store.max_memory_mutation_id(&paths)?;
+    let max_memory_mutation_id = store.max_memory_mutation_id(&paths)?;
     let max_compartment_seq = store.max_compartment_seq(session_id)?;
+    let note_status_version = store.max_note_status_version(note_project_path)?;
 
-    let mut h = DefaultHasher::new();
-    "mc-m1-rev-v1".hash(&mut h);
-    max_memory_id.hash(&mut h);
-    max_mutation_id.hash(&mut h);
-    max_compartment_seq.hash(&mut h);
-    // reserve 0 for the empty placeholder: never return 0 for a computed signal.
+    let mut in_session = DefaultHasher::new();
+    // Preserve the old digest format when both new inputs are zero, so sessions created
+    // before these inputs existed do not appear changed solely because the signal gained fields.
+    if note_status_version == 0 && user_profile_version == 0 {
+        "mc-m1-rev-v1".hash(&mut in_session);
+        max_memory_id.hash(&mut in_session);
+        max_memory_mutation_id.hash(&mut in_session);
+        max_compartment_seq.hash(&mut in_session);
+    } else {
+        "mc-m1-in-session-v2".hash(&mut in_session);
+        max_memory_id.hash(&mut in_session);
+        max_memory_mutation_id.hash(&mut in_session);
+        max_compartment_seq.hash(&mut in_session);
+        note_status_version.hash(&mut in_session);
+        user_profile_version.hash(&mut in_session);
+    }
+
+    let workspace_fingerprint = store.workspace_fingerprint(project_path, now_ms)?;
+    let mut external = DefaultHasher::new();
+    "mc-m1-external-v1".hash(&mut external);
+    workspace_fingerprint.hash(&mut external);
+
     Ok(M1RevisionSignal {
-        revision: h.finish() | 1,
+        revision: in_session.finish() | 1,
+        external_revision: external.finish() | 1,
         max_compartment_seq,
+        max_memory_id,
+        max_memory_mutation_id,
+        note_status_version,
+        user_profile_version,
     })
 }
 

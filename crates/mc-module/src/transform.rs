@@ -20,7 +20,7 @@ use crate::healing::{self, quirk_residual, SerializerProfile};
 use crate::injection::{advance_injection_from_meta, capture_todo_state_on_bust, InjectionOutcome};
 use crate::m0_compose::compose_m0_from_store;
 use crate::m1_compose::{
-    claim_and_render_notes, compose_m1_from_store, m1_revision_signal, m1_revision_signal_parts,
+    claim_and_render_notes, compose_m1_from_store, m1_revision_signal_parts_for_pass,
 };
 use crate::memory_render::M1_PLACEHOLDER;
 use crate::scheduler::{
@@ -32,16 +32,17 @@ use crate::selection::{
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
-    Channel1AppendRow, DeferredExecuteState, McStore, McStoreError, McTagRow, ModuleMeta,
-    ModuleUsage, NoteDelivery, PendingAgentDrop, PendingRewriteState, StoredCompartment,
-    TagMintInput, TemporalMarkInput, TemporalMarkRow, TransformCommit, TransformOverlayBatch,
-    UserHintDecisionInput, UserHintRow, SHADOW_SESSION_PREFIX,
+    Channel1AppendRow, DeferredExecuteState, McStore, McStoreError, McTagRow, MemoryRevision,
+    ModuleMeta, ModuleUsage, NoteDelivery, PendingAgentDrop, PendingRewriteState,
+    StoredCompartment, TagMintInput, TemporalMarkInput, TemporalMarkRow, TransformCommit,
+    TransformOverlayBatch, UserHintDecisionInput, UserHintRow, SHADOW_SESSION_PREFIX,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
+use std::sync::{Mutex, OnceLock};
 
 use crate::ck_wire::{
     duplicate_ids, project_messages, reduced_block, split_block_id, CkIngressMessage, CkWireBlock,
@@ -81,6 +82,29 @@ const USER_HINT_RESULT_LIMIT: usize = 3;
 const USER_HINT_MIN_MATCHED_TOKENS: usize = 2;
 const USER_HINT_NORMALIZED_SCORE_FLOOR: f64 = 0.35;
 const DEFAULT_CLEAR_REASONING_AGE: u64 = 50;
+const M1_PENDING_LOG_THRESHOLDS_MS: [i64; 3] =
+    [5 * 60 * 1_000, 30 * 60 * 1_000, 2 * 60 * 60 * 1_000];
+static M1_PENDING_LOG_BUCKETS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+fn log_pending_m1_delta(session_id: &str, now_ms: i64, pending_since_ms: Option<i64>) {
+    let age_ms = now_ms.saturating_sub(pending_since_ms.unwrap_or(now_ms).max(0));
+    let bucket = M1_PENDING_LOG_THRESHOLDS_MS
+        .iter()
+        .enumerate()
+        .filter(|(_, threshold)| age_ms >= **threshold)
+        .map(|(index, _)| index + 1)
+        .next_back()
+        .unwrap_or(0);
+    if bucket == 0 {
+        return;
+    }
+    let buckets = M1_PENDING_LOG_BUCKETS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut buckets = buckets.lock().expect("m1 pending log mutex");
+    if buckets.get(session_id).copied().unwrap_or(0) < bucket {
+        buckets.insert(session_id.to_string(), bucket);
+        eprintln!("mc-module: pending_m1_delta=true age_ms={age_ms} session={session_id}");
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -1072,10 +1096,22 @@ fn apply_once(
     let pending_agent_drops = store.load_pending_agent_drops(&req.session_id)?;
 
     // --- CHEAP per-pass classify signals (read EVERY pass; never the m0/m1 BODY) ---
-    // The cheap m1-change digest (watermark triple). Computed every pass to gate SOFT vs
-    // defer WITHOUT composing the body; the body composes only on the bust arm below.
-    let m1_signal = m1_revision_signal_parts(store, ctx.project_path, &req.session_id)?;
+    // The in-session lane is pending work, not a bust trigger. The external lane and the
+    // durable project epoch remain eager-HARD inputs. The body composes only below an
+    // independently established bust opportunity.
+    let mut m1_signal = m1_revision_signal_parts_for_pass(
+        store,
+        ctx.project_path,
+        ctx.note_project_path,
+        &req.session_id,
+        loaded.meta.user_profile_version,
+        ctx.now_ms,
+    )?;
     let mut current_m1_digest = m1_signal.revision;
+    let external_revision_changed = loaded.meta.initialized
+        && loaded.meta.m1_external_revision != 0
+        && m1_signal.external_revision != loaded.meta.m1_external_revision;
+    let project_memory_epoch_hard_due = loaded.meta.project_memory_epoch_pending;
     let effective_usage = effective_usage(req.usage.as_ref(), loaded.meta.last_usage.as_ref());
     let context_limit_tokens = effective_context_limit_tokens(&effective_usage);
     let usage_input_tokens = effective_usage.current_total_input_tokens as f64;
@@ -1159,15 +1195,16 @@ fn apply_once(
     } else {
         false
     };
-    let hard_fold_requested =
-        first_fold_due || scheduler_outcome.idle_ttl_fired || system_absorb_hard_due;
-    // These are the byte-changing reasons that are knowable before reduction selection:
-    // render epochs, TTL, reconcile rematerialization, emergency arming, and coverage
-    // folds. A reconcile flag with a returned boundary only clears state on a defer, so
-    // it is not a ride opportunity. The selection layer adds a different command's first
-    // application as a ride opportunity. Provider-side rejection and post-selection
-    // output drift are not knowable here; omitting them can delay a held batch to the
-    // next bust, but cannot create an extra bust.
+    let hard_fold_requested = first_fold_due
+        || scheduler_outcome.idle_ttl_fired
+        || system_absorb_hard_due
+        || external_revision_changed
+        || project_memory_epoch_hard_due;
+    // Bust-opportunity table (the deferred-work invariant): bootstrap/legacy/reconcile/shape
+    // repair, render-config or epoch HARD, requested HARD, TTL/system HARD, refresh/flush,
+    // Force/Emergency drives, and first reduction application are opportunities. An ordinary
+    // Execute with zero selected reductions is not; the pending m1 delta remains the final
+    // fallback and cannot manufacture a provider-visible bust.
     let emergency_arm_engaged = matches!(
         scheduler_outcome.pass,
         scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95
@@ -1176,7 +1213,8 @@ fn apply_once(
         || render_config_changed
         || hard_fold_requested
         || reconcile_hard_due
-        || emergency_arm_engaged;
+        || emergency_arm_engaged
+        || loaded.meta.soft_refresh_pending;
     // Profile defaults remain conservative, while the request-local tool signal enables
     // full-array tail reclaim for an active tagging surface. A false request therefore
     // retains the exact pre-capability behavior without changing the global profile table.
@@ -1299,6 +1337,10 @@ fn apply_once(
         m1_revision_changed: current_m1_digest != loaded.meta.m1_revision
             || loaded.meta.soft_refresh_pending,
         reductions_pending: reductions_pending_now,
+        // A plain Execute with zero selected reductions is byte-identical and must still
+        // defer a pending in-session delta. First reduction application, explicit refresh,
+        // hard/force/emergency arms, and bootstrap are genuine render opportunities.
+        bust_opportunity: pass_already_busting || reductions_pending_now,
     });
 
     let mut core = loaded.core.clone();
@@ -1447,8 +1489,15 @@ fn apply_once(
                         commit_expected = Some(outcome.row_version);
                         meta.revert_epoch = outcome.revert_epoch;
                         meta.last_recut = outcome.last_recut;
-                        current_m1_digest =
-                            m1_revision_signal(store, ctx.project_path, &req.session_id)?;
+                        m1_signal = m1_revision_signal_parts_for_pass(
+                            store,
+                            ctx.project_path,
+                            ctx.note_project_path,
+                            &req.session_id,
+                            loaded.meta.user_profile_version,
+                            ctx.now_ms,
+                        )?;
+                        current_m1_digest = m1_signal.revision;
                         let recut_compartments = store.load_compartments(&req.session_id)?;
                         let recut_coverage_bounds =
                             coverage_bounds_from_compartments(&recut_compartments)?;
@@ -1574,9 +1623,22 @@ fn apply_once(
                                                 // The post-fold m1 baseline digest — NOT 0. After folding up to the current
                                                 // watermarks, "no delta" == "watermarks unchanged since this digest"; setting
                                                 // 0 would make the next pass's non-zero digest read as a phantom SOFT.
-            meta.m1_revision = current_m1_digest;
+            let applied_m1_signal = m1_revision_signal_parts_for_pass(
+                store,
+                ctx.project_path,
+                ctx.note_project_path,
+                &req.session_id,
+                loaded.meta.user_profile_version,
+                ctx.now_ms,
+            )?;
+            meta.m1_revision = applied_m1_signal.revision;
+            meta.m1_external_revision = applied_m1_signal.external_revision;
+            meta.project_memory_epoch_pending = false;
+            meta.m1_pending_since_ms = None;
         }
         PassPlan::Soft => {
+            commit_memory_revision =
+                Some(memory_revision_fence(store, ctx.project_path, &m1_signal)?);
             // EXPENSIVE bust-only: compose the m1 delta body from the store against the
             // watermarks the last HARD froze (incl. the FROZEN expiry cutoff). A
             // reduction-only SOFT recomposes byte-identical m1 (watermarks unchanged), so
@@ -1657,9 +1719,21 @@ fn apply_once(
             } else if compartment_seq_changed_since_meta {
                 meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
             }
-            meta.m1_revision = current_m1_digest;
+            let applied_m1_signal = m1_revision_signal_parts_for_pass(
+                store,
+                ctx.project_path,
+                ctx.note_project_path,
+                &req.session_id,
+                loaded.meta.user_profile_version,
+                ctx.now_ms,
+            )?;
+            meta.m1_revision = applied_m1_signal.revision;
+            meta.m1_pending_since_ms = None;
         }
         PassPlan::Defer => {
+            if current_m1_digest != loaded.meta.m1_revision {
+                log_pending_m1_delta(&req.session_id, ctx.now_ms, loaded.meta.m1_pending_since_ms);
+            }
             core.step(PassInput {
                 proposed: Some(mc_core::Action::SoftPlus),
                 boundary_present: boundary_token,
@@ -1773,6 +1847,7 @@ fn apply_once(
                 consumed_drop_ids: &consumed_drop_ids,
                 first_applied_command_ids: &first_applied_command_ids,
                 memory_revision: commit_memory_revision.as_ref(),
+                compartment_max_seq: is_bust_pass.then_some(m1_signal.max_compartment_seq),
                 project_root: Some(ctx.project_directory),
                 overlays: TransformOverlayBatch {
                     max_seen_ordinal: pending_overlays.max_seen_ordinal,
@@ -1922,6 +1997,22 @@ fn effective_context_limit_tokens(usage: &ModuleUsage) -> f64 {
     } else {
         200_000.0
     }
+}
+
+fn memory_revision_fence(
+    store: &McStore,
+    project_path: &str,
+    signal: &crate::m1_compose::M1RevisionSignal,
+) -> Result<MemoryRevision, McStoreError> {
+    let project_paths = match store.resolve_workspace_membership(project_path)? {
+        Some(membership) => membership.union_identities,
+        None => vec![project_path.to_string()],
+    };
+    Ok(MemoryRevision {
+        project_paths,
+        max_memory_id: signal.max_memory_id,
+        mutation_cursor: signal.max_memory_mutation_id,
+    })
 }
 
 fn scheduler_config(execute_threshold_percentage: f64) -> SchedulerConfig {
@@ -4756,6 +4847,7 @@ fn action_str(plan: &PassPlan, _core: &CoreState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::m1_compose::m1_revision_signal;
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
     use mc_store::{
@@ -6358,6 +6450,73 @@ mod tests {
     }
 
     #[test]
+    fn pending_in_session_delta_defers_across_execute_passes_until_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let memory_id = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "original", 0))
+            .unwrap();
+        let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
+        let boot = run(&s, &execute_req, &spine());
+        assert_eq!(boot.action, "HARD");
+        let frozen = serde_json::to_vec(&boot.ck_messages).unwrap();
+        s.update_memory_content("git:proj", memory_id, "pending rule", 1)
+            .unwrap();
+
+        for _ in 0..3 {
+            let deferred =
+                transform(&s, &execute_req, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
+            assert_eq!(
+                deferred.action, "SOFT+",
+                "zero-drop Execute is defer-shaped"
+            );
+            assert_eq!(serde_json::to_vec(&deferred.ck_messages).unwrap(), frozen);
+            assert!(!m1_bytes(&deferred).contains("pending rule"));
+        }
+
+        s.arm_soft_refresh("ses").unwrap();
+        let folded =
+            transform(&s, &execute_req, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
+        assert_eq!(folded.action, "SOFT");
+        assert!(m1_bytes(&folded).contains("pending rule"));
+    }
+
+    #[test]
+    fn project_memory_epoch_from_state_sync_is_an_eager_hard_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let request = req("ses", "cfg0", vec![item("a", 1, "raw")]);
+        assert_eq!(run(&s, &request, &spine()).action, "HARD");
+        let loaded = s.load("ses").unwrap();
+        s.apply_authority_state_sync(ShadowStateSyncRequest {
+            session_id: "ses",
+            shadow_project_path: "git:proj",
+            shadow_generation: loaded.meta.shadow_generation,
+            expected_shadow_seq: loaded.meta.shadow_seq,
+            seed_boundary_id: None,
+            drop_seeds: &[],
+            drop_seed_skipped: 0,
+            compartments: &[],
+            memories: &[],
+            memory_mutations: &[],
+            user_profile: &[],
+            workspace: None,
+            last_todo_state: None,
+            project_memory_epoch: Some(7),
+            user_profile_version: None,
+            acked_watermarks: serde_json::Value::Null,
+        })
+        .unwrap();
+        assert!(s.load("ses").unwrap().meta.project_memory_epoch_pending);
+        assert_eq!(run(&s, &request, &spine()).action, "HARD");
+        assert!(!s.load("ses").unwrap().meta.project_memory_epoch_pending);
+    }
+
+    #[test]
     fn execute_with_zero_delta_is_defer_shaped_and_byte_identical() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -7279,6 +7438,7 @@ mod tests {
             ],
         )
         .unwrap();
+        s.arm_soft_refresh("ses").unwrap();
         let second = run(
             &s,
             &req(
@@ -7407,6 +7567,7 @@ mod tests {
             ],
         )
         .unwrap();
+        s.arm_soft_refresh("ses").unwrap();
         let ctx = pctx("git:proj", "/nonexistent-docs", 0);
         let err = transform(&s, &req("ses", "cfg0", live), &ctx);
         assert!(matches!(err, Err(TransformError::BoundaryNotPresent(_))));
@@ -7506,6 +7667,7 @@ mod tests {
 
         s.append_compartments("ses", &[comp(3, 2, 2, "t4", "S2")])
             .unwrap();
+        s.arm_soft_refresh("ses").unwrap();
         let folded_again = run(&s, &req("ses", "cfg0", live_reverted), &spine());
         assert_eq!(folded_again.action, "SOFT");
         assert_eq!(folded_again.boundary_id, "t4#0");
@@ -8009,6 +8171,7 @@ mod tests {
 
         s.update_memory_content("git:proj", memory_id, "corrected", 1)
             .unwrap();
+        s.arm_soft_refresh("ses").unwrap();
         let soft = run(
             &s,
             &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
@@ -8044,6 +8207,7 @@ mod tests {
             1,
         ))
         .unwrap();
+        s.arm_soft_refresh("ses").unwrap();
         let soft = run(
             &s,
             &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
@@ -8079,6 +8243,7 @@ mod tests {
         // a NEW memory lands (id past the folded max) → the digest moves → a SOFT
         s.seed_memory(5, "git:proj", "ARCHITECTURE", "a durable rule", 70)
             .unwrap();
+        s.arm_soft_refresh("ses").unwrap();
         let soft = run(
             &s,
             &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
@@ -8136,6 +8301,7 @@ mod tests {
         // an in-session UPDATE to that in-m0 memory → a mutation-log row → digest moves → SOFT
         s.seed_mutation("git:proj", "update", 5, "corrected")
             .unwrap();
+        s.arm_soft_refresh("ses").unwrap();
         let r = run(
             &s,
             &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
@@ -8168,6 +8334,7 @@ mod tests {
         // ride a new memory on m1
         s.seed_memory(5, "git:proj", "ARCHITECTURE", "folded rule", 70)
             .unwrap();
+        s.arm_soft_refresh("ses").unwrap();
         let soft = run(
             &s,
             &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
@@ -8217,6 +8384,7 @@ mod tests {
             &[comp(1, 1, 10, "m10", "S1"), comp(2, 11, 20, "m20", "S2")],
         )
         .unwrap();
+        s.arm_soft_refresh("ses").unwrap();
         let items = vec![
             item("m10", 10, "raw"),
             item("m20", 20, "raw2"),
@@ -8294,6 +8462,7 @@ mod tests {
             &[comp(1, 1, 10, "m10", "S1"), comp(2, 11, 12, "t12", "S2")],
         )
         .unwrap();
+        s.arm_soft_refresh("ses").unwrap();
         let items_v2 = vec![
             item("m10", 10, "raw"),
             item("t11", 11, "tool output"),
@@ -8361,6 +8530,7 @@ mod tests {
         // a NEW memory expiring at 1000: LIVE under cutoff 500, EXPIRED under wall-clock 2000.
         s.seed_expiring_memory(5, "git:proj", "ARCHITECTURE", "still valid", 70, 1000)
             .unwrap();
+        s.arm_soft_refresh("ses").unwrap();
 
         // a SOFT recompose at wall-clock 2000 — the cutoff stays FROZEN at 500, so the
         // memory is live and renders. A bug using now_ms=2000 would expire + drop it.
@@ -8695,6 +8865,7 @@ mod tests {
             ],
         )
         .unwrap();
+        s.arm_soft_refresh("keep-fold").unwrap();
         let moved = run(
             &s,
             &req(
@@ -8832,6 +9003,7 @@ mod tests {
             ],
         )
         .unwrap();
+        s.arm_soft_refresh("keep-fold-defer").unwrap();
         let moved_items = vec![
             item("a", 1, "raw"),
             todowrite_call("todo", 2, todos),
@@ -10733,6 +10905,7 @@ mod tests {
                     consumed_drop_ids: &[pending[0].id],
                     first_applied_command_ids: &command_ids,
                     memory_revision: None,
+                    compartment_max_seq: None,
                     project_root: None,
                     overlays: TransformOverlayBatch::default(),
                 },
@@ -10810,6 +10983,7 @@ mod tests {
                     consumed_drop_ids: &[pending_a[0].id],
                     first_applied_command_ids: &command_a,
                     memory_revision: None,
+                    compartment_max_seq: None,
                     project_root: None,
                     overlays: TransformOverlayBatch::default(),
                 },
@@ -11297,7 +11471,10 @@ mod tests {
             right.replace_compartments("identity", &extended).unwrap();
             let left_soft = run(&left, &absent, &spine());
             let right_soft = run(&right, &explicit, &spine());
-            assert_eq!(left_soft.action, "SOFT", "{profile:?}");
+            assert_eq!(
+                left_soft.action, "SOFT+",
+                "pending compartment publication defers"
+            );
             assert_eq!(
                 serde_json::to_value(left_soft).unwrap(),
                 serde_json::to_value(right_soft).unwrap(),
@@ -11740,6 +11917,7 @@ mod tests {
             &[comp(1, 1, 10, "m10", "S1"), comp(2, 11, 20, "m20", "S2")],
         )
         .unwrap();
+        s.arm_soft_refresh("ses").unwrap();
         calls.set(0);
         let soft_items = vec![
             item("m10", 10, "raw"),
@@ -12008,6 +12186,8 @@ mod tests {
                 user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: Value::Null,
             })
             .unwrap();
@@ -12067,6 +12247,8 @@ mod tests {
                 user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: Value::Null,
             })
             .unwrap();
@@ -12792,6 +12974,7 @@ mod tests {
                 consumed_drop_ids: &[],
                 first_applied_command_ids: &[],
                 memory_revision: None,
+                compartment_max_seq: None,
                 project_root: None,
                 overlays: TransformOverlayBatch::default(),
             },

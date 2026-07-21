@@ -2375,12 +2375,30 @@ pub struct ModuleMeta {
     /// tail end.
     #[serde(default)]
     pub synthetic_todo: Option<FrozenSyntheticTodoPair>,
-    /// The content-digest revision the frozen m1 block was last rendered from. The
-    /// classifier compares the incoming m1 content's revision against this to decide
-    /// whether an m1 delta rides (Soft) WITHOUT rendering. 0 = placeholder (no delta).
-    /// `serde(default)` so meta JSON persisted before this field loads cleanly.
+    /// The applied in-session revision the frozen m1 block was last rendered from.
+    /// A signal mismatch is pending work; it is not itself permission to bust the provider
+    /// cache. 0 is retained for pre-materialization metadata.
     #[serde(default)]
     pub m1_revision: u64,
+    /// External render lane fingerprint applied by the last HARD fold. Workspace changes
+    /// remain eager-HARD and are kept separate from the deferred in-session lane.
+    #[serde(default)]
+    pub m1_external_revision: u64,
+    /// Latest project memory epoch received from TypeScript state-sync. A changed epoch
+    /// arms an eager HARD on the next transform instead of silently becoming an m1 delta.
+    #[serde(default)]
+    pub project_memory_epoch: u64,
+    #[serde(default)]
+    pub project_memory_epoch_pending: bool,
+    /// Latest global user-profile version received from state-sync. It participates in the
+    /// in-session m1 signal and therefore defers until a genuine bust opportunity.
+    #[serde(default)]
+    pub user_profile_version: u64,
+    /// Best-effort durable start of the currently pending in-session delta. It is populated
+    /// by state-sync watermark edges, not by a pure defer transform, so defer remains a
+    /// zero-write replay path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub m1_pending_since_ms: Option<i64>,
 
     // --- slice 4d-m0: the two-watermark coverage model + memory manifest ---
     // (all serde(default) so pre-4d meta JSON loads cleanly)
@@ -2628,6 +2646,10 @@ pub struct TransformCommit<'a> {
     pub consumed_drop_ids: &'a [i64],
     pub first_applied_command_ids: &'a [String],
     pub memory_revision: Option<&'a MemoryRevision>,
+    /// Highest compartment sequence observed while composing a bust. The fenced commit
+    /// re-reads this scalar so a publication interleaved between signal read and commit
+    /// cannot be hidden behind the older rendered m1 bytes.
+    pub compartment_max_seq: Option<i64>,
     /// Authenticated filesystem root observed by the transform that owns this cache commit.
     pub project_root: Option<&'a str>,
     pub overlays: TransformOverlayBatch<'a>,
@@ -3202,6 +3224,8 @@ pub struct ShadowStateSyncRequest<'a> {
     pub user_profile: &'a [String],
     pub workspace: Option<&'a ShadowWorkspaceRow>,
     pub last_todo_state: Option<String>,
+    pub project_memory_epoch: Option<u64>,
+    pub user_profile_version: Option<u64>,
     pub acked_watermarks: Value,
 }
 
@@ -6037,6 +6061,7 @@ impl McStore {
                 consumed_drop_ids,
                 first_applied_command_ids: &[],
                 memory_revision,
+                compartment_max_seq: None,
                 project_root: None,
                 overlays: TransformOverlayBatch::default(),
             },
@@ -6056,6 +6081,7 @@ impl McStore {
             consumed_drop_ids,
             first_applied_command_ids,
             memory_revision,
+            compartment_max_seq,
             project_root,
             overlays,
         } = request;
@@ -6143,6 +6169,16 @@ impl McStore {
                 if current_memory != revision.max_memory_id
                     || current_mutation != revision.mutation_cursor
                 {
+                    return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
+                }
+            }
+            if let Some(expected_seq) = compartment_max_seq {
+                let current_seq: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM mc_compartments WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )?;
+                if current_seq != expected_seq {
                     return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
                 }
             }
@@ -6449,7 +6485,20 @@ impl McStore {
                 replace_authority_user_profile_tx(tx, request.user_profile)?;
             }
 
+            let in_session_watermark_changed = meta.shadow_acked_watermarks != request.acked_watermarks;
             meta.last_todo_state = request.last_todo_state.clone();
+            if in_session_watermark_changed && meta.m1_pending_since_ms.is_none() {
+                meta.m1_pending_since_ms = Some(current_time_ms());
+            }
+            if let Some(epoch) = request.project_memory_epoch {
+                if epoch != meta.project_memory_epoch {
+                    meta.project_memory_epoch_pending = true;
+                }
+                meta.project_memory_epoch = epoch;
+            }
+            if let Some(version) = request.user_profile_version {
+                meta.user_profile_version = version;
+            }
             meta.shadow_seq = meta.shadow_seq.saturating_add(1);
             meta.shadow_acked_watermarks = request.acked_watermarks.clone();
 
@@ -6927,6 +6976,20 @@ impl McStore {
             Ok(v)
         })?;
         Ok(exists != 0)
+    }
+
+    /// Return the newest note status version for the project. Note readiness is an
+    /// in-session m1 input, so it may defer, but it must not be invisible to the next
+    /// genuine rendering opportunity.
+    pub fn max_note_status_version(&self, project_path: &str) -> Result<i64, McStoreError> {
+        let max = self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COALESCE(MAX(status_version), 0) FROM mc_notes WHERE project_path = ?1",
+                params![project_path],
+                |row| row.get(0),
+            )
+        })?;
+        Ok(max)
     }
 
     /// Replace a session's entire compartment set in one fenced transaction. The
@@ -11946,6 +12009,7 @@ mod tests {
                         consumed_drop_ids: &[],
                         first_applied_command_ids: &[],
                         memory_revision: None,
+                        compartment_max_seq: None,
                         project_root: Some("/root-a"),
                         overlays: TransformOverlayBatch {
                             created_at_ms: observed_at,
@@ -12015,6 +12079,7 @@ mod tests {
                     consumed_drop_ids: &[],
                     first_applied_command_ids: &[],
                     memory_revision: None,
+                    compartment_max_seq: None,
                     project_root: Some(link_text),
                     overlays: TransformOverlayBatch::default(),
                 },
@@ -12081,6 +12146,7 @@ mod tests {
                     consumed_drop_ids: &[],
                     first_applied_command_ids: &[],
                     memory_revision: None,
+                    compartment_max_seq: None,
                     project_root: Some(missing_text),
                     overlays: TransformOverlayBatch::default(),
                 },
@@ -12209,6 +12275,7 @@ mod tests {
                     consumed_drop_ids: &[],
                     first_applied_command_ids: &[],
                     memory_revision: None,
+                    compartment_max_seq: None,
                     project_root: None,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
@@ -12283,6 +12350,7 @@ mod tests {
                     consumed_drop_ids: &[],
                     first_applied_command_ids: &[],
                     memory_revision: None,
+                    compartment_max_seq: None,
                     project_root: None,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
@@ -12431,6 +12499,7 @@ mod tests {
                     consumed_drop_ids: &[pending[0].id],
                     first_applied_command_ids: &command_ids,
                     memory_revision: None,
+                    compartment_max_seq: None,
                     project_root: None,
                     overlays: TransformOverlayBatch::default(),
                 },
@@ -12879,6 +12948,7 @@ mod tests {
                         consumed_drop_ids: &[],
                         first_applied_command_ids: &[],
                         memory_revision: None,
+                        compartment_max_seq: None,
                         project_root: None,
                         overlays: TransformOverlayBatch {
                             max_seen_ordinal: Some(3),
@@ -12934,6 +13004,7 @@ mod tests {
                     consumed_drop_ids: &[],
                     first_applied_command_ids: &[],
                     memory_revision: None,
+                    compartment_max_seq: None,
                     project_root: None,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(4),
@@ -15254,6 +15325,8 @@ mod shadow_tests {
                 user_profile: &[],
                 workspace: Some(&workspace),
                 last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -15322,6 +15395,8 @@ mod shadow_tests {
                 user_profile: &[],
                 workspace: None,
                 last_todo_state: Some("[]".to_string()),
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: serde_json::json!({"seq": 0}),
             })
             .unwrap();
@@ -15354,6 +15429,8 @@ mod shadow_tests {
                 user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap_err();
@@ -15386,6 +15463,8 @@ mod shadow_tests {
                 user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap_err();
@@ -15419,6 +15498,8 @@ mod shadow_tests {
                 user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -15441,6 +15522,8 @@ mod shadow_tests {
                 user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -15471,6 +15554,8 @@ mod shadow_tests {
                 user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -15499,6 +15584,8 @@ mod shadow_tests {
                 user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap_err();
@@ -15546,6 +15633,8 @@ mod shadow_tests {
                 user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -15572,6 +15661,8 @@ mod shadow_tests {
                 user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -15608,6 +15699,8 @@ mod shadow_tests {
                 user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -16050,6 +16143,8 @@ mod shadow_tests {
                 user_profile: &[],
                 workspace: None,
                 last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -16140,6 +16235,8 @@ mod shadow_tests {
                     user_profile: &[],
                     workspace: None,
                     last_todo_state: None,
+                    project_memory_epoch: None,
+                    user_profile_version: None,
                     acked_watermarks: serde_json::Value::Null,
                 })
                 .unwrap();
@@ -16226,6 +16323,8 @@ mod shadow_tests {
                     user_profile: &[],
                     workspace: None,
                     last_todo_state: None,
+                    project_memory_epoch: None,
+                    user_profile_version: None,
                     acked_watermarks: serde_json::Value::Null,
                 })
                 .unwrap();
@@ -17061,6 +17160,8 @@ mod shadow_tests {
                 user_profile: &[],
                 workspace: None,
                 last_todo_state: Some("first".to_string()),
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: serde_json::json!({"sender": "first"}),
             })
             .unwrap();
@@ -17080,6 +17181,8 @@ mod shadow_tests {
                 user_profile: &[],
                 workspace: None,
                 last_todo_state: Some("second".to_string()),
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: serde_json::json!({"sender": "second"}),
             })
             .unwrap_err();
