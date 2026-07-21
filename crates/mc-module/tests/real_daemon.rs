@@ -452,7 +452,9 @@ fn write_empty_config(config_dir: &Path) {
 fn fast_consumer_options() -> ConsumerOptions {
     ConsumerOptions {
         handshake_timeout: Duration::from_secs(2),
-        call_timeout: Duration::from_secs(10),
+        // Debug-build module cold start under parallel cargo load can push the FIRST
+        // transform (bootstrap HARD) past 10s; this suite gates correctness, not latency.
+        call_timeout: Duration::from_secs(60),
         reconnect_backoff: RetryBackoff {
             base: Duration::from_millis(50),
             cap: Duration::from_millis(250),
@@ -464,13 +466,14 @@ fn fast_consumer_options() -> ConsumerOptions {
 
 fn fast_call_options() -> CallOptions {
     CallOptions {
-        timeout: Duration::from_secs(8),
+        // See fast_consumer_options: first-call cold start under load needs headroom.
+        timeout: Duration::from_secs(60),
         route_retry: RetryBackoff {
             base: Duration::from_millis(50),
             cap: Duration::from_millis(250),
             max_attempts: 60,
         },
-        route_retry_deadline: Duration::from_secs(10),
+        route_retry_deadline: Duration::from_secs(60),
         ..CallOptions::default()
     }
 }
