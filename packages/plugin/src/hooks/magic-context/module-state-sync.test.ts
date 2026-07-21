@@ -12,13 +12,13 @@ import {
     applyStrippedPlaceholderDelta,
     getCompartments,
 } from "../../features/magic-context/storage";
+import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { setProjectState } from "../../features/magic-context/storage-project-state";
 import {
     insertTag,
     updateTagDropMode,
     updateTagStatus,
 } from "../../features/magic-context/storage-tags";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
-import { setProjectState } from "../../features/magic-context/storage-project-state";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { mirrorModuleCompartments, syncModuleState } from "./module-state-sync";
@@ -350,9 +350,10 @@ describe("module compartment ordinal serialization", () => {
         ]);
 
         const state = syncState(7);
+        const inputMessage = wireMessage(sessionId, "m2");
         const wire = await resolveOrdinalsForModule({
             sessionId,
-            messages: [wireMessage(sessionId, "m2")],
+            messages: [inputMessage],
             generation: state.shadowGeneration,
             memoGeneration: state.idOrdinalMemoGeneration,
             memo: state.idOrdinalMemo,
@@ -364,6 +365,7 @@ describe("module compartment ordinal serialization", () => {
             }),
         );
         expect(state.idOrdinalMemo.get("m2")).toBe(2);
+        expect(inputMessage).not.toHaveProperty("absolute_ordinal");
 
         const calls: unknown[] = [];
         await syncModuleState({

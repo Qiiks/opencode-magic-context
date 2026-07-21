@@ -288,13 +288,16 @@ pub struct TransformRequest {
     /// produces valid OpenCode messages, but cannot replay fields that were not supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_messages: Option<Vec<Value>>,
-    /// Caller-owned identity for the full raw array. The module treats it as opaque and
-    /// only echoes it on success-shaped responses so consumers can validate cached bytes.
+    /// Caller-owned identity for the full ingress arrays. Full requests establish this
+    /// opaque identity; a later tail delta must name the immediately preceding identity,
+    /// and success-shaped responses echo the new value for the adapter cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_array_fingerprint: Option<String>,
     pub messages: Vec<CkIngressMessage>,
-    /// Future delta optimization. Parsed explicitly so a delta-shaped request is rejected
-    /// with flow-control bytes rather than silently treated as an empty/full payload.
+    /// Delta metadata for a request whose `messages` and `native_messages` arrays contain
+    /// only the suffix after the acknowledged ingress prefix. The handler reconstructs the
+    /// full request from its last successful snapshot and returns NEED_FULL_SYNC when that
+    /// snapshot or its prefix fingerprint is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail_delta: Option<Value>,
     #[serde(default)]

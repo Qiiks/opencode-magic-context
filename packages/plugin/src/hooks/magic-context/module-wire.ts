@@ -165,7 +165,10 @@ export async function resolveOrdinalsForModule(args: {
         return false;
     });
 
-    const annotated = visibleMessages as unknown as Array<Record<string, unknown>>;
+    // Keep the caller-owned OpenCode objects untouched. A shallow root projection is
+    // sufficient because the encoder only reads nested fields; unlike the old JSON clone,
+    // this does not walk or duplicate the full message tree on every pass.
+    const annotated: Array<Record<string, unknown>> = new Array(visibleMessages.length);
     const resolved: Array<number | undefined> = new Array(annotated.length);
     let firstUnresolved:
         | {
@@ -244,7 +247,7 @@ export async function resolveOrdinalsForModule(args: {
             };
         }
         memo.set(messageId, ordinal);
-        annotated[index].absolute_ordinal = ordinal;
+        annotated[index] = { ...visibleMessages[index], absolute_ordinal: ordinal };
     }
 
     return {
@@ -332,22 +335,60 @@ export function buildPagedModuleTransformPayloads(
     const hasItems = (arrays: Record<string, unknown[]>): boolean =>
         Object.values(arrays).some((values) => values.length > 0);
 
+    // Page admission used to clone and canonicalize the entire candidate page for every
+    // message. The wire representation is unchanged, so count its UTF-8 bytes incrementally
+    // and only build the digest once a page is actually emitted.
+    const serializedItemBytes = (value: unknown): number =>
+        Buffer.byteLength(JSON.stringify(value) ?? "null");
+    const pageByteLength = (args: {
+        index: number;
+        total: number;
+        complete: boolean;
+        arrayBytes: Record<string, number>;
+    }): number => {
+        const skeleton: Record<string, unknown> = {
+            method: body.method,
+            session_id: body.session_id,
+            shadow_generation: body.shadow_generation,
+            transform_page_id: transformPageId,
+            transform_generation: body.shadow_generation ?? 0,
+            transform_page_index: args.index,
+            transform_page_total: args.total,
+            transform_page_complete: args.complete,
+            transform_page_digest: "0".repeat(64),
+            ...Object.fromEntries(arrayFields.map((field) => [field, []])),
+        };
+        if (args.complete) Object.assign(skeleton, scalarFields);
+        const emptyArrayBytes = 2 * arrayFields.length;
+        const contentsBytes = arrayFields.reduce(
+            (sum, field) => sum + (args.arrayBytes[field] ?? 2),
+            0,
+        );
+        return Buffer.byteLength(JSON.stringify(skeleton)) - emptyArrayBytes + contentsBytes;
+    };
+
     let assumedTotal = 1;
     for (let attempt = 0; attempt < 10; attempt += 1) {
         const pages: Record<string, unknown>[] = [];
         let current = emptyArrays();
+        let currentBytes = Object.fromEntries(arrayFields.map((field) => [field, 2]));
         const appendUnit = (field: string, value: unknown): boolean => {
-            const candidate = { ...current, [field]: [...current[field], value] };
-            const candidatePage = makePage({
-                index: pages.length,
-                total: assumedTotal,
-                complete: false,
-                arrays: candidate,
-            });
-            if (Buffer.byteLength(JSON.stringify(candidatePage)) <= MODULE_PAGE_MAX_BYTES) {
-                current = candidate;
+            const valueBytes = serializedItemBytes(value);
+            const previousBytes = currentBytes[field] ?? 2;
+            current[field].push(value);
+            currentBytes[field] = previousBytes + valueBytes + (current[field].length > 1 ? 1 : 0);
+            if (
+                pageByteLength({
+                    index: pages.length,
+                    total: assumedTotal,
+                    complete: false,
+                    arrayBytes: currentBytes,
+                }) <= MODULE_PAGE_MAX_BYTES
+            ) {
                 return true;
             }
+            current[field].pop();
+            currentBytes[field] = previousBytes;
             if (hasItems(current)) {
                 pages.push(
                     makePage({
@@ -358,16 +399,22 @@ export function buildPagedModuleTransformPayloads(
                     }),
                 );
                 current = emptyArrays();
+                currentBytes = Object.fromEntries(arrayFields.map((name) => [name, 2]));
             }
-            const itemOnlyPage = makePage({
-                index: pages.length,
-                total: assumedTotal,
-                complete: false,
-                arrays: { ...current, [field]: [...current[field], value] },
-            });
-            if (Buffer.byteLength(JSON.stringify(itemOnlyPage)) > MODULE_PAGE_MAX_BYTES)
-                return false;
             current[field].push(value);
+            currentBytes[field] = 2 + valueBytes;
+            if (
+                pageByteLength({
+                    index: pages.length,
+                    total: assumedTotal,
+                    complete: false,
+                    arrayBytes: currentBytes,
+                }) > MODULE_PAGE_MAX_BYTES
+            ) {
+                current[field].pop();
+                currentBytes[field] = 2;
+                return false;
+            }
             return true;
         };
 
@@ -405,7 +452,14 @@ export function buildPagedModuleTransformPayloads(
             complete: true,
             arrays: current,
         });
-        if (Buffer.byteLength(JSON.stringify(finalPage)) > MODULE_PAGE_MAX_BYTES) {
+        if (
+            pageByteLength({
+                index: pages.length,
+                total: assumedTotal,
+                complete: true,
+                arrayBytes: currentBytes,
+            }) > MODULE_PAGE_MAX_BYTES
+        ) {
             if (!hasItems(current)) {
                 throw new Error("module transform scalar tail exceeds the 512 KiB page limit");
             }
@@ -417,13 +471,22 @@ export function buildPagedModuleTransformPayloads(
                     arrays: current,
                 }),
             );
+            current = emptyArrays();
+            currentBytes = Object.fromEntries(arrayFields.map((field) => [field, 2]));
             finalPage = makePage({
                 index: pages.length,
                 total: assumedTotal,
                 complete: true,
-                arrays: emptyArrays(),
+                arrays: current,
             });
-            if (Buffer.byteLength(JSON.stringify(finalPage)) > MODULE_PAGE_MAX_BYTES) {
+            if (
+                pageByteLength({
+                    index: pages.length,
+                    total: assumedTotal,
+                    complete: true,
+                    arrayBytes: currentBytes,
+                }) > MODULE_PAGE_MAX_BYTES
+            ) {
                 throw new Error("module transform scalar tail exceeds the 512 KiB page limit");
             }
         }

@@ -1768,6 +1768,13 @@ impl TransformSnapshotCache {
         }
     }
 
+    fn ready_request_clone(&self, session_id: &str) -> Option<Arc<TransformRequest>> {
+        match self.entries.get(session_id) {
+            Some(TransformSnapshot::Ready { request, .. }) => Some(Arc::clone(request)),
+            _ => None,
+        }
+    }
+
     fn ready_generation_matches(&self, session_id: &str, generation: u64) -> bool {
         matches!(
             self.entries.get(session_id),
@@ -2369,6 +2376,66 @@ impl McHandler {
             .lock()
             .expect("transform page mutex")
             .discard(session_id);
+    }
+
+    /// Reconstruct a full ingress snapshot from the last successful request plus a
+    /// caller-provided tail. The adapter only uses this after the module has acknowledged
+    /// the exact prefix fingerprint, so a missing/restarted cache remains fail-open via
+    /// NEED_FULL_SYNC instead of silently accepting an ambiguous prefix.
+    fn expand_transform_tail_delta(&self, parsed: &mut TransformRequest) -> bool {
+        let Some(delta) = parsed.tail_delta.as_ref().and_then(Value::as_object) else {
+            return false;
+        };
+        let Some(after) = delta.get("after").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(replace_from) = delta
+            .get("replace_from")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return false;
+        };
+        let Some(native_replace_from) = delta
+            .get("native_replace_from")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return false;
+        };
+        if parsed.full_array_fingerprint.is_none() {
+            return false;
+        }
+        let Some(request) = self
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .ready_request_clone(&parsed.session_id)
+        else {
+            return false;
+        };
+        if request.full_array_fingerprint.as_deref() != Some(after)
+            || replace_from > request.messages.len()
+        {
+            return false;
+        }
+        let Some(current_native) = parsed.native_messages.take() else {
+            return false;
+        };
+        let Some(previous_native) = request.native_messages.as_ref() else {
+            return false;
+        };
+        if native_replace_from > previous_native.len() {
+            return false;
+        }
+        let mut messages = request.messages[..replace_from].to_vec();
+        messages.extend(parsed.messages.drain(..));
+        let mut native_messages = previous_native[..native_replace_from].to_vec();
+        native_messages.extend(current_native);
+        parsed.messages = messages;
+        parsed.native_messages = Some(native_messages);
+        parsed.tail_delta = None;
+        true
     }
 
     fn transform_page_in_progress(&self, session_id: &str) -> bool {
@@ -5737,7 +5804,7 @@ impl McHandler {
         request: Value,
         from_page_apply: bool,
     ) -> HandlerOutcome {
-        let parsed: TransformRequest = match serde_json::from_value(request.clone()) {
+        let mut parsed: TransformRequest = match serde_json::from_value(request.clone()) {
             Ok(req) => req,
             Err(e) => {
                 return HandlerOutcome::Error {
@@ -5752,9 +5819,6 @@ impl McHandler {
         }
         if parsed.serve_native && serializer_profile != Some(SerializerProfile::OpencodeAiSdk) {
             return serve_native_unsupported_profile_error(&parsed.serializer_profile);
-        }
-        if parsed.tail_delta.is_some() {
-            return need_full_sync_response(parsed.full_array_fingerprint.clone());
         }
         // The module's own producer sessions must NEVER be transformed: the historian's
         // request is a raw structured-extraction call whose [system, user] shape is part
@@ -5807,7 +5871,6 @@ impl McHandler {
                 }
             }
         }
-        let parsed = Arc::new(parsed);
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
             None => {
@@ -5851,6 +5914,10 @@ impl McHandler {
             .entry(binding.session.clone())
             .or_default()
             .insert(lineage_root);
+        if parsed.tail_delta.is_some() && !self.expand_transform_tail_delta(&mut parsed) {
+            return need_full_sync_response(parsed.full_array_fingerprint.clone());
+        }
+        let parsed = Arc::new(parsed);
         if !from_page_apply && self.transform_page_in_progress(&binding.session) {
             return HandlerOutcome::Error {
                 code: "authority_transform_page_in_progress".to_string(),
@@ -15575,6 +15642,40 @@ mod tests {
         // ambiguous state between "transformed to nothing" and "re-send".
         assert!(response.get("ck_messages").is_none());
         assert_eq!(store.load("ses").unwrap().row_version, before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tail_delta_reconstructs_the_acknowledged_prefix() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        let mut first = request(vec![ck("m1", 1, "hello")]);
+        first["full_array_fingerprint"] = json!("fp-m1");
+        first["native_messages"] = json!([]);
+        let first_response = call_transform_request(&handler, first).await;
+        assert_eq!(first_response["status"], "ok");
+
+        let mut delta = request(vec![ck("m2", 2, "tail")]);
+        delta["full_array_fingerprint"] = json!("fp-m2");
+        delta["native_messages"] = json!([]);
+        delta["tail_delta"] = json!({
+            "after": "fp-m1",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        });
+        let response = call_transform_request(&handler, delta).await;
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["full_array_fingerprint"], "fp-m2");
+        assert!(response["ck_messages"].is_array());
+
+        let producer = Arc::new(ProducerState::default());
+        let (direct_handler, _store, _dir, _project) =
+            handler_with_store(producer, default_test_config());
+        let mut direct = request(vec![ck("m1", 1, "hello"), ck("m2", 2, "tail")]);
+        direct["full_array_fingerprint"] = json!("fp-m2");
+        direct["native_messages"] = json!([]);
+        let direct_response = call_transform_request(&direct_handler, direct).await;
+        assert_eq!(response["ck_messages"], direct_response["ck_messages"]);
     }
 
     #[tokio::test(flavor = "current_thread")]
