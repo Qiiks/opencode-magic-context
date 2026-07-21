@@ -35,8 +35,11 @@ import {
 import { bundleIssueReport } from "../lib/logs-opencode";
 import { migrateDreamerV2ForDoctor } from "../lib/migrate-dreamer-v2-doctor";
 import { migrateExperimentalPinKeyFilesForDoctor } from "../lib/migrate-experimental-doctor";
-import { detectOpenCode } from "../lib/opencode-detect";
-import { getOpenCodeVersion } from "../lib/opencode-helpers";
+import { detectOpenCodeInstallations } from "../lib/opencode-detect";
+import {
+    describeOpenCodeInstallations,
+    type OpenCodeInstallationReport,
+} from "../lib/opencode-helpers";
 import {
     getOpenCodePluginCacheRoots,
     OPENCODE_PLUGIN_ENTRY_WITH_VERSION as PLUGIN_ENTRY_WITH_VERSION,
@@ -560,6 +563,16 @@ async function checkEmbeddingConfig(
 
 // ── Main doctor entry ───────────────────────────────────────────────
 
+function logOpenCodeInstallationTable(installations: OpenCodeInstallationReport[]): void {
+    log.info("OpenCode installations:");
+    log.info("  marker   | path | version | source");
+    for (const installation of installations) {
+        log.info(
+            `  ${installation.active ? "[active]" : "        "} | ${installation.path} | ${installation.version} | ${installation.source}`,
+        );
+    }
+}
+
 export async function runDoctor(
     options: { force?: boolean; issue?: boolean } & V22BackfillCommandArgs = {},
 ): Promise<number> {
@@ -615,9 +628,11 @@ export async function runDoctor(
         issues++;
     };
 
-    // 1. Check OpenCode is installed
-    const detection = detectOpenCode();
-    if (detection.kind === "none") {
+    // 1. Check OpenCode is installed. Keep every rung so a stale CLI cannot
+    // hide a newer install that the user actually runs.
+    const installationReports = describeOpenCodeInstallations(detectOpenCodeInstallations());
+    const activeInstallation = installationReports[0];
+    if (!activeInstallation) {
         fail("OpenCode is not installed or not in PATH");
         // Help users whose binary IS on PATH but is shadowed by a wrapper
         // script or lives in a directory not searched by our detection
@@ -629,17 +644,25 @@ export async function runDoctor(
         outro("Doctor failed — install OpenCode first");
         return 1;
     }
-    if (detection.kind === "desktop") {
+    if (installationReports.length > 1) {
+        logOpenCodeInstallationTable(installationReports);
+    }
+    if (activeInstallation.kind === "desktop") {
         // Desktop ships no invocable CLI; the rest of doctor operates on config
         // and the plugin cache (both present for a Desktop install), so continue.
-        pass("OpenCode Desktop detected (CLI not installed)");
+        pass(
+            installationReports.length > 1
+                ? "OpenCode Desktop selected for plugin checks (CLI not installed)"
+                : "OpenCode Desktop detected (CLI not installed)",
+        );
+    } else if (activeInstallation.version === "unknown") {
+        fail(`OpenCode CLI was found at ${activeInstallation.path} but could not be executed`);
     } else {
-        const version = getOpenCodeVersion(detection.binary);
-        if (version === null) {
-            fail(`OpenCode CLI was found at ${detection.binary} but could not be executed`);
-        } else {
-            pass(`OpenCode ${version} installed`);
-        }
+        pass(
+            installationReports.length > 1
+                ? `OpenCode ${activeInstallation.version} installed (active install marked above)`
+                : `OpenCode ${activeInstallation.version} installed`,
+        );
     }
 
     // 1b. CLI vs npm latest
