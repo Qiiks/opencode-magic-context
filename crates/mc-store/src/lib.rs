@@ -1933,6 +1933,13 @@ const MIGRATIONS: &[Migration] = &[
         // eager epoch trigger keeps expiry and archival changes out of workspace identity.
         statements: "DROP TRIGGER IF EXISTS mc_memories_visibility_epoch;",
     },
+    Migration {
+        version: 38,
+        // First-divergence attribution is the most recent observation for a session. Keeping
+        // it on the existing pass trace avoids another session-scoped table and lets the cache
+        // state and its diagnostic update commit together.
+        statements: "ALTER TABLE mc_pass_trace ADD COLUMN first_divergence TEXT NULL;",
+    },
 ];
 
 /// Apply the route-to-identity vocabulary law inside the caller's fenced transaction.
@@ -2145,6 +2152,8 @@ pub struct PassTrace {
     pub last_reject_at_ms: Option<i64>,
     pub reject_count: u64,
     pub receive_count: u64,
+    /// JSON for the most recent first-divergence attribution, when one was observed.
+    pub first_divergence: Option<String>,
 }
 
 /// A validated historian fact that may become a project memory. Validation owns
@@ -2440,6 +2449,13 @@ pub struct NoteNudgeAnchorSeed {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServedBlockFingerprint {
+    pub block_id: String,
+    pub content_hash: String,
+    pub serialized_len: usize,
+}
+
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
@@ -2676,6 +2692,10 @@ pub struct ModuleMeta {
     /// Sparse response-recency anchor, piggybacked only on passes already committing.
     #[serde(default)]
     pub last_committed_pass_at_ms: i64,
+    /// Fingerprints of the blocks most recently served to the provider. The vector is exactly
+    /// the served block set for that pass, so it stays bounded by the output size.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub served_output_fingerprint: Vec<ServedBlockFingerprint>,
 
     /// Tracks which shadow reset generation this record belongs to. Operations created
     /// before the most recent reset are rejected so they cannot write rows from an older
@@ -2807,6 +2827,8 @@ pub struct TransformCommit<'a> {
     pub compartment_max_seq: Option<i64>,
     /// Authenticated filesystem root observed by the transform that owns this cache commit.
     pub project_root: Option<&'a str>,
+    /// Serialized first-divergence attribution to store with the accepted pass.
+    pub first_divergence: Option<&'a str>,
     pub overlays: TransformOverlayBatch<'a>,
 }
 
@@ -4917,7 +4939,7 @@ impl McStore {
             let pass_trace = transaction
                 .query_row(
                     "SELECT last_received_at_ms, last_completed_at_ms, last_reject_error,
-                            last_reject_at_ms, reject_count, receive_count
+                            last_reject_at_ms, reject_count, receive_count, first_divergence
                        FROM mc_pass_trace WHERE session_id = ?1",
                     params![session_id],
                     |row| {
@@ -4928,6 +4950,7 @@ impl McStore {
                             last_reject_at_ms: row.get(3)?,
                             reject_count: row.get::<_, i64>(4)?.max(0) as u64,
                             receive_count: row.get::<_, i64>(5)?.max(0) as u64,
+                            first_divergence: row.get(6)?,
                         })
                     },
                 )
@@ -4983,8 +5006,9 @@ impl McStore {
                      last_reject_error,
                      last_reject_at_ms,
                      reject_count,
-                     receive_count
-                 ) VALUES (?1, 0, ?2, NULL, NULL, 0, 0)
+                     receive_count,
+                     first_divergence
+                 ) VALUES (?1, 0, ?2, NULL, NULL, 0, 0, NULL)
                  ON CONFLICT(session_id) DO UPDATE SET
                      last_completed_at_ms = excluded.last_completed_at_ms",
                 params![session_id, now_ms],
@@ -5035,10 +5059,11 @@ impl McStore {
                      last_received_at_ms,
                      last_completed_at_ms,
                      last_reject_error,
-                     last_reject_at_ms,
-                     reject_count,
-                     receive_count
-                 FROM mc_pass_trace
+                      last_reject_at_ms,
+                      reject_count,
+                      receive_count,
+                      first_divergence
+                  FROM mc_pass_trace
                  WHERE session_id = ?1",
                 params![session_id],
                 |r| {
@@ -5049,6 +5074,7 @@ impl McStore {
                         last_reject_at_ms: r.get(3)?,
                         reject_count: r.get::<_, i64>(4)? as u64,
                         receive_count: r.get::<_, i64>(5)? as u64,
+                        first_divergence: r.get(6)?,
                     })
                 },
             )
@@ -6322,6 +6348,7 @@ impl McStore {
                 memory_revision,
                 compartment_max_seq: None,
                 project_root: None,
+                first_divergence: None,
                 overlays: TransformOverlayBatch::default(),
             },
         )
@@ -6342,6 +6369,7 @@ impl McStore {
             memory_revision,
             compartment_max_seq,
             project_root,
+            first_divergence,
             overlays,
         } = request;
         let max_seen_ordinal = overlays
@@ -6453,6 +6481,23 @@ impl McStore {
                       last_activity_at = excluded.last_activity_at",
                 params![session_id, next as i64, core_json, meta_json, current_time_ms()],
             )?;
+            if let Some(first_divergence) = first_divergence {
+                tx.execute(
+                    "INSERT INTO mc_pass_trace (
+                         session_id,
+                         last_received_at_ms,
+                         last_completed_at_ms,
+                         last_reject_error,
+                         last_reject_at_ms,
+                         reject_count,
+                         receive_count,
+                         first_divergence
+                     ) VALUES (?1, 0, 0, NULL, NULL, 0, 0, ?2)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                         first_divergence = excluded.first_divergence",
+                    params![session_id, first_divergence],
+                )?;
+            }
             if let Some(project_root) = canonical_project_root.as_deref() {
                 // Durable root lineage is committed with the cache CAS, so a restart cannot
                 // authenticate a root that never produced the accepted session state.
@@ -12506,6 +12551,7 @@ mod tests {
                         memory_revision: None,
                         compartment_max_seq: None,
                         project_root: Some("/root-a"),
+                        first_divergence: None,
                         overlays: TransformOverlayBatch {
                             created_at_ms: observed_at,
                             ..Default::default()
@@ -12576,6 +12622,7 @@ mod tests {
                     memory_revision: None,
                     compartment_max_seq: None,
                     project_root: Some(link_text),
+                    first_divergence: None,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -12643,6 +12690,7 @@ mod tests {
                     memory_revision: None,
                     compartment_max_seq: None,
                     project_root: Some(missing_text),
+                    first_divergence: None,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -12772,6 +12820,7 @@ mod tests {
                     memory_revision: None,
                     compartment_max_seq: None,
                     project_root: None,
+                    first_divergence: None,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
                         tag_mints: &tag_mints,
@@ -12847,6 +12896,7 @@ mod tests {
                     memory_revision: None,
                     compartment_max_seq: None,
                     project_root: None,
+                    first_divergence: None,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
                         tag_mints: &tags,
@@ -12996,6 +13046,7 @@ mod tests {
                     memory_revision: None,
                     compartment_max_seq: None,
                     project_root: None,
+                    first_divergence: None,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -13445,6 +13496,7 @@ mod tests {
                         memory_revision: None,
                         compartment_max_seq: None,
                         project_root: None,
+                        first_divergence: None,
                         overlays: TransformOverlayBatch {
                             max_seen_ordinal: Some(3),
                             temporal_marks: &temporal_marks,
@@ -13501,6 +13553,7 @@ mod tests {
                     memory_revision: None,
                     compartment_max_seq: None,
                     project_root: None,
+                    first_divergence: None,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(4),
                         temporal_marks: &late_mark,
@@ -13724,7 +13777,7 @@ mod tests {
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=37).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=38).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -16711,7 +16764,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=37).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=38).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)

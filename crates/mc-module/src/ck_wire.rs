@@ -380,7 +380,7 @@ fn extract_file_path(input: &Value) -> Option<String> {
         .find_map(|key| obj.get(*key).and_then(Value::as_str).map(str::to_string))
 }
 
-fn fingerprint(bytes: &str) -> String {
+pub(crate) fn fingerprint(bytes: &str) -> String {
     let digest = Sha256::digest(bytes.as_bytes());
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {

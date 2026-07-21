@@ -24,6 +24,7 @@ pub mod codec;
 pub mod compartment_coverage;
 pub mod config;
 pub mod decay_render;
+pub mod divergence;
 pub mod healing;
 pub mod historian;
 pub mod historian_chunk;

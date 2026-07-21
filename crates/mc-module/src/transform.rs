@@ -16,6 +16,7 @@
 
 use crate::ck_wire;
 use crate::compartment_coverage::{fold_m0_content_epoch, resolve_coverage, M0ContentEpoch};
+use crate::divergence::{self, FirstDivergence};
 use crate::healing::{self, quirk_residual, SerializerProfile};
 use crate::injection::{advance_injection_from_meta, capture_todo_state_on_bust, InjectionOutcome};
 use crate::m0_compose::compose_m0_from_store;
@@ -34,8 +35,9 @@ use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInpu
 use mc_store::{
     Channel1AppendRow, DeferredExecuteState, McStore, McStoreError, McTagRow, MemoryRevision,
     ModuleMeta, ModuleUsage, NoteDelivery, PendingAgentDrop, PendingRewriteState,
-    StoredCompartment, TagMintInput, TemporalMarkInput, TemporalMarkRow, TransformCommit,
-    TransformOverlayBatch, UserHintDecisionInput, UserHintRow, SHADOW_SESSION_PREFIX,
+    ServedBlockFingerprint, StoredCompartment, TagMintInput, TemporalMarkInput, TemporalMarkRow,
+    TransformCommit, TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
+    SHADOW_SESSION_PREFIX,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -570,6 +572,10 @@ pub struct TransformResponse {
     /// The classifier's raw cause for a HARD/SOFT decision. Unknown future causes are retained.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub materialize_reason: Option<String>,
+    /// First position where the newly served block sequence differs from the previous sequence,
+    /// excluding blocks added only at the end.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub first_divergence: Option<FirstDivergence>,
     /// Optional diagnostic timings. Omitted only by compatibility constructors and on old
     /// responses; normal module transform passes include this object.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -621,6 +627,7 @@ impl TransformResponse {
             action: "NEED_FULL_SYNC".to_string(),
             decision: "NEED_FULL_SYNC".to_string(),
             materialize_reason: None,
+            first_divergence: None,
             timings: None,
             boundary_id: String::new(),
             reconcile_pending: false,
@@ -648,6 +655,7 @@ impl TransformResponse {
             action: "PASSTHROUGH".to_string(),
             decision: "PASSTHROUGH".to_string(),
             materialize_reason: None,
+            first_divergence: None,
             timings: None,
             boundary_id: String::new(),
             reconcile_pending: false,
@@ -988,6 +996,56 @@ fn apply_once_with_estimator(
     }
 }
 
+fn served_output_fingerprints(messages: &[CkWireMessage]) -> Vec<ServedBlockFingerprint> {
+    let mut synthetic_index = 0usize;
+    let mut fingerprints = Vec::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        let message_id = if message.meta.synthetic {
+            let id = match message.content.first().map(|block| &block.kind) {
+                Some(ck_wire::CkKind::ToolCall { id, .. }) => {
+                    format!("mc_todo:{id}:call")
+                }
+                Some(ck_wire::CkKind::ToolResult { id, .. }) => {
+                    format!("mc_todo:{id}:result")
+                }
+                _ if synthetic_index < 2 => format!("mc_m{synthetic_index}"),
+                _ => format!("mc_synthetic:{synthetic_index}"),
+            };
+            synthetic_index = synthetic_index.saturating_add(1);
+            id
+        } else {
+            message
+                .meta
+                .harness_id
+                .clone()
+                .or_else(|| {
+                    message
+                        .meta
+                        .ordinal
+                        .map(|ordinal| format!("ordinal:{ordinal}"))
+                })
+                .unwrap_or_else(|| format!("served_message:{message_index}"))
+        };
+
+        let single_block = message.content.len() == 1;
+        for (block_index, block) in message.content.iter().enumerate() {
+            let serialized = serde_json::to_string(block)
+                .expect("CK wire blocks must always have a JSON representation");
+            let block_id = if single_block {
+                message_id.clone()
+            } else {
+                format!("{message_id}#{block_index}")
+            };
+            fingerprints.push(ServedBlockFingerprint {
+                block_id,
+                content_hash: ck_wire::fingerprint(&serialized),
+                serialized_len: serialized.len(),
+            });
+        }
+    }
+    fingerprints
+}
+
 fn apply_once(
     store: &McStore,
     req: &TransformRequest,
@@ -1155,13 +1213,54 @@ fn apply_once(
             let passthrough_overlay = tagging_active.then(|| {
                 tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends)
             });
+            let passthrough_messages =
+                pending_passthrough_messages(&projection, req, passthrough_overlay.as_ref());
+            let served_fingerprints = served_output_fingerprints(&passthrough_messages);
+            let first_divergence = divergence::first_divergence(
+                &loaded.meta.served_output_fingerprint,
+                &served_fingerprints,
+            );
+            let first_divergence_json = first_divergence
+                .as_ref()
+                .map(|value| serde_json::to_string(value).expect("divergence is serializable"));
+            let mut next_meta = loaded.meta.clone();
+            next_meta.served_output_fingerprint = served_fingerprints;
+            let fingerprint_changed = next_meta != loaded.meta;
+            let row_version = if fingerprint_changed {
+                store.commit_transform(
+                    &req.session_id,
+                    TransformCommit {
+                        expected: loaded.row_version,
+                        core: &loaded.core,
+                        meta: &next_meta,
+                        consumed_drop_ids: &[],
+                        first_applied_command_ids: &[],
+                        memory_revision: None,
+                        compartment_max_seq: None,
+                        project_root: Some(ctx.project_directory),
+                        first_divergence: first_divergence_json.as_deref(),
+                        overlays: TransformOverlayBatch::default(),
+                    },
+                )?
+            } else {
+                loaded.row_version.unwrap_or(0)
+            };
+            if let Some(first_divergence) = &first_divergence {
+                let detail =
+                    serde_json::to_string(first_divergence).expect("divergence is serializable");
+                eprintln!(
+                    "mc-module: first_divergence session={} {detail}",
+                    req.session_id
+                );
+            }
             return Ok(pending_passthrough_result(PendingPassthroughArgs {
                 projection,
                 req,
-                row_version: loaded.row_version.unwrap_or(0),
-                committed: false,
+                row_version,
+                committed: fingerprint_changed,
                 trim_mismatch,
-                tag_overlay: passthrough_overlay.as_ref(),
+                messages: passthrough_messages,
+                first_divergence,
                 surface_state,
                 timings,
                 materialize_reason: Some("pending_rewrite".to_string()),
@@ -1192,20 +1291,54 @@ fn apply_once(
             ambiguous,
         ));
         meta.last_committed_pass_at_ms = ctx.now_ms;
-        let row_version = store.commit(&req.session_id, loaded.row_version, &core, &meta)?;
+        let passthrough_overlay = tagging_active
+            .then(|| tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends));
+        let passthrough_messages =
+            pending_passthrough_messages(&projection, req, passthrough_overlay.as_ref());
+        let served_fingerprints = served_output_fingerprints(&passthrough_messages);
+        let first_divergence = divergence::first_divergence(
+            &loaded.meta.served_output_fingerprint,
+            &served_fingerprints,
+        );
+        let first_divergence_json = first_divergence
+            .as_ref()
+            .map(|value| serde_json::to_string(value).expect("divergence is serializable"));
+        meta.served_output_fingerprint = served_fingerprints;
+        let row_version = store.commit_transform(
+            &req.session_id,
+            TransformCommit {
+                expected: loaded.row_version,
+                core: &core,
+                meta: &meta,
+                consumed_drop_ids: &[],
+                first_applied_command_ids: &[],
+                memory_revision: None,
+                compartment_max_seq: None,
+                project_root: Some(ctx.project_directory),
+                first_divergence: first_divergence_json.as_deref(),
+                overlays: TransformOverlayBatch::default(),
+            },
+        )?;
+        if let Some(first_divergence) = &first_divergence {
+            let detail =
+                serde_json::to_string(first_divergence).expect("divergence is serializable");
+            eprintln!(
+                "mc-module: first_divergence session={} {detail}",
+                req.session_id
+            );
+        }
         eprintln!(
             "mc-module: armed pending_rewrite for {} fingerprint {} ambiguous={}",
             req.session_id, fingerprint, ambiguous
         );
-        let passthrough_overlay = tagging_active
-            .then(|| tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends));
         return Ok(pending_passthrough_result(PendingPassthroughArgs {
             projection,
             req,
             row_version,
             committed: true,
             trim_mismatch,
-            tag_overlay: passthrough_overlay.as_ref(),
+            messages: passthrough_messages,
+            first_divergence,
             surface_state,
             timings,
             materialize_reason: Some("pending_rewrite".to_string()),
@@ -2310,6 +2443,16 @@ fn apply_once(
     )?;
     timings.build_output = elapsed_ms(build_output_started_at);
 
+    // Compare only the served block hashes before committing the new sequence. The first pass
+    // records its baseline, and append-only tail growth is intentionally not a divergence.
+    let served_fingerprints = served_output_fingerprints(&ck_messages);
+    let first_divergence =
+        divergence::first_divergence(&loaded.meta.served_output_fingerprint, &served_fingerprints);
+    let first_divergence_json = first_divergence
+        .as_ref()
+        .map(|value| serde_json::to_string(value).expect("divergence is serializable"));
+    meta.served_output_fingerprint = served_fingerprints;
+
     // Build the output before committing so a missing synthetic-todo anchor cannot
     // persist an unusable frozen pair. Pending rows are classified from the final plan:
     // live unfrozen targets remain durable, while applied or retired targets are consumed.
@@ -2341,6 +2484,7 @@ fn apply_once(
                 memory_revision: commit_memory_revision.as_ref(),
                 compartment_max_seq: is_bust_pass.then_some(m1_signal.max_compartment_seq),
                 project_root: Some(ctx.project_directory),
+                first_divergence: first_divergence_json.as_deref(),
                 overlays: TransformOverlayBatch {
                     max_seen_ordinal: pending_overlays.max_seen_ordinal,
                     tag_mints: &pending_overlays.tag_mints,
@@ -2355,6 +2499,13 @@ fn apply_once(
         loaded.row_version.unwrap_or(0)
     };
     timings.store_commit = elapsed_ms(store_commit_started_at);
+    if let Some(first_divergence) = &first_divergence {
+        let detail = serde_json::to_string(first_divergence).expect("divergence is serializable");
+        eprintln!(
+            "mc-module: first_divergence session={} {detail}",
+            req.session_id
+        );
+    }
     let host_directives = {
         channel2_directive(Channel2DirectiveInput {
             profile: serializer_profile,
@@ -2384,6 +2535,7 @@ fn apply_once(
             action: result_action.clone(),
             decision: result_action,
             materialize_reason,
+            first_divergence,
             timings: Some(timings),
             boundary_id: core.boundary_id.clone(),
             reconcile_pending: core.reconcile_pending,
@@ -3510,11 +3662,42 @@ struct PendingPassthroughArgs<'a> {
     row_version: u64,
     committed: bool,
     trim_mismatch: Option<TrimMismatch>,
-    tag_overlay: Option<&'a TagOverlayState>,
+    messages: Vec<CkWireMessage>,
+    first_divergence: Option<FirstDivergence>,
     surface_state: SurfaceState,
     timings: TransformTimings,
     materialize_reason: Option<String>,
     total_started_at: Instant,
+}
+
+fn pending_passthrough_messages(
+    projection: &FlatProjection,
+    req: &TransformRequest,
+    tag_overlay: Option<&TagOverlayState>,
+) -> Vec<CkWireMessage> {
+    let mutation_exempt_mid = latest_assistant_mutation_exempt_mid(
+        &req.messages,
+        SerializerProfile::parse(&req.serializer_profile),
+        req.mid_turn,
+    );
+    let blocks_by_mid = projection_blocks_by_mid(projection);
+    req.messages
+        .iter()
+        .map(|message| {
+            let mut rendered = message.ck.clone();
+            if let Some(blocks) = blocks_by_mid.get(message.mid.as_str()) {
+                apply_tag_overlay_to_message(
+                    &mut rendered,
+                    message,
+                    blocks,
+                    tag_overlay,
+                    |_| false,
+                    mutation_exempt_mid == Some(message.mid.as_str()),
+                );
+            }
+            rendered
+        })
+        .collect()
 }
 
 fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWithProjection {
@@ -3524,42 +3707,19 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         row_version,
         committed,
         trim_mismatch,
-        tag_overlay,
+        messages,
+        first_divergence,
         surface_state,
         mut timings,
         materialize_reason,
         total_started_at,
     } = args;
-    let mutation_exempt_mid = latest_assistant_mutation_exempt_mid(
-        &req.messages,
-        SerializerProfile::parse(&req.serializer_profile),
-        req.mid_turn,
-    );
-    let blocks_by_mid = projection_blocks_by_mid(&projection);
-    let mut response = TransformResponse::passthrough(
-        req.messages
-            .iter()
-            .map(|message| {
-                let mut rendered = message.ck.clone();
-                if let Some(blocks) = blocks_by_mid.get(message.mid.as_str()) {
-                    apply_tag_overlay_to_message(
-                        &mut rendered,
-                        message,
-                        blocks,
-                        tag_overlay,
-                        |_| false,
-                        mutation_exempt_mid == Some(message.mid.as_str()),
-                    );
-                }
-                rendered
-            })
-            .collect(),
-        req.full_array_fingerprint.clone(),
-    );
+    let mut response = TransformResponse::passthrough(messages, req.full_array_fingerprint.clone());
     response.row_version = row_version;
     response.surface_state = surface_state;
     response.committed = committed;
     response.materialize_reason = materialize_reason;
+    response.first_divergence = first_divergence;
     timings.total = elapsed_ms(total_started_at);
     response.timings = Some(timings);
     TransformWithProjection {
@@ -7088,6 +7248,64 @@ mod tests {
         let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
         ctx.injected_reductions = d.to_vec();
         transform(s, req, &ctx).unwrap()
+    }
+
+    #[test]
+    fn served_fingerprint_records_cold_start_and_attributes_middle_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "served-divergence";
+        let baseline_messages = vec![item("a", 0, "a"), item("b", 1, "b"), item("c", 2, "c")];
+        let baseline_request = req(session, "cfg0", baseline_messages.clone());
+
+        let first = run(&store, &baseline_request, &spine());
+        assert!(first.first_divergence.is_none());
+        assert!(!store
+            .load(session)
+            .unwrap()
+            .meta
+            .served_output_fingerprint
+            .is_empty());
+
+        let stable = run(&store, &baseline_request, &spine());
+        assert!(stable.first_divergence.is_none());
+        assert_eq!(stable.row_version, first.row_version);
+        assert!(!stable.committed);
+
+        let inserted_request = req(
+            session,
+            "cfg0",
+            vec![
+                item("a", 0, "a"),
+                item("inserted", 1, "inserted"),
+                item("b", 2, "b"),
+                item("c", 3, "c"),
+            ],
+        );
+        let inserted = run(&store, &inserted_request, &spine());
+        let inserted_divergence = inserted.first_divergence.as_ref().unwrap();
+        assert_eq!(
+            inserted_divergence.kind,
+            divergence::DivergenceKind::Inserted
+        );
+        assert_eq!(inserted_divergence.block_id_old.as_deref(), Some("b"));
+        assert_eq!(
+            inserted_divergence.block_id_new.as_deref(),
+            Some("inserted")
+        );
+        let trace = store.load_pass_trace(session).unwrap().unwrap();
+        let inserted_json = serde_json::to_string(inserted_divergence).unwrap();
+        assert_eq!(
+            trace.first_divergence.as_deref(),
+            Some(inserted_json.as_str())
+        );
+
+        let removed_request = req(session, "cfg0", vec![item("a", 0, "a"), item("c", 3, "c")]);
+        let removed = run(&store, &removed_request, &spine());
+        let removed_divergence = removed.first_divergence.as_ref().unwrap();
+        assert_eq!(removed_divergence.kind, divergence::DivergenceKind::Removed);
+        assert_eq!(removed_divergence.block_id_old.as_deref(), Some("inserted"));
+        assert_eq!(removed_divergence.block_id_new.as_deref(), Some("c"));
     }
 
     fn comparable_response(response: TransformResponse) -> Value {
@@ -12603,6 +12821,7 @@ mod tests {
                     memory_revision: None,
                     compartment_max_seq: None,
                     project_root: None,
+                    first_divergence: None,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -12681,6 +12900,7 @@ mod tests {
                     memory_revision: None,
                     compartment_max_seq: None,
                     project_root: None,
+                    first_divergence: None,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -15113,6 +15333,7 @@ mod tests {
                 memory_revision: None,
                 compartment_max_seq: None,
                 project_root: None,
+                first_divergence: None,
                 overlays: TransformOverlayBatch::default(),
             },
         )
