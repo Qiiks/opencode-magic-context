@@ -1993,8 +1993,16 @@ fn apply_once(
                     strip_survivors.extend(new_strip_units.clone());
                     core.frozen_units.clear();
                     core.pending_changes.clear();
-                    let mut rendered =
-                        vec![synth_region("m0", comp.m0_bytes), render_m1_body(&m1.body)];
+                    // Post-fold m1 parity with the ordinary HARD arm: everything except the
+                    // claimed notes was just folded into the recomposed m0, so rendering the
+                    // full composed body here would duplicate memories/mutations/compartments
+                    // across both layers for the rest of the epoch. Only the notes survive.
+                    let refold_m1_unit = if m1.notes_block.is_empty() {
+                        render_m1_placeholder()
+                    } else {
+                        render_m1_body(&m1.notes_block)
+                    };
+                    let mut rendered = vec![synth_region("m0", comp.m0_bytes), refold_m1_unit];
                     rendered.extend(survivors);
                     rendered.extend(strip_survivors);
                     core.step(PassInput {
@@ -13170,7 +13178,21 @@ mod tests {
         );
         assert!(
             m1_bytes(&pressure).contains("ready note survives pressure refold"),
-            "pressure refold must retain the composed m1 body"
+            "pressure refold must keep the claimed note model-visible"
+        );
+        // Exact-once across layers: the pressure-causing memory deltas fold into m0 and
+        // must NOT survive in the post-fold m1 (the ordinary-HARD notes-only contract).
+        assert!(
+            m0_bytes(&pressure).contains("updated rule 1"),
+            "folded m0 must carry the memory deltas that caused the pressure"
+        );
+        assert!(
+            !m1_bytes(&pressure).contains("updated rule"),
+            "post-refold m1 must not duplicate memory deltas already folded into m0"
+        );
+        assert!(
+            !m1_bytes(&pressure).contains("<memory-updates>"),
+            "post-refold m1 must be notes-only"
         );
         let deliveries = pressure.note_deliveries.clone().expect("note delivery");
         assert_eq!(deliveries.len(), 1);

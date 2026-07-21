@@ -173,6 +173,11 @@ pub struct M1Composition {
     pub note_deliveries: Vec<NoteDelivery>,
     /// True only when the pending profile version produced a non-empty, budgeted block.
     pub profile_rendered: bool,
+    /// The claimed-notes block alone. A pressure refold folds every other m1 section
+    /// into the recomposed m0, so rendering `body` there would duplicate memories,
+    /// mutations, and compartments across both layers for the rest of the epoch; only
+    /// the notes (which m0 never absorbs) may survive as the post-fold m1.
+    pub notes_block: String,
 }
 
 pub fn claim_and_render_notes(
@@ -363,6 +368,7 @@ pub fn compose_m1_from_store(
         new_coverage,
         note_deliveries,
         profile_rendered,
+        notes_block,
     })
 }
 
