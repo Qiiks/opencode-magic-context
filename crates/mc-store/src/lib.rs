@@ -13494,7 +13494,7 @@ mod tests {
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=36).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=37).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -16314,7 +16314,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=36).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=37).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)
