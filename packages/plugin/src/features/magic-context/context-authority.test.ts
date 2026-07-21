@@ -675,7 +675,7 @@ describe("memory authority protocol", () => {
                 DROP TABLE mirror_live_staging;
                 DROP TABLE mirror_resnapshot_state;
                 DROP TABLE mirror_live_memory_rows;
-                DELETE FROM schema_migrations WHERE version IN (58, 59, 60, 61, 62);
+                DELETE FROM schema_migrations WHERE version IN (58, 59, 60, 61, 62, 63);
             `);
             withPrivilegedWriter(database, () => {
                 database
@@ -841,7 +841,7 @@ describe("memory authority protocol", () => {
                 DROP TABLE mirror_live_staging;
                 DROP TABLE mirror_resnapshot_state;
                 DROP TABLE mirror_live_memory_rows;
-                DELETE FROM schema_migrations WHERE version IN (58, 59, 60, 61, 62);
+                DELETE FROM schema_migrations WHERE version IN (58, 59, 60, 61, 62, 63);
             `);
             withPrivilegedWriter(database, () => {
                 database

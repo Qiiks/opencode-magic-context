@@ -2408,6 +2408,9 @@ const MIGRATIONS: Migration[] = [
         version: 63,
         description: "Add anchor_block_id to notes (module note mirror writes it)",
         up(db: Database): void {
+            // Sparse legacy databases may not contain the optional notes table; there
+            // is no column to add until normal boot initialization creates that table.
+            if (!tableExists(db, "notes")) return;
             // The module-side mc_notes schema carries anchor_block_id (the flat block
             // the note was taken against); the mirror consumer writes it through to
             // context.db so anchors survive a later drain back to TS authority. The

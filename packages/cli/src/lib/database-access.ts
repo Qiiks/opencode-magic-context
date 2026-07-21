@@ -1,15 +1,19 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import {
-    getPersistedSchemaVersion,
-    LATEST_SUPPORTED_VERSION,
-} from "@magic-context/core/features/magic-context/storage-db";
-import {
     ensureContextStoreUuid,
     getContextStoreUuid,
 } from "@magic-context/core/features/magic-context/context-authority";
+import {
+    getPersistedSchemaVersion as getCorePersistedSchemaVersion,
+    LATEST_SUPPORTED_VERSION,
+} from "@magic-context/core/features/magic-context/storage-db";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 import { Database } from "@magic-context/core/shared/sqlite";
+
+export function getPersistedSchemaVersion(db: DatabaseType): number {
+    return getCorePersistedSchemaVersion(db);
+}
 
 export class UnsupportedSchemaVersionError extends Error {
     readonly path: string;
@@ -26,6 +30,29 @@ export class UnsupportedSchemaVersionError extends Error {
         this.supportedVersion = supportedVersion;
     }
 }
+
+export class OutdatedSchemaVersionError extends Error {
+    readonly path: string;
+    readonly persistedVersion: number;
+    readonly minimumSupportedVersion: number;
+
+    constructor(path: string, persistedVersion: number, minimumSupportedVersion: number) {
+        super(
+            `Refusing to mutate ${path}: database schema v${persistedVersion} is behind this CLI's schema floor v${minimumSupportedVersion}. Run a session or doctor migrate first so the plugin can upgrade it, then retry.`,
+        );
+        this.name = "OutdatedSchemaVersionError";
+        this.path = path;
+        this.persistedVersion = persistedVersion;
+        this.minimumSupportedVersion = minimumSupportedVersion;
+    }
+}
+
+/**
+ * A CLI write must not make a live database newer than a running plugin can
+ * read. The current checkout is therefore the mutation floor; read-only
+ * diagnostics may still inspect older supported schemas without changing them.
+ */
+export const CLI_SCHEMA_FLOOR_VERSION = LATEST_SUPPORTED_VERSION;
 
 /**
  * Opens an existing SQLite file without silently creating an empty replacement.
@@ -67,7 +94,7 @@ export function openExistingDatabase(
  */
 export function openExistingContextDatabase(
     path: string,
-    options: { readonly: boolean },
+    options: { readonly: boolean; minimumSupportedVersion?: number },
 ): DatabaseType | null {
     const db = openExistingDatabase(path, options);
     if (db === null) return null;
@@ -81,13 +108,21 @@ export function openExistingContextDatabase(
                 LATEST_SUPPORTED_VERSION,
             );
         }
+        const minimumSupportedVersion =
+            options.minimumSupportedVersion ??
+            (options.readonly ? undefined : CLI_SCHEMA_FLOOR_VERSION);
+        if (minimumSupportedVersion !== undefined && persistedVersion < minimumSupportedVersion) {
+            throw new OutdatedSchemaVersionError(path, persistedVersion, minimumSupportedVersion);
+        }
         if (!options.readonly) {
             // The CLI has no module route during database open. It can mint the
             // local store identity, but REGRESSED detection remains a later
             // module-reconciliation step when the module becomes reachable.
             const hasIdentityTable = Boolean(
                 db
-                    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'context_store_meta'")
+                    .prepare(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'context_store_meta'",
+                    )
                     .get(),
             );
             if (hasIdentityTable && !getContextStoreUuid(db)) ensureContextStoreUuid(db);
@@ -97,6 +132,18 @@ export function openExistingContextDatabase(
         db.close();
         throw error;
     }
+}
+
+/**
+ * Opens a live context database for a CLI mutation without running schema
+ * migrations. The plugin boot path owns schema upgrades; while the plugin is
+ * running, it may enforce an older maximum schema version.
+ */
+export function openExistingContextDatabaseForMutation(path: string): DatabaseType | null {
+    return openExistingContextDatabase(path, {
+        readonly: false,
+        minimumSupportedVersion: CLI_SCHEMA_FLOOR_VERSION,
+    });
 }
 
 /** Create a consistent SQLite snapshot, including committed WAL contents. */

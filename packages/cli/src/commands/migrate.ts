@@ -4,7 +4,12 @@ import { join } from "node:path";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 import { writeFileAtomic } from "../lib/atomic-write";
-import { openExistingContextDatabase, openExistingDatabase } from "../lib/database-access";
+import {
+    getPersistedSchemaVersion,
+    openExistingContextDatabase,
+    openExistingContextDatabaseForMutation,
+    openExistingDatabase,
+} from "../lib/database-access";
 import { getOpenCodeDatabasePath, projectPathToPiSessionSlug } from "../lib/migration-paths";
 import { getPiSessionsRoot } from "../lib/paths";
 
@@ -53,6 +58,9 @@ export interface MigrationResult {
     compactionMarkerWritten: boolean;
     compactionBoundaryEntryId?: string;
     compactionFirstKeptEntryId?: string;
+    /** Records the shared database's persisted schema version before and after migration so callers can verify it stays within the running plugin's supported limit. */
+    cortexkitSchemaVersionBefore?: number;
+    cortexkitSchemaVersionAfter?: number;
     dryRun: boolean;
 }
 
@@ -938,16 +946,19 @@ export function migrateOpenCodeSessionToPi(
     // Pass null to skip the cortexkit copy entirely (legacy V1 behavior).
     let cortexkitDb: DatabaseLike | null;
     let ownsCortexkitDb = false;
+    let cortexkitSchemaVersionBefore: number | null = null;
     if (opts.cortexkitDb === null) {
         cortexkitDb = null;
     } else if (opts.cortexkitDb !== undefined) {
         cortexkitDb = opts.cortexkitDb;
     } else {
         const cortexkitDbPath = opts.cortexkitDbPath ?? defaultCortexkitDbPath();
-        cortexkitDb = openExistingContextDatabase(cortexkitDbPath, {
-            readonly: Boolean(opts.dryRun),
-        });
+        cortexkitDb = opts.dryRun
+            ? openExistingContextDatabase(cortexkitDbPath, { readonly: true })
+            : openExistingContextDatabaseForMutation(cortexkitDbPath);
         ownsCortexkitDb = cortexkitDb !== null;
+        if (cortexkitDb !== null)
+            cortexkitSchemaVersionBefore = getPersistedSchemaVersion(cortexkitDb as DatabaseType);
         // If Magic Context has never created context.db, skip the state copy;
         // opening a missing path must not fabricate an empty database.
     }
@@ -1049,6 +1060,14 @@ export function migrateOpenCodeSessionToPi(
             compactionMarkerWritten: compactionMarker.written,
             compactionBoundaryEntryId: compactionMarker.boundaryEntryId,
             compactionFirstKeptEntryId: compactionMarker.firstKeptEntryId,
+            ...(cortexkitSchemaVersionBefore !== null && cortexkitDb !== null
+                ? {
+                      cortexkitSchemaVersionBefore,
+                      cortexkitSchemaVersionAfter: getPersistedSchemaVersion(
+                          cortexkitDb as DatabaseType,
+                      ),
+                  }
+                : {}),
             dryRun: Boolean(opts.dryRun),
         };
     } finally {
@@ -1124,6 +1143,11 @@ export async function runMigrateCli(args: string[]): Promise<number> {
         console.log(`  bytes: ${result.byteCount}`);
         console.log(`  compartments copied: ${result.compartmentsCopied}`);
         console.log(`  session facts copied: ${result.factsCopied}`);
+        if (result.cortexkitSchemaVersionBefore !== undefined) {
+            console.log(
+                `  Magic Context schema: v${result.cortexkitSchemaVersionBefore} → v${result.cortexkitSchemaVersionAfter}`,
+            );
+        }
         console.log(
             `  compaction marker: ${result.compactionMarkerWritten ? "yes" : "no"}${
                 result.compactionMarkerWritten
@@ -1138,6 +1162,11 @@ export async function runMigrateCli(args: string[]): Promise<number> {
         }
         if (!result.dryRun) {
             console.log("Pi may need to be restarted to pick up the new session file.");
+            if (result.cortexkitSchemaVersionBefore !== undefined) {
+                console.log(
+                    "If OpenCode or another harness is running, restart it before creating new sessions so it reloads the same schema fence.",
+                );
+            }
         }
         return 0;
     } catch (error) {

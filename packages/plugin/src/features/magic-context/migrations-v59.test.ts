@@ -39,7 +39,7 @@ describe("migration v59: live memory resnapshot staging", () => {
             ).run();
             db.exec(`
                 DROP TABLE mirror_live_staging;
-                DELETE FROM schema_migrations WHERE version IN (59, 60, 61, 62);
+                DELETE FROM schema_migrations WHERE version IN (59, 60, 61, 62, 63);
             `);
 
             runMigrations(db);

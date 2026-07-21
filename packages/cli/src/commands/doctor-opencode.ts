@@ -9,7 +9,6 @@ import {
     type EmbeddingProbeOutcome,
     probeEmbeddingEndpoint,
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
-import { closeDatabase, openDatabase } from "@magic-context/core/features/magic-context/storage";
 import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import { fixConflicts } from "@magic-context/core/shared/conflict-fixer";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
@@ -23,7 +22,10 @@ import {
 } from "../adapters/opencode";
 import { writeFileAtomic } from "../lib/atomic-write";
 import { migrateConfigLocationsForCli } from "../lib/config-location-migration";
-import { openExistingContextDatabase } from "../lib/database-access";
+import {
+    openExistingContextDatabase,
+    openExistingContextDatabaseForMutation,
+} from "../lib/database-access";
 import { collectDiagnostics } from "../lib/diagnostics-opencode";
 import {
     checkLocalEmbeddingRuntime,
@@ -567,11 +569,21 @@ export async function runDoctor(
         return runIssueFlow();
     }
 
+    let v22Db: ReturnType<typeof openExistingContextDatabase> = null;
     const v22Result = await runV22BackfillCommands(
         {
             name: "OpenCode",
-            openDatabase,
-            closeDatabase,
+            openDatabase: (readonly = true) => {
+                const dbPath = join(getMagicContextStorageDir(), "context.db");
+                v22Db = readonly
+                    ? openExistingContextDatabase(dbPath, { readonly: true })
+                    : openExistingContextDatabaseForMutation(dbPath);
+                return v22Db;
+            },
+            closeDatabase: () => {
+                v22Db?.close();
+                v22Db = null;
+            },
             log,
         },
         options,
