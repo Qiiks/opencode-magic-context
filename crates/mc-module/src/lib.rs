@@ -18675,6 +18675,8 @@ mod tests {
         user_profile: Vec<String>,
         workspace: Option<StrictShadowWorkspace>,
         last_todo_state: String,
+        project_memory_epoch: u64,
+        user_profile_version: u64,
         acked_watermarks: StrictShadowWatermarks,
     }
 
@@ -18844,6 +18846,8 @@ mod tests {
         m0_mutation_id: i64,
         memory_mutation_id: i64,
         last_todo_state_hash: String,
+        project_memory_epoch: u64,
+        project_user_profile_version: u64,
     }
 
     #[test]
