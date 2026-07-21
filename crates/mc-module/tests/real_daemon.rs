@@ -114,6 +114,13 @@ async fn mc_transform_spine_through_real_daemon() {
         .await
         .unwrap();
 
+    // Module registration is asynchronous relative to our first route.open, and the
+    // daemon's unknown_module is a terminal control-plane reject (route_retry only
+    // covers transport failures). Under load the module's debug-build boot can lose
+    // this race by tens of seconds, so poll registration with a bounded probe before
+    // the first real call instead of relying on call-site retries.
+    wait_for_module_registration(&consumer, START_TIMEOUT).await;
+
     // ===== PRODUCTION-PATH cases (session "spine"): m0/m1 composed FROM the seeded store.
     // The seed (seed_store) gave "spine" one compartment covering ordinals 1..=10 (end id
     // "m10", P1 "SUMMARY-1-10") and no memories. m0 is the compartment SUMMARY, the anchor
@@ -427,7 +434,7 @@ fn spawn_daemon(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) -> Liv
 }
 
 fn spawn_module(module_bin: &Path, connection_file: &Path, data_home: &Path) -> ModuleProcess {
-    let child = Command::new(module_bin)
+    let mut child = Command::new(module_bin)
         .arg("--subc")
         .arg(connection_file)
         .env(subc_protocol::SUBC_MODULE_ID_ENV, MODULE_ID)
@@ -437,6 +444,19 @@ fn spawn_module(module_bin: &Path, connection_file: &Path, data_home: &Path) -> 
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn module {}: {e}", module_bin.display()));
+    // The module logs to stderr; an undrained pipe fills its 64KB buffer and the module
+    // BLOCKS on a stderr write mid-boot, so it never registers (observed as a spurious
+    // unknown_module reject once boot logging grew past the buffer). Drain continuously
+    // and forward so failures keep the module's log visible.
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            for line in std::io::BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                eprintln!("mc-module: {line}");
+            }
+        });
+    }
     ModuleProcess { child }
 }
 
@@ -509,6 +529,37 @@ fn identity_for(session: &str) -> BindIdentity {
             session: session.to_string(),
         })
         .clone()
+}
+
+async fn wait_for_module_registration(consumer: &SubcConsumer, wait: Duration) {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let probe = consumer
+            .call(
+                RouteTarget::ToolProvider {
+                    module_id: MODULE_ID.to_string(),
+                },
+                identity_for("registration-probe"),
+                serde_json::to_vec(&serde_json::json!({ "kind": "status", "v": 1 })).unwrap(),
+                fast_call_options(),
+            )
+            .await;
+        match probe {
+            Ok(_) => return,
+            Err(err) => {
+                let text = format!("{err:?}");
+                if !text.contains("unknown_module") {
+                    // Registered (or a different failure the real calls will surface) —
+                    // registration itself is no longer the blocker.
+                    return;
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("module did not register with the daemon within {wait:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn wait_for_connection_file(path: &Path, wait: Duration) {
