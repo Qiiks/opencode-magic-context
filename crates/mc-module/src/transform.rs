@@ -13224,6 +13224,71 @@ mod tests {
     }
 
     #[test]
+    fn legacy_full_body_refold_state_replays_verbatim_on_defer() {
+        // Sessions that took a pressure refold under the short-lived full-body binary
+        // froze an m1 unit carrying the ENTIRE composed body (memory updates included).
+        // The corrected notes-only contract must not spuriously re-render that state:
+        // an unchanged pass defers and serves the legacy bytes verbatim; healing waits
+        // for the next genuine bust.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let memory_ids = seed_pressure_memory(&s);
+        let messages = vec![item("a", 1, "raw")];
+        run(&s, &req("ses", "cfg0", messages.clone()), &spine());
+        add_pressure_memory_updates(&s, &memory_ids);
+        let pressure = transform(
+            &s,
+            &with_usage(req("ses", "cfg0", messages.clone()), 70, 100),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap();
+        assert_eq!(
+            pressure.materialize_reason.as_deref(),
+            Some("pressure_refold")
+        );
+
+        // Rewrite the frozen m1 into the pre-fix full-body shape the old binary froze.
+        let loaded = s.load("ses").unwrap();
+        let mut core = loaded.core.clone();
+        let legacy_body =
+            "<memory-updates>\n#1: updated rule 0 (legacy full body)\n</memory-updates>";
+        let m1 = core
+            .frozen_units
+            .iter_mut()
+            .find(|unit| unit.key == "m1")
+            .expect("refold froze an m1 unit");
+        m1.frozen_payload = legacy_body.to_string();
+        s.commit("ses", loaded.row_version, &core, &loaded.meta)
+            .unwrap();
+
+        let replay = transform(
+            &s,
+            &with_usage(req("ses", "cfg0", messages.clone()), 10, 100),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap();
+        assert_eq!(replay.action, "SOFT+");
+        assert!(
+            m1_bytes(&replay).contains("legacy full body"),
+            "an unchanged pass must serve the legacy frozen bytes verbatim"
+        );
+        let after = s.load("ses").unwrap();
+        assert_eq!(
+            after
+                .core
+                .frozen_units
+                .iter()
+                .find(|unit| unit.key == "m1")
+                .unwrap()
+                .frozen_payload,
+            legacy_body,
+            "a defer pass must not rewrite the legacy frozen unit"
+        );
+    }
+
+    #[test]
     fn pressure_refold_rejects_sparse_coverage_like_ordinary_hard() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());

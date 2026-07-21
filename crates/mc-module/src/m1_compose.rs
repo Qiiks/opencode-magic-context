@@ -337,10 +337,13 @@ pub fn compose_m1_from_store(
         (String::new(), false)
     };
 
-    // Notes intentionally do not participate in m1_revision_signal: a condition can
-    // become true during a defer, but it must ride the next natural bust rather than
-    // creating a cache bust of its own. Unacknowledged ledger rows are included again,
-    // which is the honest at-least-once contract.
+    // Rendered note BYTES, claims, and deliveries do not participate in
+    // m1_revision_signal (note_status_version DOES — that is the evaluation-side
+    // signal that a note became ready). The distinction matters: a condition can
+    // become true during a defer and must ride the next natural bust rather than
+    // creating a cache bust of its own, and the applied post-fold digest must be
+    // identical whether this pass rendered notes or a placeholder. Unacknowledged
+    // ledger rows are included again, which is the honest at-least-once contract.
     let (notes_block, note_deliveries) = claim_and_render_notes(
         store,
         note_project_path,
