@@ -1028,6 +1028,7 @@ fn apply_once(
     // available on non-CC profiles is render-neutral: overlay bytes remain gated by
     // `tagging_active`, while the OpenCode host can receive the same ceiling decision.
     let mut tag_rows = transform_snapshot.tags;
+    let tag_numbers = tag_number_by_message(&tag_rows);
     let mut channel1_appends = if tagging_active {
         transform_snapshot.channel1_appends
     } else {
@@ -1552,14 +1553,20 @@ fn apply_once(
             plan,
             PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
         );
-    if let Some(cutoff) = reasoning_clear_cutoff(
+    if let Some(cutoff) = reasoning_clear_cutoff_with_tags(
         req,
         serializer_profile,
         is_bust_pass,
-        meta.reasoning_cleared_through_ordinal,
+        meta.reasoning_cleared_through_tag
+            .max(meta.reasoning_cleared_through_ordinal),
+        &tag_numbers,
     ) {
+        meta.reasoning_cleared_through_tag = meta.reasoning_cleared_through_tag.max(cutoff);
+        // Keep the legacy ordinal watermark populated so readers that predate the tag-number
+        // watermark, including older native rendering paths, continue to observe the same cutoff.
         meta.reasoning_cleared_through_ordinal = meta.reasoning_cleared_through_ordinal.max(cutoff);
     }
+    let new_strip_units = new_frozen_strip_units(&loaded.core, req, &tag_numbers, is_bust_pass);
     if loaded.meta.soft_refresh_pending && is_bust_pass {
         meta.soft_refresh_pending = false;
     }
@@ -1767,6 +1774,8 @@ fn apply_once(
                 // those obsolete units in place, rebuild the frozen unit set.
                 let effective = effective_reductions(&core, &selected_reductions);
                 let survivors = surviving_red_units(&effective, &live, comp.coverage_ordinal);
+                let mut strip_survivors = surviving_strip_units(&core, req);
+                strip_survivors.extend(new_strip_units.clone());
                 core.frozen_units.clear();
                 core.pending_changes.clear();
                 let (note_body, hard_note_deliveries) = claim_and_render_notes(
@@ -1785,6 +1794,7 @@ fn apply_once(
                 };
                 let mut rendered = vec![synth_region("m0", comp.m0_bytes), m1_unit];
                 rendered.extend(survivors);
+                rendered.extend(strip_survivors);
 
                 // A HARD re-composes m0 fully from the store, so the boundary ALWAYS reflects
                 // the current coverage — set it unconditionally (empty when no compartments,
@@ -1903,11 +1913,14 @@ fn apply_once(
                     )?;
                     let effective = effective_reductions(&core, &selected_reductions);
                     let survivors = surviving_red_units(&effective, &live, comp.coverage_ordinal);
+                    let mut strip_survivors = surviving_strip_units(&core, req);
+                    strip_survivors.extend(new_strip_units.clone());
                     core.frozen_units.clear();
                     core.pending_changes.clear();
                     let mut rendered =
                         vec![synth_region("m0", comp.m0_bytes), render_m1_placeholder()];
                     rendered.extend(survivors);
+                    rendered.extend(strip_survivors);
                     core.step(PassInput {
                         proposed: Some(mc_core::Action::Hard),
                         boundary_present: boundary_token,
@@ -1940,6 +1953,7 @@ fn apply_once(
                         &live,
                         loaded.meta.coverage_ordinal,
                     ));
+                    rendered.extend(new_strip_units.clone());
                     // A coverage-extending SOFT advances the boundary anchor (the bound core
                     // primitive); a memory-only SOFT leaves it put (None).
                     let new_boundary_id = m1.new_coverage.as_ref().map(|(id, _)| id.clone());
@@ -2111,7 +2125,7 @@ fn apply_once(
     }
 
     let build_output_started_at = Instant::now();
-    let ck_messages = build_output(
+    let ck_messages = build_output_with_tags(
         &core,
         &meta,
         &projection,
@@ -2119,6 +2133,9 @@ fn apply_once(
         tagging_active.then_some(&tag_overlay),
         tail_reclaim_enabled && !req.is_subagent,
         mutation_exempt_mid,
+        &tag_numbers,
+        meta.reasoning_cleared_through_tag
+            .max(meta.reasoning_cleared_through_ordinal),
     )?;
     timings.build_output = elapsed_ms(build_output_started_at);
 
@@ -2460,17 +2477,18 @@ fn is_legacy_baseline(core: &CoreState) -> bool {
         && core.pending_changes.is_empty()
 }
 
-/// A valid current shape: EXACTLY one `m0`, EXACTLY one `m1`, and zero-or-more `red:*`
-/// tail-reduction units. An initialized state missing `m0`/`m1`, or carrying any other
-/// key, is an unknown shape (rejected, never cleared). Tighter than "keys ⊆ {m0,m1,red}"
-/// so a corrupt initialized state missing a region can't validate.
+/// A valid current shape: EXACTLY one `m0`, EXACTLY one `m1`, and zero-or-more
+/// `red:*` or `strip:*` replay units. An initialized state missing `m0`/`m1`, or
+/// carrying any other key, is an unknown shape (rejected, never cleared).
 fn valid_m0m1_shape(core: &CoreState) -> bool {
     let m0 = core.frozen_units.iter().filter(|u| u.key == "m0").count();
     let m1 = core.frozen_units.iter().filter(|u| u.key == "m1").count();
-    let rest_ok = core
-        .frozen_units
-        .iter()
-        .all(|u| u.key == "m0" || u.key == "m1" || u.key.starts_with(RED_KEY_PREFIX));
+    let rest_ok = core.frozen_units.iter().all(|u| {
+        u.key == "m0"
+            || u.key == "m1"
+            || u.key.starts_with(RED_KEY_PREFIX)
+            || u.key.starts_with("strip:")
+    });
     m0 == 1 && m1 == 1 && rest_ok
 }
 
@@ -4683,6 +4701,458 @@ fn format_reclaimable_hint(hint: &[(i64, String)]) -> String {
 
 // --- output splice: [m0, m1] ++ tail(by coverage_ordinal) ---
 
+fn strip_unit(kind: &str, mid: &str, payload: &str) -> FrozenUnit {
+    FrozenUnit {
+        key: format!("strip:{kind}:{mid}"),
+        kind: format!("strip_{kind}"),
+        frozen_payload: payload.to_string(),
+        durability_class: mc_core::DurabilityClass::Lineage,
+        reset_rule: String::new(),
+    }
+}
+
+fn provider_sentinel_text(req: &TransformRequest) -> String {
+    if request_accepts_empty_content(req) {
+        String::new()
+    } else {
+        "[dropped]".to_string()
+    }
+}
+
+fn is_metadata_block(block: &CkWireBlock) -> bool {
+    match &block.kind {
+        ck_wire::CkKind::Opaque(opaque) => matches!(
+            opaque.kind.as_str(),
+            "meta"
+                | "step-start"
+                | "step-finish"
+                | "snapshot"
+                | "patch"
+                | "agent"
+                | "retry"
+                | "subtask"
+                | "compaction"
+        ),
+        _ => false,
+    }
+}
+
+fn is_ignored_block(block: &CkWireBlock) -> bool {
+    matches!(
+        &block.kind,
+        ck_wire::CkKind::Opaque(opaque)
+            if opaque.raw.get("ignored").and_then(Value::as_bool) == Some(true)
+    )
+}
+
+fn is_dropped_placeholder_text(text: &str) -> bool {
+    static DROPPED_PLACEHOLDERS: OnceLock<regex::Regex> = OnceLock::new();
+    DROPPED_PLACEHOLDERS
+        .get_or_init(|| regex::Regex::new(r"^(?:\s*\[dropped(?: §\d+§)?\])+\s*$").unwrap())
+        .is_match(text)
+}
+
+fn tag_stripped_text(text: &str) -> &str {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix('§') else {
+        return trimmed;
+    };
+    let Some((number, rest)) = rest.split_once('§') else {
+        return trimmed;
+    };
+    if !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit()) {
+        rest.trim_start()
+    } else {
+        trimmed
+    }
+}
+
+fn is_system_injected_text(text: &str) -> bool {
+    let text = tag_stripped_text(text);
+    text == "<!-- OMO_INTERNAL_INITIATOR -->"
+        || (text.starts_with("<system-reminder>") && text.ends_with("</system-reminder>"))
+        || text.starts_with("[SYSTEM DIRECTIVE:")
+        || text.starts_with("[Category+Skill Reminder]")
+        || text.starts_with("[EDIT ERROR - IMMEDIATE ACTION REQUIRED]")
+        || text.starts_with("[task CALL FAILED")
+        || text.starts_with("[EMERGENCY CONTEXT WINDOW WARNING]")
+}
+
+fn is_dropped_placeholder_block(block: &CkWireBlock) -> bool {
+    matches!(
+        &block.kind,
+        ck_wire::CkKind::Text { text } | ck_wire::CkKind::Reasoning { text, .. }
+            if is_dropped_placeholder_text(text)
+    )
+}
+
+fn has_text_or_reasoning_block(block: &CkWireBlock) -> bool {
+    matches!(
+        &block.kind,
+        ck_wire::CkKind::Text { .. } | ck_wire::CkKind::Reasoning { .. }
+    )
+}
+
+fn whole_system_injected(blocks: &[CkWireBlock]) -> bool {
+    let mut has_content = false;
+    for block in blocks {
+        if is_ignored_block(block) || is_metadata_block(block) {
+            continue;
+        }
+        let ck_wire::CkKind::Text { text } = &block.kind else {
+            return false;
+        };
+        has_content = true;
+        if !is_system_injected_text(text) {
+            return false;
+        }
+    }
+    has_content
+}
+
+fn has_meaningful_content(block: &CkWireBlock) -> bool {
+    if is_ignored_block(block) || is_metadata_block(block) {
+        return false;
+    }
+    match &block.kind {
+        ck_wire::CkKind::Text { text } => !text.is_empty(),
+        ck_wire::CkKind::Reasoning { .. } | ck_wire::CkKind::RedactedReasoning { .. } => false,
+        _ => true,
+    }
+}
+
+fn is_reduce_block(block: &CkWireBlock) -> bool {
+    matches!(
+        &block.kind,
+        ck_wire::CkKind::ToolCall { name, .. } if name == "ctx_reduce"
+    ) || matches!(
+        &block.kind,
+        ck_wire::CkKind::ToolResult { tool_name, .. } if tool_name == "ctx_reduce"
+    )
+}
+
+fn is_structural_noise(block: &CkWireBlock) -> bool {
+    match &block.kind {
+        ck_wire::CkKind::Opaque(opaque) => {
+            matches!(opaque.kind.as_str(), "meta" | "step-start" | "step-finish")
+        }
+        ck_wire::CkKind::Reasoning { text, .. } => text == "[cleared]",
+        _ => false,
+    }
+}
+
+fn image_block_is_large(block: &CkWireBlock) -> bool {
+    let ck_wire::CkKind::Media(media) = &block.kind else {
+        return false;
+    };
+    if media.kind != ck_wire::MediaKind::Image || !media.media_type.starts_with("image/") {
+        return false;
+    }
+    let Some(data) = media
+        .source
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|kind| *kind == "data_base64")
+        .and_then(|_| media.source.get("data"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    // OpenCode's TS strip checks the original data URL length, so include the
+    // MIME/prefix bytes rather than treating a remote URL as image payload.
+    data.len() + format!("data:{};base64,", media.media_type).len() > 200
+}
+
+fn replace_with_sentinel(block: &mut CkWireBlock, text: &str) {
+    block.kind = ck_wire::CkKind::Text {
+        text: text.to_string(),
+    };
+    block.mark_modified();
+}
+
+fn message_strip_unit<'a>(core: &'a CoreState, kind: &str, mid: &str) -> Option<&'a FrozenUnit> {
+    let key = format!("strip:{kind}:{mid}");
+    core.frozen_units.iter().find(|unit| unit.key == key)
+}
+
+fn message_tag_number(message: &CkIngressMessage, tag_numbers: &BTreeMap<String, u64>) -> u64 {
+    if tag_numbers.is_empty() {
+        return message.ordinal;
+    }
+    tag_numbers.get(&message.mid).copied().unwrap_or(0)
+}
+
+fn inline_thinking_replacement(text: &str) -> String {
+    static INLINE_THINKING: OnceLock<regex::Regex> = OnceLock::new();
+    INLINE_THINKING
+        .get_or_init(|| {
+            regex::Regex::new(r"(?s)<(?:thinking|think)>.*?</(?:thinking|think)>\s*").unwrap()
+        })
+        .replace_all(text, "")
+        .into_owned()
+}
+
+fn tag_number_by_message(tags: &[McTagRow]) -> BTreeMap<String, u64> {
+    let mut output = BTreeMap::new();
+    for tag in tags {
+        let message_id = tag
+            .block_id
+            .split_once('#')
+            .map(|(message_id, _)| message_id)
+            .unwrap_or(tag.block_id.as_str());
+        output
+            .entry(message_id.to_string())
+            .and_modify(|number: &mut u64| *number = (*number).max(tag.tag_number as u64))
+            .or_insert(tag.tag_number as u64);
+    }
+    output
+}
+
+fn tag_age_cutoff(req: &TransformRequest, tag_numbers: &BTreeMap<String, u64>) -> Option<u64> {
+    let max_tag = req
+        .messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic)
+        .map(|message| message_tag_number(message, tag_numbers))
+        .max()?;
+    let cutoff = max_tag.saturating_sub(req.clear_reasoning_age);
+    (cutoff > 0).then_some(cutoff)
+}
+
+fn new_frozen_strip_units(
+    core: &CoreState,
+    req: &TransformRequest,
+    tag_numbers: &BTreeMap<String, u64>,
+    is_bust_pass: bool,
+) -> Vec<FrozenUnit> {
+    if !is_bust_pass {
+        return Vec::new();
+    }
+    let sentinel = provider_sentinel_text(req);
+    let existing_keys: HashSet<&str> = core
+        .frozen_units
+        .iter()
+        .map(|unit| unit.key.as_str())
+        .collect();
+    let protected_start = req
+        .messages
+        .len()
+        .saturating_sub(req.protected_tags.saturating_mul(2));
+    let age_cutoff = tag_age_cutoff(req, tag_numbers);
+    let mut units = BTreeMap::<String, FrozenUnit>::new();
+    let mut has_assistant_response = false;
+
+    for index in (0..req.messages.len()).rev() {
+        let message = &req.messages[index];
+        if message.ck.meta.synthetic || message.mid.is_empty() {
+            continue;
+        }
+        let blocks = message.ck.content.as_slice();
+        if message.ck.role == "assistant" {
+            // The reverse image scan in TS treats any assistant message as evidence
+            // that older user content has already reached the model.
+            has_assistant_response = true;
+        }
+        if message.ck.role != "user" {
+            if index < protected_start && whole_system_injected(blocks) {
+                let unit = strip_unit("system_injected", &message.mid, &sentinel);
+                if !existing_keys.contains(unit.key.as_str()) {
+                    units.insert(unit.key.clone(), unit);
+                }
+            }
+            if request_accepts_empty_content(req)
+                && index < protected_start
+                && blocks.iter().any(is_reduce_block)
+            {
+                let unit = strip_unit("stale_reduce", &message.mid, &sentinel);
+                if !existing_keys.contains(unit.key.as_str()) {
+                    units.insert(unit.key.clone(), unit);
+                }
+            }
+            if !blocks.is_empty()
+                && blocks.iter().all(|block| {
+                    is_ignored_block(block)
+                        || is_metadata_block(block)
+                        || is_dropped_placeholder_block(block)
+                })
+                && blocks.iter().any(has_text_or_reasoning_block)
+            {
+                let unit = strip_unit("placeholder", &message.mid, &sentinel);
+                if !existing_keys.contains(unit.key.as_str()) {
+                    units.insert(unit.key.clone(), unit);
+                }
+            }
+            continue;
+        }
+        let is_stale_reduce = request_accepts_empty_content(req)
+            && index < protected_start
+            && blocks.iter().any(is_reduce_block);
+        if is_stale_reduce {
+            let unit = strip_unit("stale_reduce", &message.mid, &sentinel);
+            if !existing_keys.contains(unit.key.as_str()) {
+                units.insert(unit.key.clone(), unit);
+            }
+        }
+        if has_assistant_response
+            && request_accepts_empty_content(req)
+            && age_cutoff.is_some_and(|cutoff| message_tag_number(message, tag_numbers) <= cutoff)
+            && blocks.iter().any(image_block_is_large)
+        {
+            let marker = strip_unit("processed_image", &message.mid, &sentinel);
+            if !existing_keys.contains(marker.key.as_str()) {
+                units.insert(marker.key.clone(), marker);
+            }
+            for (block_index, block) in blocks.iter().enumerate() {
+                if !image_block_is_large(block) {
+                    continue;
+                }
+                // Images are reductions of individual media blocks, not whole-message
+                // strips. Reusing red:* keeps image replay in the same durable machinery
+                // as tool reductions while the message marker keeps replay stable if
+                // unrelated parts change their block index.
+                let target = format!("{}#{block_index}", message.mid);
+                let unit = red_unit(&target, "image", &sentinel);
+                if !existing_keys.contains(unit.key.as_str()) {
+                    units.insert(unit.key.clone(), unit);
+                }
+            }
+        }
+    }
+    units.into_values().collect()
+}
+
+fn apply_surface_strips(
+    core: &CoreState,
+    req: &TransformRequest,
+    message: &CkIngressMessage,
+    blocks: &[&FlatBlock],
+    rebuilt: &mut CkWireMessage,
+    tag_numbers: &BTreeMap<String, u64>,
+    reasoning_watermark: u64,
+) {
+    let sentinel = provider_sentinel_text(req);
+    let whole_strip = message_strip_unit(core, "placeholder", &message.mid)
+        .or_else(|| message_strip_unit(core, "system_injected", &message.mid));
+    if whole_strip.is_some() {
+        rebuilt.content = vec![CkWireBlock::bare(ck_wire::CkKind::Text { text: sentinel })];
+        rebuilt.mark_modified();
+        return;
+    }
+
+    let stale_reduce = message_strip_unit(core, "stale_reduce", &message.mid).is_some();
+    let image_seed = message_strip_unit(core, "processed_image", &message.mid).is_some();
+    let aged = message_tag_number(message, tag_numbers) <= reasoning_watermark;
+    let mut touched = false;
+    for block in blocks {
+        let index = block.block_index;
+        if index >= rebuilt.content.len() {
+            continue;
+        }
+        let clear_typed_reasoning = message.ck.role == "assistant"
+            && aged
+            && request_accepts_empty_content(req)
+            && matches!(&block.wire.kind, ck_wire::CkKind::Reasoning { .. });
+        if clear_typed_reasoning {
+            rebuilt.content[index].kind = ck_wire::CkKind::Reasoning {
+                text: String::new(),
+                signature: None,
+            };
+            rebuilt.content[index].mark_modified();
+            touched = true;
+            continue;
+        }
+        let should_strip =
+            (request_accepts_empty_content(req) && stale_reduce && is_reduce_block(&block.wire))
+                || ((image_seed
+                    && request_accepts_empty_content(req)
+                    && image_block_is_large(&block.wire))
+                    || (request_accepts_empty_content(req)
+                        && core.frozen_units.iter().any(|unit| {
+                            unit.key == format!("{RED_KEY_PREFIX}{}", block.id())
+                                && unit.kind == "image"
+                        })))
+                || (request_accepts_empty_content(req) && is_structural_noise(&block.wire));
+        if should_strip {
+            replace_with_sentinel(&mut rebuilt.content[index], &sentinel);
+            touched = true;
+            continue;
+        }
+        if message.ck.role == "assistant" && aged {
+            if let ck_wire::CkKind::Text { text } = &block.wire.kind {
+                let replacement = inline_thinking_replacement(text);
+                if replacement != *text {
+                    rebuilt.content[index].kind = ck_wire::CkKind::Text { text: replacement };
+                    rebuilt.content[index].mark_modified();
+                    touched = true;
+                }
+            }
+        }
+    }
+    if stale_reduce && touched && !rebuilt.content.iter().any(has_meaningful_content) {
+        rebuilt.content = vec![CkWireBlock::bare(ck_wire::CkKind::Text { text: sentinel })];
+        rebuilt.mark_modified();
+    }
+}
+
+fn surviving_strip_units(core: &CoreState, req: &TransformRequest) -> Vec<FrozenUnit> {
+    let live_mids: HashSet<&str> = req
+        .messages
+        .iter()
+        .map(|message| message.mid.as_str())
+        .collect();
+    core.frozen_units
+        .iter()
+        .filter(|unit| unit.key.starts_with("strip:"))
+        .filter(|unit| {
+            unit.key
+                .strip_prefix("strip:")
+                .and_then(|rest| rest.split_once(':'))
+                .is_some_and(|(_, mid)| live_mids.contains(mid))
+        })
+        .cloned()
+        .collect()
+}
+
+fn full_drop_tool_ids(core: &CoreState, projection: &FlatProjection) -> HashSet<String> {
+    let frozen_kind = |block_id: &str| {
+        core.frozen_units
+            .iter()
+            .find(|unit| unit.key == format!("{RED_KEY_PREFIX}{block_id}"))
+            .map(|unit| unit.kind.as_str())
+    };
+    let mut remove = HashSet::new();
+    for block in &projection.blocks {
+        let (ck_wire::CkKind::ToolCall { id, .. } | ck_wire::CkKind::ToolResult { id, .. }) =
+            &block.wire.kind
+        else {
+            continue;
+        };
+        if frozen_kind(block.id()) != Some("drop") {
+            continue;
+        }
+        // A seed containing only a tool result is a complete pair, but a skeleton or edit-marker
+        // tool call also carries the newest-window message. Keep that call paired with its result
+        // shell so the canonical message representation is preserved.
+        if matches!(&block.wire.kind, ck_wire::CkKind::ToolCall { .. }) {
+            remove.insert(id.clone());
+            continue;
+        }
+        let call_kind = projection.blocks.iter().find_map(|candidate| {
+            matches!(
+                &candidate.wire.kind,
+                ck_wire::CkKind::ToolCall { id: call_id, .. } if call_id == id
+            )
+            .then(|| frozen_kind(candidate.id()))
+            .flatten()
+        });
+        if !matches!(call_kind, Some("skeleton" | "edit_marker")) {
+            remove.insert(id.clone());
+        }
+    }
+    remove
+}
+
+#[cfg(test)]
 fn build_output(
     core: &CoreState,
     meta: &ModuleMeta,
@@ -4691,6 +5161,34 @@ fn build_output(
     tag_overlay: Option<&TagOverlayState>,
     synthetic_todo_enabled: bool,
     mutation_exempt_mid: Option<&str>,
+) -> Result<Vec<CkWireMessage>, TransformError> {
+    build_output_with_tags(
+        core,
+        meta,
+        projection,
+        req,
+        tag_overlay,
+        synthetic_todo_enabled,
+        mutation_exempt_mid,
+        &BTreeMap::new(),
+        meta.reasoning_cleared_through_tag
+            .max(meta.reasoning_cleared_through_ordinal),
+    )
+}
+
+// Keep the provider and durable-watermark arguments explicit in this builder: they affect cache
+// identity and differ across replay paths, so grouping them would make those inputs less visible.
+#[allow(clippy::too_many_arguments)]
+fn build_output_with_tags(
+    core: &CoreState,
+    meta: &ModuleMeta,
+    projection: &FlatProjection,
+    req: &TransformRequest,
+    tag_overlay: Option<&TagOverlayState>,
+    synthetic_todo_enabled: bool,
+    mutation_exempt_mid: Option<&str>,
+    tag_numbers: &BTreeMap<String, u64>,
+    reasoning_watermark: u64,
 ) -> Result<Vec<CkWireMessage>, TransformError> {
     let mut out = Vec::with_capacity(4 + req.messages.len());
     if !req.is_subagent {
@@ -4703,6 +5201,7 @@ fn build_output(
     }
 
     let blocks_by_mid = projection_blocks_by_mid(projection);
+    let full_drop_ids = full_drop_tool_ids(core, projection);
     // Subagents do not emit a synthetic m0/m1 prefix, so previously covered input
     // remains ordinary live history instead of being filtered by a primary cache watermark.
     let output_coverage = if req.is_subagent {
@@ -4762,7 +5261,13 @@ fn build_output(
                     // remains frozen but becomes inert, and this behavior is deterministic.
                     .filter(|block| !is_reasoning_block(&block.wire))
                     .filter_map(|block| {
-                        frozen_red_payload(core, block.id()).map(|p| (block.block_index, p))
+                        core.frozen_units
+                            .iter()
+                            .find(|unit| {
+                                unit.key == format!("{RED_KEY_PREFIX}{}", block.id())
+                                    && unit.kind != "image"
+                            })
+                            .map(|unit| (block.block_index, unit.frozen_payload.as_str()))
                     })
                     .collect()
             };
@@ -4790,6 +5295,39 @@ fn build_output(
                 }
             }
             if !mutation_exempt {
+                apply_surface_strips(
+                    core,
+                    req,
+                    msg,
+                    blocks,
+                    &mut rebuilt,
+                    tag_numbers,
+                    reasoning_watermark,
+                );
+                let drop_indexes: HashSet<usize> = blocks
+                    .iter()
+                    .filter(|block| {
+                        full_drop_ids.iter().any(|id| match &block.wire.kind {
+                            ck_wire::CkKind::ToolCall { id: call_id, .. }
+                            | ck_wire::CkKind::ToolResult { id: call_id, .. } => call_id == id,
+                            _ => false,
+                        })
+                    })
+                    .map(|block| block.block_index)
+                    .collect();
+                if !drop_indexes.is_empty() {
+                    rebuilt.content = rebuilt
+                        .content
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, block)| {
+                            (!drop_indexes.contains(&index)).then_some(block)
+                        })
+                        .collect();
+                    rebuilt.mark_modified();
+                }
+            }
+            if !mutation_exempt {
                 apply_tag_overlay_to_message(
                     &mut rebuilt,
                     msg,
@@ -4812,6 +5350,16 @@ fn build_output(
             );
             rebuilt
         };
+        if rendered.content.is_empty() {
+            // Full tool drops remove the carrier message as well as its blocks; keeping
+            // an empty shell would change tool adjacency on providers that merge turns.
+            // A pre-existing zero-block message is still a legitimate passthrough row.
+            if rendered.meta.synthetic || !blocks_by_mid.contains_key(msg.mid.as_str()) {
+                out.push(rendered);
+                continue;
+            }
+            continue;
+        }
         out.push(rendered);
 
         if synthetic_todo_enabled
@@ -4852,22 +5400,30 @@ fn build_output(
         );
     }
     if let Some(profile) = serializer_profile {
-        apply_serializer_residuals_with_exemption(profile, &mut out, mutation_exempt_mid);
+        apply_serializer_residuals_with_exemption(
+            profile,
+            &mut out,
+            mutation_exempt_mid,
+            req.provider_id.as_deref(),
+        );
     }
     Ok(out)
 }
 
 #[cfg(test)]
 fn apply_serializer_residuals(profile: SerializerProfile, messages: &mut [CkWireMessage]) -> usize {
-    apply_serializer_residuals_with_exemption(profile, messages, None)
+    apply_serializer_residuals_with_exemption(profile, messages, None, Some("anthropic"))
 }
 
 fn apply_serializer_residuals_with_exemption(
     profile: SerializerProfile,
     messages: &mut [CkWireMessage],
     mutation_exempt_mid: Option<&str>,
+    provider_id: Option<&str>,
 ) -> usize {
-    if quirk_residual(profile).strips_reasoning_from_merged_assistants {
+    if quirk_residual(profile).strips_reasoning_from_merged_assistants
+        && provider_id.is_none_or(|provider| provider == "anthropic")
+    {
         strip_reasoning_from_merged_assistants_with_exemption(messages, mutation_exempt_mid)
     } else {
         0
@@ -4994,8 +5550,11 @@ fn latest_assistant_mutation_exempt_mid(
 /// so `anthropic/...` is accepted as a compatibility fallback. Native OpenCode metadata is the
 /// final fallback because it carries the same provider identity on assistant and user records.
 pub(crate) fn request_accepts_empty_content(req: &TransformRequest) -> bool {
-    if req.provider_id.as_deref() == Some("anthropic") {
-        return true;
+    if let Some(provider) = req.provider_id.as_deref() {
+        // When the request includes an explicit provider identifier, use it as authoritative.
+        // Do not let a stale model key or native sidecar change the result; empty content is
+        // accepted only for the Anthropic provider.
+        return provider == "anthropic";
     }
     if req
         .model_key
@@ -5023,16 +5582,16 @@ pub(crate) fn request_accepts_empty_content(req: &TransformRequest) -> bool {
 /// Compute the next durable D2 reasoning watermark on a cache-busting pass or the
 /// one-time native bootstrap when no watermark exists yet.
 ///
-/// TS computes `maxTag - clearReasoningAge` after heuristic execution. The module does not
-/// receive TS tag numbers, but it does receive stable absolute message ordinals from the same
-/// OpenCode database. Using those ordinals gives the same monotone age boundary and avoids
-/// deriving a moving decision on defer passes. A watermark advances only when an eligible
-/// assistant actually contains typed reasoning, matching TS's persisted-watermark behavior.
-fn reasoning_clear_cutoff(
+/// TS computes `maxTag - clearReasoningAge` after heuristic execution. The module loads the
+/// durable tag rows and uses their tag numbers for the same boundary, with stable message
+/// ordinals as the compatibility fallback when no tag rows exist. A watermark advances only
+/// when an eligible assistant actually contains typed reasoning, matching TS's persisted behavior.
+fn reasoning_clear_cutoff_with_tags(
     req: &TransformRequest,
     profile: Option<SerializerProfile>,
     is_bust_pass: bool,
     persisted_watermark: u64,
+    tag_numbers: &BTreeMap<String, u64>,
 ) -> Option<u64> {
     if profile != Some(SerializerProfile::OpencodeAiSdk)
         || !request_accepts_empty_content(req)
@@ -5043,13 +5602,16 @@ fn reasoning_clear_cutoff(
         return None;
     }
 
-    let max_ordinal = req
-        .messages
-        .iter()
-        .filter(|message| !message.ck.meta.synthetic)
-        .map(|message| message.ordinal)
-        .max()?;
-    let cutoff = max_ordinal.saturating_sub(req.clear_reasoning_age);
+    let max_tag = if tag_numbers.is_empty() {
+        req.messages
+            .iter()
+            .filter(|message| !message.ck.meta.synthetic)
+            .map(|message| message.ordinal)
+            .max()?
+    } else {
+        tag_numbers.values().copied().max()?
+    };
+    let cutoff = max_tag.saturating_sub(req.clear_reasoning_age);
     if cutoff == 0 {
         return None;
     }
@@ -5059,7 +5621,7 @@ fn reasoning_clear_cutoff(
         .filter(|message| {
             !message.ck.meta.synthetic
                 && message.ck.role == "assistant"
-                && message.ordinal <= cutoff
+                && message_tag_number(message, tag_numbers) <= cutoff
         })
         .any(|message| {
             message
@@ -5080,6 +5642,7 @@ fn reasoning_clear_cutoff(
 /// That ordering is important: the codec's latest-assistant ingress shortcut cannot reintroduce
 /// a signed block after this function runs. The canonical OpenCode Anthropic adapter removes
 /// these sentinels before dispatch, so no rewritten text or stale signature reaches Anthropic.
+#[cfg(test)]
 pub(crate) fn clear_served_native_reasoning(
     profile: SerializerProfile,
     provider_accepts_empty_content: bool,
@@ -5088,6 +5651,31 @@ pub(crate) fn clear_served_native_reasoning(
     ingress_messages: &[CkIngressMessage],
     watermark: u64,
     mid_turn: bool,
+) -> usize {
+    clear_served_native_reasoning_with_tags(
+        profile,
+        provider_accepts_empty_content,
+        native_messages,
+        served_messages,
+        ingress_messages,
+        watermark,
+        mid_turn,
+        &BTreeMap::new(),
+    )
+}
+
+// Native encoding is deliberately last: it needs both the CK result and ingress/tag
+// ownership to prevent the codec's latest-assistant shortcut from restoring old reasoning.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn clear_served_native_reasoning_with_tags(
+    profile: SerializerProfile,
+    provider_accepts_empty_content: bool,
+    native_messages: &mut [Value],
+    served_messages: &[CkWireMessage],
+    ingress_messages: &[CkIngressMessage],
+    watermark: u64,
+    mid_turn: bool,
+    tag_numbers: &BTreeMap<String, u64>,
 ) -> usize {
     if profile != SerializerProfile::OpencodeAiSdk
         || !provider_accepts_empty_content
@@ -5137,7 +5725,8 @@ pub(crate) fn clear_served_native_reasoning(
         let Some(&ordinal) = ordinal_by_mid.get(mid) else {
             continue;
         };
-        if ordinal > watermark || (mid_turn && newest_assistant_mid == Some(mid)) {
+        let age_number = tag_numbers.get(mid).copied().unwrap_or(ordinal);
+        if age_number > watermark || (mid_turn && newest_assistant_mid == Some(mid)) {
             continue;
         }
 
@@ -6664,11 +7253,19 @@ mod tests {
         assert_eq!(ck_messages[0]["meta"]["synthetic"], true);
         assert_eq!(ck_messages[0]["content"].as_array().unwrap().len(), 1);
         assert_eq!(ck_messages[1]["meta"]["synthetic"], true);
-        let reduced_tool = ck_messages.last().unwrap();
-        assert_eq!(reduced_tool["content"][0]["kind"]["type"], "tool_result");
-        assert_eq!(
-            reduced_tool["content"][0]["kind"]["output"]["kind"]["text"],
-            "[dropped 12]"
+        assert!(ck_messages.iter().all(|message| {
+            message["content"].as_array().is_none_or(|content| {
+                content.iter().all(|block| {
+                    !matches!(
+                        block["kind"]["type"].as_str(),
+                        Some("tool_call") | Some("tool_result")
+                    )
+                })
+            })
+        }));
+        assert!(
+            ck_messages.len() <= 2,
+            "a full drop removes both tool carriers and their now-empty messages"
         );
     }
 
@@ -7018,6 +7615,9 @@ mod tests {
             seed_boundary_id: None,
             drop_seeds: &[],
             drop_seed_skipped: 0,
+            strip_seeds: &[],
+            strip_seed_skipped: 0,
+            reasoning_cleared_through_tag: None,
             compartments: &[],
             memories: &[],
             memory_mutations: &[],
@@ -7379,6 +7979,7 @@ mod tests {
                 SerializerProfile::OpencodeAiSdk,
                 &mut served,
                 Some("latest"),
+                Some("anthropic"),
             ),
             1
         );
@@ -7406,6 +8007,7 @@ mod tests {
                 SerializerProfile::OpencodeAiSdk,
                 &mut standalone_served,
                 Some("latest"),
+                Some("anthropic"),
             ),
             0
         );
@@ -7765,6 +8367,7 @@ mod tests {
                 SerializerProfile::OpencodeAiSdk,
                 &mut served,
                 Some("tail-66"),
+                Some("anthropic"),
             ),
             5
         );
@@ -7809,6 +8412,7 @@ mod tests {
                 SerializerProfile::OpencodeAiSdk,
                 &mut messages,
                 None,
+                Some("anthropic"),
             ),
             0
         );
@@ -12698,6 +13302,9 @@ mod tests {
                 seed_boundary_id: None,
                 drop_seeds: &seeds,
                 drop_seed_skipped: 0,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],
@@ -12759,6 +13366,9 @@ mod tests {
                 seed_boundary_id: Some("b#0"),
                 drop_seeds: &[],
                 drop_seed_skipped: 0,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &compartments,
                 memories: &[],
                 memory_mutations: &[],

@@ -2589,6 +2589,11 @@ pub struct ModuleMeta {
     /// after OpenCode rebuilds the native message array from its database.
     #[serde(default)]
     pub reasoning_cleared_through_ordinal: u64,
+    /// The tag-number watermark is used for OpenCode reasoning and inline-thinking strips.
+    /// Keep the older ordinal watermark as a fallback so rows written before the tag-number
+    /// field was introduced remain readable.
+    #[serde(default)]
+    pub reasoning_cleared_through_tag: u64,
     /// The request-local Claude Code mechanics state committed with the rendered identity.
     /// Missing legacy metadata is false, which preserves the dormant render path.
     #[serde(default)]
@@ -3318,6 +3323,15 @@ pub struct ShadowDropSeedRow {
     pub payload: Option<String>,
 }
 
+/// A TypeScript-owned strip decision that must be replayed by the module before its
+/// first transform. Message-level strips intentionally carry the message id rather
+/// than a block id because the source operation may have covered several CK blocks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShadowStripSeedRow {
+    pub message_id: String,
+    pub strip_kind: String,
+}
+
 pub struct ShadowStateSyncRequest<'a> {
     pub session_id: &'a str,
     pub shadow_project_path: &'a str,
@@ -3327,6 +3341,9 @@ pub struct ShadowStateSyncRequest<'a> {
     pub seed_boundary_id: Option<&'a str>,
     pub drop_seeds: &'a [ShadowDropSeedRow],
     pub drop_seed_skipped: usize,
+    pub strip_seeds: &'a [ShadowStripSeedRow],
+    pub strip_seed_skipped: usize,
+    pub reasoning_cleared_through_tag: Option<u64>,
     pub compartments: &'a [StoredCompartment],
     pub memories: &'a [ShadowMemoryRow],
     pub memory_mutations: &'a [ShadowMemoryMutationRow],
@@ -3347,6 +3364,8 @@ pub struct ShadowStateSyncResult {
     pub memories_skipped: bool,
     /// Number of TS drop rows that could not be materialized into frozen module units.
     pub drop_seeds_skipped: usize,
+    /// Number of TS strip rows that could not be materialized into frozen module units.
+    pub strip_seeds_skipped: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4131,6 +4150,63 @@ fn materialize_drop_seed_units(
             if existing != &unit {
                 eprintln!(
                     "mc-store: retained existing frozen drop unit for session {session_id}: {key}"
+                );
+            }
+            continue;
+        }
+        core.frozen_units.push(unit);
+    }
+    skipped
+}
+
+fn valid_strip_seed_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "placeholder" | "system_injected" | "stale_reduce" | "processed_image"
+    )
+}
+
+/// Materialize frozen message-level strips from the TypeScript authority. The unit
+/// payload is only a compatibility marker; the transform chooses the provider-aware
+/// sentinel at egress, while the unit key keeps detection/replay id-keyed.
+fn materialize_strip_seed_units(
+    core: &mut CoreState,
+    session_id: &str,
+    seeds: &[ShadowStripSeedRow],
+    initial_skipped: usize,
+) -> usize {
+    let mut skipped = initial_skipped;
+    let mut candidates = BTreeMap::<String, FrozenUnit>::new();
+    for seed in seeds {
+        if seed.message_id.is_empty()
+            || seed.message_id.contains('#')
+            || !valid_strip_seed_kind(&seed.strip_kind)
+        {
+            skipped = skipped.saturating_add(1);
+            eprintln!(
+                "mc-store: skipped invalid strip seed for session {session_id}: {}:{}",
+                seed.strip_kind, seed.message_id
+            );
+            continue;
+        }
+        let key = format!("strip:{}:{}", seed.strip_kind, seed.message_id);
+        candidates.entry(key.clone()).or_insert(FrozenUnit {
+            key,
+            kind: format!("strip_{}", seed.strip_kind),
+            frozen_payload: "[dropped]".to_string(),
+            durability_class: DurabilityClass::Lineage,
+            reset_rule: String::new(),
+        });
+    }
+    for (key, unit) in candidates {
+        if let Some(existing) = core
+            .frozen_units
+            .iter()
+            .find(|existing| existing.key == key)
+        {
+            if existing != &unit {
+                eprintln!(
+                    "mc-store: retained existing frozen strip unit for session {session_id}: {key}"
                 );
             }
             continue;
@@ -6549,6 +6625,12 @@ impl McStore {
                 request.drop_seeds,
                 request.drop_seed_skipped,
             );
+            let strip_seeds_skipped = materialize_strip_seed_units(
+                &mut core,
+                request.session_id,
+                request.strip_seeds,
+                request.strip_seed_skipped,
+            );
 
             for compartment in request.compartments {
                 upsert_compartment_tx(tx, request.session_id, compartment)?;
@@ -6611,6 +6693,13 @@ impl McStore {
             if let Some(version) = request.user_profile_version {
                 meta.user_profile_version = version;
             }
+            if let Some(watermark) = request.reasoning_cleared_through_tag {
+                meta.reasoning_cleared_through_tag =
+                    meta.reasoning_cleared_through_tag.max(watermark);
+                // Keep legacy state readers monotone while the tag-based field rolls out.
+                meta.reasoning_cleared_through_ordinal =
+                    meta.reasoning_cleared_through_ordinal.max(watermark);
+            }
             meta.shadow_seq = meta.shadow_seq.saturating_add(1);
             meta.shadow_acked_watermarks = request.acked_watermarks.clone();
 
@@ -6640,6 +6729,7 @@ impl McStore {
                 row_version: next,
                 memories_skipped,
                 drop_seeds_skipped,
+                strip_seeds_skipped,
             }))
         })?;
 
@@ -15616,6 +15706,9 @@ mod shadow_tests {
                 seed_boundary_id: None,
                 drop_seeds: &[],
                 drop_seed_skipped: 0,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &[],
                 memories: &[own, shared, private],
                 memory_mutations: &[],
@@ -15686,6 +15779,9 @@ mod shadow_tests {
                 seed_boundary_id: None,
                 drop_seeds: &[],
                 drop_seed_skipped: 0,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &compartments,
                 memories: &memories,
                 memory_mutations: &mutations,
@@ -15720,6 +15816,9 @@ mod shadow_tests {
                 seed_boundary_id: None,
                 drop_seeds: &[],
                 drop_seed_skipped: 0,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],
@@ -15754,6 +15853,9 @@ mod shadow_tests {
                 seed_boundary_id: None,
                 drop_seeds: &[],
                 drop_seed_skipped: 0,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],
@@ -15789,6 +15891,9 @@ mod shadow_tests {
                 seed_boundary_id: None,
                 drop_seeds: &[],
                 drop_seed_skipped: 0,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &initial,
                 memories: &[],
                 memory_mutations: &[],
@@ -15813,6 +15918,9 @@ mod shadow_tests {
                 seed_boundary_id: None,
                 drop_seeds: &[],
                 drop_seed_skipped: 0,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &replacement,
                 memories: &[],
                 memory_mutations: &[],
@@ -15845,6 +15953,9 @@ mod shadow_tests {
                 seed_boundary_id: None,
                 drop_seeds: &[],
                 drop_seed_skipped: 0,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &replacement,
                 memories: &[],
                 memory_mutations: &[],
@@ -15875,6 +15986,9 @@ mod shadow_tests {
                 seed_boundary_id: Some("tail#1"),
                 drop_seeds: &[],
                 drop_seed_skipped: 0,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &compartments,
                 memories: &[],
                 memory_mutations: &[],
@@ -15924,6 +16038,9 @@ mod shadow_tests {
                 seed_boundary_id: None,
                 drop_seeds: &seeds,
                 drop_seed_skipped: 0,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],
@@ -15952,6 +16069,9 @@ mod shadow_tests {
                 seed_boundary_id: None,
                 drop_seeds: &seeds,
                 drop_seed_skipped: 0,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],
@@ -15990,6 +16110,9 @@ mod shadow_tests {
                 seed_boundary_id: None,
                 drop_seeds: &seeds,
                 drop_seed_skipped: 3,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &[],
                 memories: &[],
                 memory_mutations: &[],
@@ -16434,6 +16557,9 @@ mod shadow_tests {
                 seed_boundary_id: None,
                 drop_seeds: &[],
                 drop_seed_skipped: 0,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &[],
                 memories: &[incoming],
                 memory_mutations: &[],
@@ -16526,6 +16652,9 @@ mod shadow_tests {
                     seed_boundary_id: None,
                     drop_seeds: &[],
                     drop_seed_skipped: 0,
+                    strip_seeds: &[],
+                    strip_seed_skipped: 0,
+                    reasoning_cleared_through_tag: None,
                     compartments: &[],
                     memories: &[incoming],
                     memory_mutations: &[],
@@ -16614,6 +16743,9 @@ mod shadow_tests {
                     seed_boundary_id: None,
                     drop_seeds: &[],
                     drop_seed_skipped: 0,
+                    strip_seeds: &[],
+                    strip_seed_skipped: 0,
+                    reasoning_cleared_through_tag: None,
                     compartments: &[],
                     memories: &[incoming],
                     memory_mutations: &[],
@@ -17452,6 +17584,9 @@ mod shadow_tests {
                 seed_boundary_id: None,
                 drop_seeds: &[],
                 drop_seed_skipped: 0,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &[comp(0, 0, "first#0")],
                 memories: &[],
                 memory_mutations: &[],
@@ -17473,6 +17608,9 @@ mod shadow_tests {
                 seed_boundary_id: None,
                 drop_seeds: &[],
                 drop_seed_skipped: 0,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
                 compartments: &[comp(1, 1, "second#0")],
                 memories: &[],
                 memory_mutations: &[],

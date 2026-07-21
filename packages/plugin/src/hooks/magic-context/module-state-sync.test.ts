@@ -6,7 +6,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { runMigrations } from "../../features/magic-context/migrations";
-import { getCompartments } from "../../features/magic-context/storage";
+import {
+    addProcessedImageStrippedIds,
+    addStaleReduceStrippedIds,
+    applyStrippedPlaceholderDelta,
+    getCompartments,
+} from "../../features/magic-context/storage";
 import {
     insertTag,
     updateTagDropMode,
@@ -84,13 +89,7 @@ function createOpenCodeDb(
                 }),
             );
             for (const part of message.parts ?? [{ type: "text", text: message.id }]) {
-                insertPart.run(
-                    message.id,
-                    sessionId,
-                    timestamp,
-                    timestamp,
-                    JSON.stringify(part),
-                );
+                insertPart.run(message.id, sessionId, timestamp, timestamp, JSON.stringify(part));
             }
         });
     } finally {
@@ -218,6 +217,44 @@ describe("module drop-state cold-start seed", () => {
         ]);
         expect(body.drop_seeds[0]?.payload).toContain("src/main.ts");
         expect(body.drop_seed_skipped).toBe(1);
+    });
+});
+
+describe("module strip-state cold-start seed", () => {
+    it("carries frozen placeholder, stale-reduce, and image ids plus the tag watermark", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-strip-seed";
+        applyStrippedPlaceholderDelta(db, sessionId, { add: ["placeholder-message"] });
+        addStaleReduceStrippedIds(db, sessionId, ["reduce-message"]);
+        addProcessedImageStrippedIds(db, sessionId, ["image-message"]);
+        db.prepare(
+            "UPDATE session_meta SET cleared_reasoning_through_tag = ? WHERE session_id = ?",
+        ).run(42, sessionId);
+
+        const calls: unknown[] = [];
+        await syncModuleState({
+            client: {
+                async call(args) {
+                    calls.push(args.body);
+                    return { result: { shadow_seq: 1 } };
+                },
+            },
+            state: syncState(),
+            pass: { db, sessionId, nowMs: 1 },
+            projectRoot: "/tmp/project",
+            force: true,
+        });
+
+        const body = calls[0] as {
+            strip_seeds: Array<{ message_id: string; strip_kind: string }>;
+            reasoning_cleared_through_tag: number;
+        };
+        expect(body.strip_seeds).toEqual([
+            { message_id: "image-message", strip_kind: "processed_image" },
+            { message_id: "placeholder-message", strip_kind: "placeholder" },
+            { message_id: "reduce-message", strip_kind: "stale_reduce" },
+        ]);
+        expect(body.reasoning_cleared_through_tag).toBe(42);
     });
 });
 
