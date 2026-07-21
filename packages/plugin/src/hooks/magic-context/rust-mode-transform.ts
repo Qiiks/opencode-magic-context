@@ -51,6 +51,7 @@ import { resolveHistoryBudgetTokens } from "./transform";
 import { loadContextUsage } from "./transform-context-state";
 import type { MessageLike } from "./transform-operations";
 import { runRustModePostprocess } from "./transform-postprocess-phase";
+import { logTransformTiming } from "./transform-stage-logger";
 
 export class MemoryAuthorityUnavailableError extends Error {
     readonly code = "MEMORY_AUTHORITY_UNAVAILABLE";
@@ -94,6 +95,19 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
     ): Promise<ModuleCompartmentMirrorResponse>;
 }
 
+interface RustWireCache {
+    rawCount: number;
+    wireCount: number;
+    rawLastId: string | null;
+    rawLastSignature: string | null;
+    rawLastVisible: boolean;
+    ckFingerprint: string;
+    ckPrefixFingerprintBeforeLast: string;
+    nativeFingerprint: string;
+    nativePrefixFingerprintBeforeLast: string;
+    fingerprint: string;
+}
+
 interface RustSessionState extends ModuleStateSyncState {
     initialized: boolean;
     consecutiveFailures: number;
@@ -132,10 +146,6 @@ export interface RustModeTransformOptions {
     allowAuthorityProtocolBypassForTests?: boolean;
 }
 
-function cloneForModule<T>(value: T): T {
-    return JSON.parse(JSON.stringify(value)) as T;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === "object";
 }
@@ -156,6 +166,39 @@ function messageInfo(value: unknown): Record<string, unknown> {
     return isRecord(value.info) ? value.info : value;
 }
 
+function messageIdOf(message: MessageLike): string | null {
+    const id = messageInfo(message).id;
+    return typeof id === "string" && id.length > 0 ? id : null;
+}
+
+function messageCacheSignature(message: MessageLike): string {
+    const parts = Array.isArray(message.parts) ? message.parts : [];
+    const serializedParts = JSON.stringify(parts) ?? "null";
+    const serializedMessage = JSON.stringify(message) ?? "null";
+    return `${messageIdOf(message) ?? ""}:${parts.length}:${Buffer.byteLength(serializedParts)}:${createHash("sha256").update(serializedMessage).digest("hex")}`;
+}
+
+function advanceWireFingerprint(previous: string, encoded: unknown): string {
+    return createHash("sha256")
+        .update(previous)
+        .update("\\0")
+        .update(JSON.stringify(encoded) ?? "null")
+        .digest("hex");
+}
+
+function buildWireFingerprint(encoded: unknown[]): {
+    fingerprint: string;
+    prefixFingerprintBeforeLast: string;
+} {
+    let fingerprint = "rust-wire-v1";
+    let prefixFingerprintBeforeLast = fingerprint;
+    for (let index = 0; index < encoded.length; index += 1) {
+        if (index === encoded.length - 1) prefixFingerprintBeforeLast = fingerprint;
+        fingerprint = advanceWireFingerprint(fingerprint, encoded[index]);
+    }
+    return { fingerprint, prefixFingerprintBeforeLast };
+}
+
 function newestUserMessage(messages: MessageLike[]): MessageLike | undefined {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
         if (messageInfo(messages[index]).role === "user") return messages[index];
@@ -172,6 +215,30 @@ function newestAssistantOrUserMessageId(messages: MessageLike[]): string | null 
     return null;
 }
 
+interface RustPassTimings {
+    ordinalResolve: number;
+    stateSync: number;
+    clone: number;
+    wireBuild: number;
+    transport: number;
+    transportPages: number;
+    apply: number;
+    lkgSnapshot: number;
+}
+
+function emptyRustPassTimings(): RustPassTimings {
+    return {
+        ordinalResolve: 0,
+        stateSync: 0,
+        clone: 0,
+        wireBuild: 0,
+        transport: 0,
+        transportPages: 0,
+        apply: 0,
+        lkgSnapshot: 0,
+    };
+}
+
 function formatRustPassLog(args: {
     decision: string;
     reason: string;
@@ -181,8 +248,19 @@ function formatRustPassLog(args: {
     applied: boolean;
     elapsedMs: number;
     moduleElapsedMs: number;
+    timings?: RustPassTimings;
 }): string {
-    return `rust pass: decision=${args.decision} reason=${args.reason} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms`;
+    const timings = args.timings ?? emptyRustPassTimings();
+    const measured =
+        timings.ordinalResolve +
+        timings.stateSync +
+        timings.clone +
+        timings.wireBuild +
+        timings.transport +
+        timings.apply +
+        timings.lkgSnapshot;
+    const unattributed = Math.max(0, args.elapsedMs - measured);
+    return `rust pass: decision=${args.decision} reason=${args.reason} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} other:${unattributed.toFixed(1)}`;
 }
 
 function isSyntheticUserMessage(message: MessageLike | undefined): boolean {
@@ -588,6 +666,12 @@ function buildTransformBody(args: {
     channel2NudgeState: string;
     emergencyRecoveryArmed: boolean;
     declaredTrim?: unknown;
+    fullArrayFingerprint?: string;
+    tailDelta?: {
+        after: string;
+        replaceFrom: number;
+        nativeReplaceFrom: number;
+    };
 }): Record<string, unknown> {
     return {
         method: "transform",
@@ -612,6 +696,16 @@ function buildTransformBody(args: {
         protected_tags: args.passInputs.protected_tags ?? DEFAULT_PROTECTED_TAGS,
         messages: args.input,
         native_messages: args.nativeMessages,
+        ...(args.fullArrayFingerprint ? { full_array_fingerprint: args.fullArrayFingerprint } : {}),
+        ...(args.tailDelta
+            ? {
+                  tail_delta: {
+                      after: args.tailDelta.after,
+                      replace_from: args.tailDelta.replaceFrom,
+                      native_replace_from: args.tailDelta.nativeReplaceFrom,
+                  },
+              }
+            : {}),
         usage: args.usage,
         provider_error: args.passInputs.provider_error,
         mid_turn: args.midTurn,
@@ -647,7 +741,25 @@ export function createRustModeTransform(
     getState: (sessionId: string) => Readonly<RustSessionState>;
 } {
     const states = new Map<string, RustSessionState>();
+    const wireCaches = new Map<string, RustWireCache>();
     const timeoutMs = Math.max(1, options.moduleTimeoutMs ?? RUST_SEND_TIMEOUT_MS);
+
+    const logStage = (
+        sessionId: string,
+        stage: keyof RustPassTimings,
+        startedAt: number,
+        timings: RustPassTimings,
+        extra?: string,
+    ): void => {
+        const elapsed = Math.max(0, performance.now() - startedAt);
+        timings[stage] += elapsed;
+        logTransformTiming(
+            sessionId,
+            `rust.${stage.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)}`,
+            startedAt,
+            extra,
+        );
+    };
 
     const callModule = async (
         args: Parameters<RustModeModuleClient["call"]>[0],
@@ -765,6 +877,7 @@ export function createRustModeTransform(
     ): Promise<void> => {
         const passStartedAt = performance.now();
         const state = ensureState(states, sessionId);
+        const timings = emptyRustPassTimings();
         state.passCount += 1;
         const syntheticTurn = observeSyntheticTurn(state, messages);
         const syntheticLoopBlocked = syntheticTurn && state.syntheticTurnCount >= 3;
@@ -797,6 +910,7 @@ export function createRustModeTransform(
                     applied,
                     elapsedMs,
                     moduleElapsedMs,
+                    timings,
                 }),
             );
         };
@@ -837,7 +951,6 @@ export function createRustModeTransform(
                 return;
             }
         }
-        const rawMessages = messages.slice();
         const reduceAvailability = resolveCtxReduceAvailability(sessionId);
         // A provisional fail-open verdict must not activate provider-visible bytes. The
         // first persisted user message freezes the verdict for all later transform passes.
@@ -902,9 +1015,68 @@ export function createRustModeTransform(
                 emergency_recovery_armed:
                     overflowState.needsEmergencyRecovery || isEmergencyRecoveryArmed(sessionId),
             };
-            const resolved = await resolveOrdinalsForModule({
+            const previousWireCache = wireCaches.get(sessionId);
+            let wireDelta:
+                | {
+                      rawStart: number;
+                      wireStart: number;
+                      after: string;
+                      ckAfter: string;
+                      nativeAfter: string;
+                  }
+                | undefined;
+            if (previousWireCache && messages.length >= previousWireCache.rawCount) {
+                const appending = messages.length > previousWireCache.rawCount;
+                const lastMessage = messages.at(-1);
+                const lastChanged =
+                    !appending && lastMessage !== undefined
+                        ? messageCacheSignature(lastMessage) !== previousWireCache.rawLastSignature
+                        : false;
+                const replaceExistingTail =
+                    lastChanged || (appending && previousWireCache.rawLastVisible);
+                const rawStart = replaceExistingTail
+                    ? Math.max(0, previousWireCache.rawCount - 1)
+                    : previousWireCache.rawCount;
+                const replaceExistingWireTail =
+                    previousWireCache.rawLastVisible && (lastChanged || appending);
+                const wireStart = replaceExistingWireTail
+                    ? Math.max(0, previousWireCache.wireCount - 1)
+                    : previousWireCache.wireCount;
+                const ckAfter =
+                    wireStart === previousWireCache.wireCount - 1
+                        ? previousWireCache.ckPrefixFingerprintBeforeLast
+                        : wireStart === previousWireCache.wireCount
+                          ? previousWireCache.ckFingerprint
+                          : undefined;
+                const nativeAfter =
+                    rawStart === previousWireCache.rawCount - 1
+                        ? previousWireCache.nativePrefixFingerprintBeforeLast
+                        : rawStart === previousWireCache.rawCount
+                          ? previousWireCache.nativeFingerprint
+                          : undefined;
+                if (ckAfter !== undefined && nativeAfter !== undefined) {
+                    wireDelta = {
+                        rawStart,
+                        wireStart,
+                        ckAfter,
+                        nativeAfter,
+                        after: `${ckAfter}|${nativeAfter}`,
+                    };
+                }
+            }
+            const cloneStartedAt = performance.now();
+            const ordinalMessages = wireDelta ? messages.slice(wireDelta.rawStart) : messages;
+            logStage(
                 sessionId,
-                messages: cloneForModule(messages),
+                "clone",
+                cloneStartedAt,
+                timings,
+                wireDelta ? "mode=projection-tail" : "mode=projection-full",
+            );
+            const ordinalStartedAt = performance.now();
+            let resolved = await resolveOrdinalsForModule({
+                sessionId,
+                messages: ordinalMessages,
                 generation: state.shadowGeneration,
                 memoGeneration: state.idOrdinalMemoGeneration,
                 memo: state.idOrdinalMemo,
@@ -912,6 +1084,29 @@ export function createRustModeTransform(
                 memoStoredCount: state.ordinalMemoStoredCount,
                 memoCanonicalCount: state.ordinalMemoCanonicalCount,
             });
+            logStage(sessionId, "ordinalResolve", ordinalStartedAt, timings);
+            if (!resolved.ok && wireDelta) {
+                // A cache miss or ordinal drift invalidates the delta assumption. Re-prime
+                // from the durable raw rows before deciding whether the pass can proceed.
+                wireDelta = undefined;
+                const fullOrdinalStartedAt = performance.now();
+                resolved = await resolveOrdinalsForModule({
+                    sessionId,
+                    messages,
+                    generation: state.shadowGeneration,
+                    memoGeneration: state.idOrdinalMemoGeneration,
+                    memo: state.idOrdinalMemo,
+                    memoAnchor: state.ordinalMemoAnchor,
+                    memoCanonicalCount: state.ordinalMemoCanonicalCount,
+                });
+                logStage(
+                    sessionId,
+                    "ordinalResolve",
+                    fullOrdinalStartedAt,
+                    timings,
+                    "fallback=full",
+                );
+            }
             if (!resolved.ok) {
                 throw new Error(
                     `rust ordinal ${resolved.reason}: messageId=${resolved.messageId ?? "unknown"} ` +
@@ -937,45 +1132,115 @@ export function createRustModeTransform(
                 deps.memoryConfig?.enabled && directory.length > 0
                     ? resolveProjectIdentity(directory)
                     : deps.projectPath;
-            await prepareRustMemoryAuthority({
-                db: deps.db,
-                module: options.moduleClient,
-                projectPath: memoryProjectPath ?? projectRoot,
-                projectRoot,
-                state,
-                allowProtocolBypassForTests: options.allowAuthorityProtocolBypassForTests,
-                onProjectPrepared: options.onProjectPrepared,
-            });
+            const stateSyncStartedAt = performance.now();
             const authoritySeqAdoption = { used: false };
-            if (options.memorySyncRequestedSessions?.delete(sessionId)) {
-                // A memory tool call can complete after the prior authority pass has
-                // acknowledged its watermarks. Rewind only memory watermarks so the
-                // next pass ships the mutation delta without reseeding compartments.
-                const watermarks = state.lastAckedWatermarks;
-                if (watermarks) {
-                    state.lastAckedWatermarks = {
-                        ...watermarks,
-                        memory_id: 0,
-                        memory_mutation_id: 0,
+            try {
+                await prepareRustMemoryAuthority({
+                    db: deps.db,
+                    module: options.moduleClient,
+                    projectPath: memoryProjectPath ?? projectRoot,
+                    projectRoot,
+                    state,
+                    allowProtocolBypassForTests: options.allowAuthorityProtocolBypassForTests,
+                    onProjectPrepared: options.onProjectPrepared,
+                });
+                if (options.memorySyncRequestedSessions?.delete(sessionId)) {
+                    // A memory tool call can complete after the prior authority pass has
+                    // acknowledged its watermarks. Rewind only memory watermarks so the
+                    // next pass ships the mutation delta without reseeding compartments.
+                    const watermarks = state.lastAckedWatermarks;
+                    if (watermarks) {
+                        state.lastAckedWatermarks = {
+                            ...watermarks,
+                            memory_id: 0,
+                            memory_mutation_id: 0,
+                        };
+                    }
+                }
+                await syncModuleState({
+                    client: { call: callModule },
+                    state,
+                    pass: syncPass,
+                    projectRoot,
+                    force: !state.initialized,
+                    options: {
+                        authority: true,
+                        authorityState: state.memoryAuthorityReady ? "MODULE" : undefined,
+                        authoritySeqAdoption,
+                    },
+                });
+            } finally {
+                logStage(sessionId, "stateSync", stateSyncStartedAt, timings);
+            }
+            const wireBuildStartedAt = performance.now();
+            const encodedInput = encodeOpenCodeMessagesToCk(resolved.annotatedInput);
+            let pendingWireCache: RustWireCache = (() => {
+                const rawLast = messages.at(-1);
+                if (!wireDelta || !previousWireCache) {
+                    const ckFingerprint = buildWireFingerprint(encodedInput);
+                    const nativeFingerprint = buildWireFingerprint(messages);
+                    return {
+                        rawCount: messages.length,
+                        wireCount: encodedInput.length,
+                        rawLastId: rawLast ? messageIdOf(rawLast) : null,
+                        rawLastSignature: rawLast ? messageCacheSignature(rawLast) : null,
+                        rawLastVisible:
+                            rawLast !== undefined &&
+                            encodedInput.some((entry) => entry.mid === messageIdOf(rawLast)),
+                        ckFingerprint: ckFingerprint.fingerprint,
+                        ckPrefixFingerprintBeforeLast: ckFingerprint.prefixFingerprintBeforeLast,
+                        nativeFingerprint: nativeFingerprint.fingerprint,
+                        nativePrefixFingerprintBeforeLast:
+                            nativeFingerprint.prefixFingerprintBeforeLast,
+                        fingerprint: `${ckFingerprint.fingerprint}|${nativeFingerprint.fingerprint}`,
                     };
                 }
-            }
-            await syncModuleState({
-                client: { call: callModule },
-                state,
-                pass: syncPass,
-                projectRoot,
-                force: !state.initialized,
-                options: {
-                    authority: true,
-                    authorityState: state.memoryAuthorityReady ? "MODULE" : undefined,
-                    authoritySeqAdoption,
-                },
-            });
-            const body = buildTransformBody({
+                let ckFingerprint = wireDelta.ckAfter;
+                let ckPrefixFingerprintBeforeLast = ckFingerprint;
+                for (let index = 0; index < encodedInput.length; index += 1) {
+                    if (index === encodedInput.length - 1)
+                        ckPrefixFingerprintBeforeLast = ckFingerprint;
+                    ckFingerprint = advanceWireFingerprint(ckFingerprint, encodedInput[index]);
+                }
+                const nativeMessages = messages.slice(wireDelta.rawStart);
+                let nativeFingerprint = wireDelta.nativeAfter;
+                let nativePrefixFingerprintBeforeLast = nativeFingerprint;
+                for (let index = 0; index < nativeMessages.length; index += 1) {
+                    if (index === nativeMessages.length - 1)
+                        nativePrefixFingerprintBeforeLast = nativeFingerprint;
+                    nativeFingerprint = advanceWireFingerprint(
+                        nativeFingerprint,
+                        nativeMessages[index],
+                    );
+                }
+                const rawLastVisible =
+                    rawLast !== undefined &&
+                    encodedInput.some((entry) => entry.mid === messageIdOf(rawLast));
+                return {
+                    rawCount: messages.length,
+                    wireCount: wireDelta.wireStart + encodedInput.length,
+                    rawLastId: rawLast ? messageIdOf(rawLast) : null,
+                    rawLastSignature: rawLast ? messageCacheSignature(rawLast) : null,
+                    rawLastVisible,
+                    ckFingerprint,
+                    ckPrefixFingerprintBeforeLast,
+                    nativeFingerprint,
+                    nativePrefixFingerprintBeforeLast,
+                    fingerprint: `${ckFingerprint}|${nativeFingerprint}`,
+                };
+            })();
+            let body = buildTransformBody({
                 sessionId,
-                input: encodeOpenCodeMessagesToCk(resolved.annotatedInput),
-                nativeMessages: messages,
+                input: encodedInput,
+                nativeMessages: wireDelta ? messages.slice(wireDelta.rawStart) : messages,
+                fullArrayFingerprint: pendingWireCache.fingerprint,
+                tailDelta: wireDelta
+                    ? {
+                          after: wireDelta.after,
+                          replaceFrom: wireDelta.wireStart,
+                          nativeReplaceFrom: wireDelta.rawStart,
+                      }
+                    : undefined,
                 passInputs,
                 usage: passUsage(usage, contextLimit),
                 modelKey: modelKey ?? null,
@@ -990,8 +1255,16 @@ export function createRustModeTransform(
                 emergencyRecoveryArmed: passInputs.emergency_recovery_armed === true,
             });
             const pages = buildPagedModuleTransformPayloads(body);
+            logStage(
+                sessionId,
+                "wireBuild",
+                wireBuildStartedAt,
+                timings,
+                wireDelta ? `mode=tail_delta input=${encodedInput.length}` : "mode=full",
+            );
             let response: Record<string, unknown> | undefined;
-            for (const page of pages) {
+            for (const [index, page] of pages.entries()) {
+                const transportStartedAt = performance.now();
                 response = responseValue(
                     await callModule({
                         sessionId,
@@ -1000,11 +1273,20 @@ export function createRustModeTransform(
                         body: page,
                     }),
                 );
+                timings.transportPages += 1;
+                logStage(
+                    sessionId,
+                    "transport",
+                    transportStartedAt,
+                    timings,
+                    `page=${index + 1}/${pages.length}`,
+                );
             }
             if (!response) throw new Error("rust module returned no transform response");
             captureResponseTelemetry(response);
             if (isNeedFullSync(response)) {
                 state.initialized = false;
+                const retryStateSyncStartedAt = performance.now();
                 await syncModuleState({
                     client: { call: callModule },
                     state,
@@ -1017,8 +1299,92 @@ export function createRustModeTransform(
                         authoritySeqAdoption,
                     },
                 });
+                logStage(sessionId, "stateSync", retryStateSyncStartedAt, timings, "retry=full");
+                if (wireDelta) {
+                    const retryOrdinalStartedAt = performance.now();
+                    const retryResolved = await resolveOrdinalsForModule({
+                        sessionId,
+                        messages,
+                        generation: state.shadowGeneration,
+                        memoGeneration: state.idOrdinalMemoGeneration,
+                        memo: state.idOrdinalMemo,
+                        memoAnchor: state.ordinalMemoAnchor,
+                        memoStoredCount: state.ordinalMemoStoredCount,
+                        memoCanonicalCount: state.ordinalMemoCanonicalCount,
+                    });
+                    logStage(
+                        sessionId,
+                        "ordinalResolve",
+                        retryOrdinalStartedAt,
+                        timings,
+                        "retry=full",
+                    );
+                    if (!retryResolved.ok) {
+                        throw new Error(`rust ordinal ${retryResolved.reason} during full retry`);
+                    }
+                    state.idOrdinalMemoGeneration = retryResolved.memoGeneration;
+                    state.ordinalMemoAnchor = retryResolved.memoAnchor;
+                    state.ordinalMemoStoredCount = retryResolved.memoStoredCount;
+                    state.ordinalMemoCanonicalCount = retryResolved.memoCanonicalCount;
+                    const retryEncodedInput = encodeOpenCodeMessagesToCk(
+                        retryResolved.annotatedInput,
+                    );
+                    const retryCkFingerprint = buildWireFingerprint(retryEncodedInput);
+                    const retryNativeFingerprint = buildWireFingerprint(messages);
+                    const retryRawLast = messages.at(-1);
+                    pendingWireCache = {
+                        rawCount: messages.length,
+                        wireCount: retryEncodedInput.length,
+                        rawLastId: retryRawLast ? messageIdOf(retryRawLast) : null,
+                        rawLastSignature: retryRawLast ? messageCacheSignature(retryRawLast) : null,
+                        rawLastVisible:
+                            retryRawLast !== undefined &&
+                            retryEncodedInput.some(
+                                (entry) => entry.mid === messageIdOf(retryRawLast),
+                            ),
+                        ckFingerprint: retryCkFingerprint.fingerprint,
+                        ckPrefixFingerprintBeforeLast:
+                            retryCkFingerprint.prefixFingerprintBeforeLast,
+                        nativeFingerprint: retryNativeFingerprint.fingerprint,
+                        nativePrefixFingerprintBeforeLast:
+                            retryNativeFingerprint.prefixFingerprintBeforeLast,
+                        fingerprint: `${retryCkFingerprint.fingerprint}|${retryNativeFingerprint.fingerprint}`,
+                    };
+                    const retryWireBuildStartedAt = performance.now();
+                    body = buildTransformBody({
+                        sessionId,
+                        input: retryEncodedInput,
+                        nativeMessages: messages,
+                        fullArrayFingerprint: pendingWireCache.fingerprint,
+                        passInputs,
+                        usage: passUsage(usage, contextLimit),
+                        modelKey: modelKey ?? null,
+                        providerId: model?.providerID ?? null,
+                        systemPromptHash: sessionMeta.systemPromptHash ?? "",
+                        upgradeState: String(passInputs.upgrade_state ?? ""),
+                        midTurn,
+                        prevResponseCompletedAtMs:
+                            sessionMeta.lastResponseTime > 0
+                                ? sessionMeta.lastResponseTime
+                                : undefined,
+                        requestObservedAtMs,
+                        channel2NudgeState: String(passInputs.channel2_nudge_state ?? ""),
+                        emergencyRecoveryArmed: passInputs.emergency_recovery_armed === true,
+                    });
+                    logStage(
+                        sessionId,
+                        "wireBuild",
+                        retryWireBuildStartedAt,
+                        timings,
+                        "retry=full",
+                    );
+                }
                 response = undefined;
-                for (const page of buildPagedModuleTransformPayloads(body)) {
+                const retryWireBuildStartedAt = performance.now();
+                const retryPages = buildPagedModuleTransformPayloads(body);
+                logStage(sessionId, "wireBuild", retryWireBuildStartedAt, timings, "retry=full");
+                for (const [index, page] of retryPages.entries()) {
+                    const transportStartedAt = performance.now();
                     response = responseValue(
                         await callModule({
                             sessionId,
@@ -1026,6 +1392,14 @@ export function createRustModeTransform(
                             method: "transform",
                             body: page,
                         }),
+                    );
+                    timings.transportPages += 1;
+                    logStage(
+                        sessionId,
+                        "transport",
+                        transportStartedAt,
+                        timings,
+                        `page=${index + 1}/${retryPages.length} retry=full`,
                     );
                 }
                 if (!response) throw new Error("rust module returned no retry transform response");
@@ -1060,8 +1434,12 @@ export function createRustModeTransform(
                 }
             };
             let appliedMessages: unknown[];
+            const applyStartedAt = performance.now();
             try {
-                appliedMessages = applyNativeMessagesVerbatim(output, response);
+                // Validate and postprocess the module result before touching the caller-owned
+                // array. This keeps failure recovery O(1) on the steady path: no defensive
+                // full-array clone is needed just in case boundary validation rejects it.
+                appliedMessages = applyNativeMessagesVerbatim({ messages: [] }, response);
                 runRustModePostprocess({
                     db: deps.db,
                     sessionId,
@@ -1073,8 +1451,32 @@ export function createRustModeTransform(
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {
                     assertNativeBoundary(appliedMessages, sessionId, boundaryId);
                 }
-                appliedAt = performance.now();
+                logStage(sessionId, "apply", applyStartedAt, timings);
+                const lkgSnapshotStartedAt = performance.now();
+                const explicitDecision =
+                    typeof response.decision === "string" ||
+                    typeof response.action === "string" ||
+                    typeof response.cache_bust === "boolean";
+                const decisionUpper = decision.toUpperCase();
+                const cacheBustingPass =
+                    response.cache_bust === true ||
+                    decisionUpper === "HARD" ||
+                    decisionUpper === "MIGRATE_HARD" ||
+                    decisionUpper === "EXECUTE" ||
+                    !explicitDecision;
+                if (cacheBustingPass) captureRustResponse(sessionId, messages, response);
+                logStage(
+                    sessionId,
+                    "lkgSnapshot",
+                    lkgSnapshotStartedAt,
+                    timings,
+                    cacheBustingPass ? "captured=true" : "captured=false",
+                );
+                const applyReplaceStartedAt = performance.now();
+                replaceMessagesInPlace(output, appliedMessages);
+                logStage(sessionId, "apply", applyReplaceStartedAt, timings);
             } catch (error) {
+                logStage(sessionId, "apply", applyStartedAt, timings, "failed=true");
                 try {
                     await sendNoteDeliveryDisposition("transform.nack");
                 } catch (nackError) {
@@ -1091,7 +1493,6 @@ export function createRustModeTransform(
                     sessionLog(sessionId, "rust note delivery ack failed (will retry):", ackError);
                 }
             }
-            captureRustResponse(sessionId, rawMessages, response);
             state.initialized = true;
             state.seedPassPending = false;
             state.consecutiveFailures = 0;
@@ -1150,6 +1551,8 @@ export function createRustModeTransform(
                     sessionLog(sessionId, "rust compartment mirror-back failed (ignored):", error);
                 }
             }
+            wireCaches.set(sessionId, pendingWireCache);
+            appliedAt = performance.now();
             finishPass(true);
         } catch (error) {
             if (
@@ -1162,12 +1565,10 @@ export function createRustModeTransform(
                     error,
                 );
             }
-            // Restore the caller-owned raw array before attempting LKG replay. The
-            // invariant is checked after in-place application, so a failed check may
-            // have already replaced its contents with an untrusted module response.
-            replaceMessagesInPlace(output, rawMessages);
-            const replayed = replayLastGood(sessionId, rawMessages, output);
-            if (!replayed) replaceMessagesInPlace(output, rawMessages);
+            // Validation happens before the caller-owned array is replaced, so the
+            // original live array is still available for fail-open replay.
+            const replayed = replayLastGood(sessionId, messages, output);
+            if (!replayed) replaceMessagesInPlace(output, messages);
             markFailure(sessionId, state, error);
             finishPass(false);
             return;

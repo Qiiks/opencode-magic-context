@@ -298,7 +298,7 @@ describe("Rust mode authority adapter", () => {
                 moduleElapsedMs: 8.765,
             }),
         ).toBe(
-            "rust pass: decision=HARD reason=first_render served_from=transform in=4 out=3 applied=true elapsed=12.3 ms module=8.8 ms",
+            "rust pass: decision=HARD reason=first_render served_from=transform in=4 out=3 applied=true elapsed=12.3 ms module=8.8 ms stages=ordinal_resolve:0.0 state_sync:0.0 clone:0.0 wire_build:0.0 transport:0.0 transport_pages:0 apply:0.0 lkg_snapshot:0.0 other:12.3",
         );
     });
 
@@ -541,6 +541,13 @@ describe("Rust mode authority adapter", () => {
         const secondOutput = { messages: secondInput as unknown[] };
         await transform.run(sessionId, secondInput, secondOutput, makeMeta(db, sessionId));
         expect(methods).toEqual(["transform"]);
+        expect(transformRequest?.tail_delta).toEqual({
+            after: expect.any(String),
+            replace_from: 1,
+            native_replace_from: 1,
+        });
+        expect((transformRequest?.messages as unknown[]).length).toBe(0);
+        expect((transformRequest?.native_messages as unknown[]).length).toBe(0);
         expect(secondOutput.messages).toEqual(native);
     });
 
@@ -775,6 +782,70 @@ describe("Rust mode authority adapter", () => {
         ).toBe(true);
         expect(transformBodies.at(-1)?.tool_present).toBe(true);
         expect(output.messages).toEqual(native);
+    });
+
+    it("keeps an 800-message steady-state pass on the incremental wire path", async () => {
+        const sessionId = `rust-wire-delta-${Date.now()}`;
+        sessions.push(sessionId);
+        const rows = Array.from({ length: 800 }, (_, index) => ({
+            id: `m-${index + 1}`,
+            timeCreated: index + 1,
+            contributesOrdinal: true,
+            hasValidInfo: true,
+        }));
+        unregisters.push(
+            setRawMessageProvider(sessionId, {
+                readMessages: () => rows,
+                readMessageOrdinalPage: (after, limit) =>
+                    rows
+                        .filter(
+                            (row) =>
+                                !after ||
+                                row.timeCreated > after.timeCreated ||
+                                (row.timeCreated === after.timeCreated && row.id > after.id),
+                        )
+                        .slice(0, limit),
+                getStoredMessageCount: () => rows.length,
+            }),
+        );
+        const db = makeDb();
+        const requestBodies: Array<Record<string, unknown>> = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform") requestBodies.push(body as Record<string, unknown>);
+                return method === "transform" ? { native_messages: [] } : { ok: true };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const messages = rows.map((row) => ({
+            info: { id: row.id, role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: `message ${row.id}` }],
+        }));
+        await transform.run(
+            sessionId,
+            messages,
+            { messages: [...messages] },
+            makeMeta(db, sessionId),
+        );
+        const steadyStartedAt = performance.now();
+        await transform.run(
+            sessionId,
+            messages,
+            { messages: [...messages] },
+            makeMeta(db, sessionId),
+        );
+        const steadyElapsed = performance.now() - steadyStartedAt;
+
+        expect(requestBodies).toHaveLength(2);
+        expect(requestBodies[0]?.messages).toHaveLength(800);
+        expect(requestBodies[1]?.messages).toHaveLength(0);
+        expect(requestBodies[1]?.native_messages).toHaveLength(0);
+        expect(requestBodies[1]?.tail_delta).toEqual({
+            after: expect.any(String),
+            replace_from: 800,
+            native_replace_from: 800,
+        });
+        expect(steadyElapsed).toBeLessThan(200);
     });
 
     it("passes through raw input, parks after three failures, then probes on the fifth pass", async () => {
