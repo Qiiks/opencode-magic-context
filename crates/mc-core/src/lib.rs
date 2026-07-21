@@ -69,6 +69,9 @@ pub struct ClassifierInput {
     /// so a never-before-seen target id is the only "change" that can occur within an
     /// epoch. Coalesces with `m1_revision_changed` into one SOFT (never two busts).
     pub reductions_pending: bool,
+    /// True only when this pass is already going to render bytes for an independent
+    /// reason. A pending in-session m1 delta is deferred unless this gate is open.
+    pub bust_opportunity: bool,
 }
 
 /// The routing decision for a pass. Distinguishes a plain Hard from a legacy
@@ -99,9 +102,10 @@ pub enum PassPlan {
 /// - Rule 6 (reconcile-clearing defer) runs BEFORE rule 7 (soft-delta): the core's
 ///   `step_soft` never touches `reconcile_pending`, so a pass with the flag still set
 ///   must clear it via a `step_defer` first; the deferred m1 delta re-derives next pass.
-/// - Rule 7 REQUIRES `boundary_present`: `step_soft` ignores the boundary and never sets
-///   `reconcile_pending`, so a boundary-absent Soft would bust the m1 breakpoint AND
-///   strand the reconcile flag (serving stale frozen bytes with no path to reconcile).
+/// - Rule 7 requires both `boundary_present` and `bust_opportunity`: an in-session signal
+///   mismatch is pending work, not itself permission to rewrite provider-visible bytes.
+///   `bust_opportunity` is supplied by the module after it identifies an independent render
+///   (hard arm, explicit refresh, force/emergency drive, or first reduction application).
 ///   The boundary-absent delta case therefore falls to rule 8 (defer + set reconcile via
 ///   `step_defer`); the delta re-derives once reconcile resolves.
 pub fn classify(input: &ClassifierInput) -> PassPlan {
@@ -133,11 +137,13 @@ pub fn classify(input: &ClassifierInput) -> PassPlan {
     if input.reconcile_pending {
         return PassPlan::Defer;
     }
-    // 7. A delta rides — m1 content OR a new reduction to freeze — ONLY with the
-    //    boundary present. The two coalesce into ONE Soft: the module's Soft render
-    //    emits whichever deltas are active (changed m1 + each newly-frozen reduction)
-    //    in a single rendered set, so a pass where both change is one bust, not two.
-    if input.boundary_present && (input.m1_revision_changed || input.reductions_pending) {
+    // 7. A delta rides only when this pass already has an independent bust opportunity.
+    //    The two deltas coalesce into ONE Soft: the module's Soft render emits whichever
+    //    deltas are active (changed m1 + each newly-frozen reduction) in one rendered set.
+    if input.boundary_present
+        && input.bust_opportunity
+        && (input.m1_revision_changed || input.reductions_pending)
+    {
         return PassPlan::Soft;
     }
     // 8. Defer: replay frozen bytes verbatim.
@@ -153,6 +159,7 @@ mod tests {
             initialized: true,
             valid_m0m1_shape: true,
             boundary_present: true,
+            bust_opportunity: true,
             ..Default::default()
         }
     }
@@ -161,6 +168,7 @@ mod tests {
     fn bootstrap_when_uninitialized_is_hard() {
         let input = ClassifierInput {
             initialized: false,
+            m1_revision_changed: true,
             ..Default::default()
         };
         assert_eq!(classify(&input), PassPlan::Hard);
@@ -171,6 +179,7 @@ mod tests {
         let input = ClassifierInput {
             is_legacy_baseline: true,
             valid_m0m1_shape: false, // legacy is not m0/m1-valid, but rule 2 wins
+            m1_revision_changed: true,
             ..base()
         };
         assert_eq!(classify(&input), PassPlan::MigrateHard);
@@ -181,6 +190,7 @@ mod tests {
         let input = ClassifierInput {
             is_legacy_baseline: false,
             valid_m0m1_shape: false,
+            m1_revision_changed: true,
             ..base()
         };
         assert!(matches!(classify(&input), PassPlan::Reject(_)));
@@ -190,6 +200,7 @@ mod tests {
     fn epoch_change_is_hard() {
         let input = ClassifierInput {
             render_config_changed: true,
+            m1_revision_changed: true,
             ..base()
         };
         assert_eq!(classify(&input), PassPlan::Hard);
@@ -199,6 +210,7 @@ mod tests {
     fn hard_fold_requested_is_hard() {
         let input = ClassifierInput {
             hard_fold_requested: true,
+            m1_revision_changed: true,
             ..base()
         };
         assert_eq!(classify(&input), PassPlan::Hard);
@@ -209,6 +221,7 @@ mod tests {
         let input = ClassifierInput {
             reconcile_pending: true,
             boundary_present: false,
+            m1_revision_changed: true,
             ..base()
         };
         assert_eq!(classify(&input), PassPlan::Hard);
@@ -243,6 +256,16 @@ mod tests {
             ..base()
         };
         assert_eq!(classify(&absent), PassPlan::Defer);
+    }
+
+    #[test]
+    fn pending_delta_without_bust_opportunity_defers() {
+        let input = ClassifierInput {
+            m1_revision_changed: true,
+            bust_opportunity: false,
+            ..base()
+        };
+        assert_eq!(classify(&input), PassPlan::Defer);
     }
 
     #[test]
@@ -286,6 +309,7 @@ mod tests {
         // never Soft-bust + strand the flag — same guard as the m1 soft-delta.
         let input = ClassifierInput {
             boundary_present: false,
+            m1_revision_changed: true,
             reductions_pending: true,
             reconcile_pending: false,
             ..base()

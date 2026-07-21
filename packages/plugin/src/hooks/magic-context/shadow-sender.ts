@@ -230,6 +230,8 @@ interface ShadowWatermarks {
     m0_mutation_id: number;
     memory_mutation_id: number;
     last_todo_state_hash: string;
+    project_memory_epoch: number;
+    project_user_profile_version: number;
 }
 
 interface ShadowWorkspacePayload {

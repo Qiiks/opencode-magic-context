@@ -134,12 +134,16 @@
       ]
     },
     "last_todo_state": "[{\"content\":\"fixture todo\",\"status\":\"pending\"}]",
+    "project_memory_epoch": 0,
+    "user_profile_version": 0,
     "acked_watermarks": {
       "compartment_sequence": 2,
       "memory_id": 2,
       "m0_mutation_id": 1,
       "memory_mutation_id": 1,
-      "last_todo_state_hash": "1d9122e1b8a66758890684eba25ec2577a82b9c66407a55a903de3b5132bd905"
+      "last_todo_state_hash": "1d9122e1b8a66758890684eba25ec2577a82b9c66407a55a903de3b5132bd905",
+      "project_memory_epoch": 0,
+      "project_user_profile_version": 0
     }
   },
   "shadow_transform": {
@@ -260,6 +264,8 @@
     "memory_id": 2,
     "m0_mutation_id": 1,
     "memory_mutation_id": 1,
-    "last_todo_state_hash": "1d9122e1b8a66758890684eba25ec2577a82b9c66407a55a903de3b5132bd905"
+    "last_todo_state_hash": "1d9122e1b8a66758890684eba25ec2577a82b9c66407a55a903de3b5132bd905",
+    "project_memory_epoch": 0,
+    "project_user_profile_version": 0
   }
 }

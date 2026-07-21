@@ -283,6 +283,8 @@ export async function generateShadowWireFixture(): Promise<string> {
             m0_mutation_id: 0,
             memory_mutation_id: 0,
             last_todo_state_hash: "",
+            project_memory_epoch: 0,
+            project_user_profile_version: 0,
         };
         const messages = fixtureMessages();
         const inputMessages = structuredClone(messages);

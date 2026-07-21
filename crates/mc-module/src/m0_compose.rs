@@ -286,6 +286,8 @@ mod tests {
                 user_profile: &profile,
                 workspace: None,
                 last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();

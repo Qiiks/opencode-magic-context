@@ -13,6 +13,7 @@ import {
     updateTagStatus,
 } from "../../features/magic-context/storage-tags";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { setProjectState } from "../../features/magic-context/storage-project-state";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { mirrorModuleCompartments, syncModuleState } from "./module-state-sync";
@@ -217,6 +218,36 @@ describe("module drop-state cold-start seed", () => {
         ]);
         expect(body.drop_seeds[0]?.payload).toContain("src/main.ts");
         expect(body.drop_seed_skipped).toBe(1);
+    });
+});
+
+describe("module state external epochs", () => {
+    it("carries dashboard project and profile epochs on the completed sync page", async () => {
+        const db = createContextDb();
+        setProjectState(db, "/tmp/project", { projectMemoryEpoch: 9 });
+        setProjectState(db, "__global__", { projectUserProfileVersion: 4 });
+        const calls: unknown[] = [];
+        await syncModuleState({
+            client: {
+                async call(args) {
+                    calls.push(args.body);
+                    return { result: { shadow_seq: 1 } };
+                },
+            },
+            state: syncState(),
+            pass: { db, sessionId: "ses-epoch", projectPath: "/tmp/project", nowMs: 1 },
+            projectRoot: "/tmp/project",
+            force: true,
+        });
+        const body = calls.at(-1) as Record<string, unknown>;
+        expect(body.project_memory_epoch).toBe(9);
+        expect(body.user_profile_version).toBe(4);
+        expect(body.acked_watermarks).toEqual(
+            expect.objectContaining({
+                project_memory_epoch: 9,
+                project_user_profile_version: 4,
+            }),
+        );
     });
 });
 

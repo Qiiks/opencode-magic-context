@@ -6,6 +6,10 @@ import {
 } from "../../features/magic-context/memory/storage-memory";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { getCompartments, getOrCreateSessionMeta } from "../../features/magic-context/storage";
+import {
+    GLOBAL_USER_PROFILE_PROJECT_PATH,
+    getProjectState,
+} from "../../features/magic-context/storage-project-state";
 import { getTagsBySession } from "../../features/magic-context/storage-tags";
 import type { TagEntry } from "../../features/magic-context/types";
 import {
@@ -40,6 +44,8 @@ export interface ModuleWatermarks {
     m0_mutation_id: number;
     memory_mutation_id: number;
     last_todo_state_hash: string;
+    project_memory_epoch: number;
+    project_user_profile_version: number;
 }
 
 export interface ModuleWorkspacePayload {
@@ -76,6 +82,8 @@ export interface ModuleStateSyncPayload {
         user_profile: string[];
         workspace?: ModuleWorkspacePayload | null;
         last_todo_state?: string;
+        project_memory_epoch?: number;
+        user_profile_version?: number;
         acked_watermarks?: ModuleWatermarks;
         drop_seeds?: ModuleDropSeed[];
         drop_seed_skipped?: number;
@@ -299,6 +307,11 @@ export function loadModuleWatermarks(args: {
         m0_mutation_id: m0Row?.max_id ?? 0,
         memory_mutation_id: memoryMutationId,
         last_todo_state_hash: stableHash(sessionMeta.lastTodoState ?? ""),
+        project_memory_epoch: args.projectPath
+            ? (getProjectState(args.db, args.projectPath)?.projectMemoryEpoch ?? 0)
+            : 0,
+        project_user_profile_version:
+            getProjectState(args.db, GLOBAL_USER_PROFILE_PROJECT_PATH)?.projectUserProfileVersion ?? 0,
     };
 }
 
@@ -312,7 +325,9 @@ export function moduleWatermarksEqual(
         left.memory_id === right.memory_id &&
         left.m0_mutation_id === right.m0_mutation_id &&
         left.memory_mutation_id === right.memory_mutation_id &&
-        left.last_todo_state_hash === right.last_todo_state_hash
+        left.last_todo_state_hash === right.last_todo_state_hash &&
+        left.project_memory_epoch === right.project_memory_epoch &&
+        left.project_user_profile_version === right.project_user_profile_version
     );
 }
 
@@ -609,12 +624,14 @@ export function buildPagedModuleStateSyncPayloads(args: {
                       seed_boundary_id: args.seedBoundaryId,
                       workspace: args.workspace,
                       last_todo_state: args.lastTodoState,
-                       acked_watermarks: args.watermarks,
-                       ...(args.dropSeedSkipped !== undefined
-                           ? { drop_seed_skipped: args.dropSeedSkipped }
-                           : {}),
-                   }
-                 : {}),
+                      project_memory_epoch: args.watermarks.project_memory_epoch,
+                      user_profile_version: args.watermarks.project_user_profile_version,
+                      acked_watermarks: args.watermarks,
+                      ...(args.dropSeedSkipped !== undefined
+                          ? { drop_seed_skipped: args.dropSeedSkipped }
+                          : {}),
+                  }
+                : {}),
         },
         watermarks: args.watermarks,
     });
@@ -788,6 +805,8 @@ export async function buildModuleStateSyncPayload(args: {
               m0_mutation_id: 0,
               memory_mutation_id: 0,
               last_todo_state_hash: "",
+              project_memory_epoch: 0,
+              project_user_profile_version: 0,
           }
         : (args.state.lastAckedWatermarks ?? {
               compartment_sequence: -1,
@@ -795,6 +814,8 @@ export async function buildModuleStateSyncPayload(args: {
               m0_mutation_id: 0,
               memory_mutation_id: 0,
               last_todo_state_hash: "",
+              project_memory_epoch: 0,
+              project_user_profile_version: 0,
           });
     const rawById = new Map<string, RawMessageParts | null>();
     const readRawById = (messageId: string): RawMessageParts | null => {
@@ -934,6 +955,8 @@ export async function buildModuleStateSyncPayload(args: {
             user_profile: userProfile,
             workspace: workspace.workspace,
             last_todo_state: sessionMeta.lastTodoState ?? "",
+            project_memory_epoch: currentWatermarks.project_memory_epoch,
+            user_profile_version: currentWatermarks.project_user_profile_version,
             acked_watermarks: currentWatermarks,
         },
         watermarks: currentWatermarks,
