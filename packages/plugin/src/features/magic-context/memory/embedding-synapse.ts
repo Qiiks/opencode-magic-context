@@ -29,7 +29,10 @@ export interface SynapseCatalogEntry {
     // The live catalog omits dims; it is adopted from the first embed response
     // envelope and pinned for the provider's lifetime.
     dims?: number;
+    /** Rows per embed.batch call, from the service's measured per-lane policy. */
     recommended_batch?: number;
+    /** Token ceiling per embed.batch call; pages split on whichever limit hits first. */
+    recommended_token_budget?: number;
     provenance?: unknown;
     certified?: boolean;
     status?: string;
@@ -242,7 +245,14 @@ function extractCatalogEntries(value: unknown): SynapseCatalogEntry[] {
         ) {
             return [];
         }
-        const recommendedBatch = record.recommended_batch ?? record.recommendedBatch;
+        // recommended_batch arrives either as a bare row count (early servers) or as
+        // the measured policy object {rows, token_budget}. Accept both; a lane
+        // without a measured policy omits the field and keeps client defaults.
+        const rawBatch = record.recommended_batch ?? record.recommendedBatch;
+        const batchRecord = asRecord(rawBatch);
+        const recommendedBatch =
+            typeof rawBatch === "number" ? rawBatch : batchRecord ? batchRecord.rows : undefined;
+        const recommendedTokenBudget = batchRecord ? batchRecord.token_budget : undefined;
         const state = typeof record.state === "string" ? record.state : undefined;
         return [
             {
@@ -254,6 +264,9 @@ function extractCatalogEntries(value: unknown): SynapseCatalogEntry[] {
                     : {}),
                 ...(typeof recommendedBatch === "number" && recommendedBatch > 0
                     ? { recommended_batch: Math.floor(recommendedBatch) }
+                    : {}),
+                ...(typeof recommendedTokenBudget === "number" && recommendedTokenBudget > 0
+                    ? { recommended_token_budget: Math.floor(recommendedTokenBudget) }
                     : {}),
                 ...(record.provenance !== undefined ? { provenance: record.provenance } : {}),
                 ...(typeof record.certified === "boolean" ? { certified: record.certified } : {}),
@@ -347,6 +360,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     private initializing: Promise<boolean> | null = null;
     private permanentFailure = false;
     private batchLimit = 16;
+    private tokenBudget: number | null = null;
 
     constructor(options: SynapseEmbeddingProviderOptions) {
         this.options = options;
@@ -373,6 +387,32 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 : null;
         this.modelId = this.metadata?.laneIdentity ?? "synapse:v1:pending";
         this.batchLimit = this.metadata?.recommended_batch ?? 16;
+        this.tokenBudget = this.metadata?.recommended_token_budget ?? null;
+    }
+
+    /**
+     * Page split honors both halves of the service's measured policy: at most
+     * batchLimit rows AND (when the lane publishes one) at most the token budget
+     * per call, estimated at 4 chars/token. Splitting on whichever limit hits
+     * first keeps a page's GPU/ANE occupancy inside the measured knee, so one
+     * oversized page cannot recreate the uninterruptible-latency regression the
+     * budget exists to bound. A single item over budget still ships alone: the
+     * service truncates per its own contract, the client never drops work.
+     */
+    private nextPage(
+        items: readonly { id: string; text: string; contentSha256: string }[],
+        start: number,
+    ): readonly { id: string; text: string; contentSha256: string }[] {
+        const hardEnd = Math.min(items.length, start + this.batchLimit);
+        if (this.tokenBudget === null) return items.slice(start, hardEnd);
+        let end = start;
+        let tokens = 0;
+        while (end < hardEnd) {
+            tokens += Math.ceil(items[end].text.length / 4);
+            if (tokens > this.tokenBudget && end > start) break;
+            end += 1;
+        }
+        return items.slice(start, Math.max(end, start + 1));
     }
 
     static async discover(options: SynapseEmbeddingProviderOptions): Promise<SynapseLaneMetadata> {
@@ -428,6 +468,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     this.metadata = metadata;
                     this.modelId = metadata.laneIdentity;
                     this.batchLimit = metadata.recommended_batch ?? this.batchLimit;
+                    this.tokenBudget = metadata.recommended_token_budget ?? this.tokenBudget;
                 }
                 this.initialized = true;
                 return true;
@@ -496,9 +537,10 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         if (items.length === 0 || !(await this.initialize()) || !this.metadata || signal?.aborted) {
             return output;
         }
-        for (let start = 0; start < items.length; start += this.batchLimit) {
+        for (let start = 0; start < items.length; ) {
             if (signal?.aborted || this.permanentFailure) break;
-            const page = items.slice(start, start + this.batchLimit);
+            const page = this.nextPage(items, start);
+            start += page.length;
             try {
                 const requestKey = this.requestKey(page);
                 let body: unknown = {};

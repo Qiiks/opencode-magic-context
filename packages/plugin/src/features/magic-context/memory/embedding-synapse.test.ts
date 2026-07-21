@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import {
     SYNAPSE_MAX_INPUT_TOKENS,
     SynapseEmbeddingProvider,
@@ -135,5 +136,178 @@ describe("SynapseEmbeddingProvider", () => {
 
         expect(await provider.embed("hello")).toBeNull();
         expect(await provider.embed("again")).toBeNull();
+    });
+});
+
+describe("recommended batch policy", () => {
+    it("object-form recommended_batch {rows, token_budget} sets both limits and pages split on the token budget", async () => {
+        const calls: number[][] = [];
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "/tmp/unused",
+            projectRoot: "/tmp/p",
+            session: "s",
+            clientFactory: async () =>
+                ({
+                    async call(_m: string, method: string, params?: unknown) {
+                        if (method === "models.list") {
+                            return {
+                                result: {
+                                    table_epoch: 0,
+                                    models: [
+                                        {
+                                            model_id: "gte-modernbert-base-f16",
+                                            fingerprints: ["fp1"],
+                                            state: "ready",
+                                            recommended_batch: { rows: 3, token_budget: 100 },
+                                        },
+                                    ],
+                                },
+                            };
+                        }
+                        const items = (params as { items: { id: string; content: string }[] })
+                            .items;
+                        calls.push(items.map((item) => item.content.length));
+                        return {
+                            result: {
+                                model_id: "gte-modernbert-base-f16",
+                                fingerprint: "fp1",
+                                table_epoch: 0,
+                                dims: 2,
+                                vectors: items.map((item) => ({
+                                    id: item.id,
+                                    vector: [0.5, 0.5],
+                                    content_sha256: createHash("sha256")
+                                        .update(item.content)
+                                        .digest("hex"),
+                                })),
+                            },
+                        };
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+        // 4 items of ~200 chars = ~50 estimated tokens each against a 100-token
+        // budget: pages must split at 2 items even though the row limit is 3.
+        const text = "x".repeat(200);
+        const items = ["a", "b", "c", "d"].map((id) => ({
+            id,
+            text,
+            contentSha256: createHash("sha256").update(text).digest("hex"),
+        }));
+        const vectors = await provider.embedItems(items);
+        expect(vectors.size).toBe(4);
+        expect(calls.map((page) => page.length)).toEqual([2, 2]);
+    });
+
+    it("bare-number recommended_batch still sets the row limit (legacy wire shape)", async () => {
+        const calls: number[] = [];
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "/tmp/unused",
+            projectRoot: "/tmp/p",
+            session: "s",
+            clientFactory: async () =>
+                ({
+                    async call(_m: string, method: string, params?: unknown) {
+                        if (method === "models.list") {
+                            return {
+                                result: {
+                                    table_epoch: 0,
+                                    models: [
+                                        {
+                                            model_id: "gte-modernbert-base-f16",
+                                            fingerprints: ["fp1"],
+                                            state: "ready",
+                                            recommended_batch: 2,
+                                        },
+                                    ],
+                                },
+                            };
+                        }
+                        const items = (params as { items: { id: string; content: string }[] })
+                            .items;
+                        calls.push(items.length);
+                        return {
+                            result: {
+                                model_id: "gte-modernbert-base-f16",
+                                fingerprint: "fp1",
+                                table_epoch: 0,
+                                dims: 2,
+                                vectors: items.map((item) => ({
+                                    id: item.id,
+                                    vector: [0.5, 0.5],
+                                    content_sha256: createHash("sha256")
+                                        .update(item.content)
+                                        .digest("hex"),
+                                })),
+                            },
+                        };
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+        const items = ["a", "b", "c"].map((id) => ({
+            id,
+            text: "hello",
+            contentSha256: createHash("sha256").update("hello").digest("hex"),
+        }));
+        const vectors = await provider.embedItems(items);
+        expect(vectors.size).toBe(3);
+        expect(calls).toEqual([2, 1]);
+    });
+
+    it("single item over the token budget still ships alone", async () => {
+        const calls: number[] = [];
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "/tmp/unused",
+            projectRoot: "/tmp/p",
+            session: "s",
+            clientFactory: async () =>
+                ({
+                    async call(_m: string, method: string, params?: unknown) {
+                        if (method === "models.list") {
+                            return {
+                                result: {
+                                    table_epoch: 0,
+                                    models: [
+                                        {
+                                            model_id: "gte-modernbert-base-f16",
+                                            fingerprints: ["fp1"],
+                                            state: "ready",
+                                            recommended_batch: { rows: 8, token_budget: 10 },
+                                        },
+                                    ],
+                                },
+                            };
+                        }
+                        const items = (params as { items: { id: string; content: string }[] })
+                            .items;
+                        calls.push(items.length);
+                        return {
+                            result: {
+                                model_id: "gte-modernbert-base-f16",
+                                fingerprint: "fp1",
+                                table_epoch: 0,
+                                dims: 2,
+                                vectors: items.map((item) => ({
+                                    id: item.id,
+                                    vector: [0.5, 0.5],
+                                    content_sha256: createHash("sha256")
+                                        .update(item.content)
+                                        .digest("hex"),
+                                })),
+                            },
+                        };
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+        const big = "y".repeat(400);
+        const items = [
+            { id: "big1", text: big, contentSha256: createHash("sha256").update(big).digest("hex") },
+            { id: "big2", text: big, contentSha256: createHash("sha256").update(big).digest("hex") },
+        ];
+        const vectors = await provider.embedItems(items);
+        expect(vectors.size).toBe(2);
+        expect(calls).toEqual([1, 1]);
     });
 });
