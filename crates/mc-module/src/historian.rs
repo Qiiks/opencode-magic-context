@@ -1727,6 +1727,8 @@ mod tests {
             mid_turn: false,
             prev_response_completed_at_ms: None,
             request_observed_at_ms: None,
+            channel2_nudge_state: String::new(),
+            emergency_recovery_armed: false,
             history_budget_tokens: None,
             declared_trim: None,
         }
@@ -1741,6 +1743,8 @@ mod tests {
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             memory_enabled: true,
+            inject_docs: true,
+            temporal_awareness: true,
             now_ms: 0,
             execute_threshold_percentage: 65.0,
             smart_drops: false,

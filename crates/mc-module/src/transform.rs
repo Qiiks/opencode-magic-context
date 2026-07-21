@@ -170,6 +170,10 @@ pub struct ProducerContext<'a> {
     pub user_profile_budget_tokens: f64,
     /// Whether memory tools and m0 memory rendering are enabled for this binding.
     pub memory_enabled: bool,
+    /// Whether the m0 project-docs block is enabled for this binding.
+    pub inject_docs: bool,
+    /// Whether temporal gap overlays are enabled for this binding.
+    pub temporal_awareness: bool,
     /// The wall-clock now (ms) for THIS pass. Used only to SET `meta.expiry_cutoff_ms` on
     /// a HARD (the first materialization freezes it); every later pass reads the frozen
     /// meta value, never this, so expiry never drifts the bytes between passes.
@@ -307,6 +311,13 @@ pub struct TransformRequest {
     /// and would inflate every gap by that delay. Request evidence only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_observed_at_ms: Option<u64>,
+    /// Durable host Channel-2 lease state. A terminal or already-pending lease suppresses
+    /// another module directive until the host re-arms it.
+    #[serde(default)]
+    pub channel2_nudge_state: String,
+    /// Durable provider-overflow recovery state. It controls historian discard-last healing.
+    #[serde(default)]
+    pub emergency_recovery_armed: bool,
     /// History budget resolved by the harness from the stable context limit, threshold,
     /// and history-budget percentage. Authority transforms carry it per pass because a
     /// route can outlive a config reload; absent values use the bind-time fallback.
@@ -377,6 +388,10 @@ struct TransformRequestWire {
     #[serde(default)]
     request_observed_at_ms: Option<u64>,
     #[serde(default)]
+    channel2_nudge_state: String,
+    #[serde(default)]
+    emergency_recovery_armed: bool,
+    #[serde(default)]
     history_budget_tokens: Option<f64>,
     #[serde(default)]
     declared_trim: Option<DeclaredTrim>,
@@ -417,6 +432,8 @@ impl<'de> Deserialize<'de> for TransformRequest {
             mid_turn: wire.mid_turn,
             prev_response_completed_at_ms: wire.prev_response_completed_at_ms,
             request_observed_at_ms: wire.request_observed_at_ms,
+            channel2_nudge_state: wire.channel2_nudge_state,
+            emergency_recovery_armed: wire.emergency_recovery_armed,
             history_budget_tokens: wire.history_budget_tokens,
             declared_trim: wire.declared_trim,
         })
@@ -738,6 +755,8 @@ struct OverlayComputation<'a, 'ctx> {
     temporal_rows: &'a mut Vec<TemporalMarkRow>,
     user_hint_rows: &'a mut Vec<UserHintRow>,
     overlay_frontier: Option<u64>,
+    tagging_enabled: bool,
+    temporal_enabled: bool,
     mutation_exempt_mid: Option<&'a str>,
 }
 
@@ -1040,7 +1059,8 @@ fn apply_once(
     } else {
         Vec::new()
     };
-    let mut temporal_marks = if tagging_active {
+    let temporal_active = tagging_active && ctx.temporal_awareness;
+    let mut temporal_marks = if temporal_active {
         transform_snapshot.temporal_marks
     } else {
         Vec::new()
@@ -1178,6 +1198,8 @@ fn apply_once(
             temporal_rows: &mut temporal_marks,
             user_hint_rows: &mut user_hints,
             overlay_frontier,
+            tagging_enabled: tagging_active,
+            temporal_enabled: temporal_active,
             mutation_exempt_mid,
         })?;
     }
@@ -1461,6 +1483,7 @@ fn apply_once(
         initialized: loaded.meta.initialized,
         is_legacy_baseline: is_legacy_baseline(&loaded.core),
         valid_m0m1_shape: valid_m0m1_shape(&loaded.core),
+        cached_m1_missing: cached_m1_missing(&loaded.core),
         render_config_changed,
         hard_fold_requested,
         boundary_present,
@@ -1629,6 +1652,7 @@ fn apply_once(
                         memory_enabled: ctx.memory_enabled,
                         memory_budget_tokens: ctx.memory_budget_tokens,
                         user_profile_budget_tokens: ctx.user_profile_budget_tokens,
+                        inject_docs: ctx.inject_docs,
                     },
                     estimate_tokens,
                 )?;
@@ -1722,6 +1746,7 @@ fn apply_once(
                                     memory_enabled: ctx.memory_enabled,
                                     memory_budget_tokens: ctx.memory_budget_tokens,
                                     user_profile_budget_tokens: ctx.user_profile_budget_tokens,
+                                    inject_docs: ctx.inject_docs,
                                 },
                                 estimate_tokens,
                             )?;
@@ -1909,6 +1934,7 @@ fn apply_once(
                             memory_enabled: ctx.memory_enabled,
                             memory_budget_tokens: ctx.memory_budget_tokens,
                             user_profile_budget_tokens: ctx.user_profile_budget_tokens,
+                            inject_docs: ctx.inject_docs,
                         },
                         estimate_tokens,
                     )?;
@@ -2126,6 +2152,18 @@ fn apply_once(
         }
     }
 
+    // A persisted synthetic pair is host-facing state, not a reason to reject the entire
+    // transform when its original anchor was compacted or omitted by a later request.
+    // TypeScript drops the stale pair and continues with the current tail.
+    if meta
+        .synthetic_todo
+        .as_ref()
+        .and_then(|pair| pair.anchor_mid.as_deref())
+        .is_some_and(|anchor| !req.messages.iter().any(|message| message.mid == anchor))
+    {
+        meta.synthetic_todo = None;
+    }
+
     let build_output_started_at = Instant::now();
     let ck_messages = build_output_with_tags(
         &core,
@@ -2200,6 +2238,7 @@ fn apply_once(
             input_tokens: usage_input_tokens,
             execute_threshold_percentage: ctx.execute_threshold_percentage,
             protected_tags: req.protected_tags,
+            channel2_nudge_state: &req.channel2_nudge_state,
         })
     };
 
@@ -2483,6 +2522,16 @@ fn is_legacy_baseline(core: &CoreState) -> bool {
 /// A valid current shape: EXACTLY one `m0`, EXACTLY one `m1`, and zero-or-more
 /// `red:*` or `strip:*` replay units. An initialized state missing `m0`/`m1`, or
 /// carrying any other key, is an unknown shape (rejected, never cleared).
+fn cached_m1_missing(core: &CoreState) -> bool {
+    let m0 = core.frozen_units.iter().filter(|u| u.key == "m0").count();
+    let m1 = core.frozen_units.iter().filter(|u| u.key == "m1").count();
+    let rest_ok = core
+        .frozen_units
+        .iter()
+        .all(|u| u.key == "m0" || u.key.starts_with(RED_KEY_PREFIX) || u.key.starts_with("strip:"));
+    m0 == 1 && m1 == 0 && rest_ok
+}
+
 fn valid_m0m1_shape(core: &CoreState) -> bool {
     let m0 = core.frozen_units.iter().filter(|u| u.key == "m0").count();
     let m1 = core.frozen_units.iter().filter(|u| u.key == "m1").count();
@@ -3264,7 +3313,11 @@ fn reanchor_kept_synthetic_todo_if_folded_or_shrunk(
     let folded_by_advance =
         anchor_folded_by_coverage(req, old_coverage, meta.coverage_ordinal, &anchor_mid);
     if !folded_by_advance && !coverage_shrunk_on_bust {
-        return Err(TransformError::SyntheticTodoAnchorMissing(anchor_mid));
+        // TypeScript skips defer replay when a persisted real anchor disappeared from
+        // the current message set. Dropping the stale pair is safer than failing back
+        // to raw/LKG and preserves the rest of the transform response.
+        meta.synthetic_todo = None;
+        return Ok(());
     }
 
     // A coverage-moving bust already changes the rendered bytes: advance folds the old
@@ -3834,6 +3887,8 @@ fn compute_active_overlay_decisions(
         temporal_rows,
         user_hint_rows,
         overlay_frontier: frontier,
+        tagging_enabled,
+        temporal_enabled,
         mutation_exempt_mid,
     } = input;
     let existing_tag_ids = tag_rows
@@ -3902,6 +3957,10 @@ fn compute_active_overlay_decisions(
             continue;
         }
 
+        if !temporal_enabled {
+            previous_new_user_mint = Some(current_mint);
+            continue;
+        }
         let marker_text = if authored_tail.is_some_and(|tail| tail.mid == message.mid) {
             // The gap pairs the proxy's INGRESS observation with its completion
             // observation. Module-side now_ms would add queue plus blocking-arm
@@ -3969,7 +4028,9 @@ fn compute_active_overlay_decisions(
     let max_seen_ordinal =
         decided_frontier.filter(|ordinal| frontier.is_none_or(|current| *ordinal > current));
 
-    let user_hint = authored_tail
+    let user_hint = tagging_enabled
+        .then_some(authored_tail)
+        .flatten()
         .filter(|message| frontier.is_none_or(|frontier| message.ordinal > frontier))
         .filter(|message| mutation_exempt_mid != Some(message.mid.as_str()))
         .and_then(|message| {
@@ -4437,12 +4498,17 @@ struct Channel2DirectiveInput<'a> {
     input_tokens: f64,
     execute_threshold_percentage: f64,
     protected_tags: usize,
+    channel2_nudge_state: &'a str,
 }
 
 fn channel2_directive(input: Channel2DirectiveInput<'_>) -> Option<HostDirectives> {
     // OpenCode is the host-delivery leg. CC and owned serializers retain their historic
     // response shape; their host integrations own any channel-2 surface separately.
     if input.profile != Some(SerializerProfile::OpencodeAiSdk)
+        || matches!(
+            input.channel2_nudge_state,
+            "pending" | "claimed" | "delivered"
+        )
         || input.context_limit_tokens <= 0.0
         || input.execute_threshold_percentage <= 0.0
     {
@@ -5593,37 +5659,10 @@ fn latest_assistant_mutation_exempt_mid(
 
 /// Match TS `modelAcceptsEmptyContent` for the OpenCode native request.
 ///
-/// The explicit provider id is preferred. Older plugin senders already supplied a model key,
-/// so `anthropic/...` is accepted as a compatibility fallback. Native OpenCode metadata is the
-/// final fallback because it carries the same provider identity on assistant and user records.
+/// The explicit provider id is authoritative. Missing or contradictory provider metadata must
+/// use the non-empty placeholder, just as TypeScript's exact-provider helper does.
 pub(crate) fn request_accepts_empty_content(req: &TransformRequest) -> bool {
-    if let Some(provider) = req.provider_id.as_deref() {
-        // When the request includes an explicit provider identifier, use it as authoritative.
-        // Do not let a stale model key or native sidecar change the result; empty content is
-        // accepted only for the Anthropic provider.
-        return provider == "anthropic";
-    }
-    if req
-        .model_key
-        .as_deref()
-        .and_then(|key| key.split_once('/').map(|(provider, _)| provider))
-        == Some("anthropic")
-    {
-        return true;
-    }
-    let Some(native_messages) = req.native_messages.as_deref() else {
-        return false;
-    };
-    native_messages.iter().rev().any(|message| {
-        let info = message.get("info").unwrap_or(message);
-        info.get("providerID").and_then(Value::as_str) == Some("anthropic")
-            || info
-                .get("model")
-                .and_then(|model| model.get("providerID"))
-                .and_then(Value::as_str)
-                == Some("anthropic")
-            || message.get("providerID").and_then(Value::as_str) == Some("anthropic")
-    })
+    req.provider_id.as_deref() == Some("anthropic")
 }
 
 /// Compute the next durable D2 reasoning watermark on a cache-busting pass or the
@@ -6572,6 +6611,8 @@ mod tests {
             mid_turn: false,
             prev_response_completed_at_ms: None,
             request_observed_at_ms: None,
+            channel2_nudge_state: String::new(),
+            emergency_recovery_armed: false,
             history_budget_tokens: None,
             declared_trim: None,
         }
@@ -6629,6 +6670,8 @@ mod tests {
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             memory_enabled: true,
+            inject_docs: true,
+            temporal_awareness: true,
             now_ms,
             execute_threshold_percentage: 65.0,
             smart_drops: false,
@@ -7681,6 +7724,9 @@ mod tests {
             todo_synthetic_anchor: None,
             todo_synthetic_anchor_present: false,
             emergency_latches: None,
+            pending_compaction_marker: None,
+            deferred_execute_state: None,
+            channel2_nudge_state: None,
             acked_watermarks: serde_json::Value::Null,
         })
         .unwrap();
@@ -10418,7 +10464,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_todo_defer_anchor_vanished_fails_loud() {
+    fn synthetic_todo_defer_anchor_vanished_is_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("vanished", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -10433,9 +10479,7 @@ mod tests {
             ),
             &spine(),
         );
-        let before = s.load("vanished").unwrap().row_version;
-
-        let err = transform(
+        let response = transform(
             &s,
             &req(
                 "vanished",
@@ -10444,10 +10488,17 @@ mod tests {
             ),
             &pctx("git:proj", "/nonexistent-docs", 0),
         )
-        .unwrap_err();
+        .expect("missing persisted anchors are skipped like TypeScript");
 
-        assert!(matches!(err, TransformError::SyntheticTodoAnchorMissing(mid) if mid == "todo"));
-        assert_eq!(s.load("vanished").unwrap().row_version, before);
+        assert!(response.messages().iter().all(|message| {
+            message.content.iter().all(|block| {
+                !matches!(
+                    &block.kind,
+                    ck_wire::CkKind::ToolCall { id, .. } if id.starts_with("mc_synthetic_todo_")
+                )
+            })
+        }));
+        assert!(s.load("vanished").unwrap().meta.synthetic_todo.is_none());
     }
 
     #[test]
@@ -10808,6 +10859,14 @@ mod tests {
             )
             .unwrap();
             assert_eq!(tail_bytes(&false_window, "m3"), "question");
+
+            let mut temporal_disabled = pctx("git:proj", "/nonexistent-docs", 7_930_000);
+            temporal_disabled.temporal_awareness = false;
+            let mut disabled_request = active;
+            disabled_request.prev_response_completed_at_ms = Some(10_000);
+            disabled_request.request_observed_at_ms = Some(730_000);
+            let disabled = transform(&s, &disabled_request, &temporal_disabled).unwrap();
+            assert_eq!(tail_bytes(&disabled, "m3"), "question");
         });
     }
 
@@ -12981,11 +13040,12 @@ mod tests {
     }
 
     #[test]
-    fn shape_tighten_rejects_missing_m1_but_allows_red() {
+    fn missing_m1_rebuilds_but_arbitrary_shape_still_rejects() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         let dc = pctx("git:proj", "/nonexistent-docs", 0);
-        // an initialized state with m0 + a red:* but NO m1 → unknown shape, reject
+        // An initialized state with m0 + a red:* but NO m1 is the recoverable
+        // `cached_m1_missing` shape from the TypeScript materializer.
         let bad = CoreState {
             version: 1,
             boundary_id: "a#0".into(),
@@ -13003,10 +13063,17 @@ mod tests {
             ..Default::default()
         };
         s.commit("ses", None, &bad, &meta).unwrap();
-        let err = transform(&s, &req("ses", "cfg0", vec![item("a", 1, "BASE")]), &dc).unwrap_err();
+        let rebuilt = transform(&s, &req("ses", "cfg0", vec![item("a", 1, "BASE")]), &dc)
+            .expect("missing m1 is reconstructed by a HARD pass");
+        assert_eq!(rebuilt.action, "HARD");
         assert!(
-            matches!(err, TransformError::UnknownShape(_)),
-            "missing m1 rejects"
+            s.load("ses")
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "m1"),
+            "the recovery fold writes the missing m1 placeholder"
         );
 
         // a valid m0 + m1 + red:* state classifies normally (does NOT reject). Use the
@@ -13376,6 +13443,9 @@ mod tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: Value::Null,
             })
             .unwrap();
@@ -13448,6 +13518,9 @@ mod tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: Value::Null,
             })
             .unwrap();

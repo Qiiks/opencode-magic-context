@@ -1464,9 +1464,22 @@ function applyNoteRow(db: Database, feed: ChangefeedRow): void {
         return;
     }
     const contextId = contextNoteId(db, feed, moduleProject);
+    const existing = db.prepare("SELECT * FROM notes WHERE id = ?").get(contextId) as
+        | Record<string, unknown>
+        | undefined;
+    // Historical v23 feed rows contain only the small note surface. Preserve every
+    // rich TS-owned column that is absent from such a snapshot, while still honoring
+    // explicit nulls in current complete rows.
+    const effectiveRow: Record<string, unknown> = { ...(existing ?? {}), ...row };
+    if (!hasSnapshotField(row, "created_at_ms") && existing?.created_at !== undefined) {
+        effectiveRow.created_at_ms = existing.created_at;
+    }
+    if (!hasSnapshotField(row, "updated_at_ms") && existing?.updated_at !== undefined) {
+        effectiveRow.updated_at_ms = existing.updated_at;
+    }
     // Delivery-only module states are collapsed to the TS vocabulary. The ledger remains
     // authoritative for at-least-once delivery; context.db must not invent a new status.
-    const moduleStatus = rowString(row, "status", "active");
+    const moduleStatus = rowString(effectiveRow, "status", "active");
     const contextStatus =
         moduleStatus === "surfaced" || moduleStatus === "surfacing" ? "ready" : moduleStatus;
     db.prepare(
@@ -1477,38 +1490,44 @@ function applyNoteRow(db: Database, feed: ChangefeedRow): void {
          check_last_liveness_at = ?, last_checked_at = ?, check_status = ?, check_version = ?,
          policy_version = ?, anchor_block_id = ?, anchor_ordinal = ?, created_at = ?, updated_at = ? WHERE id = ?`,
     ).run(
-        rowString(row, "type", "smart"),
+        rowString(effectiveRow, "type", "smart"),
         contextStatus,
         moduleProject,
-        rowNullableString(row, "session_id"),
-        rowString(row, "content"),
-        rowNullableString(row, "surface_condition"),
-        typeof row.ready_at === "number" ? row.ready_at : null,
-        rowNullableString(row, "ready_reason"),
-        rowNullableString(row, "manifest_json"),
-        rowNullableString(row, "compiled_check"),
-        rowNullableString(row, "check_hash"),
-        rowNullableString(row, "check_cron"),
-        rowNumber(row, "check_failure_count"),
-        rowNumber(row, "check_network_failure_count"),
-        typeof row.check_quarantined_until === "number" ? row.check_quarantined_until : null,
-        typeof row.check_next_due_at === "number" ? row.check_next_due_at : null,
-        typeof row.check_compiled_at === "number" ? row.check_compiled_at : null,
-        typeof row.check_false_since_at === "number" ? row.check_false_since_at : null,
-        typeof row.check_last_liveness_at === "number" ? row.check_last_liveness_at : null,
-        typeof row.last_checked_at === "number" ? row.last_checked_at : null,
-        rowString(row, "check_status", "uncompiled"),
-        rowNumber(row, "check_version"),
-        rowNumber(row, "policy_version", 1),
-        rowNullableString(row, "anchor_block_id"),
-        typeof row.anchor_ordinal === "number" ? row.anchor_ordinal : null,
-        rowNumber(row, "created_at_ms"),
-        rowNumber(row, "updated_at_ms"),
+        rowNullableString(effectiveRow, "session_id"),
+        rowString(effectiveRow, "content"),
+        rowNullableString(effectiveRow, "surface_condition"),
+        typeof effectiveRow.ready_at === "number" ? effectiveRow.ready_at : null,
+        rowNullableString(effectiveRow, "ready_reason"),
+        rowNullableString(effectiveRow, "manifest_json"),
+        rowNullableString(effectiveRow, "compiled_check"),
+        rowNullableString(effectiveRow, "check_hash"),
+        rowNullableString(effectiveRow, "check_cron"),
+        rowNumber(effectiveRow, "check_failure_count"),
+        rowNumber(effectiveRow, "check_network_failure_count"),
+        typeof effectiveRow.check_quarantined_until === "number"
+            ? effectiveRow.check_quarantined_until
+            : null,
+        typeof effectiveRow.check_next_due_at === "number" ? effectiveRow.check_next_due_at : null,
+        typeof effectiveRow.check_compiled_at === "number" ? effectiveRow.check_compiled_at : null,
+        typeof effectiveRow.check_false_since_at === "number"
+            ? effectiveRow.check_false_since_at
+            : null,
+        typeof effectiveRow.check_last_liveness_at === "number"
+            ? effectiveRow.check_last_liveness_at
+            : null,
+        typeof effectiveRow.last_checked_at === "number" ? effectiveRow.last_checked_at : null,
+        rowString(effectiveRow, "check_status", "uncompiled"),
+        rowNumber(effectiveRow, "check_version"),
+        rowNumber(effectiveRow, "policy_version", 1),
+        rowNullableString(effectiveRow, "anchor_block_id"),
+        typeof effectiveRow.anchor_ordinal === "number" ? effectiveRow.anchor_ordinal : null,
+        rowNumber(effectiveRow, "created_at_ms"),
+        rowNumber(effectiveRow, "updated_at_ms"),
         contextId,
     );
     db.prepare(
         "INSERT INTO mirror_note_revisions(module_project, module_row_id, context_row_id, status_version) VALUES (?, ?, ?, ?) ON CONFLICT(module_project, module_row_id) DO UPDATE SET context_row_id = excluded.context_row_id, status_version = excluded.status_version",
-    ).run(moduleProject, feed.module_row_id, contextId, rowNumber(row, "status_version"));
+    ).run(moduleProject, feed.module_row_id, contextId, rowNumber(effectiveRow, "status_version"));
 }
 
 export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): number {

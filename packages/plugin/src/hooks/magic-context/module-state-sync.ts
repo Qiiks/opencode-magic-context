@@ -1,4 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
+
 import {
     getMaxMemoryIdForProjects,
     getMemoriesByProject,
@@ -18,9 +19,12 @@ import {
 } from "../../features/magic-context/storage-memory-mutation-log";
 import {
     getAutoSearchHintDecisions,
+    getChannel2NudgeState,
     getEmergencyInputSample,
     getNoteNudgeAnchors,
+    getPendingCompactionMarkerState,
     getPersistedTodoSyntheticAnchor,
+    peekDeferredExecutePending,
 } from "../../features/magic-context/storage-meta-persisted";
 import { getPendingOps } from "../../features/magic-context/storage-ops";
 import {
@@ -102,6 +106,18 @@ export interface ModuleEmergencyLatchSeed {
     last_execute_ordinal: number;
 }
 
+export interface ModulePendingCompactionMarkerSeed {
+    ordinal: number;
+    end_message_id: string;
+    published_at: number;
+}
+
+export interface ModuleDeferredExecuteSeed {
+    id: string;
+    reason: string;
+    recorded_at: number;
+}
+
 export type ModuleStripKind =
     | "placeholder"
     | "system_injected"
@@ -144,6 +160,9 @@ export interface ModuleStateSyncPayload {
         auto_search_hint_skipped?: number;
         todo_synthetic_anchor?: ModuleTodoSyntheticAnchorSeed | null;
         emergency_latches?: ModuleEmergencyLatchSeed;
+        pending_compaction_marker?: ModulePendingCompactionMarkerSeed | null;
+        deferred_execute_state?: ModuleDeferredExecuteSeed | null;
+        channel2_nudge_state?: string;
         strip_seeds?: ModuleStripSeed[];
         strip_seed_skipped?: number;
         reasoning_cleared_through_tag?: number;
@@ -738,6 +757,9 @@ export function buildPagedModuleStateSyncPayloads(args: {
     autoSearchHintSkipped?: number;
     todoSyntheticAnchor?: ModuleTodoSyntheticAnchorSeed | null;
     emergencyLatches?: ModuleEmergencyLatchSeed;
+    pendingCompactionMarker?: ModulePendingCompactionMarkerSeed | null;
+    deferredExecuteState?: ModuleDeferredExecuteSeed | null;
+    channel2NudgeState?: string;
     stripSeeds?: ModuleStripSeed[];
     stripSeedSkipped?: number;
     reasoningClearedThroughTag?: number;
@@ -785,6 +807,9 @@ export function buildPagedModuleStateSyncPayloads(args: {
         autoSearchHintSkipped?: number;
         stripSeeds?: ModuleStripSeed[];
         stripSeedSkipped?: number;
+        pendingCompactionMarker?: ModulePendingCompactionMarkerSeed | null;
+        deferredExecuteState?: ModuleDeferredExecuteSeed | null;
+        channel2NudgeState?: string;
     }): ModuleStateSyncPayload => ({
         method: "state_sync",
         params: {
@@ -836,6 +861,15 @@ export function buildPagedModuleStateSyncPayloads(args: {
                           : {}),
                       ...(args.emergencyLatches !== undefined
                           ? { emergency_latches: args.emergencyLatches }
+                          : {}),
+                      ...(args.pendingCompactionMarker !== undefined
+                          ? { pending_compaction_marker: args.pendingCompactionMarker }
+                          : {}),
+                      ...(args.deferredExecuteState !== undefined
+                          ? { deferred_execute_state: args.deferredExecuteState }
+                          : {}),
+                      ...(args.channel2NudgeState !== undefined
+                          ? { channel2_nudge_state: args.channel2NudgeState }
                           : {}),
                       ...(args.stripSeedSkipped !== undefined
                           ? { strip_seed_skipped: args.stripSeedSkipped }
@@ -1204,6 +1238,35 @@ export async function buildModuleStateSyncPayload(args: {
     const stripSeeds = args.force
         ? buildStripSeeds({ db: args.pass.db, sessionId: args.pass.sessionId })
         : undefined;
+    const pendingMarker = args.force
+        ? getPendingCompactionMarkerState(args.pass.db, args.pass.sessionId)
+        : undefined;
+    const pendingCompactionMarker =
+        pendingMarker === undefined
+            ? undefined
+            : pendingMarker === null
+              ? null
+              : {
+                    ordinal: pendingMarker.ordinal,
+                    end_message_id: pendingMarker.endMessageId,
+                    published_at: pendingMarker.publishedAt,
+                };
+    const deferredPending = args.force
+        ? peekDeferredExecutePending(args.pass.db, args.pass.sessionId)
+        : undefined;
+    const deferredExecuteState =
+        deferredPending === undefined
+            ? undefined
+            : deferredPending === null
+              ? null
+              : {
+                    id: deferredPending.id,
+                    reason: deferredPending.reason,
+                    recorded_at: deferredPending.recordedAt,
+                };
+    const channel2NudgeState = args.force
+        ? getChannel2NudgeState(args.pass.db, args.pass.sessionId)
+        : undefined;
     const payloadArgs = {
         shadowGeneration: args.state.shadowGeneration,
         expectedShadowSeq: args.state.lastAckedSeq,
@@ -1242,6 +1305,9 @@ export async function buildModuleStateSyncPayload(args: {
                 : undefined,
         todoSyntheticAnchor,
         emergencyLatches,
+        pendingCompactionMarker,
+        deferredExecuteState,
+        channel2NudgeState,
         stripSeeds: stripSeeds && stripSeeds.length > 0 ? stripSeeds : undefined,
         stripSeedSkipped: undefined,
         reasoningClearedThroughTag: sessionMeta.clearedReasoningThroughTag,
@@ -1268,6 +1334,15 @@ export async function buildModuleStateSyncPayload(args: {
             project_memory_epoch: currentWatermarks.project_memory_epoch,
             user_profile_version: currentWatermarks.project_user_profile_version,
             acked_watermarks: currentWatermarks,
+            ...(pendingCompactionMarker !== undefined
+                ? { pending_compaction_marker: pendingCompactionMarker }
+                : {}),
+            ...(deferredExecuteState !== undefined
+                ? { deferred_execute_state: deferredExecuteState }
+                : {}),
+            ...(channel2NudgeState !== undefined
+                ? { channel2_nudge_state: channel2NudgeState }
+                : {}),
         },
         watermarks: currentWatermarks,
     };

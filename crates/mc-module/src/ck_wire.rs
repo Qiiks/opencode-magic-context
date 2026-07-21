@@ -127,6 +127,7 @@ pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection,
     let mut blocks = Vec::new();
     let mut identity_by_mid: BTreeMap<String, Vec<BlockIdentity>> = BTreeMap::new();
     let mut pending_calls: BTreeMap<String, VecDeque<String>> = BTreeMap::new();
+    let mut call_arcs: BTreeMap<String, String> = BTreeMap::new();
 
     for msg in messages {
         if msg.mid.contains('#') {
@@ -136,12 +137,26 @@ pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection,
         let role = msg.ck.role.as_str();
         if role == "assistant" {
             pending_calls.clear();
+            call_arcs.clear();
+            let mut call_counts = BTreeMap::<&str, usize>::new();
+            for block in &msg.ck.content {
+                if let CkKind::ToolCall { id, .. } = &block.kind {
+                    *call_counts.entry(id.as_str()).or_default() += 1;
+                }
+            }
             for (index, block) in msg.ck.content.iter().enumerate() {
                 if let CkKind::ToolCall { id, .. } = &block.kind {
+                    let block_id = block_id(&msg.mid, index);
+                    let arc_id = if call_counts.get(id.as_str()).copied().unwrap_or(0) > 1 {
+                        tool_arc_id(&msg.mid, id)
+                    } else {
+                        block_id.clone()
+                    };
+                    call_arcs.insert(block_id, arc_id.clone());
                     pending_calls
                         .entry(id.clone())
                         .or_default()
-                        .push_back(block_id(&msg.mid, index));
+                        .push_back(arc_id);
                 }
             }
         }
@@ -149,7 +164,7 @@ pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection,
         let mut identities = Vec::new();
         for (index, block) in msg.ck.content.iter().enumerate() {
             let id = block_id(&msg.mid, index);
-            let arc_id = arc_for_block(&msg.mid, index, &msg.ck, &mut pending_calls)?;
+            let arc_id = arc_for_block(&msg.mid, index, &msg.ck, &mut pending_calls, &call_arcs)?;
             let flat = flatten_block(msg, index, block, id, arc_id)?;
             if !flat.synthetic {
                 identities.push(BlockIdentity {
@@ -309,14 +324,21 @@ fn flatten_block(
     })
 }
 
+fn tool_arc_id(mid: &str, call_id: &str) -> String {
+    format!("{mid}#call:{call_id}")
+}
+
 fn arc_for_block(
     mid: &str,
     index: usize,
     msg: &CkWireMessage,
     pending_calls: &mut BTreeMap<String, VecDeque<String>>,
+    call_arcs: &BTreeMap<String, String>,
 ) -> Result<Option<String>, CkWireError> {
     match &msg.content[index].kind {
-        CkKind::ToolCall { .. } if msg.role == "assistant" => Ok(Some(block_id(mid, index))),
+        CkKind::ToolCall { .. } if msg.role == "assistant" => {
+            Ok(call_arcs.get(&block_id(mid, index)).cloned())
+        }
         CkKind::ToolResult { id, .. } => {
             let Some(queue) = pending_calls.get_mut(id) else {
                 return Err(CkWireError::UnpairedToolResult {
@@ -417,6 +439,40 @@ mod tests {
                 HarnessMeta::default(),
             ),
         }
+    }
+
+    #[test]
+    fn repeated_call_id_within_owner_message_shares_one_arc_identity() {
+        let message = CkIngressMessage {
+            mid: "assistant-1".to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![
+                    CkWireBlock::bare(CkKind::ToolCall {
+                        id: "duplicate".into(),
+                        name: "read".into(),
+                        input: serde_json::json!({"path": "one"}),
+                        provider_executed: false,
+                    }),
+                    CkWireBlock::bare(CkKind::ToolCall {
+                        id: "duplicate".into(),
+                        name: "read".into(),
+                        input: serde_json::json!({"path": "two"}),
+                        provider_executed: false,
+                    }),
+                ],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta::default(),
+            ),
+        };
+        let projection = project_messages(&[message]).expect("duplicate call ids are projectable");
+        assert_eq!(projection.blocks[0].arc_id, projection.blocks[1].arc_id);
+        assert_eq!(
+            projection.blocks[0].arc_id.as_deref(),
+            Some("assistant-1#call:duplicate")
+        );
     }
 
     // Claude Code emits the tool_result INSIDE the next user message (alongside the

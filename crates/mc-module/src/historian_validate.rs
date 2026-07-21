@@ -519,13 +519,11 @@ pub fn validate_historian_output(
             .last()
             .map(|c| c.end_message)
             .unwrap_or(chunk.end_index);
-        // Discard-last measures real lookahead messages, not gaps in a sparse
-        // ordinal space where retired message numbers can be arbitrarily far apart.
-        let lookahead_count = present_ordinals
-            .iter()
-            .filter(|ordinal| **ordinal > last_end && **ordinal <= chunk.end_index)
-            .count() as u64;
-        if lookahead_count <= BOUNDARY_HEALING_SLACK {
+        // TypeScript uses numeric ordinal distance here. Retired message numbers are
+        // intentionally part of that distance, so a sparse coordinate gap still counts
+        // as lookahead for boundary healing.
+        let lookahead_distance = chunk.end_index.saturating_sub(last_end);
+        if lookahead_distance <= BOUNDARY_HEALING_SLACK {
             compartments.pop();
             discarded_last = true;
         }
@@ -1497,7 +1495,7 @@ mod tests {
     }
 
     #[test]
-    fn discard_last_counts_present_sparse_lookahead_messages() {
+    fn discard_last_uses_numeric_sparse_ordinal_distance() {
         let sparse = HistorianChunk {
             start_index: 1,
             end_index: 100,
@@ -1516,9 +1514,9 @@ mod tests {
 
         let validated = validate_historian_output(&text, &sparse, &[], ValidateOptions::default())
             .expect("sparse chunk validates");
-        assert!(validated.discarded_last);
-        assert_eq!(validated.compartments.len(), 1);
-        assert_eq!(validated.unprocessed_from, 2);
+        assert!(!validated.discarded_last);
+        assert_eq!(validated.compartments.len(), 2);
+        assert_eq!(validated.unprocessed_from, 3);
     }
 
     #[test]

@@ -52,14 +52,15 @@ use tokio::sync::Notify;
 use chrono::{Local, TimeZone};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use mc_store::{
-    canonical_root, validate_state_import_compartments, HistorianPhase, InsertMemoryInput,
-    MappingUpdate, McStore, McStoreError, NoteCasOutcome, NoteEvaluationInput, NoteInput,
-    NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop, PendingAgentDropSeedRow,
-    RecordWrapupCommandOutcome, ShadowDivergenceRecord, ShadowDropSeedRow, ShadowMemoryMutationRow,
-    ShadowMemoryRow, ShadowStateSyncError, ShadowStateSyncRequest, ShadowStripSeedRow,
-    ShadowWorkspaceMemberRow, ShadowWorkspaceRow, StateImportError, StateImportPreflight,
-    StateImportValidationError, StoredChunkTranscript, StoredCompartment, StoredMemoryMutation,
-    StoredNote, TodoStateSetOutcome, UserHintSeedRow, VerificationUpdate, WrapupCommandRecord,
+    canonical_root, validate_state_import_compartments, DeferredExecuteState, HistorianPhase,
+    InsertMemoryInput, MappingUpdate, McStore, McStoreError, NoteCasOutcome, NoteEvaluationInput,
+    NoteInput, NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop, PendingAgentDropSeedRow,
+    PendingCompactionMarkerState, RecordWrapupCommandOutcome, ShadowDivergenceRecord,
+    ShadowDropSeedRow, ShadowMemoryMutationRow, ShadowMemoryRow, ShadowStateSyncError,
+    ShadowStateSyncRequest, ShadowStripSeedRow, ShadowWorkspaceMemberRow, ShadowWorkspaceRow,
+    StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
+    StoredCompartment, StoredMemoryMutation, StoredNote, TodoStateSetOutcome, UserHintSeedRow,
+    VerificationUpdate, WrapupCommandRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -221,8 +222,9 @@ const DEFAULT_MIN_COMMIT_CLUSTERS: usize = 3;
 /// historian context limit; the config fallback is intentionally explicit in config.rs.
 #[cfg(test)]
 const DEFAULT_HISTORIAN_CHUNK_TOKENS: usize = 32_000;
-/// Secondary assembler guard; TS trigger sizing is authoritative, this only rejects tiny chunks.
-const DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS: usize = 512;
+/// TypeScript evaluates every nonempty eligible chunk after trigger checks. Rust keeps
+/// this minimum at zero so it does not impose an additional minimum-token requirement.
+const DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS: usize = 0;
 /// Thalamus clamps the prompt argument to the same range before forwarding it.
 /// Changing either bound requires a coordinated module and Thalamus update so a
 /// retried prompt resolves to the same keep watermark on both sides.
@@ -334,6 +336,12 @@ struct ShadowStateSyncWire {
     todo_synthetic_anchor: Option<Option<TodoSyntheticAnchorSeedWire>>,
     #[serde(default)]
     emergency_latches: Option<EmergencyLatchSeedWire>,
+    #[serde(default)]
+    pending_compaction_marker: Option<Option<PendingCompactionMarkerState>>,
+    #[serde(default)]
+    deferred_execute_state: Option<Option<DeferredExecuteState>>,
+    #[serde(default)]
+    channel2_nudge_state: Option<String>,
     #[serde(default)]
     strip_seeds: Vec<ShadowStripSeedWire>,
     #[serde(default)]
@@ -2240,6 +2248,8 @@ impl McHandler {
                 historian_context_limit_tokens: 128_000,
                 memory_budget_tokens: 8_000.0,
                 user_profile_budget_tokens: 4_000.0,
+                inject_docs: true,
+                temporal_awareness: true,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
                 shadow_enabled: true,
@@ -3320,7 +3330,7 @@ impl McHandler {
                 auto_promote: cfg.auto_promote,
                 user_memory_collection_enabled: cfg.user_memory_collection_enabled,
                 extraction_free: false,
-                in_emergency: usage_percentage >= 95.0,
+                in_emergency: parsed.emergency_recovery_armed,
                 force_keep_last_compartment: false,
                 fold_is_only_reclaim,
                 failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
@@ -5881,6 +5891,8 @@ impl McHandler {
                     .filter(|budget| budget.is_finite() && *budget >= 0.0)
                     .unwrap_or(binding.history_budget_tokens),
                 memory_enabled: binding.config.memory_enabled,
+                inject_docs: binding.config.inject_docs,
+                temporal_awareness: binding.config.temporal_awareness,
                 memory_budget_tokens: binding.config.memory_budget_tokens,
                 user_profile_budget_tokens: binding.config.user_profile_budget_tokens,
                 now_ms: pass_now,
@@ -6655,6 +6667,9 @@ impl McHandler {
                 seed.last_execute_ordinal,
             )
         });
+        let pending_compaction_marker = parsed.pending_compaction_marker;
+        let deferred_execute_state = parsed.deferred_execute_state;
+        let channel2_nudge_state = parsed.channel2_nudge_state;
         let strip_seeds: Vec<ShadowStripSeedRow> = parsed
             .strip_seeds
             .into_iter()
@@ -6781,6 +6796,13 @@ impl McHandler {
                 todo_synthetic_anchor: todo_synthetic_anchor.as_ref(),
                 todo_synthetic_anchor_present,
                 emergency_latches,
+                pending_compaction_marker: pending_compaction_marker
+                    .as_ref()
+                    .map(|marker| marker.as_ref()),
+                deferred_execute_state: deferred_execute_state
+                    .as_ref()
+                    .map(|deferred| deferred.as_ref()),
+                channel2_nudge_state: channel2_nudge_state.as_deref(),
                 strip_seeds: &strip_seeds,
                 strip_seed_skipped,
                 reasoning_cleared_through_tag,
@@ -6811,6 +6833,13 @@ impl McHandler {
                 todo_synthetic_anchor: todo_synthetic_anchor.as_ref(),
                 todo_synthetic_anchor_present,
                 emergency_latches,
+                pending_compaction_marker: pending_compaction_marker
+                    .as_ref()
+                    .map(|marker| marker.as_ref()),
+                deferred_execute_state: deferred_execute_state
+                    .as_ref()
+                    .map(|deferred| deferred.as_ref()),
+                channel2_nudge_state: channel2_nudge_state.as_deref(),
                 strip_seeds: &strip_seeds,
                 strip_seed_skipped,
                 reasoning_cleared_through_tag,
@@ -7370,6 +7399,8 @@ impl McHandler {
             mid_turn: parsed.pass_inputs.mid_turn,
             prev_response_completed_at_ms: None,
             request_observed_at_ms: None,
+            channel2_nudge_state: String::new(),
+            emergency_recovery_armed: false,
             history_budget_tokens: None,
             declared_trim: parsed.declared_trim.clone(),
         };
@@ -7384,6 +7415,8 @@ impl McHandler {
                 .history_budget_tokens
                 .unwrap_or(binding.history_budget_tokens),
             memory_enabled: binding.config.memory_enabled,
+            inject_docs: binding.config.inject_docs,
+            temporal_awareness: binding.config.temporal_awareness,
             memory_budget_tokens: binding.config.memory_budget_tokens,
             user_profile_budget_tokens: binding.config.user_profile_budget_tokens,
             now_ms: parsed.pass_inputs.now_ms,
@@ -9665,6 +9698,9 @@ fn assemble_shadow_seed(
         auto_search_hint_skipped: final_batch.auto_search_hint_skipped,
         todo_synthetic_anchor: final_batch.todo_synthetic_anchor,
         emergency_latches: final_batch.emergency_latches,
+        pending_compaction_marker: final_batch.pending_compaction_marker,
+        deferred_execute_state: final_batch.deferred_execute_state,
+        channel2_nudge_state: final_batch.channel2_nudge_state,
         strip_seeds,
         strip_seed_skipped: final_batch.strip_seed_skipped,
         reasoning_cleared_through_tag: final_batch.reasoning_cleared_through_tag,
@@ -12356,6 +12392,8 @@ mod tests {
             historian_context_limit_tokens: 128_000,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
+            inject_docs: true,
+            temporal_awareness: true,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
             shadow_enabled: true,
@@ -12819,8 +12857,9 @@ mod tests {
         ]);
         request["serializer_profile"] = json!("opencode-aisdk");
         request["serve_native"] = json!(true);
-        // This is the current built-plugin wire shape: provider_id and clear_reasoning_age
-        // are absent, so the module must use native OpenCode metadata as its fallback.
+        // Empty sentinels require the exact canonical provider identity. Native metadata
+        // alone must not broaden that provider gate.
+        request["provider_id"] = json!("anthropic");
         request["native_messages"] = json!([
             {
                 "info": {
@@ -12851,9 +12890,14 @@ mod tests {
             SerializerProfile::parse(&parsed.serializer_profile),
             Some(SerializerProfile::OpencodeAiSdk)
         );
-        assert!(parsed.provider_id.is_none());
+        assert_eq!(parsed.provider_id.as_deref(), Some("anthropic"));
         assert_eq!(parsed.clear_reasoning_age, 50);
         assert!(transform::request_accepts_empty_content(&parsed));
+
+        let mut contradictory = parsed.clone();
+        contradictory.provider_id = None;
+        contradictory.model_key = Some("anthropic/claude-opus".to_string());
+        assert!(!transform::request_accepts_empty_content(&contradictory));
 
         let response = call_transform_request(&handler, request).await;
         assert_eq!(response["status"], "ok");
@@ -12939,10 +12983,12 @@ mod tests {
             .as_str()
             .expect("due OpenCode pass must carry channel2 text");
         assert!(first_text.contains("Routine context housekeeping is near"));
-        let second = call_transform_request(&handler, opencode_request).await;
-        assert_eq!(
-            second["host_directives"]["channel2_nudge"]["text"],
-            first_text
+        let mut terminal_request = opencode_request;
+        terminal_request["channel2_nudge_state"] = json!("delivered");
+        let second = call_transform_request(&handler, terminal_request).await;
+        assert!(
+            second.get("host_directives").is_none(),
+            "a terminal TypeScript Channel-2 lease suppresses repeated directives"
         );
 
         let mut not_due = request_with_usage(vec![ck("short", 1, "small")], 10_000, 100_000);
@@ -18411,6 +18457,8 @@ mod tests {
                 memory_budget_tokens: 8_000.0,
                 user_profile_budget_tokens: 4_000.0,
                 memory_enabled: true,
+                inject_docs: true,
+                temporal_awareness: true,
                 now_ms: now_ms(),
                 execute_threshold_percentage: 65.0,
                 smart_drops: false,
@@ -19087,6 +19135,8 @@ mod tests {
                 memory_budget_tokens: 8_000.0,
                 user_profile_budget_tokens: 4_000.0,
                 memory_enabled: true,
+                inject_docs: true,
+                temporal_awareness: true,
                 now_ms: now_ms(),
                 execute_threshold_percentage: 65.0,
                 smart_drops: false,
@@ -19143,6 +19193,12 @@ mod tests {
         todo_synthetic_anchor: Option<serde_json::Value>,
         #[serde(default)]
         emergency_latches: Option<serde_json::Value>,
+        #[serde(default)]
+        pending_compaction_marker: Option<serde_json::Value>,
+        #[serde(default)]
+        deferred_execute_state: Option<serde_json::Value>,
+        #[serde(default)]
+        channel2_nudge_state: String,
         workspace: Option<StrictShadowWorkspace>,
         last_todo_state: String,
         project_memory_epoch: u64,
@@ -20343,6 +20399,7 @@ mod tests {
                 memory_enabled: true,
                 memory_budget_tokens: 8_000.0,
                 user_profile_budget_tokens: 4_000.0,
+                inject_docs: true,
             },
             |_| 0,
         )
@@ -20423,6 +20480,7 @@ mod tests {
                 memory_enabled: true,
                 memory_budget_tokens: 8_000.0,
                 user_profile_budget_tokens: 4_000.0,
+                inject_docs: true,
             },
             |_| 0,
         )
@@ -20924,6 +20982,9 @@ mod tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: Value::Null,
             })
             .unwrap();

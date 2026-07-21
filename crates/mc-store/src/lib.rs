@@ -2347,6 +2347,16 @@ pub struct DeferredExecuteState {
     pub reason: String,
 }
 
+/// A TypeScript-owned compaction marker waiting for the consuming transform pass.
+/// The module retains the marker during a TS-to-Rust transition so a restart cannot
+/// silently lose the pending boundary reconciliation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCompactionMarkerState {
+    pub ordinal: u64,
+    pub end_message_id: String,
+    pub published_at: i64,
+}
+
 /// Durable alarm state for a boundary-absent request that shares no prefix with the
 /// session's held lineage. The transform arms this once and then serves matching
 /// absent-shape traffic raw without more writes; only boundary-present recovery or a
@@ -2642,6 +2652,12 @@ pub struct ModuleMeta {
     /// Execute intent recorded when mid-turn tool-use defers a scheduler execute.
     #[serde(default)]
     pub deferred_execute_state: Option<DeferredExecuteState>,
+    /// Pending TypeScript compaction marker retained across authority transitions.
+    #[serde(default)]
+    pub pending_compaction_marker: Option<PendingCompactionMarkerState>,
+    /// Channel-2 host lease state copied from the TypeScript session metadata.
+    #[serde(default)]
+    pub channel2_nudge_state: String,
     /// Emergency drain latch active bit.
     #[serde(default)]
     pub emergency_drain_active: bool,
@@ -3377,6 +3393,9 @@ pub struct ShadowStateSyncRequest<'a> {
     pub todo_synthetic_anchor: Option<&'a FrozenSyntheticTodoPair>,
     pub todo_synthetic_anchor_present: bool,
     pub emergency_latches: Option<(f64, bool, u64)>,
+    pub pending_compaction_marker: Option<Option<&'a PendingCompactionMarkerState>>,
+    pub deferred_execute_state: Option<Option<&'a DeferredExecuteState>>,
+    pub channel2_nudge_state: Option<&'a str>,
     pub strip_seeds: &'a [ShadowStripSeedRow],
     pub strip_seed_skipped: usize,
     pub reasoning_cleared_through_tag: Option<u64>,
@@ -6721,6 +6740,15 @@ impl McStore {
             } else {
                 false
             };
+            if let Some(marker) = request.pending_compaction_marker {
+                meta.pending_compaction_marker = marker.cloned();
+            }
+            if let Some(deferred) = request.deferred_execute_state {
+                meta.deferred_execute_state = deferred.cloned();
+            }
+            if let Some(state) = request.channel2_nudge_state {
+                meta.channel2_nudge_state = state.to_string();
+            }
             let strip_seeds_skipped = materialize_strip_seed_units(
                 &mut core,
                 request.session_id,
@@ -15799,6 +15827,14 @@ mod shadow_tests {
         let mut private = memory(3, "foreign preference");
         private.project_path = foreign.to_string();
         private.category = "PREFERENCES".to_string();
+        let marker = PendingCompactionMarkerState {
+            ordinal: 42,
+            end_message_id: "m42#0".to_string(),
+            published_at: 100,
+        };
+        let deferred = DeferredExecuteState {
+            reason: "mid-turn".to_string(),
+        };
 
         store
             .apply_shadow_state_sync(ShadowStateSyncRequest {
@@ -15828,9 +15864,17 @@ mod shadow_tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: Some(Some(&marker)),
+                deferred_execute_state: Some(Some(&deferred)),
+                channel2_nudge_state: Some("delivered"),
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
+
+        let seeded_meta = store.load(session).unwrap().meta;
+        assert_eq!(seeded_meta.pending_compaction_marker, Some(marker));
+        assert_eq!(seeded_meta.deferred_execute_state, Some(deferred));
+        assert_eq!(seeded_meta.channel2_nudge_state, "delivered");
 
         let membership = store
             .resolve_workspace_membership(session)
@@ -15909,6 +15953,9 @@ mod shadow_tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: serde_json::json!({"seq": 0}),
             })
             .unwrap();
@@ -15954,6 +16001,9 @@ mod shadow_tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap_err();
@@ -15999,6 +16049,9 @@ mod shadow_tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap_err();
@@ -16045,6 +16098,9 @@ mod shadow_tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -16080,6 +16136,9 @@ mod shadow_tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -16123,6 +16182,9 @@ mod shadow_tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -16164,6 +16226,9 @@ mod shadow_tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap_err();
@@ -16224,6 +16289,9 @@ mod shadow_tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -16263,6 +16331,9 @@ mod shadow_tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -16312,6 +16383,9 @@ mod shadow_tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -16767,6 +16841,9 @@ mod shadow_tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -16870,6 +16947,9 @@ mod shadow_tests {
                     todo_synthetic_anchor: None,
                     todo_synthetic_anchor_present: false,
                     emergency_latches: None,
+                    pending_compaction_marker: None,
+                    deferred_execute_state: None,
+                    channel2_nudge_state: None,
                     acked_watermarks: serde_json::Value::Null,
                 })
                 .unwrap();
@@ -16969,6 +17049,9 @@ mod shadow_tests {
                     todo_synthetic_anchor: None,
                     todo_synthetic_anchor_present: false,
                     emergency_latches: None,
+                    pending_compaction_marker: None,
+                    deferred_execute_state: None,
+                    channel2_nudge_state: None,
                     acked_watermarks: serde_json::Value::Null,
                 })
                 .unwrap();
@@ -17818,6 +17901,9 @@ mod shadow_tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: serde_json::json!({"sender": "first"}),
             })
             .unwrap();
@@ -17850,6 +17936,9 @@ mod shadow_tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: serde_json::json!({"sender": "second"}),
             })
             .unwrap_err();

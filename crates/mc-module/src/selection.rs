@@ -196,11 +196,13 @@ struct ToolArc {
     ordinal: u64,
     provider_executed: bool,
     input: serde_json::Value,
-    /// FlatBlock id of the ToolCall block (`mid#block_index`).
-    call_id: Option<String>,
+    /// FlatBlock ids of ToolCall blocks owned by this `(assistant mid, call id)` arc.
+    /// Malformed providers can repeat a call id inside one assistant message; TS treats
+    /// those blocks as one drop target, so Rust keeps one composite arc with many blocks.
+    call_inputs: Vec<(String, serde_json::Value)>,
     call_bytes: usize,
-    /// FlatBlock id of the paired ToolResult block (absent if the result hasn't arrived).
-    result_id: Option<String>,
+    /// FlatBlock ids of paired ToolResult blocks (absent when a result has not arrived).
+    result_ids: Vec<String>,
     result_bytes: usize,
     /// Adjacent Reasoning block ids dropped with the arc, + their bytes.
     reasoning_ids: Vec<String>,
@@ -258,9 +260,9 @@ fn group_arcs(items: &[SelItem], frozen: &HashSet<String>) -> Vec<ToolArc> {
             ordinal: u64::MAX,
             provider_executed: false,
             input: serde_json::Value::Null,
-            call_id: None,
+            call_inputs: Vec::new(),
             call_bytes: 0,
-            result_id: None,
+            result_ids: Vec::new(),
             result_bytes: 0,
             reasoning_ids: Vec::new(),
             reasoning_bytes: 0,
@@ -273,17 +275,19 @@ fn group_arcs(items: &[SelItem], frozen: &HashSet<String>) -> Vec<ToolArc> {
         match &item.kind {
             SelKind::ToolCall { name, input } => {
                 entry.name = normalize_tool_name(name);
-                entry.input = input.clone();
-                entry.call_id = Some(item.id.clone());
-                entry.call_bytes = item.byte_size;
+                if entry.call_inputs.is_empty() {
+                    entry.input = input.clone();
+                }
+                entry.call_inputs.push((item.id.clone(), input.clone()));
+                entry.call_bytes += item.byte_size;
                 entry.provider_executed = item.provider_executed;
             }
             SelKind::ToolResult { tool_name } => {
                 if entry.name.is_empty() {
                     entry.name = normalize_tool_name(tool_name);
                 }
-                entry.result_id = Some(item.id.clone());
-                entry.result_bytes = item.byte_size;
+                entry.result_ids.push(item.id.clone());
+                entry.result_bytes += item.byte_size;
                 if item.provider_executed {
                     entry.provider_executed = true;
                 }
@@ -468,12 +472,12 @@ fn expand_arc(
     frozen: &HashSet<String>,
     out: &mut Vec<ReductionDecision>,
 ) {
-    if let Some(call_id) = &arc.call_id {
+    for (call_id, input) in &arc.call_inputs {
         if !frozen.contains(call_id) {
             let (kind, payload) = match shape {
-                ArcShape::Skeleton => (RedKind::Skeleton, skeleton_payload(&arc.input)),
+                ArcShape::Skeleton => (RedKind::Skeleton, skeleton_payload(input)),
                 ArcShape::FullDrop => (RedKind::Drop, DROPPED_PLACEHOLDER.to_string()),
-                ArcShape::EditMarker => (RedKind::EditMarker, edit_marker_payload(&arc.input)),
+                ArcShape::EditMarker => (RedKind::EditMarker, edit_marker_payload(input)),
             };
             out.push(ReductionDecision {
                 target_id: call_id.clone(),
@@ -482,7 +486,7 @@ fn expand_arc(
             });
         }
     }
-    if let Some(result_id) = &arc.result_id {
+    for result_id in &arc.result_ids {
         if !frozen.contains(result_id) {
             out.push(ReductionDecision {
                 target_id: result_id.clone(),

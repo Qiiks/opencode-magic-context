@@ -103,6 +103,8 @@ pub struct M0ComposeInputs<'a> {
     pub memory_budget_tokens: f64,
     /// Maximum token estimate for the user-profile block.
     pub user_profile_budget_tokens: f64,
+    /// Whether the TypeScript materializer would include the project-docs block.
+    pub inject_docs: bool,
 }
 
 fn memory_selection_order(
@@ -343,7 +345,11 @@ pub fn compose_m0_from_store(
         inputs.user_profile_budget_tokens,
         estimate_tokens,
     );
-    let docs = read_project_docs_canonical(inputs.project_directory);
+    let docs = if inputs.inject_docs {
+        read_project_docs_canonical(inputs.project_directory)
+    } else {
+        crate::project_docs::ProjectDocs::default()
+    };
 
     // Compose m0 through the shared renderer after the project/profile budgets have selected
     // their candidates. History keeps its existing decay-pressure fit in this same render.
@@ -437,6 +443,7 @@ mod tests {
             memory_enabled: true,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
+            inject_docs: true,
         };
         let m0 = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
 
@@ -449,6 +456,29 @@ mod tests {
         assert!(m0.m0_bytes.contains("## 1-10 · C1\nP1 of 1"));
         assert!(m0.m0_bytes.contains("## 11-20 · C2\nP1 of 2"));
         assert!(!m0.m0_bytes.contains("<compartment"));
+    }
+
+    #[test]
+    fn disabled_docs_render_empty_block_and_hash_without_reading_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        std::fs::write(dir.path().join("ARCHITECTURE.md"), "secret docs").unwrap();
+        let inputs = M0ComposeInputs {
+            session_id: "docs-off",
+            project_path: "git:docs-off",
+            project_directory: dir.path().to_str().unwrap(),
+            now_ms: 0,
+            history_budget_tokens: 60_000.0,
+            covered_system_messages: &[],
+            memory_enabled: true,
+            memory_budget_tokens: 8_000.0,
+            user_profile_budget_tokens: 4_000.0,
+            inject_docs: false,
+        };
+        let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
+        assert!(!composed.m0_bytes.contains("secret docs"));
+        assert!(!composed.m0_bytes.contains("<project-docs>"));
+        assert!(composed.docs_hash.is_empty());
     }
 
     #[test]
@@ -485,6 +515,9 @@ mod tests {
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
                 emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -501,6 +534,7 @@ mod tests {
             memory_enabled: true,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
+            inject_docs: true,
         };
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         assert_eq!(
@@ -526,6 +560,7 @@ mod tests {
             memory_enabled: true,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
+            inject_docs: true,
         };
         let m0 = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
 
@@ -564,6 +599,7 @@ mod tests {
             memory_enabled: false,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
+            inject_docs: true,
         };
 
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
@@ -596,6 +632,7 @@ mod tests {
             memory_enabled: true,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
+            inject_docs: true,
         };
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         assert_eq!(composed.coverage_ordinal, Some(30));
@@ -622,6 +659,7 @@ mod tests {
             memory_enabled: true,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
+            inject_docs: true,
         };
         let a = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         let b = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();

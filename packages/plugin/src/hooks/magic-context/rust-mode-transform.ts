@@ -16,6 +16,7 @@ import { getMemoryVerifications } from "../../features/magic-context/memory/stor
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import {
     casChannel2NudgeState,
+    getChannel2NudgeState,
     getOverflowState,
     isEmergencyRecoveryArmed,
 } from "../../features/magic-context/storage-meta-persisted";
@@ -582,6 +583,10 @@ function buildTransformBody(args: {
     systemPromptHash: string;
     upgradeState: string;
     midTurn: boolean;
+    prevResponseCompletedAtMs?: number;
+    requestObservedAtMs?: number;
+    channel2NudgeState: string;
+    emergencyRecoveryArmed: boolean;
     declaredTrim?: unknown;
 }): Record<string, unknown> {
     return {
@@ -610,6 +615,10 @@ function buildTransformBody(args: {
         usage: args.usage,
         provider_error: args.passInputs.provider_error,
         mid_turn: args.midTurn,
+        prev_response_completed_at_ms: args.prevResponseCompletedAtMs,
+        request_observed_at_ms: args.requestObservedAtMs,
+        channel2_nudge_state: args.channel2NudgeState,
+        emergency_recovery_armed: args.emergencyRecoveryArmed,
         model_key: args.modelKey,
         provider_id: args.providerId,
         tool_present: args.passInputs.tool_present === true,
@@ -866,8 +875,10 @@ export function createRustModeTransform(
                 resolvedContextLimit,
             );
             const midTurn = isMidTurn(deps, sessionId);
+            const requestObservedAtMs = Date.now();
+            const overflowState = getOverflowState(deps.db, sessionId, modelKey);
             const passInputs: Record<string, unknown> = {
-                now_ms: Date.now(),
+                now_ms: requestObservedAtMs,
                 model_key: modelKey,
                 provider_id: model?.providerID ?? null,
                 usage: passUsage(usage, contextLimit),
@@ -881,6 +892,10 @@ export function createRustModeTransform(
                 upgrade_state: readUpgradeState(deps.db, sessionId),
                 tool_present: toolPresent,
                 protected_tags: deps.protectedTags ?? DEFAULT_PROTECTED_TAGS,
+                temporal_awareness: deps.experimentalTemporalAwareness === true,
+                channel2_nudge_state: getChannel2NudgeState(deps.db, sessionId),
+                emergency_recovery_armed:
+                    overflowState.needsEmergencyRecovery || isEmergencyRecoveryArmed(sessionId),
             };
             const resolved = await resolveOrdinalsForModule({
                 sessionId,
@@ -963,6 +978,11 @@ export function createRustModeTransform(
                 systemPromptHash: sessionMeta.systemPromptHash ?? "",
                 upgradeState: String(passInputs.upgrade_state ?? ""),
                 midTurn,
+                prevResponseCompletedAtMs:
+                    sessionMeta.lastResponseTime > 0 ? sessionMeta.lastResponseTime : undefined,
+                requestObservedAtMs,
+                channel2NudgeState: String(passInputs.channel2_nudge_state ?? ""),
+                emergencyRecoveryArmed: passInputs.emergency_recovery_armed === true,
             });
             const pages = buildPagedModuleTransformPayloads(body);
             let response: Record<string, unknown> | undefined;

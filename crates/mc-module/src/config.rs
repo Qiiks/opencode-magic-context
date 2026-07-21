@@ -55,6 +55,10 @@ pub struct McModuleConfig {
     pub historian_context_limit_tokens: usize,
     pub memory_budget_tokens: f64,
     pub user_profile_budget_tokens: f64,
+    /// Controls whether the frozen m0 baseline includes the canonical project-docs block.
+    pub inject_docs: bool,
+    /// Controls temporal gap overlays when the active wire surface supports overlays.
+    pub temporal_awareness: bool,
     pub smart_drops: bool,
     pub cache_ttl: String,
     /// Kill switch for the shadow byte-compare lane, honored module-side so a
@@ -75,6 +79,8 @@ impl Default for McModuleConfig {
             historian_context_limit_tokens: DEFAULT_HISTORIAN_CONTEXT_LIMIT_TOKENS,
             memory_budget_tokens: DEFAULT_MEMORY_BUDGET_TOKENS,
             user_profile_budget_tokens: DEFAULT_USER_PROFILE_BUDGET_TOKENS,
+            inject_docs: true,
+            temporal_awareness: true,
             smart_drops: false,
             shadow_enabled: true,
             cache_ttl: "5m".to_string(),
@@ -224,6 +230,15 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         if let Some(enabled) = user.pointer("/smart_drops").and_then(Value::as_bool) {
             cfg.smart_drops = enabled;
         }
+        if let Some(enabled) = user
+            .pointer("/dreamer/inject_docs")
+            .and_then(Value::as_bool)
+        {
+            cfg.inject_docs = enabled;
+        }
+        if let Some(enabled) = user.pointer("/temporal_awareness").and_then(Value::as_bool) {
+            cfg.temporal_awareness = enabled;
+        }
         if let Some(cache_ttl) = user.pointer("/cache_ttl").and_then(Value::as_str) {
             if !cache_ttl.trim().is_empty() {
                 cfg.cache_ttl = cache_ttl.trim().to_string();
@@ -260,6 +275,18 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         }
         if let Some(enabled) = project.pointer("/smart_drops").and_then(Value::as_bool) {
             cfg.smart_drops = enabled;
+        }
+        if let Some(enabled) = project
+            .pointer("/dreamer/inject_docs")
+            .and_then(Value::as_bool)
+        {
+            cfg.inject_docs = enabled;
+        }
+        if let Some(enabled) = project
+            .pointer("/temporal_awareness")
+            .and_then(Value::as_bool)
+        {
+            cfg.temporal_awareness = enabled;
         }
     }
 
@@ -431,6 +458,24 @@ mod tests {
         assert_eq!(derive_historian_chunk_tokens(128_000), 32_000);
         assert_eq!(derive_historian_chunk_tokens(200_000), 50_000);
         assert_eq!(derive_historian_chunk_tokens(400_000), 50_000);
+    }
+
+    #[test]
+    fn docs_and_temporal_flags_follow_user_then_project_tiers() {
+        let user = serde_json::json!({
+            "dreamer": { "inject_docs": false },
+            "temporal_awareness": false
+        });
+        let project = serde_json::json!({
+            "dreamer": { "inject_docs": true },
+            "temporal_awareness": true
+        });
+        let cfg = merge_tiers(Some(&user), Some(&project));
+        assert!(cfg.inject_docs);
+        assert!(cfg.temporal_awareness);
+        let defaults = merge_tiers(None, None);
+        assert!(defaults.inject_docs);
+        assert!(defaults.temporal_awareness);
     }
 
     #[test]

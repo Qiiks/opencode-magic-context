@@ -52,6 +52,9 @@ pub struct ClassifierInput {
     /// [`PassPlan::Reject`] (never cleared — a destructive clear must never fire on an
     /// unrecognized shape). The module computes this; this crate only carries the bool.
     pub valid_m0m1_shape: bool,
+    /// Initialized state with one valid m0 and no m1 can be rebuilt like the TS
+    /// `cached_m1_missing` HARD path; it is not an arbitrary unknown shape.
+    pub cached_m1_missing: bool,
     /// Render-config (model/system/tool) differs from the persisted one → epoch Hard.
     pub render_config_changed: bool,
     /// A HARD trigger fired (compaction fold / idle-ttl / pressure) — decider-supplied.
@@ -117,7 +120,11 @@ pub fn classify(input: &ClassifierInput) -> PassPlan {
     if input.is_legacy_baseline {
         return PassPlan::MigrateHard;
     }
-    // 2b. Any other unrecognized shape → clean Error, NEVER a destructive clear.
+    // 2b. A missing m1 is a recoverable cache shape, not an unknown schema.
+    if input.cached_m1_missing {
+        return PassPlan::Hard;
+    }
+    // 2c. Any other unrecognized shape → clean Error, NEVER a destructive clear.
     if !input.valid_m0m1_shape {
         return PassPlan::Reject("unknown frozen-set shape");
     }
@@ -183,6 +190,16 @@ mod tests {
             ..base()
         };
         assert_eq!(classify(&input), PassPlan::MigrateHard);
+    }
+
+    #[test]
+    fn missing_m1_is_rebuilt_as_hard() {
+        let input = ClassifierInput {
+            cached_m1_missing: true,
+            valid_m0m1_shape: false,
+            ..base()
+        };
+        assert_eq!(classify(&input), PassPlan::Hard);
     }
 
     #[test]

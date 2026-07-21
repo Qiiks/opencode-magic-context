@@ -77,6 +77,61 @@ function protocol(seedCalls: { bytes: number[] }): AuthorityModuleClient {
 }
 
 describe("memory authority protocol", () => {
+    test("historical sparse note feed rows preserve rich local columns", () => {
+        const database = db();
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO notes (id, type, status, content, project_path, session_id,
+                     manifest_json, compiled_check, check_status, check_version, policy_version,
+                     created_at, updated_at)
+                     VALUES (41, 'smart', 'ready', 'rich note', '/repo', 'session',
+                     '{"condition":"pr"}', 'compiled', 'compiled', 7, 3, 100, 200)`,
+                )
+                .run();
+        });
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "notes",
+                cursor: 0,
+                next_cursor: 1,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "notes",
+                        op: "insert",
+                        module_row_id: 9,
+                        full_row_snapshot: {
+                            context_store_uuid: "store",
+                            context_row_id: 41,
+                            project_path: "/repo",
+                            session_id: "session",
+                            content: "updated by module",
+                            status: "active",
+                            updated_at_ms: 300,
+                        },
+                        content_hash: null,
+                    },
+                ],
+            },
+        });
+        expect(
+            database
+                .prepare(
+                    "SELECT content, manifest_json, compiled_check, check_version, policy_version FROM notes WHERE id = 41",
+                )
+                .get(),
+        ).toEqual({
+            content: "updated by module",
+            manifest_json: '{"condition":"pr"}',
+            compiled_check: "compiled",
+            check_version: 7,
+            policy_version: 3,
+        });
+    });
+
     test("mapping feed rows round-trip into the verification side table", () => {
         const database = db();
         const contextMemory = insertMemory(database, {
