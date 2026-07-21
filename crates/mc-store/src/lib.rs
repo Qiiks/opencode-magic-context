@@ -52,6 +52,12 @@ pub struct HarnessMeta {
     pub ordinal: Option<u64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub synthetic: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub summary: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub errored: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2414,6 +2420,12 @@ impl<'de> Deserialize<'de> for FrozenSyntheticTodoPair {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteNudgeAnchorSeed {
+    pub message_id: String,
+    pub text: String,
+}
+
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
@@ -2484,6 +2496,10 @@ pub struct ModuleMeta {
     /// tail end.
     #[serde(default)]
     pub synthetic_todo: Option<FrozenSyntheticTodoPair>,
+    /// Sticky note-nudge decisions copied from TypeScript during bootstrap. The host
+    /// replays these anchors after native serving so a mode transition keeps them visible.
+    #[serde(default)]
+    pub note_nudge_anchors: Vec<NoteNudgeAnchorSeed>,
     /// The applied in-session revision the frozen m1 block was last rendered from.
     /// A signal mismatch is pending work; it is not itself permission to bust the provider
     /// cache. 0 is retained for pre-materialization metadata.
@@ -3318,6 +3334,18 @@ pub struct ShadowDropSeedRow {
     pub payload: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingAgentDropSeedRow {
+    pub block_id: String,
+    pub queued_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserHintSeedRow {
+    pub block_id: String,
+    pub hint_text: String,
+}
+
 pub struct ShadowStateSyncRequest<'a> {
     pub session_id: &'a str,
     pub shadow_project_path: &'a str,
@@ -3327,6 +3355,14 @@ pub struct ShadowStateSyncRequest<'a> {
     pub seed_boundary_id: Option<&'a str>,
     pub drop_seeds: &'a [ShadowDropSeedRow],
     pub drop_seed_skipped: usize,
+    pub pending_agent_drops: &'a [PendingAgentDropSeedRow],
+    pub pending_agent_drops_skipped: usize,
+    pub user_hint_seeds: &'a [UserHintSeedRow],
+    pub auto_search_hint_skipped: usize,
+    pub note_nudge_anchors: Option<&'a [NoteNudgeAnchorSeed]>,
+    pub todo_synthetic_anchor: Option<&'a FrozenSyntheticTodoPair>,
+    pub todo_synthetic_anchor_present: bool,
+    pub emergency_latches: Option<(f64, bool, u64)>,
     pub compartments: &'a [StoredCompartment],
     pub memories: &'a [ShadowMemoryRow],
     pub memory_mutations: &'a [ShadowMemoryMutationRow],
@@ -3347,6 +3383,13 @@ pub struct ShadowStateSyncResult {
     pub memories_skipped: bool,
     /// Number of TS drop rows that could not be materialized into frozen module units.
     pub drop_seeds_skipped: usize,
+    pub pending_agent_drops_seeded: usize,
+    pub pending_agent_drops_skipped: usize,
+    pub user_hint_seeds_seeded: usize,
+    pub auto_search_hint_skipped: usize,
+    pub note_nudge_anchors_seeded: usize,
+    pub todo_synthetic_anchor_seeded: bool,
+    pub emergency_latches_seeded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6549,6 +6592,59 @@ impl McStore {
                 request.drop_seeds,
                 request.drop_seed_skipped,
             );
+            let mut pending_agent_drops_seeded = 0usize;
+            let mut pending_agent_drops_skipped = request.pending_agent_drops_skipped;
+            for seed in request.pending_agent_drops {
+                if !valid_drop_seed_block_id(&seed.block_id) {
+                    pending_agent_drops_skipped = pending_agent_drops_skipped.saturating_add(1);
+                    eprintln!(
+                        "mc-store: skipped invalid pending drop seed for session {}: {}",
+                        request.session_id, seed.block_id
+                    );
+                    continue;
+                }
+                pending_agent_drops_seeded += tx.execute(
+                    "INSERT INTO pending_agent_drops(session_id, target_id, queued_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(session_id, target_id) DO NOTHING",
+                    params![request.session_id, seed.block_id, seed.queued_at_ms.max(0)],
+                )?;
+            }
+            let mut user_hint_seeds_seeded = 0usize;
+            let mut auto_search_hint_skipped = request.auto_search_hint_skipped;
+            for seed in request.user_hint_seeds {
+                if !valid_drop_seed_block_id(&seed.block_id) {
+                    auto_search_hint_skipped = auto_search_hint_skipped.saturating_add(1);
+                    continue;
+                }
+                user_hint_seeds_seeded += tx.execute(
+                    "INSERT INTO mc_user_hints(session_id, block_id, hint_text, created_at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(session_id, block_id) DO NOTHING",
+                    params![request.session_id, seed.block_id, seed.hint_text, current_time_ms()],
+                )?;
+            }
+            let note_nudge_anchors_seeded = request
+                .note_nudge_anchors
+                .map(|anchors| {
+                    meta.note_nudge_anchors = anchors.to_vec();
+                    anchors.len()
+                })
+                .unwrap_or(0);
+            let todo_synthetic_anchor_seeded = if request.todo_synthetic_anchor_present {
+                meta.synthetic_todo = request.todo_synthetic_anchor.cloned();
+                true
+            } else {
+                false
+            };
+            let emergency_latches_seeded = if let Some((sample, has_prior, watermark)) = request.emergency_latches {
+                meta.last_emergency_input_sample = sample.max(0.0);
+                meta.has_prior_emergency_drop = has_prior;
+                meta.last_execute_ordinal = watermark;
+                true
+            } else {
+                false
+            };
 
             for compartment in request.compartments {
                 upsert_compartment_tx(tx, request.session_id, compartment)?;
@@ -6640,6 +6736,13 @@ impl McStore {
                 row_version: next,
                 memories_skipped,
                 drop_seeds_skipped,
+                pending_agent_drops_seeded,
+                pending_agent_drops_skipped,
+                user_hint_seeds_seeded,
+                auto_search_hint_skipped,
+                note_nudge_anchors_seeded,
+                todo_synthetic_anchor_seeded,
+                emergency_latches_seeded,
             }))
         })?;
 
@@ -15624,6 +15727,14 @@ mod shadow_tests {
                 last_todo_state: None,
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -15694,6 +15805,14 @@ mod shadow_tests {
                 last_todo_state: Some("[]".to_string()),
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: serde_json::json!({"seq": 0}),
             })
             .unwrap();
@@ -15728,6 +15847,14 @@ mod shadow_tests {
                 last_todo_state: None,
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap_err();
@@ -15762,6 +15889,14 @@ mod shadow_tests {
                 last_todo_state: None,
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap_err();
@@ -15797,6 +15932,14 @@ mod shadow_tests {
                 last_todo_state: None,
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -15821,6 +15964,14 @@ mod shadow_tests {
                 last_todo_state: None,
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -15853,6 +16004,14 @@ mod shadow_tests {
                 last_todo_state: None,
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -15883,6 +16042,14 @@ mod shadow_tests {
                 last_todo_state: None,
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap_err();
@@ -15932,6 +16099,14 @@ mod shadow_tests {
                 last_todo_state: None,
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -15960,6 +16135,14 @@ mod shadow_tests {
                 last_todo_state: None,
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -15998,6 +16181,14 @@ mod shadow_tests {
                 last_todo_state: None,
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -16442,6 +16633,14 @@ mod shadow_tests {
                 last_todo_state: None,
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();
@@ -16534,6 +16733,14 @@ mod shadow_tests {
                     last_todo_state: None,
                     project_memory_epoch: None,
                     user_profile_version: None,
+                    pending_agent_drops: &[],
+                    pending_agent_drops_skipped: 0,
+                    user_hint_seeds: &[],
+                    auto_search_hint_skipped: 0,
+                    note_nudge_anchors: None,
+                    todo_synthetic_anchor: None,
+                    todo_synthetic_anchor_present: false,
+                    emergency_latches: None,
                     acked_watermarks: serde_json::Value::Null,
                 })
                 .unwrap();
@@ -16622,6 +16829,14 @@ mod shadow_tests {
                     last_todo_state: None,
                     project_memory_epoch: None,
                     user_profile_version: None,
+                    pending_agent_drops: &[],
+                    pending_agent_drops_skipped: 0,
+                    user_hint_seeds: &[],
+                    auto_search_hint_skipped: 0,
+                    note_nudge_anchors: None,
+                    todo_synthetic_anchor: None,
+                    todo_synthetic_anchor_present: false,
+                    emergency_latches: None,
                     acked_watermarks: serde_json::Value::Null,
                 })
                 .unwrap();
@@ -17460,6 +17675,14 @@ mod shadow_tests {
                 last_todo_state: Some("first".to_string()),
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: serde_json::json!({"sender": "first"}),
             })
             .unwrap();
@@ -17481,6 +17704,14 @@ mod shadow_tests {
                 last_todo_state: Some("second".to_string()),
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: serde_json::json!({"sender": "second"}),
             })
             .unwrap_err();

@@ -610,7 +610,7 @@ describe("Rust mode authority adapter", () => {
         expect(requestBodies[0]?.tool_present).toBe(false);
     });
 
-    it("delivers a repeated module directive only once across the synthetic nudge turn", async () => {
+    it("defers a repeated module directive until the terminal boundary", async () => {
         const sessionId = `rust-channel2-refire-${Date.now()}`;
         sessions.push(sessionId);
         const db = makeDb();
@@ -660,7 +660,8 @@ describe("Rust mode authority adapter", () => {
             makeMeta(db, sessionId),
         );
 
-        expect(getChannel2NudgeState(db, sessionId)).toBe("delivered");
+        expect(getChannel2NudgeState(db, sessionId)).toBe("");
+        expect(promptAsync).not.toHaveBeenCalled();
         expect(transform.getState(sessionId).syntheticTurnCount).toBe(1);
     });
 
@@ -710,7 +711,8 @@ describe("Rust mode authority adapter", () => {
         setChannel2NudgeState(db, sessionId, "pending");
         const realInput = makeMessages(sessionId);
         await transform.run(sessionId, realInput, { messages: realInput }, makeMeta(db, sessionId));
-        expect(promptAsync).toHaveBeenCalledTimes(1);
+        expect(promptAsync).toHaveBeenCalledTimes(0);
+        expect(getChannel2NudgeState(db, sessionId)).toBe("pending");
         expect(transform.getState(sessionId).syntheticTurnCount).toBe(0);
     });
 

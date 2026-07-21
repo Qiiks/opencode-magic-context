@@ -318,6 +318,8 @@ export interface TransformDeps {
      * and read in tool.execute.after.
      */
     channel1StateBySession?: Map<string, import("./ctx-reduce-nudge").Channel1State>;
+    /** Module-authored Channel 2 text held until the terminal `message.updated` event, when the host delivers the pending nudge. */
+    channel2DirectiveTextBySession?: Map<string, string>;
     protectedTags: number;
     /**
      * ctx_reduce visibility is resolved per session from the session's tool

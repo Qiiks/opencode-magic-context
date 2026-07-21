@@ -310,6 +310,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // Written at the end of each transform pass (post-drop), read in
     // tool.execute.after. Only populated for primary sessions.
     const channel1StateBySession = new Map<string, import("./ctx-reduce-nudge").Channel1State>();
+    const channel2DirectiveTextBySession = new Map<string, string>();
 
     /**
      * Return the live provider/model for a session.
@@ -851,6 +852,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         contextUsageMap,
         db,
         channel1StateBySession,
+        channel2DirectiveTextBySession,
         protectedTags: deps.config.protected_tags,
         smartDrops: deps.config.smart_drops === true,
         clearReasoningAge: deps.config.clear_reasoning_age ?? 50,
@@ -939,6 +941,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         db,
         client: deps.client,
         channel1StateBySession,
+        channel2DirectiveTextBySession,
         internalChildSessions,
         getNotificationParams: (sessionId) =>
             getLiveNotificationParams(
@@ -975,6 +978,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             internalChildSessions.delete(sessionId);
             rustMemorySyncRequestedSessions.delete(sessionId);
             channel1StateBySession.delete(sessionId);
+            channel2DirectiveTextBySession.delete(sessionId);
             shadowSender?.clearSession(sessionId);
             clearEmbedSessionState(sessionId);
         },

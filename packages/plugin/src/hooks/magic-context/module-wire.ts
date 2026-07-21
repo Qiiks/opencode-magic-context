@@ -457,14 +457,13 @@ function toolCallId(part: Record<string, unknown>, messageId: string, blockIndex
  * parts is not enough because ignored parts disappear and completed tools
  * become a call/result pair.
  */
-export function moduleRawBlockMappings(
-    message: RawMessageParts | null,
-): ModuleRawBlockMapping[] {
+export function moduleRawBlockMappings(message: RawMessageParts | null): ModuleRawBlockMapping[] {
     if (!message) return [];
     const mappings: ModuleRawBlockMapping[] = [];
     let blockIndex = 0;
     for (const [partIndex, partValue] of message.parts.entries()) {
-        if (partValue === null || typeof partValue !== "object" || Array.isArray(partValue)) continue;
+        if (partValue === null || typeof partValue !== "object" || Array.isArray(partValue))
+            continue;
         const part = partValue as Record<string, unknown>;
         const type = typeof part.type === "string" ? part.type : "unknown";
         if (type === "text") {
@@ -488,7 +487,13 @@ export function moduleRawBlockMappings(
             mappings.push({ blockIndex, partIndex, kind: "tool_call", callId, toolInput: input });
             blockIndex += 1;
             if (state?.status === "completed" || state?.status === "error") {
-                mappings.push({ blockIndex, partIndex, kind: "tool_result", callId, toolInput: input });
+                mappings.push({
+                    blockIndex,
+                    partIndex,
+                    kind: "tool_result",
+                    callId,
+                    toolInput: input,
+                });
                 blockIndex += 1;
             }
             continue;
@@ -618,7 +623,13 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
             ck: {
                 role,
                 content,
-                meta: { harness_id: id, ordinal },
+                meta: {
+                    harness_id: id,
+                    ordinal,
+                    summary: info.summary === true,
+                    errored: info.error !== undefined && info.error !== null,
+                    ...(typeof info.finish === "string" ? { finish: info.finish } : {}),
+                },
             },
         };
     });

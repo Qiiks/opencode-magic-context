@@ -760,6 +760,7 @@ struct Channel1NudgeInputs<'a, 'ctx> {
     mutation_exempt_mid: Option<&'a str>,
     context_limit_tokens: f64,
     input_tokens: f64,
+    protected_tags: usize,
 }
 
 /// Transform errors. Each leaves the durable frozen-set UNCHANGED (the CAS simply does
@@ -2099,6 +2100,7 @@ fn apply_once(
                 mutation_exempt_mid,
                 context_limit_tokens,
                 input_tokens: usage_input_tokens,
+                protected_tags: req.protected_tags,
             },
             &mut meta,
         ) {
@@ -2180,6 +2182,7 @@ fn apply_once(
             context_limit_tokens,
             input_tokens: usage_input_tokens,
             execute_threshold_percentage: ctx.execute_threshold_percentage,
+            protected_tags: req.protected_tags,
         })
     };
 
@@ -2882,9 +2885,23 @@ fn tail_sel_items(live: &[&FlatBlock], coverage: Option<u64>) -> Vec<SelItem> {
 }
 
 fn tail_end_mid(req: &TransformRequest, coverage: Option<u64>) -> Option<String> {
+    // Synthetic todo state is attached to the latest non-synthetic assistant message,
+    // never to a trailing user or tool message. If no eligible assistant exists, return
+    // None so build_output can place the stable anchor after the initial metadata blocks.
     req.messages
         .iter()
-        .rfind(|msg| !msg.ck.meta.synthetic && is_tail(msg.ordinal, coverage))
+        .rev()
+        .find(|msg| {
+            !msg.ck.meta.synthetic
+                && !msg.ck.meta.summary
+                && !msg.ck.meta.errored
+                && !msg.ck.meta.finish.as_deref().is_some_and(|finish| {
+                    let finish = finish.to_ascii_lowercase();
+                    finish.contains("error") || finish.contains("abort")
+                })
+                && msg.ck.role == "assistant"
+                && is_tail(msg.ordinal, coverage)
+        })
         .map(|msg| msg.mid.clone())
 }
 
@@ -4284,8 +4301,11 @@ fn maybe_append_channel1_nudge(
         / 100.0)
         .round()
         .max(0.0) as i64;
-    let reclaimable_tokens =
-        reclaimable_older_than_working_window(&active_tags, working_window_tokens);
+    let reclaimable_tokens = reclaimable_older_than_working_window(
+        &active_tags,
+        working_window_tokens,
+        input.protected_tags,
+    );
     let decision = decide_channel1(
         reclaimable_tokens,
         live_tail_tokens,
@@ -4314,7 +4334,7 @@ fn maybe_append_channel1_nudge(
         &existing_blocks,
         input.mutation_exempt_mid,
     )?;
-    let hint = oldest_reclaimable_hint(&active_tags, working_window_tokens);
+    let hint = oldest_reclaimable_hint(&active_tags, working_window_tokens, input.protected_tags);
     let reminder = build_channel1_reminder(decision.level, decision.reclaimable_tokens, &hint);
     Some(Channel1AppendRow {
         block_id,
@@ -4398,6 +4418,7 @@ struct Channel2DirectiveInput<'a> {
     context_limit_tokens: f64,
     input_tokens: f64,
     execute_threshold_percentage: f64,
+    protected_tags: usize,
 }
 
 fn channel2_directive(input: Channel2DirectiveInput<'_>) -> Option<HostDirectives> {
@@ -4420,7 +4441,8 @@ fn channel2_directive(input: Channel2DirectiveInput<'_>) -> Option<HostDirective
         input.tag_rows,
         input.mutation_exempt_mid,
     );
-    let (reclaimable_tokens, live_tail_tokens) = channel2_token_aggregate(&active_tags);
+    let (reclaimable_tokens, live_tail_tokens) =
+        channel2_token_aggregate(&active_tags, input.protected_tags);
     let usable_tokens =
         (working_window_tokens as f64 - input.input_tokens + live_tail_tokens as f64).max(0.0);
     let due = reclaimable_tokens >= CHANNEL2_MIN_RECLAIMABLE
@@ -4429,7 +4451,7 @@ fn channel2_directive(input: Channel2DirectiveInput<'_>) -> Option<HostDirective
     if !due {
         return None;
     }
-    let hint = oldest_channel2_hint(&active_tags);
+    let hint = oldest_channel2_hint(&active_tags, input.protected_tags);
     Some(HostDirectives {
         channel2_nudge: Some(Channel2NudgeDirective {
             text: build_channel2_reminder(reclaimable_tokens, &hint),
@@ -4437,26 +4459,39 @@ fn channel2_directive(input: Channel2DirectiveInput<'_>) -> Option<HostDirective
     })
 }
 
-fn channel2_token_aggregate(active_tags: &[ActiveTagForNudge]) -> (i64, i64) {
-    let protected_cutoff =
-        (active_tags.len() > 20).then(|| active_tags[active_tags.len() - 20].tag_number);
+fn protected_tag_cutoff(active_tags: &[ActiveTagForNudge], protected_tags: usize) -> Option<i64> {
+    if protected_tags == 0 {
+        return None;
+    }
+    active_tags
+        .get(active_tags.len().checked_sub(protected_tags)?)
+        .map(|tag| tag.tag_number)
+        .or(Some(i64::MIN))
+}
+
+fn channel2_token_aggregate(
+    active_tags: &[ActiveTagForNudge],
+    protected_tags: usize,
+) -> (i64, i64) {
+    let protected_cutoff = protected_tag_cutoff(active_tags, protected_tags);
     let reclaimable = active_tags
         .iter()
         .filter(|tag| tag.kind == "tool_result")
         .filter(|tag| protected_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff))
         .map(|tag| tag.token_count.max(0))
         .sum();
-    let live_tail = active_tags
-        .iter()
-        .filter(|tag| tag.kind != "tool_result")
-        .map(|tag| tag.token_count.max(0))
-        .sum();
+    // The usable range includes the full live tail, including tool results. Only
+    // tool-result bytes are reclaimable; excluding them here would make the ceiling
+    // predicate fire early compared with the host aggregate (conversation + tool I/O).
+    let live_tail = active_tags.iter().map(|tag| tag.token_count.max(0)).sum();
     (reclaimable, live_tail)
 }
 
-fn oldest_channel2_hint(active_tags: &[ActiveTagForNudge]) -> Vec<(i64, String)> {
-    let protected_cutoff =
-        (active_tags.len() > 20).then(|| active_tags[active_tags.len() - 20].tag_number);
+fn oldest_channel2_hint(
+    active_tags: &[ActiveTagForNudge],
+    protected_tags: usize,
+) -> Vec<(i64, String)> {
+    let protected_cutoff = protected_tag_cutoff(active_tags, protected_tags);
     active_tags
         .iter()
         .filter(|tag| tag.kind == "tool_result")
@@ -4478,6 +4513,7 @@ fn build_channel2_reminder(reclaimable_tokens: i64, hint: &[(i64, String)]) -> S
 fn reclaimable_older_than_working_window(
     active_tags: &[ActiveTagForNudge],
     working_window_tokens: i64,
+    protected_tags: usize,
 ) -> i64 {
     let mut protected = HashSet::new();
     let mut sum = 0i64;
@@ -4488,9 +4524,14 @@ fn reclaimable_older_than_working_window(
         protected.insert(tag.tag_number);
         sum += tag.token_count.max(0);
     }
+    let configured_cutoff = protected_tag_cutoff(active_tags, protected_tags);
     active_tags
         .iter()
-        .filter(|tag| tag.kind != "tool_call" && !protected.contains(&tag.tag_number))
+        .filter(|tag| {
+            tag.kind == "tool_result"
+                && !protected.contains(&tag.tag_number)
+                && configured_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff)
+        })
         .map(|tag| tag.token_count.max(0))
         .sum()
 }
@@ -4626,6 +4667,7 @@ fn tool_result_can_carry_channel1(block: &CkWireBlock) -> bool {
 fn oldest_reclaimable_hint(
     active_tags: &[ActiveTagForNudge],
     working_window_tokens: i64,
+    protected_tags: usize,
 ) -> Vec<(i64, String)> {
     let mut protected = HashSet::new();
     let mut sum = 0i64;
@@ -4636,9 +4678,14 @@ fn oldest_reclaimable_hint(
         protected.insert(tag.tag_number);
         sum += tag.token_count.max(0);
     }
+    let configured_cutoff = protected_tag_cutoff(active_tags, protected_tags);
     active_tags
         .iter()
-        .filter(|tag| tag.kind == "tool_result" && !protected.contains(&tag.tag_number))
+        .filter(|tag| {
+            tag.kind == "tool_result"
+                && !protected.contains(&tag.tag_number)
+                && configured_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff)
+        })
         .take(4)
         .map(|tag| (tag.tag_number, "tool".to_string()))
         .collect()
@@ -7026,6 +7073,14 @@ mod tests {
             last_todo_state: None,
             project_memory_epoch: Some(7),
             user_profile_version: None,
+            pending_agent_drops: &[],
+            pending_agent_drops_skipped: 0,
+            user_hint_seeds: &[],
+            auto_search_hint_skipped: 0,
+            note_nudge_anchors: None,
+            todo_synthetic_anchor: None,
+            todo_synthetic_anchor_present: false,
+            emergency_latches: None,
             acked_watermarks: serde_json::Value::Null,
         })
         .unwrap();
@@ -9392,7 +9447,7 @@ mod tests {
                 vec![
                     item("a", 1, "raw"),
                     todowrite_call("todo", 2, todos),
-                    item("t3", 3, "new tail end"),
+                    assistant_form("t3", 3, &["new tail end"]),
                 ],
             ),
             &spine(),
@@ -9472,7 +9527,7 @@ mod tests {
                 vec![
                     item("a", 1, "raw"),
                     todowrite_call("todo", 2, todos),
-                    item("tail", 4, "new post-revert tail"),
+                    assistant_form("tail", 4, &["new post-revert tail"]),
                 ],
             ),
             &spine(),
@@ -9525,7 +9580,7 @@ mod tests {
         let moved_items = vec![
             item("a", 1, "raw"),
             todowrite_call("todo", 2, todos),
-            item("t3", 3, "new tail end"),
+            assistant_form("t3", 3, &["new tail end"]),
         ];
         let moved = run(
             &s,
@@ -12706,6 +12761,14 @@ mod tests {
                 last_todo_state: None,
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: Value::Null,
             })
             .unwrap();
@@ -12767,6 +12830,14 @@ mod tests {
                 last_todo_state: None,
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: Value::Null,
             })
             .unwrap();

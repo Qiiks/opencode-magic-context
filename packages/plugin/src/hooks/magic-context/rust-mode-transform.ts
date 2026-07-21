@@ -10,6 +10,7 @@ import {
     pullMemoryMirrorOnce,
     reconcileAuthorityProject,
 } from "../../features/magic-context/context-authority";
+import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import { getMemoryVerifications } from "../../features/magic-context/memory/storage-memory-verifications";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
@@ -18,11 +19,9 @@ import {
     getOverflowState,
     isEmergencyRecoveryArmed,
 } from "../../features/magic-context/storage-meta-persisted";
-import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
 import { writeRustTransformDecision } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
-import { maybeDeliverChannel2 } from "./channel2-delivery";
 import { resolveCtxReduceAvailability } from "./ctx-reduce-availability";
 import {
     resolveExecuteThreshold,
@@ -50,6 +49,7 @@ import type { TransformDeps } from "./transform";
 import { resolveHistoryBudgetTokens } from "./transform";
 import { loadContextUsage } from "./transform-context-state";
 import type { MessageLike } from "./transform-operations";
+import { runRustModePostprocess } from "./transform-postprocess-phase";
 
 export class MemoryAuthorityUnavailableError extends Error {
     readonly code = "MEMORY_AUTHORITY_UNAVAILABLE";
@@ -329,9 +329,7 @@ function getSessionDirectory(
 
 function readUpgradeState(db: TransformDeps["db"], sessionId: string): string {
     const row = db
-        .prepare(
-            "SELECT COUNT(*) AS count FROM compartments WHERE session_id = ? AND legacy = 1",
-        )
+        .prepare("SELECT COUNT(*) AS count FROM compartments WHERE session_id = ? AND legacy = 1")
         .get(sessionId) as { count?: number } | undefined;
     return (row?.count ?? 0) > 0 ? "legacy" : "ready";
 }
@@ -882,7 +880,7 @@ export function createRustModeTransform(
                 system_prompt_hash: sessionMeta.systemPromptHash ?? "",
                 upgrade_state: readUpgradeState(deps.db, sessionId),
                 tool_present: toolPresent,
-                protected_tags: DEFAULT_PROTECTED_TAGS,
+                protected_tags: deps.protectedTags ?? DEFAULT_PROTECTED_TAGS,
             };
             const resolved = await resolveOrdinalsForModule({
                 sessionId,
@@ -1039,6 +1037,13 @@ export function createRustModeTransform(
             let appliedMessages: unknown[];
             try {
                 appliedMessages = applyNativeMessagesVerbatim(output, response);
+                runRustModePostprocess({
+                    db: deps.db,
+                    sessionId,
+                    messages: appliedMessages as MessageLike[],
+                    projectPath: memoryProjectPath,
+                    fullFeatureMode: !sessionMeta.isSubagent,
+                });
                 const boundaryId = response.boundary_id;
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {
                     assertNativeBoundary(appliedMessages, sessionId, boundaryId);
@@ -1074,21 +1079,21 @@ export function createRustModeTransform(
                 // event handler while synthetic turns are cascading.
                 try {
                     casChannel2NudgeState(deps.db, sessionId, "pending", "");
+                    deps.channel2DirectiveTextBySession?.delete(sessionId);
                 } catch {
                     // The delivery lease remains authoritative if another sender owns it.
                 }
             } else if (directiveText) {
+                // The module only recommends Channel 2 here. Delivery must wait for the
+                // terminal message.updated boundary, where the host's shared claim/CAS
+                // path revalidates the lease and coalesces the synthetic user turn.
                 try {
                     casChannel2NudgeState(deps.db, sessionId, "", "pending");
-                    await maybeDeliverChannel2(sessionId, {
-                        db: deps.db,
-                        client: options.hostClient,
-                        directiveText,
-                    });
+                    deps.channel2DirectiveTextBySession?.set(sessionId, directiveText);
                 } catch (error) {
                     sessionLog(
                         sessionId,
-                        "rust channel2 directive delivery failed (ignored):",
+                        "rust channel2 pending-intent CAS failed (ignored):",
                         error,
                     );
                 }

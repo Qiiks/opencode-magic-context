@@ -584,7 +584,14 @@ fn select_agent_drops(
             continue;
         }
         let first_applied = ctx.first_applied_agent_drop_ids.contains(id);
-        let can_ride = ctx.pass_already_busting
+        // A context already at its execute ceiling is an independent/natural bust
+        // opportunity. It must drain every queued row; the one-self-bust rule only
+        // applies while this pass would bust solely because of a newly selected drop.
+        let natural_bust = ctx.pass_already_busting
+            || (ctx.pass_class == PassClass::Execute
+                && ctx.ceiling_tokens > 0.0
+                && ctx.current_total_input_tokens >= ctx.ceiling_tokens);
+        let can_ride = natural_bust
             || (first_applied
                 && ctx.agent_drop_ids.iter().any(|other| {
                     other != id
@@ -985,6 +992,34 @@ mod tests {
             pass_already_busting: false,
             protected_block_ids: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn natural_bust_drains_a_single_command_remainder() {
+        let items = vec![SelItem {
+            id: "drop".to_string(),
+            ordinal: 1,
+            kind: SelKind::Text,
+            provider_executed: false,
+            byte_size: 128,
+            arc_id: None,
+        }];
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.agent_drop_ids = vec!["drop".to_string()];
+        ctx.agent_drop_command_ids
+            .insert("drop".to_string(), "command-1".to_string());
+        ctx.first_applied_agent_drop_ids.insert("drop".to_string());
+        ctx.current_total_input_tokens = 100.0;
+        ctx.ceiling_tokens = 100.0;
+
+        let selected =
+            select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].target_id, "drop");
+
+        ctx.current_total_input_tokens = 99.0;
+        let held = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert!(held.is_empty());
     }
 
     /// Project per-block decisions back to arc-level {arc_id -> "drop"|"edit_marker"}

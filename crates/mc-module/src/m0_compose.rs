@@ -474,6 +474,14 @@ mod tests {
                 last_todo_state: None,
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: serde_json::Value::Null,
             })
             .unwrap();

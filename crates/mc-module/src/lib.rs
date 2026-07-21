@@ -54,11 +54,12 @@ use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, Storag
 use mc_store::{
     canonical_root, validate_state_import_compartments, HistorianPhase, InsertMemoryInput,
     MappingUpdate, McStore, McStoreError, NoteCasOutcome, NoteEvaluationInput, NoteInput,
-    NoteWriteInput, PendingAgentDrop, RecordWrapupCommandOutcome, ShadowDivergenceRecord,
-    ShadowDropSeedRow, ShadowMemoryMutationRow, ShadowMemoryRow, ShadowStateSyncError,
-    ShadowStateSyncRequest, ShadowWorkspaceMemberRow, ShadowWorkspaceRow, StateImportError,
-    StateImportPreflight, StateImportValidationError, StoredChunkTranscript, StoredCompartment,
-    StoredMemoryMutation, StoredNote, TodoStateSetOutcome, VerificationUpdate, WrapupCommandRecord,
+    NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop, PendingAgentDropSeedRow,
+    RecordWrapupCommandOutcome, ShadowDivergenceRecord, ShadowDropSeedRow, ShadowMemoryMutationRow,
+    ShadowMemoryRow, ShadowStateSyncError, ShadowStateSyncRequest, ShadowWorkspaceMemberRow,
+    ShadowWorkspaceRow, StateImportError, StateImportPreflight, StateImportValidationError,
+    StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
+    TodoStateSetOutcome, UserHintSeedRow, VerificationUpdate, WrapupCommandRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -319,6 +320,20 @@ struct ShadowStateSyncWire {
     drop_seeds: Vec<ShadowDropSeedWire>,
     #[serde(default)]
     drop_seed_skipped: usize,
+    #[serde(default)]
+    pending_agent_drops: Vec<PendingAgentDropSeedWire>,
+    #[serde(default)]
+    pending_agent_drops_skipped: usize,
+    #[serde(default)]
+    note_nudge_anchors: Option<Vec<NoteNudgeAnchorSeedWire>>,
+    #[serde(default)]
+    auto_search_hint_decisions: Vec<UserHintSeedWire>,
+    #[serde(default)]
+    auto_search_hint_skipped: usize,
+    #[serde(default)]
+    todo_synthetic_anchor: Option<Option<TodoSyntheticAnchorSeedWire>>,
+    #[serde(default)]
+    emergency_latches: Option<EmergencyLatchSeedWire>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -331,6 +346,40 @@ struct ShadowDropSeedWire {
     drop_mode: String,
     #[serde(default)]
     payload: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PendingAgentDropSeedWire {
+    block_id: String,
+    #[serde(default)]
+    queued_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NoteNudgeAnchorSeedWire {
+    message_id: String,
+    text: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UserHintSeedWire {
+    block_id: String,
+    #[serde(default)]
+    hint_text: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TodoSyntheticAnchorSeedWire {
+    call_id: String,
+    message_id: String,
+    state_json: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EmergencyLatchSeedWire {
+    last_input_sample: f64,
+    has_prior_drop: bool,
+    last_execute_ordinal: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6189,6 +6238,8 @@ impl McHandler {
             "workspace",
             "last_todo_state",
             "acked_watermarks",
+            "todo_synthetic_anchor",
+            "emergency_latches",
         ]
         .iter()
         .filter(|field| {
@@ -6197,11 +6248,17 @@ impl McHandler {
                 .is_some_and(|object| object.contains_key(**field))
         })
         .count();
-        let drop_seed_skipped_present = request
-            .as_object()
-            .is_some_and(|object| object.contains_key("drop_seed_skipped"));
-        if !seed_complete && (scalar_tail_fields != 0 || drop_seed_skipped_present)
-            || seed_complete && scalar_tail_fields != 4
+        let seed_skip_fields_present = request.as_object().is_some_and(|object| {
+            [
+                "drop_seed_skipped",
+                "pending_agent_drops_skipped",
+                "auto_search_hint_skipped",
+            ]
+            .iter()
+            .any(|field| object.contains_key(*field))
+        });
+        if !seed_complete && (scalar_tail_fields != 0 || seed_skip_fields_present)
+            || seed_complete && scalar_tail_fields < 4
         {
             self.discard_shadow_seed(&binding.session);
             return HandlerOutcome::Error {
@@ -6517,6 +6574,49 @@ impl McHandler {
             })
             .collect();
         let drop_seed_skipped = parsed.drop_seed_skipped;
+        let pending_agent_drops: Vec<PendingAgentDropSeedRow> = parsed
+            .pending_agent_drops
+            .into_iter()
+            .map(|seed| PendingAgentDropSeedRow {
+                block_id: seed.block_id,
+                queued_at_ms: seed.queued_at_ms,
+            })
+            .collect();
+        let user_hint_seeds: Vec<UserHintSeedRow> = parsed
+            .auto_search_hint_decisions
+            .into_iter()
+            .map(|seed| UserHintSeedRow {
+                block_id: seed.block_id,
+                hint_text: seed.hint_text,
+            })
+            .collect();
+        let note_nudge_anchors: Option<Vec<NoteNudgeAnchorSeed>> =
+            parsed.note_nudge_anchors.map(|anchors| {
+                anchors
+                    .into_iter()
+                    .map(|anchor| NoteNudgeAnchorSeed {
+                        message_id: anchor.message_id,
+                        text: anchor.text,
+                    })
+                    .collect()
+            });
+        let todo_synthetic_anchor_present = parsed.todo_synthetic_anchor.is_some();
+        let todo_synthetic_anchor = parsed.todo_synthetic_anchor.flatten().and_then(|seed| {
+            let pair = injection::build_synthetic_todo_pair(&seed.state_json)?;
+            if pair.call_id != seed.call_id {
+                return None;
+            }
+            let anchor =
+                (seed.message_id != "__magic_context_todo_head__").then_some(seed.message_id);
+            Some(pair.freeze_at(anchor))
+        });
+        let emergency_latches = parsed.emergency_latches.map(|seed| {
+            (
+                seed.last_input_sample,
+                seed.has_prior_drop,
+                seed.last_execute_ordinal,
+            )
+        });
         let compartments: Vec<StoredCompartment> = parsed
             .compartments
             .into_iter()
@@ -6625,6 +6725,14 @@ impl McHandler {
                 seed_boundary_id: parsed.seed_boundary_id.as_deref(),
                 drop_seeds: &drop_seeds,
                 drop_seed_skipped,
+                pending_agent_drops: &pending_agent_drops,
+                pending_agent_drops_skipped: parsed.pending_agent_drops_skipped,
+                user_hint_seeds: &user_hint_seeds,
+                auto_search_hint_skipped: parsed.auto_search_hint_skipped,
+                note_nudge_anchors: note_nudge_anchors.as_deref(),
+                todo_synthetic_anchor: todo_synthetic_anchor.as_ref(),
+                todo_synthetic_anchor_present,
+                emergency_latches,
                 compartments: &compartments,
                 memories: &memories,
                 memory_mutations: &memory_mutations,
@@ -6644,6 +6752,14 @@ impl McHandler {
                 seed_boundary_id: parsed.seed_boundary_id.as_deref(),
                 drop_seeds: &drop_seeds,
                 drop_seed_skipped,
+                pending_agent_drops: &pending_agent_drops,
+                pending_agent_drops_skipped: parsed.pending_agent_drops_skipped,
+                user_hint_seeds: &user_hint_seeds,
+                auto_search_hint_skipped: parsed.auto_search_hint_skipped,
+                note_nudge_anchors: note_nudge_anchors.as_deref(),
+                todo_synthetic_anchor: todo_synthetic_anchor.as_ref(),
+                todo_synthetic_anchor_present,
+                emergency_latches,
                 compartments: &compartments,
                 memories: &memories,
                 memory_mutations: &memory_mutations,
@@ -6663,6 +6779,13 @@ impl McHandler {
                 "row_version": result.row_version,
                 "memories_skipped": result.memories_skipped,
                 "drop_seeds_skipped": result.drop_seeds_skipped,
+                "pending_agent_drops_seeded": result.pending_agent_drops_seeded,
+                "pending_agent_drops_skipped": result.pending_agent_drops_skipped,
+                "user_hint_seeds_seeded": result.user_hint_seeds_seeded,
+                "auto_search_hint_skipped": result.auto_search_hint_skipped,
+                "note_nudge_anchors_seeded": result.note_nudge_anchors_seeded,
+                "todo_synthetic_anchor_seeded": result.todo_synthetic_anchor_seeded,
+                "emergency_latches_seeded": result.emergency_latches_seeded,
             })),
             Err(ShadowStateSyncError::GenerationMismatch { expected, found }) => {
                 HandlerOutcome::Error {
@@ -9412,18 +9535,34 @@ fn assemble_shadow_seed(
     let mut memories = Vec::new();
     let mut memory_mutations = Vec::new();
     let mut drop_seeds = Vec::new();
+    let mut pending_agent_drops = Vec::new();
+    let mut auto_search_hint_decisions = Vec::new();
+    let mut note_nudge_anchors = Vec::new();
+    let mut note_nudge_anchors_present = false;
     let mut user_profile = Vec::new();
     for mut batch in batches {
         compartments.append(&mut batch.compartments);
         memories.append(&mut batch.memories);
         memory_mutations.append(&mut batch.memory_mutations);
         drop_seeds.append(&mut batch.drop_seeds);
+        pending_agent_drops.append(&mut batch.pending_agent_drops);
+        auto_search_hint_decisions.append(&mut batch.auto_search_hint_decisions);
+        if let Some(anchors) = batch.note_nudge_anchors {
+            note_nudge_anchors_present = true;
+            note_nudge_anchors.extend(anchors);
+        }
         user_profile.append(&mut batch.user_profile);
     }
     compartments.append(&mut final_batch.compartments);
     memories.append(&mut final_batch.memories);
     memory_mutations.append(&mut final_batch.memory_mutations);
     drop_seeds.append(&mut final_batch.drop_seeds);
+    pending_agent_drops.append(&mut final_batch.pending_agent_drops);
+    auto_search_hint_decisions.append(&mut final_batch.auto_search_hint_decisions);
+    if let Some(anchors) = final_batch.note_nudge_anchors {
+        note_nudge_anchors_present = true;
+        note_nudge_anchors.extend(anchors);
+    }
     user_profile.append(&mut final_batch.user_profile);
     ShadowStateSyncWire {
         session_id: final_batch.session_id,
@@ -9446,6 +9585,13 @@ fn assemble_shadow_seed(
         acked_watermarks: final_batch.acked_watermarks,
         drop_seeds,
         drop_seed_skipped: final_batch.drop_seed_skipped,
+        pending_agent_drops,
+        pending_agent_drops_skipped: final_batch.pending_agent_drops_skipped,
+        note_nudge_anchors: note_nudge_anchors_present.then_some(note_nudge_anchors),
+        auto_search_hint_decisions,
+        auto_search_hint_skipped: final_batch.auto_search_hint_skipped,
+        todo_synthetic_anchor: final_batch.todo_synthetic_anchor,
+        emergency_latches: final_batch.emergency_latches,
     }
 }
 
@@ -12697,7 +12843,7 @@ mod tests {
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
         let output = "tool output ".repeat(8_000);
         let mut messages = Vec::new();
-        for index in 0..25u64 {
+        for index in 0..45u64 {
             let call_mid = format!("call-{index}");
             let result_mid = format!("result-{index}");
             messages.push(assistant_tool_call(&call_mid, index * 2 + 1));
@@ -18907,6 +19053,20 @@ mod tests {
         memories: Vec<StrictShadowMemory>,
         memory_mutations: Vec<StrictShadowMemoryMutation>,
         user_profile: Vec<String>,
+        #[serde(default)]
+        pending_agent_drops: Vec<serde_json::Value>,
+        #[serde(default)]
+        pending_agent_drops_skipped: usize,
+        #[serde(default)]
+        note_nudge_anchors: Vec<serde_json::Value>,
+        #[serde(default)]
+        auto_search_hint_decisions: Vec<serde_json::Value>,
+        #[serde(default)]
+        auto_search_hint_skipped: usize,
+        #[serde(default)]
+        todo_synthetic_anchor: Option<serde_json::Value>,
+        #[serde(default)]
+        emergency_latches: Option<serde_json::Value>,
         workspace: Option<StrictShadowWorkspace>,
         last_todo_state: String,
         project_memory_epoch: u64,
@@ -20675,6 +20835,14 @@ mod tests {
                 last_todo_state: None,
                 project_memory_epoch: None,
                 user_profile_version: None,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
                 acked_watermarks: Value::Null,
             })
             .unwrap();

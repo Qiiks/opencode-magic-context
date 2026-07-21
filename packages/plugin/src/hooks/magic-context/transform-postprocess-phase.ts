@@ -36,6 +36,7 @@ import type { SessionMeta, TagEntry } from "../../features/magic-context/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
+import { isRecord } from "../../shared/record-type-guard";
 import { runAutoSearchHint } from "./auto-search-runner";
 import { applyDeferredCompactionMarker, MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { getActiveCompartmentRun } from "./compartment-runner";
@@ -152,6 +153,61 @@ function injectPersistedTodoAnchor(
     if (messageId !== TODO_HEAD_ANCHOR_ID) return false;
     injectSyntheticTodoAtHead(messages, sessionId, part);
     return true;
+}
+
+/**
+ * Apply the host-resident note and recall overlays after native Rust serving.
+ * These anchors are deliberately appended after the module response lands: they
+ * are TypeScript cache decisions, not module-owned CK bytes.
+ */
+export function runRustModePostprocess(args: {
+    db: ContextDatabase;
+    sessionId: string;
+    messages: MessageLike[];
+    projectPath?: string;
+    fullFeatureMode: boolean;
+}): void {
+    if (!args.fullFeatureMode) return;
+    // Test doubles and older integrations may return the legacy bare message shape.
+    // The host-side sticky phase only applies to OpenCode MessageLike objects, so leave
+    // those responses untouched instead of treating a missing `info` object as a failure.
+    if (
+        args.messages.some(
+            (message) =>
+                !message ||
+                typeof message !== "object" ||
+                !isRecord((message as { info?: unknown }).info),
+        )
+    ) {
+        return;
+    }
+    for (const anchor of getNoteNudgeAnchors(args.db, args.sessionId)) {
+        appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
+    }
+    for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
+        if (decision.decision === "hint") {
+            appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
+        }
+    }
+
+    const currentUserMessageId = findLastUserMessageId(args.messages);
+    const noteReadStillVisible = hasVisibleNoteReadCall(args.messages);
+    const deferredNoteText = peekNoteNudgeText(
+        args.db,
+        args.sessionId,
+        currentUserMessageId,
+        args.projectPath,
+        noteReadStillVisible,
+    );
+    if (!deferredNoteText) return;
+    const instruction = `\n\n<instruction name="deferred_notes">${deferredNoteText}</instruction>`;
+    const anchoredMessageId = findLastUserMessageId(args.messages);
+    const outcome = markNoteNudgeDelivered(args.db, args.sessionId, instruction, anchoredMessageId);
+    if (anchoredMessageId && outcome.ok) {
+        appendReminderToUserMessageById(args.messages, anchoredMessageId, instruction);
+    } else if (anchoredMessageId && !outcome.ok) {
+        sessionLog(args.sessionId, `rust note-nudge delivery skipped wire append: ${outcome.kind}`);
+    }
 }
 
 function dropMarkerSummaryTag(

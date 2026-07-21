@@ -182,6 +182,7 @@ pub fn decode_opencode_with_sidecar(
                 harness_id: Some(mid.clone()),
                 ordinal: Some(ordinal),
                 synthetic,
+                ..Default::default()
             },
         );
         decoded.push(CkIngressMessage {

@@ -98,6 +98,7 @@ pub fn decode_pi_with_sidecar(
                 harness_id: Some(mid.clone()),
                 ordinal: Some(ordinal),
                 synthetic: false,
+                ..Default::default()
             },
         );
         decoded.push(CkIngressMessage {
@@ -337,6 +338,7 @@ fn decode_opaque_entry(
             harness_id: Some(mid.clone()),
             ordinal: Some(ordinal),
             synthetic: false,
+            ..Default::default()
         },
     );
     sidecar.remember_message(
