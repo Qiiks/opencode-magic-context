@@ -134,6 +134,7 @@ describe("memory authority protocol", () => {
 
     test("mapping feed rows round-trip into the verification side table", () => {
         const database = db();
+        const storeUuid = ensureContextStoreUuid(database);
         const contextMemory = insertMemory(database, {
             projectPath: "/repo",
             category: "CONSTRAINTS",
@@ -161,7 +162,7 @@ describe("memory authority protocol", () => {
                         normalized_hash: "module-hash",
                         status: "active",
                         mapping: ["src/lib.rs", "src/lib.rs"],
-                        context_store_uuid: "store",
+                        context_store_uuid: storeUuid,
                         context_row_id: contextMemory.id,
                     },
                 },
@@ -174,6 +175,7 @@ describe("memory authority protocol", () => {
     });
     test("preserves source metadata across the historical 9397 mapping sequence", () => {
         const database = db();
+        const storeUuid = ensureContextStoreUuid(database);
         withPrivilegedWriter(database, () => {
             database
                 .prepare(
@@ -212,7 +214,7 @@ describe("memory authority protocol", () => {
             superseded_by_memory_id: null,
             merged_from: null,
             metadata_json: null,
-            context_store_uuid: "store",
+            context_store_uuid: storeUuid,
             context_row_id: 9397,
         };
         applyMirrorPage({
@@ -507,15 +509,17 @@ describe("memory authority protocol", () => {
         ).toEqual({ count: 0 });
     });
 
-    test("mirror-back adopts an unambiguous legacy facade row by content", () => {
+    test("mirror-back keeps same content in separate project rows", () => {
         const database = db();
         withPrivilegedWriter(database, () => {
             database
                 .prepare(
                     "INSERT INTO memories (id, project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0)",
                 )
-                .run(9395, "/repo", "CONFIG_VALUES", "drive model", "same-hash");
+                .run(9395, "project-a", "PROJECT_RULES", "shared fact", "H");
         });
+        const before = database.prepare("SELECT * FROM memories WHERE id = 9395").get();
+
         applyMirrorPage({
             db: database,
             page: {
@@ -531,94 +535,206 @@ describe("memory authority protocol", () => {
                         module_row_id: 8214,
                         full_row_snapshot: {
                             id: 8214,
-                            project_path: "git:identity",
-                            category: "CONFIG_VALUES",
-                            content: "drive model",
-                            normalized_hash: "same-hash",
+                            project_path: "project-b",
+                            category: "PROJECT_RULES",
+                            content: "shared fact",
+                            normalized_hash: "H",
                             status: "active",
                         },
-                        content_hash: "same-hash",
+                        content_hash: "H",
                     },
                 ],
             },
         });
-        expect(
-            database
-                .prepare("SELECT COUNT(*) AS count FROM memories WHERE category = 'CONFIG_VALUES'")
-                .get(),
-        ).toEqual({ count: 1 });
-        expect(database.prepare("SELECT id, project_path FROM memories").get()).toEqual({
-            id: 9395,
-            project_path: "git:identity",
-        });
+
+        expect(database.prepare("SELECT * FROM memories WHERE id = 9395").get()).toEqual(before);
         expect(
             database
                 .prepare(
-                    "SELECT context_row_id FROM mirror_identity WHERE domain = 'memories' AND module_project = 'git:identity' AND module_row_id = 8214",
+                    "SELECT id, project_path, category, normalized_hash FROM memories ORDER BY id",
+                )
+                .all(),
+        ).toEqual([
+            {
+                id: 9395,
+                project_path: "project-a",
+                category: "PROJECT_RULES",
+                normalized_hash: "H",
+            },
+            {
+                id: 9396,
+                project_path: "project-b",
+                category: "PROJECT_RULES",
+                normalized_hash: "H",
+            },
+        ]);
+        expect(
+            database
+                .prepare(
+                    "SELECT context_row_id FROM mirror_identity WHERE domain = 'memories' AND module_project = 'project-b' AND module_row_id = 8214",
                 )
                 .get(),
-        ).toEqual({ context_row_id: 9395 });
+        ).toEqual({ context_row_id: 9396 });
+    });
+
+    test("mirror-back adopts an unambiguous legacy facade row by same-project content", () => {
+        const database = db();
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    "INSERT INTO memories (id, project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0)",
+                )
+                .run(9395, "project-a", "PROJECT_RULES", "shared fact", "H");
+        });
 
         applyMirrorPage({
             db: database,
             page: {
                 domain: "memories",
-                cursor: 1,
-                next_cursor: 2,
+                cursor: 0,
+                next_cursor: 1,
                 has_more: false,
                 rows: [
                     {
-                        feed_seq: 2,
+                        feed_seq: 1,
+                        domain: "memories",
+                        op: "insert",
+                        module_row_id: 8214,
+                        full_row_snapshot: {
+                            id: 8214,
+                            project_path: "project-a",
+                            category: "PROJECT_RULES",
+                            content: "updated shared fact",
+                            normalized_hash: "H",
+                            status: "active",
+                        },
+                        content_hash: "H",
+                    },
+                ],
+            },
+        });
+
+        expect(database.prepare("SELECT COUNT(*) AS count FROM memories").get()).toEqual({
+            count: 1,
+        });
+        expect(database.prepare("SELECT id, project_path, content FROM memories").get()).toEqual({
+            id: 9395,
+            project_path: "project-a",
+            content: "updated shared fact",
+        });
+        expect(
+            database
+                .prepare(
+                    "SELECT context_row_id FROM mirror_identity WHERE domain = 'memories' AND module_project = 'project-a' AND module_row_id = 8214",
+                )
+                .get(),
+        ).toEqual({ context_row_id: 9395 });
+    });
+
+    test("mirror-back skips an adopted row whose project ownership differs", () => {
+        const database = db();
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    "INSERT INTO memories (id, project_path, category, content, normalized_hash, importance, source_type, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0)",
+                )
+                .run(9395, "project-a", "PROJECT_RULES", "owned by A", "A-hash", 75, "agent");
+            database
+                .prepare(
+                    "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', 'project-b', 8214, 9395)",
+                )
+                .run();
+        });
+        const before = database.prepare("SELECT * FROM memories WHERE id = 9395").get();
+
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 0,
+                next_cursor: 1,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "memories",
+                        op: "update",
+                        module_row_id: 8214,
+                        full_row_snapshot: {
+                            id: 8214,
+                            project_path: "project-b",
+                            category: "PROJECT_RULES",
+                            content: "owned by B",
+                            normalized_hash: "B-hash",
+                            status: "active",
+                        },
+                        content_hash: "B-hash",
+                    },
+                ],
+            },
+        });
+
+        expect(database.prepare("SELECT * FROM memories WHERE id = 9395").get()).toEqual(before);
+    });
+
+    test("mirror-back pins row-id adoption to the local context store UUID", () => {
+        const database = db();
+        const localStoreUuid = ensureContextStoreUuid(database);
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    "INSERT INTO memories (id, project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0)",
+                )
+                .run(9395, "project-a", "PROJECT_RULES", "local fact", "local-hash");
+        });
+
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 0,
+                next_cursor: 1,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
                         domain: "memories",
                         op: "insert",
                         module_row_id: 9395,
                         full_row_snapshot: {
                             id: 9395,
-                            project_path: "/repo",
-                            category: "CONFIG_VALUES",
-                            content: "drive model",
-                            normalized_hash: "same-hash",
+                            project_path: "project-a",
+                            category: "PROJECT_RULES",
+                            content: "foreign fact",
+                            normalized_hash: "foreign-hash",
+                            context_store_uuid: `${localStoreUuid}-foreign`,
+                            context_row_id: 9395,
                             status: "active",
                         },
-                        content_hash: "same-hash",
+                        content_hash: "foreign-hash",
                     },
                 ],
             },
         });
-        applyMirrorPage({
-            db: database,
-            page: {
-                domain: "memories",
-                cursor: 2,
-                next_cursor: 3,
-                has_more: false,
-                rows: [
-                    {
-                        feed_seq: 3,
-                        domain: "memories",
-                        op: "tombstone",
-                        module_row_id: 9395,
-                        full_row_snapshot: {
-                            id: 9395,
-                            project_path: "/repo",
-                            category: "CONFIG_VALUES",
-                            content: "drive model",
-                            normalized_hash: "same-hash",
-                            status: "active",
-                        },
-                        content_hash: "same-hash",
-                    },
-                ],
-            },
+
+        expect(database.prepare("SELECT COUNT(*) AS count FROM memories").get()).toEqual({
+            count: 2,
         });
-        expect(database.prepare("SELECT id FROM memories").get()).toEqual({ id: 9395 });
+        expect(
+            database
+                .prepare("SELECT id, project_path, normalized_hash FROM memories ORDER BY id")
+                .all(),
+        ).toEqual([
+            { id: 9395, project_path: "project-a", normalized_hash: "local-hash" },
+            { id: 9396, project_path: "project-a", normalized_hash: "foreign-hash" },
+        ]);
         expect(
             database
                 .prepare(
-                    "SELECT context_row_id FROM mirror_identity WHERE domain = 'memories' AND module_project = 'git:identity' AND module_row_id = 8214",
+                    "SELECT context_row_id FROM mirror_identity WHERE domain = 'memories' AND module_project = 'project-a' AND module_row_id = 9395",
                 )
                 .get(),
-        ).toEqual({ context_row_id: 9395 });
+        ).toEqual({ context_row_id: 9396 });
     });
 
     test("canonical mapping survives legacy-first normalization tombstone ordering", () => {

@@ -1062,7 +1062,10 @@ function contextMemoryId(
     if (mapped) return mapped.context_row_id;
     const sourceUuid = rowNullableString(row, "context_store_uuid");
     const sourceId = rowNumber(row, "context_row_id", -1);
-    if (sourceUuid && sourceId >= 0) {
+    const localStoreUuid = getContextStoreUuid(db);
+    // A module row id is meaningful only inside the context database that minted it;
+    // matching the number in another store could silently bind this project to foreign data.
+    if (sourceUuid && sourceUuid === localStoreUuid && sourceId >= 0) {
         const existing = db
             .prepare("SELECT id FROM memories WHERE id = ? AND project_path = ?")
             .get(sourceId, moduleProject) as { id?: number } | undefined;
@@ -1071,17 +1074,17 @@ function contextMemoryId(
             return existing.id;
         }
     }
-    // A legacy facade row may have no source identity even though the context
-    // database already owns the same fact. Adopt an unambiguous content match
-    // instead of creating a second context row during mirror-back.
+    // A legacy facade row may have no source identity even though this project in the
+    // context database already owns the same fact. Scope the fallback to the module
+    // row's context-store project identity so another project cannot claim that row.
     const normalizedHash = rowString(row, "normalized_hash");
     const category = rowString(row, "category", "CONSTRAINTS");
     if (normalizedHash) {
         const candidates = db
             .prepare(
-                "SELECT id FROM memories WHERE category = ? AND normalized_hash = ? ORDER BY id",
+                "SELECT id FROM memories WHERE project_path = ? AND category = ? AND normalized_hash = ? ORDER BY id",
             )
-            .all(category, normalizedHash) as Array<{ id?: number }>;
+            .all(moduleProject, category, normalizedHash) as Array<{ id?: number }>;
         if (candidates.length === 1 && candidates[0]?.id !== undefined) {
             rememberIdentity(db, domain, moduleProject, moduleRowId, candidates[0].id);
             return candidates[0].id;
@@ -1223,6 +1226,14 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
               metadata_json?: string | null;
           }
         | undefined;
+    if (existing && existing.project_path !== moduleProject) {
+        // Mirror identities identify rows but never authorize moving ownership between projects;
+        // keep the durable row untouched when stale or corrupt metadata points across that boundary.
+        log(
+            `[magic-context] skipping memory mirror update for module ${moduleProject}/${feed.module_row_id}: context row ${contextId} belongs to ${existing.project_path}`,
+        );
+        return;
+    }
     const has = (key: string): boolean => hasSnapshotField(row, key);
     const nullableNumber = (key: string, previous: number | null | undefined): number | null =>
         has(key)
