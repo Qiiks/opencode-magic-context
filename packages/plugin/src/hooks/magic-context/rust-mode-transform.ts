@@ -251,15 +251,6 @@ function newestUserMessage(messages: MessageLike[]): MessageLike | undefined {
     return undefined;
 }
 
-function newestAssistantOrUserMessageId(messages: MessageLike[]): string | null {
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-        const info = messageInfo(messages[index]);
-        if (info.role !== "assistant" && info.role !== "user") continue;
-        if (typeof info.id === "string" && info.id.length > 0) return info.id;
-    }
-    return null;
-}
-
 interface RustPassTimings {
     ordinalResolve: number;
     stateSync: number;
@@ -922,6 +913,7 @@ export function createRustModeTransform(
         sessionMeta: ReturnType<typeof getOrCreateSessionMeta>,
     ): Promise<void> => {
         const passStartedAt = performance.now();
+        const passObservedAtMs = Date.now();
         const state = ensureState(states, sessionId);
         const timings = emptyRustPassTimings();
         state.passCount += 1;
@@ -936,7 +928,6 @@ export function createRustModeTransform(
         }
         const inputCount = messages.length;
         let requestInputTokens = 0;
-        const newestMessageId = newestAssistantOrUserMessageId(messages);
         let decision = "error";
         let materializeReason = "none";
         let servedFrom = "none";
@@ -946,7 +937,8 @@ export function createRustModeTransform(
         // Parking must not hide pressure from the recovery policy. Usage is cheap to read
         // and is the same value copied onto the module request when this pass runs.
         const passUsageSnapshot = loadContextUsage(deps.contextUsageMap, deps.db, sessionId);
-        const finishPass = (applied: boolean): void => {
+        requestInputTokens = Math.max(0, Math.floor(passUsageSnapshot.inputTokens));
+        const finishPass = (applied: boolean, served = true): void => {
             const elapsedAt = applied && appliedAt !== undefined ? appliedAt : performance.now();
             const elapsedMs = Math.max(0, elapsedAt - passStartedAt);
             sessionLog(
@@ -963,6 +955,15 @@ export function createRustModeTransform(
                     timings,
                 }),
             );
+            if (served) {
+                writeRustTransformDecision({
+                    sessionId,
+                    decision,
+                    materializeReason: materializeReason === "none" ? null : materializeReason,
+                    inputTokens: requestInputTokens,
+                    tsMs: passObservedAtMs,
+                });
+            }
         };
         const captureResponseTelemetry = (response: Record<string, unknown>): void => {
             decision =
@@ -1554,16 +1555,6 @@ export function createRustModeTransform(
                     throw new Error("rust module still requires full sync after a full-array send");
                 }
             }
-            if (newestMessageId) {
-                writeRustTransformDecision({
-                    db: deps.db,
-                    sessionId,
-                    messageId: newestMessageId,
-                    decision,
-                    materializeReason: materializeReason === "none" ? null : materializeReason,
-                    inputTokens: requestInputTokens,
-                });
-            }
             const deliveryPassIds = noteDeliveryPassIds(response);
             const sendNoteDeliveryDisposition = async (
                 method: "transform.ack" | "transform.nack",
@@ -1735,7 +1726,7 @@ export function createRustModeTransform(
                 // provider-proven overflow. Surface the established fail-closed error so
                 // the host aborts instead of sending a prompt that is guaranteed to 400.
                 markFailure(sessionId, state, error);
-                finishPass(false);
+                finishPass(false, false);
                 throw new EmergencyFailClosedError(
                     "Rust Magic Context remained unavailable above 95% of a proven context limit",
                     { cause: error },
@@ -1745,6 +1736,9 @@ export function createRustModeTransform(
             // original live array is still available for fail-open replay.
             const replayed = replayLastGood(sessionId, messages, output);
             if (!replayed) replaceMessagesInPlace(output, messages);
+            servedFrom = replayed ? "lkg" : "raw";
+            if (decision.toLowerCase() !== "need_full_sync") decision = "error";
+            materializeReason = "none";
             markFailure(sessionId, state, error);
             finishPass(false);
             return;

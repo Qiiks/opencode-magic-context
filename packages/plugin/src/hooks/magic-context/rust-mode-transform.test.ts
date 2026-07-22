@@ -12,9 +12,13 @@ import {
 import { runMigrations } from "../../features/magic-context/migrations";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/magic-context/storage";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { initializeDatabase, openDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { recordDetectedContextLimit } from "../../features/magic-context/storage-meta-persisted";
+import {
+    scheduleOpenCodeTransformDecisionWrite,
+    __test as transformDecisionTest,
+} from "../../features/magic-context/transform-decision-log";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -47,19 +51,29 @@ const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 afterEach(() => {
     closeReadOnlySessionDb();
+    transformDecisionTest.reset();
     for (const unregister of unregisters.splice(0)) unregister();
+    for (const db of databases.splice(0)) closeQuietly(db);
     for (const dataHome of availabilityDataHomes.splice(0)) {
         rmSync(dataHome, { recursive: true, force: true });
     }
     if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = originalXdgDataHome;
-    for (const db of databases.splice(0)) closeQuietly(db);
 });
 
 function makeDb(): ContextDatabase {
     const db = new Database(":memory:") as ContextDatabase;
     initializeDatabase(db);
     runMigrations(db);
+    databases.push(db);
+    return db;
+}
+
+function makeFileDb(): ContextDatabase {
+    const directory = mkdtempSync(join(tmpdir(), "rust-mode-context-"));
+    availabilityDataHomes.push(directory);
+    const db = openDatabase(join(directory, "context.db")) as ContextDatabase | null;
+    if (!db) throw new Error("file-backed test database did not open");
     databases.push(db);
     return db;
 }
@@ -305,59 +319,153 @@ describe("Rust mode authority adapter", () => {
         );
     });
 
-    it("writes one dashboard decision row for each Rust classifier decision", async () => {
-        const sessionId = `rust-decisions-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
+    it("binds every served Rust pass class to the provider assistant decision row", async () => {
+        const db = makeFileDb();
+        const bindProviderAssistant = async (sessionId: string, messageId: string) => {
+            expect(
+                scheduleOpenCodeTransformDecisionWrite({
+                    db,
+                    sessionId,
+                    messageId,
+                    inputTokens: 123,
+                }),
+            ).toBe(true);
+            await new Promise((resolve) => setTimeout(resolve, 5));
+        };
+
+        const classifierSession = `rust-decisions-${Date.now()}`;
+        sessions.push(classifierSession);
+        installRawProvider(classifierSession);
         const responses = [
             { decision: "HARD", materialize_reason: "first_render" },
             { decision: "SOFT", materialize_reason: "m1_delta" },
             { decision: "SOFT+" },
+            { decision: "PASSTHROUGH" },
         ];
-        const moduleClient: RustModeModuleClient = {
+        const classifierClient: RustModeModuleClient = {
             call: async ({ method }) =>
                 method === "transform"
                     ? { ...responses.shift(), native_messages: [] }
                     : { ok: true },
         };
-        const deps = makeDeps(db, moduleClient);
-        deps.contextUsageMap.set(sessionId, {
+        const classifierDeps = makeDeps(db, classifierClient);
+        classifierDeps.contextUsageMap.set(classifierSession, {
             usage: { inputTokens: 123, percentage: 1 },
             updatedAt: Date.now(),
         });
-        const transform = createRustModeTransform(deps, { moduleClient });
-
-        for (let index = 0; index < 3; index += 1) {
-            const messages: MessageLike[] = [
-                {
-                    info: { id: `turn-${index}`, role: "user", sessionID: sessionId },
-                    parts: [{ type: "text", text: "hello" }],
-                },
-            ];
-            await transform.run(sessionId, messages, { messages }, makeMeta(db, sessionId));
+        const classifierTransform = createRustModeTransform(classifierDeps, {
+            moduleClient: classifierClient,
+        });
+        for (let index = 0; index < 4; index += 1) {
+            const messages = makeMessages(classifierSession);
+            await classifierTransform.run(
+                classifierSession,
+                messages,
+                { messages },
+                makeMeta(db, classifierSession),
+            );
+            await bindProviderAssistant(classifierSession, `classifier-response-${index}`);
         }
+
+        const failureSession = `rust-decision-errors-${Date.now()}`;
+        sessions.push(failureSession);
+        installRawProvider(failureSession);
+        const failureClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method === "transform") throw new Error("daemon unavailable");
+                return { ok: true };
+            },
+        };
+        const failureTransform = createRustModeTransform(makeDeps(db, failureClient), {
+            moduleClient: failureClient,
+        });
+        for (let index = 0; index < 3; index += 1) {
+            const messages = makeMessages(failureSession);
+            await failureTransform.run(
+                failureSession,
+                messages,
+                { messages },
+                makeMeta(db, failureSession),
+            );
+            await bindProviderAssistant(failureSession, `error-response-${index}`);
+        }
+        const parkedMessages = makeMessages(failureSession);
+        await failureTransform.run(
+            failureSession,
+            parkedMessages,
+            { messages: parkedMessages },
+            makeMeta(db, failureSession),
+        );
+        await bindProviderAssistant(failureSession, "parked-response");
+
+        const fullSyncSession = `rust-decision-full-sync-${Date.now()}`;
+        sessions.push(fullSyncSession);
+        installRawProvider(fullSyncSession);
+        const fullSyncClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform" ? { status: "need_full_sync" } : { ok: true },
+        };
+        const fullSyncTransform = createRustModeTransform(makeDeps(db, fullSyncClient), {
+            moduleClient: fullSyncClient,
+        });
+        const fullSyncMessages = makeMessages(fullSyncSession);
+        await fullSyncTransform.run(
+            fullSyncSession,
+            fullSyncMessages,
+            { messages: fullSyncMessages },
+            makeMeta(db, fullSyncSession),
+        );
+        await bindProviderAssistant(fullSyncSession, "full-sync-response");
 
         expect(
             db
                 .prepare(
-                    "SELECT decision, materialized, materialize_reason, input_tokens FROM transform_decisions WHERE session_id = ? ORDER BY ts_ms, rowid",
+                    "SELECT message_id, decision, materialized, materialize_reason FROM transform_decisions ORDER BY rowid",
                 )
-                .all(sessionId),
+                .all(),
         ).toEqual([
             {
+                message_id: "classifier-response-0",
                 decision: "execute",
                 materialized: 1,
                 materialize_reason: "first_render",
-                input_tokens: 123,
             },
             {
+                message_id: "classifier-response-1",
                 decision: "execute",
                 materialized: 0,
                 materialize_reason: "m1_delta",
-                input_tokens: 123,
             },
-            { decision: "defer", materialized: 0, materialize_reason: null, input_tokens: 123 },
+            {
+                message_id: "classifier-response-2",
+                decision: "defer",
+                materialized: 0,
+                materialize_reason: null,
+            },
+            {
+                message_id: "classifier-response-3",
+                decision: "passthrough",
+                materialized: 0,
+                materialize_reason: null,
+            },
+            ...Array.from({ length: 3 }, (_, index) => ({
+                message_id: `error-response-${index}`,
+                decision: "error",
+                materialized: 0,
+                materialize_reason: null,
+            })),
+            {
+                message_id: "parked-response",
+                decision: "parked",
+                materialized: 0,
+                materialize_reason: null,
+            },
+            {
+                message_id: "full-sync-response",
+                decision: "need_full_sync",
+                materialized: 0,
+                materialize_reason: null,
+            },
         ]);
     });
 

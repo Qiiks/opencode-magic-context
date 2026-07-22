@@ -2639,14 +2639,14 @@ pub struct ModuleMeta {
     /// The most recent serializer profile observed on this durable conversation key.
     #[serde(default)]
     pub last_serializer_profile: String,
-    /// Highest absolute message ordinal whose old OpenCode reasoning was cleared.
-    /// The watermark is durable so a defer pass can replay the same empty sentinels
-    /// after OpenCode rebuilds the native message array from its database.
+    /// Durable compatibility copy of the OpenCode reasoning cutoff captured on the last bust.
+    /// A defer pass replays the same cutoff after OpenCode rebuilds the native message array.
     #[serde(default)]
     pub reasoning_cleared_through_ordinal: u64,
-    /// The tag-number watermark is used for OpenCode reasoning and inline-thinking strips.
-    /// Keep the older ordinal watermark as a fallback so rows written before the tag-number
-    /// field was introduced remain readable.
+    /// Tag-number cutoff captured on the last independently busting pass. This is the cycle
+    /// basis, not merely the highest message changed on that pass: preserving it across restart
+    /// prevents later tag mints from trickling reasoning strips into the cached prefix.
+    /// Keep the older ordinal field populated so pre-tag readers remain compatible.
     #[serde(default)]
     pub reasoning_cleared_through_tag: u64,
     /// The request-local Claude Code mechanics state committed with the rendered identity.

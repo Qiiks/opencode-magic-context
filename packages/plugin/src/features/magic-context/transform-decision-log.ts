@@ -3,7 +3,14 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { getDatabasePath } from "./storage-db";
 
 export type TransformDecisionHarness = "opencode" | "pi";
-export type TransformSchedulerDecision = "execute" | "defer";
+export type TransformSchedulerDecision =
+    | "execute"
+    | "defer"
+    | "error"
+    | "need_full_sync"
+    | "parked"
+    | "passthrough"
+    | "unknown";
 
 /**
  * Max transform_decisions rows kept per (session_id, harness). Pruned newest-first
@@ -125,33 +132,34 @@ export function normalizeMaterializeReason(
 }
 
 /**
- * Record a Rust module pass immediately. Rust has already classified the pass, so there is
- * no TypeScript post-transform pending state to wait for; the caller supplies the newest
- * message id currently visible to the wrapper.
+ * Stage one Rust pass for the assistant message that will receive its provider usage row.
+ * The transform runs before that assistant exists, so binding to the newest input message
+ * attributes a multi-step pass to the previous step. The ordinary OpenCode event path binds
+ * this pending record to the next completed assistant id.
  */
 export function writeRustTransformDecision(args: {
-    db: Database;
     sessionId: string;
-    messageId: string;
     decision: string;
     materializeReason: string | null;
     inputTokens: number;
     tsMs?: number;
 }): void {
-    if (args.messageId.length === 0) return;
+    const rawDecision = args.decision.trim();
+    const decisionUpper = rawDecision.toUpperCase();
     const mapped =
-        args.decision === "HARD"
-            ? { decision: "execute" as const, materialized: true }
-            : args.decision === "SOFT"
-              ? { decision: "execute" as const, materialized: false }
-              : args.decision === "SOFT+"
-                ? { decision: "defer" as const, materialized: false }
-                : null;
-    if (!mapped) return;
-    const row: TransformDecisionRow = {
-        sessionId: args.sessionId,
-        harness: "opencode",
-        messageId: args.messageId,
+        decisionUpper === "HARD" || decisionUpper === "MIGRATE_HARD"
+            ? { decision: "execute" as const, materialized: true, bustedThisPass: true }
+            : decisionUpper === "SOFT" || decisionUpper === "EXECUTE"
+              ? { decision: "execute" as const, materialized: false, bustedThisPass: true }
+              : decisionUpper === "SOFT+"
+                ? { decision: "defer" as const, materialized: false, bustedThisPass: false }
+                : {
+                      decision: (rawDecision.toLowerCase() ||
+                          "unknown") as TransformSchedulerDecision,
+                      materialized: false,
+                      bustedThisPass: false,
+                  };
+    pendingDecisionBySession.set(args.sessionId, {
         tsMs: args.tsMs ?? Date.now(),
         decision: mapped.decision,
         materialized: mapped.materialized,
@@ -160,18 +168,8 @@ export function writeRustTransformDecision(args: {
         droppedTokens: 0,
         droppedCount: 0,
         inputTokens: args.inputTokens,
-        bustedThisPass: true,
-    };
-    const dbPath = getDatabasePath(args.db);
-    if (dbPath) {
-        writeTransformDecisionBestEffort(dbPath, row);
-        return;
-    }
-    try {
-        writeTransformDecisionRowOnDatabase(args.db, row, false);
-    } catch {
-        // Best-effort telemetry only. Never throw into the transform hook.
-    }
+        bustedThisPass: mapped.bustedThisPass,
+    });
 }
 
 export function clearOpenCodePendingTransformDecision(sessionId: string): void {

@@ -1146,7 +1146,7 @@ fn apply_once(
     // available on non-CC profiles is render-neutral: overlay bytes remain gated by
     // `tagging_active`, while the OpenCode host can receive the same ceiling decision.
     let mut tag_rows = transform_snapshot.tags;
-    let tag_numbers = tag_number_by_message(&tag_rows);
+    let mut tag_numbers = tag_number_by_message(&tag_rows);
     let mut channel1_appends = if tagging_active {
         transform_snapshot.channel1_appends
     } else {
@@ -1380,6 +1380,10 @@ fn apply_once(
             temporal_enabled: temporal_active,
             mutation_exempt_mid,
         })?;
+        // The cutoff captured by a bust includes tags minted by that same accepted pass.
+        // Deferring this refresh until the next request would split one eligible batch across
+        // several provider-visible rewrites as a multi-step turn keeps minting tags.
+        tag_numbers = tag_number_by_message(&tag_rows);
     }
     let pending_agent_drops = store.load_pending_agent_drops(&req.session_id)?;
 
@@ -1761,14 +1765,9 @@ fn apply_once(
             plan,
             PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
         );
-    if let Some(cutoff) = reasoning_clear_cutoff_with_tags(
-        req,
-        serializer_profile,
-        is_bust_pass,
-        meta.reasoning_cleared_through_tag
-            .max(meta.reasoning_cleared_through_ordinal),
-        &tag_numbers,
-    ) {
+    if let Some(cutoff) =
+        reasoning_clear_cutoff_with_tags(req, serializer_profile, is_bust_pass, &tag_numbers)
+    {
         meta.reasoning_cleared_through_tag = meta.reasoning_cleared_through_tag.max(cutoff);
         // Keep the legacy ordinal watermark populated so readers that predate the tag-number
         // watermark, including older native rendering paths, continue to observe the same cutoff.
@@ -6256,51 +6255,28 @@ pub(crate) fn request_accepts_empty_content(req: &TransformRequest) -> bool {
     req.provider_id.as_deref() == Some("anthropic")
 }
 
-/// Compute the next durable D2 reasoning watermark on a cache-busting pass or the
-/// one-time native bootstrap when no watermark exists yet.
+/// Capture the next durable D2 reasoning cutoff only on a pass that is already busting.
 ///
-/// TS computes `maxTag - clearReasoningAge` after heuristic execution. The module loads the
-/// durable tag rows and uses their tag numbers for the same boundary, with stable message
-/// ordinals as the compatibility fallback when no tag rows exist. A watermark advances only
-/// when an eligible assistant actually contains typed reasoning, matching TS's persisted behavior.
+/// The cutoff is the bust cycle's immutable basis, not merely the highest message changed on
+/// that pass. Persisting it even when no currently visible assistant is eligible prevents a
+/// restart or a later tail step from re-deriving a newer cutoff and trickling old reasoning out
+/// one message at a time. Mid-turn busts still capture the historical cutoff; the newest live
+/// assistant remains protected by the render and native-serving exemptions.
 fn reasoning_clear_cutoff_with_tags(
     req: &TransformRequest,
     profile: Option<SerializerProfile>,
     is_bust_pass: bool,
-    persisted_watermark: u64,
     tag_numbers: &BTreeMap<String, u64>,
 ) -> Option<u64> {
     if profile != Some(SerializerProfile::OpencodeAiSdk)
         || !request_accepts_empty_content(req)
         || !req.serve_native
-        || (!is_bust_pass && persisted_watermark > 0)
-        || req.mid_turn
+        || !is_bust_pass
     {
         return None;
     }
 
-    let max_tag = tag_numbers.values().copied().max()?;
-    let cutoff = max_tag.saturating_sub(req.clear_reasoning_age);
-    if cutoff == 0 {
-        return None;
-    }
-
-    req.messages
-        .iter()
-        .filter(|message| {
-            !message.ck.meta.synthetic && message.ck.role == "assistant" && {
-                let tag = message_tag_number(message, tag_numbers);
-                tag > 0 && tag <= cutoff
-            }
-        })
-        .any(|message| {
-            message
-                .ck
-                .content
-                .iter()
-                .any(|block| matches!(&block.kind, ck_wire::CkKind::Reasoning { .. }))
-        })
-        .then_some(cutoff)
+    tag_age_cutoff(req, tag_numbers)
 }
 
 /// Apply the final OpenCode D2 replay to native message parts.
@@ -9048,6 +9024,222 @@ mod tests {
             serde_json::to_vec(&protected[1]).unwrap(),
             serde_json::to_vec(&request.messages[1].ck).unwrap(),
             "a merged latest assistant must follow the serializer healing rule"
+        );
+    }
+
+    #[test]
+    fn newest_signed_reasoning_is_exempt_regardless_of_cutoff() {
+        let latest = CkIngressMessage {
+            mid: "latest".to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![
+                    ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                        text: "signed thinking".to_string(),
+                        signature: Some("signature".to_string()),
+                    }),
+                    ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                        text: "answer".to_string(),
+                    }),
+                ],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some("latest".to_string()),
+                    ..Default::default()
+                },
+            ),
+        };
+        let mut request = active_opencode_req("newest-reasoning", "cfg0", vec![latest.clone()]);
+        request.provider_id = Some("anthropic".to_string());
+        request.serve_native = true;
+        request.mid_turn = true;
+        let projection = project_messages(&request.messages).unwrap();
+        let tag_numbers = BTreeMap::from([("latest".to_string(), 1)]);
+        let exempt = latest_assistant_mutation_exempt_mid(
+            &request.messages,
+            Some(SerializerProfile::OpencodeAiSdk),
+            request.mid_turn,
+        );
+
+        let output = build_output_with_tags(
+            &CoreState::default(),
+            &ModuleMeta::default(),
+            &projection,
+            &request,
+            None,
+            false,
+            exempt,
+            &tag_numbers,
+            u64::MAX,
+        )
+        .unwrap();
+
+        assert_eq!(output, vec![latest.ck]);
+    }
+
+    #[test]
+    fn reasoning_cutoff_batches_on_one_fold_and_survives_restart() {
+        fn signed_assistant(mid: &str, ordinal: u64) -> CkIngressMessage {
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    vec![
+                        ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                            text: format!("thinking-{mid}"),
+                            signature: Some(format!("signature-{mid}")),
+                        }),
+                        ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                            text: format!("answer-{mid}"),
+                        }),
+                    ],
+                    None,
+                    ck_wire::ProviderExtras::new(),
+                    ck_wire::HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        fn request(messages: Vec<CkIngressMessage>) -> TransformRequest {
+            let mut request = active_opencode_req("reasoning-batch", "cfg0", messages);
+            request.provider_id = Some("anthropic".to_string());
+            request.serve_native = true;
+            request.clear_reasoning_age = 3;
+            with_usage(request, 70, 100)
+        }
+
+        fn reasoning_text<'a>(response: &'a TransformResponse, mid: &str) -> &'a str {
+            response
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some(mid))
+                .and_then(|message| {
+                    message.content.iter().find_map(|block| match &block.kind {
+                        ck_wire::CkKind::Reasoning { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                })
+                .unwrap_or_else(|| panic!("missing reasoning for {mid}"))
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = store(dir.path());
+        db.replace_compartments(
+            "reasoning-batch",
+            &[comp(1, 1, 1, "anchor", "first coverage")],
+        )
+        .unwrap();
+        let mut messages = vec![
+            item("anchor", 1, "covered"),
+            item("fold-target", 2, "fold later"),
+            signed_assistant("assistant-a", 3),
+            item("gap-b", 4, "separator"),
+            signed_assistant("assistant-b", 5),
+        ];
+
+        let transition = run(&db, &request(messages.clone()), &spine());
+        assert_eq!(transition.action, "HARD");
+        let tagged = run(&db, &request(messages.clone()), &spine());
+        assert_eq!(tagged.action, "SOFT+");
+        assert_eq!(
+            reasoning_text(&tagged, "assistant-a"),
+            "thinking-assistant-a"
+        );
+        assert_eq!(
+            reasoning_text(&tagged, "assistant-b"),
+            "thinking-assistant-b"
+        );
+        assert_eq!(
+            db.load("reasoning-batch")
+                .unwrap()
+                .meta
+                .reasoning_cleared_through_tag,
+            0,
+            "tag minting alone must not advance the cutoff"
+        );
+
+        messages.push(item("gap-c", 6, "separator"));
+        messages.push(signed_assistant("assistant-c", 7));
+        let before_fold = run(&db, &request(messages.clone()), &spine());
+        assert_eq!(before_fold.action, "SOFT+");
+        assert!(before_fold.first_divergence.is_none());
+        assert_eq!(
+            reasoning_text(&before_fold, "assistant-a"),
+            "thinking-assistant-a"
+        );
+        assert_eq!(
+            reasoning_text(&before_fold, "assistant-b"),
+            "thinking-assistant-b"
+        );
+
+        db.replace_compartments(
+            "reasoning-batch",
+            &[
+                comp(1, 1, 1, "anchor", "first coverage"),
+                comp(2, 2, 2, "fold-target", "second coverage"),
+            ],
+        )
+        .unwrap();
+        messages.push(item("gap-d", 8, "separator"));
+        messages.push(signed_assistant("assistant-d", 9));
+        let fold = run(&db, &request(messages.clone()), &spine());
+        assert_eq!(fold.action, "SOFT");
+        assert_eq!(fold.materialize_reason.as_deref(), Some("coverage_fold"));
+        assert!(
+            fold.first_divergence.is_some(),
+            "the coverage fold is the one bust"
+        );
+        assert_eq!(reasoning_text(&fold, "assistant-a"), "");
+        assert_eq!(reasoning_text(&fold, "assistant-b"), "");
+        assert_eq!(reasoning_text(&fold, "assistant-c"), "thinking-assistant-c");
+        assert_eq!(reasoning_text(&fold, "assistant-d"), "thinking-assistant-d");
+        assert_eq!(
+            db.load("reasoning-batch")
+                .unwrap()
+                .meta
+                .reasoning_cleared_through_tag,
+            6,
+            "the fold captures every current-pass tag in one cutoff"
+        );
+
+        drop(db);
+        let restarted = store(dir.path());
+        messages.push(item("gap-e", 10, "separator"));
+        messages.push(signed_assistant("assistant-e", 11));
+        let after_fold = run(&restarted, &request(messages), &spine());
+        assert_eq!(after_fold.action, "SOFT+");
+        assert!(
+            after_fold.first_divergence.is_none(),
+            "the post-fold pass may append but must not mutate the served prefix"
+        );
+        assert_eq!(reasoning_text(&after_fold, "assistant-a"), "");
+        assert_eq!(reasoning_text(&after_fold, "assistant-b"), "");
+        assert_eq!(
+            reasoning_text(&after_fold, "assistant-c"),
+            "thinking-assistant-c"
+        );
+        assert_eq!(
+            reasoning_text(&after_fold, "assistant-d"),
+            "thinking-assistant-d"
+        );
+        assert_eq!(
+            reasoning_text(&after_fold, "assistant-e"),
+            "thinking-assistant-e"
+        );
+        assert_eq!(
+            restarted
+                .load("reasoning-batch")
+                .unwrap()
+                .meta
+                .reasoning_cleared_through_tag,
+            6,
+            "a restart must replay the prior bust cutoff instead of deriving maxTag-age"
         );
     }
 
