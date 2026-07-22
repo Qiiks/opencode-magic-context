@@ -52,6 +52,35 @@ export interface SpawnOptions {
     openCodeConfigExtra?: Record<string, unknown>;
     /** Override the mock model's context token limit. Default 200000. */
     modelContextLimit?: number;
+    /**
+     * Reuse a pre-created isolated env instead of allocating a fresh one. The
+     * Rust-mode harness creates the env first so a hermetic subc daemon can
+     * write its connection file into `${dataDir}/cortexkit/run/` BEFORE opencode
+     * boots, and so a serve restart can re-attach to the same data dir (keeping
+     * opencode.db + context.db across the restart). Default: allocate a new env.
+     */
+    existingEnv?: IsolatedEnv;
+    /**
+     * When set, add `subc: { connection_file }` to the USER-tier magic-context
+     * config. This is the only tier that gates `userTierHasSubc` (project-tier
+     * `subc` is stripped by project-security), so Rust mode needs it here to
+     * activate. Default: no user-tier subc block (TS mode).
+     */
+    userSubcConnectionFile?: string;
+    /**
+     * When set, ALSO write `<workdir>/.cortexkit/magic-context.jsonc` (the
+     * project-tier config). Rust mode is opted in per-project via
+     * `transform_mode: "rust"` here, mirroring production where a repo selects
+     * the runtime while the user supplies daemon credentials. Default: no
+     * project-tier config file.
+     */
+    projectMagicContextConfig?: Record<string, unknown>;
+    /**
+     * Extra environment variables for the opencode child (e.g.
+     * MAGIC_CONTEXT_LOG_PATH to redirect the plugin diagnostic log to a
+     * per-suite file). Merged last, overriding inherited values.
+     */
+    extraEnv?: Record<string, string>;
 }
 
 /**
@@ -67,8 +96,14 @@ async function pickFreePort(): Promise<number> {
 
 /**
  * Create isolated config/data/cache dirs under a unique temp subdir.
+ *
+ * Exported so the Rust-mode harness can allocate the env up front: it needs the
+ * concrete `dataDir` before opencode boots to place a hermetic subc daemon's
+ * connection file at `${dataDir}/cortexkit/run/subc-connection.json` (the path
+ * the plugin's Rust module client reads), and it reuses the same env across a
+ * serve restart so opencode.db + context.db survive the restart.
  */
-function createIsolatedEnv(): IsolatedEnv {
+export function createIsolatedEnv(): IsolatedEnv {
     const unique = `opencode-e2e-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const base = join(tmpdir(), unique);
     const configDir = join(base, "config");
@@ -138,8 +173,14 @@ function writeConfigs(
         ...(opts.openCodeConfigExtra ?? {}),
     };
 
-    // magic-context defaults tuned for fast triggering in tests.
-    const magicContext = {
+    // magic-context defaults tuned for fast triggering in tests. This is the
+    // USER-tier config: thresholds live here because project-tier thresholds are
+    // security-clamped raise-only, so a small/fast threshold must come from the
+    // trusted user tier. Rust mode's `subc.connection_file` is also user-tier —
+    // it is the only tier that flips `userTierHasSubc`, which the transform-mode
+    // resolver requires before Rust can activate (project-tier `subc` is stripped
+    // by project-security hardening).
+    const magicContext: Record<string, unknown> = {
         $schema:
             "https://raw.githubusercontent.com/cortexkit/opencode-magic-context/master/assets/magic-context.schema.json",
         execute_threshold_percentage: 40,
@@ -148,6 +189,9 @@ function writeConfigs(
         sidekick: { disable: true },
         ...(opts.magicContextConfig ?? {}),
     };
+    if (opts.userSubcConnectionFile) {
+        magicContext.subc = { connection_file: opts.userSubcConnectionFile };
+    }
 
     writeFileSync(join(env.configDir, "opencode.json"), JSON.stringify(opencodeConfig, null, 2));
 
@@ -164,6 +208,29 @@ function writeConfigs(
         join(userConfigDir, "magic-context.jsonc"),
         JSON.stringify(magicContext, null, 2),
     );
+
+    // Project-tier config: written to the hard-cutover location the loader reads,
+    // `<workdir>/.cortexkit/magic-context.jsonc`. Rust mode is opted in here via
+    // `transform_mode: "rust"`, matching production where a repository selects the
+    // runtime while the user supplies the daemon credentials above. This file is
+    // (re)written on every spawn so a serve restart can flip the mode in place
+    // (the cold-start-drop-seed scenario switches ts→rust across a restart).
+    if (opts.projectMagicContextConfig) {
+        const projectConfigDir = join(env.workdir, ".cortexkit");
+        mkdirSync(projectConfigDir, { recursive: true });
+        writeFileSync(
+            join(projectConfigDir, "magic-context.jsonc"),
+            JSON.stringify(
+                {
+                    $schema:
+                        "https://raw.githubusercontent.com/cortexkit/opencode-magic-context/master/assets/magic-context.schema.json",
+                    ...opts.projectMagicContextConfig,
+                },
+                null,
+                2,
+            ),
+        );
+    }
 
     // tui.json: not needed for headless serve, but harmless to emit nothing for now.
 }
@@ -218,7 +285,9 @@ async function waitForReady(url: string, timeoutMs = 300_000): Promise<void> {
 }
 
 export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode> {
-    const env = createIsolatedEnv();
+    // Reuse a caller-provided env for the Rust-mode harness (connection file
+    // pre-placed, data dir shared across a serve restart); otherwise allocate.
+    const env = opts.existingEnv ?? createIsolatedEnv();
     const port = opts.port ?? (await pickFreePort());
 
     writeConfigs(env, opts.mockProviderURL, opts);
@@ -236,6 +305,16 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
         if (key === "OPENCODE_SERVER_PASSWORD") continue;
         if (key === "OPENCODE_SERVER_USERNAME") continue;
         if (key === "NODE_ENV") continue;
+        // Strip any inherited subc supervised-launch identity. When the test
+        // process is itself launched under a subc supervisor (e.g. an AFT/Alfonso
+        // worktree sets SUBC_MODULE_ID=aft), the plugin's Rust module client would
+        // present THAT supervised identity to our hermetic daemon, which rejects it
+        // ("consumer_identity for module_id 'aft' did not match a supervised launch
+        // nonce"). A real opencode install is never launched under a supervised subc
+        // identity, so clearing these matches production and lets the plugin connect
+        // as an ordinary client. Harmless for TS-mode suites, which never touch subc.
+        if (key === "SUBC_MODULE_ID") continue;
+        if (key === "SUBC_LAUNCH_NONCE") continue;
         childEnv[key] = value;
     }
     childEnv.OPENCODE_CONFIG_DIR = env.configDir;
@@ -244,6 +323,12 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
     childEnv.XDG_CACHE_HOME = env.cacheDir;
     // Ensure anthropic doesn't bail for missing env vars — we use a fake key.
     childEnv.ANTHROPIC_API_KEY = "test-key-not-real";
+    // Caller overrides (e.g. MAGIC_CONTEXT_LOG_PATH pointing the plugin log at a
+    // per-suite file so Rust-mode scenarios can assert on transform decisions).
+    // Merged last so an explicit override wins over the inherited value.
+    for (const [key, value] of Object.entries(opts.extraEnv ?? {})) {
+        childEnv[key] = value;
+    }
 
     // Bind to 0.0.0.0 (all interfaces) instead of 127.0.0.1 — empirically on
     // GitHub-hosted runners, opencode binding to 127.0.0.1 sometimes results

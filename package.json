@@ -8,6 +8,7 @@
     "typecheck": "bun run --cwd packages/plugin typecheck && bun run --cwd packages/pi-plugin typecheck && bun run --cwd packages/cli typecheck",
     "test": "bun run --cwd packages/plugin test && bun run --cwd packages/pi-plugin test && bun run --cwd packages/cli test",
     "test:e2e": "bun run --cwd packages/e2e-tests test",
+    "test:rust-e2e": "bun run --cwd packages/e2e-tests test:rust-e2e",
     "test:e2e-docker": "tests/docker/run-e2e.sh",
     "lint": "bun run --cwd packages/plugin lint && bun run --cwd packages/pi-plugin lint && bun run --cwd packages/cli lint",
     "lint:fix": "bun run --cwd packages/plugin lint:fix && bun run --cwd packages/pi-plugin lint:fix",
