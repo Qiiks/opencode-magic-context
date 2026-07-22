@@ -612,6 +612,15 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
             index + 1;
         const role = typeof info.role === "string" ? info.role : "user";
         const parts = Array.isArray(raw.parts) ? raw.parts : [];
+        const synthetic =
+            parts.length > 0 &&
+            parts.every(
+                (part) =>
+                    part !== null &&
+                    typeof part === "object" &&
+                    ((part as Record<string, unknown>).synthetic === true ||
+                        (part as Record<string, unknown>).syntheticTodoMarker === true),
+            );
         const content: Record<string, unknown>[] = [];
         for (const partValue of parts) {
             if (partValue === null || typeof partValue !== "object") continue;
@@ -689,6 +698,7 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
                 meta: {
                     harness_id: id,
                     ordinal,
+                    synthetic,
                     summary: info.summary === true,
                     errored: info.error !== undefined && info.error !== null,
                     ...(typeof info.finish === "string" ? { finish: info.finish } : {}),
