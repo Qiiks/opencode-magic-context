@@ -56,6 +56,8 @@ export interface SessionMetaRow {
     emergency_drain_active: number | null;
     historian_drain_failure_at: number | null;
     upgrade_reminded_at: number | null;
+    upgrade_reminder_last_sent_at: number | null;
+    upgrade_reminder_count: number | null;
     pi_stable_id_scheme: number | null;
 }
 
@@ -110,6 +112,8 @@ export const SESSION_META_SELECT_COLUMNS = [
     "emergency_drain_active",
     "historian_drain_failure_at",
     "upgrade_reminded_at",
+    "upgrade_reminder_last_sent_at",
+    "upgrade_reminder_count",
     "pi_stable_id_scheme",
 ] as const;
 
@@ -163,6 +167,8 @@ export const META_COLUMNS: Record<string, string> = {
     emergencyDrainActive: "emergency_drain_active",
     historianDrainFailureAt: "historian_drain_failure_at",
     upgradeRemindedAt: "upgrade_reminded_at",
+    upgradeReminderLastSentAt: "upgrade_reminder_last_sent_at",
+    upgradeReminderCount: "upgrade_reminder_count",
     piStableIdScheme: "pi_stable_id_scheme",
 };
 
@@ -194,6 +200,7 @@ export const NULL_BIND_META_KEYS = new Set([
     "cachedM0ProjectIdentity",
     "lastObservedModelKey",
     "upgradeRemindedAt",
+    "upgradeReminderLastSentAt",
     "piStableIdScheme",
 ]);
 
@@ -279,6 +286,8 @@ export function isSessionMetaRow(row: unknown): row is SessionMetaRow {
         isNumberOrNull(r.force_emergency_bypass_window_start) &&
         isNumberOrNull(r.force_emergency_bypass_used) &&
         isNumberOrNull(r.upgrade_reminded_at) &&
+        isNumberOrNull(r.upgrade_reminder_last_sent_at) &&
+        isNumberOrNull(r.upgrade_reminder_count) &&
         isNumberOrNull(r.pi_stable_id_scheme) &&
         isNumberOrNull(r.tool_reclaim_watermark)
     );
@@ -334,6 +343,8 @@ export function getDefaultSessionMeta(sessionId: string): SessionMeta {
         forceEmergencyBypassWindowStart: 0,
         forceEmergencyBypassUsed: 0,
         upgradeRemindedAt: null,
+        upgradeReminderLastSentAt: null,
+        upgradeReminderCount: 0,
         piStableIdScheme: null,
     };
 }
@@ -450,6 +461,8 @@ export function toSessionMeta(row: SessionMetaRow): SessionMeta {
         forceEmergencyBypassWindowStart: numOrZero(row.force_emergency_bypass_window_start),
         forceEmergencyBypassUsed: numOrZero(row.force_emergency_bypass_used),
         upgradeRemindedAt: numOrNull(row.upgrade_reminded_at),
+        upgradeReminderLastSentAt: numOrNull(row.upgrade_reminder_last_sent_at),
+        upgradeReminderCount: numOrZero(row.upgrade_reminder_count),
         piStableIdScheme: numOrNull(row.pi_stable_id_scheme),
     };
 }

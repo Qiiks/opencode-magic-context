@@ -9,7 +9,9 @@ import {
 } from "../../features/magic-context/storage-meta-session";
 import {
     __resetUpgradeReminderProcessGuard,
+    MAX_UPGRADE_REMINDERS_PER_SESSION,
     maybeSendUpgradeReminder,
+    UPGRADE_REMINDER_COOLDOWN_MS,
     type UpgradeReminderDeps,
 } from "./upgrade-reminder";
 
@@ -93,7 +95,7 @@ function makeDeps(
 }
 
 describe("E5 upgrade reminder", () => {
-    it("fires once for a legacy session and stamps upgradeRemindedAt", async () => {
+    it("records the first delivered reminder for the durable cooldown", async () => {
         const db = openDatabase();
         insertLegacyCompartment(db, "ses-legacy");
         const sent: string[] = [];
@@ -102,7 +104,11 @@ describe("E5 upgrade reminder", () => {
 
         expect(sent).toHaveLength(1);
         expect(sent[0]).toContain("/ctx-session-upgrade");
-        expect(getOrCreateSessionMeta(db, "ses-legacy").upgradeRemindedAt).not.toBeNull();
+        expect(getOrCreateSessionMeta(db, "ses-legacy")).toMatchObject({
+            upgradeRemindedAt: null,
+            upgradeReminderCount: 1,
+            upgradeReminderLastSentAt: expect.any(Number),
+        });
     });
 
     it("enqueues a TUI dialog action (not an ignored message) when a TUI is connected", async () => {
@@ -127,7 +133,7 @@ describe("E5 upgrade reminder", () => {
         expect(getOrCreateSessionMeta(db, "ses-tui").upgradeRemindedAt).toBeNull();
     });
 
-    it("re-shows the TUI dialog on a new process when the user never made a choice", async () => {
+    it("suppresses a re-opened TUI dialog until the durable cooldown expires", async () => {
         const db = openDatabase();
         insertLegacyCompartment(db, "ses-tui-interrupted");
         const dialogActions: string[] = [];
@@ -143,8 +149,9 @@ describe("E5 upgrade reminder", () => {
             "ses-tui-interrupted",
         );
 
-        // No durable stamp was set, so the dialog re-fires on the second process.
-        expect(dialogActions).toEqual(["ses-tui-interrupted", "ses-tui-interrupted"]);
+        // The display remains dismissible, but the shared delivery timestamp keeps
+        // a new process from immediately showing the same dialog again.
+        expect(dialogActions).toEqual(["ses-tui-interrupted"]);
     });
 
     it("does not stamp when the ignored-message delivery is skipped", async () => {
@@ -171,13 +178,13 @@ describe("E5 upgrade reminder", () => {
         expect(getOrCreateSessionMeta(db, "ses-skip").upgradeRemindedAt).toBeNull();
     });
 
-    it("does not re-fire after the durable stamp (simulating a new process)", async () => {
+    it("suppresses a delivered reminder within the cooldown on a new process", async () => {
         const db = openDatabase();
         insertLegacyCompartment(db, "ses-legacy");
         const sent: string[] = [];
 
         await maybeSendUpgradeReminder(makeDeps(db, sent), "ses-legacy");
-        // Reset the in-process guard to simulate a restart — durable stamp must hold.
+        // Reset the in-process guard to simulate a restart — the durable cooldown must hold.
         __resetUpgradeReminderProcessGuard();
         await maybeSendUpgradeReminder(makeDeps(db, sent), "ses-legacy");
 
@@ -249,11 +256,10 @@ describe("E5 upgrade reminder", () => {
         expect(getOrCreateSessionMeta(db, "ses-clean").upgradeRemindedAt).toBeNull();
     });
 
-    it("transient delivery (Pi toast) does NOT stamp and re-fires on a new process", async () => {
+    it("transient Pi delivery uses the same cooldown without an explicit-dismissal stamp", async () => {
         // Pi delivers via ctx.ui.notify — a transient toast with no scrollback.
-        // Stamping on a missed toast permanently suppressed the reminder (dogfood
-        // 2026-05-31, Pi session 019de471). With deliveryPersists:false the stamp
-        // is never written and the reminder re-fires each process until upgraded.
+        // It ignores the explicit-dismissal stamp, but persists the shared cooldown
+        // and cap so repeated process starts cannot produce an endless toast loop.
         const db = openDatabase();
         insertLegacyCompartment(db, "ses-pi");
         const sent: string[] = [];
@@ -267,14 +273,13 @@ describe("E5 upgrade reminder", () => {
         // No durable stamp on a transient toast.
         expect(getOrCreateSessionMeta(db, "ses-pi").upgradeRemindedAt).toBeNull();
 
-        // New process (guard cleared) → re-fires (would have been suppressed by a
-        // stamp on the persistent path).
+        // New process (guard cleared) still respects the persisted cooldown.
         __resetUpgradeReminderProcessGuard();
         await maybeSendUpgradeReminder(deps(), "ses-pi");
-        expect(sent).toHaveLength(2);
+        expect(sent).toHaveLength(1);
     });
 
-    it("transient delivery ignores a STALE durable stamp left by a pre-fix build", async () => {
+    it("transient delivery ignores a stale explicit-dismissal stamp", async () => {
         // Pi session 019de471 was stamped by the buggy stamp-on-toast path. After
         // the fix, that stale stamp must NOT gate transient delivery.
         const db = openDatabase();
@@ -289,6 +294,33 @@ describe("E5 upgrade reminder", () => {
 
         // Fires despite the stale stamp (per-process guard governs, not the stamp).
         expect(sent).toHaveLength(1);
+    });
+
+    it("fires at most three reminders per session even after every cooldown", async () => {
+        const db = openDatabase();
+        insertLegacyCompartment(db, "ses-capped");
+        const sent: string[] = [];
+
+        for (
+            let expectedCount = 1;
+            expectedCount <= MAX_UPGRADE_REMINDERS_PER_SESSION;
+            expectedCount++
+        ) {
+            await maybeSendUpgradeReminder(makeDeps(db, sent), "ses-capped");
+            expect(getOrCreateSessionMeta(db, "ses-capped").upgradeReminderCount).toBe(
+                expectedCount,
+            );
+            updateSessionMeta(db, "ses-capped", {
+                upgradeReminderLastSentAt: Date.now() - UPGRADE_REMINDER_COOLDOWN_MS - 1,
+            });
+            __resetUpgradeReminderProcessGuard();
+        }
+
+        await maybeSendUpgradeReminder(makeDeps(db, sent), "ses-capped");
+        expect(sent).toHaveLength(MAX_UPGRADE_REMINDERS_PER_SESSION);
+        expect(getOrCreateSessionMeta(db, "ses-capped").upgradeReminderCount).toBe(
+            MAX_UPGRADE_REMINDERS_PER_SESSION,
+        );
     });
 
     it("skips subagent sessions", async () => {

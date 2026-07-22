@@ -138,7 +138,7 @@ describe("executeContextRecomp", () => {
                             parts: [
                                 {
                                     type: "text",
-                                    text: `<compartment start="1" end="4" title="Recovered history">Recovered summary</compartment>\n<CONSTRAINTS>\n* Rebuilt fact.\n</CONSTRAINTS>`,
+                                    text: `<compartment start="1" end="4" title="Recovered history"><p1>Recovered summary</p1></compartment>\n<CONSTRAINTS>\n* Rebuilt fact.\n</CONSTRAINTS>`,
                                 },
                             ],
                         },
@@ -294,7 +294,7 @@ describe("executeContextRecomp", () => {
                             parts: [
                                 {
                                     type: "text",
-                                    text: `<compartment start="1" end="2" title="Chunk one">Chunk one summary</compartment>\n<WORKFLOW_RULES>\n* Candidate fact.\n</WORKFLOW_RULES>\n<unprocessed_from>3</unprocessed_from>`,
+                                    text: `<compartment start="1" end="2" title="Chunk one"><p1>Chunk one summary</p1></compartment>\n<WORKFLOW_RULES>\n* Candidate fact.\n</WORKFLOW_RULES>\n<unprocessed_from>3</unprocessed_from>`,
                                 },
                             ],
                         },
@@ -379,7 +379,7 @@ describe("executeContextRecomp", () => {
                             parts: [
                                 {
                                     type: "text",
-                                    text: `<compartment start="1" end="1" title="Part one">One</compartment>\n<compartment start="3" end="4" title="Part two">Two</compartment>`,
+                                    text: `<compartment start="1" end="1" title="Part one"><p1>One</p1></compartment>\n<compartment start="3" end="4" title="Part two"><p1>Two</p1></compartment>`,
                                 },
                             ],
                         },
@@ -394,7 +394,7 @@ describe("executeContextRecomp", () => {
                         parts: [
                             {
                                 type: "text",
-                                text: `<compartment start="1" end="4" title="Recovered history">Recovered summary</compartment>\n<CONSTRAINTS>\n* Rebuilt fact.\n</CONSTRAINTS>`,
+                                text: `<compartment start="1" end="4" title="Recovered history"><p1>Recovered summary</p1></compartment>\n<CONSTRAINTS>\n* Rebuilt fact.\n</CONSTRAINTS>`,
                             },
                         ],
                     },
@@ -441,6 +441,127 @@ describe("executeContextRecomp", () => {
         ]);
     });
 
+    it("retries flat v1 output and publishes the repaired tiered result", async () => {
+        useTempDataHome("magic-recomp-flat-repair-");
+        const sessionId = "ses-recomp-flat-repair";
+        createOpenCodeDb(sessionId, [
+            { id: "m-1", role: "user", text: "eligible one" },
+            { id: "m-2", role: "assistant", text: "eligible two" },
+            { id: "m-3", role: "user", text: "eligible three" },
+            { id: "m-4", role: "assistant", text: "eligible four" },
+            { id: "m-5", role: "user", text: "protected 1" },
+            { id: "m-6", role: "user", text: "protected 2" },
+            { id: "m-7", role: "user", text: "protected 3" },
+            { id: "m-8", role: "user", text: "protected 4" },
+            { id: "m-9", role: "user", text: "protected 5" },
+        ]);
+        const db = openDatabase();
+        let historianFetches = 0;
+        const messages = mock(async (input: { query?: { directory?: string } }) => {
+            if (!input.query?.directory) return { data: [] };
+            historianFetches += 1;
+            const text =
+                historianFetches === 1
+                    ? `<output><compartment start="1" end="4" title="flat">flat summary</compartment></output>`
+                    : `<output><compartment start="1" end="4" title="repaired"><p1>tiered summary</p1></compartment></output>`;
+            return {
+                data: [
+                    {
+                        info: { role: "assistant", time: { created: historianFetches } },
+                        parts: [{ type: "text", text }],
+                    },
+                ],
+            };
+        });
+        const client = {
+            session: {
+                get: mock(async () => ({ data: { directory: "/tmp/flat-repair" } })),
+                create: mock(async () => ({ data: { id: `ses-agent-${historianFetches}` } })),
+                prompt: mock(async () => ({})),
+                messages,
+                delete: mock(async () => ({})),
+            },
+        } as unknown as PluginContext["client"];
+
+        const result = await executeContextRecomp({
+            client,
+            db,
+            sessionId,
+            historianChunkTokens: 10_000,
+            directory: "/tmp",
+        });
+
+        expect(result).toContain("## Magic Recomp — Complete");
+        expect(historianFetches).toBe(2);
+        expect(getCompartments(db, sessionId)).toEqual([
+            expect.objectContaining({ title: "repaired", p1: "tiered summary", legacy: 0 }),
+        ]);
+    });
+
+    it("records exhausted flat v1 output without writing legacy rows", async () => {
+        useTempDataHome("magic-recomp-flat-exhausted-");
+        const sessionId = "ses-recomp-flat-exhausted";
+        createOpenCodeDb(sessionId, [
+            { id: "m-1", role: "user", text: "eligible one" },
+            { id: "m-2", role: "assistant", text: "eligible two" },
+            { id: "m-3", role: "user", text: "protected 1" },
+            { id: "m-4", role: "user", text: "protected 2" },
+            { id: "m-5", role: "user", text: "protected 3" },
+            { id: "m-6", role: "user", text: "protected 4" },
+            { id: "m-7", role: "user", text: "protected 5" },
+        ]);
+        const db = openDatabase();
+        const client = {
+            session: {
+                get: mock(async () => ({ data: { directory: "/tmp/flat-exhausted" } })),
+                create: mock(async () => ({ data: { id: "ses-agent-flat" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({
+                    data: [
+                        {
+                            info: { role: "assistant", time: { created: 1 } },
+                            parts: [
+                                {
+                                    type: "text",
+                                    text: `<output><compartment start="1" end="2" title="flat">flat summary</compartment></output>`,
+                                },
+                            ],
+                        },
+                    ],
+                })),
+                delete: mock(async () => ({})),
+            },
+        } as unknown as PluginContext["client"];
+
+        const result = await executeContextRecomp({
+            client,
+            db,
+            sessionId,
+            historianChunkTokens: 10_000,
+            directory: "/tmp",
+        });
+
+        expect(result).toContain("missing the tiered paraphrase structure");
+        expect(getCompartments(db, sessionId)).toHaveLength(0);
+        expect(
+            db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM compartments WHERE session_id = ? AND legacy = 1",
+                )
+                .get(sessionId),
+        ).toEqual({ count: 0 });
+        expect(
+            db
+                .prepare(
+                    "SELECT status, failure_reason FROM historian_runs WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                )
+                .get(sessionId),
+        ).toEqual({
+            status: "failed",
+            failure_reason: expect.stringContaining("missing the tiered paraphrase structure"),
+        });
+    });
+
     it("accepts full-state historian output on a later recomp pass", async () => {
         useTempDataHome("magic-recomp-full-state-");
         createOpenCodeDb("ses-recomp-full-state", [
@@ -471,7 +592,7 @@ describe("executeContextRecomp", () => {
                             parts: [
                                 {
                                     type: "text",
-                                    text: `<compartment start="1" end="2" title="Pass one">Initial summary</compartment>`,
+                                    text: `<compartment start="1" end="2" title="Pass one"><p1>Initial summary</p1></compartment>`,
                                 },
                             ],
                         },
@@ -486,7 +607,7 @@ describe("executeContextRecomp", () => {
                         parts: [
                             {
                                 type: "text",
-                                text: `<compartment start="3" end="3" title="Pass two">Next summary</compartment>\n<PROJECT_RULES>\n* Rewritten fact.\n</PROJECT_RULES>`,
+                                text: `<compartment start="3" end="3" title="Pass two"><p1>Next summary</p1></compartment>\n<PROJECT_RULES>\n* Rewritten fact.\n</PROJECT_RULES>`,
                             },
                         ],
                     },
@@ -631,7 +752,7 @@ describe("executeContextRecomp", () => {
                             parts: [
                                 {
                                     type: "text",
-                                    text: `<compartment start="1" end="1" title="Bad one">One</compartment>\n<compartment start="3" end="6" title="Bad two">Two</compartment>`,
+                                    text: `<compartment start="1" end="1" title="Bad one"><p1>One</p1></compartment>\n<compartment start="3" end="6" title="Bad two"><p1>Two</p1></compartment>`,
                                 },
                             ],
                         },
@@ -646,7 +767,7 @@ describe("executeContextRecomp", () => {
                         parts: [
                             {
                                 type: "text",
-                                text: `<compartment start="${chunkStart}" end="${chunkEnd}" title="Chunk ${chunkStart}-${chunkEnd}">Chunk ${chunkStart}-${chunkEnd} summary</compartment>\n<WORKFLOW_RULES>\n* Final fact.\n</WORKFLOW_RULES>`,
+                                text: `<compartment start="${chunkStart}" end="${chunkEnd}" title="Chunk ${chunkStart}-${chunkEnd}"><p1>Chunk ${chunkStart}-${chunkEnd} summary</p1></compartment>\n<WORKFLOW_RULES>\n* Final fact.\n</WORKFLOW_RULES>`,
                             },
                         ],
                     },
@@ -728,7 +849,7 @@ describe("executeContextRecomp", () => {
                         parts: [
                             {
                                 type: "text",
-                                text: `<compartment start="${chunkStart}" end="${chunkStart + 2}" title="Bad one">One</compartment>\n<compartment start="${chunkStart + 1}" end="${chunkEnd}" title="Bad two">Two</compartment>`,
+                                text: `<compartment start="${chunkStart}" end="${chunkStart + 2}" title="Bad one"><p1>One</p1></compartment>\n<compartment start="${chunkStart + 1}" end="${chunkEnd}" title="Bad two"><p1>Two</p1></compartment>`,
                             },
                         ],
                     },
@@ -822,7 +943,7 @@ describe("executeContextRecomp", () => {
                             parts: [
                                 {
                                     type: "text",
-                                    text: `<compartment start="1" end="1" title="Bad one">One</compartment>\n<compartment start="3" end="6" title="Bad two">Two</compartment>`,
+                                    text: `<compartment start="1" end="1" title="Bad one"><p1>One</p1></compartment>\n<compartment start="3" end="6" title="Bad two"><p1>Two</p1></compartment>`,
                                 },
                             ],
                         },
@@ -837,7 +958,7 @@ describe("executeContextRecomp", () => {
                         parts: [
                             {
                                 type: "text",
-                                text: `<compartment start="${chunkStart}" end="${chunkEnd}" title="Chunk ${chunkStart}-${chunkEnd}">Chunk ${chunkStart}-${chunkEnd} summary</compartment>\n<WORKFLOW_RULES>\n* Final fact.\n</WORKFLOW_RULES>`,
+                                text: `<compartment start="${chunkStart}" end="${chunkEnd}" title="Chunk ${chunkStart}-${chunkEnd}"><p1>Chunk ${chunkStart}-${chunkEnd} summary</p1></compartment>\n<WORKFLOW_RULES>\n* Final fact.\n</WORKFLOW_RULES>`,
                             },
                         ],
                     },
@@ -1109,7 +1230,7 @@ describe("runCompartmentAgent", () => {
                             parts: [
                                 {
                                     type: "text",
-                                    text: '<compartment start="1" end="2" title="Expired marker">Expired marker run.</compartment>',
+                                    text: '<compartment start="1" end="2" title="Expired marker"><p1>Expired marker run.</p1></compartment>',
                                 },
                             ],
                         },
@@ -1168,7 +1289,7 @@ describe("runCompartmentAgent", () => {
                     parts: [
                         {
                             type: "text",
-                            text: `<compartment start="1" end="2" title="Docs and setup">Summary content</compartment>\n<WORKFLOW_RULES>\n* Commit to feat first\n</WORKFLOW_RULES>`,
+                            text: `<compartment start="1" end="2" title="Docs and setup"><p1>Summary content</p1></compartment>\n<WORKFLOW_RULES>\n* Commit to feat first\n</WORKFLOW_RULES>`,
                         },
                     ],
                 },
@@ -1237,7 +1358,7 @@ describe("runCompartmentAgent", () => {
                             parts: [
                                 {
                                     type: "text",
-                                    text: `<compartment start="1" end="2" title="Published">Summary</compartment>\n<PROJECT_RULES>\n* Durable fact survives registration outage.\n</PROJECT_RULES>`,
+                                    text: `<compartment start="1" end="2" title="Published"><p1>Summary</p1></compartment>\n<PROJECT_RULES>\n* Durable fact survives registration outage.\n</PROJECT_RULES>`,
                                 },
                             ],
                         },
@@ -1309,7 +1430,7 @@ describe("runCompartmentAgent", () => {
                             parts: [
                                 {
                                     type: "text",
-                                    text: `<compartment start="1" end="2" title="Should roll back">Summary</compartment>\n<PROJECT_RULES>\n* This fact insert fails.\n</PROJECT_RULES>`,
+                                    text: `<compartment start="1" end="2" title="Should roll back"><p1>Summary</p1></compartment>\n<PROJECT_RULES>\n* This fact insert fails.\n</PROJECT_RULES>`,
                                 },
                             ],
                         },
@@ -1370,7 +1491,7 @@ describe("runCompartmentAgent", () => {
                             parts: [
                                 {
                                     type: "text",
-                                    text: `<compartment start="1" end="2" title="Recovered">Summary</compartment>`,
+                                    text: `<compartment start="1" end="2" title="Recovered"><p1>Summary</p1></compartment>`,
                                 },
                             ],
                         },
@@ -1436,7 +1557,7 @@ describe("runCompartmentAgent", () => {
                             parts: [
                                 {
                                     type: "text",
-                                    text: `<compartment start="3" end="4" title="Bad">Bad</compartment>`,
+                                    text: `<compartment start="3" end="4" title="Bad"><p1>Bad</p1></compartment>`,
                                 },
                             ],
                         },
@@ -1451,7 +1572,7 @@ describe("runCompartmentAgent", () => {
                         parts: [
                             {
                                 type: "text",
-                                text: `<compartment start="1" end="2" title="Fallback">Recovered</compartment>`,
+                                text: `<compartment start="1" end="2" title="Fallback"><p1>Recovered</p1></compartment>`,
                             },
                         ],
                     },
@@ -1530,7 +1651,7 @@ describe("runCompartmentAgent", () => {
                             parts: [
                                 {
                                     type: "text",
-                                    text: `<compartment start="9" end="9" title="Bad">Out of range</compartment>`,
+                                    text: `<compartment start="9" end="9" title="Bad"><p1>Out of range</p1></compartment>`,
                                 },
                             ],
                         },
@@ -1544,7 +1665,7 @@ describe("runCompartmentAgent", () => {
                         parts: [
                             {
                                 type: "text",
-                                text: `<compartment start="1" end="2" title="ChainFallback">Recovered via sonnet</compartment>`,
+                                text: `<compartment start="1" end="2" title="ChainFallback"><p1>Recovered via sonnet</p1></compartment>`,
                             },
                         ],
                     },
@@ -1655,7 +1776,7 @@ describe("runCompartmentAgent", () => {
                     parts: [
                         {
                             type: "text",
-                            text: `<compartment start="3" end="4" title="Later work">Later summary</compartment>`,
+                            text: `<compartment start="3" end="4" title="Later work"><p1>Later summary</p1></compartment>`,
                         },
                     ],
                 },
@@ -1771,7 +1892,7 @@ describe("runCompartmentAgent", () => {
                             parts: [
                                 {
                                     type: "text",
-                                    text: `<compartment start="1" end="2" title="Stored history">Stored summary</compartment>`,
+                                    text: `<compartment start="1" end="2" title="Stored history"><p1>Stored summary</p1></compartment>`,
                                 },
                             ],
                         },
@@ -1863,7 +1984,7 @@ describe("runCompartmentAgent", () => {
                     parts: [
                         {
                             type: "text",
-                            text: `<compartment start="1" end="2" title="Eligible work">Summary</compartment>`,
+                            text: `<compartment start="1" end="2" title="Eligible work"><p1>Summary</p1></compartment>`,
                         },
                     ],
                 },
@@ -1992,7 +2113,7 @@ describe("runCompartmentAgent", () => {
                             parts: [
                                 {
                                     type: "text",
-                                    text: `<compartment start="1" end="1" title="Part one">One</compartment>\n<compartment start="3" end="3" title="Part two">Two</compartment>`,
+                                    text: `<compartment start="1" end="1" title="Part one"><p1>One</p1></compartment>\n<compartment start="3" end="3" title="Part two"><p1>Two</p1></compartment>`,
                                 },
                             ],
                         },
@@ -2133,8 +2254,8 @@ describe("runCompartmentAgent", () => {
             historianFetches += 1;
             const text =
                 historianFetches <= 2
-                    ? '<output><compartment start="1" end="1" title="first">First</compartment><compartment start="7" end="7" title="second">Second</compartment></output>'
-                    : '<output><compartment start="1" end="7" title="re-read">All narrative preserved</compartment></output>';
+                    ? '<output><compartment start="1" end="1" title="first"><p1>First</p1></compartment><compartment start="7" end="7" title="second"><p1>Second</p1></compartment></output>'
+                    : '<output><compartment start="1" end="7" title="re-read"><p1>All narrative preserved</p1></compartment></output>';
             return {
                 data: [
                     {
@@ -2264,7 +2385,7 @@ describe("runCompartmentAgent", () => {
                             parts: [
                                 {
                                     type: "text",
-                                    text: '<compartment start="1" end="2" title="Eligible head">Head summary</compartment>',
+                                    text: '<compartment start="1" end="2" title="Eligible head"><p1>Head summary</p1></compartment>',
                                 },
                             ],
                         },
@@ -2502,7 +2623,7 @@ it("rolls back protected-tail drain reservation when publish throws after histor
                         parts: [
                             {
                                 type: "text",
-                                text: '<compartment start="1" end="2" title="Done">Summary</compartment>',
+                                text: '<compartment start="1" end="2" title="Done"><p1>Summary</p1></compartment>',
                             },
                         ],
                     },

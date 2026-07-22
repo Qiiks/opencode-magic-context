@@ -135,6 +135,9 @@ export function contextualizeUpgradeReason(reason: string): string {
     if (/already mutating compartment state|lease|already running/i.test(rewritten)) {
         return "The history comparter is currently updating this session's tail. This is temporary — wait a few seconds, then run `/ctx-session-upgrade` again (or just send another message and re-run it). No changes were made.";
     }
+    if (/missing the tiered paraphrase structure \(p1\.\.p4\)/i.test(rewritten)) {
+        return `Your configured \`historian.model\` could not produce the required tiered (p1..p4) compartment output. Choose a historian model that can follow the XML format in magic-context.jsonc, then run \`/ctx-session-upgrade\` again. No compartments were rewritten. Validation error: ${rewritten}`;
+    }
     return rewritten;
 }
 

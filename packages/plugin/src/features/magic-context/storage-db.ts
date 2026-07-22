@@ -46,7 +46,7 @@ export function getSchemaFenceRejection(): {
     return lastSchemaFenceRejection;
 }
 
-export const LATEST_SUPPORTED_VERSION = 65;
+export const LATEST_SUPPORTED_VERSION = 66;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -1044,8 +1044,10 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       cached_m0_model_key TEXT,
       cached_m0_project_identity TEXT,
       cached_m0_last_baseline_end_message_id TEXT,
-      upgrade_reminded_at INTEGER,
-      pi_stable_id_scheme INTEGER
+       upgrade_reminded_at INTEGER,
+       upgrade_reminder_last_sent_at INTEGER,
+       upgrade_reminder_count INTEGER NOT NULL DEFAULT 0,
+       pi_stable_id_scheme INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS tool_owner_backfill_state (
@@ -1453,6 +1455,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // ALTER in the Pi plugin.
     ensureColumn(db, "session_meta", "cached_m0_last_baseline_end_message_id", "TEXT");
     ensureColumn(db, "session_meta", "upgrade_reminded_at", "INTEGER");
+    ensureColumn(db, "session_meta", "upgrade_reminder_last_sent_at", "INTEGER");
+    ensureColumn(db, "session_meta", "upgrade_reminder_count", "INTEGER NOT NULL DEFAULT 0");
 
     db.exec(`
       CREATE TABLE IF NOT EXISTS project_state (

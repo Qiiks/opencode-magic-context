@@ -1,4 +1,3 @@
-import { setBootQuietPeriodForTests } from '@magic-context/core/plugin/boot-quiet';
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -42,10 +41,12 @@ import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/der
 import { resolveExecuteThreshold } from "@magic-context/core/hooks/magic-context/event-resolvers";
 import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudger";
 import { withRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
+import { setBootQuietPeriodForTests } from "@magic-context/core/plugin/boot-quiet";
 import { clearModelsDevCache } from "@magic-context/core/shared/models-dev-cache";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
+
 import { clearAutoSearchForPiSession } from "./auto-search-pi";
 import {
 	awaitInFlightHistorians,
@@ -2330,7 +2331,7 @@ describe("registerPiContextHandler", () => {
 				run: mock(async () => ({
 					ok: true as const,
 					assistantText:
-						'<compartment start="1" end="2" title="Forward">Forward pressure history.</compartment>',
+						'<compartment start="1" end="2" title="Forward"><p1>Forward pressure history.</p1></compartment>',
 					durationMs: 1,
 				})),
 			} as unknown as SubagentRunner;
@@ -2410,7 +2411,7 @@ describe("registerPiContextHandler", () => {
 				run: mock(async () => ({
 					ok: true as const,
 					assistantText:
-						'<compartment start="1" end="2" title="Skipped">Should not run.</compartment>',
+						'<compartment start="1" end="2" title="Skipped"><p1>Should not run.</p1></compartment>',
 					durationMs: 1,
 				})),
 			} as unknown as SubagentRunner;
@@ -2487,7 +2488,7 @@ describe("registerPiContextHandler", () => {
 				run: mock(async () => ({
 					ok: true as const,
 					assistantText:
-						'<compartment start="1" end="2" title="Expired">Expired wrapup marker no longer blocks.</compartment>',
+						'<compartment start="1" end="2" title="Expired"><p1>Expired wrapup marker no longer blocks.</p1></compartment>',
 					durationMs: 1,
 				})),
 			} as unknown as SubagentRunner;
@@ -2929,7 +2930,7 @@ describe("registerPiContextHandler", () => {
 				run: mock(async () => ({
 					ok: true as const,
 					assistantText:
-						'<compartment start="1" end="2" title="Recovered">Recovered prior Pi history.</compartment>',
+						'<compartment start="1" end="2" title="Recovered"><p1>Recovered prior Pi history.</p1></compartment>',
 					durationMs: 1,
 				})),
 			} as unknown as SubagentRunner;
@@ -3045,7 +3046,7 @@ describe("registerPiContextHandler", () => {
 					return {
 						ok: true as const,
 						assistantText:
-							'<compartment start="1" end="2" title="Cleared">Cleared session publication.</compartment>',
+							'<compartment start="1" end="2" title="Cleared"><p1>Cleared session publication.</p1></compartment>',
 						durationMs: 1,
 					};
 				}),
@@ -3107,7 +3108,7 @@ describe("registerPiContextHandler", () => {
 					return {
 						ok: true as const,
 						assistantText:
-							'<compartment start="1" end="2" title="Active">Active session publication.</compartment>',
+							'<compartment start="1" end="2" title="Active"><p1>Active session publication.</p1></compartment>',
 						durationMs: 1,
 					};
 				}),
@@ -3168,7 +3169,7 @@ describe("registerPiContextHandler", () => {
 					});
 					return {
 						ok: true as const,
-						assistantText: `<compartment start="1" end="2" title="Multi ${callIndex}">Multi-session publication.</compartment>`,
+						assistantText: `<compartment start="1" end="2" title="Multi ${callIndex}"><p1>Multi-session publication.</p1></compartment>`,
 						durationMs: 1,
 					};
 				}),

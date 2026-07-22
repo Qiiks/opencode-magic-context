@@ -40,7 +40,7 @@ describe("migration v65: per-memory mural cue columns", () => {
             initializeDatabase(db);
             runMigrations(db);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
-            expect(LATEST_MIGRATION_VERSION).toBe(65);
+            expect(LATEST_MIGRATION_VERSION).toBe(66);
             const names = columnNames(db, "memories");
             expect(names.has("mural_cue")).toBe(true);
             expect(names.has("mural_cue_hash")).toBe(true);
@@ -91,6 +91,30 @@ describe("migration v65: per-memory mural cue columns", () => {
             // table, and v65 must skip rather than throw.
             seedAppliedVersion(db, 64);
             expect(() => runMigrations(db)).not.toThrow();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("migration v66: bounded upgrade reminders", () => {
+    test("upgrades session metadata with cooldown and cap fields", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec("CREATE TABLE session_meta (session_id TEXT PRIMARY KEY)");
+            db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-legacy");
+            seedAppliedVersion(db, 65);
+
+            runMigrations(db);
+
+            const names = columnNames(db, "session_meta");
+            expect(names.has("upgrade_reminder_last_sent_at")).toBe(true);
+            expect(names.has("upgrade_reminder_count")).toBe(true);
+            expect(
+                db
+                    .prepare("SELECT upgrade_reminder_count FROM session_meta WHERE session_id = ?")
+                    .get("ses-legacy"),
+            ).toEqual({ upgrade_reminder_count: 0 });
         } finally {
             closeQuietly(db);
         }

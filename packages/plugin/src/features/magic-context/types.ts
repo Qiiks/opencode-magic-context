@@ -112,7 +112,12 @@ export interface SessionMeta {
     recoveryNoEligibleHeadCount: number;
     forceEmergencyBypassWindowStart: number;
     forceEmergencyBypassUsed: number;
+    /** Set only after an explicit OpenCode dialog choice; keeps the fresh dialog dismissed. */
     upgradeRemindedAt: number | null;
+    /** Most recent push reminder delivery, used for the bounded re-notification cooldown. */
+    upgradeReminderLastSentAt: number | null;
+    /** Total delivered upgrade reminders; the hard cap prevents an endless nag loop. */
+    upgradeReminderCount: number;
 }
 
 export type SchedulerDecision = "execute" | "defer";

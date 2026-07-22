@@ -43,6 +43,8 @@ const SESSION_META_FALLBACK_SELECTS: Partial<
     cached_m0_project_identity: "NULL AS cached_m0_project_identity",
     last_observed_model_key: "NULL AS last_observed_model_key",
     upgrade_reminded_at: "NULL AS upgrade_reminded_at",
+    upgrade_reminder_last_sent_at: "NULL AS upgrade_reminder_last_sent_at",
+    upgrade_reminder_count: "0 AS upgrade_reminder_count",
 };
 
 // Per-connection memo of the resolved projection SQL. getOrCreateSessionMeta is

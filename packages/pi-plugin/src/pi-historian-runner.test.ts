@@ -82,7 +82,7 @@ function rawMessages(count = 12) {
 }
 
 function successXml(fact = "Pi historian facts can promote to memory.") {
-	return `<compartment start="1" end="2" title="Initial Pi slice">Summarized the first Pi turn.</compartment>\n<PROJECT_RULES>\n* ${fact}\n</PROJECT_RULES>`;
+	return `<compartment start="1" end="2" title="Initial Pi slice"><p1>Summarized the first Pi turn.</p1></compartment>\n<PROJECT_RULES>\n* ${fact}\n</PROJECT_RULES>`;
 }
 
 function successXmlWithUserObservation(observation: string) {
@@ -90,8 +90,8 @@ function successXmlWithUserObservation(observation: string) {
 }
 
 function twoCompartmentSuccessXml() {
-	return `<compartment start="1" end="2" title="Initial Pi slice">Summarized the first Pi turn.</compartment>
-<compartment start="3" end="4" title="Provisional Pi slice">Summarized the provisional Pi turn.</compartment>
+	return `<compartment start="1" end="2" title="Initial Pi slice"><p1>Summarized the first Pi turn.</p1></compartment>
+<compartment start="3" end="4" title="Provisional Pi slice"><p1>Summarized the provisional Pi turn.</p1></compartment>
 <PROJECT_RULES>
 * Pi mid-loop wrapup facts must promote.
 </PROJECT_RULES>`;

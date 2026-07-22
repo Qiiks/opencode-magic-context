@@ -1117,7 +1117,7 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
             DROP TABLE mirror_live_staging;
             DROP TABLE mirror_resnapshot_state;
             DROP TABLE mirror_live_memory_rows;
-            DELETE FROM schema_migrations WHERE version IN (58, 59, 60, 61, 62, 63, 64, 65);
+            DELETE FROM schema_migrations WHERE version IN (58, 59, 60, 61, 62, 63, 64, 65, 66);
         `);
         withPrivilegedWriter(db, () => {
             db.prepare(

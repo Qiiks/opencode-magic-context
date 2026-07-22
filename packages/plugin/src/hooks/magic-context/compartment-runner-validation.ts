@@ -196,14 +196,19 @@ export function validateStoredCompartments(
 }
 
 function validateParsedCompartments(
-    compartments: Array<{ startMessage: number; endMessage: number }>,
+    compartments: Array<{ startMessage: number; endMessage: number; p1?: string }>,
     chunkStart: number,
     chunkEnd: number,
     unprocessedFrom: number | null,
 ): string | null {
     let expectedStart = chunkStart;
 
-    for (const compartment of compartments) {
+    for (const [index, compartment] of compartments.entries()) {
+        // P1 is the required v2 boundary. Missing P2-P4 deliberately retain the
+        // parser's denser-tier fallbacks; only the flat v1 shape must retry.
+        if (!compartment.p1?.trim()) {
+            return `compartment ${index + 1} is missing the tiered paraphrase structure (p1..p4); re-emit with all four tiers`;
+        }
         if (compartment.endMessage < compartment.startMessage) {
             return `invalid range ${compartment.startMessage}-${compartment.endMessage}`;
         }

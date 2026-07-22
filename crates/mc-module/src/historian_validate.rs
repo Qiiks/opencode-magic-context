@@ -926,7 +926,18 @@ fn validate_parsed_compartments(
         .collect();
     let mut expected_start = chunk_ordinals.first().copied();
 
-    for compartment in compartments {
+    for (index, compartment) in compartments.iter().enumerate() {
+        // P1 is the required v2 boundary. Missing P2-P4 deliberately keep the
+        // parser's denser-tier fallbacks; only the flat v1 shape must retry.
+        match compartment.p1.as_deref() {
+            Some(p1) if !p1.trim().is_empty() => {}
+            _ => {
+                return Some(format!(
+                    "compartment {} is missing the tiered paraphrase structure (p1..p4); re-emit with all four tiers",
+                    index + 1
+                ));
+            }
+        }
         if compartment.end_message < compartment.start_message {
             return Some(format!(
                 "invalid range {}-{}",
@@ -1342,6 +1353,26 @@ mod tests {
 
         assert_eq!(validated.compartments[0].end_message, 30);
         assert_eq!(validated.compartments[1].start_message, 31);
+    }
+
+    #[test]
+    fn tierless_compartments_reject_while_p1_only_output_keeps_soft_fallbacks() {
+        let flat = r#"<output><compartment start="1" end="2" title="flat">flat summary</compartment><meta><unprocessed_from>3</unprocessed_from></meta></output>"#;
+        let error = validate_historian_output(flat, &chunk(1, 2), &[], ValidateOptions::default())
+            .expect_err("flat v1 output must re-enter the producer retry chain");
+        assert!(error.message.contains(
+            "compartment 1 is missing the tiered paraphrase structure (p1..p4); re-emit with all four tiers"
+        ));
+
+        let p1_only = r#"<output><compartment start="1" end="2" title="partial"><p1>full summary</p1></compartment><meta><unprocessed_from>3</unprocessed_from></meta></output>"#;
+        let validated =
+            validate_historian_output(p1_only, &chunk(1, 2), &[], ValidateOptions::default())
+                .expect("P1 is enough for the parser's deliberate soft-tier fallback");
+        let compartment = &validated.compartments[0];
+        assert_eq!(compartment.p1.as_deref(), Some("full summary"));
+        assert_eq!(compartment.p2.as_deref(), Some("full summary"));
+        assert_eq!(compartment.p3.as_deref(), Some("full summary"));
+        assert_eq!(compartment.p4.as_deref(), Some(""));
     }
 
     #[test]

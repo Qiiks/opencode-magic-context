@@ -2982,7 +2982,7 @@ describe("createTransform historian failure handling", () => {
                                 parts: [
                                     {
                                         type: "text",
-                                        text: `<compartment start="1" end="2" title="Recovered">Summary</compartment>`,
+                                        text: `<compartment start="1" end="2" title="Recovered"><p1>Summary</p1></compartment>`,
                                     },
                                 ],
                             },

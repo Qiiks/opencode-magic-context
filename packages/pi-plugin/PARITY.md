@@ -124,10 +124,10 @@ another) because one process can serve multiple sessions and TUI port discovery
 is newest-pid-wins.
 
 **Pi:** transient terminal notifications. The upgrade reminder passes
-`deliveryPersists=false` on Pi, so it does NOT durably stamp `upgrade_reminded_at`
-on display (the toast vanishes, leaving no scrollback) — it re-prompts each Pi
-start until the session is actually upgraded. OpenCode (persistent chat message)
-stamps on send.
+`deliveryPersists=false` on Pi, so a missed toast does not honor the old explicit-
+dismissal stamp. Both harnesses persist the 24-hour reminder cooldown and three-
+delivery cap, preventing repeated startup toasts while `/ctx-status` still reports
+compartments that need upgrading.
 
 ---
 

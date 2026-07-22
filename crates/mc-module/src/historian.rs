@@ -56,7 +56,13 @@ fn to_stored_compartment(
         p4: c.p4.clone(),
         importance: c.importance.map(|i| i as i32).unwrap_or(50),
         episode_type: c.episode_type.clone(),
-        legacy: 0,
+        // Strict validation makes tierless output unreachable, but derive legacy
+        // from P1 so a future bypass cannot falsely mark a flat row as v2.
+        legacy: if c.p1.as_deref().is_some_and(|p1| !p1.trim().is_empty()) {
+            0
+        } else {
+            1
+        },
         created_at: created_at_ms,
     }
 }
@@ -1803,6 +1809,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stored_compartment_legacy_flag_tracks_p1_presence() {
+        let tiered = ValidatedCompartment {
+            sequence: 1,
+            start_message: 1,
+            end_message: 2,
+            start_message_id: "m1#0".into(),
+            end_message_id: "m2#0".into(),
+            title: "tiered".into(),
+            content: "full".into(),
+            p1: Some("full".into()),
+            p2: Some("short".into()),
+            p3: Some("brief".into()),
+            p4: Some("".into()),
+            importance: None,
+            episode_type: None,
+        };
+        let flat = ValidatedCompartment {
+            p1: None,
+            p2: None,
+            p3: None,
+            p4: None,
+            ..tiered.clone()
+        };
+
+        assert_eq!(
+            to_stored_compartment(&tiered, 1, empty_boundary_dates()).legacy,
+            0
+        );
+        assert_eq!(
+            to_stored_compartment(&flat, 1, empty_boundary_dates()).legacy,
+            1
+        );
+    }
+
+    fn flat_historian_xml(content: &str) -> String {
+        format!(
+            r#"<output>
+<compartments>
+<compartment start="2" end="3" title="flat">{content}</compartment>
+</compartments>
+<meta><messages_processed>2-3</messages_processed><unprocessed_from>4</unprocessed_from></meta>
+</output>"#
+        )
+    }
+
     fn historian_xml(p1: &str) -> String {
         format!(
             r#"<output>
@@ -3132,7 +3184,7 @@ mod tests {
         let models = vec!["prov/model-a".to_string(), "other/model-b".to_string()];
         let mut producer = ScriptedProducer::default()
             .with_start(Ok(run_handle("run-invalid")))
-            .with_output(Ok(producer_output("not historian xml".to_string())))
+            .with_output(Ok(producer_output(flat_historian_xml("flat primary"))))
             .with_start(Ok(run_handle("run-valid")))
             .with_output(Ok(producer_output(historian_xml("fallback summary"))));
 
@@ -3172,9 +3224,9 @@ mod tests {
         let models = vec!["prov/model-a".to_string(), "other/model-b".to_string()];
         let mut producer = ScriptedProducer::default()
             .with_start(Ok(run_handle("run-invalid-a")))
-            .with_output(Ok(producer_output("not historian xml".to_string())))
+            .with_output(Ok(producer_output(flat_historian_xml("flat primary"))))
             .with_start(Ok(run_handle("run-invalid-b")))
-            .with_output(Ok(producer_output("<output/>".to_string())));
+            .with_output(Ok(producer_output(flat_historian_xml("flat fallback"))));
         let mut request = fire_request(&store, "placeholder prompt", &models, &chunk, &prior);
         request.now_ms = 0;
         request.failure_backoff_at_ms = HISTORIAN_FAILURE_BACKOFF_MS;
@@ -3189,6 +3241,15 @@ mod tests {
         let state = store.load("ses").unwrap().meta.historian;
 
         assert_eq!(producer.observed_starts.len(), 2);
+        assert_eq!(
+            store
+                .load_historian_assembly_snapshot("ses")
+                .unwrap()
+                .compartments
+                .len(),
+            1,
+            "flat retries must not publish any new compartment rows"
+        );
         assert_eq!(
             state.last_failure.as_deref(),
             Some(format!("validate rejected: {final_error}").as_str()),

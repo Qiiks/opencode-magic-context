@@ -2472,6 +2472,20 @@ const MIGRATIONS: Migration[] = [
             ensureColumn(db, "memories", "mural_cue_at", "INTEGER");
         },
     },
+    {
+        version: 66,
+        description: "bound per-session historian upgrade reminders",
+        up(db: Database): void {
+            if (!tableExists(db, "session_meta")) return;
+            ensureColumn(db, "session_meta", "upgrade_reminder_last_sent_at", "INTEGER");
+            ensureColumn(
+                db,
+                "session_meta",
+                "upgrade_reminder_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            );
+        },
+    },
 ];
 
 /**
