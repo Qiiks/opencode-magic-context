@@ -983,6 +983,16 @@ export function createRustModeTransform(
             const timings = isRecord(response.timings) ? response.timings : undefined;
             const total = timings?.total;
             moduleElapsedMs = typeof total === "number" && Number.isFinite(total) ? total : 0;
+            // A slow module pass earns its stage breakdown in the log: the pass line
+            // only carries the module total, which cannot distinguish a tokenizer
+            // stall from a store commit stall on large sessions.
+            if (timings && moduleElapsedMs >= 1000) {
+                const detail = Object.entries(timings)
+                    .filter(([key, value]) => key !== "total" && typeof value === "number")
+                    .map(([key, value]) => `${key}:${(value as number).toFixed(1)}`)
+                    .join(" ");
+                if (detail) sessionLog(sessionId, `rust module stages (slow pass): ${detail}`);
+            }
         };
         if (state.parked) {
             state.passesSincePark += 1;
