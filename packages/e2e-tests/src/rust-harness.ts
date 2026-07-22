@@ -474,6 +474,35 @@ export class RustTestHarness {
         }
     }
 
+    /**
+     * Override one session's cache TTL for a deterministic cache-busting probe.
+     * The regular config path only refreshes this value on a new session; tests
+     * that preserve a warm module session need to change it without recreating
+     * the queued module-side drop.
+     */
+    setSessionCacheTtl(sessionId: string, cacheTtl: string): void {
+        if (this.contextDbCached) {
+            try {
+                this.contextDbCached.close();
+            } catch {
+                // Best-effort close: a failure must not prevent reopening the database below.
+            }
+            this.contextDbCached = null;
+        }
+        const dbPath = this.contextDbPath();
+        const db = new Database(dbPath);
+        try {
+            const result = db
+                .prepare("UPDATE session_meta SET cache_ttl = ? WHERE session_id = ?")
+                .run(cacheTtl, sessionId) as { changes?: number };
+            if (result.changes !== 1) {
+                throw new Error(`session cache TTL update affected ${result.changes ?? 0} rows`);
+            }
+        } finally {
+            db.close();
+        }
+    }
+
     /** All mock requests received in this suite. */
     requests() {
         return this.mock.requests();

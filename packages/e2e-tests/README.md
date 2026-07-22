@@ -107,6 +107,10 @@ Gated scenarios (skip with a printed reason until their dependency lands):
   still wedges the Rust ordinal resolver (a distinct gap from the merged
   tail-readopt / park-self-heal fix). Set `MC_RUST_E2E_REMOVAL=1` once the removal
   ordinal-reconcile self-heal lands.
+- **Duplicate tool-use IDs** (`duplicate-tool-use-id`) — consuming a queued drop on
+  a selection bust needs the hermetic `broca` runner. Set
+  `MC_RUST_E2E_DUPLICATE_IDS=1` once that runner is provisioned; the test body
+  always walks every served message array, even while gated.
 
 ### CI
 

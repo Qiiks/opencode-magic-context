@@ -55,6 +55,11 @@ export function removalHealEnabled(): boolean {
     return process.env.MC_RUST_E2E_REMOVAL === "1";
 }
 
+/** Enable the duplicate-ID regression only when the stack can produce the selection refresh needed to reproduce duplicate IDs. */
+export function duplicateIdInfraEnabled(): boolean {
+    return process.env.MC_RUST_E2E_DUPLICATE_IDS === "1";
+}
+
 /**
  * Reason string for the removal-self-heal skip. Distinct from the shipped
  * tail-readopt/park fix: a mid-session removal drives the Rust ordinal resolver
@@ -63,6 +68,14 @@ export function removalHealEnabled(): boolean {
  */
 export const REMOVAL_SKIP_REASON =
     "mid-session message removal (session.revert) still wedges the Rust ordinal resolver — a distinct gap from the merged tail-readopt/park fix (set MC_RUST_E2E_REMOVAL=1 once the removal ordinal-reconcile self-heal lands)";
+
+/**
+ * The hermetic stack has no broca runner, so it cannot complete the historian-backed
+ * selection bust that consumes a queued ctx_reduce drop. Keep the assertion body
+ * available for a provisioned runner instead of reporting a false green pass.
+ */
+export const DUPLICATE_ID_SKIP_REASON =
+    "requires a broca-capable hermetic stack to reach the queued-drop selection bust (set MC_RUST_E2E_DUPLICATE_IDS=1 once that runner is provisioned)";
 
 /**
  * Print a one-line skip notice. Call from a gated scenario's single `it` so the
