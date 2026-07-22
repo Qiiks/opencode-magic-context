@@ -9879,7 +9879,7 @@ fn ctx_note_description() -> String {
 fn ctx_memory_schema() -> Value {
     json!({
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "properties": {
             "action": {
                 "type": "string",
@@ -9926,8 +9926,6 @@ fn ctx_memory_schema() -> Value {
                 "type": "string",
                 "description": "Resolved MC project identity supplied by the host transport."
             },
-            "reduced": { "type": "boolean" },
-            "summary": { "type": "string" }
         }
     })
 }
@@ -9935,7 +9933,7 @@ fn ctx_memory_schema() -> Value {
 fn ctx_search_schema() -> Value {
     json!({
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "properties": {
             "query": {
                 "type": "string",
@@ -9949,8 +9947,6 @@ fn ctx_search_schema() -> Value {
                 "default": 8,
                 "description": "Maximum number of matches to return."
             },
-            "reduced": { "type": "boolean" },
-            "summary": { "type": "string" }
         }
     })
 }
@@ -9958,13 +9954,11 @@ fn ctx_search_schema() -> Value {
 fn ctx_expand_schema() -> Value {
     json!({
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "properties": {
             "start": { "type": "integer", "minimum": 1, "description": "First message ordinal to expand." },
             "end": { "type": "integer", "minimum": 1, "description": "Last message ordinal to expand, inclusive." },
             "message": { "type": "integer", "minimum": 1, "description": "Recover the single persisted chunk transcript covering this message ordinal." },
-            "reduced": { "type": "boolean" },
-            "summary": { "type": "string" }
         }
     })
 }
@@ -9972,7 +9966,7 @@ fn ctx_expand_schema() -> Value {
 fn ctx_note_schema() -> Value {
     json!({
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "properties": {
             "action": { "type": "string", "enum": ["write", "read", "update", "dismiss"], "description": "Operation to perform. Defaults to write when content is provided, otherwise read." },
             "content": { "type": "string", "maxLength": 65536, "description": "Note text for write/update, or optional dismissal resolution when action is dismiss." },
@@ -9982,8 +9976,6 @@ fn ctx_note_schema() -> Value {
             "filter": { "type": "string", "enum": ["all", "active", "pending", "ready", "dismissed"], "description": "Optional read filter. Defaults to active session notes plus ready smart notes." },
             "surface_condition": { "type": "string", "maxLength": 4096, "description": "Optional externally checkable condition to record with the note. Evaluation arrives later." },
             "memory_project": { "type": "string", "description": "Resolved MC project identity supplied by the host transport." },
-            "reduced": { "type": "boolean" },
-            "summary": { "type": "string" }
         }
     })
 }
@@ -10015,11 +10007,9 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
                     schema: json!({
                         "type": "object",
                         "properties": {
-                            "drop": { "type": "string" },
-                            "reduced": { "type": "boolean" },
-                            "summary": { "type": "string" }
+                            "drop": { "type": "string" }
                         },
-                        "additionalProperties": false
+                        "additionalProperties": true
                     }),
                 },
                 Tool {
@@ -12994,6 +12984,23 @@ mod tests {
         assert!(parse_tag_range_string("1-1001").is_err());
     }
 
+    #[test]
+    fn facade_arguments_preserve_decorated_reduced_fields() {
+        let request = json!({
+            "arguments": {
+                "drop": "1-5",
+                "reduced": true,
+                "summary": "{\"drop\":\"1-5\"}",
+                "stray": "kept"
+            }
+        });
+        let arguments = facade_arguments(&request, &["drop"]).expect("arguments object");
+        assert_eq!(arguments["drop"], json!("1-5"));
+        assert_eq!(arguments["reduced"], json!(true));
+        assert_eq!(arguments["summary"], json!("{\"drop\":\"1-5\"}"));
+        assert_eq!(arguments["stray"], json!("kept"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn facade_ctx_reduce_is_inert_before_resolution_or_storage() {
         let producer = Arc::new(ProducerState::default());
@@ -13021,27 +13028,68 @@ mod tests {
     }
 
     #[test]
-    fn ctx_reduce_manifest_schema_is_closed_and_accepts_reduced_envelopes() {
+    fn ctx_manifest_schemas_accept_unknown_args_without_advertising_reduced_fields() {
         let manifest = manifest("magic-context");
         let ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0] else {
             panic!("tool provider manifest entry");
         };
-        let tool = tools
+        let by_name = tools
             .iter()
-            .find(|tool| tool.name == "ctx_reduce")
-            .expect("ctx_reduce manifest entry");
-        assert_eq!(
-            tool.schema,
-            json!({
-                "type": "object",
-                "properties": {
-                    "drop": { "type": "string" },
-                    "reduced": { "type": "boolean" },
-                    "summary": { "type": "string" }
-                },
-                "additionalProperties": false
-            })
-        );
+            .map(|tool| (tool.name.as_str(), tool))
+            .collect::<HashMap<_, _>>();
+        let expected_fields = [
+            ("ctx_reduce", vec!["drop"]),
+            (
+                "ctx_memory",
+                vec![
+                    "action",
+                    "category",
+                    "content",
+                    "id",
+                    "ids",
+                    "target_id",
+                    "source_ids",
+                    "reason",
+                    "memory_project",
+                ],
+            ),
+            ("ctx_search", vec!["query", "limit"]),
+            ("ctx_expand", vec!["start", "end", "message"]),
+            (
+                "ctx_note",
+                vec![
+                    "action",
+                    "content",
+                    "note_id",
+                    "limit",
+                    "offset",
+                    "filter",
+                    "surface_condition",
+                    "memory_project",
+                ],
+            ),
+        ];
+
+        for (name, expected) in expected_fields {
+            let tool = by_name
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name} manifest entry"));
+            assert_ne!(
+                tool.schema.get("additionalProperties"),
+                Some(&json!(false)),
+                "{name} must preserve compatibility arguments"
+            );
+            let properties = tool.schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} schema properties"));
+            let mut actual = properties.keys().map(String::as_str).collect::<Vec<_>>();
+            actual.sort_unstable();
+            let mut expected = expected;
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "{name} advertised fields changed");
+            assert!(!properties.contains_key("reduced"));
+            assert!(!properties.contains_key("summary"));
+        }
     }
 
     #[test]

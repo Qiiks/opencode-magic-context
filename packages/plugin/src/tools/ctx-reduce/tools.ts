@@ -33,6 +33,17 @@ function formatRawDropForAck(rawDrop: string): string {
         .join(", ");
 }
 
+const ctxReduceArgsShape = {
+    drop: tool.schema
+        .string()
+        .optional()
+        .describe("Tag IDs to drop entirely. Ranges: '3-5', '1,2,9'"),
+};
+// The tool definition exposes only the documented argument shape to the model
+// provider, but older callers may still send extra arguments. Parse with
+// passthrough so execute() can receive those fields without advertising them.
+const ctxReduceArgsSchema = tool.schema.object(ctxReduceArgsShape).passthrough();
+
 function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
     let fallbackCommandSequence = 0;
 
@@ -58,15 +69,10 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
 
     return tool({
         description: CTX_REDUCE_DESCRIPTION,
-        args: {
-            drop: tool.schema
-                .string()
-                .optional()
-                .describe("Tag IDs to drop entirely. Ranges: '3-5', '1,2,9'"),
-            reduced: tool.schema.boolean().optional(),
-            summary: tool.schema.string().optional(),
-        },
-        async execute(args: CtxReduceArgs, toolContext) {
+        args: ctxReduceArgsShape,
+        async execute(rawArgs: CtxReduceArgs, toolContext) {
+            const parsedArgs = ctxReduceArgsSchema.safeParse(rawArgs);
+            let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxReduceArgs;
             args = unwrapImitatedReducedArgs(args, ["drop"], { drop: "string" });
             const sessionId = toolContext.sessionID;
 

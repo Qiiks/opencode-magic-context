@@ -37,36 +37,37 @@ const DEFAULT_LIMIT = 10;
 const NOTE_EXPAND_HINT =
 	"Use ctx_expand(start=N-10, end=N) around any note @msg anchor above to read the surrounding conversation context.";
 
-const ParamsSchema = Type.Object({
-	query: Type.Optional(
-		Type.String({
-			description:
-				"Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
-		}),
-	),
-	limit: Type.Optional(
-		Type.Number({
-			description: "Maximum results to return (default: 10)",
-		}),
-	),
-	sources: Type.Optional(
-		Type.Array(
-			Type.Union([
-				Type.Literal("memory"),
-				Type.Literal("message"),
-				Type.Literal("git_commit"),
-				Type.Literal("primer"),
-				Type.Literal("note"),
-			]),
-			{
+const ParamsSchema = Type.Object(
+	{
+		query: Type.Optional(
+			Type.String({
 				description:
-					'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources.',
-			},
+					"Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
+			}),
 		),
-	),
-	reduced: Type.Optional(Type.Boolean()),
-	summary: Type.Optional(Type.String()),
-});
+		limit: Type.Optional(
+			Type.Number({
+				description: "Maximum results to return (default: 10)",
+			}),
+		),
+		sources: Type.Optional(
+			Type.Array(
+				Type.Union([
+					Type.Literal("memory"),
+					Type.Literal("message"),
+					Type.Literal("git_commit"),
+					Type.Literal("primer"),
+					Type.Literal("note"),
+				]),
+				{
+					description:
+						'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources.',
+				},
+			),
+		),
+	},
+	{ additionalProperties: true },
+);
 
 type CtxSearchParams = Static<typeof ParamsSchema>;
 

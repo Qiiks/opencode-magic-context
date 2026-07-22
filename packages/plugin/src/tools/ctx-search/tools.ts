@@ -158,30 +158,33 @@ function formatSearchResults(
     return `Found ${results.length} result${results.length === 1 ? "" : "s"} for "${query}":\n\n${body}`;
 }
 
+const ctxSearchArgsShape = {
+    query: tool.schema
+        .string()
+        .optional()
+        .describe(
+            "Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
+        ),
+    limit: tool.schema.number().optional().describe("Maximum results to return (default: 10)"),
+    sources: tool.schema
+        .array(tool.schema.enum(["memory", "message", "git_commit", "primer", "note"]))
+        .optional()
+        .describe(
+            'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources; pass [] to search no sources.',
+        ),
+};
+// The tool definition exposes only the documented argument shape to the model
+// provider, but older callers may still send extra arguments. Parse with
+// passthrough so execute() can receive those fields without advertising them.
+const ctxSearchArgsSchema = tool.schema.object(ctxSearchArgsShape).passthrough();
+
 function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
     return tool({
         description: CTX_SEARCH_DESCRIPTION,
-        args: {
-            query: tool.schema
-                .string()
-                .optional()
-                .describe(
-                    "Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
-                ),
-            limit: tool.schema
-                .number()
-                .optional()
-                .describe("Maximum results to return (default: 10)"),
-            sources: tool.schema
-                .array(tool.schema.enum(["memory", "message", "git_commit", "primer", "note"]))
-                .optional()
-                .describe(
-                    'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources; pass [] to search no sources.',
-                ),
-            reduced: tool.schema.boolean().optional(),
-            summary: tool.schema.string().optional(),
-        },
-        async execute(args: CtxSearchArgs, toolContext) {
+        args: ctxSearchArgsShape,
+        async execute(rawArgs: CtxSearchArgs, toolContext) {
+            const parsedArgs = ctxSearchArgsSchema.safeParse(rawArgs);
+            let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxSearchArgs;
             args = unwrapImitatedReducedArgs(args, ["query"], {
                 query: "string",
                 limit: "number",

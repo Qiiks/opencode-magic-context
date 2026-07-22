@@ -105,49 +105,51 @@ const DREAMER_ONLY_ACTIONS: ReadonlySet<CtxMemoryAction> = new Set(["list"]);
 
 const GET_MAX_IDS = 20;
 
-const ParamsSchema = Type.Object({
-	action: Type.Optional(
-		Type.Union(
-			ALL_ACTIONS.map((a) => Type.Literal(a)),
-			{
-				description: "What to do: write, update, archive, merge, get, or list",
-			},
+const ParamsSchema = Type.Object(
+	{
+		action: Type.Optional(
+			Type.Union(
+				ALL_ACTIONS.map((a) => Type.Literal(a)),
+				{
+					description:
+						"What to do: write, update, archive, merge, get, or list",
+				},
+			),
 		),
-	),
-	content: Type.Optional(
-		Type.String({
-			description:
-				"The memory text — one standalone fact (required for write, update, merge)",
-		}),
-	),
-	category: Type.Optional(
-		Type.Union(
-			V2_MEMORY_CATEGORIES.map((c) => Type.Literal(c)),
-			{
+		content: Type.Optional(
+			Type.String({
 				description:
-					"What kind of fact this is (required for write; optional merge override)",
-			},
+					"The memory text — one standalone fact (required for write, update, merge)",
+			}),
 		),
-	),
-	ids: Type.Optional(
-		Type.Array(Type.Number(), {
-			description:
-				"Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more, get one to twenty",
-		}),
-	),
-	limit: Type.Optional(
-		Type.Number({
-			description: "Max results for list (default: 10)",
-		}),
-	),
-	reason: Type.Optional(
-		Type.String({
-			description: "Why the memory is being archived (optional, recommended)",
-		}),
-	),
-	reduced: Type.Optional(Type.Boolean()),
-	summary: Type.Optional(Type.String()),
-});
+		category: Type.Optional(
+			Type.Union(
+				V2_MEMORY_CATEGORIES.map((c) => Type.Literal(c)),
+				{
+					description:
+						"What kind of fact this is (required for write; optional merge override)",
+				},
+			),
+		),
+		ids: Type.Optional(
+			Type.Array(Type.Number(), {
+				description:
+					"Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more, get one to twenty",
+			}),
+		),
+		limit: Type.Optional(
+			Type.Number({
+				description: "Max results for list (default: 10)",
+			}),
+		),
+		reason: Type.Optional(
+			Type.String({
+				description: "Why the memory is being archived (optional, recommended)",
+			}),
+		),
+	},
+	{ additionalProperties: true },
+);
 
 type CtxMemoryParams = Static<typeof ParamsSchema>;
 

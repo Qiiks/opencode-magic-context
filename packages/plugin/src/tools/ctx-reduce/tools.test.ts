@@ -115,6 +115,24 @@ describe("createCtxReduceTools", () => {
             expect(result).toContain("'drop' must be provided");
         });
 
+        it("accepts reduced compatibility fields alongside a real drop", async () => {
+            seedTags(db, [{ id: 3, sessionId: "ses-1" }]);
+
+            const result = await tools.ctx_reduce.execute(
+                {
+                    drop: "3",
+                    reduced: true,
+                    summary: JSON.stringify({ drop: "8" }),
+                },
+                toolContext(),
+            );
+
+            expect(result).toContain("Queued");
+            expect(getPendingOps(db, "ses-1")).toEqual([
+                expect.objectContaining({ tag_id: 3, operation: "drop" }),
+            ]);
+        });
+
         it("queues drop ops and returns an acknowledgement", async () => {
             seedTags(db, [
                 { id: 3, sessionId: "ses-1" },

@@ -86,8 +86,21 @@ describe("createCtxMemoryTool", () => {
 				undefined,
 				ctx,
 			);
+			const decorated = await tool.execute(
+				"call-decorated",
+				{
+					action: "get",
+					ids: [memory.id],
+					reduced: true,
+					summary: JSON.stringify({ action: "archive", ids: [memory.id] }),
+				},
+				new AbortController().signal,
+				undefined,
+				ctx,
+			);
 
 			expect(imitated).toEqual(plain);
+			expect(decorated).toEqual(plain);
 		} finally {
 			closeQuietly(db);
 		}

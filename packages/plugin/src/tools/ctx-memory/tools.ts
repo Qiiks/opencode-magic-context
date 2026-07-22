@@ -337,47 +337,45 @@ function updateMemoryContentInCurrentTransaction(
     invalidateMemory(memory.projectPath, memory.id);
 }
 
+const ctxMemoryArgsShape = {
+    // Keep the complete action argument shape available to execute(); it can reject
+    // actions that are unsafe for the current agent once that agent is known. The
+    // passthrough parser also retains extra arguments sent by older callers.
+    action: tool.schema
+        .enum([...CTX_MEMORY_DREAMER_ACTIONS])
+        .optional()
+        .describe("What to do: write, update, archive, merge, get, or list"),
+    content: tool.schema
+        .string()
+        .optional()
+        .describe("The memory text — one standalone fact (required for write, update, merge)"),
+    category: tool.schema
+        .enum([...V2_MEMORY_CATEGORIES])
+        .optional()
+        .describe("What kind of fact this is (required for write; optional merge override)"),
+    ids: tool.schema
+        .array(tool.schema.number())
+        .optional()
+        .describe(
+            "Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more, get one to twenty",
+        ),
+    limit: tool.schema.number().optional().describe("Max results for list (default: 10)"),
+    reason: tool.schema
+        .string()
+        .optional()
+        .describe("Why the memory is being archived (optional, recommended)"),
+};
+const ctxMemoryArgsSchema = tool.schema.object(ctxMemoryArgsShape).passthrough();
+
 function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
     const allowedActions = getAllowedActions(deps);
 
     return tool({
         description: CTX_MEMORY_DESCRIPTION,
-        args: {
-            // The OpenCode plugin exposes one shared tool definition for all agents, so
-            // schema-level narrowing to `allowedActions` blocks dreamer child sessions
-            // before execute() can inspect `toolContext.agent`. Keep the full action
-            // schema visible to the runtime and enforce primary-session safety below.
-            action: tool.schema
-                .enum([...CTX_MEMORY_DREAMER_ACTIONS])
-                .optional()
-                .describe("What to do: write, update, archive, merge, get, or list"),
-            content: tool.schema
-                .string()
-                .optional()
-                .describe(
-                    "The memory text — one standalone fact (required for write, update, merge)",
-                ),
-            category: tool.schema
-                .enum([...V2_MEMORY_CATEGORIES])
-                .optional()
-                .describe(
-                    "What kind of fact this is (required for write; optional merge override)",
-                ),
-            ids: tool.schema
-                .array(tool.schema.number())
-                .optional()
-                .describe(
-                    "Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more, get one to twenty",
-                ),
-            limit: tool.schema.number().optional().describe("Max results for list (default: 10)"),
-            reason: tool.schema
-                .string()
-                .optional()
-                .describe("Why the memory is being archived (optional, recommended)"),
-            reduced: tool.schema.boolean().optional(),
-            summary: tool.schema.string().optional(),
-        },
-        async execute(args: CtxMemoryArgs, toolContext) {
+        args: ctxMemoryArgsShape,
+        async execute(rawArgs: CtxMemoryArgs, toolContext) {
+            const parsedArgs = ctxMemoryArgsSchema.safeParse(rawArgs);
+            let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxMemoryArgs;
             args = unwrapImitatedReducedArgs(args, ["action"], {
                 action: { type: "enum", values: CTX_MEMORY_DREAMER_ACTIONS },
                 content: "string",
