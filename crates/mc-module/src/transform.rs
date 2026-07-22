@@ -1998,6 +1998,17 @@ fn apply_once(
         meta.reasoning_cleared_through_ordinal = meta.reasoning_cleared_through_ordinal.max(cutoff);
     }
     let new_strip_units = new_frozen_strip_units(&loaded.core, req, &tag_numbers, is_bust_pass);
+    let caveman_age_basis_tag = if is_bust_pass && req.caveman_enabled {
+        let basis = tag_rows
+            .iter()
+            .filter_map(|row| u64::try_from(row.tag_number).ok())
+            .max()
+            .unwrap_or(0);
+        meta.caveman_age_basis_tag = basis;
+        basis
+    } else {
+        loaded.meta.caveman_age_basis_tag
+    };
     let new_caveman_units = new_caveman_units(
         &loaded.core,
         req,
@@ -2005,6 +2016,7 @@ fn apply_once(
         &live,
         loaded.meta.coverage_ordinal,
         is_bust_pass,
+        caveman_age_basis_tag,
     );
     if loaded.meta.soft_refresh_pending && is_bust_pass {
         meta.soft_refresh_pending = false;
@@ -3239,8 +3251,10 @@ fn caveman_target_depth(position: usize, total: usize) -> u8 {
     }
 }
 
-/// Select and render new/deeper caveman units on bust passes only. The original tag source is
-/// authoritative, so a later tier shift never compresses an already-compressed payload.
+/// Select and render new/deeper caveman units on bust passes only. `age_basis_tag` is captured
+/// durably by the caller with the same commit as these units, so newly minted tags cannot change
+/// this cycle's eligible population. The original tag source is authoritative, so a later tier
+/// shift never compresses an already-compressed payload.
 fn new_caveman_units(
     core: &CoreState,
     req: &TransformRequest,
@@ -3248,13 +3262,13 @@ fn new_caveman_units(
     live: &[&FlatBlock],
     coverage: Option<u64>,
     is_bust_pass: bool,
+    age_basis_tag: u64,
 ) -> Vec<FrozenUnit> {
-    if !is_bust_pass || !req.caveman_enabled || req.is_subagent {
+    if !is_bust_pass || !req.caveman_enabled || req.is_subagent || age_basis_tag == 0 {
         return Vec::new();
     }
 
-    let max_tag = tag_rows.iter().map(|row| row.tag_number).max().unwrap_or(0);
-    let protected_cutoff = max_tag.saturating_sub(req.protected_tags as i64);
+    let protected_cutoff = age_basis_tag.saturating_sub(req.protected_tags as u64);
     let tags_by_block = tag_rows
         .iter()
         .filter(|row| row.kind == "message")
@@ -3273,11 +3287,12 @@ fn new_caveman_units(
                 return None;
             }
             let row = tags_by_block.get(block.id.as_str())?;
-            if row.tag_number > protected_cutoff || row.source_bytes.len() < req.caveman_min_chars {
+            let tag_number = u64::try_from(row.tag_number).ok()?;
+            if tag_number > protected_cutoff || row.source_bytes.len() < req.caveman_min_chars {
                 return None;
             }
             let source = String::from_utf8(row.source_bytes.clone()).ok()?;
-            (!source.is_empty()).then_some((row.tag_number, block.id.clone(), source))
+            (!source.is_empty()).then_some((tag_number, block.id.clone(), source))
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
@@ -12119,6 +12134,7 @@ mod tests {
         assert_eq!(meta.historian.expected_revert_epoch, 0);
         assert!(meta.synthetic_todo.is_none());
         assert!(!meta.cc_u1_active);
+        assert_eq!(meta.caveman_age_basis_tag, 0);
         assert!(meta.initialized);
     }
 
@@ -15322,6 +15338,26 @@ mod tests {
         assert_eq!(first.response.ck_messages, second.response.ck_messages);
     }
 
+    fn caveman_test_source(label: &str) -> String {
+        format!(
+            "I just really wanted to basically explain {label} clearly, and in order to understand it, we need to consider the context. "
+        )
+        .repeat(8)
+    }
+
+    fn stored_caveman_units(store: &McStore, session_id: &str) -> Vec<FrozenUnit> {
+        let mut units = store
+            .load(session_id)
+            .unwrap()
+            .core
+            .frozen_units
+            .into_iter()
+            .filter(|unit| unit.key.starts_with(CAV_KEY_PREFIX))
+            .collect::<Vec<_>>();
+        units.sort_by(|left, right| left.key.cmp(&right.key));
+        units
+    }
+
     #[test]
     fn caveman_selection_is_bust_only_and_replays_frozen_payload() {
         let source = "I just really wanted to basically explain the implementation clearly, and in order to understand it, we need to consider the context. ".repeat(8);
@@ -15343,11 +15379,18 @@ mod tests {
             created_at_ms: 0,
             source_bytes: source.as_bytes().to_vec(),
         }];
-        let no_units =
-            new_caveman_units(&CoreState::default(), &request, &tags, &live, None, false);
+        let no_units = new_caveman_units(
+            &CoreState::default(),
+            &request,
+            &tags,
+            &live,
+            None,
+            false,
+            1,
+        );
         assert!(no_units.is_empty(), "defer must not mint a cav unit");
 
-        let units = new_caveman_units(&CoreState::default(), &request, &tags, &live, None, true);
+        let units = new_caveman_units(&CoreState::default(), &request, &tags, &live, None, true, 1);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].key, "cav:m1#0");
         assert_eq!(units[0].reset_rule, "3");
@@ -15411,7 +15454,7 @@ mod tests {
             created_at_ms: 0,
             source_bytes: source.as_bytes().to_vec(),
         }];
-        let units = new_caveman_units(&core, &request, &tags, &live, None, true);
+        let units = new_caveman_units(&core, &request, &tags, &live, None, true, 1);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].reset_rule, "3");
         assert!(units[0].frozen_payload.len() <= lite.len());
@@ -15448,7 +15491,8 @@ mod tests {
             std::slice::from_ref(&tag),
             &live,
             None,
-            true
+            true,
+            1,
         )
         .is_empty());
 
@@ -15471,7 +15515,8 @@ mod tests {
             std::slice::from_ref(&tag),
             &live,
             None,
-            true
+            true,
+            1,
         )
         .is_empty());
 
@@ -15485,9 +15530,225 @@ mod tests {
             .iter()
             .filter(|block| !block.synthetic)
             .collect::<Vec<_>>();
+        assert!(new_caveman_units(
+            &CoreState::default(),
+            &protected,
+            &[tag],
+            &live,
+            None,
+            true,
+            1,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn caveman_multi_step_tags_batch_on_the_only_mid_sequence_bust() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "caveman-multi-step";
+        store
+            .replace_compartments(session, &[comp(1, 1, 1, "anchor", "first coverage")])
+            .unwrap();
+
+        let mut messages = vec![item("anchor", 1, "covered")];
+        let boot = run(&store, &req(session, "cfg", messages.clone()), &spine());
+        assert_eq!(boot.action, "HARD");
+
+        messages.extend([
+            item("separator", 2, "fold this later"),
+            item("old-a", 3, &caveman_test_source("old-a")),
+            item("old-b", 4, &caveman_test_source("old-b")),
+        ]);
+        let mut armed_request = req(session, "cfg", messages.clone());
+        armed_request.caveman_enabled = true;
+        armed_request.caveman_min_chars = 1;
+        armed_request.protected_tags = 0;
+        let armed = run(&store, &armed_request, &spine());
+        assert_eq!(armed.action, "SOFT+");
+        assert!(armed.first_divergence.is_none());
+        assert!(stored_caveman_units(&store, session).is_empty());
+        assert_eq!(store.load(session).unwrap().meta.caveman_age_basis_tag, 0);
+
+        messages.push(item("old-c", 5, &caveman_test_source("old-c")));
+        armed_request.messages = messages.clone();
+        let growing = run(&store, &armed_request, &spine());
+        assert_eq!(growing.action, "SOFT+");
+        assert!(growing.first_divergence.is_none());
+        assert!(stored_caveman_units(&store, session).is_empty());
+
+        store
+            .replace_compartments(
+                session,
+                &[
+                    comp(1, 1, 1, "anchor", "first coverage"),
+                    comp(2, 2, 2, "separator", "second coverage"),
+                ],
+            )
+            .unwrap();
+        store.arm_soft_refresh(session).unwrap();
+        messages.push(item("old-d", 6, &caveman_test_source("old-d")));
+        armed_request.messages = messages.clone();
+        let fold = run(&store, &armed_request, &spine());
+        assert_eq!(fold.action, "SOFT");
+        assert!(fold.first_divergence.is_some());
+        let folded_units = stored_caveman_units(&store, session);
         assert!(
-            new_caveman_units(&CoreState::default(), &protected, &[tag], &live, None, true)
-                .is_empty()
+            !folded_units.is_empty(),
+            "the fold must mint the accumulated eligible batch"
+        );
+        let basis = store.load(session).unwrap().meta.caveman_age_basis_tag;
+        assert_eq!(
+            basis,
+            store
+                .load_tags_for_session(session)
+                .unwrap()
+                .into_iter()
+                .filter_map(|row| u64::try_from(row.tag_number).ok())
+                .max()
+                .unwrap()
+        );
+
+        for ordinal in 7..=8 {
+            messages.push(item(
+                &format!("post-fold-{ordinal}"),
+                ordinal,
+                &caveman_test_source(&format!("post-fold-{ordinal}")),
+            ));
+            armed_request.messages = messages.clone();
+            let defer = run(&store, &armed_request, &spine());
+            assert_eq!(defer.action, "SOFT+");
+            assert!(
+                defer.first_divergence.is_none(),
+                "a defer may append but must keep every previously served block byte-identical"
+            );
+            assert_eq!(stored_caveman_units(&store, session), folded_units);
+            assert_eq!(
+                store.load(session).unwrap().meta.caveman_age_basis_tag,
+                basis
+            );
+        }
+    }
+
+    #[test]
+    fn caveman_arming_large_backlog_waits_and_batches_on_next_genuine_bust() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "caveman-arming-backlog";
+        store
+            .replace_compartments(session, &[comp(1, 1, 1, "anchor", "covered")])
+            .unwrap();
+        let mut messages = vec![item("anchor", 1, "covered")];
+        messages.extend((1..=100u64).map(|index| {
+            item(
+                &format!("backlog-{index}"),
+                index + 1,
+                &caveman_test_source(&format!("backlog-{index}")),
+            )
+        }));
+
+        let boot = run(&store, &req(session, "cfg", messages.clone()), &spine());
+        assert_eq!(boot.action, "HARD");
+
+        let mut armed_request = req(session, "cfg", messages);
+        armed_request.caveman_enabled = true;
+        armed_request.caveman_min_chars = 1;
+        armed_request.protected_tags = 0;
+        let armed = run(&store, &armed_request, &spine());
+        assert_eq!(armed.action, "SOFT+");
+        assert!(armed.first_divergence.is_none());
+        assert_eq!(store.load_tags_for_session(session).unwrap().len(), 101);
+        assert!(stored_caveman_units(&store, session).is_empty());
+        assert_eq!(store.load(session).unwrap().meta.caveman_age_basis_tag, 0);
+
+        store.arm_soft_refresh(session).unwrap();
+        let bust = run(&store, &armed_request, &spine());
+        assert_eq!(bust.action, "SOFT");
+        assert_eq!(bust.materialize_reason.as_deref(), Some("explicit_flush"));
+        assert!(bust.first_divergence.is_some());
+        let units = stored_caveman_units(&store, session);
+        assert_eq!(units.len(), 60);
+        for depth in 1..=3 {
+            assert_eq!(
+                units
+                    .iter()
+                    .filter(|unit| caveman_depth(unit) == depth)
+                    .count(),
+                20,
+                "the armed backlog should tier as one immutable population"
+            );
+        }
+        assert_eq!(store.load(session).unwrap().meta.caveman_age_basis_tag, 101);
+
+        let replay = run(&store, &armed_request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert!(replay.first_divergence.is_none());
+        assert_eq!(stored_caveman_units(&store, session), units);
+    }
+
+    #[test]
+    fn caveman_restart_replays_frozen_basis_until_an_independent_bust() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "caveman-restart-basis";
+        let mut messages = vec![item("anchor", 1, "covered")];
+        messages.extend((1..=10u64).map(|index| {
+            item(
+                &format!("before-{index}"),
+                index + 1,
+                &caveman_test_source(&format!("before-{index}")),
+            )
+        }));
+        let mut request = req(session, "cfg", messages.clone());
+
+        let db = store(dir.path());
+        db.replace_compartments(session, &[comp(1, 1, 1, "anchor", "covered")])
+            .unwrap();
+        assert_eq!(run(&db, &request, &spine()).action, "HARD");
+        request.caveman_enabled = true;
+        request.caveman_min_chars = 1;
+        request.protected_tags = 0;
+        assert_eq!(run(&db, &request, &spine()).action, "SOFT+");
+        db.arm_soft_refresh(session).unwrap();
+        let bust = run(&db, &request, &spine());
+        assert_eq!(bust.action, "SOFT");
+        let frozen_units = stored_caveman_units(&db, session);
+        assert_eq!(frozen_units.len(), 6);
+        assert_eq!(db.load(session).unwrap().meta.caveman_age_basis_tag, 11);
+        drop(db);
+
+        let restarted = store(dir.path());
+        for ordinal in 12..=15u64 {
+            messages.push(item(
+                &format!("after-{ordinal}"),
+                ordinal,
+                &caveman_test_source(&format!("after-{ordinal}")),
+            ));
+        }
+        request.messages = messages;
+        let defer = run(&restarted, &request, &spine());
+        assert_eq!(defer.action, "SOFT+");
+        assert!(defer.first_divergence.is_none());
+        assert_eq!(stored_caveman_units(&restarted, session), frozen_units);
+        let loaded = restarted.load(session).unwrap();
+        assert_eq!(loaded.meta.caveman_age_basis_tag, 11);
+        assert_eq!(
+            restarted
+                .load_tags_for_session(session)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.tag_number)
+                .max(),
+            Some(15),
+            "newly tagged text must accumulate beyond the replayed basis"
+        );
+
+        restarted.arm_soft_refresh(session).unwrap();
+        let next_bust = run(&restarted, &request, &spine());
+        assert_eq!(next_bust.action, "SOFT");
+        assert_eq!(
+            restarted.load(session).unwrap().meta.caveman_age_basis_tag,
+            15,
+            "only an independent bust may advance the basis"
         );
     }
 

@@ -2646,6 +2646,12 @@ pub struct ModuleMeta {
     /// Keep the older ordinal field populated so pre-tag readers remain compatible.
     #[serde(default)]
     pub reasoning_cleared_through_tag: u64,
+    /// Highest tag number used as the immutable caveman age basis by the last
+    /// caveman-enabled genuine bust. Defer passes and restarts retain this value while
+    /// newly tagged text waits for the next independently busting pass. Zero means no
+    /// caveman-enabled bust has captured an age basis yet.
+    #[serde(default)]
+    pub caveman_age_basis_tag: u64,
     /// The request-local Claude Code mechanics state committed with the rendered identity.
     /// Missing legacy metadata is false, which preserves the dormant render path.
     #[serde(default)]
