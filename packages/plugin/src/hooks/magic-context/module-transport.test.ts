@@ -19,7 +19,7 @@ import {
     Priority,
     SERVER_PROOF_DOMAIN,
 } from "@cortexkit/subc-client";
-import { __shadowSenderTest } from "./shadow-sender";
+import { SubcModuleTransport } from "./module-transport";
 
 class FakeServerReader {
     private buffered = Buffer.alloc(0);
@@ -89,9 +89,9 @@ async function listen(server: Server): Promise<number> {
     return address.port;
 }
 
-describe("SubcShadowTransport", () => {
+describe("SubcModuleTransport", () => {
     it("uses the shared v2 client while preserving route identity and flat request bytes", async () => {
-        const tempDir = mkdtempSync(join(tmpdir(), "shadow-subc-v2-"));
+        const tempDir = mkdtempSync(join(tmpdir(), "module-subc-v2-"));
         const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
         const daemonId = Uint8Array.from({ length: 16 }, (_, index) => 100 + index);
         const serverNonce = Uint8Array.from({ length: 32 }, (_, index) => 200 - index);
@@ -167,22 +167,21 @@ describe("SubcShadowTransport", () => {
             );
             chmodSync(connectionFile, 0o600);
 
-            const transport = new __shadowSenderTest.SubcShadowTransport(
+            const transport = new SubcModuleTransport(
                 connectionFile,
                 "magic-context",
                 1_000,
             );
             const flatBody = {
-                method: "shadow_transform",
-                shadow_generation: 4,
-                seed_pass: false,
+                method: "transform",
+                v: 1,
                 input: [{ id: "m1" }],
             };
             await expect(
                 transport.call({
                     sessionId: "session-1",
                     projectRoot: "/workspace/project",
-                    method: "shadow_transform",
+                    method: "transform",
                     body: flatBody,
                 }),
             ).resolves.toEqual({ result: { ok: true } });
@@ -204,7 +203,7 @@ describe("SubcShadowTransport", () => {
                 identity: {
                     project_root: "/workspace/project",
                     harness: "opencode",
-                    session: "shadow:session-1",
+                    session: "session-1",
                 },
                 ...consumerIdentity,
             });

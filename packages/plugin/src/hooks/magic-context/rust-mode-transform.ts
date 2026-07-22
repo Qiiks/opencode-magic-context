@@ -405,7 +405,7 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             seedPassPending: true,
             failureCount: 0,
             parkCount: 0,
-            shadowGeneration: 0,
+            moduleGeneration: 0,
             lastAckedSeq: 0,
             lastAckedWatermarks: null,
             idOrdinalMemoGeneration: 0,
@@ -1156,7 +1156,7 @@ export function createRustModeTransform(
             let resolved = await resolveOrdinalsForModule({
                 sessionId,
                 messages: ordinalMessages,
-                generation: state.shadowGeneration,
+                generation: state.moduleGeneration,
                 memoGeneration: state.idOrdinalMemoGeneration,
                 memo: state.idOrdinalMemo,
                 memoAnchor: state.ordinalMemoAnchor,
@@ -1172,7 +1172,7 @@ export function createRustModeTransform(
                 resolved = await resolveOrdinalsForModule({
                     sessionId,
                     messages,
-                    generation: state.shadowGeneration,
+                    generation: state.moduleGeneration,
                     memoGeneration: state.idOrdinalMemoGeneration,
                     memo: state.idOrdinalMemo,
                     memoAnchor: state.ordinalMemoAnchor,
@@ -1348,7 +1348,7 @@ export function createRustModeTransform(
                 const fullResolved = await resolveOrdinalsForModule({
                     sessionId,
                     messages,
-                    generation: state.shadowGeneration,
+                    generation: state.moduleGeneration,
                     memoGeneration: state.idOrdinalMemoGeneration,
                     memo: state.idOrdinalMemo,
                     memoAnchor: state.ordinalMemoAnchor,
@@ -1446,7 +1446,7 @@ export function createRustModeTransform(
                     const retryResolved = await resolveOrdinalsForModule({
                         sessionId,
                         messages,
-                        generation: state.shadowGeneration,
+                        generation: state.moduleGeneration,
                         memoGeneration: state.idOrdinalMemoGeneration,
                         memo: state.idOrdinalMemo,
                         memoAnchor: state.ordinalMemoAnchor,

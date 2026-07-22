@@ -79,27 +79,6 @@ if [[ -f "$HOME/.config/openrouter.key" ]]; then
     cp "$HOME/.config/openrouter.key" "$SNAPSHOT/home/.config/openrouter.key"
 fi
 
-magic_config="$SNAPSHOT/home/.config/cortexkit/magic-context.jsonc"
-magic_config_tmp="$magic_config.tmp"
-awk '
-    BEGIN { skipping = 0 }
-    skipping {
-        if ($0 ~ /^[[:space:]]*}[[:space:]]*,?[[:space:]]*$/) skipping = 0
-        next
-    }
-    /"shadow_transform"[[:space:]]*:/ {
-        if ($0 ~ /{[^}]*}/) {
-            line = $0
-            gsub(/"shadow_transform"[[:space:]]*:[[:space:]]*{[^}]*}[[:space:]]*,?/, "", line)
-            if (line !~ /^[[:space:]]*$/) print line
-        } else {
-            skipping = 1
-        }
-        next
-    }
-    { print }
-' "$magic_config" > "$magic_config_tmp"
-mv "$magic_config_tmp" "$magic_config"
 
 rewrite_opencode_plugin_path() {
     local config_path=$1

@@ -8,7 +8,6 @@ describe("resolveTransformMode", () => {
             resolveTransformMode({
                 configured: "rust",
                 userTierHasSubc: false,
-                shadowTransformEnabled: false,
             }),
         ).toEqual({
             mode: "ts",
@@ -21,7 +20,6 @@ describe("resolveTransformMode", () => {
             resolveTransformMode({
                 configured: "rust",
                 userTierHasSubc: true,
-                shadowTransformEnabled: false,
             }),
         ).toEqual({ mode: "rust", warnings: [] });
     });
@@ -31,35 +29,8 @@ describe("resolveTransformMode", () => {
             resolveTransformMode({
                 configured: "ts",
                 userTierHasSubc: false,
-                shadowTransformEnabled: true,
             }),
         ).toEqual({ mode: "ts", warnings: [] });
-    });
-
-    it("warns once per project when rust wins over shadow_transform", () => {
-        const args = {
-            configured: "rust" as const,
-            userTierHasSubc: true,
-            shadowTransformEnabled: true,
-            projectKey: "transform-mode-shadow-project",
-        };
-
-        const first = resolveTransformMode(args);
-        const second = resolveTransformMode(args);
-
-        expect(first.mode).toBe("rust");
-        expect(first.warnings).toEqual([
-            'shadow_transform is ignored while transform_mode is "rust" (a session cannot shadow itself); shadow disabled for these sessions.',
-        ]);
-        expect(second).toEqual({ mode: "rust", warnings: [] });
-
-        const otherProject = resolveTransformMode({
-            ...args,
-            projectKey: "another-transform-mode-shadow-project",
-        });
-        expect(otherProject.warnings).toEqual([
-            'shadow_transform is ignored while transform_mode is "rust" (a session cannot shadow itself); shadow disabled for these sessions.',
-        ]);
     });
 
     it("accepts caveman compression in rust mode without a warning", () => {

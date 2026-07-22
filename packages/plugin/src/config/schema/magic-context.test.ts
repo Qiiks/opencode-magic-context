@@ -76,9 +76,6 @@ describe("MagicContextConfigSchema", () => {
                     overlay: false,
                 },
                 smart_drops: false,
-                shadow_transform: {
-                    enabled: false,
-                },
                 shadow_embedding: {
                     enabled: false,
                 },

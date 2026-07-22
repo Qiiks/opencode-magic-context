@@ -173,7 +173,7 @@ export interface ModuleStateSyncPayload {
 
 /** The subset of sender state needed to serialize a state-sync payload. */
 export interface ModuleStateSyncState {
-    shadowGeneration: number;
+    moduleGeneration: number;
     lastAckedSeq: number;
     lastAckedWatermarks: ModuleWatermarks | null;
     idOrdinalMemoGeneration: number;
@@ -460,14 +460,14 @@ function serializeCompartment(args: {
         sessionId: args.sessionId,
         raw: startRaw,
         messageId: args.compartment.startMessageId,
-        generation: args.state.shadowGeneration,
+        generation: args.state.moduleGeneration,
         state: args.state,
     });
     const endOrdinal = canonicalOrdinalForMessageId({
         sessionId: args.sessionId,
         raw: endRaw,
         messageId: args.compartment.endMessageId,
-        generation: args.state.shadowGeneration,
+        generation: args.state.moduleGeneration,
         state: args.state,
     });
     if (startOrdinal === "mismatch" || endOrdinal === "mismatch") return "mismatch";
@@ -741,7 +741,7 @@ type SeedItem =
     | { kind: "user_profile"; value: string };
 
 export function buildPagedModuleStateSyncPayloads(args: {
-    shadowGeneration: number;
+    moduleGeneration: number;
     expectedShadowSeq: number;
     seedId: string;
     seedBoundaryId: string | null;
@@ -813,10 +813,10 @@ export function buildPagedModuleStateSyncPayloads(args: {
     }): ModuleStateSyncPayload => ({
         method: "state_sync",
         params: {
-            shadow_generation: args.shadowGeneration,
+            shadow_generation: args.moduleGeneration,
             expected_shadow_seq: args.expectedShadowSeq,
             seed_id: args.seedId,
-            seed_generation: args.shadowGeneration,
+            seed_generation: args.moduleGeneration,
             seed_batch_index: input.index,
             seed_batch_total: input.total,
             seed_complete: input.complete,
@@ -1268,7 +1268,7 @@ export async function buildModuleStateSyncPayload(args: {
         ? getChannel2NudgeState(args.pass.db, args.pass.sessionId)
         : undefined;
     const payloadArgs = {
-        shadowGeneration: args.state.shadowGeneration,
+        moduleGeneration: args.state.moduleGeneration,
         expectedShadowSeq: args.state.lastAckedSeq,
         seedId: args.seedId ?? randomUUID(),
         seedBoundaryId:
@@ -1324,7 +1324,7 @@ export async function buildModuleStateSyncPayload(args: {
     return {
         method: "state_sync",
         params: {
-            shadow_generation: args.state.shadowGeneration,
+            shadow_generation: args.state.moduleGeneration,
             expected_shadow_seq: args.state.lastAckedSeq,
             compartments,
             ...(omitAuthorityMemorySections ? {} : { memories, memory_mutations: memoryMutations }),
