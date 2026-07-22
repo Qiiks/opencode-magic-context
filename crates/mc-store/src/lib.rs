@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 pub type ProviderExtras = BTreeMap<String, BTreeMap<String, Value>>;
 
@@ -3309,6 +3310,20 @@ pub struct LoadedState {
     pub row_version: Option<u64>,
 }
 
+/// Query-family timings collected while loading a transform snapshot.
+///
+/// These fields are not durable state. They expose the read-transaction breakdown to the
+/// module's per-pass diagnostic line without changing snapshot contents or transaction scope.
+#[derive(Debug, Clone, Default)]
+pub struct TransformSnapshotTimings {
+    pub cache_state_ms: f64,
+    pub tags_ms: f64,
+    pub temporal_ms: f64,
+    pub user_hints_ms: f64,
+    pub channel1_ms: f64,
+    pub overlay_frontier_ms: f64,
+}
+
 /// Cache state and every byte-affecting transform overlay from one SQLite snapshot.
 #[derive(Debug, Clone)]
 pub struct TransformSnapshot {
@@ -3318,6 +3333,7 @@ pub struct TransformSnapshot {
     pub user_hints: Vec<UserHintRow>,
     pub channel1_appends: Vec<Channel1AppendRow>,
     pub overlay_frontier: Option<u64>,
+    pub timings: TransformSnapshotTimings,
 }
 
 #[derive(Debug)]
@@ -4715,6 +4731,7 @@ impl McStore {
     ) -> Result<TransformSnapshot, McStoreError> {
         let snapshot = self.inner.with_conn(|conn| {
             let transaction = conn.unchecked_transaction()?;
+            let cache_state_started_at = Instant::now();
             let state = transaction
                 .query_row(
                     "SELECT row_version, core_state, meta FROM mc_cache_state WHERE session_id = ?1",
@@ -4752,8 +4769,10 @@ impl McStore {
                     row_version: None,
                 },
             };
+            let cache_state_ms = cache_state_started_at.elapsed().as_secs_f64() * 1_000.0;
             after_state_read();
 
+            let tags_started_at = Instant::now();
             let tags = {
                 let mut statement = transaction.prepare(
                     "SELECT tag_number, block_id, kind, token_count, created_at_ms, source_bytes
@@ -4764,6 +4783,8 @@ impl McStore {
                     .collect::<Result<Vec<_>, _>>()?;
                 rows
             };
+            let tags_ms = tags_started_at.elapsed().as_secs_f64() * 1_000.0;
+            let temporal_started_at = Instant::now();
             let temporal_marks = {
                 let mut statement = transaction.prepare(
                     "SELECT block_id, marker_text, created_at FROM mc_temporal_marks
@@ -4780,6 +4801,8 @@ impl McStore {
                     .collect::<Result<Vec<_>, _>>()?;
                 rows
             };
+            let temporal_ms = temporal_started_at.elapsed().as_secs_f64() * 1_000.0;
+            let user_hints_started_at = Instant::now();
             let user_hints = {
                 let mut statement = transaction.prepare(
                     "SELECT block_id, hint_text, created_at FROM mc_user_hints
@@ -4796,6 +4819,8 @@ impl McStore {
                     .collect::<Result<Vec<_>, _>>()?;
                 rows
             };
+            let user_hints_ms = user_hints_started_at.elapsed().as_secs_f64() * 1_000.0;
+            let channel1_started_at = Instant::now();
             let channel1_appends = {
                 let mut statement = transaction.prepare(
                     "SELECT block_id, reminder_text, fired_at_ms FROM mc_channel1_appends
@@ -4812,6 +4837,8 @@ impl McStore {
                     .collect::<Result<Vec<_>, _>>()?;
                 rows
             };
+            let channel1_ms = channel1_started_at.elapsed().as_secs_f64() * 1_000.0;
+            let overlay_frontier_started_at = Instant::now();
             let overlay_frontier = transaction
                 .query_row(
                     "SELECT max_seen_ordinal FROM mc_overlay_frontiers WHERE session_id = ?1",
@@ -4820,6 +4847,7 @@ impl McStore {
                 )
                 .optional()?
                 .map(|ordinal| ordinal.max(0) as u64);
+            let overlay_frontier_ms = overlay_frontier_started_at.elapsed().as_secs_f64() * 1_000.0;
             transaction.commit()?;
             Ok(TransformSnapshot {
                 loaded,
@@ -4828,6 +4856,14 @@ impl McStore {
                 user_hints,
                 channel1_appends,
                 overlay_frontier,
+                timings: TransformSnapshotTimings {
+                    cache_state_ms,
+                    tags_ms,
+                    temporal_ms,
+                    user_hints_ms,
+                    channel1_ms,
+                    overlay_frontier_ms,
+                },
             })
         })?;
         Ok(snapshot)

@@ -21,7 +21,8 @@ use crate::healing::{self, quirk_residual, SerializerProfile};
 use crate::injection::{advance_injection_from_meta, capture_todo_state_on_bust, InjectionOutcome};
 use crate::m0_compose::compose_m0_from_store;
 use crate::m1_compose::{
-    claim_and_render_notes, compose_m1_from_store, m1_revision_signal_parts_for_pass,
+    claim_and_render_notes, compose_m1_from_store, m1_revision_signal_parts_for_pass_timed,
+    M1RevisionReadTimings,
 };
 use crate::memory_render::M1_PLACEHOLDER;
 use crate::scheduler::{
@@ -735,14 +736,40 @@ pub struct HostDirectives {
     pub channel2_nudge: Option<Channel2NudgeDirective>,
 }
 
-/// Per-stage transform timings, in floating-point milliseconds.
+/// Per-stage transform timings and work counts for one module pass.
 ///
-/// The values measure the existing seams in `apply_once` and `build_output`; they are
-/// diagnostic timings, so stages that do not run on a pass remain zero.
+/// The values are diagnostic only: stages that do not run on a pass remain zero, while
+/// the count fields describe the final pass state used to build the served response.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TransformTimings {
     #[serde(default)]
     pub total: f64,
+    #[serde(default)]
+    pub projection: f64,
+    #[serde(default)]
+    pub store_cache_state: f64,
+    #[serde(default)]
+    pub store_tags: f64,
+    #[serde(default)]
+    pub store_temporal: f64,
+    #[serde(default)]
+    pub store_user_hints: f64,
+    #[serde(default)]
+    pub store_channel1: f64,
+    #[serde(default)]
+    pub store_overlay_frontier: f64,
+    #[serde(default)]
+    pub store_notes: f64,
+    #[serde(default)]
+    pub store_memories: f64,
+    #[serde(default)]
+    pub pending_drops: f64,
+    #[serde(default)]
+    pub coverage_resolve: f64,
+    #[serde(default)]
+    pub tag_overlay: f64,
+    #[serde(default)]
+    pub unit_mint: f64,
     #[serde(default)]
     pub decide: f64,
     #[serde(default)]
@@ -754,9 +781,121 @@ pub struct TransformTimings {
     #[serde(default)]
     pub todo: f64,
     #[serde(default)]
+    pub blocks_by_mid: f64,
+    #[serde(default)]
+    pub full_drop_tool_ids: f64,
+    #[serde(default)]
     pub build_output: f64,
     #[serde(default)]
+    pub build_identity: f64,
+    #[serde(default)]
+    pub build_identity_max: f64,
+    #[serde(default)]
+    pub build_frozen_unit_scan: f64,
+    #[serde(default)]
+    pub build_cache_lookup: f64,
+    #[serde(default)]
+    pub build_serialize_misses: f64,
+    #[serde(default)]
+    pub build_tail_loop: f64,
+    #[serde(default)]
+    pub divergence: f64,
+    #[serde(default)]
     pub store_commit: f64,
+    #[serde(default)]
+    pub response_encode: f64,
+    #[serde(default)]
+    pub frozen_units: usize,
+    #[serde(default)]
+    pub tail_units_matched: usize,
+    #[serde(default)]
+    pub projection_blocks: usize,
+    #[serde(default)]
+    pub tail_messages_emitted: usize,
+    #[serde(default)]
+    pub build_identity_messages: usize,
+    #[serde(default)]
+    pub cache_hits: usize,
+    #[serde(default)]
+    pub cache_misses: usize,
+    #[serde(default)]
+    pub cache_dirty_skips: usize,
+}
+
+/// Render the one-line, greppable timing record emitted after the response splice.
+///
+/// Session ids are made whitespace-safe because each field is parsed as one `key=value` token.
+pub fn format_pass_timing_line(
+    session_id: &str,
+    timings: &TransformTimings,
+    response_encode_ms: f64,
+) -> String {
+    let session = if session_id.is_empty() {
+        "-".to_string()
+    } else {
+        session_id
+            .chars()
+            .map(|character| {
+                if character.is_whitespace() {
+                    '_'
+                } else {
+                    character
+                }
+            })
+            .collect()
+    };
+    format!(
+        "mc-pass-timing session={session} total={:.1} projection={:.1} \
+         store_cache_state={:.1} store_tags={:.1} store_temporal={:.1} \
+         store_user_hints={:.1} store_channel1={:.1} store_overlay_frontier={:.1} \
+         store_notes={:.1} store_memories={:.1} pending_drops={:.1} coverage_resolve={:.1} \
+         tag_overlay={:.1} unit_mint={:.1} \
+         decide={:.1} seed_or_sync={:.1} compose_m0m1={:.1} selection={:.1} todo={:.1} \
+         blocks_by_mid={:.1} full_drop_tool_ids={:.1} build_output={:.1} \
+         build_identity={:.1} build_identity_max={:.1} build_frozen_unit_scan={:.1} \
+         build_cache_lookup={:.1} build_serialize_misses={:.1} build_tail_loop={:.1} \
+         divergence={:.1} store_commit={:.1} response_encode={response_encode_ms:.1} \
+         frozen_units={} tail_units_matched={} projection_blocks={} tail_messages_emitted={} \
+         build_identity_messages={} cache_hits={} cache_misses={} cache_dirty_skips={}",
+        timings.total,
+        timings.projection,
+        timings.store_cache_state,
+        timings.store_tags,
+        timings.store_temporal,
+        timings.store_user_hints,
+        timings.store_channel1,
+        timings.store_overlay_frontier,
+        timings.store_notes,
+        timings.store_memories,
+        timings.pending_drops,
+        timings.coverage_resolve,
+        timings.tag_overlay,
+        timings.unit_mint,
+        timings.decide,
+        timings.seed_or_sync,
+        timings.compose_m0m1,
+        timings.selection,
+        timings.todo,
+        timings.blocks_by_mid,
+        timings.full_drop_tool_ids,
+        timings.build_output,
+        timings.build_identity,
+        timings.build_identity_max,
+        timings.build_frozen_unit_scan,
+        timings.build_cache_lookup,
+        timings.build_serialize_misses,
+        timings.build_tail_loop,
+        timings.divergence,
+        timings.store_commit,
+        timings.frozen_units,
+        timings.tail_units_matched,
+        timings.projection_blocks,
+        timings.tail_messages_emitted,
+        timings.build_identity_messages,
+        timings.cache_hits,
+        timings.cache_misses,
+        timings.cache_dirty_skips,
+    )
 }
 
 /// A transform pass result. Diagnostics remain alongside the CK array, but the response
@@ -1300,8 +1439,12 @@ fn apply_once(
 ) -> Result<TransformWithProjection, TransformError> {
     let total_started_at = Instant::now();
     let mut timings = TransformTimings::default();
+    let mut m1_revision_read_timings = M1RevisionReadTimings::default();
     // --- ingress: CK messages -> flat blocks, then strip synthetic before cache logic ---
+    let projection_started_at = Instant::now();
     let projection = project_messages(&req.messages)?;
+    timings.projection = elapsed_ms(projection_started_at);
+    timings.projection_blocks = projection.blocks.len();
     if let Some(id) = duplicate_ids(&projection.blocks) {
         return Err(TransformError::DuplicateBlockId(id));
     }
@@ -1334,6 +1477,12 @@ fn apply_once(
     let seed_or_sync_started_at = Instant::now();
     let transform_snapshot = store.load_transform_snapshot(&req.session_id)?;
     timings.seed_or_sync = elapsed_ms(seed_or_sync_started_at);
+    timings.store_cache_state = transform_snapshot.timings.cache_state_ms;
+    timings.store_tags = transform_snapshot.timings.tags_ms;
+    timings.store_temporal = transform_snapshot.timings.temporal_ms;
+    timings.store_user_hints = transform_snapshot.timings.user_hints_ms;
+    timings.store_channel1 = transform_snapshot.timings.channel1_ms;
+    timings.store_overlay_frontier = transform_snapshot.timings.overlay_frontier_ms;
     let loaded = transform_snapshot.loaded;
     let overlay_frontier = transform_snapshot.overlay_frontier;
     // Legacy sessions stored the CC latch before the generic surface latch existed.
@@ -1392,7 +1541,9 @@ fn apply_once(
     // available on non-CC profiles is render-neutral: overlay bytes remain gated by
     // `tagging_active`, while the OpenCode host can receive the same ceiling decision.
     let mut tag_rows = transform_snapshot.tags;
+    let tag_overlay_started_at = Instant::now();
     let mut tag_numbers = tag_number_by_message(&tag_rows);
+    timings.tag_overlay += elapsed_ms(tag_overlay_started_at);
     let mut channel1_appends = if tagging_active {
         transform_snapshot.channel1_appends
     } else {
@@ -1413,8 +1564,10 @@ fn apply_once(
     // Check whether the boundary is present in the live messages, or through a stored
     // trim record that matches durable coverage and the first untrimmed message. A failed
     // trim record is treated as Absent so the existing reconciliation error paths still run.
+    let coverage_resolve_started_at = Instant::now();
     let (boundary_state, trim_mismatch) =
         resolve_boundary_state(store, req, &loaded.core, &loaded.meta, &live)?;
+    timings.coverage_resolve += elapsed_ms(coverage_resolve_started_at);
     let boundary_present = boundary_state.is_present();
     let boundary_token = if boundary_present {
         loaded.core.boundary_id.clone()
@@ -1629,21 +1782,26 @@ fn apply_once(
         // The cutoff captured by a bust includes tags minted by that same accepted pass.
         // Deferring this refresh until the next request would split one eligible batch across
         // several provider-visible rewrites as a multi-step turn keeps minting tags.
+        let tag_overlay_started_at = Instant::now();
         tag_numbers = tag_number_by_message(&tag_rows);
+        timings.tag_overlay += elapsed_ms(tag_overlay_started_at);
     }
+    let pending_drops_started_at = Instant::now();
     let pending_agent_drops = store.load_pending_agent_drops(&req.session_id)?;
+    timings.pending_drops = elapsed_ms(pending_drops_started_at);
 
     // --- CHEAP per-pass classify signals (read EVERY pass; never the m0/m1 BODY) ---
     // The in-session lane is pending work, not a bust trigger. The external lane and the
     // durable project epoch remain eager-HARD inputs. The body composes only below an
     // independently established bust opportunity.
-    let mut m1_signal = m1_revision_signal_parts_for_pass(
+    let mut m1_signal = m1_revision_signal_parts_for_pass_timed(
         store,
         ctx.project_path,
         ctx.note_project_path,
         &req.session_id,
         loaded.meta.user_profile_version,
         ctx.now_ms,
+        Some(&mut m1_revision_read_timings),
     )?;
     let mut current_m1_digest = m1_signal.revision;
     let external_revision_changed = loaded.meta.initialized
@@ -2019,6 +2177,7 @@ fn apply_once(
         // watermark, including older native rendering paths, continue to observe the same cutoff.
         meta.reasoning_cleared_through_ordinal = meta.reasoning_cleared_through_ordinal.max(cutoff);
     }
+    let unit_mint_started_at = Instant::now();
     let new_strip_units = new_frozen_strip_units(&loaded.core, req, &tag_numbers, is_bust_pass);
     let caveman_age_basis_tag = if is_bust_pass && req.caveman_enabled {
         let basis = tag_rows
@@ -2040,6 +2199,7 @@ fn apply_once(
         is_bust_pass,
         caveman_age_basis_tag,
     );
+    timings.unit_mint = elapsed_ms(unit_mint_started_at);
     if loaded.meta.soft_refresh_pending && is_bust_pass {
         meta.soft_refresh_pending = false;
     }
@@ -2165,13 +2325,14 @@ fn apply_once(
                             commit_expected = Some(outcome.row_version);
                             meta.revert_epoch = outcome.revert_epoch;
                             meta.last_recut = outcome.last_recut;
-                            m1_signal = m1_revision_signal_parts_for_pass(
+                            m1_signal = m1_revision_signal_parts_for_pass_timed(
                                 store,
                                 ctx.project_path,
                                 ctx.note_project_path,
                                 &req.session_id,
                                 loaded.meta.user_profile_version,
                                 ctx.now_ms,
+                                Some(&mut m1_revision_read_timings),
                             )?;
                             current_m1_digest = m1_signal.revision;
                             let recut_compartments = store.load_compartments(&req.session_id)?;
@@ -2319,13 +2480,14 @@ fn apply_once(
                                                     // The post-fold m1 baseline digest — NOT 0. After folding up to the current
                                                     // watermarks, "no delta" == "watermarks unchanged since this digest"; setting
                                                     // 0 would make the next pass's non-zero digest read as a phantom SOFT.
-                let applied_m1_signal = m1_revision_signal_parts_for_pass(
+                let applied_m1_signal = m1_revision_signal_parts_for_pass_timed(
                     store,
                     ctx.project_path,
                     ctx.note_project_path,
                     &req.session_id,
                     loaded.meta.user_profile_version,
                     ctx.now_ms,
+                    Some(&mut m1_revision_read_timings),
                 )?;
                 meta.m1_revision = applied_m1_signal.revision;
                 meta.m1_user_profile_version = loaded.meta.user_profile_version;
@@ -2479,13 +2641,14 @@ fn apply_once(
                     meta.memory_mutation_cursor = comp.memory_mutation_cursor;
                     meta.max_memory_id = comp.max_memory_id;
                     meta.expiry_cutoff_ms = ctx.now_ms;
-                    let applied_m1_signal = m1_revision_signal_parts_for_pass(
+                    let applied_m1_signal = m1_revision_signal_parts_for_pass_timed(
                         store,
                         ctx.project_path,
                         ctx.note_project_path,
                         &req.session_id,
                         loaded.meta.user_profile_version,
                         ctx.now_ms,
+                        Some(&mut m1_revision_read_timings),
                     )?;
                     meta.m1_revision = applied_m1_signal.revision;
                     meta.m1_user_profile_version = loaded.meta.user_profile_version;
@@ -2569,13 +2732,14 @@ fn apply_once(
                     } else if compartment_seq_changed_since_meta {
                         meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
                     }
-                    let applied_m1_signal = m1_revision_signal_parts_for_pass(
+                    let applied_m1_signal = m1_revision_signal_parts_for_pass_timed(
                         store,
                         ctx.project_path,
                         ctx.note_project_path,
                         &req.session_id,
                         loaded.meta.user_profile_version,
                         ctx.now_ms,
+                        Some(&mut m1_revision_read_timings),
                     )?;
                     if m1_has_content {
                         meta.m1_revision = applied_m1_signal.revision;
@@ -2745,14 +2909,35 @@ fn apply_once(
         messages: ck_messages,
         cache_entries: output_cache_entries,
         cache_stats: output_cache_stats,
+        timings: build_timings,
     } = built_output;
     timings.build_output = elapsed_ms(build_output_started_at);
+    timings.blocks_by_mid = build_timings.blocks_by_mid;
+    timings.full_drop_tool_ids = build_timings.full_drop_tool_ids;
+    timings.build_identity = build_timings.identity;
+    timings.build_identity_max = build_timings.identity_max;
+    timings.build_frozen_unit_scan = build_timings.frozen_unit_scan;
+    timings.build_cache_lookup = build_timings.cache_lookup;
+    timings.build_serialize_misses = build_timings.serialize_misses;
+    timings.build_tail_loop = build_timings.tail_loop;
+    timings.build_identity_messages = build_timings.identity_messages;
+    timings.cache_hits = build_timings.cache_hits;
+    timings.cache_misses = build_timings.cache_misses;
+    timings.cache_dirty_skips = build_timings.cache_dirty_skips;
+    timings.tail_messages_emitted = ck_messages
+        .iter()
+        .filter(|message| !message.meta.synthetic)
+        .count();
+    timings.frozen_units = core.frozen_units.len();
+    timings.tail_units_matched = frozen_units_matched_to_tail(&core, req, meta.coverage_ordinal);
 
     // Compare only the served block hashes before committing the new sequence. The first pass
     // records its baseline, and append-only tail growth is intentionally not a divergence.
+    let divergence_started_at = Instant::now();
     let served_fingerprints = served_output_fingerprints(&ck_messages);
     let first_divergence =
         divergence::first_divergence(&loaded.meta.served_output_fingerprint, &served_fingerprints);
+    timings.divergence = elapsed_ms(divergence_started_at);
     let first_divergence_json = first_divergence
         .as_ref()
         .map(|value| serde_json::to_string(value).expect("divergence is serializable"));
@@ -2844,6 +3029,8 @@ fn apply_once(
         })
     };
 
+    timings.store_memories = m1_revision_read_timings.memories_ms;
+    timings.store_notes = m1_revision_read_timings.notes_ms;
     timings.total = elapsed_ms(total_started_at);
     Ok(TransformWithProjection {
         projection,
@@ -3415,6 +3602,36 @@ fn surviving_caveman_units(
 
 /// Is `ordinal` in the live TAIL (strictly after the coverage watermark)? None coverage
 /// = nothing folded yet = all live items are tail.
+fn frozen_units_matched_to_tail(
+    core: &CoreState,
+    req: &TransformRequest,
+    coverage: Option<u64>,
+) -> usize {
+    let tail_mids: HashSet<&str> = req
+        .messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic && is_tail(message.ordinal, coverage))
+        .map(|message| message.mid.as_str())
+        .collect();
+    core.frozen_units
+        .iter()
+        .filter(|unit| {
+            unit.key
+                .strip_prefix(RED_KEY_PREFIX)
+                .or_else(|| unit.key.strip_prefix(CAV_KEY_PREFIX))
+                .and_then(split_block_id)
+                .map(|(mid, _)| mid)
+                .or_else(|| {
+                    unit.key
+                        .strip_prefix("strip:")
+                        .and_then(|rest| rest.split_once(':'))
+                        .map(|(_, mid)| mid)
+                })
+                .is_some_and(|mid| tail_mids.contains(mid))
+        })
+        .count()
+}
+
 fn is_tail(ordinal: u64, coverage: Option<u64>) -> bool {
     coverage.is_none_or(|c| ordinal > c)
 }
@@ -6142,10 +6359,28 @@ fn full_drop_tool_ids(core: &CoreState, projection: &FlatProjection) -> HashSet<
     remove
 }
 
+#[derive(Debug, Default)]
+struct BuildOutputTimings {
+    total: f64,
+    blocks_by_mid: f64,
+    full_drop_tool_ids: f64,
+    identity: f64,
+    identity_max: f64,
+    frozen_unit_scan: f64,
+    cache_lookup: f64,
+    serialize_misses: f64,
+    tail_loop: f64,
+    identity_messages: usize,
+    cache_hits: usize,
+    cache_misses: usize,
+    cache_dirty_skips: usize,
+}
+
 struct BuiltOutput {
     messages: Vec<ServedMessage>,
     cache_entries: HashMap<String, SerializedOutputCacheEntry>,
     cache_stats: SerializedOutputCacheStats,
+    timings: BuildOutputTimings,
 }
 
 fn digest_field(hasher: &mut Sha256, value: &[u8]) {
@@ -6166,6 +6401,7 @@ fn message_output_identity(
     full_drop_ids: &HashSet<String>,
     mutation_exempt: bool,
     first_assistant_in_run: bool,
+    frozen_unit_scan_ms: &mut f64,
 ) -> String {
     let mut hasher = Sha256::new();
     digest_field(&mut hasher, message.mid.as_bytes());
@@ -6201,6 +6437,7 @@ fn message_output_identity(
         &((message_tag > 0 && message_tag <= reasoning_watermark) as u8).to_le_bytes(),
     );
 
+    let frozen_unit_scan_started_at = Instant::now();
     for unit in &core.frozen_units {
         let targets_message = unit
             .key
@@ -6218,6 +6455,8 @@ fn message_output_identity(
             digest_field(&mut hasher, unit.frozen_payload.as_bytes());
         }
     }
+
+    *frozen_unit_scan_ms += elapsed_ms(frozen_unit_scan_started_at);
 
     for block in blocks {
         digest_field(&mut hasher, block.id.as_bytes());
@@ -6260,11 +6499,27 @@ fn cached_or_serialize_output(
     key: &str,
     identity: &str,
     dirty: bool,
+    timings: &mut BuildOutputTimings,
     build: impl FnOnce() -> CkWireMessage,
 ) -> (ServedMessage, bool) {
-    match cached_output_item(snapshot, key, identity, dirty).flatten() {
-        Some(served) => (served, true),
-        None => (ServedMessage::from_message(build()), false),
+    let cache_lookup_started_at = Instant::now();
+    let cached = cached_output_item(snapshot, key, identity, dirty).flatten();
+    timings.cache_lookup += elapsed_ms(cache_lookup_started_at);
+    if dirty && snapshot.is_some() {
+        timings.cache_dirty_skips = timings.cache_dirty_skips.saturating_add(1);
+    }
+    match cached {
+        Some(served) => {
+            timings.cache_hits = timings.cache_hits.saturating_add(1);
+            (served, true)
+        }
+        None => {
+            timings.cache_misses = timings.cache_misses.saturating_add(1);
+            let serialization_started_at = Instant::now();
+            let served = ServedMessage::from_message(build());
+            timings.serialize_misses += elapsed_ms(serialization_started_at);
+            (served, false)
+        }
     }
 }
 
@@ -6372,6 +6627,8 @@ fn build_output_with_tags(
     cache_snapshot: Option<&SerializedOutputCacheSnapshot>,
     prefix_dirty: bool,
 ) -> Result<BuiltOutput, TransformError> {
+    let build_output_started_at = Instant::now();
+    let mut build_timings = BuildOutputTimings::default();
     let mut out = Vec::with_capacity(4 + req.messages.len());
     let mut cache_entries = HashMap::new();
     let mut cache_stats = SerializedOutputCacheStats::default();
@@ -6381,10 +6638,14 @@ fn build_output_with_tags(
         if let Some(unit) = core.frozen_units.iter().find(|unit| unit.key == "m0") {
             let key = "synthetic:m0".to_string();
             let identity = "m0".to_string();
-            let (served, reused) =
-                cached_or_serialize_output(cache_snapshot, &key, &identity, prefix_dirty, || {
-                    CkWireMessage::synthetic_user_text(unit.frozen_payload.clone())
-                });
+            let (served, reused) = cached_or_serialize_output(
+                cache_snapshot,
+                &key,
+                &identity,
+                prefix_dirty,
+                &mut build_timings,
+                || CkWireMessage::synthetic_user_text(unit.frozen_payload.clone()),
+            );
             record_output_item(
                 &mut cache_entries,
                 &mut cache_stats,
@@ -6398,10 +6659,14 @@ fn build_output_with_tags(
         if let Some(unit) = core.frozen_units.iter().find(|unit| unit.key == "m1") {
             let key = "synthetic:m1".to_string();
             let identity = "m1".to_string();
-            let (served, reused) =
-                cached_or_serialize_output(cache_snapshot, &key, &identity, prefix_dirty, || {
-                    CkWireMessage::synthetic_user_text(unit.frozen_payload.clone())
-                });
+            let (served, reused) = cached_or_serialize_output(
+                cache_snapshot,
+                &key,
+                &identity,
+                prefix_dirty,
+                &mut build_timings,
+                || CkWireMessage::synthetic_user_text(unit.frozen_payload.clone()),
+            );
             record_output_item(
                 &mut cache_entries,
                 &mut cache_stats,
@@ -6414,8 +6679,14 @@ fn build_output_with_tags(
         }
     }
 
+    let blocks_by_mid_started_at = Instant::now();
     let blocks_by_mid = projection_blocks_by_mid(projection);
+    build_timings.blocks_by_mid = elapsed_ms(blocks_by_mid_started_at);
+    let full_drop_tool_ids_started_at = Instant::now();
     let full_drop_ids = full_drop_tool_ids(core, projection);
+    let full_drop_tool_ids_ms = elapsed_ms(full_drop_tool_ids_started_at);
+    build_timings.full_drop_tool_ids = full_drop_tool_ids_ms;
+    build_timings.frozen_unit_scan += full_drop_tool_ids_ms;
     let output_coverage = if req.is_subagent {
         None
     } else {
@@ -6432,10 +6703,14 @@ fn build_output_with_tags(
             for (suffix, message) in [("call", &pair.assistant_msg), ("result", &pair.tool_msg)] {
                 let key = format!("todo:{}:{suffix}", pair.call_id);
                 let identity = key.clone();
-                let (served, reused) =
-                    cached_or_serialize_output(cache_snapshot, &key, &identity, false, || {
-                        message.clone()
-                    });
+                let (served, reused) = cached_or_serialize_output(
+                    cache_snapshot,
+                    &key,
+                    &identity,
+                    false,
+                    &mut build_timings,
+                    || message.clone(),
+                );
                 record_output_item(
                     &mut cache_entries,
                     &mut cache_stats,
@@ -6451,6 +6726,7 @@ fn build_output_with_tags(
     }
 
     let mut inserted_synthetic_todo = false;
+    let tail_loop_started_at = Instant::now();
     for msg in req
         .messages
         .iter()
@@ -6470,6 +6746,7 @@ fn build_output_with_tags(
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let key = format!("tail:{}", msg.mid);
+        let identity_started_at = Instant::now();
         let identity = message_output_identity(
             core,
             projection,
@@ -6482,12 +6759,22 @@ fn build_output_with_tags(
             &full_drop_ids,
             mutation_exempt,
             first_assistant_in_run,
+            &mut build_timings.frozen_unit_scan,
         );
+        let identity_ms = elapsed_ms(identity_started_at);
+        build_timings.identity += identity_ms;
+        build_timings.identity_max = build_timings.identity_max.max(identity_ms);
+        build_timings.identity_messages = build_timings.identity_messages.saturating_add(1);
 
+        let cache_lookup_started_at = Instant::now();
         let cached = cached_output_item(cache_snapshot, &key, &identity, false);
+        build_timings.cache_lookup += elapsed_ms(cache_lookup_started_at);
         let (served, reused) = if let Some(cached) = cached {
+            build_timings.cache_hits = build_timings.cache_hits.saturating_add(1);
             (cached, true)
         } else {
+            build_timings.cache_misses = build_timings.cache_misses.saturating_add(1);
+            let serialization_started_at = Instant::now();
             let mut rendered = if blocks.is_empty() {
                 let mut rebuilt = msg.ck.clone();
                 apply_tag_overlay_to_message(
@@ -6604,7 +6891,7 @@ fn build_output_with_tags(
             let present = !rendered.content.is_empty()
                 || rendered.meta.synthetic
                 || !blocks_by_mid.contains_key(msg.mid.as_str());
-            if present {
+            let output = if present {
                 if let Some(profile) = serializer_profile {
                     apply_serializer_residual_to_message(
                         profile,
@@ -6617,7 +6904,9 @@ fn build_output_with_tags(
                 (Some(ServedMessage::from_message(rendered)), false)
             } else {
                 (None, false)
-            }
+            };
+            build_timings.serialize_misses += elapsed_ms(serialization_started_at);
+            output
         };
 
         record_output_item(
@@ -6644,10 +6933,14 @@ fn build_output_with_tags(
                 {
                     let key = format!("todo:{}:{suffix}", pair.call_id);
                     let identity = key.clone();
-                    let (served, reused) =
-                        cached_or_serialize_output(cache_snapshot, &key, &identity, false, || {
-                            message.clone()
-                        });
+                    let (served, reused) = cached_or_serialize_output(
+                        cache_snapshot,
+                        &key,
+                        &identity,
+                        false,
+                        &mut build_timings,
+                        || message.clone(),
+                    );
                     record_output_item(
                         &mut cache_entries,
                         &mut cache_stats,
@@ -6664,6 +6957,7 @@ fn build_output_with_tags(
         }
     }
 
+    build_timings.tail_loop = elapsed_ms(tail_loop_started_at);
     if synthetic_todo_enabled {
         if let Some(pair) = &meta.synthetic_todo {
             if pair.anchor_mid.is_some() && !inserted_synthetic_todo {
@@ -6686,10 +6980,12 @@ fn build_output_with_tags(
         );
     }
 
+    build_timings.total = elapsed_ms(build_output_started_at);
     Ok(BuiltOutput {
         messages: out,
         cache_entries,
         cache_stats,
+        timings: build_timings,
     })
 }
 
@@ -7151,6 +7447,14 @@ mod tests {
             .as_ref()
             .expect("normal responses include timings");
         assert!(timings.total >= 0.0);
+        assert!(timings.projection >= 0.0);
+        assert!(timings.store_cache_state >= 0.0);
+        assert!(timings.store_tags >= 0.0);
+        assert!(timings.store_temporal >= 0.0);
+        assert!(timings.store_user_hints >= 0.0);
+        assert!(timings.store_channel1 >= 0.0);
+        assert!(timings.store_notes >= 0.0);
+        assert!(timings.store_memories >= 0.0);
         assert!(timings.seed_or_sync >= 0.0);
         assert!(timings.decide >= 0.0);
         assert!(timings.compose_m0m1 >= 0.0);
@@ -7174,6 +7478,49 @@ mod tests {
             serde_json::from_value::<TransformTimings>(json!({})).unwrap(),
             TransformTimings::default()
         );
+    }
+
+    #[test]
+    fn pass_timing_line_is_parseable_for_an_empty_session() {
+        let line = format_pass_timing_line("", &TransformTimings::default(), 0.0);
+        let fields = line
+            .split_whitespace()
+            .skip(1)
+            .map(|field| field.split_once('=').expect("timing fields use key=value"))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(line.split_whitespace().next(), Some("mc-pass-timing"));
+        assert_eq!(fields.get("session"), Some(&"-"));
+        for key in [
+            "total",
+            "projection",
+            "store_cache_state",
+            "store_notes",
+            "store_memories",
+            "build_output",
+            "build_identity",
+            "build_identity_max",
+            "build_frozen_unit_scan",
+            "build_cache_lookup",
+            "build_serialize_misses",
+            "build_tail_loop",
+            "divergence",
+            "store_commit",
+            "response_encode",
+        ] {
+            assert_eq!(fields[key], "0.0", "{key} renders one decimal place");
+        }
+        for key in [
+            "frozen_units",
+            "tail_units_matched",
+            "projection_blocks",
+            "tail_messages_emitted",
+            "build_identity_messages",
+            "cache_hits",
+            "cache_misses",
+            "cache_dirty_skips",
+        ] {
+            assert_eq!(fields[key], "0", "{key} renders as an integer");
+        }
     }
 
     fn run_active_surface_test<T>(f: impl FnOnce() -> T) -> T {
@@ -16679,6 +17026,103 @@ mod tests {
             .iter()
             .map(|message| message.canonical_bytes().to_vec())
             .collect()
+    }
+
+    #[test]
+    #[ignore = "run manually to profile a production-sized module pass"]
+    fn full_module_pass_timing_fixture() {
+        const MESSAGE_COUNT: usize = 1_800;
+        const FROZEN_UNIT_COUNT: usize = 47_075;
+        let messages = (0..MESSAGE_COUNT)
+            .map(|index| item(&format!("m{index}"), index as u64 + 1, "tail payload"))
+            .collect::<Vec<_>>();
+        let request = req("perf-full-module-pass", "cfg0", messages);
+        let projection = project_messages(&request.messages).unwrap();
+        let mut frozen_units = vec![
+            synth_region("m0", "m0 fixture".to_string()),
+            synth_region("m1", "m1 fixture".to_string()),
+        ];
+        for index in 0..MESSAGE_COUNT {
+            let target = format!("m{index}#0");
+            let unit = match index % 3 {
+                0 => red_unit(&target, "drop", "[dropped]"),
+                1 => FrozenUnit {
+                    key: format!("{CAV_KEY_PREFIX}{target}"),
+                    kind: "caveman".to_string(),
+                    frozen_payload: "condensed tail payload".to_string(),
+                    durability_class: mc_core::DurabilityClass::Lineage,
+                    reset_rule: String::new(),
+                },
+                _ => FrozenUnit {
+                    key: format!("strip:thinking:m{index}"),
+                    kind: "strip".to_string(),
+                    frozen_payload: String::new(),
+                    durability_class: mc_core::DurabilityClass::Lineage,
+                    reset_rule: String::new(),
+                },
+            };
+            frozen_units.push(unit);
+        }
+        for index in frozen_units.len()..FROZEN_UNIT_COUNT {
+            frozen_units.push(red_unit(&format!("retired-{index}#0"), "drop", "[dropped]"));
+        }
+        assert_eq!(frozen_units.len(), FROZEN_UNIT_COUNT);
+        let core = CoreState {
+            frozen_units,
+            ..Default::default()
+        };
+        let meta = ModuleMeta::default();
+        let first = build_cached_fixture(&core, &meta, &request, &projection, None, None, true);
+        let snapshot = SerializedOutputCacheSnapshot {
+            entries: first.cache_entries.clone(),
+        };
+        let replay = build_cached_fixture(
+            &core,
+            &meta,
+            &request,
+            &projection,
+            None,
+            Some(&snapshot),
+            false,
+        );
+        let fresh = build_cached_fixture(&core, &meta, &request, &projection, None, None, true);
+        assert_eq!(
+            canonical_output(&replay.messages),
+            canonical_output(&fresh.messages)
+        );
+        assert_eq!(replay.timings.identity_messages, MESSAGE_COUNT);
+        assert_eq!(replay.timings.cache_misses, 0);
+        assert_eq!(replay.timings.cache_hits, MESSAGE_COUNT + 2);
+
+        let timings = TransformTimings {
+            total: replay.timings.total,
+            build_output: replay.timings.total,
+            blocks_by_mid: replay.timings.blocks_by_mid,
+            full_drop_tool_ids: replay.timings.full_drop_tool_ids,
+            build_identity: replay.timings.identity,
+            build_identity_max: replay.timings.identity_max,
+            build_frozen_unit_scan: replay.timings.frozen_unit_scan,
+            build_cache_lookup: replay.timings.cache_lookup,
+            build_serialize_misses: replay.timings.serialize_misses,
+            build_tail_loop: replay.timings.tail_loop,
+            frozen_units: core.frozen_units.len(),
+            tail_units_matched: frozen_units_matched_to_tail(&core, &request, None),
+            projection_blocks: projection.blocks.len(),
+            tail_messages_emitted: replay
+                .messages
+                .iter()
+                .filter(|message| !message.meta.synthetic)
+                .count(),
+            build_identity_messages: replay.timings.identity_messages,
+            cache_hits: replay.timings.cache_hits,
+            cache_misses: replay.timings.cache_misses,
+            cache_dirty_skips: replay.timings.cache_dirty_skips,
+            ..Default::default()
+        };
+        eprintln!(
+            "{}",
+            format_pass_timing_line("perf-full-module-pass", &timings, 0.0)
+        );
     }
 
     #[test]

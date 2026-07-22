@@ -5797,7 +5797,7 @@ impl McHandler {
                     retained_bytes,
                 );
         }
-        respond_transform(response)
+        respond_transform(&parsed.session_id, response)
     }
 
     #[cfg(test)]
@@ -8520,7 +8520,12 @@ fn replay_dream_task_response(response_json: &str) -> HandlerOutcome {
     respond(response)
 }
 
-fn respond_transform(mut response: transform::TransformResponse) -> HandlerOutcome {
+fn respond_transform(
+    session_id: &str,
+    mut response: transform::TransformResponse,
+) -> HandlerOutcome {
+    let response_encode_started_at = Instant::now();
+    let pass_timings = response.timings.clone();
     let messages = response.ck_messages.take();
     let mut value = match serde_json::to_value(response) {
         Ok(value) => value,
@@ -8547,7 +8552,13 @@ fn respond_transform(mut response: transform::TransformResponse) -> HandlerOutco
         }
     };
     let Some(messages) = messages else {
-        return HandlerOutcome::Response(encoded);
+        let outcome = HandlerOutcome::Response(encoded);
+        emit_pass_timing(
+            session_id,
+            pass_timings.as_ref(),
+            response_encode_started_at,
+        );
+        return outcome;
     };
 
     const PLACEHOLDER: &[u8] = br#""ck_messages":null"#;
@@ -8577,7 +8588,30 @@ fn respond_transform(mut response: transform::TransformResponse) -> HandlerOutco
     }
     output.push(b']');
     output.extend_from_slice(&encoded[null_start + 4..]);
-    HandlerOutcome::Response(output)
+    let outcome = HandlerOutcome::Response(output);
+    emit_pass_timing(
+        session_id,
+        pass_timings.as_ref(),
+        response_encode_started_at,
+    );
+    outcome
+}
+
+fn emit_pass_timing(
+    session_id: &str,
+    timings: Option<&transform::TransformTimings>,
+    response_encode_started_at: Instant,
+) {
+    if let Some(timings) = timings {
+        eprintln!(
+            "{}",
+            transform::format_pass_timing_line(
+                session_id,
+                timings,
+                response_encode_started_at.elapsed().as_secs_f64() * 1_000.0,
+            )
+        );
+    }
 }
 
 fn respond(value: Value) -> HandlerOutcome {
@@ -11407,7 +11441,9 @@ mod tests {
         );
         let expected =
             serde_json::to_vec(&serde_json::to_value(response.clone()).unwrap()).unwrap();
-        let HandlerOutcome::Response(actual) = respond_transform(response) else {
+        let HandlerOutcome::Response(actual) =
+            respond_transform("serialized-output-cache", response)
+        else {
             panic!("cached transform response failed to encode");
         };
         assert_eq!(actual, expected);
