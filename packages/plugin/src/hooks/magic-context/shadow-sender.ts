@@ -1909,8 +1909,13 @@ export class SubcShadowTransport implements ShadowTransport {
         // One identity may legitimately have multiple filesystem routes (for example,
         // worktrees). Reusing a route across roots would bind authority to the wrong tree.
         const routeKey = `${sessionId}\0${projectRoot}`;
-        const existing = this.routes.get(routeKey);
+        // Read the cached route only AFTER the connection is settled: ensureConnected
+        // may dial a fresh connection (clearing this.routes), and a route handle
+        // captured before that dial belongs to the dead connection. Returning it
+        // produced StaleRouteHandleError on the first pass after every reconnect —
+        // and one such error pass served a 965K-token raw array to a live session.
         const client = await this.ensureConnected();
+        const existing = this.routes.get(routeKey);
         if (existing) return { client, route: existing };
 
         const target: RouteTarget = { kind: "tool_provider", module_id: this.moduleId };

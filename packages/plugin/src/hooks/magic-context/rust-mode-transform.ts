@@ -1612,8 +1612,20 @@ export function createRustModeTransform(
                     decisionUpper === "HARD" ||
                     decisionUpper === "MIGRATE_HARD" ||
                     decisionUpper === "EXECUTE" ||
+                    // SOFT re-renders m1 (delta folds, coverage folds): the served
+                    // bytes changed, so the previous LKG snapshot is already stale.
+                    // Omitting SOFT here left the slot holding pre-fold bytes that
+                    // failed anchor validation on the next failure — and the miss
+                    // fell through to a 965K-token raw serve on a live session.
+                    decisionUpper === "SOFT" ||
                     !explicitDecision;
-                if (cacheBustingPass) captureRustResponse(sessionId, messages, response);
+                // Slots are process-memory: after a serve restart every session has
+                // NO snapshot until its next busting pass, and any transport failure
+                // in that window falls through LKG to a raw full-array serve. The
+                // first applied pass of a process seeds the slot unconditionally.
+                if (cacheBustingPass || !getSlot(sessionId)) {
+                    captureRustResponse(sessionId, messages, response);
+                }
                 logStage(
                     sessionId,
                     "lkgSnapshot",
