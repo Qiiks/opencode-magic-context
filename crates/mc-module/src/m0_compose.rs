@@ -11,7 +11,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use mc_store::{McStore, McStoreError, MemoryRevision, SHADOW_SESSION_PREFIX};
+use mc_store::{McStore, McStoreError, MemoryRevision};
 
 use crate::compartment_coverage::{resolve_coverage, CoverageGap};
 use crate::decay_render::DecayRenderCompartment;
@@ -334,11 +334,7 @@ pub fn compose_m0_from_store(
 
     // --- user-profile + project-docs ---
     let user_profile = if inputs.memory_enabled {
-        if inputs.project_path.starts_with(SHADOW_SESSION_PREFIX) {
-            store.load_shadow_user_profile(inputs.project_path)?
-        } else {
-            store.load_active_user_memories()?
-        }
+        store.load_active_user_memories()?
     } else {
         Vec::new()
     };
@@ -398,7 +394,7 @@ pub fn compose_m0_from_store(
 mod tests {
     use super::*;
     use cortexkit_store_types::StorageDescriptor;
-    use mc_store::{InsertMemoryInput, ModuleMeta, ShadowStateSyncRequest, StoredCompartment};
+    use mc_store::{InsertMemoryInput, ModuleMeta, StoredCompartment};
 
     fn no_estimate(_: &str) -> usize {
         0
@@ -490,69 +486,6 @@ mod tests {
         assert!(!composed.m0_bytes.contains("secret docs"));
         assert!(!composed.m0_bytes.contains("<project-docs>"));
         assert!(composed.docs_hash.is_empty());
-    }
-
-    #[test]
-    fn shadow_profile_seed_matches_typescript_profile_block_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
-        let session_id = "shadow:profile";
-        let profile = vec!["prefers root cause".to_string(), "x < y & z".to_string()];
-        store
-            .apply_shadow_state_sync(ShadowStateSyncRequest {
-                session_id,
-                shadow_project_path: session_id,
-                shadow_generation: 0,
-                expected_shadow_seq: 0,
-                seed_boundary_id: None,
-                drop_seeds: &[],
-                drop_seed_skipped: 0,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                compartments: &[],
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &profile,
-                workspace: None,
-                last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: None,
-                deferred_execute_state: None,
-                channel2_nudge_state: None,
-                acked_watermarks: serde_json::Value::Null,
-            })
-            .unwrap();
-
-        let project_dir = dir.path().join("repo");
-        std::fs::create_dir_all(&project_dir).unwrap();
-        let inputs = M0ComposeInputs {
-            session_id,
-            project_path: session_id,
-            project_directory: project_dir.to_str().unwrap(),
-            now_ms: 0,
-            history_budget_tokens: 60_000.0,
-            covered_system_messages: &[],
-            memory_enabled: true,
-            memory_budget_tokens: 8_000.0,
-            user_profile_budget_tokens: 4_000.0,
-            inject_docs: true,
-            temporal_awareness: true,
-        };
-        let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
-        assert_eq!(
-            composed.m0_bytes,
-            "<user-profile>\n- prefers root cause\n- x &lt; y &amp; z\n</user-profile>\n\n<session-history></session-history>"
-        );
     }
 
     #[test]

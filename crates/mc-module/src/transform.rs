@@ -37,7 +37,6 @@ use mc_store::{
     MemoryRevision, ModuleMeta, ModuleUsage, NoteDelivery, PendingAgentDrop, PendingRewriteState,
     ServedBlockFingerprint, StoredCompartment, TagMintInput, TemporalMarkInput, TemporalMarkRow,
     TransformCommit, TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
-    SHADOW_SESSION_PREFIX,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -908,9 +907,8 @@ impl std::fmt::Display for TransformError {
 impl std::error::Error for TransformError {}
 
 impl TransformError {
-    /// These failures are deterministic for the same shadow payload. The sender can park a
-    /// poisoned shadow lineage instead of retrying it forever; store and search failures remain
-    /// retryable because their cause may be transient.
+    /// These failures are deterministic for the same request, while store and search failures
+    /// remain retryable because their cause may be transient.
     pub fn is_deterministic_reject(&self) -> bool {
         !matches!(self, Self::Store(_) | Self::Search(_))
     }
@@ -1164,7 +1162,7 @@ fn apply_once(
         Vec::new()
     };
 
-    // Check whether the boundary is present in the live messages, or through a shadow
+    // Check whether the boundary is present in the live messages, or through a stored
     // trim record that matches durable coverage and the first untrimmed message. A failed
     // trim record is treated as Absent so the existing reconciliation error paths still run.
     let (boundary_state, trim_mismatch) =
@@ -2567,7 +2565,7 @@ fn apply_once(
 }
 
 fn provisional_tail_mid(req: &TransformRequest) -> Option<&str> {
-    if !req.mid_turn || !req.session_id.starts_with(SHADOW_SESSION_PREFIX) {
+    if !req.mid_turn {
         return None;
     }
     req.messages
@@ -6577,8 +6575,8 @@ mod tests {
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
     use mc_store::{
-        InsertMemoryInput, McTagRow, ModuleUsage, NoteCasOutcome, NoteEvaluationInput,
-        NoteWriteInput, ShadowDropSeedRow, ShadowStateSyncRequest, StoredCompartment,
+        InsertMemoryInput, McTagRow, ModuleDropSeedRow, ModuleStateSyncRequest, ModuleUsage,
+        NoteCasOutcome, NoteEvaluationInput, NoteWriteInput, StoredCompartment,
     };
 
     #[test]
@@ -7763,48 +7761,33 @@ mod tests {
     }
 
     #[test]
-    fn shadow_mid_turn_tail_stays_provisional_and_re_adopts_completed_tail() {
+    fn mid_turn_tail_stays_provisional_and_re_adopts_completed_tail() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        let session = "shadow:identity-recovery";
+        let session = "identity-recovery";
         let partial = assistant_form("tail", 1, &["partial"]);
         let complete = assistant_form("tail", 1, &["partial", "completed"]);
 
-        // A completed tail can grow after an earlier non-streaming observation. It must adopt
-        // the new tail identity instead of requiring a shadow reset to recover the session.
-        let pinned = req(session, "cfg0", vec![partial.clone()]);
-        transform(&store, &pinned, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
-        let drift = req(session, "cfg0", vec![complete.clone()]);
-        transform(&store, &drift, &pctx("git:proj", "/nonexistent-docs", 1)).unwrap();
+        // A completed tail can grow after an earlier observation. Re-adopt the completed
+        // identity instead of rejecting a valid conversation update.
+        transform(
+            &store,
+            &req(session, "cfg0", vec![partial.clone()]),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap();
+        transform(
+            &store,
+            &req(session, "cfg0", vec![complete.clone()]),
+            &pctx("git:proj", "/nonexistent-docs", 1),
+        )
+        .unwrap();
         let adopted = store.load(session).unwrap();
         assert_eq!(adopted.meta.tail_identity_re_adopt_count, 1);
         assert_eq!(adopted.meta.block_identity_by_mid["tail"].len(), 2);
 
-        // The streaming exemption remains shadow-only: an owned request still records its
-        // completed identity even if an unexpected caller sets the mid_turn field.
-        let owned_session = "owned:identity-provisional";
-        let mut owned_mid_turn = req(
-            owned_session,
-            "cfg0",
-            vec![assistant_form("owned", 1, &["partial"])],
-        );
-        owned_mid_turn.mid_turn = true;
-        transform(
-            &store,
-            &owned_mid_turn,
-            &pctx("git:proj", "/nonexistent-docs", 3),
-        )
-        .unwrap();
-        assert!(store
-            .load(owned_session)
-            .unwrap()
-            .meta
-            .block_identity_by_mid
-            .contains_key("owned"));
-
-        // Shadow sends carry mid_turn, so the same partial form is never pinned.
-        let shadow_session = "shadow:identity-provisional";
-        let mut provisional = req(shadow_session, "cfg0", vec![partial]);
+        let provisional_session = "identity-provisional";
+        let mut provisional = req(provisional_session, "cfg0", vec![partial]);
         provisional.mid_turn = true;
         transform(
             &store,
@@ -7813,20 +7796,20 @@ mod tests {
         )
         .unwrap();
         assert!(!store
-            .load(shadow_session)
+            .load(provisional_session)
             .unwrap()
             .meta
             .block_identity_by_mid
             .contains_key("tail"));
         transform(
             &store,
-            &req(shadow_session, "cfg0", vec![complete]),
+            &req(provisional_session, "cfg0", vec![complete]),
             &pctx("git:proj", "/nonexistent-docs", 4),
         )
         .unwrap();
         assert_eq!(
             store
-                .load(shadow_session)
+                .load(provisional_session)
                 .unwrap()
                 .meta
                 .block_identity_by_mid
@@ -8574,9 +8557,9 @@ mod tests {
         let request = req("ses", "cfg0", vec![item("a", 1, "raw")]);
         assert_eq!(run(&s, &request, &spine()).action, "HARD");
         let loaded = s.load("ses").unwrap();
-        s.apply_authority_state_sync(ShadowStateSyncRequest {
+        s.apply_authority_state_sync(ModuleStateSyncRequest {
             session_id: "ses",
-            shadow_project_path: "git:proj",
+            project_path: "git:proj",
             shadow_generation: loaded.meta.shadow_generation,
             expected_shadow_seq: loaded.meta.shadow_seq,
             seed_boundary_id: None,
@@ -14559,16 +14542,16 @@ mod tests {
     fn seeded_drops_are_served_on_first_fold_and_replayed_on_defer() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        let seeds = [ShadowDropSeedRow {
+        let seeds = [ModuleDropSeedRow {
             block_id: "m1#0".to_string(),
             related_block_ids: vec![],
             drop_mode: "full".to_string(),
             payload: None,
         }];
         store
-            .apply_shadow_state_sync(ShadowStateSyncRequest {
+            .apply_authority_state_sync(ModuleStateSyncRequest {
                 session_id: "seeded-drops",
-                shadow_project_path: "git:proj",
+                project_path: "git:proj",
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
                 seed_boundary_id: None,
@@ -14794,7 +14777,7 @@ mod tests {
     }
 
     #[test]
-    fn seeded_boundary_validates_declared_trim_before_the_first_shadow_fold() {
+    fn seeded_boundary_validates_declared_trim_before_the_first_module_fold() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let compartments = vec![StoredCompartment {
@@ -14810,9 +14793,9 @@ mod tests {
             ..Default::default()
         }];
         store
-            .apply_shadow_state_sync(ShadowStateSyncRequest {
+            .apply_authority_state_sync(ModuleStateSyncRequest {
                 session_id: "seeded-trim",
-                shadow_project_path: "git:proj",
+                project_path: "git:proj",
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
                 seed_boundary_id: Some("b#0"),
