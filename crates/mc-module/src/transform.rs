@@ -42,6 +42,7 @@ use mc_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::ops::Deref;
@@ -783,6 +784,8 @@ pub struct TransformTimings {
     #[serde(default)]
     pub blocks_by_mid: f64,
     #[serde(default)]
+    pub build_frozen_unit_index: f64,
+    #[serde(default)]
     pub full_drop_tool_ids: f64,
     #[serde(default)]
     pub build_output: f64,
@@ -851,8 +854,8 @@ pub fn format_pass_timing_line(
          store_notes={:.1} store_memories={:.1} pending_drops={:.1} coverage_resolve={:.1} \
          tag_overlay={:.1} unit_mint={:.1} \
          decide={:.1} seed_or_sync={:.1} compose_m0m1={:.1} selection={:.1} todo={:.1} \
-         blocks_by_mid={:.1} full_drop_tool_ids={:.1} build_output={:.1} \
-         build_identity={:.1} build_identity_max={:.1} build_frozen_unit_scan={:.1} \
+         blocks_by_mid={:.1} build_frozen_unit_index={:.1} full_drop_tool_ids={:.1} \
+         build_output={:.1} build_identity={:.1} build_identity_max={:.1} build_frozen_unit_scan={:.1} \
          build_cache_lookup={:.1} build_serialize_misses={:.1} build_tail_loop={:.1} \
          divergence={:.1} store_commit={:.1} response_encode={response_encode_ms:.1} \
          frozen_units={} tail_units_matched={} projection_blocks={} tail_messages_emitted={} \
@@ -877,6 +880,7 @@ pub fn format_pass_timing_line(
         timings.selection,
         timings.todo,
         timings.blocks_by_mid,
+        timings.build_frozen_unit_index,
         timings.full_drop_tool_ids,
         timings.build_output,
         timings.build_identity,
@@ -2913,6 +2917,7 @@ fn apply_once(
     } = built_output;
     timings.build_output = elapsed_ms(build_output_started_at);
     timings.blocks_by_mid = build_timings.blocks_by_mid;
+    timings.build_frozen_unit_index = build_timings.frozen_unit_index;
     timings.full_drop_tool_ids = build_timings.full_drop_tool_ids;
     timings.build_identity = build_timings.identity;
     timings.build_identity_max = build_timings.identity_max;
@@ -6320,11 +6325,13 @@ fn surviving_strip_units(core: &CoreState, req: &TransformRequest) -> Vec<Frozen
         .collect()
 }
 
-fn full_drop_tool_ids(core: &CoreState, projection: &FlatProjection) -> HashSet<String> {
+fn full_drop_tool_ids(
+    frozen_units: &FrozenUnitLookup<'_>,
+    projection: &FlatProjection,
+) -> HashSet<String> {
     let frozen_kind = |block_id: &str| {
-        core.frozen_units
-            .iter()
-            .find(|unit| unit.key == format!("{RED_KEY_PREFIX}{block_id}"))
+        frozen_units
+            .by_key(&format!("{RED_KEY_PREFIX}{block_id}"))
             .map(|unit| unit.kind.as_str())
     };
     let mut remove = HashSet::new();
@@ -6363,6 +6370,7 @@ fn full_drop_tool_ids(core: &CoreState, projection: &FlatProjection) -> HashSet<
 struct BuildOutputTimings {
     total: f64,
     blocks_by_mid: f64,
+    frozen_unit_index: f64,
     full_drop_tool_ids: f64,
     identity: f64,
     identity_max: f64,
@@ -6374,6 +6382,79 @@ struct BuildOutputTimings {
     cache_hits: usize,
     cache_misses: usize,
     cache_dirty_skips: usize,
+}
+
+struct FrozenUnitIndex<'a> {
+    by_key: HashMap<&'a str, &'a FrozenUnit>,
+    by_tail_mid: HashMap<&'a str, Vec<&'a FrozenUnit>>,
+}
+
+impl<'a> FrozenUnitIndex<'a> {
+    fn new(frozen_units: &'a [FrozenUnit]) -> Self {
+        let mut by_key = HashMap::with_capacity(frozen_units.len());
+        let mut by_tail_mid: HashMap<&str, Vec<&FrozenUnit>> = HashMap::new();
+        for unit in frozen_units {
+            by_key.entry(unit.key.as_str()).or_insert(unit);
+            let target_mid = unit
+                .key
+                .strip_prefix(RED_KEY_PREFIX)
+                .or_else(|| unit.key.strip_prefix(CAV_KEY_PREFIX))
+                .and_then(split_block_id)
+                .map(|(mid, _)| mid)
+                .or_else(|| {
+                    unit.key
+                        .strip_prefix("strip:")
+                        .and_then(|rest| rest.rsplit_once(':'))
+                        .map(|(_, mid)| mid)
+                });
+            if let Some(mid) = target_mid {
+                by_tail_mid.entry(mid).or_default().push(unit);
+            }
+        }
+        Self {
+            by_key,
+            by_tail_mid,
+        }
+    }
+}
+
+enum FrozenUnitLookup<'a> {
+    Indexed(FrozenUnitIndex<'a>),
+    Scan(&'a [FrozenUnit]),
+}
+
+impl<'a> FrozenUnitLookup<'a> {
+    fn by_key(&self, key: &str) -> Option<&'a FrozenUnit> {
+        match self {
+            Self::Indexed(index) => index.by_key.get(key).copied(),
+            Self::Scan(frozen_units) => frozen_units.iter().find(|unit| unit.key == key),
+        }
+    }
+
+    fn for_tail_message(&self, mid: &str) -> Cow<'_, [&'a FrozenUnit]> {
+        match self {
+            Self::Indexed(index) => {
+                Cow::Borrowed(index.by_tail_mid.get(mid).map(Vec::as_slice).unwrap_or(&[]))
+            }
+            Self::Scan(frozen_units) => Cow::Owned(
+                frozen_units
+                    .iter()
+                    .filter(|unit| {
+                        unit.key
+                            .strip_prefix(RED_KEY_PREFIX)
+                            .or_else(|| unit.key.strip_prefix(CAV_KEY_PREFIX))
+                            .and_then(split_block_id)
+                            .map(|(unit_mid, _)| unit_mid == mid)
+                            .unwrap_or_else(|| {
+                                unit.key
+                                    .strip_prefix("strip:")
+                                    .is_some_and(|key| key.ends_with(&format!(":{mid}")))
+                            })
+                    })
+                    .collect(),
+            ),
+        }
+    }
 }
 
 struct BuiltOutput {
@@ -6390,7 +6471,7 @@ fn digest_field(hasher: &mut Sha256, value: &[u8]) {
 
 #[allow(clippy::too_many_arguments)]
 fn message_output_identity(
-    core: &CoreState,
+    frozen_units: &FrozenUnitLookup<'_>,
     projection: &FlatProjection,
     req: &TransformRequest,
     message: &CkIngressMessage,
@@ -6438,22 +6519,10 @@ fn message_output_identity(
     );
 
     let frozen_unit_scan_started_at = Instant::now();
-    for unit in &core.frozen_units {
-        let targets_message = unit
-            .key
-            .strip_prefix(RED_KEY_PREFIX)
-            .or_else(|| unit.key.strip_prefix(CAV_KEY_PREFIX))
-            .and_then(split_block_id)
-            .is_some_and(|(mid, _)| mid == message.mid)
-            || unit
-                .key
-                .strip_prefix("strip:")
-                .is_some_and(|key| key.ends_with(&format!(":{}", message.mid)));
-        if targets_message {
-            digest_field(&mut hasher, unit.key.as_bytes());
-            digest_field(&mut hasher, unit.kind.as_bytes());
-            digest_field(&mut hasher, unit.frozen_payload.as_bytes());
-        }
+    for unit in frozen_units.for_tail_message(&message.mid).iter() {
+        digest_field(&mut hasher, unit.key.as_bytes());
+        digest_field(&mut hasher, unit.kind.as_bytes());
+        digest_field(&mut hasher, unit.frozen_payload.as_bytes());
     }
 
     *frozen_unit_scan_ms += elapsed_ms(frozen_unit_scan_started_at);
@@ -6627,15 +6696,86 @@ fn build_output_with_tags(
     cache_snapshot: Option<&SerializedOutputCacheSnapshot>,
     prefix_dirty: bool,
 ) -> Result<BuiltOutput, TransformError> {
+    build_output_with_tags_inner(
+        core,
+        meta,
+        projection,
+        req,
+        tag_overlay,
+        synthetic_todo_enabled,
+        mutation_exempt_mid,
+        tag_numbers,
+        reasoning_watermark,
+        cache_snapshot,
+        prefix_dirty,
+        true,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn build_output_with_tags_unindexed(
+    core: &CoreState,
+    meta: &ModuleMeta,
+    projection: &FlatProjection,
+    req: &TransformRequest,
+    tag_overlay: Option<&TagOverlayState>,
+    synthetic_todo_enabled: bool,
+    mutation_exempt_mid: Option<&str>,
+    tag_numbers: &BTreeMap<String, u64>,
+    reasoning_watermark: u64,
+    cache_snapshot: Option<&SerializedOutputCacheSnapshot>,
+    prefix_dirty: bool,
+) -> Result<BuiltOutput, TransformError> {
+    build_output_with_tags_inner(
+        core,
+        meta,
+        projection,
+        req,
+        tag_overlay,
+        synthetic_todo_enabled,
+        mutation_exempt_mid,
+        tag_numbers,
+        reasoning_watermark,
+        cache_snapshot,
+        prefix_dirty,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_output_with_tags_inner(
+    core: &CoreState,
+    meta: &ModuleMeta,
+    projection: &FlatProjection,
+    req: &TransformRequest,
+    tag_overlay: Option<&TagOverlayState>,
+    synthetic_todo_enabled: bool,
+    mutation_exempt_mid: Option<&str>,
+    tag_numbers: &BTreeMap<String, u64>,
+    reasoning_watermark: u64,
+    cache_snapshot: Option<&SerializedOutputCacheSnapshot>,
+    prefix_dirty: bool,
+    use_frozen_unit_index: bool,
+) -> Result<BuiltOutput, TransformError> {
     let build_output_started_at = Instant::now();
     let mut build_timings = BuildOutputTimings::default();
     let mut out = Vec::with_capacity(4 + req.messages.len());
     let mut cache_entries = HashMap::new();
     let mut cache_stats = SerializedOutputCacheStats::default();
+    let frozen_unit_index_started_at = Instant::now();
+    let frozen_units = if use_frozen_unit_index {
+        FrozenUnitLookup::Indexed(FrozenUnitIndex::new(&core.frozen_units))
+    } else {
+        FrozenUnitLookup::Scan(&core.frozen_units)
+    };
+    if use_frozen_unit_index {
+        build_timings.frozen_unit_index = elapsed_ms(frozen_unit_index_started_at);
+    }
     let mut prev_assistant = false;
 
     if !req.is_subagent {
-        if let Some(unit) = core.frozen_units.iter().find(|unit| unit.key == "m0") {
+        if let Some(unit) = frozen_units.by_key("m0") {
             let key = "synthetic:m0".to_string();
             let identity = "m0".to_string();
             let (served, reused) = cached_or_serialize_output(
@@ -6656,7 +6796,7 @@ fn build_output_with_tags(
             );
             out.push(served);
         }
-        if let Some(unit) = core.frozen_units.iter().find(|unit| unit.key == "m1") {
+        if let Some(unit) = frozen_units.by_key("m1") {
             let key = "synthetic:m1".to_string();
             let identity = "m1".to_string();
             let (served, reused) = cached_or_serialize_output(
@@ -6683,10 +6823,8 @@ fn build_output_with_tags(
     let blocks_by_mid = projection_blocks_by_mid(projection);
     build_timings.blocks_by_mid = elapsed_ms(blocks_by_mid_started_at);
     let full_drop_tool_ids_started_at = Instant::now();
-    let full_drop_ids = full_drop_tool_ids(core, projection);
-    let full_drop_tool_ids_ms = elapsed_ms(full_drop_tool_ids_started_at);
-    build_timings.full_drop_tool_ids = full_drop_tool_ids_ms;
-    build_timings.frozen_unit_scan += full_drop_tool_ids_ms;
+    let full_drop_ids = full_drop_tool_ids(&frozen_units, projection);
+    build_timings.full_drop_tool_ids = elapsed_ms(full_drop_tool_ids_started_at);
     let output_coverage = if req.is_subagent {
         None
     } else {
@@ -6748,7 +6886,7 @@ fn build_output_with_tags(
         let key = format!("tail:{}", msg.mid);
         let identity_started_at = Instant::now();
         let identity = message_output_identity(
-            core,
+            &frozen_units,
             projection,
             req,
             msg,
@@ -6794,12 +6932,9 @@ fn build_output_with_tags(
                         .iter()
                         .filter(|block| !is_reasoning_block(&block.wire))
                         .filter_map(|block| {
-                            core.frozen_units
-                                .iter()
-                                .find(|unit| {
-                                    unit.key == format!("{RED_KEY_PREFIX}{}", block.id())
-                                        && unit.kind != "image"
-                                })
+                            frozen_units
+                                .by_key(&format!("{RED_KEY_PREFIX}{}", block.id()))
+                                .filter(|unit| unit.kind != "image")
                                 .map(|unit| (block.block_index, unit.frozen_payload.as_str()))
                         })
                         .collect()
@@ -6832,8 +6967,7 @@ fn build_output_with_tags(
                             continue;
                         }
                         let unit_key = format!("{CAV_KEY_PREFIX}{}", block.id);
-                        let Some(unit) = core.frozen_units.iter().find(|unit| unit.key == unit_key)
-                        else {
+                        let Some(unit) = frozen_units.by_key(&unit_key) else {
                             continue;
                         };
                         if !matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }) {
@@ -7497,6 +7631,7 @@ mod tests {
             "store_notes",
             "store_memories",
             "build_output",
+            "build_frozen_unit_index",
             "build_identity",
             "build_identity_max",
             "build_frozen_unit_scan",
@@ -17073,6 +17208,25 @@ mod tests {
         };
         let meta = ModuleMeta::default();
         let first = build_cached_fixture(&core, &meta, &request, &projection, None, None, true);
+        let unindexed = build_output_with_tags_unindexed(
+            &core,
+            &meta,
+            &projection,
+            &request,
+            None,
+            false,
+            None,
+            &BTreeMap::new(),
+            0,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            canonical_output(&first.messages),
+            canonical_output(&unindexed.messages),
+            "indexed output must remain byte-identical to the unfixed scan path"
+        );
         let snapshot = SerializedOutputCacheSnapshot {
             entries: first.cache_entries.clone(),
         };
@@ -17098,6 +17252,7 @@ mod tests {
             total: replay.timings.total,
             build_output: replay.timings.total,
             blocks_by_mid: replay.timings.blocks_by_mid,
+            build_frozen_unit_index: replay.timings.frozen_unit_index,
             full_drop_tool_ids: replay.timings.full_drop_tool_ids,
             build_identity: replay.timings.identity,
             build_identity_max: replay.timings.identity_max,
