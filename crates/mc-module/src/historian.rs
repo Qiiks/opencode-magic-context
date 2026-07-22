@@ -1784,6 +1784,9 @@ mod tests {
             .unwrap()
             .ck_messages
             .unwrap_or_default()
+            .into_iter()
+            .map(crate::transform::ServedMessage::into_message)
+            .collect()
     }
 
     fn comp(seq: i64, start: i64, end: i64, end_id: &str, p1: &str) -> StoredCompartment {

@@ -41,9 +41,10 @@ use mc_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
-use std::sync::{Mutex, OnceLock};
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::ck_wire::{
@@ -90,6 +91,209 @@ const DEFAULT_CAVEMAN_MIN_CHARS: usize = 500;
 const M1_PENDING_LOG_THRESHOLDS_MS: [i64; 3] =
     [5 * 60 * 1_000, 30 * 60 * 1_000, 2 * 60 * 60 * 1_000];
 static M1_PENDING_LOG_BUCKETS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+const SERIALIZED_OUTPUT_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// One served CK message plus the canonical bytes used by the module response writer.
+/// The typed value stays behind an `Arc`, so a cache hit does not clone large tool output trees.
+#[derive(Debug, Clone)]
+pub struct ServedMessage {
+    message: Arc<CkWireMessage>,
+    canonical_bytes: Arc<[u8]>,
+    block_fingerprints: Arc<[(String, usize)]>,
+}
+
+impl ServedMessage {
+    fn from_message(message: CkWireMessage) -> Self {
+        let canonical = serde_json::to_value(&message)
+            .expect("CK wire messages must always have a JSON representation");
+        let canonical_bytes =
+            serde_json::to_vec(&canonical).expect("CK wire message values must always serialize");
+        let block_fingerprints = message
+            .content
+            .iter()
+            .map(|block| {
+                let serialized = serde_json::to_string(block)
+                    .expect("CK wire blocks must always have a JSON representation");
+                (ck_wire::fingerprint(&serialized), serialized.len())
+            })
+            .collect::<Vec<_>>();
+        Self {
+            message: Arc::new(message),
+            canonical_bytes: Arc::from(canonical_bytes),
+            block_fingerprints: Arc::from(block_fingerprints),
+        }
+    }
+
+    pub fn into_message(self) -> CkWireMessage {
+        Arc::try_unwrap(self.message).unwrap_or_else(|message| (*message).clone())
+    }
+
+    pub(crate) fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+}
+
+impl Deref for ServedMessage {
+    type Target = CkWireMessage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.message
+    }
+}
+
+impl PartialEq for ServedMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.message == other.message
+    }
+}
+
+impl PartialEq<CkWireMessage> for ServedMessage {
+    fn eq(&self, other: &CkWireMessage) -> bool {
+        self.message.as_ref() == other
+    }
+}
+
+impl Serialize for ServedMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.message.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ServedMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        CkWireMessage::deserialize(deserializer).map(Self::from_message)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SerializedOutputCacheEntry {
+    identity: String,
+    served: Option<ServedMessage>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SerializedOutputCacheSnapshot {
+    entries: HashMap<String, SerializedOutputCacheEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SerializedOutputCacheStats {
+    pub reused_items: usize,
+    pub serialized_items: usize,
+}
+
+#[derive(Debug)]
+struct SerializedOutputSession {
+    revert_epoch: u64,
+    retained_bytes: usize,
+    entries: HashMap<String, SerializedOutputCacheEntry>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    stats: SerializedOutputCacheStats,
+}
+
+#[derive(Debug)]
+pub(crate) struct SerializedOutputCache {
+    sessions: HashMap<String, SerializedOutputSession>,
+    lru: VecDeque<String>,
+    retained_bytes: usize,
+    max_retained_bytes: usize,
+}
+
+impl Default for SerializedOutputCache {
+    fn default() -> Self {
+        Self::new(SERIALIZED_OUTPUT_CACHE_BUDGET_BYTES)
+    }
+}
+
+impl SerializedOutputCache {
+    fn new(max_retained_bytes: usize) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            lru: VecDeque::new(),
+            retained_bytes: 0,
+            max_retained_bytes,
+        }
+    }
+
+    pub(crate) fn remove(&mut self, session_id: &str) {
+        if let Some(session) = self.sessions.remove(session_id) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+        }
+        self.lru.retain(|candidate| candidate != session_id);
+    }
+
+    fn snapshot(&mut self, session_id: &str, revert_epoch: u64) -> SerializedOutputCacheSnapshot {
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.revert_epoch != revert_epoch)
+        {
+            self.remove(session_id);
+        }
+        let entries = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.entries.clone())
+            .unwrap_or_default();
+        if !entries.is_empty() {
+            self.lru.retain(|candidate| candidate != session_id);
+            self.lru.push_back(session_id.to_string());
+        }
+        SerializedOutputCacheSnapshot { entries }
+    }
+
+    fn replace(
+        &mut self,
+        session_id: &str,
+        revert_epoch: u64,
+        entries: HashMap<String, SerializedOutputCacheEntry>,
+        stats: SerializedOutputCacheStats,
+    ) {
+        self.remove(session_id);
+        let retained_bytes = entries
+            .values()
+            .filter_map(|entry| entry.served.as_ref())
+            .map(|served| served.canonical_bytes.len())
+            .sum();
+        if retained_bytes > self.max_retained_bytes {
+            return;
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.sessions.insert(
+            session_id.to_string(),
+            SerializedOutputSession {
+                revert_epoch,
+                retained_bytes,
+                entries,
+                stats,
+            },
+        );
+        self.lru.push_back(session_id.to_string());
+        while self.retained_bytes > self.max_retained_bytes {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            if let Some(session) = self.sessions.remove(&oldest) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn stats(&self, session_id: &str) -> SerializedOutputCacheStats {
+        self.sessions
+            .get(session_id)
+            .map(|session| session.stats)
+            .unwrap_or_default()
+    }
+}
 
 fn log_pending_m1_delta(session_id: &str, now_ms: i64, pending_since_ms: Option<i64>) {
     let age_ms = now_ms.saturating_sub(pending_since_ms.unwrap_or(now_ms).max(0));
@@ -596,7 +800,7 @@ pub struct TransformResponse {
     /// "transformed to nothing" and "re-send required". Every `ok` response carries
     /// `Some`, even when legitimately empty.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub ck_messages: Option<Vec<CkWireMessage>>,
+    pub ck_messages: Option<Vec<ServedMessage>>,
     /// OpenCode message-with-parts output, present only when the request opted into native
     /// serving and selected the `opencode-aisdk` serializer profile.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -614,7 +818,7 @@ pub struct TransformResponse {
 impl TransformResponse {
     /// The output array of an `ok`/passthrough response; empty for `need_full_sync`
     /// (whose wire form omits the field entirely).
-    pub fn messages(&self) -> &[CkWireMessage] {
+    pub fn messages(&self) -> &[ServedMessage] {
         self.ck_messages.as_deref().unwrap_or(&[])
     }
 
@@ -664,7 +868,12 @@ impl TransformResponse {
             committed: false,
             coverage_ordinal: None,
             historian: None,
-            ck_messages: Some(ck_messages),
+            ck_messages: Some(
+                ck_messages
+                    .into_iter()
+                    .map(ServedMessage::from_message)
+                    .collect(),
+            ),
             native_messages: None,
             host_directives: None,
             note_deliveries: None,
@@ -968,7 +1177,22 @@ pub fn transform_with_projection(
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
 ) -> Result<TransformWithProjection, TransformError> {
-    apply_once_with_estimator(store, req, ctx, mc_tokenizer::estimate_tokens)
+    apply_once_with_estimator(store, req, ctx, mc_tokenizer::estimate_tokens, None)
+}
+
+pub(crate) fn transform_with_projection_cached(
+    store: &McStore,
+    req: &TransformRequest,
+    ctx: &ProducerContext<'_>,
+    output_cache: &Mutex<SerializedOutputCache>,
+) -> Result<TransformWithProjection, TransformError> {
+    apply_once_with_estimator(
+        store,
+        req,
+        ctx,
+        mc_tokenizer::estimate_tokens,
+        Some(output_cache),
+    )
 }
 
 /// The retry wrapper around [`apply_once`], parameterized by the token estimator so tests
@@ -979,10 +1203,11 @@ fn apply_once_with_estimator(
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
+    output_cache: Option<&Mutex<SerializedOutputCache>>,
 ) -> Result<TransformWithProjection, TransformError> {
     let mut attempt = 0;
     loop {
-        match apply_once(store, req, ctx, estimate_tokens) {
+        match apply_once(store, req, ctx, estimate_tokens, output_cache) {
             Err(TransformError::Store(McStoreError::CasConflict { .. }))
                 if attempt < MAX_CAS_RETRIES =>
             {
@@ -994,7 +1219,7 @@ fn apply_once_with_estimator(
     }
 }
 
-fn served_output_fingerprints(messages: &[CkWireMessage]) -> Vec<ServedBlockFingerprint> {
+fn served_output_fingerprints(messages: &[ServedMessage]) -> Vec<ServedBlockFingerprint> {
     let mut synthetic_index = 0usize;
     let mut fingerprints = Vec::new();
     for (message_index, message) in messages.iter().enumerate() {
@@ -1025,10 +1250,10 @@ fn served_output_fingerprints(messages: &[CkWireMessage]) -> Vec<ServedBlockFing
                 .unwrap_or_else(|| format!("served_message:{message_index}"))
         };
 
-        let single_block = message.content.len() == 1;
-        for (block_index, block) in message.content.iter().enumerate() {
-            let serialized = serde_json::to_string(block)
-                .expect("CK wire blocks must always have a JSON representation");
+        let single_block = message.block_fingerprints.len() == 1;
+        for (block_index, (content_hash, serialized_len)) in
+            message.block_fingerprints.iter().enumerate()
+        {
             let block_id = if single_block {
                 message_id.clone()
             } else {
@@ -1036,8 +1261,8 @@ fn served_output_fingerprints(messages: &[CkWireMessage]) -> Vec<ServedBlockFing
             };
             fingerprints.push(ServedBlockFingerprint {
                 block_id,
-                content_hash: ck_wire::fingerprint(&serialized),
-                serialized_len: serialized.len(),
+                content_hash: content_hash.clone(),
+                serialized_len: *serialized_len,
             });
         }
     }
@@ -1049,6 +1274,7 @@ fn apply_once(
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
+    output_cache: Option<&Mutex<SerializedOutputCache>>,
 ) -> Result<TransformWithProjection, TransformError> {
     let total_started_at = Instant::now();
     let mut timings = TransformTimings::default();
@@ -2433,7 +2659,13 @@ fn apply_once(
     }
 
     let build_output_started_at = Instant::now();
-    let ck_messages = build_output_with_tags(
+    let output_cache_snapshot = output_cache.map(|cache| {
+        cache
+            .lock()
+            .expect("serialized output cache mutex")
+            .snapshot(&req.session_id, meta.revert_epoch)
+    });
+    let built_output = build_output_with_tags(
         &core,
         &meta,
         &projection,
@@ -2444,7 +2676,42 @@ fn apply_once(
         &tag_numbers,
         meta.reasoning_cleared_through_tag
             .max(meta.reasoning_cleared_through_ordinal),
+        output_cache_snapshot.as_ref(),
+        is_bust_pass,
     )?;
+    #[cfg(test)]
+    if output_cache.is_some() {
+        let fresh = build_output_with_tags(
+            &core,
+            &meta,
+            &projection,
+            req,
+            tagging_active.then_some(&tag_overlay),
+            tail_reclaim_enabled && !req.is_subagent,
+            mutation_exempt_mid,
+            &tag_numbers,
+            meta.reasoning_cleared_through_tag
+                .max(meta.reasoning_cleared_through_ordinal),
+            None,
+            true,
+        )?;
+        let cached_bytes = built_output
+            .messages
+            .iter()
+            .map(ServedMessage::canonical_bytes)
+            .collect::<Vec<_>>();
+        let fresh_bytes = fresh
+            .messages
+            .iter()
+            .map(ServedMessage::canonical_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(cached_bytes, fresh_bytes, "serialized output cache drift");
+    }
+    let BuiltOutput {
+        messages: ck_messages,
+        cache_entries: output_cache_entries,
+        cache_stats: output_cache_stats,
+    } = built_output;
     timings.build_output = elapsed_ms(build_output_started_at);
 
     // Compare only the served block hashes before committing the new sequence. The first pass
@@ -2503,6 +2770,17 @@ fn apply_once(
         loaded.row_version.unwrap_or(0)
     };
     timings.store_commit = elapsed_ms(store_commit_started_at);
+    if let Some(cache) = output_cache {
+        cache
+            .lock()
+            .expect("serialized output cache mutex")
+            .replace(
+                &req.session_id,
+                meta.revert_epoch,
+                output_cache_entries,
+                output_cache_stats,
+            );
+    }
     for re_adoption in &tail_identity_re_adoptions {
         eprintln!(
             "mc-module: identity re-adopted for tail mid {} old_hash={} new_hash={}",
@@ -3741,7 +4019,7 @@ struct PendingPassthroughArgs<'a> {
     row_version: u64,
     committed: bool,
     trim_mismatch: Option<TrimMismatch>,
-    messages: Vec<CkWireMessage>,
+    messages: Vec<ServedMessage>,
     first_divergence: Option<FirstDivergence>,
     surface_state: SurfaceState,
     timings: TransformTimings,
@@ -3753,7 +4031,7 @@ fn pending_passthrough_messages(
     projection: &FlatProjection,
     req: &TransformRequest,
     tag_overlay: Option<&TagOverlayState>,
-) -> Vec<CkWireMessage> {
+) -> Vec<ServedMessage> {
     let mutation_exempt_mid = latest_assistant_mutation_exempt_mid(
         &req.messages,
         SerializerProfile::parse(&req.serializer_profile),
@@ -3774,7 +4052,7 @@ fn pending_passthrough_messages(
                     mutation_exempt_mid == Some(message.mid.as_str()),
                 );
             }
-            rendered
+            ServedMessage::from_message(rendered)
         })
         .collect()
 }
@@ -3793,7 +4071,9 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         materialize_reason,
         total_started_at,
     } = args;
-    let mut response = TransformResponse::passthrough(messages, req.full_array_fingerprint.clone());
+    let mut response =
+        TransformResponse::passthrough(Vec::new(), req.full_array_fingerprint.clone());
+    response.ck_messages = Some(messages);
     response.row_version = row_version;
     response.surface_state = surface_state;
     response.committed = committed;
@@ -3887,13 +4167,6 @@ fn reanchor_kept_synthetic_todo_if_folded_or_shrunk(
     debug_assert!(folded_by_advance || coverage_shrunk_on_bust);
     pair.anchor_mid = tail_end_mid(req, meta.coverage_ordinal);
     Ok(())
-}
-
-fn push_synthetic_todo_pair(out: &mut Vec<CkWireMessage>, meta: &ModuleMeta) {
-    if let Some(pair) = &meta.synthetic_todo {
-        out.push(pair.assistant_msg.clone());
-        out.push(pair.tool_msg.clone());
-    }
 }
 
 fn tag_mint_inputs(
@@ -5832,6 +6105,187 @@ fn full_drop_tool_ids(core: &CoreState, projection: &FlatProjection) -> HashSet<
     remove
 }
 
+struct BuiltOutput {
+    messages: Vec<ServedMessage>,
+    cache_entries: HashMap<String, SerializedOutputCacheEntry>,
+    cache_stats: SerializedOutputCacheStats,
+}
+
+fn digest_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update(value.len().to_le_bytes());
+    hasher.update(value);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn message_output_identity(
+    core: &CoreState,
+    projection: &FlatProjection,
+    req: &TransformRequest,
+    message: &CkIngressMessage,
+    blocks: &[&FlatBlock],
+    tag_overlay: Option<&TagOverlayState>,
+    tag_numbers: &BTreeMap<String, u64>,
+    reasoning_watermark: u64,
+    full_drop_ids: &HashSet<String>,
+    mutation_exempt: bool,
+    first_assistant_in_run: bool,
+) -> String {
+    let mut hasher = Sha256::new();
+    digest_field(&mut hasher, message.mid.as_bytes());
+    digest_field(&mut hasher, message.ck.role.as_bytes());
+    let shallow = serde_json::to_vec(&(
+        &message.ck.origin,
+        &message.ck.provider_extras,
+        &message.ck.meta,
+    ))
+    .expect("CK message metadata must serialize");
+    digest_field(&mut hasher, &shallow);
+    if let Some(identities) = projection.identity_by_mid.get(&message.mid) {
+        for identity in identities {
+            digest_field(&mut hasher, identity.kind_tag.as_bytes());
+            digest_field(&mut hasher, identity.byte_fingerprint.as_bytes());
+        }
+    }
+
+    digest_field(&mut hasher, req.serializer_profile.as_bytes());
+    digest_field(
+        &mut hasher,
+        req.provider_id.as_deref().unwrap_or_default().as_bytes(),
+    );
+    digest_field(&mut hasher, &[req.is_subagent as u8]);
+    digest_field(&mut hasher, &[req.caveman_enabled as u8]);
+    digest_field(&mut hasher, &[request_accepts_empty_content(req) as u8]);
+    digest_field(&mut hasher, &[mutation_exempt as u8]);
+    digest_field(&mut hasher, &[first_assistant_in_run as u8]);
+    let message_tag = message_tag_number(message, tag_numbers);
+    digest_field(&mut hasher, &message_tag.to_le_bytes());
+    digest_field(
+        &mut hasher,
+        &((message_tag > 0 && message_tag <= reasoning_watermark) as u8).to_le_bytes(),
+    );
+
+    for unit in &core.frozen_units {
+        let targets_message = unit
+            .key
+            .strip_prefix(RED_KEY_PREFIX)
+            .or_else(|| unit.key.strip_prefix(CAV_KEY_PREFIX))
+            .and_then(split_block_id)
+            .is_some_and(|(mid, _)| mid == message.mid)
+            || unit
+                .key
+                .strip_prefix("strip:")
+                .is_some_and(|key| key.ends_with(&format!(":{}", message.mid)));
+        if targets_message {
+            digest_field(&mut hasher, unit.key.as_bytes());
+            digest_field(&mut hasher, unit.kind.as_bytes());
+            digest_field(&mut hasher, unit.frozen_payload.as_bytes());
+        }
+    }
+
+    for block in blocks {
+        digest_field(&mut hasher, block.id.as_bytes());
+        for value in [
+            tag_overlay
+                .and_then(|overlay| overlay.tag_by_block_id.get(&block.id))
+                .map(ToString::to_string),
+            tag_overlay.and_then(|overlay| overlay.temporal_by_block_id.get(&block.id).cloned()),
+            tag_overlay.and_then(|overlay| overlay.user_hint_by_block_id.get(&block.id).cloned()),
+            tag_overlay.and_then(|overlay| overlay.channel1_by_block_id.get(&block.id).cloned()),
+        ] {
+            digest_field(&mut hasher, value.as_deref().unwrap_or_default().as_bytes());
+        }
+        let full_drop = match &block.wire.kind {
+            ck_wire::CkKind::ToolCall { id, .. } | ck_wire::CkKind::ToolResult { id, .. } => {
+                full_drop_ids.contains(id)
+            }
+            _ => false,
+        };
+        digest_field(&mut hasher, &[full_drop as u8]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn cached_output_item(
+    snapshot: Option<&SerializedOutputCacheSnapshot>,
+    key: &str,
+    identity: &str,
+    dirty: bool,
+) -> Option<Option<ServedMessage>> {
+    (!dirty)
+        .then(|| snapshot?.entries.get(key))
+        .flatten()
+        .filter(|entry| entry.identity == identity)
+        .map(|entry| entry.served.clone())
+}
+
+fn cached_or_serialize_output(
+    snapshot: Option<&SerializedOutputCacheSnapshot>,
+    key: &str,
+    identity: &str,
+    dirty: bool,
+    build: impl FnOnce() -> CkWireMessage,
+) -> (ServedMessage, bool) {
+    match cached_output_item(snapshot, key, identity, dirty).flatten() {
+        Some(served) => (served, true),
+        None => (ServedMessage::from_message(build()), false),
+    }
+}
+
+fn record_output_item(
+    entries: &mut HashMap<String, SerializedOutputCacheEntry>,
+    stats: &mut SerializedOutputCacheStats,
+    key: String,
+    identity: String,
+    served: Option<ServedMessage>,
+    reused: bool,
+) {
+    if reused {
+        stats.reused_items = stats.reused_items.saturating_add(1);
+    } else {
+        stats.serialized_items = stats.serialized_items.saturating_add(1);
+    }
+    entries.insert(key, SerializedOutputCacheEntry { identity, served });
+}
+
+fn apply_serializer_residual_to_message(
+    profile: SerializerProfile,
+    provider_id: Option<&str>,
+    mutation_exempt: bool,
+    first_assistant_in_run: bool,
+    message: &mut CkWireMessage,
+) -> usize {
+    if !quirk_residual(profile).strips_reasoning_from_merged_assistants
+        || provider_id.is_some_and(|provider| provider != "anthropic")
+        || message.role != "assistant"
+        || (mutation_exempt && first_assistant_in_run)
+    {
+        return 0;
+    }
+    let keep_index = first_assistant_in_run.then(|| {
+        message
+            .content
+            .iter()
+            .enumerate()
+            .find(|(_, block)| !is_reasoning_ignored_block(block))
+            .and_then(|(index, block)| is_reasoning_block(block).then_some(index))
+    });
+    let keep_index = keep_index.flatten();
+    let mut stripped = 0;
+    for (index, block) in message.content.iter_mut().enumerate() {
+        if !is_reasoning_block(block) || Some(index) == keep_index {
+            continue;
+        }
+        *block = CkWireBlock::bare(ck_wire::CkKind::Text {
+            text: String::new(),
+        });
+        stripped += 1;
+    }
+    if stripped > 0 {
+        message.mark_modified();
+    }
+    stripped
+}
+
 #[cfg(test)]
 fn build_output(
     core: &CoreState,
@@ -5853,7 +6307,16 @@ fn build_output(
         &BTreeMap::new(),
         meta.reasoning_cleared_through_tag
             .max(meta.reasoning_cleared_through_ordinal),
+        None,
+        true,
     )
+    .map(|built| {
+        built
+            .messages
+            .into_iter()
+            .map(ServedMessage::into_message)
+            .collect()
+    })
 }
 
 // Keep the provider and durable-watermark arguments explicit in this builder: they affect cache
@@ -5869,222 +6332,307 @@ fn build_output_with_tags(
     mutation_exempt_mid: Option<&str>,
     tag_numbers: &BTreeMap<String, u64>,
     reasoning_watermark: u64,
-) -> Result<Vec<CkWireMessage>, TransformError> {
+    cache_snapshot: Option<&SerializedOutputCacheSnapshot>,
+    prefix_dirty: bool,
+) -> Result<BuiltOutput, TransformError> {
     let mut out = Vec::with_capacity(4 + req.messages.len());
+    let mut cache_entries = HashMap::new();
+    let mut cache_stats = SerializedOutputCacheStats::default();
+    let mut prev_assistant = false;
+
     if !req.is_subagent {
-        if let Some(u) = core.frozen_units.iter().find(|u| u.key == "m0") {
-            out.push(CkWireMessage::synthetic_user_text(u.frozen_payload.clone()));
+        if let Some(unit) = core.frozen_units.iter().find(|unit| unit.key == "m0") {
+            let key = "synthetic:m0".to_string();
+            let identity = "m0".to_string();
+            let (served, reused) =
+                cached_or_serialize_output(cache_snapshot, &key, &identity, prefix_dirty, || {
+                    CkWireMessage::synthetic_user_text(unit.frozen_payload.clone())
+                });
+            record_output_item(
+                &mut cache_entries,
+                &mut cache_stats,
+                key,
+                identity,
+                Some(served.clone()),
+                reused,
+            );
+            out.push(served);
         }
-        if let Some(u) = core.frozen_units.iter().find(|u| u.key == "m1") {
-            out.push(CkWireMessage::synthetic_user_text(u.frozen_payload.clone()));
+        if let Some(unit) = core.frozen_units.iter().find(|unit| unit.key == "m1") {
+            let key = "synthetic:m1".to_string();
+            let identity = "m1".to_string();
+            let (served, reused) =
+                cached_or_serialize_output(cache_snapshot, &key, &identity, prefix_dirty, || {
+                    CkWireMessage::synthetic_user_text(unit.frozen_payload.clone())
+                });
+            record_output_item(
+                &mut cache_entries,
+                &mut cache_stats,
+                key,
+                identity,
+                Some(served.clone()),
+                reused,
+            );
+            out.push(served);
         }
     }
 
     let blocks_by_mid = projection_blocks_by_mid(projection);
     let full_drop_ids = full_drop_tool_ids(core, projection);
-    // Subagents do not emit a synthetic m0/m1 prefix, so previously covered input
-    // remains ordinary live history instead of being filtered by a primary cache watermark.
     let output_coverage = if req.is_subagent {
         None
     } else {
         meta.coverage_ordinal
     };
+    let serializer_profile = SerializerProfile::parse(&req.serializer_profile);
 
-    // A synthetic-todo pair with no message anchor (anchor_mid == None) was composed when
-    // the tail was empty (every live message folded under coverage). It is frozen
-    // immediately AFTER the m0/m1 head blocks pushed above and BEFORE the tail loop below
-    // — emitting it HERE, not after that loop, is what keeps its position byte-stable:
-    // later tail growth appends after it, so the [m0, m1, pair] prefix stays identical on
-    // every subsequent defer pass. Emitting it after the loop would let the pair float to
-    // the end of a growing tail, changing the bytes of a cached prefix on every turn — the
-    // exact failure the position-freeze design prevents. (A None anchor also never
-    // relocates on a bust: reanchor_kept_synthetic_todo_if_folded early-returns on None, so
-    // the pair stays right after m0/m1 for its whole life until a Replace or Clear.)
-    if synthetic_todo_enabled
-        && meta
+    if synthetic_todo_enabled {
+        if let Some(pair) = meta
             .synthetic_todo
             .as_ref()
-            .is_some_and(|pair| pair.anchor_mid.is_none())
-    {
-        push_synthetic_todo_pair(&mut out, meta);
+            .filter(|pair| pair.anchor_mid.is_none())
+        {
+            for (suffix, message) in [("call", &pair.assistant_msg), ("result", &pair.tool_msg)] {
+                let key = format!("todo:{}:{suffix}", pair.call_id);
+                let identity = key.clone();
+                let (served, reused) =
+                    cached_or_serialize_output(cache_snapshot, &key, &identity, false, || {
+                        message.clone()
+                    });
+                record_output_item(
+                    &mut cache_entries,
+                    &mut cache_stats,
+                    key,
+                    identity,
+                    Some(served.clone()),
+                    reused,
+                );
+                prev_assistant = served.role == "assistant";
+                out.push(served);
+            }
+        }
     }
 
-    // Covered system messages are stored in m0 during the HARD render for the current
-    // coverage. The claude-code-anthropic profile epoch makes old sessions do that HARD
-    // before this code stops emitting those messages separately, preventing old m0 bytes
-    // that lack the block from losing the prompt content.
-
-    let serializer_profile = SerializerProfile::parse(&req.serializer_profile);
     let mut inserted_synthetic_todo = false;
-    // Tail messages are strictly after the coverage watermark. Full-array profiles also
-    // keep pinned leading system prompts that sit before the first summarized ordinal.
-    // The outer loop is the inbound message list, not the reduced-block map, so a live
-    // tail message with zero content blocks still passes through instead of disappearing.
-    for msg in req.messages.iter().filter(|m| !m.ck.meta.synthetic) {
+    for msg in req
+        .messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic)
+    {
         let keep_leading_system = serializer_profile
             != Some(SerializerProfile::ClaudeCodeAnthropic)
             && is_uncovered_leading_system(msg, meta);
         if !is_tail(msg.ordinal, output_coverage) && !keep_leading_system {
             continue;
         }
+
         let mutation_exempt = mutation_exempt_mid == Some(msg.mid.as_str());
-        let rendered = if let Some(blocks) = blocks_by_mid.get(msg.mid.as_str()) {
-            let reduced: BTreeMap<usize, &str> = if mutation_exempt {
-                BTreeMap::new()
-            } else {
-                blocks
-                    .iter()
-                    // Render-time heal: if an immutable unit targets a reasoning block,
-                    // ignore it and serve the block's original signed bytes. Applying
-                    // the unit would produce an unsigned reasoning block that Anthropic
-                    // rejects, which would permanently block the session. The unit
-                    // remains frozen but becomes inert, and this behavior is deterministic.
-                    .filter(|block| !is_reasoning_block(&block.wire))
-                    .filter_map(|block| {
-                        core.frozen_units
-                            .iter()
-                            .find(|unit| {
-                                unit.key == format!("{RED_KEY_PREFIX}{}", block.id())
-                                    && unit.kind != "image"
-                            })
-                            .map(|unit| (block.block_index, unit.frozen_payload.as_str()))
-                    })
-                    .collect()
-            };
-            let mut rebuilt = msg.ck.clone();
-            if !reduced.is_empty() {
-                rebuilt.mark_modified();
-                for block in blocks {
-                    if let Some(payload) = reduced.get(&block.block_index) {
-                        // Canonical frozen bytes never carry a tag number. The egress clone
-                        // may add the target's live number, while legacy numbered payloads
-                        // remain byte-identical because only exact `[dropped]` is overlaid.
-                        let display_payload = (*payload == "[dropped]")
-                            .then(|| {
-                                tag_overlay
-                                    .and_then(|overlay| overlay.tag_by_block_id.get(&block.id))
-                                    .map(|tag_number| format!("[dropped §{tag_number}§]"))
-                            })
-                            .flatten();
-                        rebuilt.content[block.block_index] = reduced_block(
-                            &block.wire,
-                            display_payload.as_deref().unwrap_or(payload),
-                            block.file_path.as_deref(),
-                        );
-                    }
-                }
-            } else if !req.is_subagent
-                && req.caveman_enabled
-                && matches!(msg.ck.role.as_str(), "user" | "assistant")
-            {
-                for block in blocks {
-                    if is_reasoning_block(&block.wire) {
-                        continue;
-                    }
-                    let key = format!("{CAV_KEY_PREFIX}{}", block.id);
-                    let Some(unit) = core.frozen_units.iter().find(|unit| unit.key == key) else {
-                        continue;
-                    };
-                    if !matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }) {
-                        continue;
-                    }
-                    rebuilt.content[block.block_index].kind = ck_wire::CkKind::Text {
-                        text: unit.frozen_payload.clone(),
-                    };
-                    rebuilt.content[block.block_index].mark_modified();
-                    rebuilt.mark_modified();
-                }
-            }
-            if !mutation_exempt {
-                apply_surface_strips(
-                    core,
-                    req,
-                    msg,
-                    blocks,
-                    &mut rebuilt,
-                    tag_numbers,
-                    reasoning_watermark,
-                );
-                let drop_indexes: HashSet<usize> = blocks
-                    .iter()
-                    .filter(|block| {
-                        full_drop_ids.iter().any(|id| match &block.wire.kind {
-                            ck_wire::CkKind::ToolCall { id: call_id, .. }
-                            | ck_wire::CkKind::ToolResult { id: call_id, .. } => call_id == id,
-                            _ => false,
-                        })
-                    })
-                    .map(|block| block.block_index)
-                    .collect();
-                if !drop_indexes.is_empty() {
-                    rebuilt.content = rebuilt
-                        .content
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(index, block)| {
-                            (!drop_indexes.contains(&index)).then_some(block)
-                        })
-                        .collect();
-                    rebuilt.mark_modified();
-                }
-            }
-            if !mutation_exempt {
+        let first_assistant_in_run = msg.ck.role == "assistant" && !prev_assistant;
+        let blocks = blocks_by_mid
+            .get(msg.mid.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let key = format!("tail:{}", msg.mid);
+        let identity = message_output_identity(
+            core,
+            projection,
+            req,
+            msg,
+            blocks,
+            tag_overlay,
+            tag_numbers,
+            reasoning_watermark,
+            &full_drop_ids,
+            mutation_exempt,
+            first_assistant_in_run,
+        );
+
+        let cached = cached_output_item(cache_snapshot, &key, &identity, false);
+        let (served, reused) = if let Some(cached) = cached {
+            (cached, true)
+        } else {
+            let mut rendered = if blocks.is_empty() {
+                let mut rebuilt = msg.ck.clone();
                 apply_tag_overlay_to_message(
                     &mut rebuilt,
                     msg,
                     blocks,
                     tag_overlay,
-                    |block| reduced.contains_key(&block.block_index),
-                    false,
+                    |_| false,
+                    mutation_exempt,
                 );
-            }
-            rebuilt
-        } else {
-            let mut rebuilt = msg.ck.clone();
-            apply_tag_overlay_to_message(
-                &mut rebuilt,
-                msg,
-                &[],
-                tag_overlay,
-                |_| false,
-                mutation_exempt,
-            );
-            rebuilt
-        };
-        if rendered.content.is_empty() {
-            // Full tool drops remove the carrier message as well as its blocks; keeping
-            // an empty shell would change tool adjacency on providers that merge turns.
-            // A pre-existing zero-block message is still a legitimate passthrough row.
-            if rendered.meta.synthetic || !blocks_by_mid.contains_key(msg.mid.as_str()) {
-                out.push(rendered);
-                continue;
-            }
-            continue;
-        }
-        out.push(rendered);
+                rebuilt
+            } else {
+                let reduced: BTreeMap<usize, &str> = if mutation_exempt {
+                    BTreeMap::new()
+                } else {
+                    blocks
+                        .iter()
+                        .filter(|block| !is_reasoning_block(&block.wire))
+                        .filter_map(|block| {
+                            core.frozen_units
+                                .iter()
+                                .find(|unit| {
+                                    unit.key == format!("{RED_KEY_PREFIX}{}", block.id())
+                                        && unit.kind != "image"
+                                })
+                                .map(|unit| (block.block_index, unit.frozen_payload.as_str()))
+                        })
+                        .collect()
+                };
+                let mut rebuilt = msg.ck.clone();
+                if !reduced.is_empty() {
+                    rebuilt.mark_modified();
+                    for block in blocks {
+                        if let Some(payload) = reduced.get(&block.block_index) {
+                            let display_payload = (*payload == "[dropped]")
+                                .then(|| {
+                                    tag_overlay
+                                        .and_then(|overlay| overlay.tag_by_block_id.get(&block.id))
+                                        .map(|tag_number| format!("[dropped §{tag_number}§]"))
+                                })
+                                .flatten();
+                            rebuilt.content[block.block_index] = reduced_block(
+                                &block.wire,
+                                display_payload.as_deref().unwrap_or(payload),
+                                block.file_path.as_deref(),
+                            );
+                        }
+                    }
+                } else if !req.is_subagent
+                    && req.caveman_enabled
+                    && matches!(msg.ck.role.as_str(), "user" | "assistant")
+                {
+                    for block in blocks {
+                        if is_reasoning_block(&block.wire) {
+                            continue;
+                        }
+                        let unit_key = format!("{CAV_KEY_PREFIX}{}", block.id);
+                        let Some(unit) = core.frozen_units.iter().find(|unit| unit.key == unit_key)
+                        else {
+                            continue;
+                        };
+                        if !matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }) {
+                            continue;
+                        }
+                        rebuilt.content[block.block_index].kind = ck_wire::CkKind::Text {
+                            text: unit.frozen_payload.clone(),
+                        };
+                        rebuilt.content[block.block_index].mark_modified();
+                        rebuilt.mark_modified();
+                    }
+                }
+                if !mutation_exempt {
+                    apply_surface_strips(
+                        core,
+                        req,
+                        msg,
+                        blocks,
+                        &mut rebuilt,
+                        tag_numbers,
+                        reasoning_watermark,
+                    );
+                    let drop_indexes: HashSet<usize> = blocks
+                        .iter()
+                        .filter(|block| match &block.wire.kind {
+                            ck_wire::CkKind::ToolCall { id, .. }
+                            | ck_wire::CkKind::ToolResult { id, .. } => full_drop_ids.contains(id),
+                            _ => false,
+                        })
+                        .map(|block| block.block_index)
+                        .collect();
+                    if !drop_indexes.is_empty() {
+                        rebuilt.content = rebuilt
+                            .content
+                            .into_iter()
+                            .enumerate()
+                            .filter_map(|(index, block)| {
+                                (!drop_indexes.contains(&index)).then_some(block)
+                            })
+                            .collect();
+                        rebuilt.mark_modified();
+                    }
+                    apply_tag_overlay_to_message(
+                        &mut rebuilt,
+                        msg,
+                        blocks,
+                        tag_overlay,
+                        |block| reduced.contains_key(&block.block_index),
+                        false,
+                    );
+                }
+                rebuilt
+            };
 
-        if synthetic_todo_enabled
-            && meta
+            let present = !rendered.content.is_empty()
+                || rendered.meta.synthetic
+                || !blocks_by_mid.contains_key(msg.mid.as_str());
+            if present {
+                if let Some(profile) = serializer_profile {
+                    apply_serializer_residual_to_message(
+                        profile,
+                        req.provider_id.as_deref(),
+                        mutation_exempt,
+                        first_assistant_in_run,
+                        &mut rendered,
+                    );
+                }
+                (Some(ServedMessage::from_message(rendered)), false)
+            } else {
+                (None, false)
+            }
+        };
+
+        record_output_item(
+            &mut cache_entries,
+            &mut cache_stats,
+            key,
+            identity,
+            served.clone(),
+            reused,
+        );
+        let Some(served) = served else {
+            continue;
+        };
+        prev_assistant = served.role == "assistant";
+        out.push(served);
+
+        if synthetic_todo_enabled {
+            if let Some(pair) = meta
                 .synthetic_todo
                 .as_ref()
-                .and_then(|pair| pair.anchor_mid.as_deref())
-                == Some(msg.mid.as_str())
-        {
-            push_synthetic_todo_pair(&mut out, meta);
-            inserted_synthetic_todo = true;
+                .filter(|pair| pair.anchor_mid.as_deref() == Some(msg.mid.as_str()))
+            {
+                for (suffix, message) in [("call", &pair.assistant_msg), ("result", &pair.tool_msg)]
+                {
+                    let key = format!("todo:{}:{suffix}", pair.call_id);
+                    let identity = key.clone();
+                    let (served, reused) =
+                        cached_or_serialize_output(cache_snapshot, &key, &identity, false, || {
+                            message.clone()
+                        });
+                    record_output_item(
+                        &mut cache_entries,
+                        &mut cache_stats,
+                        key,
+                        identity,
+                        Some(served.clone()),
+                        reused,
+                    );
+                    prev_assistant = served.role == "assistant";
+                    out.push(served);
+                }
+                inserted_synthetic_todo = true;
+            }
         }
     }
 
-    // A pair anchored to a real message must have been spliced inside the loop; if its
-    // anchor is absent from the current tail we fail loud rather than silently relocate
-    // (a bust folds the anchor via reanchor_kept_synthetic_todo_if_folded, so reaching
-    // here means the anchor vanished on a defer = a revert/drift invariant violation).
-    // The None-anchor case was already emitted before the loop, so it is not re-checked.
     if synthetic_todo_enabled {
         if let Some(pair) = &meta.synthetic_todo {
             if pair.anchor_mid.is_some() && !inserted_synthetic_todo {
-                let mid = pair.anchor_mid.clone().unwrap_or_default();
-                return Err(TransformError::SyntheticTodoAnchorMissing(mid));
+                return Err(TransformError::SyntheticTodoAnchorMissing(
+                    pair.anchor_mid.clone().unwrap_or_default(),
+                ));
             }
         }
     }
@@ -6100,15 +6648,12 @@ fn build_output_with_tags(
             "claude-code-anthropic synthetic prefix must not contain system-role messages"
         );
     }
-    if let Some(profile) = serializer_profile {
-        apply_serializer_residuals_with_exemption(
-            profile,
-            &mut out,
-            mutation_exempt_mid,
-            req.provider_id.as_deref(),
-        );
-    }
-    Ok(out)
+
+    Ok(BuiltOutput {
+        messages: out,
+        cache_entries,
+        cache_stats,
+    })
 }
 
 #[cfg(test)]
@@ -6116,6 +6661,7 @@ fn apply_serializer_residuals(profile: SerializerProfile, messages: &mut [CkWire
     apply_serializer_residuals_with_exemption(profile, messages, None, Some("anthropic"))
 }
 
+#[cfg(test)]
 fn apply_serializer_residuals_with_exemption(
     profile: SerializerProfile,
     messages: &mut [CkWireMessage],
@@ -6131,64 +6677,25 @@ fn apply_serializer_residuals_with_exemption(
     }
 }
 
+#[cfg(test)]
 fn strip_reasoning_from_merged_assistants_with_exemption(
     messages: &mut [CkWireMessage],
     mutation_exempt_mid: Option<&str>,
 ) -> usize {
     let mut stripped = 0;
     let mut prev_assistant = false;
-    let mut kept_reasoning_in_run = false;
-
     for message in messages {
-        if message.role != "assistant" {
-            prev_assistant = false;
-            kept_reasoning_in_run = false;
-            continue;
-        }
-        let first_in_run = !prev_assistant;
-        if mutation_exempt_mid == message.meta.harness_id.as_deref() && first_in_run {
-            prev_assistant = true;
-            continue;
-        }
-
-        if first_in_run {
-            kept_reasoning_in_run = false;
-        }
-
-        let mut keep_index = None;
-        if first_in_run && !kept_reasoning_in_run {
-            for (idx, block) in message.content.iter().enumerate() {
-                if is_reasoning_ignored_block(block) {
-                    continue;
-                }
-                if is_reasoning_block(block) {
-                    keep_index = Some(idx);
-                }
-                break;
-            }
-        }
-
-        let mut modified = false;
-        for (idx, block) in message.content.iter_mut().enumerate() {
-            if !is_reasoning_block(block) {
-                continue;
-            }
-            if Some(idx) == keep_index {
-                kept_reasoning_in_run = true;
-                continue;
-            }
-            *block = CkWireBlock::bare(ck_wire::CkKind::Text {
-                text: String::new(),
-            });
-            stripped += 1;
-            modified = true;
-        }
-        if modified {
-            message.mark_modified();
-        }
-        prev_assistant = true;
+        let first_assistant_in_run = message.role == "assistant" && !prev_assistant;
+        let mutation_exempt = mutation_exempt_mid == message.meta.harness_id.as_deref();
+        stripped += apply_serializer_residual_to_message(
+            SerializerProfile::OpencodeAiSdk,
+            Some("anthropic"),
+            mutation_exempt,
+            first_assistant_in_run,
+            message,
+        );
+        prev_assistant = message.role == "assistant";
     }
-
     stripped
 }
 
@@ -9056,10 +9563,19 @@ mod tests {
             exempt,
             &tag_numbers,
             u64::MAX,
+            None,
+            true,
         )
         .unwrap();
 
-        assert_eq!(output, vec![latest.ck]);
+        assert_eq!(
+            output
+                .messages
+                .into_iter()
+                .map(ServedMessage::into_message)
+                .collect::<Vec<_>>(),
+            vec![latest.ck]
+        );
     }
 
     #[test]
@@ -14472,6 +14988,7 @@ mod tests {
             ),
             &ctx,
             counting,
+            None,
         )
         .unwrap();
         assert_eq!(boot.response.action, "HARD");
@@ -14493,9 +15010,14 @@ mod tests {
             item("m20", 20, "raw2"),
             item("t21", 21, "tail"),
         ];
-        let soft =
-            apply_once_with_estimator(&s, &req("ses", "cfg0", soft_items.clone()), &ctx, counting)
-                .unwrap();
+        let soft = apply_once_with_estimator(
+            &s,
+            &req("ses", "cfg0", soft_items.clone()),
+            &ctx,
+            counting,
+            None,
+        )
+        .unwrap();
         assert_eq!(soft.response.action, "SOFT");
         assert_eq!(
             calls.get(),
@@ -14506,7 +15028,8 @@ mod tests {
         // defer: replays frozen m0/m1, composes nothing.
         calls.set(0);
         let defer =
-            apply_once_with_estimator(&s, &req("ses", "cfg0", soft_items), &ctx, counting).unwrap();
+            apply_once_with_estimator(&s, &req("ses", "cfg0", soft_items), &ctx, counting, None)
+                .unwrap();
         assert_eq!(defer.response.action, "SOFT+");
         assert_eq!(
             calls.get(),
@@ -15807,5 +16330,208 @@ mod tests {
         let steady = run(&s, &hidden, &spine());
         let steady_joined = serde_json::to_string(&steady.ck_messages).unwrap();
         assert!(!steady_joined.contains('\u{a7}'), "{steady_joined}");
+    }
+
+    fn output_cache_fixture(
+        m0: &str,
+        m1: &str,
+    ) -> (CoreState, ModuleMeta, TransformRequest, FlatProjection) {
+        let core = CoreState {
+            frozen_units: vec![
+                synth_region("m0", m0.to_string()),
+                synth_region("m1", m1.to_string()),
+            ],
+            ..Default::default()
+        };
+        let meta = ModuleMeta::default();
+        let request = req(
+            "serialized-output-cache",
+            "cfg0",
+            vec![item("a", 1, "alpha"), item("b", 2, "beta")],
+        );
+        let projection = project_messages(&request.messages).unwrap();
+        (core, meta, request, projection)
+    }
+
+    fn build_cached_fixture(
+        core: &CoreState,
+        meta: &ModuleMeta,
+        request: &TransformRequest,
+        projection: &FlatProjection,
+        overlay: Option<&TagOverlayState>,
+        snapshot: Option<&SerializedOutputCacheSnapshot>,
+        prefix_dirty: bool,
+    ) -> BuiltOutput {
+        build_output_with_tags(
+            core,
+            meta,
+            projection,
+            request,
+            overlay,
+            false,
+            None,
+            &BTreeMap::new(),
+            0,
+            snapshot,
+            prefix_dirty,
+        )
+        .unwrap()
+    }
+
+    fn canonical_output(messages: &[ServedMessage]) -> Vec<Vec<u8>> {
+        messages
+            .iter()
+            .map(|message| message.canonical_bytes().to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn serialized_output_cache_reuses_steady_state_and_matches_fresh_bytes() {
+        let (core, meta, request, projection) = output_cache_fixture("m0-v1", "m1-v1");
+        let first = build_cached_fixture(&core, &meta, &request, &projection, None, None, true);
+        let snapshot = SerializedOutputCacheSnapshot {
+            entries: first.cache_entries.clone(),
+        };
+        let replay = build_cached_fixture(
+            &core,
+            &meta,
+            &request,
+            &projection,
+            None,
+            Some(&snapshot),
+            false,
+        );
+        let fresh = build_cached_fixture(&core, &meta, &request, &projection, None, None, true);
+
+        assert_eq!(replay.cache_stats.serialized_items, 0);
+        assert_eq!(replay.cache_stats.reused_items, 4);
+        assert_eq!(
+            canonical_output(&replay.messages),
+            canonical_output(&fresh.messages)
+        );
+    }
+
+    #[test]
+    fn serialized_output_cache_tag_overlay_invalidates_only_its_message() {
+        let (core, meta, request, projection) = output_cache_fixture("m0-v1", "m1-v1");
+        let first = build_cached_fixture(&core, &meta, &request, &projection, None, None, true);
+        let snapshot = SerializedOutputCacheSnapshot {
+            entries: first.cache_entries.clone(),
+        };
+        let overlay = TagOverlayState {
+            tag_by_block_id: BTreeMap::from([("b#0".to_string(), 7)]),
+            ..Default::default()
+        };
+        let tagged = build_cached_fixture(
+            &core,
+            &meta,
+            &request,
+            &projection,
+            Some(&overlay),
+            Some(&snapshot),
+            false,
+        );
+        let fresh = build_cached_fixture(
+            &core,
+            &meta,
+            &request,
+            &projection,
+            Some(&overlay),
+            None,
+            true,
+        );
+
+        assert_eq!(tagged.cache_stats.serialized_items, 1);
+        assert_eq!(tagged.cache_stats.reused_items, 3);
+        assert_eq!(
+            canonical_output(&tagged.messages),
+            canonical_output(&fresh.messages)
+        );
+    }
+
+    #[test]
+    fn serialized_output_cache_drop_invalidates_only_the_target() {
+        let (core, meta, request, projection) = output_cache_fixture("m0-v1", "m1-v1");
+        let first = build_cached_fixture(&core, &meta, &request, &projection, None, None, true);
+        let snapshot = SerializedOutputCacheSnapshot {
+            entries: first.cache_entries.clone(),
+        };
+        let mut dropped_core = core.clone();
+        dropped_core
+            .frozen_units
+            .push(red_unit("b#0", "drop", "[dropped]"));
+        let dropped = build_cached_fixture(
+            &dropped_core,
+            &meta,
+            &request,
+            &projection,
+            None,
+            Some(&snapshot),
+            false,
+        );
+        let fresh = build_cached_fixture(
+            &dropped_core,
+            &meta,
+            &request,
+            &projection,
+            None,
+            None,
+            true,
+        );
+
+        assert_eq!(dropped.cache_stats.serialized_items, 1);
+        assert_eq!(dropped.cache_stats.reused_items, 3);
+        assert_eq!(
+            canonical_output(&dropped.messages),
+            canonical_output(&fresh.messages)
+        );
+    }
+
+    #[test]
+    fn serialized_output_cache_fold_refreshes_prefix_and_reuses_tail() {
+        let (core, meta, request, projection) = output_cache_fixture("m0-v1", "m1-v1");
+        let first = build_cached_fixture(&core, &meta, &request, &projection, None, None, true);
+        let snapshot = SerializedOutputCacheSnapshot {
+            entries: first.cache_entries.clone(),
+        };
+        let (folded_core, _, _, _) = output_cache_fixture("m0-v2", "m1-v2");
+        let folded = build_cached_fixture(
+            &folded_core,
+            &meta,
+            &request,
+            &projection,
+            None,
+            Some(&snapshot),
+            true,
+        );
+        let fresh =
+            build_cached_fixture(&folded_core, &meta, &request, &projection, None, None, true);
+
+        assert_eq!(folded.cache_stats.serialized_items, 2);
+        assert_eq!(folded.cache_stats.reused_items, 2);
+        assert_eq!(
+            canonical_output(&folded.messages),
+            canonical_output(&fresh.messages)
+        );
+    }
+
+    #[test]
+    fn serialized_output_cache_revert_epoch_bump_evicts_session() {
+        let (core, meta, request, projection) = output_cache_fixture("m0-v1", "m1-v1");
+        let built = build_cached_fixture(&core, &meta, &request, &projection, None, None, true);
+        let mut cache = SerializedOutputCache::new(1024 * 1024);
+        cache.replace(
+            &request.session_id,
+            3,
+            built.cache_entries,
+            built.cache_stats,
+        );
+        assert!(!cache.snapshot(&request.session_id, 3).entries.is_empty());
+
+        assert!(cache.snapshot(&request.session_id, 4).entries.is_empty());
+        assert_eq!(
+            cache.stats(&request.session_id),
+            SerializedOutputCacheStats::default()
+        );
     }
 }

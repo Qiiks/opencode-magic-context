@@ -44,6 +44,7 @@ pub mod transform;
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -101,7 +102,9 @@ use subc_protocol::{
 };
 #[cfg(test)]
 use transform::ReductionDecision;
-use transform::{transform_with_projection, HistorianDiagnostics, TransformRequest};
+use transform::{
+    transform_with_projection_cached, HistorianDiagnostics, SerializedOutputCache, TransformRequest,
+};
 
 /// The per-route binding: the project, harness, session-slot value, and fallback render
 /// budget frozen at bind. Transform routes carry the durable session in `session`. Facade
@@ -1629,6 +1632,7 @@ pub struct McHandler {
     wrapup_sessions: Arc<Mutex<HashMap<String, LiveWrapupSession>>>,
     recomp_sessions: Arc<Mutex<HashSet<String>>>,
     transform_snapshots: Arc<Mutex<TransformSnapshotCache>>,
+    serialized_outputs: Mutex<SerializedOutputCache>,
     scheduler_observations: Mutex<HashMap<String, SchedulerObservation>>,
     guidance_dates: Mutex<HashMap<String, String>>,
     #[cfg(test)]
@@ -2026,6 +2030,7 @@ impl McHandler {
             transform_snapshots: Arc::new(Mutex::new(TransformSnapshotCache::new(
                 TRANSFORM_SNAPSHOT_BUDGET_BYTES,
             ))),
+            serialized_outputs: Mutex::new(SerializedOutputCache::default()),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -2109,6 +2114,7 @@ impl McHandler {
             transform_snapshots: Arc::new(Mutex::new(TransformSnapshotCache::new(
                 TRANSFORM_SNAPSHOT_BUDGET_BYTES,
             ))),
+            serialized_outputs: Mutex::new(SerializedOutputCache::default()),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
             guidance_now_ms: Mutex::new(None),
@@ -2165,6 +2171,10 @@ impl McHandler {
             self.transform_snapshots
                 .lock()
                 .expect("transform snapshots mutex")
+                .remove(&session_id);
+            self.serialized_outputs
+                .lock()
+                .expect("serialized output cache mutex")
                 .remove(&session_id);
         }
     }
@@ -2290,6 +2300,10 @@ impl McHandler {
             self.transform_snapshots
                 .lock()
                 .expect("transform snapshots mutex")
+                .remove(&session);
+            self.serialized_outputs
+                .lock()
+                .expect("serialized output cache mutex")
                 .remove(&session);
         }
     }
@@ -3927,6 +3941,10 @@ impl McHandler {
                 }
             }
         };
+        self.serialized_outputs
+            .lock()
+            .expect("serialized output cache mutex")
+            .remove(&session_id);
         // A transform generation is an in-memory fence for cached raw snapshots. Marking
         // this session in-flight prevents an already assembled historian from acquiring
         // a ready snapshot after the durable revert epoch has been bumped.
@@ -5542,7 +5560,12 @@ impl McHandler {
                     .remove(&parsed.session_id)
                     .unwrap_or_default(),
             };
-            transform_with_projection(&store, &parsed, &producer_ctx)
+            transform_with_projection_cached(
+                &store,
+                &parsed,
+                &producer_ctx,
+                &self.serialized_outputs,
+            )
         };
         let reject_transform = |e: crate::transform::TransformError| {
             let message = e.to_string();
@@ -5771,7 +5794,7 @@ impl McHandler {
                     retained_bytes,
                 );
         }
-        respond(serde_json::to_value(response).unwrap_or(Value::Null))
+        respond_transform(response)
     }
 
     #[cfg(test)]
@@ -8432,17 +8455,19 @@ fn attach_native_messages_with_tags(
         .map(codec::decode_opencode)
         .map(|decoded| decoded.sidecar)
         .unwrap_or_else(|| codec::DecodeSidecar::new("opencode"));
-    let mut native_messages = codec::encode_opencode_with_session(
-        response.messages(),
-        &sidecar,
-        Some(&request.session_id),
-    );
+    let served_messages = response
+        .messages()
+        .iter()
+        .map(|message| message.deref().clone())
+        .collect::<Vec<_>>();
+    let mut native_messages =
+        codec::encode_opencode_with_session(&served_messages, &sidecar, Some(&request.session_id));
     if let Some(profile) = SerializerProfile::parse(&request.serializer_profile) {
         transform::clear_served_native_reasoning_with_tags(
             profile,
             transform::request_accepts_empty_content(request),
             &mut native_messages,
-            response.messages(),
+            &served_messages,
             &request.messages,
             reasoning_watermark,
             request.mid_turn,
@@ -8490,6 +8515,66 @@ fn replay_dream_task_response(response_json: &str) -> HandlerOutcome {
         };
     }
     respond(response)
+}
+
+fn respond_transform(mut response: transform::TransformResponse) -> HandlerOutcome {
+    let messages = response.ck_messages.take();
+    let mut value = match serde_json::to_value(response) {
+        Ok(value) => value,
+        Err(error) => {
+            return HandlerOutcome::Error {
+                code: "encode_failed".to_string(),
+                message: error.to_string(),
+            }
+        }
+    };
+    if messages.is_some() {
+        value
+            .as_object_mut()
+            .expect("transform responses serialize as objects")
+            .insert("ck_messages".to_string(), Value::Null);
+    }
+    let encoded = match serde_json::to_vec(&value) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            return HandlerOutcome::Error {
+                code: "encode_failed".to_string(),
+                message: error.to_string(),
+            }
+        }
+    };
+    let Some(messages) = messages else {
+        return HandlerOutcome::Response(encoded);
+    };
+
+    const PLACEHOLDER: &[u8] = br#""ck_messages":null"#;
+    let Some(start) = encoded
+        .windows(PLACEHOLDER.len())
+        .position(|window| window == PLACEHOLDER)
+    else {
+        return HandlerOutcome::Error {
+            code: "encode_failed".to_string(),
+            message: "transform response lost ck_messages placeholder".to_string(),
+        };
+    };
+    let null_start = start + PLACEHOLDER.len() - 4;
+    let retained_bytes = messages
+        .iter()
+        .map(|message| message.canonical_bytes().len())
+        .sum::<usize>();
+    let mut output =
+        Vec::with_capacity(encoded.len() + retained_bytes + messages.len().saturating_sub(1) + 2);
+    output.extend_from_slice(&encoded[..null_start]);
+    output.push(b'[');
+    for (index, message) in messages.iter().enumerate() {
+        if index > 0 {
+            output.push(b',');
+        }
+        output.extend_from_slice(message.canonical_bytes());
+    }
+    output.push(b']');
+    output.extend_from_slice(&encoded[null_start + 4..]);
+    HandlerOutcome::Response(output)
 }
 
 fn respond(value: Value) -> HandlerOutcome {
@@ -11309,6 +11394,20 @@ mod tests {
 
     async fn call_transform(handler: &McHandler, messages: Vec<CkIngressMessage>) -> Value {
         call_transform_request(handler, request(messages)).await
+    }
+
+    #[test]
+    fn cached_transform_response_writer_is_byte_identical_to_value_round_trip() {
+        let response = transform::TransformResponse::passthrough(
+            vec![ck("wire-byte-cache", 1, "hello").ck],
+            Some("fingerprint".to_string()),
+        );
+        let expected =
+            serde_json::to_vec(&serde_json::to_value(response.clone()).unwrap()).unwrap();
+        let HandlerOutcome::Response(actual) = respond_transform(response) else {
+            panic!("cached transform response failed to encode");
+        };
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -17826,6 +17925,7 @@ mod tests {
         page
     }
 
+    #[allow(dead_code)]
     fn seed_accounting(handler: &McHandler) -> (usize, usize) {
         let seeds = handler
             .state_sync_seeds
