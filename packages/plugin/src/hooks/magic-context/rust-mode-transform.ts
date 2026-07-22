@@ -16,6 +16,7 @@ import { getMemoryVerifications } from "../../features/magic-context/memory/stor
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import {
     casChannel2NudgeState,
+    clearEmergencyRecovery,
     getChannel2NudgeState,
     getOverflowState,
     isEmergencyRecoveryArmed,
@@ -1705,6 +1706,27 @@ export function createRustModeTransform(
                     });
                 } catch (error) {
                     sessionLog(sessionId, "rust compartment mirror-back failed (ignored):", error);
+                }
+            }
+            // TS mode disarms overflow recovery when the historian publishes; in rust
+            // mode publication happens module-side, so the applied pass that lands a
+            // materialization is the equivalent proof the session recovered. Without
+            // this clear the latch stays armed forever, and its side effects persist
+            // (forced 95% pressure, LKG refusing to cover transport failures — the
+            // 20:38Z incident escalated to a 1.6M-token raw serve exactly this way).
+            if (
+                materializeReason !== "none" &&
+                passUsageSnapshot.percentage < 80 &&
+                getOverflowState(deps.db, sessionId).needsEmergencyRecovery
+            ) {
+                try {
+                    clearEmergencyRecovery(deps.db, sessionId);
+                    sessionLog(
+                        sessionId,
+                        `rust pass disarmed emergency recovery after ${materializeReason} at ${passUsageSnapshot.percentage.toFixed(1)}% usage`,
+                    );
+                } catch {
+                    // Best-effort: the next materializing pass retries the disarm.
                 }
             }
             wireCaches.set(sessionId, pendingWireCache);
