@@ -160,6 +160,9 @@ export interface MagicContextDeps {
         shadow_transform?: {
             enabled: boolean;
         };
+        experimental?: {
+            mural?: { enabled: boolean; model?: string };
+        };
     };
     /** Test seam for the Rust authority adapter; production creates the subc client. */
     rustModeModuleClient?: RustModeModuleClient;
@@ -1143,6 +1146,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               userMemoryCollectionEnabled:
                                   userMemoryCollectionEnabled(dreamerConfig),
                               language: deps.config.language,
+                              experimentalMural: deps.config.experimental?.mural,
+                              memoryInjectionBudgetTokens:
+                                  deps.config.memory?.injection_budget_tokens,
                               transformMode: deps.config.transform_mode,
                               // Manual /ctx-dream uses the same live authority
                               // lookup and module transport as scheduled runs.

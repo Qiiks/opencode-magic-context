@@ -297,6 +297,10 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         try {
             if (config.task === "render-mural") {
                 if (deps.experimentalMural?.enabled !== true) {
+                    // Config-gated no-op, but say so: a silent "completed" here
+                    // reads as a successful render in /ctx-dream summaries and
+                    // has already masked a wiring gap once.
+                    log("[dreamer] render-mural: skipped (experimental.mural is not enabled)");
                     recordRun("completed", null);
                     return { status: "completed" };
                 }
