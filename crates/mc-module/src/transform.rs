@@ -18,7 +18,9 @@ use crate::ck_wire;
 use crate::compartment_coverage::{fold_m0_content_epoch, resolve_coverage, M0ContentEpoch};
 use crate::divergence::{self, FirstDivergence};
 use crate::healing::{self, quirk_residual, SerializerProfile};
-use crate::injection::{advance_injection_from_meta, capture_todo_state_on_bust, InjectionOutcome};
+use crate::injection::{
+    advance_injection_from_meta, capture_todo_state_on_bust, is_synthetic_todo_id, InjectionOutcome,
+};
 use crate::m0_compose::compose_m0_from_store;
 use crate::m1_compose::{
     claim_and_render_notes, compose_m1_from_store, m1_revision_signal_parts_for_pass,
@@ -1291,6 +1293,25 @@ fn served_output_fingerprints(messages: &[ServedMessage]) -> Vec<ServedBlockFing
     fingerprints
 }
 
+fn normalize_synthetic_todo_ingress(req: &TransformRequest) -> Option<TransformRequest> {
+    let mut normalized = None;
+    for (index, message) in req.messages.iter().enumerate() {
+        if message.ck.meta.synthetic
+            || !message.ck.content.iter().any(|block| match &block.kind {
+                ck_wire::CkKind::ToolCall { id, .. } | ck_wire::CkKind::ToolResult { id, .. } => {
+                    is_synthetic_todo_id(id)
+                }
+                _ => false,
+            })
+        {
+            continue;
+        }
+        let next = normalized.get_or_insert_with(|| req.clone());
+        next.messages[index].ck.meta.synthetic = true;
+    }
+    normalized
+}
+
 fn apply_once(
     store: &McStore,
     req: &TransformRequest,
@@ -1300,6 +1321,11 @@ fn apply_once(
 ) -> Result<TransformWithProjection, TransformError> {
     let total_started_at = Instant::now();
     let mut timings = TransformTimings::default();
+    // OpenCode transports the frozen todo pair as one marked tool part. Older adapters did not
+    // copy that marker into CK metadata, so recognize the reserved call-id namespace here too.
+    // Normalizing before projection keeps the replayed pair out of selection, coverage, and output.
+    let normalized_req = normalize_synthetic_todo_ingress(req);
+    let req = normalized_req.as_ref().unwrap_or(req);
     // --- ingress: CK messages -> flat blocks, then strip synthetic before cache logic ---
     let projection = project_messages(&req.messages)?;
     if let Some(id) = duplicate_ids(&projection.blocks) {
@@ -6284,6 +6310,101 @@ fn record_output_item(
     entries.insert(key, SerializedOutputCacheEntry { identity, served });
 }
 
+fn duplicate_tool_use_locations(messages: &[ServedMessage]) -> Vec<(String, usize, usize)> {
+    let mut seen = HashSet::new();
+    let mut duplicates = Vec::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        for (block_index, block) in message.content.iter().enumerate() {
+            if let ck_wire::CkKind::ToolCall { id, .. } = &block.kind {
+                if !seen.insert(id.clone()) {
+                    duplicates.push((id.clone(), message_index, block_index));
+                }
+            }
+        }
+    }
+    duplicates
+}
+
+/// Last-resort provider-validity belt. The normal ingress and render paths must keep tool-use ids
+/// unique; debug and test builds fail at the first violation so the originating path is fixed.
+/// Release builds report every violation and remove only later owners (plus an otherwise orphaned
+/// adjacent result) rather than trapping a live session in a deterministic provider-400 loop.
+fn enforce_unique_tool_use_ids(
+    messages: Vec<ServedMessage>,
+    session_id: &str,
+) -> Vec<ServedMessage> {
+    let duplicates = duplicate_tool_use_locations(&messages);
+    if duplicates.is_empty() {
+        return messages;
+    }
+
+    for (id, message_index, block_index) in &duplicates {
+        eprintln!(
+            "mc-module: duplicate_tool_use_id session={} id={} message_index={} block_index={} action=drop_later",
+            session_id, id, message_index, block_index
+        );
+    }
+    debug_assert!(
+        duplicates.is_empty(),
+        "served output contains duplicate tool_use ids: {duplicates:?}"
+    );
+
+    #[cfg(not(debug_assertions))]
+    {
+        let mut messages = messages;
+        let mut remove_positions = duplicates
+            .iter()
+            .map(|(_, message_index, block_index)| (*message_index, *block_index))
+            .collect::<HashSet<_>>();
+        for (id, message_index, _) in &duplicates {
+            let owner_becomes_empty = messages[*message_index]
+                .content
+                .iter()
+                .enumerate()
+                .all(|(block_index, _)| remove_positions.contains(&(*message_index, block_index)));
+            if !owner_becomes_empty {
+                continue;
+            }
+            if let Some(result) = messages.get(message_index + 1) {
+                for (block_index, block) in result.content.iter().enumerate() {
+                    if matches!(
+                        &block.kind,
+                        ck_wire::CkKind::ToolResult { id: result_id, .. } if result_id == id
+                    ) {
+                        remove_positions.insert((message_index + 1, block_index));
+                    }
+                }
+            }
+        }
+
+        let original = std::mem::take(&mut messages);
+        for (message_index, served) in original.into_iter().enumerate() {
+            if !remove_positions
+                .iter()
+                .any(|(owner_index, _)| *owner_index == message_index)
+            {
+                messages.push(served);
+                continue;
+            }
+            let mut rendered = served.into_message();
+            rendered.content = rendered
+                .content
+                .into_iter()
+                .enumerate()
+                .filter_map(|(block_index, block)| {
+                    (!remove_positions.contains(&(message_index, block_index))).then_some(block)
+                })
+                .collect();
+            if !rendered.content.is_empty() {
+                messages.push(ServedMessage::from_message(rendered));
+            }
+        }
+        messages
+    }
+    #[cfg(debug_assertions)]
+    messages
+}
+
 fn apply_serializer_residual_to_message(
     profile: SerializerProfile,
     provider_id: Option<&str>,
@@ -6634,7 +6755,7 @@ fn build_output_with_tags(
         prev_assistant = served.role == "assistant";
         out.push(served);
 
-        if synthetic_todo_enabled {
+        if synthetic_todo_enabled && !inserted_synthetic_todo {
             if let Some(pair) = meta
                 .synthetic_todo
                 .as_ref()
@@ -6685,6 +6806,8 @@ fn build_output_with_tags(
             "claude-code-anthropic synthetic prefix must not contain system-role messages"
         );
     }
+
+    out = enforce_unique_tool_use_ids(out, &req.session_id);
 
     Ok(BuiltOutput {
         messages: out,
@@ -7845,10 +7968,19 @@ mod tests {
 
     /// Run a transform with a default producer context (project "git:proj", a nonexistent
     /// docs dir, now_ms=0). Most tests don't vary the context.
+    fn assert_no_duplicate_tool_use_ids(messages: &[ServedMessage]) {
+        assert!(
+            duplicate_tool_use_locations(messages).is_empty(),
+            "served array contains duplicate tool_use ids"
+        );
+    }
+
     fn run(s: &McStore, req: &TransformRequest, d: &[ReductionDecision]) -> TransformResponse {
         let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
         ctx.injected_reductions = d.to_vec();
-        transform(s, req, &ctx).unwrap()
+        let response = transform(s, req, &ctx).unwrap();
+        assert_no_duplicate_tool_use_ids(response.messages());
+        response
     }
 
     #[test]
@@ -11595,6 +11727,75 @@ mod tests {
             serde_json::to_value(emitted).unwrap(),
             serde_json::to_value(&empty.ck).unwrap()
         );
+    }
+
+    #[test]
+    fn synthetic_todo_anchor_is_inserted_once_for_repeated_empty_mid() {
+        let core = CoreState {
+            frozen_units: vec![
+                synth_region("m0", "m0".to_string()),
+                synth_region("m1", "m1".to_string()),
+            ],
+            ..Default::default()
+        };
+        let pair = crate::injection::build_synthetic_todo_pair(
+            r#"[{"content":"once","status":"pending","priority":"high"}]"#,
+        )
+        .unwrap()
+        .freeze_at(Some("anchor".to_string()));
+        let meta = ModuleMeta {
+            synthetic_todo: Some(pair.clone()),
+            ..Default::default()
+        };
+        let request = req(
+            "duplicate-empty-anchor",
+            "cfg0",
+            vec![empty_message("anchor", 1), empty_message("anchor", 2)],
+        );
+        let projection = project_messages(&request.messages).unwrap();
+
+        let output = build_output(&core, &meta, &projection, &request, None, true, None).unwrap();
+        let count = output
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|block| {
+                matches!(
+                    &block.kind,
+                    ck_wire::CkKind::ToolCall { id, .. } if id == &pair.call_id
+                )
+            })
+            .count();
+
+        assert_eq!(count, 1);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "served output contains duplicate tool_use ids")]
+    fn duplicate_tool_use_belt_panics_in_test_builds() {
+        let messages = vec![
+            ServedMessage::from_message(assistant_tool_call("one", 1, "duplicate").ck),
+            ServedMessage::from_message(assistant_tool_call("two", 2, "duplicate").ck),
+        ];
+        let _ = enforce_unique_tool_use_ids(messages, "belt-test");
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn duplicate_tool_use_belt_drops_later_owner_and_result_in_release() {
+        let messages = vec![
+            ServedMessage::from_message(assistant_tool_call("one", 1, "duplicate").ck),
+            ServedMessage::from_message(tool_result("one-result", 2, "duplicate", "first").ck),
+            ServedMessage::from_message(assistant_tool_call("two", 3, "duplicate").ck),
+            ServedMessage::from_message(tool_result("two-result", 4, "duplicate", "second").ck),
+        ];
+
+        let healed = enforce_unique_tool_use_ids(messages, "belt-release-test");
+
+        assert!(duplicate_tool_use_locations(&healed).is_empty());
+        assert_eq!(healed.len(), 2);
+        assert_eq!(healed[0].meta.harness_id.as_deref(), Some("one"));
+        assert_eq!(healed[1].meta.harness_id.as_deref(), Some("one-result"));
     }
 
     #[test]
@@ -16679,6 +16880,122 @@ mod tests {
             .iter()
             .map(|message| message.canonical_bytes().to_vec())
             .collect()
+    }
+
+    #[test]
+    fn warm_cache_selection_bust_does_not_replay_collapsed_synthetic_todo_as_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .replace_compartments("duplicate-tool-use", &[comp(1, 1, 1, "covered", "summary")])
+            .unwrap();
+        let cache = Mutex::new(SerializedOutputCache::new(1024 * 1024));
+        let context = smart_pctx();
+        let todos = json!([{
+            "content": "Preserve one synthetic pair",
+            "status": "pending",
+            "priority": "high"
+        }]);
+        let base_messages = vec![
+            item("covered", 1, "covered raw"),
+            todowrite_call("todo-owner", 2, todos),
+            assistant_tool_call("live-call", 3, "toolu_live"),
+            tool_result("live-result", 4, "toolu_live", &"large output ".repeat(500)),
+        ];
+        let base_request = active_cc_req("duplicate-tool-use", "cfg0", base_messages.clone());
+        let estimate = |value: &str| value.len();
+
+        let boot =
+            apply_once_with_estimator(&store, &base_request, &context, estimate, Some(&cache))
+                .unwrap();
+        assert_eq!(boot.response.action, "HARD");
+        let pair = store
+            .load("duplicate-tool-use")
+            .unwrap()
+            .meta
+            .synthetic_todo
+            .expect("bust freezes synthetic todo pair");
+
+        // OpenCode collapses the pair to one tool part. The pre-fix adapter replayed that part
+        // without CK's synthetic bit, so the durable pair and this apparent live owner shared an id.
+        let mut collapsed = pair.assistant_msg.clone();
+        collapsed.content.extend(pair.tool_msg.content.clone());
+        collapsed.meta = ck_wire::HarnessMeta {
+            harness_id: Some("collapsed-todo-replay".to_string()),
+            ordinal: Some(5),
+            ..Default::default()
+        };
+        let mut replay_messages = base_messages;
+        replay_messages.push(CkIngressMessage {
+            mid: "collapsed-todo-replay".to_string(),
+            ordinal: 5,
+            ck: collapsed,
+        });
+        let replay_request = active_cc_req("duplicate-tool-use", "cfg0", replay_messages);
+
+        let warm =
+            apply_once_with_estimator(&store, &replay_request, &context, estimate, Some(&cache))
+                .unwrap();
+        assert_eq!(warm.response.action, "SOFT+");
+        assert_no_duplicate_tool_use_ids(warm.response.messages());
+        assert!(
+            cache
+                .lock()
+                .unwrap()
+                .stats("duplicate-tool-use")
+                .reused_items
+                > 0
+        );
+
+        store
+            .append_pending_agent_drops(
+                "duplicate-tool-use",
+                &["live-call#0".to_string(), "live-result#0".to_string()],
+                1,
+            )
+            .unwrap();
+        let selection_request = with_usage(replay_request, 70, 100);
+        let mut selection_context = smart_pctx();
+        selection_context.injected_reductions = with_reductions(vec![
+            reduce("live-call#0", "skeleton", "read [dropped]"),
+            reduce("live-result#0", "drop", "[dropped]"),
+        ]);
+        let selected = apply_once_with_estimator(
+            &store,
+            &selection_request,
+            &selection_context,
+            estimate,
+            Some(&cache),
+        )
+        .unwrap();
+
+        assert_eq!(selected.response.action, "SOFT");
+        assert_eq!(
+            selected.response.materialize_reason.as_deref(),
+            Some("selection")
+        );
+        assert!(store
+            .load_pending_agent_drops("duplicate-tool-use")
+            .unwrap()
+            .is_empty());
+        assert_no_duplicate_tool_use_ids(selected.response.messages());
+        let ids = selected
+            .response
+            .messages()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match &block.kind {
+                ck_wire::CkKind::ToolCall { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids.iter()
+                .filter(|id| **id == pair.call_id.as_str())
+                .count(),
+            1,
+            "the frozen synthetic owner is served exactly once"
+        );
     }
 
     #[test]

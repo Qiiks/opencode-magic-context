@@ -899,6 +899,10 @@ fn is_synthetic_message(parts: &[Value]) -> bool {
             part.get("synthetic")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
+                || part
+                    .get("syntheticTodoMarker")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
         })
 }
 
@@ -967,6 +971,28 @@ mod tests {
             encode_opencode(&[decoded.messages[0].ck.clone()], &decoded.sidecar),
             raw
         );
+    }
+
+    #[test]
+    fn synthetic_todo_marker_survives_collapsed_pair_decode() {
+        let raw = vec![json!({
+            "info": { "id": "msg_todo", "role": "assistant" },
+            "parts": [{
+                "type": "tool",
+                "tool": "todowrite",
+                "callID": "mc_synthetic_todo_deadbeefdeadbeef",
+                "syntheticTodoMarker": true,
+                "state": {
+                    "status": "completed",
+                    "input": { "todos": [] },
+                    "output": "[]"
+                }
+            }]
+        })];
+
+        let decoded = decode_opencode(&raw);
+
+        assert!(decoded.messages[0].ck.meta.synthetic);
     }
 
     #[test]
