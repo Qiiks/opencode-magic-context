@@ -2813,7 +2813,7 @@ pub struct UserHintDecisionInput {
 #[derive(Debug, Default)]
 pub struct TransformOverlayBatch<'a> {
     pub max_seen_ordinal: Option<u64>,
-    pub tag_mints: &'a [TagMintInput],
+    pub tag_mints: &'a [McTagRow],
     pub temporal_marks: &'a [TemporalMarkInput],
     pub user_hint: Option<&'a UserHintDecisionInput>,
     pub channel1_append: Option<&'a Channel1AppendRow>,
@@ -12170,10 +12170,12 @@ mod tests {
             .unwrap();
 
         let split_state = store.load("ses").unwrap();
-        let tag_mints = [TagMintInput {
+        let tag_mints = [McTagRow {
+            tag_number: 1,
             block_id: "m1#0".to_string(),
             kind: "message".to_string(),
             token_count: 4,
+            created_at_ms: 10,
             source_bytes: b"authored text".to_vec(),
         }];
         let temporal_marks = [TemporalMarkInput {
@@ -12246,10 +12248,12 @@ mod tests {
             .commit("ses", stale.row_version, &stale.core, &stale.meta)
             .unwrap();
 
-        let tags = [TagMintInput {
+        let tags = [McTagRow {
+            tag_number: 1,
             block_id: "m1#0".to_string(),
             kind: "message".to_string(),
             token_count: 1,
+            created_at_ms: 1,
             source_bytes: b"text".to_vec(),
         }];
         let marks = [TemporalMarkInput {
