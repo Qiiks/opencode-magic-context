@@ -124,6 +124,10 @@ interface RustSessionState extends ModuleStateSyncState {
     parked: boolean;
     passesSincePark: number;
     warningSent: boolean;
+    /** Set when the module answered need_full_sync: the next pass must send the
+     * full wire array (delta eligibility bypassed) until a pass applies. Wire-layer
+     * only — never triggers a state re-seed. */
+    forceFullWire: boolean;
     ordinalMemoAnchor: RawMessageOrdinalAnchor | null;
     ordinalMemoStoredCount: number | null;
     ordinalMemoCanonicalCount: number;
@@ -394,6 +398,7 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             parked: false,
             passesSincePark: 0,
             warningSent: false,
+            forceFullWire: false,
             ordinalMemoAnchor: null,
             ordinalMemoStoredCount: null,
             ordinalMemoCanonicalCount: 0,
@@ -1075,7 +1080,11 @@ export function createRustModeTransform(
                       nativeAfter: string;
                   }
                 | undefined;
-            if (previousWireCache && messages.length >= previousWireCache.rawCount) {
+            if (
+                !state.forceFullWire &&
+                previousWireCache &&
+                messages.length >= previousWireCache.rawCount
+            ) {
                 const appending = messages.length > previousWireCache.rawCount;
                 const lastMessage = messages.at(-1);
                 // Delta transport is only sound when the prefix the module would reuse is
@@ -1316,7 +1325,74 @@ export function createRustModeTransform(
                 channel2NudgeState: String(passInputs.channel2_nudge_state ?? ""),
                 emergencyRecoveryArmed: passInputs.emergency_recovery_armed === true,
             });
-            const pages = buildPagedModuleTransformPayloads(body);
+            let pages = buildPagedModuleTransformPayloads(body);
+            if (wireDelta && pages.length > 1) {
+                // A delta that needs paging has lost its reason to exist — and page
+                // frames carrying tail_delta as a scalar field can hit the module's
+                // delta-expansion gate before page reassembly completes, poisoning
+                // the page coordinator and looping need_full_sync forever (the SUBC
+                // incident). Fall back to a plain full send instead.
+                wireDelta = undefined;
+                // The delta-path ordinal resolve annotated only the tail slice;
+                // the full send must re-resolve the whole array.
+                const fullResolved = await resolveOrdinalsForModule({
+                    sessionId,
+                    messages,
+                    generation: state.shadowGeneration,
+                    memoGeneration: state.idOrdinalMemoGeneration,
+                    memo: state.idOrdinalMemo,
+                    memoAnchor: state.ordinalMemoAnchor,
+                    memoStoredCount: state.ordinalMemoStoredCount,
+                    memoCanonicalCount: state.ordinalMemoCanonicalCount,
+                });
+                if (!fullResolved.ok) {
+                    throw new Error(
+                        `rust ordinal ${fullResolved.reason} during delta-page full fallback`,
+                    );
+                }
+                state.idOrdinalMemoGeneration = fullResolved.memoGeneration;
+                state.ordinalMemoAnchor = fullResolved.memoAnchor;
+                state.ordinalMemoStoredCount = fullResolved.memoStoredCount;
+                state.ordinalMemoCanonicalCount = fullResolved.memoCanonicalCount;
+                const fullEncoded = encodeOpenCodeMessagesToCk(fullResolved.annotatedInput);
+                const fullCk = buildWireFingerprint(fullEncoded);
+                const fullNative = buildWireFingerprint(messages);
+                const fullRawLast = messages.at(-1);
+                pendingWireCache = {
+                    rawCount: messages.length,
+                    wireCount: fullEncoded.length,
+                    rawLastId: fullRawLast ? messageIdOf(fullRawLast) : null,
+                    rawLastSignature: fullRawLast ? messageCacheSignature(fullRawLast) : null,
+                    rawLastVisible:
+                        fullRawLast !== undefined &&
+                        fullEncoded.some((entry) => entry.mid === messageIdOf(fullRawLast)),
+                    ckFingerprint: fullCk.fingerprint,
+                    ckPrefixFingerprintBeforeLast: fullCk.prefixFingerprintBeforeLast,
+                    nativeFingerprint: fullNative.fingerprint,
+                    nativePrefixFingerprintBeforeLast: fullNative.prefixFingerprintBeforeLast,
+                    rawLightSignatures: lightSignaturesFor(messages),
+                    fingerprint: `${fullCk.fingerprint}|${fullNative.fingerprint}`,
+                };
+                body = buildTransformBody({
+                    sessionId,
+                    input: fullEncoded,
+                    nativeMessages: messages,
+                    fullArrayFingerprint: pendingWireCache.fingerprint,
+                    passInputs,
+                    usage: passUsage(usage, contextLimit),
+                    modelKey: modelKey ?? null,
+                    providerId: model?.providerID ?? null,
+                    systemPromptHash: sessionMeta.systemPromptHash ?? "",
+                    upgradeState: String(passInputs.upgrade_state ?? ""),
+                    midTurn,
+                    prevResponseCompletedAtMs:
+                        sessionMeta.lastResponseTime > 0 ? sessionMeta.lastResponseTime : undefined,
+                    requestObservedAtMs,
+                    channel2NudgeState: String(passInputs.channel2_nudge_state ?? ""),
+                    emergencyRecoveryArmed: passInputs.emergency_recovery_armed === true,
+                });
+                pages = buildPagedModuleTransformPayloads(body);
+            }
             logStage(
                 sessionId,
                 "wireBuild",
@@ -1347,21 +1423,14 @@ export function createRustModeTransform(
             if (!response) throw new Error("rust module returned no transform response");
             captureResponseTelemetry(response);
             if (isNeedFullSync(response)) {
-                state.initialized = false;
-                const retryStateSyncStartedAt = performance.now();
-                await syncModuleState({
-                    client: { call: callModule },
-                    state,
-                    pass: syncPass,
-                    projectRoot,
-                    force: true,
-                    options: {
-                        authority: true,
-                        authorityState: state.memoryAuthorityReady ? "MODULE" : undefined,
-                        authoritySeqAdoption,
-                    },
-                });
-                logStage(sessionId, "stateSync", retryStateSyncStartedAt, timings, "retry=full");
+                // need_full_sync is a WIRE-layer miss: the module (often freshly
+                // restarted, with its process-local Ready snapshot gone) cannot
+                // reconstruct the array from a tail delta. It says nothing about
+                // context.db state — the module's durable store survives restarts —
+                // so this arm must NOT re-seed state. A full state re-seed here
+                // cost 19-74s per pass on a live session (the SUBC loop) and
+                // hammered the module hard enough to crash-loop it.
+                state.forceFullWire = true;
                 if (wireDelta) {
                     const retryOrdinalStartedAt = performance.now();
                     const retryResolved = await resolveOrdinalsForModule({
@@ -1467,6 +1536,13 @@ export function createRustModeTransform(
                 }
                 if (!response) throw new Error("rust module returned no retry transform response");
                 captureResponseTelemetry(response);
+                if (isNeedFullSync(response)) {
+                    // The retry was a genuine full send; a second need_full_sync means
+                    // the module cannot serve at all. Throwing routes this through the
+                    // failure ladder (LKG replay now, park after three) instead of
+                    // letting an empty-output response masquerade as a served pass.
+                    throw new Error("rust module still requires full sync after a full-array send");
+                }
             }
             if (newestMessageId) {
                 writeRustTransformDecision({
@@ -1562,6 +1638,9 @@ export function createRustModeTransform(
             state.parked = false;
             state.passesSincePark = 0;
             state.warningSent = false;
+            // An applied pass proves the module reconstructed the wire; delta
+            // transport may resume on the next pass.
+            state.forceFullWire = false;
 
             const directiveText = directiveTextOf(response);
             if (syntheticTurn) {
