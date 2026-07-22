@@ -23,7 +23,7 @@
           "default": {
             "enabled": false
           },
-          "description": "Experimental mural: a single rendered image of project memories that did not fit the context budget.",
+          "description": "Experimental mural: a single deterministically-rendered image of project memories that did not fit the context budget. Cues are compressed per-memory by the compress-cues dreamer task.",
           "type": "object",
           "properties": {
             "enabled": {
@@ -31,6 +31,7 @@
               "type": "boolean"
             },
             "model": {
+              "description": "Model for the compress-cues task that compresses each memory into a mural cue. The mural image itself is rendered deterministically (no author model).",
               "type": "string",
               "minLength": 1
             }
@@ -399,8 +400,8 @@
               "schedule": "0 4 * * 0",
               "timeout_minutes": 20
             },
-            "render-mural": {
-              "schedule": "0 4 * * 0",
+            "compress-cues": {
+              "schedule": "0 4 * * *",
               "timeout_minutes": 20
             },
             "classify-memories": {
@@ -636,9 +637,9 @@
                 }
               }
             },
-            "render-mural": {
+            "compress-cues": {
               "default": {
-                "schedule": "0 4 * * 0",
+                "schedule": "0 4 * * *",
                 "timeout_minutes": 20
               },
               "type": "object",

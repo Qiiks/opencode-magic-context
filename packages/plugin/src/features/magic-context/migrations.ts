@@ -2446,6 +2446,32 @@ const MIGRATIONS: Migration[] = [
             ensureColumn(db, "mural_manifest", "height", "INTEGER NOT NULL DEFAULT 1092");
         },
     },
+    {
+        version: 65,
+        description:
+            "Add per-memory mural cue columns for the deterministic cue-compression cutover",
+        up(db: Database): void {
+            // The mural cutover moves cue compression off the single-shot author
+            // LLM onto a per-memory cached pure function: the compress-cues dreamer
+            // task writes one pidgin cue per memory, and resolveMural + renderMural
+            // pack them deterministically at inject time. These three columns cache
+            // that cue per memory content version.
+            //
+            //   mural_cue      — the compressed pidgin cue text (NULL until computed)
+            //   mural_cue_hash — sha256 of the memory CONTENT the cue was computed
+            //                    FROM, so an edited memory's stale cue is detected
+            //                    (mural_cue_hash != sha256(content)) and recompressed
+            //   mural_cue_at   — epoch ms the cue was written (telemetry / recency)
+            //
+            // Sparse legacy databases may not have the memories table yet; boot
+            // initialization creates it, and the ensureColumn calls in storage-db
+            // heal upgraded DBs that miss a migration row.
+            if (!tableExists(db, "memories")) return;
+            ensureColumn(db, "memories", "mural_cue", "TEXT");
+            ensureColumn(db, "memories", "mural_cue_hash", "TEXT");
+            ensureColumn(db, "memories", "mural_cue_at", "INTEGER");
+        },
+    },
 ];
 
 /**

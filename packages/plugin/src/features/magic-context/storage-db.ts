@@ -46,7 +46,7 @@ export function getSchemaFenceRejection(): {
     return lastSchemaFenceRejection;
 }
 
-export const LATEST_SUPPORTED_VERSION = 64;
+export const LATEST_SUPPORTED_VERSION = 65;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -645,6 +645,9 @@ export function initializeDatabase(db: Database): void {
       verification_status TEXT DEFAULT 'unverified',
       verified_at INTEGER,
       classified_at INTEGER,
+      mural_cue TEXT,
+      mural_cue_hash TEXT,
+      mural_cue_at INTEGER,
       superseded_by_memory_id INTEGER,
       merged_from TEXT,
       metadata_json TEXT,
@@ -1393,6 +1396,11 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "recomp_compartments", "episode_type", "TEXT");
     ensureColumn(db, "memories", "importance", "INTEGER");
     ensureColumn(db, "memories", "classified_at", "INTEGER");
+    // Per-memory mural cue cache (v65): the compress-cues dreamer task writes a
+    // compressed pidgin cue per memory content version; resolveMural reads them.
+    ensureColumn(db, "memories", "mural_cue", "TEXT");
+    ensureColumn(db, "memories", "mural_cue_hash", "TEXT");
+    ensureColumn(db, "memories", "mural_cue_at", "INTEGER");
     ensureColumn(db, "memory_verifications", "mapped_at", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "cached_m0_bytes", "BLOB");
     ensureColumn(db, "session_meta", "cached_m0_project_memory_epoch", "INTEGER");

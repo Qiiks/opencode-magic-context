@@ -434,6 +434,9 @@ interface RunPostTransformPhaseArgs {
         historyBudgetTokens?: number;
         temporalAwareness?: boolean;
         hardSignals?: M0HardSignals;
+        /** experimental.mural.enabled — drives the on-demand deterministic mural
+         *  render inside the HARD fold. */
+        muralEnabled?: boolean;
     };
 }
 
@@ -1105,6 +1108,7 @@ export async function runPostTransformPhase(
                 temporalAwareness: args.m0M1.temporalAwareness,
                 isCacheBustingPass,
                 hardSignals: args.m0M1.hardSignals,
+                muralEnabled: args.m0M1.muralEnabled,
             });
             if (result.injected) {
                 m0M1InjectedThisPass = true;

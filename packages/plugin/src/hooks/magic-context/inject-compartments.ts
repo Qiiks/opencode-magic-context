@@ -22,6 +22,8 @@ import {
     readNewMemoriesForM1Union,
 } from "../../features/magic-context/memory/storage-memory";
 import type { Memory } from "../../features/magic-context/memory/types";
+import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
+import type { MuralWireOptions } from "../../features/magic-context/mural/resolve-mural";
 import { getMural, muralDataUrl } from "../../features/magic-context/mural/storage-mural";
 import {
     computeProjectDocsHash,
@@ -642,8 +644,16 @@ export interface M0M1RenderOptions {
     userProfileBudgetTokens?: number;
     temporalAwareness?: boolean;
     /** Experimental image injection. The caller resolves model capability from
-     * the models.dev metadata; unknown capability means no image is injected. */
+     * the models.dev metadata; unknown capability means no image is injected.
+     * Normally left undefined: the mural is now rendered ON DEMAND inside the
+     * HARD fold from `muralEnabled` + the fold's model key (see resolveMuralWire),
+     * so the injected data-url only swaps on a natural fold. Tests may still pass
+     * an explicit `mural` to drive the render deterministically. */
     mural?: { enabled: boolean; supportsVision: boolean; dataUrl?: string; contentHash?: string };
+    /** Experimental mural feature switch (experimental.mural.enabled). When true
+     * and the fold's model accepts images, materializeM0 resolves + renders the
+     * deterministic mural on demand and folds its image into the m[0] baseline. */
+    muralEnabled?: boolean;
     isCacheBustingPass?: boolean;
     /** Provider-side cache-eviction signals for HARD-bust detection. */
     hardSignals?: M0HardSignals;
@@ -1575,6 +1585,22 @@ function historySliceTokens(m0Text: string): number {
     return slice ? estimateTokens(slice) : 0;
 }
 
+/**
+ * Resolve the mural wire options for a HARD fold: no image unless the mural
+ * feature is enabled AND this fold's model accepts images. Renders the
+ * deterministic mural on demand (cheap change-detection; PNG only on change).
+ * Returns undefined when the feature is off so renderM0 skips the block cleanly.
+ */
+function resolveMuralForM0(
+    options: M0M1RenderOptions,
+    projectPath: string | undefined,
+    modelKey: string,
+    budgetTokens: number,
+): MuralWireOptions | undefined {
+    if (!options.muralEnabled) return undefined;
+    return resolveMuralWire(options.db, projectPath, modelKey, true, budgetTokens);
+}
+
 export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
     const projectPath = options.projectPath;
     const projectDirectory = options.projectDirectory ?? projectPath ?? "";
@@ -1672,6 +1698,13 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
               memoryRenderOptions,
           )
         : trimMemoriesToBudgetV2(options.sessionId, memories, memoryBudget);
+    // On-demand mural: an explicit test-supplied `mural` wins; otherwise resolve
+    // it from the feature flag + this fold's model key. Runs INSIDE the HARD fold
+    // (not on defers), so the injected image only swaps on a natural fold — the
+    // baked-in cachedM0MuralDataUrl replays on defer passes.
+    const mural =
+        options.mural ??
+        resolveMuralForM0(options, projectPath, snapshotMarkers.modelKey, memoryBudget);
     let decayPressureMultiplier = 1;
     let m0Text = renderM0({
         projectDocs: docs.renderedBlock,
@@ -1683,7 +1716,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         historyBudgetTokens: options.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
         userProfileBudgetTokens: options.userProfileBudgetTokens,
         decayPressureMultiplier,
-        mural: options.mural,
+        mural,
     });
 
     let attempts = 0;
@@ -1700,7 +1733,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             historyBudgetTokens: budget,
             userProfileBudgetTokens: options.userProfileBudgetTokens,
             decayPressureMultiplier,
-            mural: options.mural,
+            mural,
         });
         attempts += 1;
     }
@@ -1708,13 +1741,9 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
     if (m0Text.length === 0) m0Text = M0_EMPTY_BODY;
     const m0Bytes = Buffer.from(m0Text, "utf8");
     options.state.cachedM0MuralDataUrl =
-        options.mural?.enabled && options.mural.supportsVision
-            ? (options.mural.dataUrl ?? null)
-            : null;
+        mural?.enabled && mural.supportsVision ? (mural.dataUrl ?? null) : null;
     options.state.cachedM0MuralHash =
-        options.mural?.enabled && options.mural.supportsVision
-            ? (options.mural.contentHash ?? null)
-            : null;
+        mural?.enabled && mural.supportsVision ? (mural.contentHash ?? null) : null;
     snapshotMarkers.muralHash = options.state.cachedM0MuralHash;
     snapshotMarkers.materializedAt = foldMaterializedAt;
     const renderedMemoryIds = trimmed.renderOrder.map((m) => m.id);
@@ -2406,6 +2435,9 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
           )
         : trimMemoriesToBudgetV2(options.sessionId, memories, memoryBudget);
     const budget = options.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
+    const mural =
+        options.mural ??
+        resolveMuralForM0(options, projectPath, snapshotMarkers.modelKey, memoryBudget);
     let decayPressureMultiplier = 1;
     let m0Text = renderM0({
         projectDocs: docs.renderedBlock,
@@ -2417,7 +2449,7 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
         historyBudgetTokens: budget,
         userProfileBudgetTokens: options.userProfileBudgetTokens,
         decayPressureMultiplier,
-        mural: options.mural,
+        mural,
     });
     let attempts = 0;
     while (budget > 0 && historySliceTokens(m0Text) > budget * 1.05 && attempts < 3) {
@@ -2432,19 +2464,15 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
             historyBudgetTokens: budget,
             userProfileBudgetTokens: options.userProfileBudgetTokens,
             decayPressureMultiplier,
-            mural: options.mural,
+            mural,
         });
         attempts += 1;
     }
     if (m0Text.length === 0) m0Text = M0_EMPTY_BODY;
     options.state.cachedM0MuralDataUrl =
-        options.mural?.enabled && options.mural.supportsVision
-            ? (options.mural.dataUrl ?? null)
-            : null;
+        mural?.enabled && mural.supportsVision ? (mural.dataUrl ?? null) : null;
     options.state.cachedM0MuralHash =
-        options.mural?.enabled && options.mural.supportsVision
-            ? (options.mural.contentHash ?? null)
-            : null;
+        mural?.enabled && mural.supportsVision ? (mural.contentHash ?? null) : null;
     snapshotMarkers.muralHash = options.state.cachedM0MuralHash;
     return {
         m0Bytes: Buffer.from(m0Text, "utf8"),

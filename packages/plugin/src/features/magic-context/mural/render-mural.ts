@@ -8,38 +8,31 @@ export const MURAL_CELL_HEIGHT = 8;
 export const MURAL_LINE_PITCH = 9;
 export const MURAL_COLUMNS = 3;
 export const MURAL_COLUMN_GAP = 1;
+/** Character width of one column. High-importance cues can be up to 90 chars, so
+ *  a cue wider than this wraps across lines (word-wrap) rather than truncating —
+ *  this restores the true three-column fill the single-column port lost. */
 export const MURAL_ROOM_WIDTH = 72;
 export const MURAL_ROWS = Math.floor(MURAL_HEIGHT / MURAL_LINE_PITCH);
 export const MURAL_LINE_CAPACITY = MURAL_COLUMNS * MURAL_ROWS;
 
-export const MURAL_CATEGORY_ORDER = [
-    "PROJECT_RULES",
-    "ARCHITECTURE",
-    "CONSTRAINTS",
-    "CONFIG_VALUES",
-    "NAMING",
-] as const;
+export type MuralCategory = string;
 
-export type MuralCategory = (typeof MURAL_CATEGORY_ORDER)[number] | string;
-
-export interface MuralSpecEntry {
+/** A flat mural entry to render. No rooms, no merges — resolveMural produces a
+ *  pre-ordered flat list (category band → importance DESC → id ASC) and the
+ *  renderer packs it deterministically into the fixed image. */
+export interface MuralRenderEntry {
     id: number;
     category: MuralCategory;
-    room: string;
-    cue?: string | string[];
-    mergeInto?: number;
     importance: number;
+    cue: string;
 }
 
 export interface MuralLayoutItem {
-    kind: "category" | "room";
+    kind: "category" | "entry";
     category: MuralCategory;
-    room?: string;
     column: number;
     startLine: number;
     endLine: number;
-    continuation?: boolean;
-    segment?: number;
 }
 
 export interface MuralRenderResult {
@@ -47,19 +40,18 @@ export interface MuralRenderResult {
     dataUrl: string;
     muralText: string;
     sha256Input: string;
-    placements: Map<
-        number,
-        { category: MuralCategory; room: string; column: number; line: number; mergedInto?: number }
-    >;
+    placements: Map<number, { category: MuralCategory; column: number; line: number }>;
     layoutItems: MuralLayoutItem[];
     renderedIds: number[];
-    droppedByTrimIds: number[];
-    droppedBySkipIds: number[];
+    /** Entries trimmed because the fixed image filled before reaching them. */
+    droppedIds: number[];
     categoryLineUsage: Record<string, number>;
+    /** Content lines actually placed in the grid (excludes blank cells). Used to
+     *  assert the three-column fill occupancy. */
+    filledLineCount: number;
 }
 
 type Cursor = { column: number; row: number };
-type Room = { category: MuralCategory; name: string; entries: MuralSpecEntry[] };
 
 const CATEGORY_COLORS: Record<string, readonly [number, number, number]> = {
     PROJECT_RULES: [24, 58, 112],
@@ -70,19 +62,9 @@ const CATEGORY_COLORS: Record<string, readonly [number, number, number]> = {
 };
 const BODY_INK: readonly [number, number, number] = [18, 20, 24];
 const PROHIBITION_INK: readonly [number, number, number] = [148, 28, 35];
-const ROOM_MARKER = "▰";
 
 function codepoints(value: string): number {
     return [...value].length;
-}
-
-function categoryIndex(category: MuralCategory): number {
-    const index = MURAL_CATEGORY_ORDER.indexOf(category as (typeof MURAL_CATEGORY_ORDER)[number]);
-    return index >= 0 ? index : MURAL_CATEGORY_ORDER.length;
-}
-
-function cueText(entry: MuralSpecEntry): string {
-    return Array.isArray(entry.cue) ? entry.cue.join("; ") : (entry.cue ?? "");
 }
 
 function escapeText(value: string): string {
@@ -94,47 +76,125 @@ function escapeText(value: string): string {
 
 function banner(category: MuralCategory): string {
     const label = ` <${category}> `;
-    if (codepoints(label) > MURAL_ROOM_WIDTH)
-        throw new Error(`category banner exceeds room width: ${category}`);
+    if (codepoints(label) > MURAL_ROOM_WIDTH) {
+        // A category name longer than a column is degenerate; hard-truncate the
+        // banner rather than throw — the deterministic renderer must never fail
+        // the m0 injection over a label width.
+        return label.slice(0, MURAL_ROOM_WIDTH);
+    }
     const remaining = MURAL_ROOM_WIDTH - codepoints(label);
     return `${"─".repeat(Math.floor(remaining / 2))}${label}${"─".repeat(Math.ceil(remaining / 2))}`;
 }
 
-function wrapCue(cue: string): string[] {
-    const words = cue.split(/\s+/).filter(Boolean);
-    if (words.length === 0) throw new Error("mural cue is empty");
+/** Hard-break a single token wider than the column into column-width slices, so
+ *  a long verbatim path/hash in a cue can never overrun a line (word-wrap alone
+ *  can't split an unbreakable token). */
+function breakLongToken(token: string, width: number): string[] {
+    const chars = [...token];
+    if (chars.length <= width) return [token];
+    const slices: string[] = [];
+    for (let i = 0; i < chars.length; i += width) {
+        slices.push(chars.slice(i, i + width).join(""));
+    }
+    return slices;
+}
+
+/**
+ * Word-wrap one cue into bullet lines that fit the column width. The first line
+ * is bulleted (`•`), continuations are indented one space. Shape adapted from
+ * the visual-memory experiment's appendEntry, hardened to hard-break an
+ * over-wide single token instead of throwing.
+ */
+function wrapCue(cue: string, width: number): string[] {
+    const words = escapeText(cue)
+        .split(/\s+/)
+        .filter(Boolean)
+        .flatMap((word) => breakLongToken(word, width - 1));
+    if (words.length === 0) return ["•"];
     const lines: string[] = [];
     let line = "•";
     for (const word of words) {
-        if (codepoints(word) >= MURAL_ROOM_WIDTH)
-            throw new Error(`mural cue anchor exceeds ${MURAL_ROOM_WIDTH} cells`);
-        const candidate = line === "•" ? `${line}${word}` : `${line} ${word}`;
-        if (codepoints(candidate) <= MURAL_ROOM_WIDTH) {
+        const separator = line === "•" || line === " " ? "" : " ";
+        const candidate = `${line}${separator}${word}`;
+        if (codepoints(candidate) <= width) {
             line = candidate;
-        } else {
-            lines.push(line);
-            line = ` ${word}`;
+            continue;
         }
+        lines.push(line);
+        line = ` ${word}`;
     }
     lines.push(line);
     return lines;
 }
 
-function roomLines(
-    room: Room,
-    selected: MuralSpecEntry[],
-): { lines: string[]; lineById: Map<number, number> } {
-    const lines = [`${ROOM_MARKER} — ${room.name} —`];
-    if (codepoints(lines[0]!) > MURAL_ROOM_WIDTH)
-        throw new Error(`room header exceeds room width: ${room.name}`);
-    const lineById = new Map<number, number>();
-    for (const entry of selected) {
-        if (entry.mergeInto !== undefined) continue;
-        const body = wrapCue(escapeText(cueText(entry)));
-        lineById.set(entry.id, lines.length);
-        lines.push(...body);
+interface PlannedLine {
+    text: string;
+    /** Entry ids whose body starts on this line (two for a shared pair). */
+    entryIds: number[];
+    isBanner: boolean;
+    category: MuralCategory;
+}
+
+/**
+ * Build the flat line plan for the pre-ordered entries: a category banner at
+ * each band boundary, then the entries' cue lines with shared-pair packing (two
+ * short non-prohibition cues on one line — a density win) and word-wrap for the
+ * rest.
+ */
+function planLines(entries: readonly MuralRenderEntry[]): PlannedLine[] {
+    const lines: PlannedLine[] = [];
+    // Two short cues share a line as `•a • b`; each half gets at most half the
+    // column minus the bullets/separator overhead.
+    const shortEntryLimit = Math.floor((MURAL_ROOM_WIDTH - 4) / 2);
+
+    let currentCategory: string | null = null;
+    for (let index = 0; index < entries.length; index++) {
+        const entry = entries[index]!;
+        if (entry.category !== currentCategory) {
+            currentCategory = entry.category;
+            lines.push({
+                text: banner(entry.category),
+                entryIds: [],
+                isBanner: true,
+                category: entry.category,
+            });
+        }
+
+        const cue = escapeText(entry.cue);
+        const next = entries[index + 1];
+        const sameCategoryNext = next && next.category === entry.category;
+        const nextCue = sameCategoryNext ? escapeText(next.cue) : "";
+        const shared = `•${cue} • ${nextCue}`;
+        if (
+            sameCategoryNext &&
+            !cue.includes("⊘") &&
+            !nextCue.includes("⊘") &&
+            codepoints(cue) <= shortEntryLimit &&
+            codepoints(nextCue) <= shortEntryLimit &&
+            codepoints(shared) <= MURAL_ROOM_WIDTH
+        ) {
+            lines.push({
+                text: shared,
+                entryIds: [entry.id, next.id],
+                isBanner: false,
+                category: entry.category,
+            });
+            index++; // consumed the pair
+            continue;
+        }
+
+        const wrapped = wrapCue(cue, MURAL_ROOM_WIDTH);
+        wrapped.forEach((text, wrappedIndex) => {
+            lines.push({
+                text,
+                // Only the first wrapped line anchors the entry's placement.
+                entryIds: wrappedIndex === 0 ? [entry.id] : [],
+                isBanner: false,
+                category: entry.category,
+            });
+        });
     }
-    return { lines, lineById };
+    return lines;
 }
 
 function advance(cursor: Cursor): Cursor {
@@ -144,6 +204,94 @@ function advance(cursor: Cursor): Cursor {
 
 function atEnd(cursor: Cursor): boolean {
     return cursor.column >= MURAL_COLUMNS;
+}
+
+interface LayoutResult {
+    text: string;
+    grid: string[][];
+    placements: MuralRenderResult["placements"];
+    layoutItems: MuralLayoutItem[];
+    renderedIds: number[];
+    droppedIds: number[];
+    usage: Record<string, number>;
+    filledLineCount: number;
+}
+
+function renderLayout(entries: readonly MuralRenderEntry[]): LayoutResult {
+    const plan = planLines(entries);
+    const grid = Array.from({ length: MURAL_COLUMNS }, () =>
+        Array.from({ length: MURAL_ROWS }, () => ""),
+    );
+    const placements: MuralRenderResult["placements"] = new Map();
+    const layoutItems: MuralLayoutItem[] = [];
+    const renderedIds: number[] = [];
+    const placedIds = new Set<number>();
+    const usage: Record<string, number> = {};
+    let cursor: Cursor = { column: 0, row: 0 };
+    let filledLineCount = 0;
+
+    for (const line of plan) {
+        if (atEnd(cursor)) break;
+        // Never strand a category banner on the last row of a column — push it to
+        // the next column so its band isn't orphaned (mirrors the old room-header
+        // rule). A body line may take the last row.
+        if (line.isBanner && cursor.row === MURAL_ROWS - 1) {
+            cursor = advance(cursor);
+            if (atEnd(cursor)) break;
+        }
+
+        grid[cursor.column]![cursor.row] = line.text;
+        filledLineCount += 1;
+        usage[line.category] = (usage[line.category] ?? 0) + 1;
+        const placementLine = cursor.row + 1;
+        const placementColumn = cursor.column;
+        if (line.isBanner) {
+            layoutItems.push({
+                kind: "category",
+                category: line.category,
+                column: placementColumn,
+                startLine: placementLine,
+                endLine: placementLine,
+            });
+        }
+        for (const id of line.entryIds) {
+            placements.set(id, {
+                category: line.category,
+                column: placementColumn,
+                line: placementLine,
+            });
+            if (!placedIds.has(id)) {
+                placedIds.add(id);
+                renderedIds.push(id);
+            }
+            layoutItems.push({
+                kind: "entry",
+                category: line.category,
+                column: placementColumn,
+                startLine: placementLine,
+                endLine: placementLine,
+            });
+        }
+        cursor = advance(cursor);
+    }
+
+    const droppedIds = entries.filter((entry) => !placedIds.has(entry.id)).map((entry) => entry.id);
+
+    const textLines = Array.from({ length: MURAL_ROWS }, (_, row) =>
+        Array.from({ length: MURAL_COLUMNS }, (_, column) =>
+            (grid[column]?.[row] ?? "").padEnd(MURAL_ROOM_WIDTH),
+        ).join(" "),
+    );
+    return {
+        text: `${textLines.join("\n")}\n`,
+        grid,
+        placements,
+        layoutItems,
+        renderedIds,
+        droppedIds,
+        usage,
+        filledLineCount,
+    };
 }
 
 function crc32(bytes: Uint8Array): number {
@@ -330,225 +478,14 @@ function fillRect(
     }
 }
 
-function allocateCategoryBudgets(rooms: Room[]): Map<MuralCategory, number> {
-    const demand = new Map<MuralCategory, number>();
-    for (const room of rooms)
-        demand.set(room.category, (demand.get(room.category) ?? 0) + room.entries.length + 1);
-    const categories = [...new Set(rooms.map((room) => room.category))].sort(
-        (a, b) => categoryIndex(a) - categoryIndex(b),
-    );
-    const base = Math.floor(MURAL_LINE_CAPACITY / Math.max(1, MURAL_CATEGORY_ORDER.length));
-    const budgets = new Map<MuralCategory, number>();
-    let spare = MURAL_LINE_CAPACITY;
-    for (const category of categories) {
-        const amount = Math.min(base, demand.get(category) ?? 0);
-        budgets.set(category, amount);
-        spare -= amount;
-    }
-    while (spare > 0) {
-        const unmet = categories.filter(
-            (category) => (budgets.get(category) ?? 0) < (demand.get(category) ?? 0),
-        );
-        if (unmet.length === 0) break;
-        for (const category of unmet) {
-            if (spare <= 0) break;
-            budgets.set(category, (budgets.get(category) ?? 0) + 1);
-            spare--;
-        }
-    }
-    return budgets;
-}
-
-function renderLayout(specs: MuralSpecEntry[]): {
-    text: string;
-    grid: string[][];
-    placements: Map<
-        number,
-        MuralRenderResult["placements"] extends Map<number, infer V> ? V : never
-    >;
-    layoutItems: MuralLayoutItem[];
-    renderedIds: number[];
-    droppedByTrimIds: number[];
-    droppedBySkipIds: number[];
-    usage: Record<string, number>;
-} {
-    const grouped = new Map<string, Room>();
-    for (const spec of specs) {
-        const key = `${spec.category}\u0000${spec.room}`;
-        const room = grouped.get(key) ?? { category: spec.category, name: spec.room, entries: [] };
-        room.entries.push(spec);
-        grouped.set(key, room);
-    }
-    const rooms = [...grouped.values()].sort(
-        (a, b) => categoryIndex(a.category) - categoryIndex(b.category),
-    );
-    const budgets = allocateCategoryBudgets(rooms);
-    const grid = Array.from({ length: MURAL_COLUMNS }, () =>
-        Array.from({ length: MURAL_ROWS }, () => ""),
-    );
-    const placements = new Map<
-        number,
-        { category: MuralCategory; room: string; column: number; line: number; mergedInto?: number }
-    >();
-    const layoutItems: MuralLayoutItem[] = [];
-    const renderedIds: number[] = [];
-    const droppedByTrimIds: number[] = [];
-    const droppedBySkipIds: number[] = [];
-    const usage: Record<string, number> = {};
-    let cursor: Cursor = { column: 0, row: 0 };
-    for (const category of [...new Set(rooms.map((room) => room.category))].sort(
-        (a, b) => categoryIndex(a) - categoryIndex(b),
-    )) {
-        const categoryRooms = rooms.filter((room) => room.category === category);
-        let remaining = budgets.get(category) ?? 0;
-        let categoryRendered = false;
-        for (const room of categoryRooms) {
-            const includeCategoryBanner = !categoryRendered;
-            const includeGap = categoryRendered;
-            const original = room.entries;
-            let selected: MuralSpecEntry[] = [];
-            let plan: { lines: string[]; lineById: Map<number, number> } | null = null;
-            for (let keep = original.length; keep >= 1; keep--) {
-                const candidate = original.slice(0, keep);
-                if (
-                    candidate.some(
-                        (entry) =>
-                            entry.mergeInto !== undefined &&
-                            !candidate.some(
-                                (target) =>
-                                    target.id === entry.mergeInto && target.mergeInto === undefined,
-                            ),
-                    )
-                )
-                    continue;
-                const nextPlan = roomLines(
-                    room,
-                    candidate.filter((entry) => entry.mergeInto === undefined),
-                );
-                const fixed = (includeCategoryBanner ? 1 : 0) + (includeGap ? 1 : 0);
-                if (nextPlan.lines.length + fixed <= remaining) {
-                    selected = candidate;
-                    plan = nextPlan;
-                    break;
-                }
-            }
-            if (!plan) {
-                droppedBySkipIds.push(...original.map((entry) => entry.id));
-                continue;
-            }
-            const dropped = original.slice(selected.length).map((entry) => entry.id);
-            droppedByTrimIds.push(...dropped);
-            if (includeCategoryBanner) {
-                if (cursor.row >= MURAL_ROWS - 1) cursor = advance(cursor);
-                if (atEnd(cursor)) break;
-                grid[cursor.column]![cursor.row] = banner(category);
-                layoutItems.push({
-                    kind: "category",
-                    category,
-                    column: cursor.column,
-                    startLine: cursor.row + 1,
-                    endLine: cursor.row + 1,
-                });
-                cursor = advance(cursor);
-            }
-            if (includeGap && !atEnd(cursor)) {
-                if (cursor.row >= MURAL_ROWS - 2) cursor = advance(cursor);
-                if (!atEnd(cursor)) {
-                    grid[cursor.column]![cursor.row] = "";
-                    cursor = advance(cursor);
-                }
-            }
-            if (atEnd(cursor)) break;
-            categoryRendered = true;
-            const startColumn = cursor.column;
-            const startRow = cursor.row;
-            const segmentStart = cursor;
-            let segment = 0;
-            let segmentStartCursor = segmentStart;
-            const lineSlots: Cursor[] = [];
-            for (const line of plan.lines) {
-                if (atEnd(cursor)) break;
-                if (cursor.row === MURAL_ROWS - 1 && line.startsWith(ROOM_MARKER))
-                    cursor = advance(cursor);
-                if (atEnd(cursor)) break;
-                grid[cursor.column]![cursor.row] = line;
-                lineSlots.push(cursor);
-                cursor = advance(cursor);
-                if (cursor.column !== segmentStartCursor.column && lineSlots.length > 0) {
-                    layoutItems.push({
-                        kind: "room",
-                        category,
-                        room: room.name,
-                        column: segmentStartCursor.column,
-                        startLine: segmentStartCursor.row + 1,
-                        endLine: MURAL_ROWS - 1 + 1,
-                        continuation: segment > 0,
-                        segment,
-                    });
-                    segment++;
-                    segmentStartCursor = cursor;
-                }
-            }
-            if (lineSlots.length === 0) {
-                droppedBySkipIds.push(...selected.map((entry) => entry.id));
-                continue;
-            }
-            const last = lineSlots.at(-1)!;
-            if (segmentStartCursor.column === last.column)
-                layoutItems.push({
-                    kind: "room",
-                    category,
-                    room: room.name,
-                    column: segmentStartCursor.column,
-                    startLine: segmentStartCursor.row + 1,
-                    endLine: last.row + 1,
-                    continuation: segment > 0,
-                    segment,
-                });
-            for (const entry of selected) {
-                const bodyLine =
-                    entry.mergeInto === undefined
-                        ? plan.lineById.get(entry.id)
-                        : plan.lineById.get(entry.mergeInto);
-                if (bodyLine === undefined || !lineSlots[bodyLine]) continue;
-                const slot = lineSlots[bodyLine];
-                placements.set(entry.id, {
-                    category,
-                    room: room.name,
-                    column: slot.column,
-                    line: slot.row + 1,
-                    ...(entry.mergeInto === undefined ? {} : { mergedInto: entry.mergeInto }),
-                });
-                renderedIds.push(entry.id);
-            }
-            const consumed =
-                (includeCategoryBanner ? 1 : 0) + (includeGap ? 1 : 0) + plan.lines.length;
-            remaining = Math.max(0, remaining - consumed);
-            usage[category] = (usage[category] ?? 0) + consumed;
-            void startColumn;
-            void startRow;
-        }
-    }
-    const lines = Array.from({ length: MURAL_ROWS }, (_, row) =>
-        Array.from({ length: MURAL_COLUMNS }, (_, column) =>
-            (grid[column]?.[row] ?? "").padEnd(MURAL_ROOM_WIDTH),
-        ).join(" "),
-    );
-    return {
-        text: `${lines.join("\n")}\n`,
-        grid,
-        placements,
-        layoutItems,
-        renderedIds,
-        droppedByTrimIds,
-        droppedBySkipIds,
-        usage,
-    };
-}
-
-export function renderMural(specs: MuralSpecEntry[]): MuralRenderResult {
-    if (specs.length === 0) throw new Error("cannot render an empty mural");
-    const layout = renderLayout(specs);
+/**
+ * Render the deterministic mural from a pre-ordered flat entry list. Zero LLM,
+ * pure function of its input — callable any time. Category bands, bullet lines,
+ * shared-pair packing, word-wrap at the column width, and prohibition ink are
+ * all preserved from the author-era renderer; rooms and merges are gone.
+ */
+export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderResult {
+    const layout = renderLayout(entries);
     const pixels = new Uint8Array(MURAL_WIDTH * MURAL_HEIGHT * 3).fill(255);
     const contentWidth = MURAL_COLUMNS * MURAL_ROOM_WIDTH + MURAL_COLUMN_GAP * (MURAL_COLUMNS - 1);
     const left = Math.floor((MURAL_WIDTH - contentWidth * MURAL_CELL_WIDTH) / 2);
@@ -590,9 +527,9 @@ export function renderMural(specs: MuralSpecEntry[]): MuralRenderResult {
         placements: layout.placements,
         layoutItems: layout.layoutItems,
         renderedIds: layout.renderedIds,
-        droppedByTrimIds: layout.droppedByTrimIds,
-        droppedBySkipIds: layout.droppedBySkipIds,
+        droppedIds: layout.droppedIds,
         categoryLineUsage: layout.usage,
+        filledLineCount: layout.filledLineCount,
     };
 }
 

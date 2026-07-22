@@ -117,9 +117,10 @@ export function evaluateTaskGate(task: DreamTaskName, ctx: TaskGateContext): boo
             // taking the shared memory lease.
             return countActiveMemories(db, project) > 0;
 
-        case "render-mural":
-            // This gate only checks for active memories; the executor separately
-            // determines which memories exceed its limit and applies the 20-memory threshold.
+        case "compress-cues":
+            // Cheap pre-gate: only take the memory lease when a pool exists. The
+            // executor's selectCandidates does the precise NULL/stale-hash cue
+            // partition and no-ops when everything is already compressed.
             return countActiveMemories(db, project) > 0;
 
         case "classify-memories":
