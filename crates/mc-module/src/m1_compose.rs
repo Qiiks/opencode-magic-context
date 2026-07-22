@@ -15,6 +15,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::time::Instant;
 
 use mc_store::{McStore, McStoreError, ModuleMeta, NoteDelivery, StoredNote};
 
@@ -109,6 +110,13 @@ pub fn m1_revision_signal_parts(
     m1_revision_signal_parts_for_pass(store, project_path, project_path, session_id, 0, 0)
 }
 
+/// Query-family timings for the lightweight per-pass m1 revision signal.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct M1RevisionReadTimings {
+    pub memories_ms: f64,
+    pub notes_ms: f64,
+}
+
 /// Read both signal lanes for a transform pass. The extra context is supplied by the
 /// already-loaded transform route so note/profile changes are covered without rendering.
 pub fn m1_revision_signal_parts_for_pass(
@@ -119,11 +127,41 @@ pub fn m1_revision_signal_parts_for_pass(
     user_profile_version: u64,
     now_ms: i64,
 ) -> Result<M1RevisionSignal, McStoreError> {
+    m1_revision_signal_parts_for_pass_timed(
+        store,
+        project_path,
+        note_project_path,
+        session_id,
+        user_profile_version,
+        now_ms,
+        None,
+    )
+}
+
+/// The timed variant keeps the established revision bytes while exposing the memory and note
+/// query families that every transform pass reads before its scheduler decision.
+pub fn m1_revision_signal_parts_for_pass_timed(
+    store: &McStore,
+    project_path: &str,
+    note_project_path: &str,
+    session_id: &str,
+    user_profile_version: u64,
+    now_ms: i64,
+    timings: Option<&mut M1RevisionReadTimings>,
+) -> Result<M1RevisionSignal, McStoreError> {
+    let memories_started_at = Instant::now();
     let paths = union_paths(store, project_path)?;
     let max_memory_id = store.max_memory_id(&paths)?;
     let max_memory_mutation_id = store.max_memory_mutation_id(&paths)?;
+    let memories_ms = memories_started_at.elapsed().as_secs_f64() * 1_000.0;
     let max_compartment_seq = store.max_compartment_seq(session_id)?;
+    let notes_started_at = Instant::now();
     let note_status_version = store.max_note_status_version(note_project_path)?;
+    let notes_ms = notes_started_at.elapsed().as_secs_f64() * 1_000.0;
+    if let Some(timings) = timings {
+        timings.memories_ms += memories_ms;
+        timings.notes_ms += notes_ms;
+    }
 
     let mut in_session = DefaultHasher::new();
     // Preserve the old digest format when both new inputs are zero, so sessions created
