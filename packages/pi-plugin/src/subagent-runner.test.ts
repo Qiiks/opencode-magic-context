@@ -1,4 +1,4 @@
-import { describe, expect, it, mock, spyOn } from "bun:test";
+import { beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -21,6 +21,10 @@ const ISOLATED_RETRY_LOG_MESSAGE =
 	"pi subagent: a loaded Pi extension started an agent turn before the child's prompt could run; retrying with an isolated extension set (user extensions disabled for this run)";
 const ISOLATED_RETRY_MODEL_UNAVAILABLE_LOG_MESSAGE =
 	"model unavailable in isolated retry: it is provided by a disabled extension; configure it through models.json or add a built-in/provider-configured fallback";
+
+beforeEach(() => {
+	__test.resetProviderFormCache();
+});
 
 type MockChild = ReturnType<typeof createMockChild>;
 
@@ -1271,6 +1275,200 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				exitCode: 7,
 				signal: null,
 			});
+		}
+	});
+
+	it("retries a translated provider with the canonical form after a missing-key exit", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second]);
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "openai/gpt-5.5",
+		});
+		first.writeStderr(
+			"No API key found for openai-codex. Use /login to authenticate.",
+		);
+		first.emitClose(1);
+		await nextTick();
+		second.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "direct API success" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		second.emitClose(0);
+
+		expect(await resultPromise).toEqual({
+			ok: true,
+			assistantText: "direct API success",
+			toolCallCount: 0,
+			durationMs: expect.any(Number),
+			meta: { stderr: undefined },
+		});
+		expect(spawnImpl).toHaveBeenCalledTimes(2);
+		expect(spawnImpl.mock.calls[0]?.[1]).toEqual(
+			expect.arrayContaining(["--model", "openai-codex/gpt-5.5"]),
+		);
+		expect(spawnImpl.mock.calls[1]?.[1]).toEqual(
+			expect.arrayContaining(["--model", "openai/gpt-5.5"]),
+		);
+	});
+
+	it("caches the provider form that succeeds for later spawns", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		const third = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second, third]);
+
+		const firstRun = runner.run({ ...baseOptions, model: "openai/gpt-5.5" });
+		first.writeStderr(
+			"No API key found for openai-codex. Use /login to authenticate.",
+		);
+		first.emitClose(1);
+		await nextTick();
+		second.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "first direct success" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		second.emitClose(0);
+		await firstRun;
+
+		const secondRun = runner.run({ ...baseOptions, model: "openai/gpt-5.4" });
+		third.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "cached direct success" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		third.emitClose(0);
+		await secondRun;
+
+		expect(spawnImpl).toHaveBeenCalledTimes(3);
+		expect(spawnImpl.mock.calls[2]?.[1]).toEqual(
+			expect.arrayContaining(["--model", "openai/gpt-5.4"]),
+		);
+	});
+
+	it("does not provider-retry an unrelated stderr failure", async () => {
+		const first = createMockChild();
+		const { runner, spawnImpl } = runnerWith(first);
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "openai/gpt-5.5",
+		});
+		first.writeStderr(
+			"No API key found for another-provider. Check configuration.",
+		);
+		first.emitClose(1);
+
+		const result = await resultPromise;
+		expect(result.ok).toBe(false);
+		expect(spawnImpl).toHaveBeenCalledTimes(1);
+	});
+
+	it("retries google's translated provider with canonical google", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second]);
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "google/gemini-2.5-pro",
+		});
+		first.writeStderr(
+			"No API key found for google-antigravity. Use /login to authenticate.",
+		);
+		first.emitClose(1);
+		await nextTick();
+		second.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "google API success" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		second.emitClose(0);
+		await resultPromise;
+
+		expect(spawnImpl).toHaveBeenCalledTimes(2);
+		expect(spawnImpl.mock.calls[0]?.[1]).toEqual(
+			expect.arrayContaining(["--model", "google-antigravity/gemini-2.5-pro"]),
+		);
+		expect(spawnImpl.mock.calls[1]?.[1]).toEqual(
+			expect.arrayContaining(["--model", "google/gemini-2.5-pro"]),
+		);
+	});
+
+	it("bounds provider and extension retries to three spawns", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		const third = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second, third]);
+		const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
+			() => {},
+		);
+
+		try {
+			const resultPromise = runner.run({
+				...baseOptions,
+				model: "openai/gpt-5.5",
+			});
+			first.writeStderr(
+				"No API key found for openai-codex. Use /login to authenticate.",
+			);
+			first.emitClose(1);
+			await nextTick();
+			second.writeStderr(COLLISION_STDERR);
+			second.emitClose(1);
+			await nextTick();
+			third.writeStdoutLine(
+				agentEnd([
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "bounded success" }],
+						stopReason: "stop",
+					},
+				]),
+			);
+			third.emitClose(0);
+
+			expect(await resultPromise).toEqual({
+				ok: true,
+				assistantText: "bounded success",
+				toolCallCount: 0,
+				durationMs: expect.any(Number),
+				meta: { stderr: undefined },
+			});
+			expect(spawnImpl).toHaveBeenCalledTimes(3);
+			expect(spawnImpl.mock.calls[0]?.[1]).toEqual(
+				expect.arrayContaining(["--model", "openai-codex/gpt-5.5"]),
+			);
+			expect(spawnImpl.mock.calls[1]?.[1]).toEqual(
+				expect.arrayContaining(["--model", "openai/gpt-5.5"]),
+			);
+			expect(spawnImpl.mock.calls[1]?.[1]).not.toContain("--no-extensions");
+			expect(spawnImpl.mock.calls[2]?.[1]).toEqual(
+				expect.arrayContaining(["--model", "openai/gpt-5.5"]),
+			);
+			expect(spawnImpl.mock.calls[2]?.[1]).toContain("--no-extensions");
+		} finally {
+			logSpy.mockRestore();
 		}
 	});
 

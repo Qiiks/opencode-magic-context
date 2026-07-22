@@ -14,7 +14,10 @@ import { fileURLToPath } from "node:url";
 import { openDatabase } from "@magic-context/core/features/magic-context/storage";
 import type { SubagentKind } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
 import { recordChildInvocation } from "@magic-context/core/features/magic-context/subagent-token-capture";
-import { resolveModelRefForPi } from "@magic-context/core/shared/harness-provider-map";
+import {
+	piModelRefToCanonical,
+	resolveModelRefForPi,
+} from "@magic-context/core/shared/harness-provider-map";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type {
 	SubagentProgressEvent,
@@ -357,6 +360,22 @@ const MODEL_RESOLUTION_ERROR_PATTERNS = [
 	/model.+not configured/i,
 ] as const;
 
+/** Canonical provider prefix -> the Pi provider form that last succeeded. */
+const PI_PROVIDER_FORM_CACHE = new Map<string, string>();
+
+type ProviderModelAttempt = {
+	canonicalRef: string;
+	canonicalProvider: string;
+	modelRef: string;
+	attemptedProvider: string;
+	translated: boolean;
+};
+
+type ExtensionRetryResult = {
+	result: SubagentRunResult;
+	extensionRetryUsed: boolean;
+};
+
 /**
  * Pi-side implementation of `SubagentRunner`.
  *
@@ -451,13 +470,70 @@ export class PiSubagentRunner implements SubagentRunner {
 	}
 
 	async run(options: SubagentRunOptions): Promise<SubagentRunResult> {
+		const providerAttempt = resolveProviderModelAttempt(options.model);
+		const firstOptions = providerAttempt
+			? { ...options, model: providerAttempt.canonicalRef }
+			: options;
+		const firstRun = await this.runWithExtensionRetry(
+			firstOptions,
+			providerAttempt?.modelRef,
+		);
+		if (!providerAttempt) return firstRun.result;
+		if (firstRun.result.ok) {
+			PI_PROVIDER_FORM_CACHE.set(
+				providerAttempt.canonicalProvider,
+				providerAttempt.attemptedProvider,
+			);
+			return firstRun.result;
+		}
+		if (!isProviderCredentialFailure(firstRun.result, providerAttempt)) {
+			return firstRun.result;
+		}
+
+		// The canonical prefix is the second Pi choice for ambiguous providers.
+		// If the extension retry already ran, keep its isolated mode for this
+		// provider retry instead of starting a second independent retry tree.
+		const fallbackOptions = {
+			...options,
+			model: providerAttempt.canonicalRef,
+		};
+		const fallbackRun: ExtensionRetryResult = firstRun.extensionRetryUsed
+			? {
+					result: await this.runModelChain(
+						fallbackOptions,
+						{ disableDiscoveredExtensions: true },
+						providerAttempt.canonicalRef,
+					),
+					extensionRetryUsed: true,
+				}
+			: await this.runWithExtensionRetry(
+					fallbackOptions,
+					providerAttempt.canonicalRef,
+				);
+		if (fallbackRun.result.ok) {
+			PI_PROVIDER_FORM_CACHE.set(
+				providerAttempt.canonicalProvider,
+				providerAttempt.canonicalProvider,
+			);
+		}
+		return fallbackRun.result;
+	}
+
+	private async runWithExtensionRetry(
+		options: SubagentRunOptions,
+		modelRefOverride?: string,
+	): Promise<ExtensionRetryResult> {
 		const primaryRunMode: PiRunMode = { disableDiscoveredExtensions: false };
-		const primaryResult = await this.runModelChain(options, primaryRunMode);
+		const primaryResult = await this.runModelChain(
+			options,
+			primaryRunMode,
+			modelRefOverride,
+		);
 		if (
 			this.spawnUsesNoExtensions(primaryRunMode) ||
 			!isPiExtensionCollisionFailure(primaryResult)
 		) {
-			return primaryResult;
+			return { result: primaryResult, extensionRetryUsed: false };
 		}
 
 		const sessionId = options.accountingSessionId ?? "pi-subagent";
@@ -465,19 +541,25 @@ export class PiSubagentRunner implements SubagentRunner {
 			sessionId,
 			"pi subagent: a loaded Pi extension started an agent turn before the child's prompt could run; retrying with an isolated extension set (user extensions disabled for this run)",
 		);
-		const isolatedResult = await this.runModelChain(options, {
-			disableDiscoveredExtensions: true,
-		});
+		const isolatedResult = await this.runModelChain(
+			options,
+			{ disableDiscoveredExtensions: true },
+			modelRefOverride,
+		);
 		if (!isolatedResult.ok && isIsolatedRetryModelUnavailable(isolatedResult)) {
 			sessionLog(sessionId, ISOLATED_RETRY_MODEL_UNAVAILABLE_MESSAGE);
-			return annotateIsolatedRetryModelUnavailable(isolatedResult);
+			return {
+				result: annotateIsolatedRetryModelUnavailable(isolatedResult),
+				extensionRetryUsed: true,
+			};
 		}
-		return isolatedResult;
+		return { result: isolatedResult, extensionRetryUsed: true };
 	}
 
 	private async runModelChain(
 		options: SubagentRunOptions,
 		runMode: PiRunMode,
+		primaryModelRef?: string,
 	): Promise<SubagentRunResult> {
 		const models = [options.model, ...(options.fallbackModels ?? [])].filter(
 			(model): model is string => typeof model === "string" && model.length > 0,
@@ -491,7 +573,11 @@ export class PiSubagentRunner implements SubagentRunner {
 				model,
 				fallbackModels: undefined,
 			};
-			const result = await this.runOnce(attemptOptions, runMode);
+			const result = await this.runOnce(
+				attemptOptions,
+				runMode,
+				index === 0 ? primaryModelRef : undefined,
+			);
 			if (result.ok) return result;
 			lastResult = result;
 			// Pi print mode discovers extensions before reading stdin. If one of those
@@ -512,7 +598,11 @@ export class PiSubagentRunner implements SubagentRunner {
 		}
 		return (
 			lastResult ??
-			this.runOnce({ ...options, fallbackModels: undefined }, runMode)
+			this.runOnce(
+				{ ...options, fallbackModels: undefined },
+				runMode,
+				primaryModelRef,
+			)
 		);
 	}
 
@@ -527,6 +617,7 @@ export class PiSubagentRunner implements SubagentRunner {
 	private async runOnce(
 		options: SubagentRunOptions,
 		runMode: PiRunMode,
+		modelRefOverride?: string,
 	): Promise<SubagentRunResult> {
 		const startTime = Date.now();
 		let recordedAccounting = false;
@@ -661,6 +752,7 @@ export class PiSubagentRunner implements SubagentRunner {
 			subagentExtensions: this.subagentExtensions,
 			omitPositionalMessage: deliverViaStdin,
 			systemPromptPath,
+			modelRef: modelRefOverride,
 		});
 
 		// The model spec is `provider/model` — Pi accepts that directly via
@@ -1238,6 +1330,59 @@ function isFallbackEligible(reason: string): boolean {
 	);
 }
 
+function providerPrefix(ref: string): string | undefined {
+	const slash = ref.indexOf("/");
+	return slash > 0 ? ref.slice(0, slash) : undefined;
+}
+
+function replaceProviderPrefix(ref: string, provider: string): string {
+	const slash = ref.indexOf("/");
+	return slash > 0 ? `${provider}${ref.slice(slash)}` : ref;
+}
+
+function resolveProviderModelAttempt(
+	model: string | undefined,
+): ProviderModelAttempt | undefined {
+	if (typeof model !== "string" || model.length === 0) return undefined;
+
+	const canonicalRef = piModelRefToCanonical(model);
+	const canonicalProvider = providerPrefix(canonicalRef);
+	if (!canonicalProvider) return undefined;
+
+	const translatedRef = resolveModelRefForPi(canonicalRef);
+	const translatedProvider = providerPrefix(translatedRef);
+	const cachedProvider = PI_PROVIDER_FORM_CACHE.get(canonicalProvider);
+	if (
+		!translatedProvider ||
+		(translatedProvider === canonicalProvider && cachedProvider === undefined)
+	) {
+		return undefined;
+	}
+
+	const attemptedProvider = cachedProvider ?? translatedProvider;
+	return {
+		canonicalRef,
+		canonicalProvider,
+		modelRef: replaceProviderPrefix(canonicalRef, attemptedProvider),
+		attemptedProvider,
+		translated: attemptedProvider !== canonicalProvider,
+	};
+}
+
+function isProviderCredentialFailure(
+	result: SubagentRunResult,
+	attempt: ProviderModelAttempt,
+): result is FailedRunResult {
+	return (
+		attempt.translated &&
+		!result.ok &&
+		result.reason === "non_zero_exit" &&
+		getResultStderr(result).includes(
+			`No API key found for ${attempt.attemptedProvider}`,
+		)
+	);
+}
+
 /**
  * Max bytes we will pass as the positional message argv argument. Linux caps a
  * SINGLE argv entry at MAX_ARG_STRLEN (128 KiB); a historian chunk clamps to
@@ -1268,6 +1413,7 @@ export function buildArgs(
 		omitPositionalMessage?: boolean;
 		subagentEntryPath?: string;
 		systemPromptPath?: string;
+		modelRef?: string;
 	},
 ): string[] {
 	const args: string[] = [
@@ -1393,7 +1539,7 @@ export function buildArgs(
 		// google->google-antigravity). Translate to Pi's form HERE, at the only
 		// point the model reaches the spawned process, so options.model stays
 		// canonical everywhere else (accounting, logging, fallback selection).
-		args.push("--model", resolveModelRefForPi(options.model));
+		args.push("--model", opts?.modelRef ?? resolveModelRefForPi(options.model));
 	}
 
 	// Pass --thinking <level> only when explicitly configured.
@@ -1556,4 +1702,5 @@ export const __test = {
 	KNOWN_PI_SUBAGENT_AGENTS,
 	STRICT_TOOL_ALLOWLIST,
 	ZERO_TOOL_PROMPT_REQUIRED_AGENTS,
+	resetProviderFormCache: () => PI_PROVIDER_FORM_CACHE.clear(),
 };
