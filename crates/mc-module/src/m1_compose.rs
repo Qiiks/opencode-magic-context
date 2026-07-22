@@ -323,11 +323,7 @@ pub fn compose_m1_from_store(
     let (new_user_profile_block, profile_rendered) = if memory_enabled
         && meta.user_profile_version != meta.m1_user_profile_version
     {
-        let profile_rows = if project_path.starts_with("shadow:") {
-            store.load_shadow_user_profile(project_path)?
-        } else {
-            store.load_active_user_memories()?
-        };
+        let profile_rows = store.load_active_user_memories()?;
         let profile =
             trim_user_profile_to_budget(profile_rows, user_profile_budget_tokens, estimate_tokens);
         let block = render_user_profile_block(&profile, "new-user-profile");

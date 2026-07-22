@@ -83,7 +83,7 @@ import {
     setRecompTerminal,
 } from "./recomp-orchestrator";
 import type { RustModeModuleClient } from "./rust-mode-transform";
-import { createShadowSender, SubcShadowTransport } from "./shadow-sender";
+import { SubcModuleTransport } from "./module-transport";
 import { createTextCompleteHandler } from "./text-complete";
 import { createTransform } from "./transform";
 import { type ManagedWrapupContext, runManagedWrapup } from "./wrapup-orchestrator";
@@ -157,9 +157,6 @@ export interface MagicContextDeps {
             min_chars: number;
         };
         transform_mode?: ResolvedTransformMode;
-        shadow_transform?: {
-            enabled: boolean;
-        };
         experimental?: {
             mural?: { enabled: boolean; model?: string };
         };
@@ -625,18 +622,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const sidekickRunnable = isSidekickRunnable(deps.config);
     const sidekickConfig = sidekickRunnable ? deps.config.sidekick : undefined;
-    // Rust is authoritative for a session, so never arm the asynchronous
-    // comparison sender alongside the authority lane.
-    const shadowSender =
-        deps.config.transform_mode !== "rust" && deps.config.shadow_transform?.enabled === true
-            ? createShadowSender()
-            : undefined;
     const rustMemorySyncRequestedSessions = new Set<string>();
     const rustModeModuleClient =
         deps.rustModeModuleClient ??
         (deps.config.transform_mode === "rust"
             ? (() => {
-                  const transport = new SubcShadowTransport(undefined, undefined, undefined, "");
+                  const transport = new SubcModuleTransport();
                   const client: RustModeModuleClient = {
                       call: (args) => transport.call(args),
                       closeSession: (sessionId) => transport.closeSession(sessionId),
@@ -930,7 +921,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                   }
                 : undefined,
         maybeAutoEmbedSession,
-        shadowSender,
         transformMode: deps.config.transform_mode,
         rustModeModuleClient,
         rustMemorySyncRequestedSessions,
@@ -983,7 +973,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             rustMemorySyncRequestedSessions.delete(sessionId);
             channel1StateBySession.delete(sessionId);
             channel2DirectiveTextBySession.delete(sessionId);
-            shadowSender?.clearSession(sessionId);
             clearEmbedSessionState(sessionId);
         },
     });

@@ -14,8 +14,8 @@ import type { MessageLike } from "./transform-operations";
 export const MODULE_PAGE_MAX_BYTES = 512 * 1024;
 /** Large individual values are split so one message cannot exceed a page. */
 export const MODULE_ITEM_CONTINUATION_CHUNK_BYTES = 64 * 1024;
-// The module-side reassembler already recognizes this wire key; authority and
-// shadow requests must use the same continuation envelope.
+// The module-side reassembler recognizes this continuation envelope for
+// authority state sync and live transform requests.
 export const MODULE_ITEM_CONTINUATION_KEY = "__shadow_item_continuation";
 export const MODULE_ORDINAL_PAGE_SIZE = 500;
 

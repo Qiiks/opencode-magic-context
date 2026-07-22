@@ -31,7 +31,7 @@ import {
 } from "./hooks/magic-context/compartment-prompt";
 import { createLiveSessionState } from "./hooks/magic-context/live-session-state";
 import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
-import { SubcShadowTransport } from "./hooks/magic-context/shadow-sender";
+import { SubcModuleTransport } from "./hooks/magic-context/module-transport";
 import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./plugin/boot-quiet";
 import { cleanupConflictWarnings, sendConflictWarning } from "./plugin/conflict-warning-hook";
 import { startDreamScheduleTimer } from "./plugin/dream-timer";
@@ -153,7 +153,7 @@ const server: Plugin = async (ctx) => {
     const liveSessionState = createLiveSessionState();
     const rustModeModuleClient: RustModeModuleClient | undefined =
         pluginConfig.transform_mode === "rust"
-            ? new SubcShadowTransport(undefined, undefined, undefined, "")
+            ? new SubcModuleTransport()
             : undefined;
 
     const hooks = await createSessionHooksAsync({

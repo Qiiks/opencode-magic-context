@@ -199,8 +199,6 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *  - `embedding.endpoint` / `embedding.provider` — a repo must not choose
  *    where private memory/search/commit text is embedded. User-level config is
  *    the trust boundary for embedding destinations.
- *  - `shadow_transform` — developer-only subc mirror lane. A repository must
- *    not enable extra local module traffic or comparison telemetry.
  *  - `transform_mode` is intentionally allowed at project tier so a repository
  *    can opt its own runtime into the experimental Rust pipeline. The resolver
  *    requires trusted user-level `subc` configuration before Rust can activate.
@@ -233,13 +231,6 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         warnings.push(
             "Ignoring sqlite.* from project config (security: SQLite cache/mmap PRAGMAs apply to the " +
                 "process-global shared database handle; only user-level config may set them).",
-        );
-    }
-
-    if ("shadow_transform" in projectRaw) {
-        delete projectRaw.shadow_transform;
-        warnings.push(
-            "Ignoring shadow_transform from project config (security: this developer-only mirror lane is user-level only).",
         );
     }
 

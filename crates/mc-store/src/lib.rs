@@ -389,9 +389,6 @@ pub enum MediaKind {
 /// independent namespaces; this is ours).
 const NS: &str = "mc_cache";
 
-/// Durable namespace prefix for shadow-mode sessions and their mirror project rows.
-pub const SHADOW_SESSION_PREFIX: &str = "shadow:";
-
 /// Sentinel row_version meaning "no row present" (COALESCE default inside the txn).
 const NO_ROW: i64 = -1;
 const MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES: usize = 256 * 1024;
@@ -3334,7 +3331,7 @@ pub enum RecordWrapupCommandOutcome {
 /// original memory id unchanged because that id is written into prompt data and
 /// referenced by mutation rows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ShadowMemoryRow {
+pub struct ModuleMemoryRow {
     pub id: i64,
     pub project_path: String,
     pub category: String,
@@ -3363,27 +3360,27 @@ pub struct ShadowMemoryRow {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ShadowWorkspaceMemberRow {
+pub struct ModuleWorkspaceMemberRow {
     pub project_path: String,
     pub display_name: String,
     pub display_path: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ShadowWorkspaceRow {
+pub struct ModuleWorkspaceRow {
     pub name: String,
     pub share_categories: Vec<String>,
-    pub members: Vec<ShadowWorkspaceMemberRow>,
+    pub members: Vec<ModuleWorkspaceMemberRow>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ShadowMemoryMutationRow {
+pub struct ModuleMemoryMutationRow {
     pub project_path: String,
     pub mutation: StoredMemoryMutation,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ShadowDropSeedRow {
+pub struct ModuleDropSeedRow {
     pub block_id: String,
     pub related_block_ids: Vec<String>,
     pub drop_mode: String,
@@ -3406,19 +3403,19 @@ pub struct UserHintSeedRow {
 /// first transform. Message-level strips intentionally carry the message id rather
 /// than a block id because the source operation may have covered several CK blocks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ShadowStripSeedRow {
+pub struct ModuleStripSeedRow {
     pub message_id: String,
     pub strip_kind: String,
 }
 
-pub struct ShadowStateSyncRequest<'a> {
+pub struct ModuleStateSyncRequest<'a> {
     pub session_id: &'a str,
-    pub shadow_project_path: &'a str,
+    pub project_path: &'a str,
     pub shadow_generation: u64,
     pub expected_shadow_seq: u64,
     /// The producer's current flat compaction boundary. Present only on a full seed.
     pub seed_boundary_id: Option<&'a str>,
-    pub drop_seeds: &'a [ShadowDropSeedRow],
+    pub drop_seeds: &'a [ModuleDropSeedRow],
     pub drop_seed_skipped: usize,
     pub pending_agent_drops: &'a [PendingAgentDropSeedRow],
     pub pending_agent_drops_skipped: usize,
@@ -3431,14 +3428,14 @@ pub struct ShadowStateSyncRequest<'a> {
     pub pending_compaction_marker: Option<Option<&'a PendingCompactionMarkerState>>,
     pub deferred_execute_state: Option<Option<&'a DeferredExecuteState>>,
     pub channel2_nudge_state: Option<&'a str>,
-    pub strip_seeds: &'a [ShadowStripSeedRow],
+    pub strip_seeds: &'a [ModuleStripSeedRow],
     pub strip_seed_skipped: usize,
     pub reasoning_cleared_through_tag: Option<u64>,
     pub compartments: &'a [StoredCompartment],
-    pub memories: &'a [ShadowMemoryRow],
-    pub memory_mutations: &'a [ShadowMemoryMutationRow],
+    pub memories: &'a [ModuleMemoryRow],
+    pub memory_mutations: &'a [ModuleMemoryMutationRow],
     pub user_profile: &'a [String],
-    pub workspace: Option<&'a ShadowWorkspaceRow>,
+    pub workspace: Option<&'a ModuleWorkspaceRow>,
     pub last_todo_state: Option<String>,
     pub project_memory_epoch: Option<u64>,
     pub user_profile_version: Option<u64>,
@@ -3446,7 +3443,7 @@ pub struct ShadowStateSyncRequest<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShadowStateSyncResult {
+pub struct ModuleStateSyncResult {
     pub shadow_generation: u64,
     pub shadow_seq: u64,
     pub row_version: u64,
@@ -3506,68 +3503,12 @@ pub enum StateImportError {
 }
 
 #[derive(Debug)]
-pub enum ShadowStateSyncError {
+pub enum ModuleStateSyncError {
     Store(McStoreError),
     GenerationMismatch { expected: u64, found: u64 },
-    SeqMismatch { expected: u64, found: u64 },
     AuthoritySeqMismatch { expected: u64, found: u64 },
     InvalidSeedBoundary { declared: String, detail: String },
     Serde(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShadowResetResult {
-    pub shadow_generation: u64,
-    pub shadow_seq: u64,
-    pub row_version: u64,
-}
-
-pub struct ShadowDivergenceRecord<'a> {
-    pub session_id: &'a str,
-    pub shadow_generation: u64,
-    pub pass_seq: u64,
-    pub class: &'a str,
-    pub first_mid: Option<&'a str>,
-    pub first_block: Option<&'a str>,
-    pub first_field: Option<&'a str>,
-    pub ts_prefix: &'a str,
-    pub rs_prefix: &'a str,
-    pub first_diff_offset: Option<u64>,
-    pub ts_window: &'a str,
-    pub rs_window: &'a str,
-    pub normalizations_json: &'a str,
-    pub ts_decision_json: &'a str,
-    pub rs_decision_json: &'a str,
-    pub state_hash: &'a str,
-    pub created_at_ms: i64,
-    pub quarantine: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShadowDivergenceWriteResult {
-    pub quarantined: bool,
-    pub row_version: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShadowDivergenceRow {
-    pub id: i64,
-    pub session_id: String,
-    pub pass_seq: u64,
-    pub class: String,
-    pub first_mid: Option<String>,
-    pub first_block: Option<String>,
-    pub first_field: Option<String>,
-    pub ts_prefix: String,
-    pub rs_prefix: String,
-    pub first_diff_offset: Option<u64>,
-    pub ts_window: String,
-    pub rs_window: String,
-    pub normalizations_json: String,
-    pub ts_decision_json: String,
-    pub rs_decision_json: String,
-    pub state_hash: String,
-    pub created_at_ms: i64,
 }
 
 #[derive(Debug)]
@@ -3732,40 +3673,37 @@ impl From<StoreError> for StateImportError {
     }
 }
 
-impl std::fmt::Display for ShadowStateSyncError {
+impl std::fmt::Display for ModuleStateSyncError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ShadowStateSyncError::Store(e) => write!(f, "store: {e}"),
-            ShadowStateSyncError::GenerationMismatch { expected, found } => write!(
+            ModuleStateSyncError::Store(e) => write!(f, "store: {e}"),
+            ModuleStateSyncError::GenerationMismatch { expected, found } => write!(
                 f,
                 "shadow generation mismatch: expected {expected}, found {found}"
             ),
-            ShadowStateSyncError::SeqMismatch { expected, found } => {
-                write!(f, "shadow seq mismatch: expected {expected}, found {found}")
-            }
-            ShadowStateSyncError::AuthoritySeqMismatch { expected, found } => write!(
+            ModuleStateSyncError::AuthoritySeqMismatch { expected, found } => write!(
                 f,
                 "authority seq mismatch: expected {expected}, found {found}"
             ),
-            ShadowStateSyncError::InvalidSeedBoundary { declared, detail } => {
+            ModuleStateSyncError::InvalidSeedBoundary { declared, detail } => {
                 write!(f, "invalid seed boundary {declared:?}: {detail}")
             }
-            ShadowStateSyncError::Serde(e) => write!(f, "serde: {e}"),
+            ModuleStateSyncError::Serde(e) => write!(f, "serde: {e}"),
         }
     }
 }
 
-impl std::error::Error for ShadowStateSyncError {}
+impl std::error::Error for ModuleStateSyncError {}
 
-impl From<McStoreError> for ShadowStateSyncError {
+impl From<McStoreError> for ModuleStateSyncError {
     fn from(e: McStoreError) -> Self {
-        ShadowStateSyncError::Store(e)
+        ModuleStateSyncError::Store(e)
     }
 }
 
-impl From<StoreError> for ShadowStateSyncError {
+impl From<StoreError> for ModuleStateSyncError {
     fn from(e: StoreError) -> Self {
-        ShadowStateSyncError::Store(McStoreError::Store(e))
+        ModuleStateSyncError::Store(McStoreError::Store(e))
     }
 }
 
@@ -4084,18 +4022,11 @@ fn validated_seed_boundary(
     })
 }
 
-enum ShadowSyncTxnOutcome {
-    Committed(ShadowStateSyncResult),
+enum ModuleStateSyncTxnOutcome {
+    Committed(ModuleStateSyncResult),
     GenerationMismatch { found: u64 },
-    SeqMismatch { found: u64 },
     AuthoritySeqMismatch { found: u64 },
     InvalidSeedBoundary { declared: String, detail: String },
-    Serde(String),
-}
-
-enum ShadowDivergenceTxnOutcome {
-    Committed(ShadowDivergenceWriteResult),
-    GenerationMismatch { found: u64 },
     Serde(String),
 }
 
@@ -4179,7 +4110,7 @@ fn seeded_drop_unit(
 fn materialize_drop_seed_units(
     core: &mut CoreState,
     session_id: &str,
-    seeds: &[ShadowDropSeedRow],
+    seeds: &[ModuleDropSeedRow],
     initial_skipped: usize,
 ) -> usize {
     let mut skipped = initial_skipped;
@@ -4269,7 +4200,7 @@ fn valid_strip_seed_kind(kind: &str) -> bool {
 fn materialize_strip_seed_units(
     core: &mut CoreState,
     session_id: &str,
-    seeds: &[ShadowStripSeedRow],
+    seeds: &[ModuleStripSeedRow],
     initial_skipped: usize,
 ) -> usize {
     let mut skipped = initial_skipped;
@@ -6429,31 +6360,16 @@ impl McStore {
                 return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
             }
             if let Some(revision) = memory_revision.filter(|value| !value.project_paths.is_empty()) {
-                let shadow = revision
-                    .project_paths
-                    .iter()
-                    .any(|path| is_shadow_project_path(path));
-                let memory_table = if shadow { "shadow_memories" } else { "mc_memories" };
-                let mutation_table = if shadow {
-                    "shadow_memory_mutation_log"
-                } else {
-                    "mc_memory_mutation_log"
-                };
-                let path_column = if shadow {
-                    "shadow_project_path"
-                } else {
-                    "project_path"
-                };
                 let placeholders = std::iter::repeat_n("?", revision.project_paths.len())
                     .collect::<Vec<_>>()
                     .join(", ");
                 let current_memory: i64 = tx.query_row(
-                    &format!("SELECT COALESCE(MAX(id), 0) FROM {memory_table} WHERE {path_column} IN ({placeholders})"),
+                    &format!("SELECT COALESCE(MAX(id), 0) FROM mc_memories WHERE project_path IN ({placeholders})"),
                     rusqlite::params_from_iter(revision.project_paths.iter()),
                     |row| row.get(0),
                 )?;
                 let current_mutation: i64 = tx.query_row(
-                    &format!("SELECT COALESCE(MAX(id), 0) FROM {mutation_table} WHERE {path_column} IN ({placeholders})"),
+                    &format!("SELECT COALESCE(MAX(id), 0) FROM mc_memory_mutation_log WHERE project_path IN ({placeholders})"),
                     rusqlite::params_from_iter(revision.project_paths.iter()),
                     |row| row.get(0),
                 )?;
@@ -6640,33 +6556,22 @@ impl McStore {
         }
     }
 
-    /// Apply a shadow state mirror update in the same fenced transaction that advances
-    /// the shadow sequence. The generation and sequence checks run inside the transaction
-    /// before any mirror row is written, so a dropped/retried sync cannot partially apply.
-    pub fn apply_shadow_state_sync(
-        &self,
-        request: ShadowStateSyncRequest<'_>,
-    ) -> Result<ShadowStateSyncResult, ShadowStateSyncError> {
-        self.apply_state_sync(request, true)
-    }
-
     /// Apply an authority state update atomically after validating its sequence. Authority
     /// rows use the regular memory and profile tables read by real-session transforms, while
     /// compartment and cache-state tables are shared by both lanes.
     pub fn apply_authority_state_sync(
         &self,
-        request: ShadowStateSyncRequest<'_>,
-    ) -> Result<ShadowStateSyncResult, ShadowStateSyncError> {
-        self.apply_state_sync(request, false)
+        request: ModuleStateSyncRequest<'_>,
+    ) -> Result<ModuleStateSyncResult, ModuleStateSyncError> {
+        self.apply_state_sync(request)
     }
 
     fn apply_state_sync(
         &self,
-        request: ShadowStateSyncRequest<'_>,
-        shadow_lane: bool,
-    ) -> Result<ShadowStateSyncResult, ShadowStateSyncError> {
+        request: ModuleStateSyncRequest<'_>,
+    ) -> Result<ModuleStateSyncResult, ModuleStateSyncError> {
         let default_core_json = serde_json::to_string(&CoreState::default())
-            .map_err(|e| ShadowStateSyncError::Serde(e.to_string()))?;
+            .map_err(|e| ModuleStateSyncError::Serde(e.to_string()))?;
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
                 .query_row(
@@ -6686,37 +6591,31 @@ impl McStore {
                 Some((row_version, core_state_json, meta_json)) => {
                     let core = match serde_json::from_str::<CoreState>(&core_state_json) {
                         Ok(core) => core,
-                        Err(e) => return Ok(ShadowSyncTxnOutcome::Serde(e.to_string())),
+                        Err(e) => return Ok(ModuleStateSyncTxnOutcome::Serde(e.to_string())),
                     };
                     let meta = match serde_json::from_str::<ModuleMeta>(&meta_json) {
                         Ok(meta) => meta,
-                        Err(e) => return Ok(ShadowSyncTxnOutcome::Serde(e.to_string())),
+                        Err(e) => return Ok(ModuleStateSyncTxnOutcome::Serde(e.to_string())),
                     };
                     (row_version, core, meta)
                 }
                 None => {
                     let core = match serde_json::from_str::<CoreState>(&default_core_json) {
                         Ok(core) => core,
-                        Err(e) => return Ok(ShadowSyncTxnOutcome::Serde(e.to_string())),
+                        Err(e) => return Ok(ModuleStateSyncTxnOutcome::Serde(e.to_string())),
                     };
                     (NO_ROW, core, ModuleMeta::default())
                 }
             };
 
             if meta.shadow_generation != request.shadow_generation {
-                return Ok(ShadowSyncTxnOutcome::GenerationMismatch {
+                return Ok(ModuleStateSyncTxnOutcome::GenerationMismatch {
                     found: meta.shadow_generation,
                 });
             }
             if meta.shadow_seq != request.expected_shadow_seq {
-                return Ok(if shadow_lane {
-                    ShadowSyncTxnOutcome::SeqMismatch {
-                        found: meta.shadow_seq,
-                    }
-                } else {
-                    ShadowSyncTxnOutcome::AuthoritySeqMismatch {
-                        found: meta.shadow_seq,
-                    }
+                return Ok(ModuleStateSyncTxnOutcome::AuthoritySeqMismatch {
+                    found: meta.shadow_seq,
                 });
             }
 
@@ -6724,7 +6623,7 @@ impl McStore {
                 let adoption = match validated_seed_boundary(declared, request.compartments) {
                     Ok(adoption) => adoption,
                     Err(detail) => {
-                        return Ok(ShadowSyncTxnOutcome::InvalidSeedBoundary {
+                        return Ok(ModuleStateSyncTxnOutcome::InvalidSeedBoundary {
                             declared: declared.to_string(),
                             detail,
                         })
@@ -6817,49 +6716,36 @@ impl McStore {
             for compartment in request.compartments {
                 upsert_compartment_tx(tx, request.session_id, compartment)?;
             }
-            let mut memories_skipped = false;
-            if shadow_lane {
-                replace_workspace_tx(tx, request.shadow_project_path, request.workspace)?;
-                replace_shadow_memories_tx(tx, request.memories)?;
-                replace_shadow_memory_mutations_tx(tx, request.memory_mutations)?;
-                replace_shadow_user_profile_tx(tx, request.shadow_project_path, request.user_profile)?;
-            } else {
-                replace_workspace_tx(tx, request.shadow_project_path, request.workspace)?;
-                // Each authority pool has exactly one writer. When the module owns memories, this
-                // state-sync lane can only mirror module changes back to TypeScript; applying the
-                // TypeScript view here would let a stale sender overwrite module-authored fields.
-                let memories_authority_state: Option<String> = tx
-                    .query_row(
-                        "SELECT authority.state
-                           FROM mc_authority_route_bindings binding
-                           JOIN mc_authority authority
-                             ON authority.context_store_uuid = binding.context_store_uuid
-                            AND authority.project = binding.project
-                          WHERE binding.route_project_root = ?1
-                            AND authority.domain = 'memories'",
-                        params![request.shadow_project_path],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if matches!(
-                    memories_authority_state.as_deref(),
-                    Some("PREPARING" | "MODULE" | "DRAINING")
-                ) {
-                    memories_skipped = true;
-                } else {
-                    replace_authority_memories_tx(
-                        tx,
-                        request.shadow_project_path,
-                        request.memories,
-                    )?;
-                    replace_authority_memory_mutations_tx(
-                        tx,
-                        request.shadow_project_path,
-                        request.memory_mutations,
-                    )?;
-                }
-                replace_authority_user_profile_tx(tx, request.user_profile)?;
+            replace_workspace_tx(tx, request.project_path, request.workspace)?;
+            // Each authority pool has exactly one writer. When the module owns memories, this
+            // state-sync lane can only mirror module changes back to TypeScript; applying the
+            // TypeScript view here would let a stale sender overwrite module-authored fields.
+            let memories_authority_state: Option<String> = tx
+                .query_row(
+                    "SELECT authority.state
+                       FROM mc_authority_route_bindings binding
+                       JOIN mc_authority authority
+                         ON authority.context_store_uuid = binding.context_store_uuid
+                        AND authority.project = binding.project
+                      WHERE binding.route_project_root = ?1
+                        AND authority.domain = 'memories'",
+                    params![request.project_path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let memories_skipped = matches!(
+                memories_authority_state.as_deref(),
+                Some("PREPARING" | "MODULE" | "DRAINING")
+            );
+            if !memories_skipped {
+                replace_authority_memories_tx(tx, request.project_path, request.memories)?;
+                replace_authority_memory_mutations_tx(
+                    tx,
+                    request.project_path,
+                    request.memory_mutations,
+                )?;
             }
+            replace_authority_user_profile_tx(tx, request.user_profile)?;
 
             let in_session_watermark_changed = meta.shadow_acked_watermarks != request.acked_watermarks;
             meta.last_todo_state = request.last_todo_state.clone();
@@ -6888,11 +6774,11 @@ impl McStore {
             let next = current.max(0) as u64 + 1;
             let core_json = match serde_json::to_string(&core) {
                 Ok(json) => json,
-                Err(e) => return Ok(ShadowSyncTxnOutcome::Serde(e.to_string())),
+                Err(e) => return Ok(ModuleStateSyncTxnOutcome::Serde(e.to_string())),
             };
             let meta_json = match serde_json::to_string(&meta) {
                 Ok(json) => json,
-                Err(e) => return Ok(ShadowSyncTxnOutcome::Serde(e.to_string())),
+                Err(e) => return Ok(ModuleStateSyncTxnOutcome::Serde(e.to_string())),
             };
             tx.execute(
                 "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
@@ -6905,7 +6791,7 @@ impl McStore {
                 params![request.session_id, next as i64, core_json, meta_json, current_time_ms()],
             )?;
 
-            Ok(ShadowSyncTxnOutcome::Committed(ShadowStateSyncResult {
+            Ok(ModuleStateSyncTxnOutcome::Committed(ModuleStateSyncResult {
                 shadow_generation: meta.shadow_generation,
                 shadow_seq: meta.shadow_seq,
                 row_version: next,
@@ -6923,295 +6809,24 @@ impl McStore {
         })?;
 
         match outcome {
-            ShadowSyncTxnOutcome::Committed(result) => Ok(result),
-            ShadowSyncTxnOutcome::GenerationMismatch { found } => {
-                Err(ShadowStateSyncError::GenerationMismatch {
+            ModuleStateSyncTxnOutcome::Committed(result) => Ok(result),
+            ModuleStateSyncTxnOutcome::GenerationMismatch { found } => {
+                Err(ModuleStateSyncError::GenerationMismatch {
                     expected: request.shadow_generation,
                     found,
                 })
             }
-            ShadowSyncTxnOutcome::SeqMismatch { found } => Err(ShadowStateSyncError::SeqMismatch {
-                expected: request.expected_shadow_seq,
-                found,
-            }),
-            ShadowSyncTxnOutcome::AuthoritySeqMismatch { found } => {
-                Err(ShadowStateSyncError::AuthoritySeqMismatch {
+            ModuleStateSyncTxnOutcome::AuthoritySeqMismatch { found } => {
+                Err(ModuleStateSyncError::AuthoritySeqMismatch {
                     expected: request.expected_shadow_seq,
                     found,
                 })
             }
-            ShadowSyncTxnOutcome::InvalidSeedBoundary { declared, detail } => {
-                Err(ShadowStateSyncError::InvalidSeedBoundary { declared, detail })
+            ModuleStateSyncTxnOutcome::InvalidSeedBoundary { declared, detail } => {
+                Err(ModuleStateSyncError::InvalidSeedBoundary { declared, detail })
             }
-            ShadowSyncTxnOutcome::Serde(e) => Err(ShadowStateSyncError::Serde(e)),
+            ModuleStateSyncTxnOutcome::Serde(e) => Err(ModuleStateSyncError::Serde(e)),
         }
-    }
-
-    /// Start a new shadow lineage by wiping shadow-owned rows and recreating the cache
-    /// state with generation+1, seq=0, and quarantine cleared.
-    pub fn reset_shadow_session(
-        &self,
-        session_id: &str,
-        shadow_project_path: &str,
-    ) -> Result<ShadowResetResult, McStoreError> {
-        let core_json = serde_json::to_string(&CoreState::default())
-            .map_err(|e| McStoreError::Serde(e.to_string()))?;
-        let result = self.inner.with_conn_fenced(|tx| {
-            let row = tx
-                .query_row(
-                    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
-                    params![session_id],
-                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-                )
-                .optional()?;
-            let (current, current_generation) = match row {
-                Some((row_version, meta_json)) => {
-                    let meta: ModuleMeta = serde_json::from_str(&meta_json)
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                    (row_version, meta.shadow_generation)
-                }
-                None => (NO_ROW, 0),
-            };
-            let mut meta = ModuleMeta {
-                shadow_generation: current_generation.saturating_add(1),
-                shadow_seq: 0,
-                shadow_quarantined: false,
-                ..ModuleMeta::default()
-            };
-            meta.shadow_acked_watermarks = Value::Null;
-
-            tx.execute(
-                "DELETE FROM mc_compartments WHERE session_id = ?1",
-                params![session_id],
-            )?;
-            tx.execute(
-                "DELETE FROM pending_agent_drops WHERE session_id = ?1",
-                params![session_id],
-            )?;
-            tx.execute(
-                "DELETE FROM mc_reduce_command_ledger WHERE session_id = ?1",
-                params![session_id],
-            )?;
-            tx.execute(
-                "DELETE FROM mc_wrapup_commands WHERE session_id = ?1",
-                params![session_id],
-            )?;
-            tx.execute(
-                "DELETE FROM shadow_memories
-                  WHERE shadow_project_path = ?1
-                     OR shadow_project_path IN (
-                         SELECT member.project_path
-                           FROM mc_workspace_members AS anchor
-                           JOIN mc_workspace_members AS member
-                             ON member.workspace_id = anchor.workspace_id
-                          WHERE anchor.project_path = ?1
-                     )",
-                params![shadow_project_path],
-            )?;
-            tx.execute(
-                "DELETE FROM shadow_user_profile WHERE shadow_project_path = ?1",
-                params![shadow_project_path],
-            )?;
-            tx.execute(
-                "DELETE FROM shadow_memory_mutation_log
-                  WHERE shadow_project_path = ?1
-                     OR shadow_project_path IN (
-                         SELECT member.project_path
-                           FROM mc_workspace_members AS anchor
-                           JOIN mc_workspace_members AS member
-                             ON member.workspace_id = anchor.workspace_id
-                          WHERE anchor.project_path = ?1
-                     )",
-                params![shadow_project_path],
-            )?;
-            tx.execute(
-                "DELETE FROM mc_workspaces
-                  WHERE id IN (
-                      SELECT workspace_id FROM mc_workspace_members WHERE project_path = ?1
-                  )",
-                params![shadow_project_path],
-            )?;
-            let next = current.max(0) as u64 + 1;
-            let meta_json = serde_json::to_string(&meta)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-            tx.execute(
-                "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(session_id) DO UPDATE SET
-                     row_version = excluded.row_version,
-                     core_state  = excluded.core_state,
-                     meta        = excluded.meta,
-                     last_activity_at = excluded.last_activity_at",
-                params![session_id, next as i64, core_json, meta_json, current_time_ms()],
-            )?;
-            Ok(ShadowResetResult {
-                shadow_generation: meta.shadow_generation,
-                shadow_seq: meta.shadow_seq,
-                row_version: next,
-            })
-        })?;
-        Ok(result)
-    }
-
-    /// Stores one shadow divergence report and optionally marks the session quarantined in
-    /// a single compare-and-swap update. Once quarantined, later reports only increment the
-    /// durable pass counter so the first terminal row remains the sole finding. If the
-    /// generation no longer matches, the write fails so an older report cannot affect a
-    /// newer shadow lineage.
-    pub fn record_shadow_divergence(
-        &self,
-        record: ShadowDivergenceRecord<'_>,
-    ) -> Result<ShadowDivergenceWriteResult, McStoreError> {
-        let outcome = self.inner.with_conn_fenced(|tx| {
-            let row = tx
-                .query_row(
-                    "SELECT row_version, core_state, meta FROM mc_cache_state WHERE session_id = ?1",
-                    params![record.session_id],
-                    |r| {
-                        Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            let Some((current, core_json, meta_json)) = row else {
-                return Ok(ShadowDivergenceTxnOutcome::GenerationMismatch { found: 0 });
-            };
-            let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
-                Ok(meta) => meta,
-                Err(e) => return Ok(ShadowDivergenceTxnOutcome::Serde(e.to_string())),
-            };
-            if meta.shadow_generation != record.shadow_generation {
-                return Ok(ShadowDivergenceTxnOutcome::GenerationMismatch {
-                    found: meta.shadow_generation,
-                });
-            }
-
-            if meta.shadow_quarantined {
-                meta.shadow_quarantined_pass_count =
-                    meta.shadow_quarantined_pass_count.saturating_add(1);
-                let next = current.max(0) as u64 + 1;
-                let meta_json = match serde_json::to_string(&meta) {
-                    Ok(json) => json,
-                    Err(e) => return Ok(ShadowDivergenceTxnOutcome::Serde(e.to_string())),
-                };
-                tx.execute(
-                    "UPDATE mc_cache_state SET row_version = ?2, core_state = ?3, meta = ?4
-                     WHERE session_id = ?1 AND row_version = ?5",
-                    params![record.session_id, next as i64, core_json, meta_json, current],
-                )?;
-                return Ok(ShadowDivergenceTxnOutcome::Committed(
-                    ShadowDivergenceWriteResult {
-                        quarantined: true,
-                        row_version: next,
-                    },
-                ));
-            }
-
-            tx.execute(
-                "INSERT INTO shadow_divergences
-                   (session_id, pass_seq, class, first_mid, first_block, first_field,
-                    ts_prefix, rs_prefix, first_diff_offset, ts_window, rs_window,
-                    normalizations, ts_decision, rs_decision, state_hash, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-                params![
-                    record.session_id,
-                    record.pass_seq as i64,
-                    record.class,
-                    record.first_mid,
-                    record.first_block,
-                    record.first_field,
-                    record.ts_prefix,
-                    record.rs_prefix,
-                    record.first_diff_offset.map(|offset| offset as i64),
-                    record.ts_window,
-                    record.rs_window,
-                    record.normalizations_json,
-                    record.ts_decision_json,
-                    record.rs_decision_json,
-                    record.state_hash,
-                    record.created_at_ms,
-                ],
-            )?;
-
-            let mut next = current.max(0) as u64;
-            if record.quarantine && !meta.shadow_quarantined {
-                meta.shadow_quarantined = true;
-                next = next.saturating_add(1);
-                let meta_json = match serde_json::to_string(&meta) {
-                    Ok(json) => json,
-                    Err(e) => return Ok(ShadowDivergenceTxnOutcome::Serde(e.to_string())),
-                };
-                tx.execute(
-                    "UPDATE mc_cache_state SET row_version = ?2, core_state = ?3, meta = ?4
-                     WHERE session_id = ?1 AND row_version = ?5",
-                    params![record.session_id, next as i64, core_json, meta_json, current],
-                )?;
-            }
-
-            Ok(ShadowDivergenceTxnOutcome::Committed(
-                ShadowDivergenceWriteResult {
-                    quarantined: meta.shadow_quarantined,
-                    row_version: next,
-                },
-            ))
-        })?;
-
-        match outcome {
-            ShadowDivergenceTxnOutcome::Committed(result) => Ok(result),
-            ShadowDivergenceTxnOutcome::GenerationMismatch { found } => {
-                Err(McStoreError::CasConflict {
-                    expected: Some(record.shadow_generation),
-                    found,
-                })
-            }
-            ShadowDivergenceTxnOutcome::Serde(e) => Err(McStoreError::Serde(e)),
-        }
-    }
-
-    pub fn load_shadow_divergences(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<ShadowDivergenceRow>, McStoreError> {
-        let rows = self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, session_id, pass_seq, class, first_mid, first_block, first_field,
-                        ts_prefix, rs_prefix, first_diff_offset, ts_window, rs_window,
-                        normalizations, ts_decision, rs_decision, state_hash, created_at
-                   FROM shadow_divergences
-                  WHERE session_id = ?1
-                  ORDER BY pass_seq ASC, id ASC",
-            )?;
-            let mapped = stmt
-                .query_map(params![session_id], |r| {
-                    Ok(ShadowDivergenceRow {
-                        id: r.get(0)?,
-                        session_id: r.get(1)?,
-                        pass_seq: r.get::<_, i64>(2)?.max(0) as u64,
-                        class: r.get(3)?,
-                        first_mid: r.get(4)?,
-                        first_block: r.get(5)?,
-                        first_field: r.get(6)?,
-                        ts_prefix: r.get(7)?,
-                        rs_prefix: r.get(8)?,
-                        first_diff_offset: r
-                            .get::<_, Option<i64>>(9)?
-                            .map(|offset| offset.max(0) as u64),
-                        ts_window: r.get(10)?,
-                        rs_window: r.get(11)?,
-                        normalizations_json: r.get(12)?,
-                        ts_decision_json: r.get(13)?,
-                        rs_decision_json: r.get(14)?,
-                        state_hash: r.get(15)?,
-                        created_at_ms: r.get(16)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(mapped)
-        })?;
-        Ok(rows)
     }
 
     fn stored_compartment_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCompartment> {
@@ -8499,9 +8114,6 @@ impl McStore {
         project_path: &str,
         now_ms: i64,
     ) -> Result<Vec<StoredMemory>, McStoreError> {
-        if is_shadow_project_path(project_path) {
-            return self.load_active_shadow_memories(project_path, now_ms);
-        }
         let rows = self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, project_path, category, content, importance, status, expires_at,
@@ -8514,41 +8126,6 @@ impl McStore {
             )?;
             let mapped = stmt
                 .query_map(params![project_path, now_ms], |r| {
-                    Ok(StoredMemory {
-                        id: r.get(0)?,
-                        project_path: r.get(1)?,
-                        category: r.get(2)?,
-                        content: r.get(3)?,
-                        importance: r.get(4)?,
-                        status: r.get(5)?,
-                        expires_at: r.get(6)?,
-                        superseded_by_memory_id: r.get(7)?,
-                        updated_at: r.get(8)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(mapped)
-        })?;
-        Ok(rows)
-    }
-
-    fn load_active_shadow_memories(
-        &self,
-        shadow_project_path: &str,
-        now_ms: i64,
-    ) -> Result<Vec<StoredMemory>, McStoreError> {
-        let rows = self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, shadow_project_path, category, content, importance, status, expires_at,
-                        superseded_by_memory_id, updated_at
-                   FROM shadow_memories
-                  WHERE shadow_project_path = ?1
-                    AND status IN ('active', 'permanent')
-                    AND (expires_at IS NULL OR expires_at > ?2)
-                  ORDER BY COALESCE(importance, 50) DESC, id ASC",
-            )?;
-            let mapped = stmt
-                .query_map(params![shadow_project_path, now_ms], |r| {
                     Ok(StoredMemory {
                         id: r.get(0)?,
                         project_path: r.get(1)?,
@@ -8591,16 +8168,6 @@ impl McStore {
         if rendered_memory_ids.is_empty() || project_paths.is_empty() {
             return Ok(Vec::new());
         }
-        if project_paths
-            .iter()
-            .any(|path| is_shadow_project_path(path))
-        {
-            return self.shadow_memory_mutations_for_render(
-                project_paths,
-                after_id,
-                rendered_memory_ids,
-            );
-        }
         // dedup + sort the id set for a stable IN-clause.
         let mut ids: Vec<i64> = rendered_memory_ids.to_vec();
         ids.sort_unstable();
@@ -8626,66 +8193,6 @@ impl McStore {
             );
             let mut stmt = conn.prepare(&sql)?;
             // bind: the project set, then after_id, then the id set (matching SQL order).
-            let mut binds: Vec<rusqlite::types::Value> = projects
-                .iter()
-                .map(|p| rusqlite::types::Value::from(p.clone()))
-                .collect();
-            binds.push(rusqlite::types::Value::from(after_id));
-            binds.extend(ids.iter().map(|&i| rusqlite::types::Value::from(i)));
-            let mapped = stmt
-                .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
-                    Ok(StoredMemoryMutation {
-                        id: r.get(0)?,
-                        mutation_type: r.get(1)?,
-                        target_memory_id: r.get(2)?,
-                        superseded_by_id: r.get(3)?,
-                        category: r.get(4)?,
-                        new_content: r.get(5)?,
-                        queued_at: r.get(6)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(mapped)
-        })?;
-
-        Ok(coalesce_mutations(rows))
-    }
-
-    fn shadow_memory_mutations_for_render(
-        &self,
-        project_paths: &[String],
-        after_id: i64,
-        rendered_memory_ids: &[i64],
-    ) -> Result<Vec<StoredMemoryMutation>, McStoreError> {
-        let mut ids: Vec<i64> = rendered_memory_ids.to_vec();
-        ids.sort_unstable();
-        ids.dedup();
-        let id_ph = std::iter::repeat_n("?", ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut projects: Vec<String> = project_paths
-            .iter()
-            .filter(|path| is_shadow_project_path(path))
-            .cloned()
-            .collect();
-        projects.sort_unstable();
-        projects.dedup();
-        if projects.is_empty() {
-            return Ok(Vec::new());
-        }
-        let proj_ph = std::iter::repeat_n("?", projects.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let rows = self.inner.with_conn(|conn| {
-            let sql = format!(
-                "SELECT id, mutation_type, target_memory_id, superseded_by_id, category,
-                        new_content, queued_at
-                   FROM shadow_memory_mutation_log
-                  WHERE shadow_project_path IN ({proj_ph}) AND id > ? AND target_memory_id IN ({id_ph})
-                  ORDER BY id ASC"
-            );
-            let mut stmt = conn.prepare(&sql)?;
             let mut binds: Vec<rusqlite::types::Value> = projects
                 .iter()
                 .map(|p| rusqlite::types::Value::from(p.clone()))
@@ -8811,17 +8318,8 @@ impl McStore {
         if membership.union_identities.is_empty() {
             return Ok(Vec::new());
         }
-        let shadow = is_shadow_project_path(&membership.own_identity);
-        let path_column = if shadow {
-            "shadow_project_path"
-        } else {
-            "project_path"
-        };
-        let table = if shadow {
-            "shadow_memories"
-        } else {
-            "mc_memories"
-        };
+        let path_column = "project_path";
+        let table = "mc_memories";
         let (sharing, binds) =
             workspace_union_memory_visibility_filter_for_column(membership, path_column);
 
@@ -8868,22 +8366,9 @@ impl McStore {
         let project_paths = membership
             .map(|value| value.union_identities.clone())
             .unwrap_or_else(|| vec![project_path.to_string()]);
-        let shadow = is_shadow_project_path(project_path);
-        let table = if shadow {
-            "shadow_memories"
-        } else {
-            "mc_memories"
-        };
-        let path_column = if shadow {
-            "shadow_project_path"
-        } else {
-            "project_path"
-        };
-        let mutation_table = if shadow {
-            "shadow_memory_mutation_log"
-        } else {
-            "mc_memory_mutation_log"
-        };
+        let table = "mc_memories";
+        let path_column = "project_path";
+        let mutation_table = "mc_memory_mutation_log";
         let snapshot = self.inner.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
             let (visibility, mut binds) = if let Some(membership) = membership {
@@ -10085,26 +9570,6 @@ impl McStore {
         Ok(rows)
     }
 
-    /// Load the profile lines mirrored for one shadow project. Shadow composition must not
-    /// read the global user-memory table owned by the production leg.
-    pub fn load_shadow_user_profile(
-        &self,
-        shadow_project_path: &str,
-    ) -> Result<Vec<String>, McStoreError> {
-        let rows = self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT content FROM shadow_user_profile
-                 WHERE shadow_project_path = ?1
-                 ORDER BY profile_index ASC",
-            )?;
-            let mapped = stmt
-                .query_map(params![shadow_project_path], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(mapped)
-        })?;
-        Ok(rows)
-    }
-
     /// The highest memory-mutation-log id across the given project identities (the union,
     /// or a single-element slice). The cursor a baseline re-render (HARD) folds the
     /// corrections up to, and the watermark a delta pass (SOFT) reads new corrections
@@ -10113,36 +9578,6 @@ impl McStore {
     pub fn max_memory_mutation_id(&self, project_paths: &[String]) -> Result<i64, McStoreError> {
         if project_paths.is_empty() {
             return Ok(0);
-        }
-        if project_paths
-            .iter()
-            .any(|path| is_shadow_project_path(path))
-        {
-            let mut projects: Vec<String> = project_paths
-                .iter()
-                .filter(|path| is_shadow_project_path(path))
-                .cloned()
-                .collect();
-            projects.sort_unstable();
-            projects.dedup();
-            if projects.is_empty() {
-                return Ok(0);
-            }
-            let ph = std::iter::repeat_n("?", projects.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let max = self.inner.with_conn(|conn| {
-                let sql = format!(
-                    "SELECT COALESCE(MAX(id), 0) FROM shadow_memory_mutation_log
-                     WHERE shadow_project_path IN ({ph})"
-                );
-                let v: i64 =
-                    conn.query_row(&sql, rusqlite::params_from_iter(projects.iter()), |r| {
-                        r.get(0)
-                    })?;
-                Ok(v)
-            })?;
-            return Ok(max);
         }
         let mut projects: Vec<String> = project_paths.to_vec();
         projects.sort_unstable();
@@ -10171,36 +9606,6 @@ impl McStore {
     pub fn max_memory_id(&self, project_paths: &[String]) -> Result<i64, McStoreError> {
         if project_paths.is_empty() {
             return Ok(0);
-        }
-        if project_paths
-            .iter()
-            .any(|path| is_shadow_project_path(path))
-        {
-            let mut projects: Vec<String> = project_paths
-                .iter()
-                .filter(|path| is_shadow_project_path(path))
-                .cloned()
-                .collect();
-            projects.sort_unstable();
-            projects.dedup();
-            if projects.is_empty() {
-                return Ok(0);
-            }
-            let ph = std::iter::repeat_n("?", projects.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let max = self.inner.with_conn(|conn| {
-                let sql = format!(
-                    "SELECT COALESCE(MAX(id), 0) FROM shadow_memories WHERE shadow_project_path IN ({ph})"
-                );
-                let v: i64 = conn.query_row(
-                    &sql,
-                    rusqlite::params_from_iter(projects.iter()),
-                    |r| r.get(0),
-                )?;
-                Ok(v)
-            })?;
-            return Ok(max);
         }
         let mut projects: Vec<String> = project_paths.to_vec();
         projects.sort_unstable();
@@ -11349,15 +10754,15 @@ fn upsert_compartment_tx(
 
 fn replace_workspace_tx(
     tx: &rusqlite::Transaction<'_>,
-    shadow_project_path: &str,
-    workspace: Option<&ShadowWorkspaceRow>,
+    project_path: &str,
+    workspace: Option<&ModuleWorkspaceRow>,
 ) -> rusqlite::Result<()> {
     tx.execute(
         "DELETE FROM mc_workspaces
           WHERE id IN (
               SELECT workspace_id FROM mc_workspace_members WHERE project_path = ?1
           )",
-        params![shadow_project_path],
+        params![project_path],
     )?;
     let Some(workspace) = workspace else {
         return Ok(());
@@ -11380,78 +10785,6 @@ fn replace_workspace_tx(
                 &member.project_path,
                 &member.display_name,
                 &member.display_path
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn replace_shadow_memories_tx(
-    tx: &rusqlite::Transaction<'_>,
-    memories: &[ShadowMemoryRow],
-) -> rusqlite::Result<()> {
-    if memories.is_empty() {
-        return Ok(());
-    }
-    for memory in memories {
-        tx.execute(
-            "INSERT INTO shadow_memories
-               (shadow_project_path, id, category, content, normalized_hash, importance,
-                scope, shareable, source_session_id, source_type, seen_count, retrieval_count,
-                first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
-                status, expires_at, verification_status, verified_at, classified_at,
-                superseded_by_memory_id, merged_from, metadata_json)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
-             ON CONFLICT(shadow_project_path, id) DO UPDATE SET
-                category = excluded.category,
-                content = excluded.content,
-                normalized_hash = excluded.normalized_hash,
-                importance = excluded.importance,
-                scope = excluded.scope,
-                shareable = excluded.shareable,
-                source_session_id = excluded.source_session_id,
-                source_type = excluded.source_type,
-                seen_count = excluded.seen_count,
-                retrieval_count = excluded.retrieval_count,
-                first_seen_at = excluded.first_seen_at,
-                created_at = excluded.created_at,
-                updated_at = excluded.updated_at,
-                last_seen_at = excluded.last_seen_at,
-                last_retrieved_at = excluded.last_retrieved_at,
-                status = excluded.status,
-                expires_at = excluded.expires_at,
-                verification_status = excluded.verification_status,
-                verified_at = excluded.verified_at,
-                classified_at = excluded.classified_at,
-                superseded_by_memory_id = excluded.superseded_by_memory_id,
-                merged_from = excluded.merged_from,
-                metadata_json = excluded.metadata_json",
-            params![
-                &memory.project_path,
-                memory.id,
-                &memory.category,
-                &memory.content,
-                &memory.normalized_hash,
-                memory.importance.map(i64::from),
-                &memory.scope,
-                memory.shareable as i64,
-                memory.source_session_id.as_deref(),
-                memory.source_type.as_deref(),
-                memory.seen_count,
-                memory.retrieval_count,
-                memory.first_seen_at,
-                memory.created_at,
-                memory.updated_at,
-                memory.last_seen_at,
-                memory.last_retrieved_at,
-                &memory.status,
-                memory.expires_at,
-                &memory.verification_status,
-                memory.verified_at,
-                memory.classified_at,
-                memory.superseded_by_memory_id,
-                memory.merged_from.as_deref(),
-                memory.metadata_json.as_deref(),
             ],
         )?;
     }
@@ -11492,7 +10825,7 @@ fn authority_memory_id_for_source_tx(
 fn replace_authority_memories_tx(
     tx: &rusqlite::Transaction<'_>,
     route_project_root: &str,
-    memories: &[ShadowMemoryRow],
+    memories: &[ModuleMemoryRow],
 ) -> rusqlite::Result<()> {
     let context_store_uuid = authority_route_context_store_uuid_tx(tx, route_project_root)?;
     for memory in memories {
@@ -11636,65 +10969,10 @@ fn replace_authority_memories_tx(
     Ok(())
 }
 
-fn replace_shadow_user_profile_tx(
-    tx: &rusqlite::Transaction<'_>,
-    shadow_project_path: &str,
-    profile_lines: &[String],
-) -> rusqlite::Result<()> {
-    tx.execute(
-        "DELETE FROM shadow_user_profile WHERE shadow_project_path = ?1",
-        params![shadow_project_path],
-    )?;
-    for (profile_index, content) in profile_lines.iter().enumerate() {
-        tx.execute(
-            "INSERT INTO shadow_user_profile (shadow_project_path, profile_index, content)
-             VALUES (?1, ?2, ?3)",
-            params![shadow_project_path, profile_index as i64, content],
-        )?;
-    }
-    Ok(())
-}
-
-fn replace_shadow_memory_mutations_tx(
-    tx: &rusqlite::Transaction<'_>,
-    mutations: &[ShadowMemoryMutationRow],
-) -> rusqlite::Result<()> {
-    if mutations.is_empty() {
-        return Ok(());
-    }
-    for row in mutations {
-        let mutation = &row.mutation;
-        tx.execute(
-            "INSERT INTO shadow_memory_mutation_log
-               (shadow_project_path, id, mutation_type, target_memory_id, superseded_by_id,
-                category, new_content, queued_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-             ON CONFLICT(shadow_project_path, id) DO UPDATE SET
-                mutation_type = excluded.mutation_type,
-                target_memory_id = excluded.target_memory_id,
-                superseded_by_id = excluded.superseded_by_id,
-                category = excluded.category,
-                new_content = excluded.new_content,
-                queued_at = excluded.queued_at",
-            params![
-                &row.project_path,
-                mutation.id,
-                &mutation.mutation_type,
-                mutation.target_memory_id,
-                mutation.superseded_by_id,
-                mutation.category.as_deref(),
-                mutation.new_content.as_deref(),
-                mutation.queued_at,
-            ],
-        )?;
-    }
-    Ok(())
-}
-
 fn replace_authority_memory_mutations_tx(
     tx: &rusqlite::Transaction<'_>,
     route_project_root: &str,
-    mutations: &[ShadowMemoryMutationRow],
+    mutations: &[ModuleMemoryMutationRow],
 ) -> rusqlite::Result<()> {
     let context_store_uuid = authority_route_context_store_uuid_tx(tx, route_project_root)?;
     for row in mutations {
@@ -12333,10 +11611,6 @@ fn stable_content_hash(content: &str) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
-}
-
-fn is_shadow_project_path(project_path: &str) -> bool {
-    project_path.starts_with(SHADOW_SESSION_PREFIX)
 }
 
 fn idle_historian_after_success(firing_seq: u64) -> HistorianDurableState {
@@ -13248,41 +12522,6 @@ mod tests {
             )
             .unwrap();
         assert!(oldest_retry.duplicate);
-    }
-
-    #[test]
-    fn reset_shadow_session_clears_command_ledger_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
-        let session_id = "shadow:cleanup";
-        let target_ids = vec!["a#0".to_string()];
-        store
-            .append_pending_agent_drops_with_command(
-                session_id,
-                Some("tool-use-1"),
-                &target_ids,
-                1,
-                false,
-            )
-            .unwrap();
-        store.reset_shadow_session(session_id, session_id).unwrap();
-
-        assert_eq!(
-            store
-                .append_pending_agent_drops_with_command(
-                    session_id,
-                    Some("tool-use-1"),
-                    &target_ids,
-                    2,
-                    false,
-                )
-                .unwrap(),
-            AppendOutcome {
-                queued: 1,
-                duplicate: false,
-                disposition: None,
-            }
-        );
     }
 
     #[test]
@@ -15847,8 +15086,8 @@ mod shadow_tests {
         }
     }
 
-    fn memory(id: i64, content: &str) -> ShadowMemoryRow {
-        ShadowMemoryRow {
+    fn memory(id: i64, content: &str) -> ModuleMemoryRow {
+        ModuleMemoryRow {
             id,
             project_path: "shadow:real".to_string(),
             category: "CONSTRAINTS".to_string(),
@@ -15860,687 +15099,6 @@ mod shadow_tests {
             verification_status: "unverified".to_string(),
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn shadow_workspace_union_stays_isolated_from_real_project_queries() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let session = "shadow:workspace-session";
-        let foreign = "shadow:workspace-session:member:foreign";
-        let workspace = ShadowWorkspaceRow {
-            name: "shadow-workspace-isolation".to_string(),
-            share_categories: vec!["CONSTRAINTS".to_string()],
-            members: vec![
-                ShadowWorkspaceMemberRow {
-                    project_path: session.to_string(),
-                    display_name: "owner".to_string(),
-                    display_path: "/real/owner".to_string(),
-                },
-                ShadowWorkspaceMemberRow {
-                    project_path: foreign.to_string(),
-                    display_name: "foreign".to_string(),
-                    display_path: "/real/foreign".to_string(),
-                },
-            ],
-        };
-        let mut own = memory(1, "own architecture");
-        own.project_path = session.to_string();
-        own.category = "ARCHITECTURE".to_string();
-        let mut shared = memory(2, "foreign constraint");
-        shared.project_path = foreign.to_string();
-        shared.shareable = 1;
-        let mut private = memory(3, "foreign preference");
-        private.project_path = foreign.to_string();
-        private.category = "PREFERENCES".to_string();
-        let marker = PendingCompactionMarkerState {
-            ordinal: 42,
-            end_message_id: "m42#0".to_string(),
-            published_at: 100,
-        };
-        let deferred = DeferredExecuteState {
-            reason: "mid-turn".to_string(),
-        };
-
-        store
-            .apply_shadow_state_sync(ShadowStateSyncRequest {
-                session_id: session,
-                shadow_project_path: session,
-                shadow_generation: 0,
-                expected_shadow_seq: 0,
-                seed_boundary_id: None,
-                drop_seeds: &[],
-                drop_seed_skipped: 0,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                compartments: &[],
-                memories: &[own, shared, private],
-                memory_mutations: &[],
-                user_profile: &[],
-                workspace: Some(&workspace),
-                last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: Some(Some(&marker)),
-                deferred_execute_state: Some(Some(&deferred)),
-                channel2_nudge_state: Some("delivered"),
-                acked_watermarks: serde_json::Value::Null,
-            })
-            .unwrap();
-
-        let seeded_meta = store.load(session).unwrap().meta;
-        assert_eq!(seeded_meta.pending_compaction_marker, Some(marker));
-        assert_eq!(seeded_meta.deferred_execute_state, Some(deferred));
-        assert_eq!(seeded_meta.channel2_nudge_state, "delivered");
-
-        let membership = store
-            .resolve_workspace_membership(session)
-            .unwrap()
-            .expect("shadow workspace membership");
-        assert!(membership
-            .union_identities
-            .iter()
-            .all(|path| path.starts_with(SHADOW_SESSION_PREFIX)));
-        let visible = store.load_workspace_union_memories(&membership, 0).unwrap();
-        assert_eq!(
-            visible.iter().map(|memory| memory.id).collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        assert!(store
-            .resolve_workspace_membership("/real/foreign")
-            .unwrap()
-            .is_none());
-        assert!(store
-            .load_active_memories("/real/foreign", 0)
-            .unwrap()
-            .is_empty());
-
-        store.reset_shadow_session(session, session).unwrap();
-        assert!(store
-            .resolve_workspace_membership(session)
-            .unwrap()
-            .is_none());
-        assert!(store.load_active_memories(foreign, 0).unwrap().is_empty());
-    }
-
-    #[test]
-    fn shadow_state_sync_is_generation_and_zero_seq_gated() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let session = "shadow:real";
-        let project = "shadow:real";
-        let compartments = vec![comp(0, 0, "a#0")];
-        let memories = vec![memory(1, "remember zero")];
-        let mutations = vec![ShadowMemoryMutationRow {
-            project_path: project.to_string(),
-            mutation: StoredMemoryMutation {
-                id: 0,
-                mutation_type: "update".to_string(),
-                target_memory_id: 1,
-                new_content: Some("remember one".to_string()),
-                ..Default::default()
-            },
-        }];
-
-        let applied = store
-            .apply_shadow_state_sync(ShadowStateSyncRequest {
-                session_id: session,
-                shadow_project_path: project,
-                shadow_generation: 0,
-                expected_shadow_seq: 0,
-                seed_boundary_id: None,
-                drop_seeds: &[],
-                drop_seed_skipped: 0,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                compartments: &compartments,
-                memories: &memories,
-                memory_mutations: &mutations,
-                user_profile: &[],
-                workspace: None,
-                last_todo_state: Some("[]".to_string()),
-                project_memory_epoch: None,
-                user_profile_version: None,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: None,
-                deferred_execute_state: None,
-                channel2_nudge_state: None,
-                acked_watermarks: serde_json::json!({"seq": 0}),
-            })
-            .unwrap();
-        assert_eq!(applied.shadow_seq, 1);
-        let loaded = store.load(session).unwrap();
-        assert_eq!(loaded.meta.shadow_generation, 0);
-        assert_eq!(loaded.meta.shadow_seq, 1);
-        assert_eq!(loaded.meta.last_todo_state.as_deref(), Some("[]"));
-        assert_eq!(store.load_compartments(session).unwrap()[0].sequence, 0);
-        assert_eq!(store.load_active_memories(project, 0).unwrap()[0].id, 1);
-        assert_eq!(
-            store
-                .max_memory_mutation_id(&[project.to_string()])
-                .unwrap(),
-            0
-        );
-
-        let seq_reject = store
-            .apply_shadow_state_sync(ShadowStateSyncRequest {
-                session_id: session,
-                shadow_project_path: project,
-                shadow_generation: 0,
-                expected_shadow_seq: 0,
-                seed_boundary_id: None,
-                drop_seeds: &[],
-                drop_seed_skipped: 0,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                compartments: &[],
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                workspace: None,
-                last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: None,
-                deferred_execute_state: None,
-                channel2_nudge_state: None,
-                acked_watermarks: serde_json::Value::Null,
-            })
-            .unwrap_err();
-        assert!(matches!(
-            seq_reject,
-            ShadowStateSyncError::SeqMismatch {
-                expected: 0,
-                found: 1
-            }
-        ));
-
-        let reset = store.reset_shadow_session(session, project).unwrap();
-        assert_eq!(reset.shadow_generation, 1);
-        assert_eq!(reset.shadow_seq, 0);
-        assert!(store.load_compartments(session).unwrap().is_empty());
-        assert!(store.load_active_memories(project, 0).unwrap().is_empty());
-
-        let stale_generation = store
-            .apply_shadow_state_sync(ShadowStateSyncRequest {
-                session_id: session,
-                shadow_project_path: project,
-                shadow_generation: 0,
-                expected_shadow_seq: 0,
-                seed_boundary_id: None,
-                drop_seeds: &[],
-                drop_seed_skipped: 0,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                compartments: &[],
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                workspace: None,
-                last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: None,
-                deferred_execute_state: None,
-                channel2_nudge_state: None,
-                acked_watermarks: serde_json::Value::Null,
-            })
-            .unwrap_err();
-        assert!(matches!(
-            stale_generation,
-            ShadowStateSyncError::GenerationMismatch {
-                expected: 0,
-                found: 1
-            }
-        ));
-    }
-
-    #[test]
-    fn assembled_paged_seed_without_reset_retains_omitted_compartments() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let session = "shadow:reset-required";
-        let initial = vec![comp(0, 0, "first#0"), comp(1, 1, "stale#0")];
-        store
-            .apply_shadow_state_sync(ShadowStateSyncRequest {
-                session_id: session,
-                shadow_project_path: session,
-                shadow_generation: 0,
-                expected_shadow_seq: 0,
-                seed_boundary_id: None,
-                drop_seeds: &[],
-                drop_seed_skipped: 0,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                compartments: &initial,
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                workspace: None,
-                last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: None,
-                deferred_execute_state: None,
-                channel2_nudge_state: None,
-                acked_watermarks: serde_json::Value::Null,
-            })
-            .unwrap();
-
-        // A completed paged seed reaches the store as one assembled request. Omitting
-        // the existing sequence-1 compartment here preserves it unless reset ran first.
-        let replacement = vec![comp(0, 0, "replacement#0")];
-        store
-            .apply_shadow_state_sync(ShadowStateSyncRequest {
-                session_id: session,
-                shadow_project_path: session,
-                shadow_generation: 0,
-                expected_shadow_seq: 1,
-                seed_boundary_id: None,
-                drop_seeds: &[],
-                drop_seed_skipped: 0,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                compartments: &replacement,
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                workspace: None,
-                last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: None,
-                deferred_execute_state: None,
-                channel2_nudge_state: None,
-                acked_watermarks: serde_json::Value::Null,
-            })
-            .unwrap();
-        assert_eq!(
-            store
-                .load_compartments(session)
-                .unwrap()
-                .iter()
-                .map(|compartment| compartment.sequence)
-                .collect::<Vec<_>>(),
-            vec![0, 1],
-            "state_sync upserts and cannot prove completeness without a prior reset"
-        );
-
-        store.reset_shadow_session(session, session).unwrap();
-        store
-            .apply_shadow_state_sync(ShadowStateSyncRequest {
-                session_id: session,
-                shadow_project_path: session,
-                shadow_generation: 1,
-                expected_shadow_seq: 0,
-                seed_boundary_id: None,
-                drop_seeds: &[],
-                drop_seed_skipped: 0,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                compartments: &replacement,
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                workspace: None,
-                last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: None,
-                deferred_execute_state: None,
-                channel2_nudge_state: None,
-                acked_watermarks: serde_json::Value::Null,
-            })
-            .unwrap();
-        assert_eq!(store.load_compartments(session).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn shadow_seed_boundary_mismatch_rejects_without_partial_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let session = "shadow:stale-boundary";
-        let compartments = vec![comp(7, 12, "tail#2")];
-
-        let error = store
-            .apply_shadow_state_sync(ShadowStateSyncRequest {
-                session_id: session,
-                shadow_project_path: session,
-                shadow_generation: 0,
-                expected_shadow_seq: 0,
-                seed_boundary_id: Some("tail#1"),
-                drop_seeds: &[],
-                drop_seed_skipped: 0,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                compartments: &compartments,
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                workspace: None,
-                last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: None,
-                deferred_execute_state: None,
-                channel2_nudge_state: None,
-                acked_watermarks: serde_json::Value::Null,
-            })
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ShadowStateSyncError::InvalidSeedBoundary { .. }
-        ));
-        let loaded = store.load(session).unwrap();
-        assert_eq!(loaded.meta.shadow_seq, 0);
-        assert!(loaded.core.boundary_id.is_empty());
-        assert!(store.load_compartments(session).unwrap().is_empty());
-    }
-
-    #[test]
-    fn drop_seed_units_are_frozen_before_transform_and_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let session = "shadow:drop-seed";
-        let seeds = vec![
-            ShadowDropSeedRow {
-                block_id: "m1#0".to_string(),
-                related_block_ids: vec!["m1#1".to_string()],
-                drop_mode: "truncated".to_string(),
-                payload: None,
-            },
-            ShadowDropSeedRow {
-                block_id: "m2#0".to_string(),
-                related_block_ids: vec![],
-                drop_mode: "edit_marker".to_string(),
-                payload: Some("{\"filePath\":\"src/main.ts\"}".to_string()),
-            },
-        ];
-        let first = store
-            .apply_shadow_state_sync(ShadowStateSyncRequest {
-                session_id: session,
-                shadow_project_path: session,
-                shadow_generation: 0,
-                expected_shadow_seq: 0,
-                seed_boundary_id: None,
-                drop_seeds: &seeds,
-                drop_seed_skipped: 0,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                compartments: &[],
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                workspace: None,
-                last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: None,
-                deferred_execute_state: None,
-                channel2_nudge_state: None,
-                acked_watermarks: serde_json::Value::Null,
-            })
-            .unwrap();
-        assert_eq!(first.drop_seeds_skipped, 0);
-        let first_state = store.load(session).unwrap();
-        assert_eq!(first_state.core.frozen_units.len(), 3);
-        assert_eq!(first_state.core.frozen_units[0].key, "red:m1#0");
-        assert_eq!(first_state.core.frozen_units[0].kind, "skeleton");
-        assert_eq!(first_state.core.frozen_units[0].frozen_payload, "[dropped]");
-        assert_eq!(first_state.core.frozen_units[1].key, "red:m1#1");
-
-        let second = store
-            .apply_shadow_state_sync(ShadowStateSyncRequest {
-                session_id: session,
-                shadow_project_path: session,
-                shadow_generation: 0,
-                expected_shadow_seq: 1,
-                seed_boundary_id: None,
-                drop_seeds: &seeds,
-                drop_seed_skipped: 0,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                compartments: &[],
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                workspace: None,
-                last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: None,
-                deferred_execute_state: None,
-                channel2_nudge_state: None,
-                acked_watermarks: serde_json::Value::Null,
-            })
-            .unwrap();
-        assert_eq!(second.drop_seeds_skipped, 0);
-        let second_state = store.load(session).unwrap();
-        assert_eq!(
-            second_state.core.frozen_units,
-            first_state.core.frozen_units
-        );
-    }
-
-    #[test]
-    fn invalid_drop_seed_is_counted_without_rejecting_state_sync() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let seeds = [ShadowDropSeedRow {
-            block_id: "not-a-block".to_string(),
-            related_block_ids: vec![],
-            drop_mode: "full".to_string(),
-            payload: None,
-        }];
-        let result = store
-            .apply_shadow_state_sync(ShadowStateSyncRequest {
-                session_id: "shadow:drop-seed-invalid",
-                shadow_project_path: "shadow:drop-seed-invalid",
-                shadow_generation: 0,
-                expected_shadow_seq: 0,
-                seed_boundary_id: None,
-                drop_seeds: &seeds,
-                drop_seed_skipped: 3,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                compartments: &[],
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                workspace: None,
-                last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: None,
-                deferred_execute_state: None,
-                channel2_nudge_state: None,
-                acked_watermarks: serde_json::Value::Null,
-            })
-            .unwrap();
-        assert_eq!(result.drop_seeds_skipped, 4);
-        assert!(store
-            .load("shadow:drop-seed-invalid")
-            .unwrap()
-            .core
-            .frozen_units
-            .is_empty());
-    }
-
-    #[test]
-    fn shadow_divergence_quarantines_until_reset() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let session = "shadow:real";
-        let project = "shadow:real";
-        let reset = store.reset_shadow_session(session, project).unwrap();
-
-        let write = store
-            .record_shadow_divergence(ShadowDivergenceRecord {
-                session_id: session,
-                shadow_generation: reset.shadow_generation,
-                pass_seq: 0,
-                class: "byte-mismatch",
-                first_mid: Some("m0"),
-                first_block: Some("0"),
-                first_field: Some("content"),
-                ts_prefix: "ts",
-                rs_prefix: "rs",
-                first_diff_offset: Some(3),
-                ts_window: "ts-window",
-                rs_window: "rs-window",
-                normalizations_json: "[]",
-                ts_decision_json: "{}",
-                rs_decision_json: "{}",
-                state_hash: "hash",
-                created_at_ms: 7,
-                quarantine: true,
-            })
-            .unwrap();
-        assert!(write.quarantined);
-        assert!(store.load(session).unwrap().meta.shadow_quarantined);
-        let rows = store.load_shadow_divergences(session).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].first_diff_offset, Some(3));
-        assert_eq!(rows[0].ts_window, "ts-window");
-        assert_eq!(rows[0].rs_window, "rs-window");
-
-        let repeated = store
-            .record_shadow_divergence(ShadowDivergenceRecord {
-                session_id: session,
-                shadow_generation: reset.shadow_generation,
-                pass_seq: 1,
-                class: "quarantined",
-                first_mid: None,
-                first_block: None,
-                first_field: None,
-                ts_prefix: "",
-                rs_prefix: "",
-                first_diff_offset: None,
-                ts_window: "",
-                rs_window: "",
-                normalizations_json: "[]",
-                ts_decision_json: "{}",
-                rs_decision_json: "{}",
-                state_hash: "hash",
-                created_at_ms: 8,
-                quarantine: false,
-            })
-            .unwrap();
-        assert!(repeated.quarantined);
-        assert_eq!(store.load_shadow_divergences(session).unwrap().len(), 1);
-        assert_eq!(
-            store
-                .load(session)
-                .unwrap()
-                .meta
-                .shadow_quarantined_pass_count,
-            1
-        );
-
-        let reset = store.reset_shadow_session(session, project).unwrap();
-        assert_eq!(reset.shadow_generation, 2);
-        let loaded = store.load(session).unwrap();
-        assert!(!loaded.meta.shadow_quarantined);
-        assert_eq!(loaded.meta.shadow_quarantined_pass_count, 0);
-        assert_eq!(store.load_shadow_divergences(session).unwrap().len(), 1);
     }
 
     #[test]
@@ -16880,9 +15438,9 @@ mod shadow_tests {
         incoming.normalized_hash = "same-hash".to_string();
 
         store
-            .apply_authority_state_sync(ShadowStateSyncRequest {
+            .apply_authority_state_sync(ModuleStateSyncRequest {
                 session_id: "authority-session",
-                shadow_project_path: route_project_root,
+                project_path: route_project_root,
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
                 seed_boundary_id: None,
@@ -16986,9 +15544,9 @@ mod shadow_tests {
             incoming.classified_at = None;
 
             let result = store
-                .apply_authority_state_sync(ShadowStateSyncRequest {
+                .apply_authority_state_sync(ModuleStateSyncRequest {
                     session_id: "authority-session",
-                    shadow_project_path: route_project_root,
+                    project_path: route_project_root,
                     shadow_generation: 0,
                     expected_shadow_seq: 0,
                     seed_boundary_id: None,
@@ -17088,9 +15646,9 @@ mod shadow_tests {
             incoming.classified_at = None;
 
             let result = store
-                .apply_authority_state_sync(ShadowStateSyncRequest {
+                .apply_authority_state_sync(ModuleStateSyncRequest {
                     session_id: "authority-session",
-                    shadow_project_path: route_project_root,
+                    project_path: route_project_root,
                     shadow_generation: 0,
                     expected_shadow_seq: 0,
                     seed_boundary_id: None,
@@ -17940,9 +16498,9 @@ mod shadow_tests {
         let project = "authority-project";
 
         store
-            .apply_authority_state_sync(ShadowStateSyncRequest {
+            .apply_authority_state_sync(ModuleStateSyncRequest {
                 session_id: session,
-                shadow_project_path: project,
+                project_path: project,
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
                 seed_boundary_id: None,
@@ -17975,9 +16533,9 @@ mod shadow_tests {
             .unwrap();
 
         let stale = store
-            .apply_authority_state_sync(ShadowStateSyncRequest {
+            .apply_authority_state_sync(ModuleStateSyncRequest {
                 session_id: session,
-                shadow_project_path: project,
+                project_path: project,
                 shadow_generation: 0,
                 expected_shadow_seq: 0,
                 seed_boundary_id: None,
@@ -18011,7 +16569,7 @@ mod shadow_tests {
 
         assert!(matches!(
             stale,
-            ShadowStateSyncError::AuthoritySeqMismatch {
+            ModuleStateSyncError::AuthoritySeqMismatch {
                 expected: 0,
                 found: 1
             }

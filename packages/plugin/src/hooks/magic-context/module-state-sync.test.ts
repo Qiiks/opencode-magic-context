@@ -106,7 +106,7 @@ function createContextDb(): Database {
 }
 
 function syncState(generation = 1): {
-    shadowGeneration: number;
+    moduleGeneration: number;
     lastAckedSeq: number;
     lastAckedWatermarks: null;
     idOrdinalMemoGeneration: number;
@@ -114,7 +114,7 @@ function syncState(generation = 1): {
     seedPassPending: boolean;
 } {
     return {
-        shadowGeneration: generation,
+        moduleGeneration: generation,
         lastAckedSeq: 0,
         lastAckedWatermarks: null,
         idOrdinalMemoGeneration: generation,
@@ -354,7 +354,7 @@ describe("module compartment ordinal serialization", () => {
         const wire = await resolveOrdinalsForModule({
             sessionId,
             messages: [inputMessage],
-            generation: state.shadowGeneration,
+            generation: state.moduleGeneration,
             memoGeneration: state.idOrdinalMemoGeneration,
             memo: state.idOrdinalMemo,
         });
@@ -403,7 +403,7 @@ describe("module compartment ordinal serialization", () => {
         const result = await resolveOrdinalsForModule({
             sessionId,
             messages: [wireMessage(sessionId, "m2")],
-            generation: state.shadowGeneration,
+            generation: state.moduleGeneration,
             memoGeneration: state.idOrdinalMemoGeneration,
             memo: state.idOrdinalMemo,
             memoStoredCount: 3,

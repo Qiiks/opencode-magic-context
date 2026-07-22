@@ -31,7 +31,7 @@ scripts/drive-rig/verify.sh
 docker exec -it mc-drive tmux attach -t drive
 ```
 
-`prepare.sh` removes and rebuilds `~/.cache/mc-drive-rig/snapshot/`. It copies both databases with SQLite `VACUUM INTO`, preserving the requested session without copying a live WAL database. It copies auth and config data, removes the user-level `shadow_transform` block from the snapshot config, keeps the `subc` block, rewrites the Magic Context plugin entry to `/snapshot/plugin-dist/index.js`, prunes dead file-path plugin references for host-only auth, aft, and other plugins, and copies the ignored benchmark `.cortexkit` directory explicitly. The connection path is rewritten to the host absolute path so the container can use the read-only bind mount.
+`prepare.sh` removes and rebuilds `~/.cache/mc-drive-rig/snapshot/`. It copies both databases with SQLite `VACUUM INTO`, preserving the requested session without copying a live WAL database. It copies auth and config data, keeps the `subc` block, rewrites the Magic Context plugin entry to `/snapshot/plugin-dist/index.js`, prunes dead file-path plugin references for host-only auth, aft, and other plugins, and copies the ignored benchmark `.cortexkit` directory explicitly. The connection path is rewritten to the host absolute path so the container can use the read-only bind mount.
 
 `run.sh` builds the image, removes any previous `mc-drive` container, and starts a replacement with four CPUs and 8 GiB of memory. The snapshot is the only writable volume. The connection file is mounted read only at its same absolute path. `HOME`, XDG data, config, and cache paths point into the snapshot. Docker Desktop's `host.docker.internal` is enabled with the host gateway flag.
 
