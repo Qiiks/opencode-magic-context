@@ -2622,6 +2622,10 @@ pub struct ModuleMeta {
     /// a later request that changes a live message's block layout fails closed.
     #[serde(default)]
     pub block_identity_by_mid: BTreeMap<String, Vec<BlockIdentity>>,
+    /// Number of accepted live-tail identity changes. Covered and frozen identities still
+    /// reject, but OpenCode may legitimately rewrite an uncovered queued message in place.
+    #[serde(default)]
+    pub tail_identity_re_adopt_count: u64,
     /// Record the newest non-synthetic flat block id seen in a successful live pass.
     /// When a note is created, this value is used as a best-effort pointer to the end
     /// of the conversation that the note refers to.

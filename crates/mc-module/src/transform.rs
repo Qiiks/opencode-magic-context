@@ -33,8 +33,8 @@ use crate::selection::{
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
-    Channel1AppendRow, DeferredExecuteState, McStore, McStoreError, McTagRow, MemoryRevision,
-    ModuleMeta, ModuleUsage, NoteDelivery, PendingAgentDrop, PendingRewriteState,
+    BlockIdentity, Channel1AppendRow, DeferredExecuteState, McStore, McStoreError, McTagRow,
+    MemoryRevision, ModuleMeta, ModuleUsage, NoteDelivery, PendingAgentDrop, PendingRewriteState,
     ServedBlockFingerprint, StoredCompartment, TagMintInput, TemporalMarkInput, TemporalMarkRow,
     TransformCommit, TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
     SHADOW_SESSION_PREFIX,
@@ -1350,8 +1350,9 @@ fn apply_once(
         loaded.meta.pending_rewrite.is_some() && boundary_present;
 
     let provisional_tail_mid = provisional_tail_mid(req);
-    enforce_block_identity(
+    let tail_identity_re_adoptions = enforce_block_identity(
         &loaded.meta,
+        req,
         &projection,
         &loaded.core,
         provisional_tail_mid,
@@ -1741,7 +1742,13 @@ fn apply_once(
             meta.pending_rewrite_last_failure = None;
         }
     }
-    apply_ingress_meta(&mut meta, req, &projection, provisional_tail_mid);
+    apply_ingress_meta(
+        &mut meta,
+        req,
+        &projection,
+        provisional_tail_mid,
+        &tail_identity_re_adoptions,
+    );
     meta.cc_u1_active = cc_u1_active;
     meta.tagging_surface_active = tagging_surface_requested;
     if cc_u1_active {
@@ -2499,6 +2506,12 @@ fn apply_once(
         loaded.row_version.unwrap_or(0)
     };
     timings.store_commit = elapsed_ms(store_commit_started_at);
+    for re_adoption in &tail_identity_re_adoptions {
+        eprintln!(
+            "mc-module: identity re-adopted for tail mid {} old_hash={} new_hash={}",
+            re_adoption.mid, re_adoption.old_hash_prefix, re_adoption.new_hash_prefix
+        );
+    }
     if let Some(first_divergence) = &first_divergence {
         let detail = serde_json::to_string(first_divergence).expect("divergence is serializable");
         eprintln!(
@@ -2564,21 +2577,39 @@ fn provisional_tail_mid(req: &TransformRequest) -> Option<&str> {
         .map(|message| message.mid.as_str())
 }
 
+#[derive(Debug, Clone)]
+struct TailIdentityReAdoption {
+    mid: String,
+    old_hash_prefix: String,
+    new_hash_prefix: String,
+}
+
 fn enforce_block_identity(
     meta: &ModuleMeta,
+    req: &TransformRequest,
     projection: &FlatProjection,
     core: &CoreState,
     provisional_tail_mid: Option<&str>,
-) -> Result<(), TransformError> {
+) -> Result<Vec<TailIdentityReAdoption>, TransformError> {
+    let mut re_adoptions = Vec::new();
     for (mid, vector) in &projection.identity_by_mid {
         if provisional_tail_mid == Some(mid.as_str()) {
             continue;
         }
-        if let Some(stored) = meta.block_identity_by_mid.get(mid) {
-            if stored != vector {
-                return Err(TransformError::IdentityDrift(mid.clone()));
-            }
+        let Some(stored) = meta.block_identity_by_mid.get(mid) else {
+            continue;
+        };
+        if stored == vector {
+            continue;
         }
+        if identity_drift_requires_reject(meta, req, core, mid) {
+            return Err(TransformError::IdentityDrift(mid.clone()));
+        }
+        re_adoptions.push(TailIdentityReAdoption {
+            mid: mid.clone(),
+            old_hash_prefix: block_identity_hash_prefix(stored),
+            new_hash_prefix: block_identity_hash_prefix(vector),
+        });
     }
 
     let live_ids: BTreeSet<&str> = projection
@@ -2603,7 +2634,46 @@ fn enforce_block_identity(
             return Err(TransformError::FrozenRedTargetVanish(target));
         }
     }
-    Ok(())
+    Ok(re_adoptions)
+}
+
+fn identity_drift_requires_reject(
+    meta: &ModuleMeta,
+    req: &TransformRequest,
+    core: &CoreState,
+    mid: &str,
+) -> bool {
+    let covered = req
+        .messages
+        .iter()
+        .find(|message| !message.ck.meta.synthetic && message.mid == mid)
+        .is_some_and(|message| !is_tail(message.ordinal, meta.coverage_ordinal));
+    let boundary_anchor = core.boundary_id == mid
+        || split_block_id(&core.boundary_id).is_some_and(|(anchor_mid, _)| anchor_mid == mid);
+    covered || boundary_anchor || frozen_unit_targets_mid(core, mid)
+}
+
+fn frozen_unit_targets_mid(core: &CoreState, mid: &str) -> bool {
+    let strip_suffix = format!(":{mid}");
+    core.frozen_units.iter().any(|unit| {
+        let target = unit
+            .key
+            .strip_prefix(RED_KEY_PREFIX)
+            .or_else(|| unit.key.strip_prefix(CAV_KEY_PREFIX));
+        if target.is_some_and(|target| {
+            split_block_id(target).is_some_and(|(unit_mid, _)| unit_mid == mid)
+        }) {
+            return true;
+        }
+        unit.key
+            .strip_prefix("strip:")
+            .is_some_and(|key| key.ends_with(&strip_suffix))
+    })
+}
+
+fn block_identity_hash_prefix(vector: &[BlockIdentity]) -> String {
+    let serialized = serde_json::to_string(vector).expect("block identities are serializable");
+    ck_wire::fingerprint(&serialized).chars().take(12).collect()
 }
 
 fn apply_ingress_meta(
@@ -2611,12 +2681,24 @@ fn apply_ingress_meta(
     req: &TransformRequest,
     projection: &FlatProjection,
     provisional_tail_mid: Option<&str>,
+    re_adoptions: &[TailIdentityReAdoption],
 ) {
     if let Some(mid) = provisional_tail_mid {
         // Remove any stale pin for a tail that became streaming again. The next completed
         // pass must establish identity from the stable block vector, not from a partial form.
         meta.block_identity_by_mid.remove(mid);
     }
+    for re_adoption in re_adoptions {
+        let vector = projection
+            .identity_by_mid
+            .get(&re_adoption.mid)
+            .expect("identity enforcement only re-adopts projected messages");
+        meta.block_identity_by_mid
+            .insert(re_adoption.mid.clone(), vector.clone());
+    }
+    meta.tail_identity_re_adopt_count = meta
+        .tail_identity_re_adopt_count
+        .saturating_add(re_adoptions.len() as u64);
     for (mid, vector) in &projection.identity_by_mid {
         if provisional_tail_mid == Some(mid.as_str()) {
             continue;
@@ -7681,34 +7763,25 @@ mod tests {
     }
 
     #[test]
-    fn shadow_mid_turn_tail_stays_provisional_and_reset_recovers_identity_drift() {
+    fn shadow_mid_turn_tail_stays_provisional_and_re_adopts_completed_tail() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let session = "shadow:identity-recovery";
         let partial = assistant_form("tail", 1, &["partial"]);
         let complete = assistant_form("tail", 1, &["partial", "completed"]);
 
-        // This is the production failure shape when a streaming form is pinned first.
+        // A completed tail can grow after an earlier non-streaming observation. It must adopt
+        // the new tail identity instead of requiring a shadow reset to recover the session.
         let pinned = req(session, "cfg0", vec![partial.clone()]);
         transform(&store, &pinned, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap();
         let drift = req(session, "cfg0", vec![complete.clone()]);
-        assert!(matches!(
-            transform(&store, &drift, &pctx("git:proj", "/nonexistent-docs", 1)),
-            Err(TransformError::IdentityDrift(mid)) if mid == "tail"
-        ));
+        transform(&store, &drift, &pctx("git:proj", "/nonexistent-docs", 1)).unwrap();
+        let adopted = store.load(session).unwrap();
+        assert_eq!(adopted.meta.tail_identity_re_adopt_count, 1);
+        assert_eq!(adopted.meta.block_identity_by_mid["tail"].len(), 2);
 
-        let reset = store.reset_shadow_session(session, session).unwrap();
-        assert!(reset.shadow_seq == 0);
-        assert!(store
-            .load(session)
-            .unwrap()
-            .meta
-            .block_identity_by_mid
-            .is_empty());
-        transform(&store, &drift, &pctx("git:proj", "/nonexistent-docs", 2)).unwrap();
-
-        // The exemption is shadow-only; a non-shadow request remains byte-for-byte strict even
-        // if an unexpected caller supplies the mid_turn field.
+        // The streaming exemption remains shadow-only: an owned request still records its
+        // completed identity even if an unexpected caller sets the mid_turn field.
         let owned_session = "owned:identity-provisional";
         let mut owned_mid_turn = req(
             owned_session,
@@ -7765,9 +7838,102 @@ mod tests {
     }
 
     #[test]
+    fn tail_identity_drift_re_adopts_atomically_and_attributes_served_divergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let session = "tail-identity-re-adopt";
+        s.replace_compartments(session, &[comp(1, 1, 1, "covered", "SUMMARY")])
+            .unwrap();
+        let original = vec![item("covered", 1, "covered"), item("tail", 2, "before")];
+        run(&s, &req(session, "cfg0", original), &spine());
+        let before = s.load(session).unwrap();
+        let original_identity = before
+            .meta
+            .block_identity_by_mid
+            .get("tail")
+            .cloned()
+            .unwrap();
+
+        let mutated_request = req(
+            session,
+            "cfg0",
+            vec![item("covered", 1, "covered"), item("tail", 2, "after")],
+        );
+        let mutated_projection = project_messages(&mutated_request.messages).unwrap();
+        let re_adoptions = enforce_block_identity(
+            &before.meta,
+            &mutated_request,
+            &mutated_projection,
+            &before.core,
+            None,
+        )
+        .unwrap();
+        let mut speculative_meta = before.meta.clone();
+        apply_ingress_meta(
+            &mut speculative_meta,
+            &mutated_request,
+            &mutated_projection,
+            None,
+            &re_adoptions,
+        );
+        assert_eq!(speculative_meta.tail_identity_re_adopt_count, 1);
+        assert_eq!(
+            s.load(session).unwrap().row_version,
+            before.row_version,
+            "staging a re-adoption cannot change the durable identity before its CAS"
+        );
+        assert_eq!(
+            s.load(session)
+                .unwrap()
+                .meta
+                .block_identity_by_mid
+                .get("tail"),
+            Some(&original_identity)
+        );
+
+        let adopted = transform(
+            &s,
+            &mutated_request,
+            &pctx("git:proj", "/nonexistent-docs", 1),
+        )
+        .unwrap();
+        let after = s.load(session).unwrap();
+        assert!(after.row_version.unwrap() > before.row_version.unwrap());
+        assert_ne!(
+            after.meta.block_identity_by_mid.get("tail"),
+            Some(&original_identity),
+            "the accepted CAS must persist the new tail identity"
+        );
+        assert_eq!(after.meta.tail_identity_re_adopt_count, 1);
+        let divergence = adopted.first_divergence.as_ref().unwrap();
+        assert_eq!(divergence.kind, divergence::DivergenceKind::ContentChanged);
+        assert_eq!(divergence.block_id_old.as_deref(), Some("tail"));
+        assert_eq!(divergence.block_id_new.as_deref(), Some("tail"));
+
+        let replay = transform(
+            &s,
+            &req(
+                session,
+                "cfg0",
+                vec![item("covered", 1, "covered"), item("tail", 2, "after")],
+            ),
+            &pctx("git:proj", "/nonexistent-docs", 2),
+        )
+        .unwrap();
+        assert_eq!(replay.first_divergence, None);
+        assert_eq!(
+            s.load(session).unwrap().meta.tail_identity_re_adopt_count,
+            1,
+            "a replay of the adopted bytes is not another re-adoption"
+        );
+    }
+
+    #[test]
     fn enforcement_rejects_drift_duplicates_and_vanished_reduction_targets() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
         run(&s, &req("ses", "cfg0", vec![item("a", 1, "one")]), &spine());
         let drift = transform(
             &s,
@@ -7817,6 +7983,65 @@ mod tests {
             vanished,
             TransformError::FrozenRedTargetVanish(id) if id == "live#1"
         ));
+    }
+
+    #[test]
+    fn boundary_anchor_and_frozen_tail_identity_drift_still_reject() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let original = vec![item("anchor", 1, "stable"), item("tail", 2, "before")];
+        let projection = project_messages(&original).unwrap();
+        let meta = ModuleMeta {
+            initialized: true,
+            coverage_ordinal: Some(1),
+            block_identity_by_mid: projection.identity_by_mid.clone(),
+            ..Default::default()
+        };
+        let anchor_core = CoreState {
+            boundary_id: "anchor#0".to_string(),
+            ..Default::default()
+        };
+        s.commit("identity-anchor", None, &anchor_core, &meta)
+            .unwrap();
+        let anchor_error = transform(
+            &s,
+            &req(
+                "identity-anchor",
+                "cfg0",
+                vec![item("anchor", 1, "changed"), item("tail", 2, "before")],
+            ),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap_err();
+        assert!(matches!(anchor_error, TransformError::IdentityDrift(mid) if mid == "anchor"));
+
+        for (name, frozen_unit) in [
+            ("reduction", red_unit("tail#0", "drop", "[dropped]")),
+            ("caveman", caveman_unit("tail#0", 1, "compressed")),
+            ("strip", strip_unit("placeholder", "tail", "[dropped]")),
+        ] {
+            let session = format!("identity-frozen-{name}");
+            let core = CoreState {
+                boundary_id: "anchor#0".to_string(),
+                frozen_units: vec![frozen_unit],
+                ..Default::default()
+            };
+            s.commit(&session, None, &core, &meta).unwrap();
+            let error = transform(
+                &s,
+                &req(
+                    &session,
+                    "cfg0",
+                    vec![item("anchor", 1, "stable"), item("tail", 2, "changed")],
+                ),
+                &pctx("git:proj", "/nonexistent-docs", 0),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, TransformError::IdentityDrift(ref mid) if mid == "tail"),
+                "{name} frozen unit must preserve the tail identity, got {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -12415,6 +12640,14 @@ mod tests {
             let stable = active_cc_req("reject", "cfg0", vec![item("m1", 1, "old")]);
             run(&store_c, &stable, &spine());
             run(&store_c, &stable, &spine());
+            let loaded = store_c.load("reject").unwrap();
+            let mut frozen_core = loaded.core.clone();
+            frozen_core
+                .frozen_units
+                .push(red_unit("m1#0", "drop", "[dropped]"));
+            store_c
+                .commit("reject", loaded.row_version, &frozen_core, &loaded.meta)
+                .unwrap();
             let err = transform(
                 &store_c,
                 &active_cc_req(

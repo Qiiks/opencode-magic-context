@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, mock } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+
 import {
     type AuthorityStatus,
     getAuthorityManagedMarker,
@@ -13,9 +14,11 @@ import type { ContextDatabase } from "../../features/magic-context/storage";
 import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
+import { recordDetectedContextLimit } from "../../features/magic-context/storage-meta-persisted";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
 import {
@@ -885,9 +888,115 @@ describe("Rust mode authority adapter", () => {
             const output = { messages: input as unknown[] };
             await transform.run(sessionId, input, output, makeMeta(db, sessionId));
             if (pass === 0) expect(output.messages).toBe(input);
+            else expect(output.messages).toEqual([{ role: "assistant", parts: [] }]);
         }
         expect(transform.getState(sessionId).parked).toBe(false);
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(0);
+        expect(transform.getState(sessionId).warningSent).toBe(false);
         expect(transformCalls).toBe(1);
+    });
+
+    it("retries the module on every parked pass at emergency pressure", async () => {
+        const sessionId = `rust-park-pressure-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let transformCalls = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method === "transform") {
+                    transformCalls += 1;
+                    throw new Error("daemon unavailable");
+                }
+                return { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.contextUsageMap.set(sessionId, {
+            usage: { inputTokens: 90_000, percentage: 90 },
+            updatedAt: Date.now(),
+        });
+        const transform = createRustModeTransform(deps, { moduleClient });
+
+        for (let pass = 0; pass < 3; pass += 1) {
+            const input = makeMessages(sessionId);
+            await transform.run(
+                sessionId,
+                input,
+                { messages: input as unknown[] },
+                makeMeta(db, sessionId),
+            );
+        }
+        expect(transform.getState(sessionId).parked).toBe(true);
+        expect(transformCalls).toBe(3);
+
+        const input = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            input,
+            { messages: input as unknown[] },
+            makeMeta(db, sessionId),
+        );
+        expect(transformCalls).toBe(4);
+        expect(transform.getState(sessionId).parked).toBe(true);
+    });
+
+    it("fails closed when a parked module fails above 95% of a provider-proven limit", async () => {
+        const sessionId = `rust-park-fail-closed-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const modelKey = "test-provider/test-model";
+        recordDetectedContextLimit(db, sessionId, 100_000, modelKey);
+        let transformCalls = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method === "transform") {
+                    transformCalls += 1;
+                    throw new Error("daemon unavailable");
+                }
+                return { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.contextUsageMap.set(sessionId, {
+            usage: { inputTokens: 96_000, percentage: 96 },
+            updatedAt: Date.now(),
+        });
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = [
+            {
+                info: {
+                    id: "m1",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: "hello" }],
+            },
+        ] as MessageLike[];
+
+        for (let pass = 0; pass < 3; pass += 1) {
+            await transform.run(
+                sessionId,
+                input,
+                { messages: input as unknown[] },
+                makeMeta(db, sessionId),
+            );
+        }
+        expect(transform.getState(sessionId).parked).toBe(true);
+        expect(transformCalls).toBe(3);
+
+        await expect(
+            transform.run(
+                sessionId,
+                input,
+                { messages: input as unknown[] },
+                makeMeta(db, sessionId),
+            ),
+        ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        expect(transformCalls).toBe(4);
+        expect(transform.getState(sessionId).parked).toBe(true);
     });
 });
 
@@ -1319,5 +1428,68 @@ describe("delta prefix-mutation guard", () => {
         expect(requestBodies[2]?.tail_delta).toBeUndefined();
         expect(requestBodies[2]?.messages).toHaveLength(4);
         expect(requestBodies[2]?.native_messages).toHaveLength(4);
+    });
+
+    it("recovers after a queued user message is mutated in place and the module rejects twice", async () => {
+        const sessionId = `rust-tail-mutation-recovery-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const initial = makeMessages(sessionId);
+        const mutated: MessageLike[] = [
+            {
+                info: { id: "m1", role: "user", sessionID: sessionId },
+                parts: [
+                    {
+                        type: "text",
+                        text: "<system-reminder>queued user message was wrapped in place</system-reminder>",
+                    },
+                ],
+            },
+        ];
+        let transformCalls = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                transformCalls += 1;
+                if (transformCalls === 2 || transformCalls === 3) {
+                    throw new Error("CK message block identity drift");
+                }
+                return {
+                    native_messages: [
+                        {
+                            info: { id: "m1", role: "user", sessionID: sessionId },
+                            parts: [{ type: "text", text: "module recovered" }],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+
+        await transform.run(
+            sessionId,
+            initial,
+            { messages: initial as unknown[] },
+            makeMeta(db, sessionId),
+        );
+        for (let retry = 0; retry < 2; retry += 1) {
+            const output = { messages: mutated as unknown[] };
+            await transform.run(sessionId, mutated, output, makeMeta(db, sessionId));
+            expect(output.messages).toBe(mutated);
+        }
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(2);
+        expect(transform.getState(sessionId).parked).toBe(false);
+
+        const recoveredOutput = { messages: mutated as unknown[] };
+        await transform.run(sessionId, mutated, recoveredOutput, makeMeta(db, sessionId));
+        expect(transformCalls).toBe(4);
+        expect(recoveredOutput.messages).toEqual([
+            {
+                info: { id: "m1", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "module recovered" }],
+            },
+        ]);
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(0);
     });
 });

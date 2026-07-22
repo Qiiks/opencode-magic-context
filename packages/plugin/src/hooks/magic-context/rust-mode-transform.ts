@@ -24,6 +24,7 @@ import { writeRustTransformDecision } from "../../features/magic-context/transfo
 import type { ContextUsage } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
 import { resolveCtxReduceAvailability } from "./ctx-reduce-availability";
+import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     resolveExecuteThreshold,
     resolveModelKey,
@@ -936,6 +937,10 @@ export function createRustModeTransform(
         let servedFrom = "none";
         let moduleElapsedMs = 0;
         let appliedAt: number | undefined;
+        let parkedEmergencyFailClosed = false;
+        // Parking must not hide pressure from the recovery policy. Usage is cheap to read
+        // and is the same value copied onto the module request when this pass runs.
+        const passUsageSnapshot = loadContextUsage(deps.contextUsageMap, deps.db, sessionId);
         const finishPass = (applied: boolean): void => {
             const elapsedAt = applied && appliedAt !== undefined ? appliedAt : performance.now();
             const elapsedMs = Math.max(0, elapsedAt - passStartedAt);
@@ -978,7 +983,7 @@ export function createRustModeTransform(
             state.passesSincePark += 1;
             // The fifth live pass is the first retry opportunity after the
             // three-failure park; later retries use the same global cadence.
-            if (state.passCount % RUST_PROBE_INTERVAL !== 0) {
+            if (passUsageSnapshot.percentage < 90 && state.passCount % RUST_PROBE_INTERVAL !== 0) {
                 decision = "parked";
                 const replayed = replayLastGood(sessionId, messages, output);
                 if (replayed) {
@@ -1001,7 +1006,7 @@ export function createRustModeTransform(
                 modelFromMessages(messages) ?? findLastAssistantModelFromOpenCodeDb(sessionId);
             const modelKey = model ? resolveModelKey(model.providerID, model.modelID) : null;
             if (model) deps.liveModelBySession?.set(sessionId, model);
-            const usage = loadContextUsage(deps.contextUsageMap, deps.db, sessionId);
+            const usage = passUsageSnapshot;
             requestInputTokens = Math.max(0, Math.floor(usage.inputTokens));
             const resolvedContextLimit = model
                 ? resolveTrustedContextLimit(model.providerID, model.modelID, {
@@ -1015,6 +1020,11 @@ export function createRustModeTransform(
                     : usage.percentage > 0
                       ? Math.round(usage.inputTokens / (usage.percentage / 100))
                       : 128_000;
+            parkedEmergencyFailClosed =
+                state.parked &&
+                usage.percentage >= 95 &&
+                resolvedContextLimit !== undefined &&
+                resolvedContextLimit > 0;
             const threshold = resolveExecuteThreshold(
                 deps.executeThresholdPercentage ?? 65,
                 modelKey ?? undefined,
@@ -1551,6 +1561,7 @@ export function createRustModeTransform(
             state.consecutiveFailures = 0;
             state.parked = false;
             state.passesSincePark = 0;
+            state.warningSent = false;
 
             const directiveText = directiveTextOf(response);
             if (syntheticTurn) {
@@ -1616,6 +1627,17 @@ export function createRustModeTransform(
                     sessionId,
                     "rust transform wire invariant failed; LKG replay required",
                     error,
+                );
+            }
+            if (parkedEmergencyFailClosed) {
+                // A parked module cannot be allowed to replay stale cached bytes into a
+                // provider-proven overflow. Surface the established fail-closed error so
+                // the host aborts instead of sending a prompt that is guaranteed to 400.
+                markFailure(sessionId, state, error);
+                finishPass(false);
+                throw new EmergencyFailClosedError(
+                    "Rust Magic Context remained unavailable above 95% of a proven context limit",
+                    { cause: error },
                 );
             }
             // Validation happens before the caller-owned array is replaced, so the

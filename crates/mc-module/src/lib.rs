@@ -4555,6 +4555,7 @@ impl McHandler {
             "pending_drop_count": pending_drop_count,
             "pending_m1_delta": pending_m1_delta,
             "pending_m1_age_ms": pending_m1_age_ms,
+            "tail_identity_re_adopt_count": loaded.meta.tail_identity_re_adopt_count,
             "usage": {
                 "current_total_input_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.current_total_input_tokens),
                 "context_limit_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.context_limit_tokens),
@@ -5792,6 +5793,7 @@ impl McHandler {
             "row_version": loaded.row_version,
             "historian": loaded.meta.historian,
             "publication_floor_ordinal": loaded.meta.publication_floor_ordinal,
+            "tail_identity_re_adopt_count": loaded.meta.tail_identity_re_adopt_count,
             "pass_trace": pass_trace,
             "epochs": {
                 "memory_render_epoch": MEMORY_RENDER_FORMAT_EPOCH,
@@ -16694,6 +16696,7 @@ mod tests {
         assert!(summary.contains("last historian: published seq 3"));
         assert_eq!(body["pending_m1_delta"], json!(true));
         assert_eq!(body["pending_m1_age_ms"], json!(0));
+        assert_eq!(body["tail_identity_re_adopt_count"], json!(0));
         assert!(summary.ends_with("surface active"));
     }
 
