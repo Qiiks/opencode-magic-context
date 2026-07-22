@@ -202,48 +202,51 @@ function moduleNoteText(response: unknown): string | null {
     return null;
 }
 
+const ctxNoteArgsShape = {
+    action: tool.schema
+        .enum(["write", "read", "dismiss", "update"])
+        .optional()
+        .describe(
+            "Operation to perform. Defaults to 'write' when content is provided, otherwise 'read'.",
+        ),
+    content: tool.schema.string().optional().describe("Note text to store when action is 'write'."),
+    surface_condition: tool.schema
+        .string()
+        .optional()
+        .describe(
+            "Externally verifiable condition for smart notes. A separate background agent (dreamer) checks this using gh CLI, web fetches, file reads, git, etc. — NOT your conversation history. Use only for things like GitHub PR/issue state, release tags, file contents, or workflow runs. DO NOT use for 'when the user mentions X' / 'when we revisit Y' / 'when relevant to current task' — dreamer has no access to session context. For session-relative reminders, omit this and write a regular note.",
+        ),
+    filter: tool.schema
+        .enum(["all", "active", "pending", "ready", "dismissed"])
+        .optional()
+        .describe(
+            "Optional read filter. Defaults to active session notes + ready smart notes. Use 'all' to inspect every status or 'pending' to inspect unsurfaced smart notes.",
+        ),
+    limit: tool.schema
+        .number()
+        .optional()
+        .describe("Max notes per section for read, newest first (default: 25)"),
+    offset: tool.schema
+        .number()
+        .optional()
+        .describe("Skip this many newest notes for read — page older ones (default: 0)"),
+    note_id: tool.schema
+        .number()
+        .optional()
+        .describe("Note ID (required for 'dismiss' and 'update' actions)."),
+};
+// The tool definition exposes only the documented argument shape to the model
+// provider, but older callers may still send extra arguments. Parse with
+// passthrough so execute() can receive those fields without advertising them.
+const ctxNoteArgsSchema = tool.schema.object(ctxNoteArgsShape).passthrough();
+
 function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
     return tool({
         description: CTX_NOTE_DESCRIPTION,
-        args: {
-            action: tool.schema
-                .enum(["write", "read", "dismiss", "update"])
-                .optional()
-                .describe(
-                    "Operation to perform. Defaults to 'write' when content is provided, otherwise 'read'.",
-                ),
-            content: tool.schema
-                .string()
-                .optional()
-                .describe("Note text to store when action is 'write'."),
-            surface_condition: tool.schema
-                .string()
-                .optional()
-                .describe(
-                    "Externally verifiable condition for smart notes. A separate background agent (dreamer) checks this using gh CLI, web fetches, file reads, git, etc. — NOT your conversation history. Use only for things like GitHub PR/issue state, release tags, file contents, or workflow runs. DO NOT use for 'when the user mentions X' / 'when we revisit Y' / 'when relevant to current task' — dreamer has no access to session context. For session-relative reminders, omit this and write a regular note.",
-                ),
-            filter: tool.schema
-                .enum(["all", "active", "pending", "ready", "dismissed"])
-                .optional()
-                .describe(
-                    "Optional read filter. Defaults to active session notes + ready smart notes. Use 'all' to inspect every status or 'pending' to inspect unsurfaced smart notes.",
-                ),
-            limit: tool.schema
-                .number()
-                .optional()
-                .describe("Max notes per section for read, newest first (default: 25)"),
-            offset: tool.schema
-                .number()
-                .optional()
-                .describe("Skip this many newest notes for read — page older ones (default: 0)"),
-            note_id: tool.schema
-                .number()
-                .optional()
-                .describe("Note ID (required for 'dismiss' and 'update' actions)."),
-            reduced: tool.schema.boolean().optional(),
-            summary: tool.schema.string().optional(),
-        },
-        async execute(args: CtxNoteArgs, toolContext) {
+        args: ctxNoteArgsShape,
+        async execute(rawArgs: CtxNoteArgs, toolContext) {
+            const parsedArgs = ctxNoteArgsSchema.safeParse(rawArgs);
+            let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxNoteArgs;
             args = unwrapImitatedReducedArgs(args, ["action", "content"], {
                 action: { type: "enum", values: ["write", "read", "dismiss", "update"] },
                 content: "string",

@@ -28,15 +28,16 @@ import { CTX_REDUCE_DESCRIPTION } from "@magic-context/core/tools/ctx-reduce/con
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
-const ParamsSchema = Type.Object({
-	drop: Type.Optional(
-		Type.String({
-			description: "Tag IDs to drop entirely. Ranges: '3-5', '1,2,9'",
-		}),
-	),
-	reduced: Type.Optional(Type.Boolean()),
-	summary: Type.Optional(Type.String()),
-});
+const ParamsSchema = Type.Object(
+	{
+		drop: Type.Optional(
+			Type.String({
+				description: "Tag IDs to drop entirely. Ranges: '3-5', '1,2,9'",
+			}),
+		),
+	},
+	{ additionalProperties: true },
+);
 
 type CtxReduceParams = Static<typeof ParamsSchema>;
 
