@@ -8,17 +8,21 @@ import type { Database } from "../../../shared/sqlite";
 import { runLeaseGuardedWrite, startLeaseHeartbeat } from "../dreamer/lease";
 import { getMemoriesByProject } from "../memory/storage-memory";
 import type { Memory } from "../memory/types";
+import { log } from "../../../shared/logger";
 import {
     MURAL_AUTHORING_PROMPT,
     type MuralManifestEntry,
     type MuralSourceMemory,
     parseMuralManifest,
+    salvageMuralManifest,
     validateMuralManifest,
 } from "./mural-prompt";
 import { MURAL_HEIGHT, MURAL_WIDTH, renderMural } from "./render-mural";
 import { upsertMural } from "./storage-mural";
 
 export const MURAL_MIN_MEMORIES = 20;
+/** Salvage floor: below this the manifest is too broken to be worth rendering. */
+export const MURAL_SALVAGE_MIN_ENTRIES = 40;
 export const DEFAULT_MURAL_MEMORY_BUDGET = 8_000;
 
 export type MuralAuthorCall = (
@@ -57,8 +61,10 @@ function promptForSource(source: readonly MuralSourceMemory[], feedback?: string
     return `${MURAL_AUTHORING_PROMPT}\n\nSOURCE MEMORIES:\n${lines.join("\n")}\n${feedback ? `\nRETRY: fix the exact violating ids ${feedback}. Return the complete corrected manifest.\n` : ""}`;
 }
 
-/** Author once, then retry exactly once with the violating ids when validation
- * rejects cue budgets or manifest polarity. */
+/** Author, then retry with the violating ids when validation rejects cue
+ * budgets or manifest polarity. Three attempts: the palace trials showed the
+ * author model recovers reliably when told the exact ids, but a single retry
+ * loses the whole weekly run to one stubborn cue. */
 export async function authorMuralWithRetry(args: {
     source: readonly MuralSourceMemory[];
     call: MuralAuthorCall;
@@ -66,7 +72,13 @@ export async function authorMuralWithRetry(args: {
     fallbackModels?: readonly string[];
 }): Promise<MuralManifestEntry[]> {
     let feedback: string | undefined;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    /** Best (largest) parsed manifest across attempts. Retry replies routinely
+     * ignore "return the complete manifest" and send only the corrected
+     * entries, so the LAST attempt can be a stub while an earlier one carried
+     * the full selection minus a few bad cues — salvage from the best. */
+    let bestParsed: MuralManifestEntry[] = [];
+    const attempts = 3;
+    for (let attempt = 0; attempt < attempts; attempt++) {
         const raw = await args.call(
             promptForSource(args.source, feedback),
             args.model,
@@ -74,15 +86,32 @@ export async function authorMuralWithRetry(args: {
         );
         try {
             const entries = parseMuralManifest(raw);
+            if (entries.length > bestParsed.length) bestParsed = entries;
             validateMuralManifest(args.source, entries);
             return entries;
         } catch (error) {
-            if (attempt === 1) throw error;
+            if (attempt === attempts - 1) {
+                // Final attempt still invalid: salvage the valid subset rather
+                // than losing the whole render to a few stubborn cues. A mural
+                // missing a handful of entries beats no mural for a week.
+                const salvaged = salvageMuralManifest(args.source, bestParsed);
+                if (salvaged.entries.length >= MURAL_SALVAGE_MIN_ENTRIES) {
+                    log(
+                        `[mural] salvaged manifest: kept ${salvaged.entries.length}, dropped ids ${salvaged.droppedIds.join(",")}`,
+                    );
+                    return salvaged.entries;
+                }
+                throw error;
+            }
             const message = error instanceof Error ? error.message : String(error);
-            const ids = [...message.matchAll(/\b(?:id|ids)\s+([\d,]+)/gi)].flatMap((match) =>
-                (match[1] ?? "").split(","),
-            );
-            feedback = ids.length > 0 ? ids.join(",") : "the reported validation defects";
+            // Validator messages end in the violating id(s) but phrase them
+            // differently per rule ("ids 1,2", "missing 9516"). Extract every
+            // plausible memory id rather than pattern-matching each phrasing —
+            // a retry that names the wrong set is worse than none.
+            const ids = [...message.matchAll(/\d{3,}/g)].map((match) => match[0]);
+            feedback =
+                ids.length > 0 ? [...new Set(ids)].join(",") : "the reported validation defects";
+            feedback += ` — violation: ${message.slice(0, 200)}`;
         }
     }
     throw new Error("mural authoring exhausted retry");

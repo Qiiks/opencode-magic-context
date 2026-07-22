@@ -88,10 +88,13 @@ export function validateMuralManifest(
         seen.add(entry.id);
         const original = sourceById.get(entry.id);
         if (!original) throw new Error(`mural memory id ${entry.id} is absent from source`);
-        if (original.category !== entry.category)
-            throw new Error(`mural category mismatch for ${entry.id}`);
-        if (entry.mergeInto === undefined && original.importance !== entry.importance)
-            throw new Error(`mural importance mismatch for ${entry.id}`);
+        // Category and importance are source facts the model merely copies, and
+        // large authors flub the copy often enough to burn retries on it (live
+        // first-render lost an attempt to one mis-copied category out of 379
+        // entries). Heal them from source instead of rejecting: the model's
+        // decisions are selection, room, cue, and rank — never these columns.
+        entry.category = original.category;
+        if (entry.mergeInto === undefined) entry.importance = original.importance;
         if (entry.mergeInto !== undefined && entry.cue !== undefined)
             throw new Error(`merged mural entry ${entry.id} has a cue`);
         if (entry.cue === undefined) continue;
@@ -160,4 +163,69 @@ export function parseMuralManifest(raw: string): MuralManifestEntry[] {
     }
     if (entries.length === 0) throw new Error("mural manifest selected no memories");
     return entries;
+}
+
+/** Last-resort manifest salvage: keep every entry that individually passes the
+ * cue rules and drop the rest, instead of letting one stubborn cue among
+ * hundreds kill the whole weekly render. Category/importance are healed from
+ * source (they are copies, not decisions); merges pointing at dropped or
+ * invalid targets are dropped with their movers. Returns the surviving entries
+ * plus the dropped ids for the task log. */
+export function salvageMuralManifest(
+    source: readonly MuralSourceMemory[],
+    entries: readonly MuralManifestEntry[],
+): { entries: MuralManifestEntry[]; droppedIds: number[] } {
+    const sourceById = new Map(source.map((memory) => [memory.id, memory]));
+    const seen = new Set<number>();
+    const dropped: number[] = [];
+    const healed: MuralManifestEntry[] = [];
+    for (const entry of entries) {
+        const original = sourceById.get(entry.id);
+        if (seen.has(entry.id) || !original) {
+            dropped.push(entry.id);
+            continue;
+        }
+        seen.add(entry.id);
+        entry.category = original.category;
+        if (entry.mergeInto === undefined) entry.importance = original.importance;
+        if (entry.cue !== undefined) {
+            const budget = entry.importance >= 70 ? 90 : 50;
+            const markers = entry.cue.split("⊘").length - 1;
+            const mechanisms = entry.cue.match(/\([^()]+\)/g)?.length ?? 0;
+            const trigger = /\b(?:must not|never|without|instead of|exclude|excludes)\b/i.test(
+                entry.cue,
+            );
+            const invalid =
+                [...entry.cue].length > budget ||
+                /#\d+/.test(entry.cue) ||
+                cueHasUnbalancedParentheses(entry.cue) ||
+                (trigger && markers === 0) ||
+                markers > mechanisms ||
+                (entry.mergeInto !== undefined && entry.cue !== undefined);
+            if (invalid) {
+                dropped.push(entry.id);
+                seen.delete(entry.id);
+                continue;
+            }
+        }
+        healed.push(entry);
+    }
+    const byId = new Map(healed.map((entry) => [entry.id, entry]));
+    const entriesOut: MuralManifestEntry[] = [];
+    for (const entry of healed) {
+        if (entry.mergeInto !== undefined) {
+            const target = byId.get(entry.mergeInto);
+            if (
+                !target ||
+                target.mergeInto !== undefined ||
+                target.category !== entry.category ||
+                target.room !== entry.room
+            ) {
+                dropped.push(entry.id);
+                continue;
+            }
+        }
+        entriesOut.push(entry);
+    }
+    return { entries: entriesOut, droppedIds: dropped };
 }
