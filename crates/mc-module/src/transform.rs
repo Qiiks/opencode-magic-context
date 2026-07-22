@@ -774,6 +774,12 @@ pub struct TransformTimings {
     #[serde(default)]
     pub unit_mint: f64,
     #[serde(default)]
+    pub tag_mint_candidates: usize,
+    #[serde(default)]
+    pub tag_mint_new: usize,
+    #[serde(default)]
+    pub tag_mint_tokenized_bytes: usize,
+    #[serde(default)]
     pub decide: f64,
     #[serde(default)]
     pub seed_or_sync: f64,
@@ -855,6 +861,7 @@ pub fn format_pass_timing_line(
          store_user_hints={:.1} store_channel1={:.1} store_overlay_frontier={:.1} \
          store_notes={:.1} store_memories={:.1} pending_drops={:.1} coverage_resolve={:.1} \
          tag_overlay={:.1} unit_mint={:.1} \
+         tag_mint_candidates={} tag_mint_new={} tag_mint_tokenized_bytes={} \
          decide={:.1} seed_or_sync={:.1} compose_m0m1={:.1} selection={:.1} todo={:.1} \
          blocks_by_mid={:.1} build_frozen_unit_index={:.1} full_drop_tool_ids={:.1} \
          build_output={:.1} build_identity={:.1} build_identity_max={:.1} build_frozen_unit_scan={:.1} \
@@ -876,6 +883,9 @@ pub fn format_pass_timing_line(
         timings.coverage_resolve,
         timings.tag_overlay,
         timings.unit_mint,
+        timings.tag_mint_candidates,
+        timings.tag_mint_new,
+        timings.tag_mint_tokenized_bytes,
         timings.decide,
         timings.seed_or_sync,
         timings.compose_m0m1,
@@ -1140,7 +1150,10 @@ struct Channel1Decision {
 #[derive(Debug, Default)]
 struct PendingOverlayDecisions {
     max_seen_ordinal: Option<u64>,
-    tag_mints: Vec<TagMintInput>,
+    tag_mint_start: usize,
+    tag_mint_count: usize,
+    tag_mint_candidates: usize,
+    tag_mint_tokenized_bytes: usize,
     temporal_marks: Vec<TemporalMarkInput>,
     user_hint: Option<UserHintDecisionInput>,
     channel1_append: Option<Channel1AppendRow>,
@@ -1164,7 +1177,7 @@ struct OverlayComputation<'a, 'ctx> {
 impl PendingOverlayDecisions {
     fn is_empty(&self) -> bool {
         self.max_seen_ordinal.is_none()
-            && self.tag_mints.is_empty()
+            && self.tag_mint_count == 0
             && self.temporal_marks.is_empty()
             && self.user_hint.is_none()
             && self.channel1_append.is_none()
@@ -1809,6 +1822,9 @@ fn apply_once(
             temporal_enabled: temporal_active,
             mutation_exempt_mid,
         })?;
+        timings.tag_mint_candidates = pending_overlays.tag_mint_candidates;
+        timings.tag_mint_new = pending_overlays.tag_mint_count;
+        timings.tag_mint_tokenized_bytes = pending_overlays.tag_mint_tokenized_bytes;
         // The cutoff captured by a bust includes tags minted by that same accepted pass.
         // Deferring this refresh until the next request would split one eligible batch across
         // several provider-visible rewrites as a multi-step turn keeps minting tags.
@@ -3008,7 +3024,8 @@ fn apply_once(
                 first_divergence: first_divergence_json.as_deref(),
                 overlays: TransformOverlayBatch {
                     max_seen_ordinal: pending_overlays.max_seen_ordinal,
-                    tag_mints: &pending_overlays.tag_mints,
+                    tag_mints: &tag_rows[pending_overlays.tag_mint_start
+                        ..pending_overlays.tag_mint_start + pending_overlays.tag_mint_count],
                     temporal_marks: &pending_overlays.temporal_marks,
                     user_hint: pending_overlays.user_hint.as_ref(),
                     channel1_append: pending_overlays.channel1_append.as_ref(),
@@ -4454,27 +4471,65 @@ fn reanchor_kept_synthetic_todo_if_folded_or_shrunk(
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct TagMintWork {
+    inputs: Vec<TagMintInput>,
+    candidate_count: usize,
+    tokenized_bytes: usize,
+}
+
 fn tag_mint_inputs(
     projection: &FlatProjection,
     core: &CoreState,
     mutation_exempt_mid: Option<&str>,
-) -> Vec<TagMintInput> {
+    existing_tag_ids: &HashSet<&str>,
+) -> TagMintWork {
     let frozen = frozen_red_targets(core);
-    projection
-        .blocks
-        .iter()
-        .filter(|block| !frozen.contains(&block.id))
-        .filter(|block| mutation_exempt_mid != Some(block.mid.as_str()))
-        .filter_map(|block| {
-            let (kind, source) = taggable_source(block)?;
-            Some(TagMintInput {
-                block_id: block.id.clone(),
-                kind: kind.as_store_kind().to_string(),
-                token_count: mc_tokenizer::estimate_tokens(source) as i64,
-                source_bytes: source.as_bytes().to_vec(),
-            })
-        })
-        .collect()
+    let mut work = TagMintWork::default();
+    for block in &projection.blocks {
+        if frozen.contains(&block.id) || mutation_exempt_mid == Some(block.mid.as_str()) {
+            continue;
+        }
+        if existing_tag_ids.contains(block.id.as_str()) {
+            work.candidate_count = work.candidate_count.saturating_add(1);
+            continue;
+        }
+        let Some((kind, source)) = taggable_source(block) else {
+            continue;
+        };
+        work.candidate_count = work.candidate_count.saturating_add(1);
+        work.tokenized_bytes = work.tokenized_bytes.saturating_add(source.len());
+        work.inputs.push(TagMintInput {
+            block_id: block.id.clone(),
+            kind: kind.as_store_kind().to_string(),
+            token_count: mc_tokenizer::estimate_tokens(source) as i64,
+            source_bytes: source.as_bytes().to_vec(),
+        });
+    }
+    work
+}
+
+fn append_tag_mint_rows(
+    tag_rows: &mut Vec<McTagRow>,
+    tag_mints: Vec<TagMintInput>,
+    created_at_ms: i64,
+) -> usize {
+    let start = tag_rows.len();
+    let next_tag = tag_rows.iter().map(|row| row.tag_number).max().unwrap_or(0);
+    tag_rows.extend(
+        tag_mints
+            .into_iter()
+            .enumerate()
+            .map(|(offset, input)| McTagRow {
+                tag_number: next_tag + offset as i64 + 1,
+                block_id: input.block_id,
+                kind: input.kind,
+                token_count: input.token_count.max(0),
+                created_at_ms,
+                source_bytes: input.source_bytes,
+            }),
+    );
+    start
 }
 
 /// Return exactly the span the overlay can prefix. Mint scope and overlay scope share
@@ -5009,25 +5064,17 @@ fn compute_active_overlay_decisions(
         temporal_enabled,
         mutation_exempt_mid,
     } = input;
-    let existing_tag_ids = tag_rows
-        .iter()
-        .map(|row| row.block_id.as_str())
-        .collect::<HashSet<_>>();
-    let tag_mints = tag_mint_inputs(projection, core, mutation_exempt_mid)
-        .into_iter()
-        .filter(|input| !existing_tag_ids.contains(input.block_id.as_str()))
-        .collect::<Vec<_>>();
-    let next_tag = tag_rows.iter().map(|row| row.tag_number).max().unwrap_or(0);
-    for (offset, input) in tag_mints.iter().enumerate() {
-        tag_rows.push(McTagRow {
-            tag_number: next_tag + offset as i64 + 1,
-            block_id: input.block_id.clone(),
-            kind: input.kind.clone(),
-            token_count: input.token_count.max(0),
-            created_at_ms: ctx.now_ms,
-            source_bytes: input.source_bytes.clone(),
-        });
-    }
+    let tag_mint_work = {
+        let existing_tag_ids = tag_rows
+            .iter()
+            .map(|row| row.block_id.as_str())
+            .collect::<HashSet<_>>();
+        tag_mint_inputs(projection, core, mutation_exempt_mid, &existing_tag_ids)
+    };
+    let tag_mint_candidates = tag_mint_work.candidate_count;
+    let tag_mint_tokenized_bytes = tag_mint_work.tokenized_bytes;
+    let tag_mint_count = tag_mint_work.inputs.len();
+    let tag_mint_start = append_tag_mint_rows(tag_rows, tag_mint_work.inputs, ctx.now_ms);
 
     let mint_by_block = tag_rows
         .iter()
@@ -5193,7 +5240,10 @@ fn compute_active_overlay_decisions(
 
     Ok(PendingOverlayDecisions {
         max_seen_ordinal,
-        tag_mints,
+        tag_mint_start,
+        tag_mint_count,
+        tag_mint_candidates,
+        tag_mint_tokenized_bytes,
         temporal_marks,
         user_hint,
         channel1_append: None,
@@ -7768,6 +7818,9 @@ mod tests {
             assert_eq!(fields[key], "0.0", "{key} renders one decimal place");
         }
         for key in [
+            "tag_mint_candidates",
+            "tag_mint_new",
+            "tag_mint_tokenized_bytes",
             "frozen_units",
             "tail_units_matched",
             "projection_blocks",
@@ -12934,6 +12987,89 @@ mod tests {
         }
     }
 
+    fn legacy_tag_mint_inputs(
+        projection: &FlatProjection,
+        core: &CoreState,
+        mutation_exempt_mid: Option<&str>,
+        existing_tag_ids: &HashSet<&str>,
+    ) -> TagMintWork {
+        let frozen = frozen_red_targets(core);
+        let mut work = TagMintWork::default();
+        for block in &projection.blocks {
+            if frozen.contains(&block.id) || mutation_exempt_mid == Some(block.mid.as_str()) {
+                continue;
+            }
+            let Some((kind, source)) = taggable_source(block) else {
+                continue;
+            };
+            work.candidate_count = work.candidate_count.saturating_add(1);
+            work.tokenized_bytes = work.tokenized_bytes.saturating_add(source.len());
+            let input = TagMintInput {
+                block_id: block.id.clone(),
+                kind: kind.as_store_kind().to_string(),
+                token_count: mc_tokenizer::estimate_tokens(source) as i64,
+                source_bytes: source.as_bytes().to_vec(),
+            };
+            if !existing_tag_ids.contains(input.block_id.as_str()) {
+                work.inputs.push(input);
+            }
+        }
+        work
+    }
+
+    #[test]
+    fn mature_tag_mint_filter_preserves_rows_and_tokenizes_only_new_sources() {
+        const MESSAGE_COUNT: usize = 64;
+        const NEW_TAG_COUNT: usize = 3;
+        let messages = (0..MESSAGE_COUNT)
+            .map(|index| {
+                item(
+                    &format!("mint-{index}"),
+                    index as u64 + 1,
+                    &format!("authored source {index} {}", "payload ".repeat(32)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let request = req("mature-tag-mints", "cfg0", messages);
+        let projection = project_messages(&request.messages).unwrap();
+        let core = CoreState::default();
+        let all_work = legacy_tag_mint_inputs(&projection, &core, None, &HashSet::new());
+        assert_eq!(all_work.inputs.len(), MESSAGE_COUNT);
+
+        let existing_count = all_work.inputs.len() - NEW_TAG_COUNT;
+        let mut mature_rows = Vec::new();
+        append_tag_mint_rows(
+            &mut mature_rows,
+            all_work.inputs[..existing_count].to_vec(),
+            100,
+        );
+        let existing_ids = mature_rows
+            .iter()
+            .map(|row| row.block_id.as_str())
+            .collect::<HashSet<_>>();
+        let legacy = legacy_tag_mint_inputs(&projection, &core, None, &existing_ids);
+        let optimized = tag_mint_inputs(&projection, &core, None, &existing_ids);
+
+        assert_eq!(optimized.inputs, legacy.inputs);
+        assert_eq!(optimized.candidate_count, legacy.candidate_count);
+        assert_eq!(optimized.inputs.len(), NEW_TAG_COUNT);
+        assert!(optimized.tokenized_bytes < legacy.tokenized_bytes);
+        assert_eq!(
+            optimized.tokenized_bytes,
+            optimized
+                .inputs
+                .iter()
+                .map(|input| input.source_bytes.len())
+                .sum::<usize>()
+        );
+
+        let mut legacy_rows = mature_rows.clone();
+        append_tag_mint_rows(&mut legacy_rows, legacy.inputs, 200);
+        let mut optimized_rows = mature_rows;
+        append_tag_mint_rows(&mut optimized_rows, optimized.inputs, 200);
+        assert_eq!(optimized_rows, legacy_rows);
+    }
+
     #[test]
     fn tagging_gate_off_preserves_unreduced_golden_messages() {
         let dir = tempfile::tempdir().unwrap();
@@ -17485,8 +17621,16 @@ mod tests {
     fn full_module_pass_timing_fixture() {
         const MESSAGE_COUNT: usize = 1_800;
         const FROZEN_UNIT_COUNT: usize = 47_075;
+        const NEW_TAG_COUNT: usize = 5;
+        const PAYLOAD_BYTES: usize = 4_096;
         let messages = (0..MESSAGE_COUNT)
-            .map(|index| item(&format!("m{index}"), index as u64 + 1, "tail payload"))
+            .map(|index| {
+                item(
+                    &format!("m{index}"),
+                    index as u64 + 1,
+                    &format!("tail payload {index} {}", "x".repeat(PAYLOAD_BYTES)),
+                )
+            })
             .collect::<Vec<_>>();
         let request = req("perf-full-module-pass", "cfg0", messages);
         let projection = project_messages(&request.messages).unwrap();
@@ -17524,6 +17668,45 @@ mod tests {
             ..Default::default()
         };
         let meta = ModuleMeta::default();
+
+        let all_tag_work = tag_mint_inputs(&projection, &core, None, &HashSet::new());
+        let existing_tag_count = all_tag_work.inputs.len() - NEW_TAG_COUNT;
+        let mut mature_tag_rows = Vec::new();
+        append_tag_mint_rows(
+            &mut mature_tag_rows,
+            all_tag_work.inputs[..existing_tag_count].to_vec(),
+            100,
+        );
+        let existing_tag_ids = mature_tag_rows
+            .iter()
+            .map(|row| row.block_id.as_str())
+            .collect::<HashSet<_>>();
+        let legacy_tag_started_at = Instant::now();
+        let legacy_tag_work = legacy_tag_mint_inputs(&projection, &core, None, &existing_tag_ids);
+        let legacy_tag_ms = elapsed_ms(legacy_tag_started_at);
+        let optimized_tag_started_at = Instant::now();
+        let optimized_tag_work = tag_mint_inputs(&projection, &core, None, &existing_tag_ids);
+        let optimized_tag_ms = elapsed_ms(optimized_tag_started_at);
+        assert_eq!(optimized_tag_work.inputs, legacy_tag_work.inputs);
+        assert_eq!(optimized_tag_work.inputs.len(), NEW_TAG_COUNT);
+        let mut legacy_tag_rows = mature_tag_rows.clone();
+        append_tag_mint_rows(&mut legacy_tag_rows, legacy_tag_work.inputs, 200);
+        let mut optimized_tag_rows = mature_tag_rows;
+        append_tag_mint_rows(
+            &mut optimized_tag_rows,
+            optimized_tag_work.inputs.clone(),
+            200,
+        );
+        assert_eq!(optimized_tag_rows, legacy_tag_rows);
+        eprintln!(
+            "tag-mint-work before_ms={legacy_tag_ms:.1} after_ms={optimized_tag_ms:.1} \
+             candidates={} new={} before_tokenized_bytes={} after_tokenized_bytes={}",
+            optimized_tag_work.candidate_count,
+            optimized_tag_work.inputs.len(),
+            legacy_tag_work.tokenized_bytes,
+            optimized_tag_work.tokenized_bytes,
+        );
+
         let first = build_cached_fixture(&core, &meta, &request, &projection, None, None, true);
         let unindexed = build_output_with_tags_unindexed(
             &core,
@@ -17586,6 +17769,9 @@ mod tests {
                 .filter(|message| !message.meta.synthetic)
                 .count(),
             build_identity_messages: replay.timings.identity_messages,
+            tag_mint_candidates: optimized_tag_work.candidate_count,
+            tag_mint_new: optimized_tag_work.inputs.len(),
+            tag_mint_tokenized_bytes: optimized_tag_work.tokenized_bytes,
             cache_hits: replay.timings.cache_hits,
             cache_misses: replay.timings.cache_misses,
             cache_dirty_skips: replay.timings.cache_dirty_skips,
