@@ -84,9 +84,9 @@ function getSurfaceConfigPaths(directory: string, surface: ConfigSurface): strin
     const globalDir = dirname(USER_OPENCODE_CONFIG);
     const dirs = [
         globalDir,
-        process.env.OPENCODE_CONFIG_DIR,
         directory,
         join(directory, ".opencode"),
+        process.env.OPENCODE_CONFIG_DIR,
     ].filter((value): value is string => Boolean(value));
     const paths: string[] = [];
     for (const dir of dirs) {
@@ -338,7 +338,7 @@ function runHostPluginInstall(
                 stdio: "ignore",
             });
             processStarted = true;
-            proc.on("error", () => finish(false));
+            proc.on("error", () => finish(false, false));
             proc.on("exit", (code) => finish(code === 0));
             if (signal?.aborted) finish(false);
         } catch {
