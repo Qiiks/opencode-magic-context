@@ -10,12 +10,14 @@ const checkerMocks = {
     getCurrentRuntimePackageJsonPath: mock(() => null),
     getLatestVersion: mock(async () => null),
     getLocalDevVersion: mock(() => null),
+    preparePluginUpdate: mock(async () => ({
+        spec: "@cortexkit/opencode-magic-context@0.15.6",
+        configPaths: ["/config/opencode.jsonc", "/config/tui.jsonc"],
+    })),
 };
 
 const cacheMocks = {
-    preparePackageUpdate: mock(() => "/tmp/opencode"),
     resolveInstallContext: mock(() => ({ installDir: "/tmp/opencode" })),
-    runNpmInstallSafe: mock(async () => true),
 };
 
 mock.module("./checker", () => checkerMocks);
@@ -86,15 +88,16 @@ describe("auto-update-checker/index", () => {
         checkerMocks.getLatestVersion.mockImplementation(async () => null);
         checkerMocks.getLocalDevVersion.mockReset();
         checkerMocks.getLocalDevVersion.mockImplementation(() => null);
+        checkerMocks.preparePluginUpdate.mockReset();
+        checkerMocks.preparePluginUpdate.mockImplementation(async () => ({
+            spec: "@cortexkit/opencode-magic-context@0.15.6",
+            configPaths: ["/config/opencode.jsonc", "/config/tui.jsonc"],
+        }));
 
-        cacheMocks.preparePackageUpdate.mockReset();
-        cacheMocks.preparePackageUpdate.mockImplementation(() => "/tmp/opencode");
         cacheMocks.resolveInstallContext.mockReset();
         cacheMocks.resolveInstallContext.mockImplementation(() => ({
             installDir: "/tmp/opencode",
         }));
-        cacheMocks.runNpmInstallSafe.mockReset();
-        cacheMocks.runNpmInstallSafe.mockImplementation(async () => true);
     });
 
     test("uses resolved install root for auto-update installs", async () => {
@@ -304,17 +307,15 @@ describe("auto-update-checker/index", () => {
         });
         await waitForCalls(showToast);
 
-        expect(cacheMocks.preparePackageUpdate).toHaveBeenCalledWith(
+        expect(checkerMocks.preparePluginUpdate).toHaveBeenCalledWith(
+            "/test",
+            expect.objectContaining({ entry: "@cortexkit/opencode-magic-context@latest" }),
             "0.15.6",
-            "@cortexkit/opencode-magic-context",
-        );
-        expect(cacheMocks.runNpmInstallSafe).toHaveBeenCalledWith(
-            "/tmp/opencode",
             expect.objectContaining({ signal: expect.any(AbortSignal) }),
         );
         expect(showToast).toHaveBeenCalledWith({
             body: {
-                title: "Magic Context Updated!",
+                title: "Magic Context Update Ready",
                 message: "v0.15.5 → v0.15.6\nRestart OpenCode to apply.",
                 variant: "success",
                 duration: 8000,
@@ -350,8 +351,7 @@ describe("auto-update-checker/index", () => {
                 duration: 8000,
             },
         });
-        expect(cacheMocks.preparePackageUpdate).not.toHaveBeenCalled();
-        expect(cacheMocks.runNpmInstallSafe).not.toHaveBeenCalled();
+        expect(checkerMocks.preparePluginUpdate).not.toHaveBeenCalled();
     });
 
     test("shows pinned-version notification without installing", async () => {
@@ -382,7 +382,7 @@ describe("auto-update-checker/index", () => {
                 duration: 8000,
             },
         });
-        expect(cacheMocks.preparePackageUpdate).not.toHaveBeenCalled();
+        expect(checkerMocks.preparePluginUpdate).not.toHaveBeenCalled();
     });
 
     test("shows warning toast when latest version fetch fails", async () => {
@@ -424,7 +424,7 @@ describe("auto-update-checker/index", () => {
         }));
         checkerMocks.getCachedVersion.mockImplementation(() => "0.15.5");
         checkerMocks.getLatestVersion.mockImplementation(async () => "0.15.6");
-        cacheMocks.runNpmInstallSafe.mockImplementation(async () => false);
+        checkerMocks.preparePluginUpdate.mockImplementation(async () => null);
         const { createAutoUpdateCheckerHook } = await freshIndexImport();
         const { ctx, showToast } = createCtx();
 
@@ -438,8 +438,7 @@ describe("auto-update-checker/index", () => {
         expect(showToast).toHaveBeenCalledWith({
             body: {
                 title: "Magic Context 0.15.6",
-                message:
-                    "v0.15.6 available, but auto-update failed to install it. Check logs or retry manually.",
+                message: "v0.15.6 available, but auto-update failed to update both plugin configs.",
                 variant: "error",
                 duration: 8000,
             },

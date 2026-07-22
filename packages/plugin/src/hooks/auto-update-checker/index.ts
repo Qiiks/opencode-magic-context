@@ -1,17 +1,21 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { PluginInput } from "@opencode-ai/plugin";
 
+import { getOpenCodeStorageDir } from "../../shared/data-path";
 import { log } from "../../shared/logger";
-import { preparePackageUpdate, resolveInstallContext, runNpmInstallSafe } from "./cache";
+import { resolveInstallContext } from "./cache";
 import {
     extractChannel,
     findPluginEntry,
     getCachedVersion,
     getLatestVersion,
     getLocalDevVersion,
+    type PreparedConfigUpdate,
+    preparePluginUpdate,
 } from "./checker";
 import { CACHE_DIR, NPM_FETCH_TIMEOUT, NPM_REGISTRY_URL, PACKAGE_NAME } from "./constants";
+import { compareSemverCore } from "./semver";
 import type { AutoUpdateCheckerOptions } from "./types";
 
 type OpenCodeEvent = {
@@ -28,6 +32,8 @@ type ResolvedAutoUpdateCheckerOptions = Required<
 const DEFAULT_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const DEFAULT_INIT_DELAY_MS = 5_000;
 const TIMESTAMP_FILENAME = "last-update-check.json";
+const PENDING_UPDATE_FILENAME = "pending-plugin-update.json";
+const PENDING_UPDATE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 function warn(message: string): void {
     log(`WARN: ${message}`);
@@ -182,6 +188,70 @@ function claimCheckSlot(storageDir: string | null, intervalMs: number): boolean 
     }
 }
 
+type PendingUpdateMarker = {
+    spec: string;
+    version: string;
+    configPaths: [string, string];
+    writtenAt: number;
+};
+
+function pendingMarkerPath(storageDir: string | null): string {
+    return join(storageDir ?? getOpenCodeStorageDir(), PENDING_UPDATE_FILENAME);
+}
+
+function writePendingUpdateMarker(
+    storageDir: string | null,
+    update: PreparedConfigUpdate,
+    version: string,
+): void {
+    try {
+        const dir = storageDir ?? dirname(pendingMarkerPath(storageDir));
+        mkdirSync(dir, { recursive: true });
+        const path = pendingMarkerPath(storageDir);
+        const temp = `${path}.tmp.${process.pid}`;
+        writeFileSync(
+            temp,
+            `${JSON.stringify({ spec: update.spec, version, configPaths: update.configPaths, writtenAt: Date.now() }, null, 2)}\n`,
+            "utf-8",
+        );
+        renameSync(temp, path);
+    } catch (err) {
+        warn(`[auto-update-checker] Could not write pending update marker: ${String(err)}`);
+    }
+}
+
+function consumePendingUpdateMarker(storageDir: string | null, loadedVersion: string | null): void {
+    const path = pendingMarkerPath(storageDir);
+    if (!existsSync(path)) return;
+    try {
+        const marker = JSON.parse(readFileSync(path, "utf-8")) as Partial<PendingUpdateMarker>;
+        const age = Date.now() - (marker.writtenAt ?? 0);
+        const olderThanLoaded =
+            typeof marker.version === "string" &&
+            typeof loadedVersion === "string" &&
+            (compareSemverCore(marker.version, loadedVersion) ?? 0) < 0;
+        if (
+            marker.version === loadedVersion &&
+            marker.spec === `${PACKAGE_NAME}@${loadedVersion}` &&
+            Array.isArray(marker.configPaths) &&
+            marker.configPaths.length === 2
+        ) {
+            rmSync(path, { force: true });
+            log(`[auto-update-checker] Pending update applied: ${marker.spec}`);
+        } else if (age > PENDING_UPDATE_MAX_AGE_MS || olderThanLoaded) {
+            rmSync(path, { force: true });
+            warn("[auto-update-checker] Discarded stale or mismatched pending update marker");
+        }
+    } catch (err) {
+        try {
+            rmSync(path, { force: true });
+        } catch {
+            // Best-effort cleanup of an invalid bookkeeping marker.
+        }
+        warn(`[auto-update-checker] Discarded corrupt pending update marker: ${String(err)}`);
+    }
+}
+
 async function runStartupCheck(
     ctx: PluginInput,
     options: ResolvedAutoUpdateCheckerOptions,
@@ -189,6 +259,7 @@ async function runStartupCheck(
     if (options.signal.aborted) return;
 
     const cachedVersion = getCachedVersion();
+    consumePendingUpdateMarker(options.storageDir, cachedVersion);
     const localDevVersion = getLocalDevVersion(ctx.directory);
     const displayVersion = localDevVersion ?? cachedVersion;
 
@@ -287,40 +358,30 @@ async function runBackgroundUpdateCheck(
         return;
     }
 
-    const installDir = preparePackageUpdate(latestVersion, PACKAGE_NAME);
-    if (!installDir) {
+    const preparedUpdate = await preparePluginUpdate(ctx.directory, pluginInfo, latestVersion, {
+        signal: options.signal,
+    });
+    if (preparedUpdate) {
+        writePendingUpdateMarker(options.storageDir, preparedUpdate, latestVersion);
         showToast(
             ctx,
-            `Magic Context ${latestVersion}`,
-            `v${latestVersion} available. Auto-update could not prepare the active install.`,
-            "warning",
-            8000,
-        );
-        warn("[auto-update-checker] Failed to prepare install root for auto-update");
-        return;
-    }
-
-    const installSuccess = await runNpmInstallSafe(installDir, { signal: options.signal });
-    if (installSuccess) {
-        showToast(
-            ctx,
-            "Magic Context Updated!",
+            "Magic Context Update Ready",
             `v${currentVersion} → v${latestVersion}\nRestart OpenCode to apply.`,
             "success",
             8000,
         );
-        log(`[auto-update-checker] Update installed: ${currentVersion} → ${latestVersion}`);
+        log(`[auto-update-checker] Update ready: ${currentVersion} → ${latestVersion}`);
         return;
     }
 
     showToast(
         ctx,
         `Magic Context ${latestVersion}`,
-        `v${latestVersion} available, but auto-update failed to install it. Check logs or retry manually.`,
+        `v${latestVersion} available, but auto-update failed to update both plugin configs.`,
         "error",
         8000,
     );
-    warn("[auto-update-checker] npm install failed; update not installed");
+    warn("[auto-update-checker] Exact-spec config transaction failed; update not announced");
 }
 
 export function getAutoUpdateInstallDir(): string {
