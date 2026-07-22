@@ -906,6 +906,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         historianRunnable,
         experimentalUserMemories: userMemoryCollectionEnabled(dreamerConfig),
         experimentalTemporalAwareness: deps.config.temporal_awareness === true,
+        experimentalMuralEnabled: deps.config.experimental?.mural?.enabled === true,
         historianTwoPass: deps.config.historian?.two_pass === true,
         liveModelBySession,
         sessionDirectoryBySession,

@@ -3,6 +3,7 @@ import {
     type Statement as PreparedStatement,
     registerPrivilegedWriter,
 } from "../../../shared/sqlite";
+import { hasMuralCueColumns } from "../mural/storage-mural-cues";
 import { MEMORY_CATEGORY_ORDER_SQL } from "./constants";
 import { invalidateMemory, invalidateProject } from "./embedding-cache";
 import { computeNormalizedHash } from "./normalize-hash";
@@ -1036,6 +1037,17 @@ export function updateMemoryContent(
         // run (importance/scope were judged against the old content).
         if (hasMemoryClassifiedAtColumn(db)) {
             db.prepare("UPDATE memories SET classified_at = NULL WHERE id = ?").run(id);
+        }
+
+        // Drop the stale mural cue: it was compressed from the OLD content, so its
+        // hash no longer matches. Clearing it here means resolveMural won't render
+        // the stale cue even for the brief window before compress-cues recomputes
+        // it, and the compress-cues gate re-selects this memory (NULL cue).
+        // Column-guarded for pre-v65 DBs.
+        if (hasMuralCueColumns(db)) {
+            db.prepare(
+                "UPDATE memories SET mural_cue = NULL, mural_cue_hash = NULL, mural_cue_at = NULL WHERE id = ?",
+            ).run(id);
         }
 
         // Invalidate stale embedding — backfill will regenerate with new content.

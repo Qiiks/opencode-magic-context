@@ -71,7 +71,7 @@ function taskIcon(taskName: string): JSX.Element {
       );
     case "curate":
       return wrap(<path d="M3 6h18M7 12h10M10 18h4" />);
-    case "render-mural":
+    case "compress-cues":
       return wrap(
         <>
           <rect x="3" y="4" width="18" height="16" rx="2" />

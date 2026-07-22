@@ -390,6 +390,10 @@ export interface TransformDeps {
      *  add compact date ranges to compartment headings in <session-history>.
      *  Controlled by `experimental.temporal_awareness` config. */
     experimentalTemporalAwareness?: boolean;
+    /** experimental.mural.enabled — when true (and the fold's model accepts
+     *  images), materializeM0 renders the deterministic mural on demand and folds
+     *  its image into the m[0] baseline. */
+    experimentalMuralEnabled?: boolean;
     /** When true, run a second editor pass after historian to clean U: lines.
      *  Enables the historian-editor agent. Controlled by `historian.two_pass` config. */
     historianTwoPass?: boolean;
@@ -1838,6 +1842,7 @@ export function createTransform(deps: TransformDeps) {
                 historyBudgetTokens,
                 temporalAwareness: deps.experimentalTemporalAwareness,
                 hardSignals: m0HardSignals,
+                muralEnabled: deps.experimentalMuralEnabled,
             },
         });
         passOutcome.markFinalized();

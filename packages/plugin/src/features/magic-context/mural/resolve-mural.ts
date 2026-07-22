@@ -1,7 +1,12 @@
-import { modelSupportsVision } from "../../../shared/models-dev-cache";
 import type { Database } from "../../../shared/sqlite";
-import { getMural, muralDataUrl } from "./storage-mural";
+import { getMemoriesByProject } from "../memory";
+import { getMemoryCategoryOrder } from "../memory/constants";
+import { DEFAULT_MURAL_MEMORY_BUDGET, muralOverflowMemories } from "./mural-selection";
+import { computeCueContentHash, getMuralCueState } from "./storage-mural-cues";
 
+/** Wire options for the m0 mural image injection: whether the feature is on,
+ *  whether the fold's model accepts images, and (when both hold) the rendered
+ *  data URL plus its content hash. Produced by resolveMuralWire (render-trigger). */
 export interface MuralWireOptions {
     enabled: boolean;
     supportsVision: boolean;
@@ -9,30 +14,66 @@ export interface MuralWireOptions {
     contentHash?: string;
 }
 
-/** Resolve the project image only for models whose cached provider metadata accepts images. */
-export function resolveMuralForModel(
+/** A single deterministic mural entry: a compressed cue plus the ordering
+ *  facts. No rooms, no merges — flat category bands. */
+export interface ResolvedMuralEntry {
+    id: number;
+    category: string;
+    importance: number;
+    cue: string;
+}
+
+/**
+ * Compute the deterministic mural entry list for a project — the zero-LLM half
+ * of the cutover, callable any time.
+ *
+ * 1. SELECTION: the overflow set is the complement of the m0 budget trim (the
+ *    memories that did NOT fit the injected memory budget). Same trim the m0
+ *    path uses, so the mural shows exactly what the budget dropped.
+ * 2. FILTER: keep only overflow memories with a hash-CURRENT compressed cue
+ *    (mural_cue set AND mural_cue_hash == sha256(content)). Uncompressed or
+ *    stale memories are simply absent until the compress-cues trickle catches
+ *    up — render what exists, never block on coverage.
+ * 3. ORDER: category (MEMORY_CATEGORY_ORDER) → importance DESC → id ASC. The
+ *    id-ASC tiebreak makes the order APPEND-STABLE: inserting a new memory never
+ *    reshuffles the relative order of the existing ones within their band.
+ */
+export function resolveMural(
     db: Database,
-    projectPath: string,
-    modelKey: string | undefined,
-    enabled: boolean,
-): MuralWireOptions {
-    const result: MuralWireOptions = {
-        enabled,
-        supportsVision: false,
-    };
-    if (!enabled || !modelKey) return result;
-    const separator = modelKey.indexOf("/");
-    if (separator <= 0) return result;
-    if (!modelSupportsVision(modelKey.slice(0, separator), modelKey.slice(separator + 1))) {
-        return result;
+    projectIdentity: string,
+    budgetTokens: number = DEFAULT_MURAL_MEMORY_BUDGET,
+): ResolvedMuralEntry[] {
+    const memories = getMemoriesByProject(db, projectIdentity, ["active", "permanent"]);
+    const overflow = muralOverflowMemories(memories, budgetTokens);
+    if (overflow.length === 0) return [];
+
+    const cueState = getMuralCueState(
+        db,
+        overflow.map((memory) => memory.id),
+    );
+    const entries: ResolvedMuralEntry[] = [];
+    for (const memory of overflow) {
+        const state = cueState.get(memory.id);
+        if (!state || state.cue === null || state.hash === null) continue;
+        // Hash-current only: a cue whose content hash no longer matches is stale
+        // (the memory was edited after compression) and must not render.
+        if (state.hash !== computeCueContentHash(memory.content)) continue;
+        entries.push({
+            id: memory.id,
+            category: memory.category,
+            importance: memory.importance ?? 50,
+            cue: state.cue,
+        });
     }
-    const row = getMural(db, projectPath);
-    return row
-        ? {
-              enabled: true,
-              supportsVision: true,
-              dataUrl: muralDataUrl(row),
-              contentHash: row.contentHash,
-          }
-        : result;
+
+    entries.sort(compareMuralEntries);
+    return entries;
+}
+
+/** category order → importance DESC → id ASC (append-stable). */
+function compareMuralEntries(a: ResolvedMuralEntry, b: ResolvedMuralEntry): number {
+    const categoryDelta = getMemoryCategoryOrder(a.category) - getMemoryCategoryOrder(b.category);
+    if (categoryDelta !== 0) return categoryDelta;
+    if (a.importance !== b.importance) return b.importance - a.importance;
+    return a.id - b.id;
 }

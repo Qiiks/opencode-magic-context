@@ -59,10 +59,11 @@ export const TASKS: TaskMeta[] = [
     defaultSchedule: "0 4 * * 0",
   },
   {
-    name: "render-mural",
-    label: "Render memory mural",
-    description: "Renders the memory mural — a single image of overflow memories",
-    defaultSchedule: "0 4 * * 0",
+    name: "compress-cues",
+    label: "Compress mural cues",
+    description:
+      "Compresses each overflow memory into a mural cue (the mural image renders deterministically)",
+    defaultSchedule: "0 4 * * *",
   },
   {
     name: "classify-memories",

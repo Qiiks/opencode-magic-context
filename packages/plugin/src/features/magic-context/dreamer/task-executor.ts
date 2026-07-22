@@ -24,7 +24,7 @@ import {
     getMemoryVerifications,
     type Memory,
 } from "../memory";
-import { renderMuralTask } from "../mural/mural-task";
+import { runCompressCues } from "../mural/compress-cues";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
 import { getActiveUserMemories } from "../user-memory/storage-user-memory";
@@ -295,31 +295,32 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         }
 
         try {
-            if (config.task === "render-mural") {
+            if (config.task === "compress-cues") {
                 if (deps.experimentalMural?.enabled !== true) {
                     // Config-gated no-op, but say so: a silent "completed" here
-                    // reads as a successful render in /ctx-dream summaries and
-                    // has already masked a wiring gap once.
-                    log("[dreamer] render-mural: skipped (experimental.mural is not enabled)");
+                    // reads as a successful run in /ctx-dream summaries and would
+                    // otherwise mask a wiring gap.
+                    log("[dreamer] compress-cues: skipped (experimental.mural is not enabled)");
                     recordRun("completed", null);
                     return { status: "completed" };
                 }
-                const result = await renderMuralTask({
+                // Model ladder mirrors classify: task override → experimental.mural
+                // model (the cue COMPRESSOR model) → dreamer model → session model.
+                const result = await runCompressCues({
                     db,
                     client: deps.client,
                     projectIdentity,
-                    projectDirectory: deps.sessionDirectory,
+                    parentSessionId: parent,
+                    sessionDirectory: deps.sessionDirectory,
                     holderId,
                     leaseKey,
                     deadline,
                     model: config.model ?? deps.experimentalMural.model ?? deps.dreamerModel,
-                    configuredModel: deps.experimentalMural.model,
                     fallbackModels: config.fallbackModels,
-                    memoryBudgetTokens: deps.memoryInjectionBudgetTokens,
                 });
                 recordRun("completed", null);
                 log(
-                    `[dreamer] render-mural: ${result.status}${result.reason ? ` (${result.reason})` : ""}`,
+                    `[dreamer] compress-cues: compressed=${result.compressed} skipped=${result.skipped} chunks=${result.chunks}`,
                 );
                 return { status: "completed" };
             }

@@ -165,11 +165,11 @@ Off-hours maintenance (Dreamer) and on-demand prompt augmentation (Sidekick).
 | `dreamer.tasks.curate.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
 | `dreamer.tasks.curate.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` | — | Pi only: per-task thinking level |
 | `dreamer.tasks.curate.timeout_minutes` | number (5–) | `20` | Minutes allowed for this task before it is aborted |
-| `dreamer.tasks.render-mural.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.render-mural.model` | string | — | Per-task model override (inherits dreamer.model) |
-| `dreamer.tasks.render-mural.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
-| `dreamer.tasks.render-mural.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` | — | Pi only: per-task thinking level |
-| `dreamer.tasks.render-mural.timeout_minutes` | number (5–) | `20` | Minutes allowed for this task before it is aborted |
+| `dreamer.tasks.compress-cues.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
+| `dreamer.tasks.compress-cues.model` | string | — | Per-task model override (inherits dreamer.model) |
+| `dreamer.tasks.compress-cues.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
+| `dreamer.tasks.compress-cues.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` | — | Pi only: per-task thinking level |
+| `dreamer.tasks.compress-cues.timeout_minutes` | number (5–) | `20` | Minutes allowed for this task before it is aborted |
 | `dreamer.tasks.classify-memories.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
 | `dreamer.tasks.classify-memories.model` | string | — | Per-task model override (inherits dreamer.model) |
 | `dreamer.tasks.classify-memories.fallback_models` | string \\| string[] | — | Per-task fallback chain (inherits dreamer.fallback_models) |
@@ -254,9 +254,9 @@ Behavior tuning most installs never need to touch.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `experimental.mural` | object | — | Experimental mural: a single rendered image of project memories that did not fit the context budget. |
+| `experimental.mural` | object | — | Experimental mural: a single deterministically-rendered image of project memories that did not fit the context budget. Cues are compressed per-memory by the compress-cues dreamer task. |
 | `experimental.mural.enabled` | boolean | `false` |  |
-| `experimental.mural.model` | string | — |  |
+| `experimental.mural.model` | string | — | Model for the compress-cues task that compresses each memory into a mural cue. The mural image itself is rendered deterministically (no author model). |
 | `toast_duration_ms` | number (0–60000) | `5000` | TUI toast lifetime in milliseconds for Magic Context notifications. Set to 0 to disable Magic Context toasts entirely (min: 0, max: 60000, default: 5000) |
 | `subc.connection_file` | string | — | Path to the owner-only subc connection file. |
 | `pi.subagent_extensions` | string[] | — | User-only allowlist of Pi extensions for Magic Context subagent children. When set, children use --no-extensions and load only these entries (plus Magic Context's scoped child extension where applicable). Relative paths resolve from ~/.pi/agent, matching Pi's settings.json package location. Unset preserves normal Pi extension discovery. |

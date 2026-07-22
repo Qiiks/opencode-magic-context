@@ -118,7 +118,9 @@ const DEFAULT_TASK_SCHEDULES: Record<DreamTaskName, string> = {
     verify: "0 3 * * *",
     "verify-broad": "0 4 * * 0",
     curate: "0 4 * * 0",
-    "render-mural": "0 4 * * 0",
+    // Daily trickle: chunks are small (~40 memories), so after the initial
+    // backfill the per-memory cue compression is cheap to run every night.
+    "compress-cues": "0 4 * * *",
     "classify-memories": "0 6 * * *",
     retrospective: "0 5 * * *",
     "maintain-docs": "",
@@ -154,8 +156,8 @@ export const DreamTasksSchema = z
         curate: DreamTaskBaseConfigSchema.default(() =>
             DreamTaskBaseConfigSchema.parse(defaultTaskConfig("curate")),
         ),
-        "render-mural": DreamTaskBaseConfigSchema.default(() =>
-            DreamTaskBaseConfigSchema.parse(defaultTaskConfig("render-mural")),
+        "compress-cues": DreamTaskBaseConfigSchema.default(() =>
+            DreamTaskBaseConfigSchema.parse(defaultTaskConfig("compress-cues")),
         ),
         "classify-memories": DreamTaskBaseConfigSchema.default(() =>
             DreamTaskBaseConfigSchema.parse(defaultTaskConfig("classify-memories")),
@@ -371,6 +373,8 @@ export interface ShadowEmbeddingConfig {
 
 export interface ExperimentalMuralConfig {
     enabled: boolean;
+    /** The CUE COMPRESSOR model for the compress-cues dreamer task (the mural is
+     *  now rendered deterministically, so this no longer names an author model). */
     model?: string;
 }
 
@@ -528,11 +532,18 @@ export const MagicContextConfigSchema = z
                 mural: z
                     .object({
                         enabled: z.boolean().default(false),
-                        model: z.string().trim().min(1).optional(),
+                        model: z
+                            .string()
+                            .trim()
+                            .min(1)
+                            .optional()
+                            .describe(
+                                "Model for the compress-cues task that compresses each memory into a mural cue. The mural image itself is rendered deterministically (no author model).",
+                            ),
                     })
                     .default({ enabled: false })
                     .describe(
-                        "Experimental mural: a single rendered image of project memories that did not fit the context budget.",
+                        "Experimental mural: a single deterministically-rendered image of project memories that did not fit the context budget. Cues are compressed per-memory by the compress-cues dreamer task.",
                     ),
             })
             .default({ mural: { enabled: false } })

@@ -12,7 +12,7 @@ describe("dreamer task registry", () => {
             "verify",
             "verify-broad",
             "curate",
-            "render-mural",
+            "compress-cues",
             "classify-memories",
             "retrospective",
             "promote-primers",
@@ -20,11 +20,11 @@ describe("dreamer task registry", () => {
         ]);
         // map-memories leads the canonical order (records the mappings verify gates on).
         expect(CANONICAL_DREAM_TASKS.indexOf("map-memories")).toBe(0);
-        expect(CANONICAL_DREAM_TASKS.indexOf("render-mural")).toBe(
+        expect(CANONICAL_DREAM_TASKS.indexOf("compress-cues")).toBe(
             CANONICAL_DREAM_TASKS.indexOf("curate") + 1,
         );
         expect(CANONICAL_DREAM_TASKS.indexOf("classify-memories")).toBe(
-            CANONICAL_DREAM_TASKS.indexOf("render-mural") + 1,
+            CANONICAL_DREAM_TASKS.indexOf("compress-cues") + 1,
         );
         expect(CANONICAL_DREAM_TASKS.indexOf("retrospective")).toBe(
             CANONICAL_DREAM_TASKS.indexOf("classify-memories") + 1,
