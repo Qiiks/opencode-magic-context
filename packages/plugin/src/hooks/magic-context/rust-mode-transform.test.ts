@@ -1485,10 +1485,23 @@ describe("delta prefix-mutation guard", () => {
         );
         const db = makeDb();
         const requestBodies: Array<Record<string, unknown>> = [];
+        let moduleNativeSnapshot: unknown[] = [];
         const moduleClient: RustModeModuleClient = {
             call: async ({ method, body }) => {
-                if (method === "transform") requestBodies.push(body as Record<string, unknown>);
-                return method === "transform" ? { native_messages: [] } : { ok: true };
+                if (method !== "transform") return { ok: true };
+                const request = body as Record<string, unknown>;
+                requestBodies.push(request);
+                const suffix = request.native_messages as unknown[];
+                const delta = request.tail_delta as { native_replace_from?: unknown } | undefined;
+                if (delta && typeof delta.native_replace_from === "number") {
+                    moduleNativeSnapshot = [
+                        ...moduleNativeSnapshot.slice(0, delta.native_replace_from),
+                        ...structuredClone(suffix),
+                    ];
+                } else {
+                    moduleNativeSnapshot = structuredClone(suffix);
+                }
+                return { native_messages: structuredClone(moduleNativeSnapshot) };
             },
         };
         const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
@@ -1498,10 +1511,7 @@ describe("delta prefix-mutation guard", () => {
                 parts: [
                     {
                         type: "text",
-                        text:
-                            mutatePrefix && index === 0
-                                ? "message m-1 MUTATED IN PLACE"
-                                : `message ${row.id}`,
+                        text: mutatePrefix && index === 0 ? "MESSAGE m-1" : `message ${row.id}`,
                     },
                 ],
             }));
@@ -1526,16 +1536,123 @@ describe("delta prefix-mutation guard", () => {
         // pass must abandon the delta and full-send, because the prefix the module
         // would reuse no longer matches what OpenCode holds.
         const mutated = buildMessages(4, true);
+        expect(__rustModeTransformTest.messageContentSnapshot(mutated[0]).signature).not.toBe(
+            __rustModeTransformTest.messageContentSnapshot(appended[0]).signature,
+        );
+        const mutatedOutput = { messages: [...mutated] as unknown[] };
+        await transform.run(sessionId, mutated, mutatedOutput, makeMeta(db, sessionId));
+        expect(requestBodies).toHaveLength(3);
+        expect(requestBodies[2]?.tail_delta).toBeUndefined();
+        expect(requestBodies[2]?.messages).toHaveLength(4);
+        expect(requestBodies[2]?.native_messages).toEqual(mutated);
+        expect(JSON.stringify(requestBodies[2]?.messages)).toContain("MESSAGE m-1");
+        expect(mutatedOutput.messages).toEqual(mutated);
+
+        const stableOutput = { messages: [...mutated] as unknown[] };
+        await transform.run(sessionId, mutated, stableOutput, makeMeta(db, sessionId));
+        expect(requestBodies).toHaveLength(4);
+        expect(requestBodies[3]?.tail_delta).toEqual({
+            after: requestBodies[2]?.full_array_fingerprint,
+            replace_from: 4,
+            native_replace_from: 4,
+        });
+        expect(requestBodies[3]?.messages).toEqual([]);
+        expect(requestBodies[3]?.native_messages).toEqual([]);
+        expect(stableOutput.messages).toEqual(mutatedOutput.messages);
+    });
+
+    it("detects equal-length mutations inside tool input arguments", async () => {
+        const sessionId = `rust-tool-input-prefix-guard-${Date.now()}`;
+        sessions.push(sessionId);
+        const rows = Array.from({ length: 3 }, (_, index) => ({
+            id: `m-${index + 1}`,
+            timeCreated: index + 1,
+            contributesOrdinal: true,
+            hasValidInfo: true,
+        }));
+        unregisters.push(
+            setRawMessageProvider(sessionId, {
+                readMessages: () => rows,
+                readMessageOrdinalPage: (after, limit) =>
+                    rows
+                        .filter(
+                            (row) =>
+                                !after ||
+                                row.timeCreated > after.timeCreated ||
+                                (row.timeCreated === after.timeCreated && row.id > after.id),
+                        )
+                        .slice(0, limit),
+                getStoredMessageCount: () => rows.length,
+            }),
+        );
+        const db = makeDb();
+        const requestBodies: Array<Record<string, unknown>> = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform") requestBodies.push(body as Record<string, unknown>);
+                return method === "transform" ? { native_messages: [] } : { ok: true };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const buildMessages = (query: string): MessageLike[] =>
+            rows.map((row, index) => ({
+                info: { id: row.id, role: "assistant", sessionID: sessionId },
+                parts: [
+                    {
+                        type: "tool",
+                        callID: `call-${index}`,
+                        tool: "search",
+                        state: { status: "completed", input: { query }, output: "ok" },
+                    },
+                ],
+            }));
+
+        const initial = buildMessages("alpha");
+        await transform.run(
+            sessionId,
+            initial,
+            { messages: [...initial] },
+            makeMeta(db, sessionId),
+        );
+        const mutated = buildMessages("bravo");
+        expect(__rustModeTransformTest.messageContentSnapshot(mutated[0]).signature).not.toBe(
+            __rustModeTransformTest.messageContentSnapshot(initial[0]).signature,
+        );
         await transform.run(
             sessionId,
             mutated,
             { messages: [...mutated] },
             makeMeta(db, sessionId),
         );
-        expect(requestBodies).toHaveLength(3);
-        expect(requestBodies[2]?.tail_delta).toBeUndefined();
-        expect(requestBodies[2]?.messages).toHaveLength(4);
-        expect(requestBodies[2]?.native_messages).toHaveLength(4);
+
+        expect(requestBodies).toHaveLength(2);
+        expect(requestBodies[1]?.tail_delta).toBeUndefined();
+        expect(requestBodies[1]?.native_messages).toEqual(mutated);
+        expect(JSON.stringify(requestBodies[1]?.messages)).toContain('"query":"bravo"');
+    });
+
+    it("checks a 1,400-message multi-megabyte prefix within the steady-pass budget", () => {
+        const text = "x".repeat(2_048);
+        const messages = Array.from({ length: 1_400 }, (_, index) => ({
+            info: { id: `m-${index}`, role: "user" },
+            parts: [{ type: "text", text }],
+        })) as MessageLike[];
+        const snapshots = __rustModeTransformTest.contentSnapshotsFor(messages);
+        const samples: number[] = [];
+        for (let sample = 0; sample < 7; sample += 1) {
+            const startedAt = performance.now();
+            expect(
+                messages.every((message, index) =>
+                    __rustModeTransformTest.messageMatchesContentSnapshot(
+                        message,
+                        snapshots[index],
+                    ),
+                ),
+            ).toBe(true);
+            samples.push(performance.now() - startedAt);
+        }
+        samples.sort((left, right) => left - right);
+        expect(samples[3]).toBeLessThan(10);
     });
 
     it("recovers after a queued user message is mutated in place and the module rejects twice", async () => {

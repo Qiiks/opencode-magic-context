@@ -97,20 +97,22 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
     ): Promise<ModuleCompartmentMirrorResponse>;
 }
 
+type MessageContentField = string | number | boolean | symbol;
+
+interface MessageContentSnapshot {
+    signature: string;
+    fields: MessageContentField[];
+}
+
 interface RustWireCache {
     rawCount: number;
     wireCount: number;
     rawLastId: string | null;
     rawLastSignature: string | null;
     rawLastVisible: boolean;
-    /** Light per-message signatures for the WHOLE raw array (field reads only, no
-     * serialization). Delta passes re-verify the prefix against these so an in-place
-     * mutation of an older message (a background tool completing late, a reminder
-     * wrapper) forces a full send instead of riding a stale-prefix delta. A mutation
-     * that changes none of the observed fields (id, part count/types, text lengths,
-     * tool status) is invisible until the next natural full send; strong hashing here
-     * would reintroduce the O(session-bytes) per-pass cost this cache exists to kill. */
-    rawLightSignatures: string[];
+    /** Content-sensitive per-message snapshots for the whole raw array. Delta passes
+     * re-verify every reused message so in-place edits cannot ride a stale prefix. */
+    rawContentSnapshots: MessageContentSnapshot[];
     ckFingerprint: string;
     ckPrefixFingerprintBeforeLast: string;
     nativeFingerprint: string;
@@ -185,32 +187,114 @@ function messageIdOf(message: MessageLike): string | null {
     return typeof id === "string" && id.length > 0 ? id : null;
 }
 
-/** Cheap per-message mutation sentinel: field reads only, never serializes content. */
-function lightMessageSignature(message: MessageLike): string {
-    const parts = Array.isArray(message.parts) ? message.parts : [];
-    let acc = `${messageIdOf(message) ?? ""}:${parts.length}`;
-    for (const part of parts as Array<Record<string, unknown>>) {
-        const text = typeof part.text === "string" ? part.text.length : 0;
-        const state = part.state as Record<string, unknown> | undefined;
-        const status = state && typeof state.status === "string" ? state.status : "";
-        const output = state && typeof state.output === "string" ? state.output.length : 0;
-        acc += `|${String(part.type ?? "")}:${text}:${status}:${output}`;
+const FNV1A_32_OFFSET = 0x811c9dc5;
+const FNV1A_32_PRIME = 0x01000193;
+
+function updateFnv1a32(hash: number, value: string): number {
+    let next = hash;
+    for (let index = 0; index < value.length; index += 1) {
+        next ^= value.charCodeAt(index);
+        next = Math.imul(next, FNV1A_32_PRIME) >>> 0;
     }
-    return acc;
+    return next;
 }
 
-function lightSignaturesFor(messages: readonly MessageLike[]): string[] {
-    return messages.map(lightMessageSignature);
+const SNAPSHOT_ARRAY = Symbol("array");
+const SNAPSHOT_OBJECT = Symbol("object");
+const SNAPSHOT_KEY = Symbol("key");
+const SNAPSHOT_STRING = Symbol("string");
+const SNAPSHOT_NUMBER = Symbol("number");
+const SNAPSHOT_BOOLEAN = Symbol("boolean");
+const SNAPSHOT_NULL = Symbol("null");
+const SNAPSHOT_UNDEFINED = Symbol("undefined");
+
+function appendMessageContentFields(value: unknown, fields: MessageContentField[]): void {
+    if (value === null) {
+        fields.push(SNAPSHOT_NULL);
+        return;
+    }
+    if (typeof value === "string") {
+        fields.push(SNAPSHOT_STRING, value);
+        return;
+    }
+    if (typeof value === "number") {
+        fields.push(SNAPSHOT_NUMBER, value);
+        return;
+    }
+    if (typeof value === "boolean") {
+        fields.push(SNAPSHOT_BOOLEAN, value);
+        return;
+    }
+    if (value === undefined || typeof value === "function" || typeof value === "symbol") {
+        fields.push(SNAPSHOT_UNDEFINED);
+        return;
+    }
+    if (Array.isArray(value)) {
+        fields.push(SNAPSHOT_ARRAY, value.length);
+        for (const item of value) appendMessageContentFields(item, fields);
+        return;
+    }
+    if (typeof value === "object") {
+        const entries = Object.entries(value).filter(
+            ([, child]) =>
+                child !== undefined && typeof child !== "function" && typeof child !== "symbol",
+        );
+        fields.push(SNAPSHOT_OBJECT, entries.length);
+        for (const [key, child] of entries) {
+            fields.push(SNAPSHOT_KEY, key);
+            appendMessageContentFields(child, fields);
+        }
+        return;
+    }
+    fields.push(SNAPSHOT_UNDEFINED);
 }
 
-function prefixLightSignaturesMatch(
+function messageContentFields(message: MessageLike): MessageContentField[] {
+    const fields: MessageContentField[] = [];
+    appendMessageContentFields(message, fields);
+    return fields;
+}
+
+function signatureForFields(fields: readonly MessageContentField[]): string {
+    let hash = FNV1A_32_OFFSET;
+    for (const field of fields) {
+        const value = typeof field === "symbol" ? (field.description ?? "") : String(field);
+        hash = updateFnv1a32(hash, `${typeof field}:${value.length}:`);
+        hash = updateFnv1a32(hash, value);
+        hash = updateFnv1a32(hash, "\0");
+    }
+    return hash.toString(16).padStart(8, "0");
+}
+
+/** Capture an exact field snapshot plus its compact content-sensitive rolling hash. */
+function messageContentSnapshot(message: MessageLike): MessageContentSnapshot {
+    const fields = messageContentFields(message);
+    return { signature: signatureForFields(fields), fields };
+}
+
+function contentSnapshotsFor(messages: readonly MessageLike[]): MessageContentSnapshot[] {
+    return messages.map(messageContentSnapshot);
+}
+
+function messageMatchesContentSnapshot(
+    message: MessageLike,
+    snapshot: MessageContentSnapshot,
+): boolean {
+    const fields = messageContentFields(message);
+    return (
+        fields.length === snapshot.fields.length &&
+        fields.every((field, index) => Object.is(field, snapshot.fields[index]))
+    );
+}
+
+function prefixContentSnapshotsMatch(
     messages: readonly MessageLike[],
     cache: RustWireCache,
     prefixLength: number,
 ): boolean {
-    if (prefixLength > cache.rawLightSignatures.length) return false;
+    if (prefixLength > cache.rawContentSnapshots.length) return false;
     for (let index = 0; index < prefixLength; index += 1) {
-        if (lightMessageSignature(messages[index]) !== cache.rawLightSignatures[index]) {
+        if (!messageMatchesContentSnapshot(messages[index], cache.rawContentSnapshots[index])) {
             return false;
         }
     }
@@ -1104,7 +1188,7 @@ export function createRustModeTransform(
                 // cover the tail; this covers in-place mutation of an older message (an
                 // ephemeral reminder wrapper, a late tool completion) which must force a
                 // full send instead of riding a stale-prefix delta.
-                const prefixIntact = prefixLightSignaturesMatch(
+                const prefixIntact = prefixContentSnapshotsMatch(
                     messages,
                     previousWireCache,
                     Math.max(0, previousWireCache.rawCount - 1),
@@ -1273,7 +1357,7 @@ export function createRustModeTransform(
                         nativeFingerprint: nativeFingerprint.fingerprint,
                         nativePrefixFingerprintBeforeLast:
                             nativeFingerprint.prefixFingerprintBeforeLast,
-                        rawLightSignatures: lightSignaturesFor(messages),
+                        rawContentSnapshots: contentSnapshotsFor(messages),
                         fingerprint: `${ckFingerprint.fingerprint}|${nativeFingerprint.fingerprint}`,
                     };
                 }
@@ -1308,7 +1392,12 @@ export function createRustModeTransform(
                     ckPrefixFingerprintBeforeLast,
                     nativeFingerprint,
                     nativePrefixFingerprintBeforeLast,
-                    rawLightSignatures: lightSignaturesFor(messages),
+                    // Preserve snapshots for messages reused from the previous wire cache,
+                    // and recompute them only for messages included in this request's suffix.
+                    rawContentSnapshots: [
+                        ...previousWireCache.rawContentSnapshots.slice(0, wireDelta.rawStart),
+                        ...contentSnapshotsFor(messages.slice(wireDelta.rawStart)),
+                    ],
                     fingerprint: `${ckFingerprint}|${nativeFingerprint}`,
                 };
             })();
@@ -1382,7 +1471,7 @@ export function createRustModeTransform(
                     ckPrefixFingerprintBeforeLast: fullCk.prefixFingerprintBeforeLast,
                     nativeFingerprint: fullNative.fingerprint,
                     nativePrefixFingerprintBeforeLast: fullNative.prefixFingerprintBeforeLast,
-                    rawLightSignatures: lightSignaturesFor(messages),
+                    rawContentSnapshots: contentSnapshotsFor(messages),
                     fingerprint: `${fullCk.fingerprint}|${fullNative.fingerprint}`,
                 };
                 body = buildTransformBody({
@@ -1491,7 +1580,7 @@ export function createRustModeTransform(
                         nativeFingerprint: retryNativeFingerprint.fingerprint,
                         nativePrefixFingerprintBeforeLast:
                             retryNativeFingerprint.prefixFingerprintBeforeLast,
-                        rawLightSignatures: lightSignaturesFor(messages),
+                        rawContentSnapshots: contentSnapshotsFor(messages),
                         fingerprint: `${retryCkFingerprint.fingerprint}|${retryNativeFingerprint.fingerprint}`,
                     };
                     const retryWireBuildStartedAt = performance.now();
@@ -1795,6 +1884,9 @@ export async function runRustModeTransform(
 
 export const __rustModeTransformTest = {
     applyNativeMessagesVerbatim,
+    contentSnapshotsFor,
+    messageContentSnapshot,
+    messageMatchesContentSnapshot,
     buildTransformBody,
     formatRustPassLog,
     createRustModeTransform,
