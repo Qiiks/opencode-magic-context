@@ -1177,7 +1177,9 @@ pub fn transform_with_projection(
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
 ) -> Result<TransformWithProjection, TransformError> {
-    apply_once_with_estimator(store, req, ctx, mc_tokenizer::estimate_tokens, None)
+    let result = apply_once_with_estimator(store, req, ctx, mc_tokenizer::estimate_tokens, None);
+    record_stable_pass_trace(store, req, ctx, &result);
+    result
 }
 
 pub(crate) fn transform_with_projection_cached(
@@ -1186,13 +1188,33 @@ pub(crate) fn transform_with_projection_cached(
     ctx: &ProducerContext<'_>,
     output_cache: &Mutex<SerializedOutputCache>,
 ) -> Result<TransformWithProjection, TransformError> {
-    apply_once_with_estimator(
+    let result = apply_once_with_estimator(
         store,
         req,
         ctx,
         mc_tokenizer::estimate_tokens,
         Some(output_cache),
-    )
+    );
+    record_stable_pass_trace(store, req, ctx, &result);
+    result
+}
+
+/// Stable passes normally skip the cache-state commit, so clear their current-pass trace
+/// separately. Diverging passes already update both current and historical trace fields in the
+/// fenced commit that accepted their new served fingerprint.
+fn record_stable_pass_trace(
+    store: &McStore,
+    req: &TransformRequest,
+    ctx: &ProducerContext<'_>,
+    result: &Result<TransformWithProjection, TransformError>,
+) {
+    if result.as_ref().ok().is_some_and(|pass| {
+        pass.response.status == TransformStatus::Ok
+            && pass.response.ck_messages.is_some()
+            && pass.response.first_divergence.is_none()
+    }) {
+        let _ = store.trace_pass_stable(&req.session_id, ctx.now_ms);
+    }
 }
 
 /// The retry wrapper around [`apply_once`], parameterized by the token estimator so tests
@@ -7885,6 +7907,19 @@ mod tests {
         assert_eq!(removed_divergence.kind, divergence::DivergenceKind::Removed);
         assert_eq!(removed_divergence.block_id_old.as_deref(), Some("inserted"));
         assert_eq!(removed_divergence.block_id_new.as_deref(), Some("c"));
+
+        let stable_after_divergence = run(&store, &removed_request, &spine());
+        assert!(stable_after_divergence.first_divergence.is_none());
+        let trace = store.load_pass_trace(session).unwrap().unwrap();
+        assert!(trace.first_divergence.is_none());
+        let last_divergence: Value =
+            serde_json::from_str(trace.last_divergence.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            last_divergence["divergence"],
+            serde_json::to_value(removed_divergence).unwrap()
+        );
+        assert!(last_divergence["pass_id"].is_number());
+        assert!(last_divergence["timestamp_ms"].is_number());
     }
 
     fn comparable_response(response: TransformResponse) -> Value {

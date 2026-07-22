@@ -1937,6 +1937,12 @@ const MIGRATIONS: &[Migration] = &[
         // state and its diagnostic update commit together.
         statements: "ALTER TABLE mc_pass_trace ADD COLUMN first_divergence TEXT NULL;",
     },
+    Migration {
+        version: 39,
+        // A current-pass divergence is cleared by the next accepted pass, while this separate
+        // field keeps the last actual divergence available to diagnostics with its origin.
+        statements: "ALTER TABLE mc_pass_trace ADD COLUMN last_divergence TEXT NULL;",
+    },
 ];
 
 /// Apply the route-to-identity vocabulary law inside the caller's fenced transaction.
@@ -2149,8 +2155,10 @@ pub struct PassTrace {
     pub last_reject_at_ms: Option<i64>,
     pub reject_count: u64,
     pub receive_count: u64,
-    /// JSON for the most recent first-divergence attribution, when one was observed.
+    /// JSON for the current pass's first-divergence attribution, when one was observed.
     pub first_divergence: Option<String>,
+    /// JSON for the most recent diverging pass, including its accepted pass id and timestamp.
+    pub last_divergence: Option<String>,
 }
 
 /// A validated historian fact that may become a project memory. Validation owns
@@ -4880,7 +4888,8 @@ impl McStore {
             let pass_trace = transaction
                 .query_row(
                     "SELECT last_received_at_ms, last_completed_at_ms, last_reject_error,
-                            last_reject_at_ms, reject_count, receive_count, first_divergence
+                            last_reject_at_ms, reject_count, receive_count, first_divergence,
+                            last_divergence
                        FROM mc_pass_trace WHERE session_id = ?1",
                     params![session_id],
                     |row| {
@@ -4892,6 +4901,7 @@ impl McStore {
                             reject_count: row.get::<_, i64>(4)?.max(0) as u64,
                             receive_count: row.get::<_, i64>(5)?.max(0) as u64,
                             first_divergence: row.get(6)?,
+                            last_divergence: row.get(7)?,
                         })
                     },
                 )
@@ -4922,11 +4932,39 @@ impl McStore {
                      last_reject_error,
                      last_reject_at_ms,
                      reject_count,
-                     receive_count
-                 ) VALUES (?1, ?2, 0, NULL, NULL, 0, 1)
+                     receive_count,
+                     first_divergence
+                 ) VALUES (?1, ?2, 0, NULL, NULL, 0, 1, NULL)
                  ON CONFLICT(session_id) DO UPDATE SET
                      last_received_at_ms = excluded.last_received_at_ms,
-                     receive_count = mc_pass_trace.receive_count + 1",
+                     receive_count = mc_pass_trace.receive_count + 1,
+                     first_divergence = NULL",
+                params![session_id, now_ms],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Clear the current-pass divergence for a successful stable transform. This is separate
+    /// from `trace_pass_received` because direct module callers do not use the daemon receive
+    /// hook, while daemon callers must not count the same pass twice.
+    pub fn trace_pass_stable(&self, session_id: &str, now_ms: i64) -> Result<(), McStoreError> {
+        self.inner.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO mc_pass_trace (
+                     session_id,
+                     last_received_at_ms,
+                     last_completed_at_ms,
+                     last_reject_error,
+                     last_reject_at_ms,
+                     reject_count,
+                     receive_count,
+                     first_divergence
+                 ) VALUES (?1, 0, ?2, NULL, NULL, 0, 0, NULL)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     first_divergence = NULL,
+                     last_completed_at_ms = excluded.last_completed_at_ms",
                 params![session_id, now_ms],
             )?;
             Ok(())
@@ -4979,8 +5017,9 @@ impl McStore {
                      last_reject_error,
                      last_reject_at_ms,
                      reject_count,
-                     receive_count
-                 ) VALUES (?1, 0, 0, ?2, ?3, 1, 0)
+                     receive_count,
+                     first_divergence
+                 ) VALUES (?1, 0, 0, ?2, ?3, 1, 0, NULL)
                  ON CONFLICT(session_id) DO UPDATE SET
                      last_reject_error = excluded.last_reject_error,
                      last_reject_at_ms = excluded.last_reject_at_ms,
@@ -5000,11 +5039,12 @@ impl McStore {
                      last_received_at_ms,
                      last_completed_at_ms,
                      last_reject_error,
-                      last_reject_at_ms,
-                      reject_count,
-                      receive_count,
-                      first_divergence
-                  FROM mc_pass_trace
+                     last_reject_at_ms,
+                     reject_count,
+                     receive_count,
+                     first_divergence,
+                     last_divergence
+                   FROM mc_pass_trace
                  WHERE session_id = ?1",
                 params![session_id],
                 |r| {
@@ -5016,6 +5056,7 @@ impl McStore {
                         reject_count: r.get::<_, i64>(4)? as u64,
                         receive_count: r.get::<_, i64>(5)? as u64,
                         first_divergence: r.get(6)?,
+                        last_divergence: r.get(7)?,
                     })
                 },
             )
@@ -6348,6 +6389,15 @@ impl McStore {
         let canonical_project_root = project_root
             .filter(|root| !root.is_empty())
             .map(|root| canonical_root(root).to_string_lossy().into_owned());
+        // The accepted cache row version is a stable identity for the pass that produced the
+        // divergence. Overlay timestamps are the request clock when available; direct callers
+        // that omit one still receive a real commit timestamp.
+        let divergence_pass_id = next as i64;
+        let divergence_at_ms = if overlays.created_at_ms > 0 {
+            overlays.created_at_ms
+        } else {
+            current_time_ms()
+        };
 
         let outcome = self.inner.with_conn_fenced(|tx| {
             // Read the current row_version inside the fenced txn; NO_ROW when absent.
@@ -6407,23 +6457,36 @@ impl McStore {
                       last_activity_at = excluded.last_activity_at",
                 params![session_id, next as i64, core_json, meta_json, current_time_ms()],
             )?;
-            if let Some(first_divergence) = first_divergence {
-                tx.execute(
-                    "INSERT INTO mc_pass_trace (
-                         session_id,
-                         last_received_at_ms,
-                         last_completed_at_ms,
-                         last_reject_error,
-                         last_reject_at_ms,
-                         reject_count,
-                         receive_count,
-                         first_divergence
-                     ) VALUES (?1, 0, 0, NULL, NULL, 0, 0, ?2)
-                     ON CONFLICT(session_id) DO UPDATE SET
-                         first_divergence = excluded.first_divergence",
-                    params![session_id, first_divergence],
-                )?;
-            }
+            // Every accepted transform owns the current-pass value: stable passes write NULL
+            // rather than leaving an older divergence looking like a present observation.
+            tx.execute(
+                "INSERT INTO mc_pass_trace (
+                     session_id,
+                     last_received_at_ms,
+                     last_completed_at_ms,
+                     last_reject_error,
+                     last_reject_at_ms,
+                     reject_count,
+                     receive_count,
+                     first_divergence,
+                     last_divergence
+                 ) VALUES (
+                     ?1, 0, 0, NULL, NULL, 0, 0, ?2,
+                     CASE WHEN ?2 IS NOT NULL THEN
+                         json_object('pass_id', ?3, 'timestamp_ms', ?4, 'divergence', json(?2))
+                     ELSE NULL END
+                 )
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     first_divergence = excluded.first_divergence,
+                     last_divergence = CASE WHEN excluded.first_divergence IS NOT NULL THEN
+                          json_object(
+                              'pass_id', ?3,
+                              'timestamp_ms', ?4,
+                              'divergence', json(excluded.first_divergence)
+                          )
+                     ELSE mc_pass_trace.last_divergence END",
+                params![session_id, first_divergence, divergence_pass_id, divergence_at_ms],
+            )?;
             if let Some(project_root) = canonical_project_root.as_deref() {
                 // Durable root lineage is committed with the cache CAS, so a restart cannot
                 // authenticate a root that never produced the accepted session state.
@@ -13026,7 +13089,7 @@ mod tests {
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=38).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=39).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -15332,7 +15395,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=38).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=39).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)

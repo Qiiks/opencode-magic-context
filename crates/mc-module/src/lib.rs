@@ -4117,6 +4117,9 @@ impl McHandler {
             "pending_drop_count": pending_drop_count,
             "pending_m1_delta": pending_m1_delta,
             "pending_m1_age_ms": pending_m1_age_ms,
+            // Keep the current-pass attribution separate from the explicitly historical
+            // `last_divergence` field so stable status reads cannot imply a fresh bust.
+            "pass_trace": pass_trace,
             "tail_identity_re_adopt_count": loaded.meta.tail_identity_re_adopt_count,
             "usage": {
                 "current_total_input_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.current_total_input_tokens),
@@ -14251,6 +14254,53 @@ mod tests {
         assert!(response.get("full_array_fingerprint").is_none());
         assert_eq!(response["surface_state"], "inactive");
         assert!(response["row_version"].is_u64());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_distinguishes_current_and_historical_divergence() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        let _ = call_transform_request(&handler, request(vec![ck("m1", 1, "before")])).await;
+        let diverging = call_transform_request(&handler, request(vec![ck("m1", 1, "after")])).await;
+        assert!(diverging["first_divergence"].is_object());
+
+        let current_status = match handler.handle_status_value(&json!({
+            "kind": "status",
+            "session_id": "ses",
+        })) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("expected status response, got {other:?}"),
+        };
+        assert!(current_status["pass_trace"]["first_divergence"].is_string());
+        assert!(current_status["pass_trace"]["last_divergence"].is_string());
+
+        let stable = call_transform_request(&handler, request(vec![ck("m1", 1, "after")])).await;
+        assert!(stable.get("first_divergence").is_none());
+        let stable_status = match handler.handle_status_value(&json!({
+            "kind": "status",
+            "session_id": "ses",
+        })) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("expected status response, got {other:?}"),
+        };
+        assert!(stable_status["pass_trace"]["first_divergence"].is_null());
+        let historical: Value = serde_json::from_str(
+            stable_status["pass_trace"]["last_divergence"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(historical["pass_id"].is_number());
+        assert!(historical["timestamp_ms"].is_number());
+        assert_eq!(historical["divergence"], diverging["first_divergence"]);
+
+        let session_status = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
+        ));
+        assert!(session_status["pass_trace"]["first_divergence"].is_null());
+        assert!(session_status["pass_trace"]["last_divergence"].is_string());
     }
 
     #[tokio::test(flavor = "current_thread")]
