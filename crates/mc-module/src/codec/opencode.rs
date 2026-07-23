@@ -7,6 +7,7 @@ use crate::ck_wire::{
     MediaBlock, MediaKind, MessageOrigin, OpaqueBlock, ProviderExtras, ResultBlock,
     ResultBlockKind,
 };
+use crate::injection::SYNTHETIC_TIMESTAMP;
 
 use super::sidecar::{
     match_block_metas, meta_for_ck, stable_hash_prefix, BlockMeta, DecodeSidecar,
@@ -740,7 +741,11 @@ fn render_block_as_part(block: &CkWireBlock) -> Value {
                 "type": "tool",
                 "callID": id,
                 "tool": name,
-                "state": { "status": "running", "input": input },
+                "state": {
+                    "status": "running",
+                    "input": input,
+                    "time": synthetic_tool_time(),
+                },
             });
             if *provider_executed {
                 set_nested_value(&mut part, "metadata", "providerExecuted", Value::Bool(true));
@@ -749,7 +754,14 @@ fn render_block_as_part(block: &CkWireBlock) -> Value {
         }
         CkKind::ToolResult { output, .. } => {
             let (status, text) = output_status_text(output);
-            json!({ "type": "tool", "state": { "status": status, "output": text } })
+            let mut state = json!({
+                "status": status,
+                "input": {},
+                "time": synthetic_tool_time(),
+            });
+            let output_key = if status == "error" { "error" } else { "output" };
+            set_value(&mut state, output_key, Value::String(text));
+            json!({ "type": "tool", "state": state })
         }
         CkKind::Media(media) => render_media_part(media),
         CkKind::Opaque(opaque) => opaque.raw.clone(),
@@ -758,8 +770,29 @@ fn render_block_as_part(block: &CkWireBlock) -> Value {
 
 fn render_tool_pair_as_part(call: &CkWireBlock, result: &CkWireBlock) -> Value {
     let mut part = render_block_as_part(call);
-    update_part_from_block(&mut part, result);
+    let CkKind::ToolResult { output, .. } = &result.kind else {
+        update_part_from_block(&mut part, result);
+        return part;
+    };
+
+    let (status, text) = output_status_text(output);
+    set_nested_value(
+        &mut part,
+        "state",
+        "status",
+        Value::String(status.to_string()),
+    );
+    set_nested_value(&mut part, "state", "time", synthetic_tool_time());
+    let output_key = if status == "error" { "error" } else { "output" };
+    set_nested_value(&mut part, "state", output_key, Value::String(text));
     part
+}
+
+fn synthetic_tool_time() -> Value {
+    json!({
+        "start": SYNTHETIC_TIMESTAMP,
+        "end": SYNTHETIC_TIMESTAMP,
+    })
 }
 
 fn render_media_part(media: &MediaBlock) -> Value {
@@ -943,6 +976,196 @@ fn set_nested_value(value: &mut Value, object_key: &str, key: &str, next: Value)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fresh_tool_transform_fixture() -> Vec<CkWireMessage> {
+        let paired_id = "folded-call";
+        let paired_call = CkWireBlock::bare(CkKind::ToolCall {
+            id: paired_id.to_string(),
+            name: "read".to_string(),
+            input: json!({ "path": "covered.txt" }),
+            provider_executed: false,
+        });
+        let paired_result = CkWireBlock::bare(CkKind::ToolResult {
+            id: paired_id.to_string(),
+            tool_name: "read".to_string(),
+            output: CkToolOutput::bare(CkOutputKind::Text {
+                text: "folded output".to_string(),
+            }),
+            provider_executed: false,
+        });
+        let standalone_call = CkWireBlock::bare(CkKind::ToolCall {
+            id: "standalone-call".to_string(),
+            name: "write".to_string(),
+            input: json!({ "path": "new.txt", "content": "hello" }),
+            provider_executed: false,
+        });
+        let standalone_result = CkWireBlock::bare(CkKind::ToolResult {
+            id: "standalone-result".to_string(),
+            tool_name: "write".to_string(),
+            output: CkToolOutput::bare(CkOutputKind::ErrorText {
+                text: "write denied".to_string(),
+            }),
+            provider_executed: false,
+        });
+
+        vec![
+            CkWireMessage::from_parts(
+                "assistant",
+                vec![paired_call, paired_result],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta {
+                    harness_id: Some("folded-tool-arc".to_string()),
+                    ..Default::default()
+                },
+            ),
+            CkWireMessage::from_parts(
+                "assistant",
+                vec![standalone_call],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta {
+                    harness_id: Some("standalone-call-message".to_string()),
+                    ..Default::default()
+                },
+            ),
+            CkWireMessage::from_parts(
+                "tool",
+                vec![standalone_result],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta {
+                    harness_id: Some("standalone-result-message".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_fresh_tool_part_from_folded_transform_fixture_has_complete_state() {
+        let encoded = encode_opencode(
+            &fresh_tool_transform_fixture(),
+            &DecodeSidecar::new(HARNESS),
+            None,
+        );
+        let mut tool_part_count = 0;
+
+        for message in &encoded {
+            for part in message["parts"].as_array().unwrap() {
+                if part["type"] != "tool" {
+                    continue;
+                }
+                tool_part_count += 1;
+                let state = part["state"].as_object().unwrap();
+                assert!(
+                    state.get("status").is_some(),
+                    "tool part has no status: {part}"
+                );
+                assert!(
+                    state
+                        .get("time")
+                        .and_then(Value::as_object)
+                        .and_then(|time| time.get("start"))
+                        .is_some(),
+                    "tool part has no state.time.start: {part}"
+                );
+                assert!(
+                    state
+                        .get("time")
+                        .and_then(Value::as_object)
+                        .and_then(|time| time.get("end"))
+                        .is_some(),
+                    "tool part has no state.time.end: {part}"
+                );
+            }
+        }
+
+        assert_eq!(
+            tool_part_count, 3,
+            "fixture did not exercise all fresh tool arms"
+        );
+        assert_eq!(encoded[0]["parts"][0]["state"]["status"], "completed");
+        assert_eq!(
+            encoded[0]["parts"][0]["state"]["input"],
+            json!({ "path": "covered.txt" })
+        );
+        assert_eq!(encoded[1]["parts"][0]["state"]["status"], "running");
+        assert_eq!(encoded[2]["parts"][0]["state"]["status"], "error");
+        assert_eq!(encoded[2]["parts"][0]["state"]["input"], json!({}));
+        assert_eq!(encoded[2]["parts"][0]["state"]["error"], "write denied");
+    }
+
+    #[test]
+    fn fresh_tool_parts_are_byte_identical_across_consecutive_defer_passes() {
+        let fixture = fresh_tool_transform_fixture();
+        let sidecar = DecodeSidecar::new(HARNESS);
+        let first = encode_opencode(&fixture, &sidecar, None);
+        let second = encode_opencode(&fixture, &sidecar, None);
+        let first_tool_parts = first
+            .iter()
+            .flat_map(|message| message["parts"].as_array().unwrap())
+            .filter(|part| part["type"] == "tool")
+            .cloned()
+            .collect::<Vec<_>>();
+        let second_tool_parts = second
+            .iter()
+            .flat_map(|message| message["parts"].as_array().unwrap())
+            .filter(|part| part["type"] == "tool")
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            serde_json::to_vec(&first_tool_parts).unwrap(),
+            serde_json::to_vec(&second_tool_parts).unwrap()
+        );
+        assert!(first_tool_parts.iter().all(|part| {
+            part["state"]["time"]["start"] == SYNTHETIC_TIMESTAMP
+                && part["state"]["time"]["end"] == SYNTHETIC_TIMESTAMP
+        }));
+    }
+
+    #[test]
+    fn mark_modified_tool_mutation_preserves_native_time_verbatim() {
+        let raw = vec![json!({
+            "info": { "id": "native-tool", "role": "assistant" },
+            "parts": [{
+                "type": "tool",
+                "callID": "native-call",
+                "tool": "bash",
+                "state": {
+                    "status": "completed",
+                    "input": { "command": "printf native" },
+                    "output": "native output",
+                    "time": { "start": 12345, "end": 67890 }
+                }
+            }]
+        })];
+        let decoded = decode_opencode(&raw);
+        let mut message = decoded.messages[0].ck.clone();
+        let result = message
+            .content
+            .iter_mut()
+            .find(|block| matches!(&block.kind, CkKind::ToolResult { .. }))
+            .unwrap();
+        if let CkKind::ToolResult { output, .. } = &mut result.kind {
+            output.kind = CkOutputKind::Text {
+                text: "§1§ tagged output".to_string(),
+            };
+        }
+        result.mark_modified();
+        message.mark_modified();
+
+        let served = encode_opencode(&[message], &decoded.sidecar, None);
+        assert_eq!(
+            served[0]["parts"][0]["state"]["time"],
+            raw[0]["parts"][0]["state"]["time"]
+        );
+        assert_eq!(
+            served[0]["parts"][0]["state"]["output"],
+            "§1§ tagged output"
+        );
+    }
 
     #[test]
     fn empty_text_and_ignored_text_obey_wire_reachability() {
