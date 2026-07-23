@@ -54,6 +54,8 @@ use tokio::sync::Notify;
 
 use chrono::{Local, TimeZone};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
+#[cfg(test)]
+use mc_store::TagNumberRow;
 use mc_store::{
     canonical_root, validate_state_import_compartments, AuthoritySeedRow, DeferredExecuteState,
     FacadeMutationOutcome, HistorianPhase, InsertMemoryInput, MappingUpdate, McStore, McStoreError,
@@ -62,7 +64,7 @@ use mc_store::{
     NoteCasOutcome, NoteEvaluationInput, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput,
     PendingAgentDrop, PendingAgentDropSeedRow, PendingCompactionMarkerState,
     RecordWrapupCommandOutcome, StateImportError, StateImportPreflight, StateImportValidationError,
-    StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote, TagNumberRow,
+    StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
     TodoStateSetOutcome, UserHintSeedRow, VerificationUpdate, WrapupCommandRecord,
 };
 use serde::Deserialize;
@@ -6098,6 +6100,7 @@ impl McHandler {
         let revert_epoch = result.revert_epoch;
         let reasoning_watermark = result.reasoning_watermark;
         let mutation_exempt_mid = result.mutation_exempt_mid;
+        let tag_numbers = result.tag_numbers;
         let mut response = result.response;
         if response.committed {
             self.guidance_dates
@@ -6107,10 +6110,6 @@ impl McHandler {
         }
         response.historian = Some(diagnostics);
         if parsed.serve_native {
-            let tag_numbers = store
-                .load_tag_numbers_for_session(&parsed.session_id)
-                .map(message_tag_numbers)
-                .unwrap_or_default();
             attach_native_messages_with_tags(
                 &mut response,
                 &parsed,
@@ -8981,6 +8980,7 @@ fn attach_native_messages(
     );
 }
 
+#[cfg(test)]
 fn message_tag_numbers(rows: Vec<TagNumberRow>) -> std::collections::BTreeMap<String, u64> {
     let mut by_message = std::collections::BTreeMap::new();
     for row in rows {
@@ -12665,7 +12665,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn lightweight_tag_lookup_preserves_native_attachment_bytes() {
+    async fn native_attachment_reuses_transform_tag_baseline_and_preserves_bytes() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
         let seeded_tags = (0..55)
@@ -12718,6 +12718,11 @@ mod tests {
         let actual = call_transform_request(&handler, request).await;
         assert_eq!(actual["status"], "ok");
         let actual_native = actual["native_messages"].as_array().unwrap().clone();
+        assert_eq!(
+            store.tag_number_query_count_for_test(),
+            0,
+            "serve_native must reuse transform tag rows instead of issuing a numbers-only scan"
+        );
         let cleared_reasoning = actual_native
             .iter()
             .find(|message| message["info"]["id"] == json!("assistant-old"))
@@ -12728,7 +12733,7 @@ mod tests {
         );
 
         let mut old_tag_numbers = std::collections::BTreeMap::new();
-        for tag in store.load_transform_snapshot("ses").unwrap().tags {
+        for tag in store.load_tags_for_session("ses").unwrap() {
             let message_id = tag
                 .block_id
                 .split_once('#')

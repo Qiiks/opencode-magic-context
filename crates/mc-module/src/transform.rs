@@ -38,8 +38,8 @@ use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInpu
 use mc_store::{
     BlockIdentity, Channel1AppendRow, DeferredExecuteState, McStore, McStoreError, McTagRow,
     MemoryRevision, ModuleMeta, ModuleUsage, NoteDelivery, PendingAgentDrop, PendingRewriteState,
-    ServedBlockFingerprint, StoredCompartment, TagMintInput, TemporalMarkInput, TemporalMarkRow,
-    TransformCommit, TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
+    ServedBlockFingerprint, StoredCompartment, TagCacheSummary, TagMintInput, TemporalMarkInput,
+    TemporalMarkRow, TransformCommit, TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -97,6 +97,7 @@ const M1_PENDING_LOG_THRESHOLDS_MS: [i64; 3] =
 static M1_PENDING_LOG_BUCKETS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
 
 const SERIALIZED_OUTPUT_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const TAG_BASELINE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 /// One served CK message plus the canonical bytes used by the module response writer.
 /// The typed value stays behind an `Arc`, so a cache hit does not clone large tool output trees.
@@ -1123,6 +1124,9 @@ pub struct HistorianTriggerProgress {
 pub struct TransformWithProjection {
     pub response: TransformResponse,
     pub projection: FlatProjection,
+    /// Native attachment uses the same validated tag baseline as the transform, avoiding a
+    /// second numbers-only table scan after the response has been built.
+    pub tag_numbers: BTreeMap<String, u64>,
     pub scheduler_pass: scheduler::PassDecision,
     pub boundary_state: BoundaryState,
     pub trim_mismatch: Option<TrimMismatch>,
@@ -1226,7 +1230,7 @@ struct OverlayComputation<'a, 'ctx> {
     ctx: &'a ProducerContext<'ctx>,
     projection: &'a FlatProjection,
     core: &'a CoreState,
-    tag_rows: &'a mut Vec<McTagRow>,
+    tag_rows: &'a mut Arc<Vec<McTagRow>>,
     temporal_rows: &'a mut Vec<TemporalMarkRow>,
     user_hint_rows: &'a mut Vec<UserHintRow>,
     overlay_frontier: Option<u64>,
@@ -1582,7 +1586,9 @@ fn apply_once(
     let transform_snapshot = store.load_transform_snapshot(&req.session_id)?;
     timings.seed_or_sync = elapsed_ms(seed_or_sync_started_at);
     timings.store_cache_state = transform_snapshot.timings.cache_state_ms;
-    timings.store_tags = transform_snapshot.timings.tags_ms;
+    let tag_hydration_started_at = Instant::now();
+    let mut tag_rows = load_cached_tags(store, &req.session_id)?;
+    timings.store_tags = elapsed_ms(tag_hydration_started_at);
     timings.store_temporal = transform_snapshot.timings.temporal_ms;
     timings.store_user_hints = transform_snapshot.timings.user_hints_ms;
     timings.store_channel1 = transform_snapshot.timings.channel1_ms;
@@ -1644,7 +1650,6 @@ fn apply_once(
     // Tags are also the durable token-accounting source for host directives. Keeping them
     // available on non-CC profiles is render-neutral: overlay bytes remain gated by
     // `tagging_active`, while the OpenCode host can receive the same ceiling decision.
-    let mut tag_rows = transform_snapshot.tags;
     let tag_overlay_started_at = Instant::now();
     let mut tag_numbers = tag_number_by_message(&tag_rows);
     timings.tag_overlay += elapsed_ms(tag_overlay_started_at);
@@ -1762,6 +1767,7 @@ fn apply_once(
             }
             return Ok(pending_passthrough_result(PendingPassthroughArgs {
                 projection,
+                tag_numbers,
                 req,
                 mutation_exempt_mid: mutation_exempt_mid.map(str::to_string),
                 row_version,
@@ -1849,6 +1855,7 @@ fn apply_once(
         );
         return Ok(pending_passthrough_result(PendingPassthroughArgs {
             projection,
+            tag_numbers,
             req,
             mutation_exempt_mid: mutation_exempt_mid.map(str::to_string),
             row_version,
@@ -3207,6 +3214,7 @@ fn apply_once(
     timings.store_notes = m1_revision_read_timings.notes_ms;
     timings.total = elapsed_ms(total_started_at);
     Ok(TransformWithProjection {
+        tag_numbers: tag_number_by_message(&tag_rows),
         projection,
         scheduler_pass: scheduler_outcome.pass,
         boundary_state,
@@ -4448,6 +4456,7 @@ fn pending_rewrite_detail(session_id: &str, fingerprint: &str, ambiguous: bool) 
 
 struct PendingPassthroughArgs<'a> {
     projection: FlatProjection,
+    tag_numbers: BTreeMap<String, u64>,
     req: &'a TransformRequest,
     mutation_exempt_mid: Option<String>,
     row_version: u64,
@@ -4496,6 +4505,7 @@ fn pending_passthrough_messages(
 fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWithProjection {
     let PendingPassthroughArgs {
         projection,
+        tag_numbers,
         req,
         mutation_exempt_mid,
         row_version,
@@ -4521,6 +4531,7 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
     timings.total = elapsed_ms(total_started_at);
     response.timings = Some(timings);
     TransformWithProjection {
+        tag_numbers,
         projection,
         scheduler_pass: scheduler::PassDecision::Defer,
         boundary_state: BoundaryState::Absent,
@@ -4609,6 +4620,187 @@ fn reanchor_kept_synthetic_todo_if_folded_or_shrunk(
     debug_assert!(folded_by_advance || coverage_shrunk_on_bust);
     pair.anchor_mid = tail_end_mid(req, meta.coverage_ordinal);
     Ok(())
+}
+
+/// One immutable session baseline retained between transform passes.
+///
+/// The store generation is advanced by SQLite triggers for every tag-table mutation. The
+/// count/max pair recognizes an append-only advance, while any other generation transition
+/// requires a full refill before the cached bytes are used again.
+#[derive(Debug, Clone)]
+struct TagBaselineCacheEntry {
+    store_namespace: u64,
+    generation: u64,
+    count: usize,
+    max_tag_number: i64,
+    tags: Arc<Vec<McTagRow>>,
+    retained_bytes: usize,
+}
+
+impl TagBaselineCacheEntry {
+    fn matches(&self, store_namespace: u64, summary: TagCacheSummary) -> bool {
+        self.store_namespace == store_namespace
+            && self.generation == summary.generation
+            && self.count == summary.count
+            && self.max_tag_number == summary.max_tag_number
+    }
+
+    fn can_append(&self, store_namespace: u64, summary: TagCacheSummary) -> bool {
+        let appended = summary.count.saturating_sub(self.count);
+        self.store_namespace == store_namespace
+            && appended > 0
+            && summary.count > self.count
+            && summary.max_tag_number > self.max_tag_number
+            && summary.generation.saturating_sub(self.generation) == appended as u64
+    }
+}
+
+/// Bounded process-wide cache of immutable tag payloads. The lock protects only cache metadata:
+/// SQLite probes and row hydration always happen after the snapshot has been copied out.
+#[derive(Debug)]
+struct TagBaselineCache {
+    sessions: HashMap<String, TagBaselineCacheEntry>,
+    lru: VecDeque<String>,
+    retained_bytes: usize,
+    max_retained_bytes: usize,
+}
+
+impl TagBaselineCache {
+    fn new(max_retained_bytes: usize) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            lru: VecDeque::new(),
+            retained_bytes: 0,
+            max_retained_bytes,
+        }
+    }
+
+    fn snapshot(&mut self, session_id: &str) -> Option<TagBaselineCacheEntry> {
+        let entry = self.sessions.get(session_id)?.clone();
+        self.lru.retain(|candidate| candidate != session_id);
+        self.lru.push_back(session_id.to_string());
+        Some(entry)
+    }
+
+    fn remove(&mut self, session_id: &str) {
+        if let Some(entry) = self.sessions.remove(session_id) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(entry.retained_bytes);
+        }
+        self.lru.retain(|candidate| candidate != session_id);
+    }
+
+    fn replace(&mut self, session_id: &str, entry: TagBaselineCacheEntry) {
+        self.remove(session_id);
+        if entry.tags.is_empty() || entry.retained_bytes > self.max_retained_bytes {
+            return;
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(entry.retained_bytes);
+        self.sessions.insert(session_id.to_string(), entry);
+        self.lru.push_back(session_id.to_string());
+        while self.retained_bytes > self.max_retained_bytes {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.sessions.remove(&oldest) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(entry.retained_bytes);
+            }
+        }
+    }
+}
+
+fn tag_baseline_cache() -> &'static Mutex<TagBaselineCache> {
+    static CACHE: OnceLock<Mutex<TagBaselineCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(TagBaselineCache::new(TAG_BASELINE_CACHE_BUDGET_BYTES)))
+}
+
+fn tag_baseline_retained_bytes(tags: &[McTagRow]) -> usize {
+    tags.iter()
+        .map(|tag| {
+            tag.block_id.len()
+                + tag.kind.len()
+                + tag.source_bytes.len()
+                + std::mem::size_of::<McTagRow>()
+                + 64
+        })
+        .sum()
+}
+
+fn tag_baseline_entry(
+    store: &McStore,
+    summary: TagCacheSummary,
+    tags: Arc<Vec<McTagRow>>,
+) -> TagBaselineCacheEntry {
+    TagBaselineCacheEntry {
+        store_namespace: store.tag_cache_namespace(),
+        generation: summary.generation,
+        count: summary.count,
+        max_tag_number: summary.max_tag_number,
+        retained_bytes: tag_baseline_retained_bytes(tags.as_slice()),
+        tags,
+    }
+}
+
+/// Hydrate immutable tag rows from a cold baseline or an append-only tail. A post-read probe
+/// makes a concurrent mutation retry before its bytes reach the transform, and trigger-backed
+/// generations force a cold refill for replacement or deletion.
+fn load_cached_tags(
+    store: &McStore,
+    session_id: &str,
+) -> Result<Arc<Vec<McTagRow>>, TransformError> {
+    let store_namespace = store.tag_cache_namespace();
+    loop {
+        let summary = store.tag_cache_summary(session_id)?;
+        let cached = tag_baseline_cache()
+            .lock()
+            .expect("tag baseline cache mutex")
+            .snapshot(session_id);
+
+        if let Some(entry) = cached {
+            if entry.matches(store_namespace, summary) {
+                return Ok(entry.tags);
+            }
+            if entry.can_append(store_namespace, summary) {
+                let tail = store.load_tags_after(session_id, entry.max_tag_number)?;
+                let observed = store.tag_cache_summary(session_id)?;
+                let appended = summary.count.saturating_sub(entry.count);
+                if observed == summary
+                    && tail.len() == appended
+                    && tail
+                        .last()
+                        .is_some_and(|tag| tag.tag_number == summary.max_tag_number)
+                {
+                    let mut tags = Vec::with_capacity(summary.count);
+                    tags.extend(entry.tags.iter().cloned());
+                    tags.extend(tail);
+                    let tags = Arc::new(tags);
+                    tag_baseline_cache()
+                        .lock()
+                        .expect("tag baseline cache mutex")
+                        .replace(
+                            session_id,
+                            tag_baseline_entry(store, summary, Arc::clone(&tags)),
+                        );
+                    return Ok(tags);
+                }
+                continue;
+            }
+        }
+
+        let tags = Arc::new(store.load_tags_for_session(session_id)?);
+        let observed = store.tag_cache_summary(session_id)?;
+        if observed.count == tags.len()
+            && observed.max_tag_number == tags.last().map_or(0, |tag| tag.tag_number)
+        {
+            tag_baseline_cache()
+                .lock()
+                .expect("tag baseline cache mutex")
+                .replace(
+                    session_id,
+                    tag_baseline_entry(store, observed, Arc::clone(&tags)),
+                );
+            return Ok(tags);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -5398,7 +5590,8 @@ fn compute_active_overlay_decisions(
     let tag_mint_candidates = tag_mint_work.candidate_count;
     let tag_mint_tokenized_bytes = tag_mint_work.tokenized_bytes;
     let tag_mint_count = tag_mint_work.inputs.len();
-    let tag_mint_start = append_tag_mint_rows(tag_rows, tag_mint_work.inputs, ctx.now_ms);
+    let tag_mint_start =
+        append_tag_mint_rows(Arc::make_mut(tag_rows), tag_mint_work.inputs, ctx.now_ms);
 
     let mint_by_block = tag_rows
         .iter()
@@ -15225,6 +15418,167 @@ mod tests {
             assert_eq!(tail_bytes(&extended, "m1"), "§1§ alpha");
             assert_eq!(tail_bytes(&extended, "m2"), "§2§ beta");
         });
+    }
+
+    #[test]
+    fn tag_baseline_cache_matches_cold_passes_across_drop_reset_and_remint() {
+        fn cold_run(
+            store: &McStore,
+            request: &TransformRequest,
+            reductions: &[ReductionDecision],
+        ) -> TransformResponse {
+            tag_baseline_cache()
+                .lock()
+                .expect("tag baseline cache mutex")
+                .remove(&request.session_id);
+            run(store, request, reductions)
+        }
+
+        let cold_dir = tempfile::tempdir().unwrap();
+        let cached_dir = tempfile::tempdir().unwrap();
+        let cold = store(cold_dir.path());
+        let cached = store(cached_dir.path());
+        let session = "tag-baseline-differential";
+        let compare_pass = |request: TransformRequest, reductions: &[ReductionDecision]| {
+            let cold_response = cold_run(&cold, &request, reductions);
+            let cached_response = run(&cached, &request, reductions);
+            assert_eq!(
+                canonical_output(cold_response.messages()),
+                canonical_output(cached_response.messages()),
+                "cached hydration must preserve the served bytes"
+            );
+            assert_eq!(
+                cold.load_tags_for_session(session).unwrap(),
+                cached.load_tags_for_session(session).unwrap(),
+                "cold and cached paths must observe the same durable tag rows"
+            );
+        };
+
+        let first = active_cc_req(session, "cfg0", vec![item("m1", 1, "alpha")]);
+        // The first pass establishes the initial output transition from an inactive session.
+        compare_pass(first.clone(), &spine());
+        // Repeating the request exercises tag minting after that transition is durable.
+        compare_pass(first, &spine());
+        let extended = active_cc_req(
+            session,
+            "cfg0",
+            vec![item("m1", 1, "alpha"), item("m2", 2, "beta")],
+        );
+        compare_pass(
+            extended.clone(),
+            &with_reductions(vec![reduce("m1#0", "drop", "[dropped]")]),
+        );
+
+        for store in [&cold, &cached] {
+            let expected = store.load(session).unwrap().row_version;
+            store.reset_session_for_recomp(session, expected).unwrap();
+        }
+        // Resetting clears prior transform state, so the next pass emits the initial transition again.
+        compare_pass(extended.clone(), &spine());
+        compare_pass(
+            active_cc_req(
+                session,
+                "cfg0",
+                vec![
+                    item("m1", 1, "alpha"),
+                    item("m2", 2, "beta"),
+                    item("m3", 3, "reminted tail"),
+                ],
+            ),
+            &spine(),
+        );
+    }
+
+    #[test]
+    fn poisoned_tag_baseline_refills_after_direct_sql_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "tag-baseline-poison";
+        store
+            .execute_tag_sql_for_test(
+                "INSERT INTO mc_tags
+                    (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
+                 VALUES ('tag-baseline-poison', 1, 'm1#0', 'message', 1, 1, X'6f6c64')",
+            )
+            .unwrap();
+        let cached = load_cached_tags(&store, session).unwrap();
+        assert_eq!(cached[0].source_bytes, b"old");
+        let before = store.tag_cache_summary(session).unwrap();
+
+        // This bypasses transform commits, so only the SQLite mutation trigger can invalidate
+        // the process-local baseline. Count and max stay unchanged to prove generation matters.
+        store
+            .execute_tag_sql_for_test(
+                "UPDATE mc_tags SET source_bytes = X'706f69736f6e6564'
+                  WHERE session_id = 'tag-baseline-poison' AND tag_number = 1",
+            )
+            .unwrap();
+        let after = store.tag_cache_summary(session).unwrap();
+        assert_eq!(after.count, before.count);
+        assert_eq!(after.max_tag_number, before.max_tag_number);
+        assert_ne!(after.generation, before.generation);
+
+        let refilled = load_cached_tags(&store, session).unwrap();
+        assert_eq!(refilled[0].source_bytes, b"poisoned");
+    }
+
+    #[test]
+    fn tag_baseline_cache_keeps_interleaved_sessions_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .execute_tag_sql_for_test(
+                "INSERT INTO mc_tags
+                    (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
+                 VALUES
+                    ('tag-cache-a', 1, 'a#0', 'message', 1, 1, X'41'),
+                    ('tag-cache-b', 1, 'b#0', 'message', 1, 1, X'42')",
+            )
+            .unwrap();
+
+        let a_first = load_cached_tags(&store, "tag-cache-a").unwrap();
+        let b = load_cached_tags(&store, "tag-cache-b").unwrap();
+        let a_second = load_cached_tags(&store, "tag-cache-a").unwrap();
+        assert_eq!(a_first[0].block_id, "a#0");
+        assert_eq!(a_second[0].source_bytes, b"A");
+        assert_eq!(b[0].block_id, "b#0");
+        assert_eq!(b[0].source_bytes, b"B");
+    }
+
+    #[test]
+    #[ignore = "manual timing proof: cargo test -p mc-module tag_baseline_warm_hydration_50k -- --ignored --nocapture"]
+    fn tag_baseline_warm_hydration_50k() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "tag-baseline-50k";
+        let mut sql = String::from("BEGIN;");
+        for tag_number in 1..=50_000 {
+            sql.push_str(&format!(
+                "INSERT INTO mc_tags
+                    (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
+                 VALUES ('{session}', {tag_number}, 'm{tag_number}#0', 'message', 1, 1, X'7061796c6f6164');"
+            ));
+        }
+        sql.push_str("COMMIT;");
+        store.execute_tag_sql_for_test(&sql).unwrap();
+
+        let cold_started = Instant::now();
+        let cold = load_cached_tags(&store, session).unwrap();
+        let cold_elapsed = cold_started.elapsed();
+        let warm_started = Instant::now();
+        let warm = load_cached_tags(&store, session).unwrap();
+        let warm_elapsed = warm_started.elapsed();
+        assert_eq!(cold.len(), 50_000);
+        assert_eq!(warm.len(), 50_000);
+        eprintln!(
+            "tag baseline hydration: cold={:.3}ms warm={:.3}ms",
+            cold_elapsed.as_secs_f64() * 1_000.0,
+            warm_elapsed.as_secs_f64() * 1_000.0
+        );
+        assert!(
+            warm_elapsed < std::time::Duration::from_millis(1),
+            "warm tag hydration must stay under 1ms at 50K rows"
+        );
     }
 
     #[test]
