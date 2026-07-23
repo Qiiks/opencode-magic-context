@@ -24,10 +24,15 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Cursor, Error, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use std::time::Instant;
 
 pub type ProviderExtras = BTreeMap<String, BTreeMap<String, Value>>;
+
+static NEXT_TAG_CACHE_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
 /// Canonicalize a filesystem route root before using it as lineage state.
 ///
@@ -2015,6 +2020,69 @@ const MIGRATIONS: &[Migration] = &[
             );
     ",
     },
+    Migration {
+        version: 43,
+        // Tag rows are read from a module-local baseline. Track every SQLite mutation, including
+        // direct maintenance writes, so a cached row set can never survive a changed tag table.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_tag_cache_generations (
+            session_id TEXT PRIMARY KEY,
+            generation INTEGER NOT NULL DEFAULT 0,
+            tag_count INTEGER NOT NULL DEFAULT 0,
+            max_tag_number INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO mc_tag_cache_generations(session_id, generation, tag_count, max_tag_number)
+        SELECT session_id, 0, COUNT(*), COALESCE(MAX(tag_number), 0)
+          FROM mc_tags
+         GROUP BY session_id;
+        CREATE TRIGGER mc_tags_cache_generation_insert AFTER INSERT ON mc_tags BEGIN
+            INSERT INTO mc_tag_cache_generations(session_id, generation, tag_count, max_tag_number)
+            VALUES (NEW.session_id, 1, 1, NEW.tag_number)
+            ON CONFLICT(session_id) DO UPDATE SET
+                generation = generation + 1,
+                tag_count = tag_count + 1,
+                max_tag_number = MAX(max_tag_number, NEW.tag_number);
+        END;
+        CREATE TRIGGER mc_tags_cache_generation_delete AFTER DELETE ON mc_tags BEGIN
+            INSERT INTO mc_tag_cache_generations(session_id, generation, tag_count, max_tag_number)
+            VALUES (
+                OLD.session_id,
+                1,
+                (SELECT COUNT(*) FROM mc_tags WHERE session_id = OLD.session_id),
+                (SELECT COALESCE(MAX(tag_number), 0) FROM mc_tags WHERE session_id = OLD.session_id)
+            )
+            ON CONFLICT(session_id) DO UPDATE SET
+                generation = generation + 1,
+                tag_count = excluded.tag_count,
+                max_tag_number = excluded.max_tag_number;
+        END;
+        CREATE TRIGGER mc_tags_cache_generation_update AFTER UPDATE ON mc_tags BEGIN
+            INSERT INTO mc_tag_cache_generations(session_id, generation, tag_count, max_tag_number)
+            VALUES (
+                OLD.session_id,
+                1,
+                (SELECT COUNT(*) FROM mc_tags WHERE session_id = OLD.session_id),
+                (SELECT COALESCE(MAX(tag_number), 0) FROM mc_tags WHERE session_id = OLD.session_id)
+            )
+            ON CONFLICT(session_id) DO UPDATE SET
+                generation = generation + 1,
+                tag_count = excluded.tag_count,
+                max_tag_number = excluded.max_tag_number;
+            INSERT INTO mc_tag_cache_generations(session_id, generation, tag_count, max_tag_number)
+            VALUES (
+                NEW.session_id,
+                1,
+                (SELECT COUNT(*) FROM mc_tags WHERE session_id = NEW.session_id),
+                (SELECT COALESCE(MAX(tag_number), 0) FROM mc_tags WHERE session_id = NEW.session_id)
+            )
+            ON CONFLICT(session_id) DO UPDATE SET
+                generation = generation + 1,
+                tag_count = excluded.tag_count,
+                max_tag_number = excluded.max_tag_number;
+        END;
+>>>>>>> alfonso/task/bg_d41511b6-r12-perf-p0-session-tag-baseline-cache
+    ",
+    },
 ];
 
 /// Apply the route-to-identity vocabulary law inside the caller's fenced transaction.
@@ -2953,6 +3021,17 @@ pub struct TagNumberRow {
     pub tag_number: i64,
 }
 
+/// A cheap tag-table identity used to validate the module's in-process baseline.
+///
+/// `generation` is advanced by SQLite triggers for every insert, update, and delete. The
+/// count/max fields make normal append deltas recognizable without rehydrating old payloads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TagCacheSummary {
+    pub generation: u64,
+    pub count: usize,
+    pub max_tag_number: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Channel1AppendRow {
     pub block_id: String,
@@ -3508,18 +3587,18 @@ pub struct LoadedState {
 #[derive(Debug, Clone, Default)]
 pub struct TransformSnapshotTimings {
     pub cache_state_ms: f64,
-    pub tags_ms: f64,
     pub temporal_ms: f64,
     pub user_hints_ms: f64,
     pub channel1_ms: f64,
     pub overlay_frontier_ms: f64,
 }
 
-/// Cache state and every byte-affecting transform overlay from one SQLite snapshot.
+/// Cache state and every non-tag byte-affecting transform overlay from one SQLite snapshot.
+///
+/// Tag rows are immutable payloads cached module-side and validated with [`TagCacheSummary`].
 #[derive(Debug, Clone)]
 pub struct TransformSnapshot {
     pub loaded: LoadedState,
-    pub tags: Vec<McTagRow>,
     pub temporal_marks: Vec<TemporalMarkRow>,
     pub user_hints: Vec<UserHintRow>,
     pub channel1_appends: Vec<Channel1AppendRow>,
@@ -4854,6 +4933,9 @@ impl<'a> FacadeMutationTxn<'a> {
 
 pub struct McStore {
     inner: SqliteStore,
+    // Distinguishes independent stores in the process-local tag baseline cache. Production
+    // opens one store for the module lifetime; tests and embedded callers may open several.
+    tag_cache_namespace: u64,
     /// The connection-local caller identity used by note ownership triggers. It is
     /// installed only while a fenced note mutation is executing, so an unwrapped SQL
     /// writer fails closed instead of inheriting a previous operation's project.
@@ -5053,6 +5135,11 @@ fn materialize_strip_seed_units(
 }
 
 impl McStore {
+    /// Process-local identity for cache entries that otherwise use a session id as their key.
+    pub fn tag_cache_namespace(&self) -> u64 {
+        self.tag_cache_namespace
+    }
+
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, McStoreError> {
         let inner = open_sqlite(descriptor)?;
         let note_caller_project = Arc::new(Mutex::new(None::<String>));
@@ -5107,6 +5194,7 @@ impl McStore {
         inner.migrate(NS, MIGRATIONS)?;
         let store = McStore {
             inner,
+            tag_cache_namespace: NEXT_TAG_CACHE_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             note_caller_project,
             facade_authority_scope,
             facade_mutation_lock: Mutex::new(()),
@@ -5682,8 +5770,9 @@ impl McStore {
         }
     }
 
-    /// Load cache state and all render overlays from one SQLite read transaction.
-    /// No-write passes use this snapshot as their read linearization point.
+    /// Load cache state and non-tag render overlays from one SQLite read transaction.
+    /// No-write passes use this snapshot as their read linearization point; tag payloads use the
+    /// separately validated module baseline so a stable pass does not stream every source blob.
     pub fn load_transform_snapshot(
         &self,
         session_id: &str,
@@ -5739,18 +5828,6 @@ impl McStore {
             let cache_state_ms = cache_state_started_at.elapsed().as_secs_f64() * 1_000.0;
             after_state_read();
 
-            let tags_started_at = Instant::now();
-            let tags = {
-                let mut statement = transaction.prepare(
-                    "SELECT tag_number, block_id, kind, token_count, created_at_ms, source_bytes
-                     FROM mc_tags WHERE session_id = ?1 ORDER BY tag_number ASC",
-                )?;
-                let rows = statement
-                    .query_map(params![session_id], tag_row_from_sql)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                rows
-            };
-            let tags_ms = tags_started_at.elapsed().as_secs_f64() * 1_000.0;
             let temporal_started_at = Instant::now();
             let temporal_marks = {
                 let mut statement = transaction.prepare_cached(
@@ -5818,14 +5895,12 @@ impl McStore {
             transaction.commit()?;
             Ok(TransformSnapshot {
                 loaded,
-                tags,
                 temporal_marks,
                 user_hints,
                 channel1_appends,
                 overlay_frontier,
                 timings: TransformSnapshotTimings {
                     cache_state_ms,
-                    tags_ms,
                     temporal_ms,
                     user_hints_ms,
                     channel1_ms,
@@ -6288,7 +6363,7 @@ impl McStore {
         })?)
     }
 
-    /// Load all minted tags for a session in tag-number order.
+    /// Load all minted tags for a session in tag-number order. This is the cold baseline fill.
     pub fn load_tags_for_session(&self, session_id: &str) -> Result<Vec<McTagRow>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -6303,6 +6378,49 @@ impl McStore {
                 out.push(row?);
             }
             Ok(out)
+        })?)
+    }
+
+    /// Load only rows minted after `after_tag_number`, in primary-key order.
+    pub fn load_tags_after(
+        &self,
+        session_id: &str,
+        after_tag_number: i64,
+    ) -> Result<Vec<McTagRow>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT tag_number, block_id, kind, token_count, created_at_ms, source_bytes
+                 FROM mc_tags
+                 WHERE session_id = ?1 AND tag_number > ?2
+                 ORDER BY tag_number ASC",
+            )?;
+            let rows = stmt.query_map(params![session_id, after_tag_number], tag_row_from_sql)?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?)
+    }
+
+    /// Return the trigger-maintained tag identity for cache validation without reading blobs.
+    ///
+    /// Triggers maintain count and max during rare writes; replacements and deletions derive a
+    /// fresh max from the primary-key prefix. Steady transforms read this one small row instead of
+    /// scanning immutable tag payloads.
+    pub fn tag_cache_summary(&self, session_id: &str) -> Result<TagCacheSummary, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT generation, tag_count, max_tag_number
+                   FROM mc_tag_cache_generations
+                  WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(TagCacheSummary {
+                        generation: row.get::<_, i64>(0)?.max(0) as u64,
+                        count: row.get::<_, i64>(1)?.max(0) as usize,
+                        max_tag_number: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map(|summary| summary.unwrap_or_default())
         })?)
     }
 
@@ -6329,10 +6447,46 @@ impl McStore {
         })?)
     }
 
+    /// Load only tag-number rows minted after `after_tag_number`, in primary-key order.
+    pub fn load_tag_numbers_after(
+        &self,
+        session_id: &str,
+        after_tag_number: i64,
+    ) -> Result<Vec<TagNumberRow>, McStoreError> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.tag_number_query_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT block_id, tag_number FROM mc_tags
+                 WHERE session_id = ?1 AND tag_number > ?2
+                 ORDER BY tag_number ASC",
+            )?;
+            let rows = stmt.query_map(params![session_id, after_tag_number], |row| {
+                Ok(TagNumberRow {
+                    block_id: row.get(0)?,
+                    tag_number: row.get(1)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn tag_number_query_count_for_test(&self) -> usize {
         self.tag_number_query_count
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test-only raw SQL seam for proving trigger-backed cache invalidation against out-of-band
+    /// writes. Production tag changes use the fenced transform transaction instead.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn execute_tag_sql_for_test(&self, sql: &str) -> Result<(), McStoreError> {
+        self.inner.with_conn(|conn| {
+            conn.execute_batch(sql)?;
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// Sum stored token counts for a caller-selected block-id set.
@@ -13967,11 +14121,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(snapshot.loaded.row_version, Some(1));
-        assert!(snapshot.tags.is_empty());
         assert_eq!(snapshot.overlay_frontier, None);
         let current = store.load_transform_snapshot("ses").unwrap();
         assert_eq!(current.loaded.row_version, Some(2));
-        assert_eq!(current.tags.len(), 1);
+        assert_eq!(store.load_tags_for_session("ses").unwrap().len(), 1);
         assert_eq!(current.overlay_frontier, Some(1));
     }
 
@@ -14043,7 +14196,7 @@ mod tests {
 
         let snapshot = store.load_transform_snapshot("ses").unwrap();
         assert_eq!(snapshot.loaded.row_version, Some(2));
-        assert_eq!(snapshot.tags.len(), 1);
+        assert_eq!(store.load_tags_for_session("ses").unwrap().len(), 1);
         assert_eq!(snapshot.temporal_marks.len(), 1);
         assert_eq!(snapshot.user_hints.len(), 1);
         assert_eq!(snapshot.channel1_appends.len(), 1);
@@ -14112,7 +14265,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, McStoreError::CasConflict { .. }));
         let snapshot = store.load_transform_snapshot("ses").unwrap();
-        assert!(snapshot.tags.is_empty());
+        assert!(store.load_tags_for_session("ses").unwrap().is_empty());
         assert!(snapshot.temporal_marks.is_empty());
         assert!(snapshot.user_hints.is_empty());
         assert!(snapshot.channel1_appends.is_empty());
@@ -14784,6 +14937,46 @@ mod tests {
         );
         assert_eq!(store.tag_number_query_count_for_test(), 1);
         assert_eq!(
+            store
+                .load_tags_after("ses", 1)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.tag_number)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            store
+                .load_tag_numbers_after("ses", 1)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.tag_number)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            store.tag_cache_summary("ses").unwrap(),
+            TagCacheSummary {
+                generation: 3,
+                count: 3,
+                max_tag_number: 3,
+            }
+        );
+        store
+            .execute_tag_sql_for_test(
+                "UPDATE mc_tags SET source_bytes = X'706f69736f6e6564' WHERE session_id = 'ses' AND tag_number = 1",
+            )
+            .unwrap();
+        assert_eq!(
+            store.tag_cache_summary("ses").unwrap(),
+            TagCacheSummary {
+                generation: 5,
+                count: 3,
+                max_tag_number: 3,
+            },
+            "an update fires both OLD and NEW generation writes"
+        );
+        assert_eq!(
             all[0].token_count, 11,
             "token count is computed once at mint"
         );
@@ -14799,6 +14992,20 @@ mod tests {
                 .sum_tag_token_counts_for_blocks("ses", &token_sum_ids)
                 .unwrap(),
             44
+        );
+        store
+            .execute_tag_sql_for_test(
+                "DELETE FROM mc_tags WHERE session_id = 'ses' AND tag_number = 3",
+            )
+            .unwrap();
+        assert_eq!(
+            store.tag_cache_summary("ses").unwrap(),
+            TagCacheSummary {
+                generation: 6,
+                count: 2,
+                max_tag_number: 2,
+            },
+            "deletion advances the generation and refreshes the cached table summary"
         );
 
         assert!(store
@@ -15172,7 +15379,7 @@ mod tests {
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=42).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=43).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -18218,7 +18425,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=42).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=43).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)
