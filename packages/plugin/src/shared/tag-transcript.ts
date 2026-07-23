@@ -210,11 +210,14 @@ export function tagTranscript(
             messageId !== undefined && options.reuseMessageIds?.has(messageId) === true;
 
         let textOrdinal = 0;
+        let toolResultOrdinal = 0;
         const parts = message.parts;
 
         for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
             const part = parts[partIndex];
             if (part === undefined) continue;
+            const resultBlockOrdinal =
+                part.kind === "tool_result" ? toolResultOrdinal++ : undefined;
 
             if (part.kind !== "tool_result") {
                 activeToolResultRun = undefined;
@@ -294,6 +297,12 @@ export function tagTranscript(
                     }
                 }
                 const aggregateKey: string = existingKey ?? makeToolCompositeKey(messageId, callId);
+                // Keep block memoization separate from aggregate tag identity. The
+                // ordinal comes from this message's stable result-part order, not cache writes.
+                const tokenCacheKey =
+                    resultBlockOrdinal === undefined
+                        ? aggregateKey
+                        : `${aggregateKey}\0result-part:${messageId}:${resultBlockOrdinal}`;
                 const existing = toolAggregates.get(aggregateKey);
                 if (existing) {
                     existing.occurrences.push({ message, part, kind: part.kind });
@@ -315,7 +324,7 @@ export function tagTranscript(
                                 text,
                                 timing,
                                 tokenCache: options.toolTokenCache,
-                                tokenCacheKey: aggregateKey,
+                                tokenCacheKey,
                             });
                         }
                         if (timing) timing.identity += performance.now() - identityStart;
@@ -324,7 +333,7 @@ export function tagTranscript(
                             part,
                             timing,
                             options.toolTokenCache,
-                            aggregateKey,
+                            tokenCacheKey,
                         );
                         text = accounting.text;
                         if (part.kind === "tool_result") {
@@ -428,7 +437,7 @@ export function tagTranscript(
                             text,
                             timing,
                             tokenCache: options.toolTokenCache,
-                            tokenCacheKey: aggregateKey,
+                            tokenCacheKey,
                         });
                     }
                     if (timing) timing.identity += performance.now() - identityStart;
@@ -437,7 +446,7 @@ export function tagTranscript(
                         part,
                         timing,
                         options.toolTokenCache,
-                        aggregateKey,
+                        tokenCacheKey,
                     );
                     text = accounting.text;
                     const outputByteSize = part.kind === "tool_result" ? accounting.byteSize : 0;
