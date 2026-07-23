@@ -10,7 +10,8 @@ use crate::ck_wire::{
 use crate::injection::SYNTHETIC_TIMESTAMP;
 
 use super::sidecar::{
-    match_block_metas, meta_for_ck, stable_hash_prefix, BlockMeta, DecodeSidecar,
+    block_is_unchanged, decoded_block_fingerprint, is_synthetic_part, match_block_metas,
+    meta_for_ck, stable_hash_prefix, stamp_block_identity, BlockMeta, DecodeSidecar,
     DecodedHarnessMessages, ExtractedBoundary, HarnessMessageMeta,
 };
 
@@ -264,15 +265,28 @@ fn encode_opencode_impl(
                 index += 2;
                 continue;
             }
+            let call_is_fresh = meta_for_ck(sidecar, &messages[index], index).is_none();
+            let result_is_fresh = meta_for_ck(sidecar, next, index + 1).is_none();
+            if call_is_fresh && result_is_fresh {
+                if let Some(part) = render_adjacent_tool_pair(&messages[index], next) {
+                    let mut message = encode_new_message(&messages[index], session_id);
+                    set_value(&mut message, "parts", Value::Array(vec![part]));
+                    encoded.push(message);
+                    index += 2;
+                    continue;
+                }
+            }
         }
         let msg = &messages[index];
-        let meta = if msg.meta.synthetic {
-            let current = sidecar.synthetic_message_for_index(synthetic_index);
-            synthetic_index += 1;
-            current
-        } else {
-            meta_for_ck(sidecar, msg, index)
-        };
+        let meta = meta_for_ck(sidecar, msg, index).or_else(|| {
+            if msg.meta.synthetic {
+                let current = sidecar.synthetic_message_for_index(synthetic_index);
+                synthetic_index += 1;
+                current
+            } else {
+                None
+            }
+        });
         encoded.push(match meta {
             Some(meta) if mutation_exempt_mid == Some(meta.mid.as_str()) => meta.raw.clone(),
             Some(meta) => encode_with_meta(msg, meta, preserve_compaction),
@@ -321,6 +335,9 @@ fn decode_tool_part(
         part,
         "tool_call",
     );
+    if let Some(last) = block_metas.last_mut() {
+        last.native_id = Some(id.clone());
+    }
 
     let status = tool_status(part);
     if matches!(status.as_deref(), Some("completed" | "error")) {
@@ -333,7 +350,7 @@ fn decode_tool_part(
             .to_string();
         let output = tool_output_from_part(part, status.as_deref() == Some("error"), output_text);
         let result_block = CkWireBlock::bare(CkKind::ToolResult {
-            id,
+            id: id.clone(),
             tool_name,
             output,
             provider_executed,
@@ -346,18 +363,23 @@ fn decode_tool_part(
             part,
             "tool_result",
         );
+        if let Some(last) = block_metas.last_mut() {
+            last.native_id = Some(id);
+        }
     }
 }
 
 fn push_block(
     content: &mut Vec<CkWireBlock>,
     block_metas: &mut Vec<BlockMeta>,
-    block: CkWireBlock,
+    mut block: CkWireBlock,
     part_index: usize,
     raw: &Value,
     kind: &str,
 ) {
     let block_index = content.len();
+    let content_fingerprint = decoded_block_fingerprint(&block);
+    stamp_block_identity(&mut block, block_index, part_index, &content_fingerprint);
     content.push(block);
     block_metas.push(BlockMeta {
         block_index,
@@ -365,6 +387,7 @@ fn push_block(
         native_index: Some(part_index),
         native_id: string_field(raw, "id").or_else(|| string_field(raw, "callID")),
         item_id: None,
+        content_fingerprint: Some(content_fingerprint),
         raw: raw.clone(),
     });
 }
@@ -462,16 +485,45 @@ fn tool_output_from_part(part: &Value, is_error: bool, output_text: String) -> C
         });
     }
     for attachment in attachments {
-        if attachment.is_object() {
-            blocks.push(ResultBlock {
-                kind: ResultBlockKind::Media {
-                    media: media_from_part(attachment),
-                },
-                provider_extras: ProviderExtras::new(),
-            });
+        if !attachment.is_object() {
+            continue;
         }
+        let mut provider_extras = ProviderExtras::new();
+        provider_extras
+            .entry(HARNESS.to_string())
+            .or_default()
+            .insert("rawAttachment".to_string(), attachment.clone());
+        let has_media_shape = attachment.get("mime").is_some()
+            || attachment.get("mimeType").is_some()
+            || matches!(
+                attachment.get("type").and_then(Value::as_str),
+                Some("file" | "image")
+            );
+        let kind = if has_media_shape {
+            ResultBlockKind::Media {
+                media: media_from_part(attachment),
+            }
+        } else {
+            ResultBlockKind::Opaque {
+                opaque: OpaqueBlock {
+                    source: json!({ "type": "harness", "harness": HARNESS }),
+                    kind: string_field(attachment, "type")
+                        .unwrap_or_else(|| "attachment".to_string()),
+                    raw: attachment.clone(),
+                    arc: None,
+                },
+            }
+        };
+        blocks.push(ResultBlock {
+            kind,
+            provider_extras,
+        });
     }
-    CkToolOutput::bare(CkOutputKind::Content { blocks })
+    CkToolOutput::bare(if is_error {
+        CkOutputKind::ErrorContent { blocks }
+    } else {
+        CkOutputKind::Content { blocks }
+    })
 }
 
 fn encode_with_meta(
@@ -490,6 +542,9 @@ fn encode_with_meta(
     for (block, block_meta) in msg.content.iter().zip(&matched_metas.by_block) {
         if let Some(part_index) = block_meta.and_then(|block_meta| block_meta.native_index) {
             if let Some(part) = parts.get_mut(part_index) {
+                if block_meta.is_some_and(|meta| block_is_unchanged(block, meta)) {
+                    continue;
+                }
                 // Reasoning parts may contain provider signatures, so changing their bytes could
                 // invalidate verification. Preserve the matched native reasoning part exactly;
                 // apply updates only to separately mapped sibling parts.
@@ -598,18 +653,16 @@ fn update_part_from_block(part: &mut Value, block: &CkWireBlock) {
                 set_nested_value(part, "metadata", "providerExecuted", Value::Bool(true));
             }
         }
-        CkKind::ToolResult { output, .. } => {
-            let (status, text) = output_status_text(output);
+        CkKind::ToolResult {
+            id,
+            tool_name,
+            output,
+            ..
+        } => {
             set_string(part, "type", "tool");
-            set_nested_value(part, "state", "status", Value::String(status.to_string()));
-            if status == "error"
-                && nested_has(part, "state", "error")
-                && !nested_has(part, "state", "output")
-            {
-                set_nested_value(part, "state", "error", Value::String(text));
-            } else {
-                set_nested_value(part, "state", "output", Value::String(text));
-            }
+            set_string(part, "callID", id);
+            set_string(part, "tool", tool_name);
+            apply_tool_output_to_part(part, output);
         }
         CkKind::Media(media) => {
             *part = render_media_part(media);
@@ -618,6 +671,25 @@ fn update_part_from_block(part: &mut Value, block: &CkWireBlock) {
             *part = opaque.raw.clone();
         }
     }
+}
+
+fn render_adjacent_tool_pair(call: &CkWireMessage, result: &CkWireMessage) -> Option<Value> {
+    if call.role != "assistant" || result.role != "tool" {
+        return None;
+    }
+    let [call_block] = call.content.as_slice() else {
+        return None;
+    };
+    let [result_block] = result.content.as_slice() else {
+        return None;
+    };
+    let CkKind::ToolCall { id: call_id, .. } = &call_block.kind else {
+        return None;
+    };
+    let CkKind::ToolResult { id: result_id, .. } = &result_block.kind else {
+        return None;
+    };
+    (call_id == result_id).then(|| render_tool_pair_as_part(call_block, result_block))
 }
 
 fn render_synthetic_todo_pair(call: &CkWireMessage, result: &CkWireMessage) -> Option<Value> {
@@ -713,7 +785,13 @@ fn encode_new_message(msg: &CkWireMessage, session_id: Option<&str>) -> Value {
         }
         info
     } else {
-        json!({ "id": id, "role": msg.role })
+        let role = if msg.role == "tool" {
+            // MessageV2 model conversion only visits tool parts inside assistant messages.
+            "assistant"
+        } else {
+            msg.role.as_str()
+        };
+        json!({ "id": id, "role": role })
     };
     json!({ "info": info, "parts": parts })
 }
@@ -752,16 +830,23 @@ fn render_block_as_part(block: &CkWireBlock) -> Value {
             }
             part
         }
-        CkKind::ToolResult { output, .. } => {
-            let (status, text) = output_status_text(output);
-            let mut state = json!({
-                "status": status,
-                "input": {},
-                "time": synthetic_tool_time(),
+        CkKind::ToolResult {
+            id,
+            tool_name,
+            output,
+            ..
+        } => {
+            let mut part = json!({
+                "type": "tool",
+                "callID": id,
+                "tool": tool_name,
+                "state": {
+                    "input": {},
+                    "time": synthetic_tool_time(),
+                }
             });
-            let output_key = if status == "error" { "error" } else { "output" };
-            set_value(&mut state, output_key, Value::String(text));
-            json!({ "type": "tool", "state": state })
+            apply_tool_output_to_part(&mut part, output);
+            part
         }
         CkKind::Media(media) => render_media_part(media),
         CkKind::Opaque(opaque) => opaque.raw.clone(),
@@ -775,16 +860,8 @@ fn render_tool_pair_as_part(call: &CkWireBlock, result: &CkWireBlock) -> Value {
         return part;
     };
 
-    let (status, text) = output_status_text(output);
-    set_nested_value(
-        &mut part,
-        "state",
-        "status",
-        Value::String(status.to_string()),
-    );
+    apply_tool_output_to_part(&mut part, output);
     set_nested_value(&mut part, "state", "time", synthetic_tool_time());
-    let output_key = if status == "error" { "error" } else { "output" };
-    set_nested_value(&mut part, "state", output_key, Value::String(text));
     part
 }
 
@@ -856,6 +933,64 @@ fn output_status_text(output: &CkToolOutput) -> (&'static str, String) {
     }
 }
 
+fn output_attachments(output: &CkToolOutput) -> Vec<Value> {
+    let blocks = match &output.kind {
+        CkOutputKind::Content { blocks } | CkOutputKind::ErrorContent { blocks } => blocks,
+        _ => return Vec::new(),
+    };
+    blocks
+        .iter()
+        .filter_map(|block| match &block.kind {
+            ResultBlockKind::Text { .. } => None,
+            ResultBlockKind::Media { media } => Some(render_tool_attachment(block, media)),
+            ResultBlockKind::Opaque { opaque } => Some(opaque.raw.clone()),
+        })
+        .collect()
+}
+
+fn render_tool_attachment(block: &ResultBlock, media: &MediaBlock) -> Value {
+    let Some(mut retained) = block
+        .provider_extras
+        .get(HARNESS)
+        .and_then(|namespace| namespace.get("rawAttachment"))
+        .cloned()
+    else {
+        return render_media_part(media);
+    };
+    if media_from_part(&retained) == *media {
+        return retained;
+    }
+    let fresh = render_media_part(media);
+    let Some(retained_object) = retained.as_object_mut() else {
+        return fresh;
+    };
+    for key in [
+        "type", "mime", "mimeType", "filename", "name", "url", "data",
+    ] {
+        retained_object.remove(key);
+    }
+    if let Some(fresh_object) = fresh.as_object() {
+        retained_object.extend(fresh_object.clone());
+    }
+    retained
+}
+
+fn apply_tool_output_to_part(part: &mut Value, output: &CkToolOutput) {
+    let (status, text) = output_status_text(output);
+    set_nested_value(part, "state", "status", Value::String(status.to_string()));
+    let output_key = if status == "error" { "error" } else { "output" };
+    let stale_key = if status == "error" { "output" } else { "error" };
+    remove_nested_value(part, "state", stale_key);
+    set_nested_value(part, "state", output_key, Value::String(text));
+
+    let attachments = output_attachments(output);
+    if attachments.is_empty() {
+        remove_nested_value(part, "state", "attachments");
+    } else {
+        set_nested_value(part, "state", "attachments", Value::Array(attachments));
+    }
+}
+
 fn opaque_block(kind: &str, raw: Value, arc: Option<Value>) -> CkWireBlock {
     CkWireBlock::bare(CkKind::Opaque(OpaqueBlock {
         source: json!({ "type": "harness", "harness": HARNESS }),
@@ -919,16 +1054,7 @@ fn tool_status(part: &Value) -> Option<String> {
 }
 
 fn is_synthetic_message(parts: &[Value]) -> bool {
-    !parts.is_empty()
-        && parts.iter().all(|part| {
-            part.get("synthetic")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-                || part
-                    .get("syntheticTodoMarker")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-        })
+    !parts.is_empty() && parts.iter().all(is_synthetic_part)
 }
 
 fn string_field(value: &Value, key: &str) -> Option<String> {
@@ -948,11 +1074,10 @@ fn set_value(value: &mut Value, key: &str, next: Value) {
     }
 }
 
-fn nested_has(value: &Value, object_key: &str, key: &str) -> bool {
-    value
-        .get(object_key)
-        .and_then(Value::as_object)
-        .is_some_and(|obj| obj.contains_key(key))
+fn remove_nested_value(value: &mut Value, object_key: &str, key: &str) {
+    if let Some(nested) = value.get_mut(object_key).and_then(Value::as_object_mut) {
+        nested.remove(key);
+    }
 }
 
 fn set_nested_value(value: &mut Value, object_key: &str, key: &str, next: Value) {
@@ -1002,8 +1127,29 @@ mod tests {
         let standalone_result = CkWireBlock::bare(CkKind::ToolResult {
             id: "standalone-result".to_string(),
             tool_name: "write".to_string(),
-            output: CkToolOutput::bare(CkOutputKind::ErrorText {
-                text: "write denied".to_string(),
+            output: CkToolOutput::bare(CkOutputKind::ErrorContent {
+                blocks: vec![
+                    ResultBlock {
+                        kind: ResultBlockKind::Text {
+                            text: "write denied".to_string(),
+                        },
+                        provider_extras: ProviderExtras::new(),
+                    },
+                    ResultBlock {
+                        kind: ResultBlockKind::Media {
+                            media: MediaBlock {
+                                kind: MediaKind::Image,
+                                media_type: "image/png".to_string(),
+                                filename: Some("error.png".to_string()),
+                                source: json!({
+                                    "type": "data_base64",
+                                    "data": "aW1hZ2U="
+                                }),
+                            },
+                        },
+                        provider_extras: ProviderExtras::new(),
+                    },
+                ],
             }),
             provider_executed: false,
         });
@@ -1057,6 +1203,14 @@ mod tests {
                     continue;
                 }
                 tool_part_count += 1;
+                assert!(
+                    part.get("callID").and_then(Value::as_str).is_some(),
+                    "tool part has no callID: {part}"
+                );
+                assert!(
+                    part.get("tool").and_then(Value::as_str).is_some(),
+                    "tool part has no tool name: {part}"
+                );
                 let state = part["state"].as_object().unwrap();
                 assert!(
                     state.get("status").is_some(),
@@ -1091,9 +1245,21 @@ mod tests {
             json!({ "path": "covered.txt" })
         );
         assert_eq!(encoded[1]["parts"][0]["state"]["status"], "running");
+        assert_eq!(encoded[2]["info"]["role"], "assistant");
+        assert_eq!(encoded[2]["parts"][0]["callID"], "standalone-result");
+        assert_eq!(encoded[2]["parts"][0]["tool"], "write");
         assert_eq!(encoded[2]["parts"][0]["state"]["status"], "error");
         assert_eq!(encoded[2]["parts"][0]["state"]["input"], json!({}));
         assert_eq!(encoded[2]["parts"][0]["state"]["error"], "write denied");
+        assert_eq!(
+            encoded[2]["parts"][0]["state"]["attachments"],
+            json!([{
+                "type": "file",
+                "mime": "image/png",
+                "filename": "error.png",
+                "url": "data:image/png;base64,aW1hZ2U="
+            }])
+        );
     }
 
     #[test]
@@ -1123,6 +1289,261 @@ mod tests {
             part["state"]["time"]["start"] == SYNTHETIC_TIMESTAMP
                 && part["state"]["time"]["end"] == SYNTHETIC_TIMESTAMP
         }));
+    }
+
+    #[test]
+    fn adjacent_equal_kind_deletion_retains_the_surviving_native_part() {
+        let raw = vec![json!({
+            "info": { "id": "adjacent-text", "role": "assistant" },
+            "parts": [
+                { "type": "text", "text": "A", "vendorPart": "A" },
+                {
+                    "type": "text",
+                    "text": "DELETE",
+                    "time": { "start": 2 },
+                    "vendorPart": "delete"
+                },
+                {
+                    "type": "text",
+                    "text": "SURVIVE",
+                    "time": { "start": 3 },
+                    "vendorPart": "survive"
+                }
+            ]
+        })];
+        let decoded = decode_opencode(&raw);
+        let mut message = decoded.messages[0].ck.clone();
+        message.content.remove(1);
+
+        let encoded = encode_opencode(&[message], &decoded.sidecar, None);
+        assert_eq!(
+            encoded[0]["parts"],
+            json!([
+                { "type": "text", "text": "A", "vendorPart": "A" },
+                {
+                    "type": "text",
+                    "text": "SURVIVE",
+                    "time": { "start": 3 },
+                    "vendorPart": "survive"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn mutated_survivor_keeps_its_own_native_extras_after_sibling_deletion() {
+        let raw = vec![json!({
+            "info": { "id": "mutated-adjacent-text", "role": "assistant" },
+            "parts": [
+                { "type": "text", "text": "A", "vendorPart": "A" },
+                { "type": "text", "text": "DELETE", "vendorPart": "delete" },
+                { "type": "text", "text": "SURVIVE", "vendorPart": "survive" }
+            ]
+        })];
+        let decoded = decode_opencode(&raw);
+        let mut message = decoded.messages[0].ck.clone();
+        message.content.remove(1);
+        let survivor = &mut message.content[1];
+        survivor.kind = CkKind::Text {
+            text: "§3§ SURVIVE".to_string(),
+        };
+        survivor.mark_modified();
+        message.mark_modified();
+
+        let encoded = encode_opencode(&[message], &decoded.sidecar, None);
+        assert_eq!(
+            encoded[0]["parts"],
+            json!([
+                { "type": "text", "text": "A", "vendorPart": "A" },
+                { "type": "text", "text": "§3§ SURVIVE", "vendorPart": "survive" }
+            ])
+        );
+    }
+
+    #[test]
+    fn adjacent_idless_tools_match_their_synthesized_identity() {
+        let raw = vec![json!({
+            "info": { "id": "idless-tools", "role": "assistant" },
+            "parts": [
+                {
+                    "type": "tool",
+                    "tool": "read",
+                    "vendorPart": "delete",
+                    "state": { "status": "running", "input": { "path": "delete" } }
+                },
+                {
+                    "type": "tool",
+                    "tool": "read",
+                    "vendorPart": "survive",
+                    "state": { "status": "running", "input": { "path": "survive" } }
+                }
+            ]
+        })];
+        let decoded = decode_opencode(&raw);
+        let mut message = decoded.messages[0].ck.clone();
+        let first_id = match &message.content[0].kind {
+            CkKind::ToolCall { id, .. } => id.clone(),
+            _ => panic!("expected first tool call"),
+        };
+        let second_id = match &message.content[1].kind {
+            CkKind::ToolCall { id, .. } => id.clone(),
+            _ => panic!("expected second tool call"),
+        };
+        assert_ne!(first_id, second_id);
+        assert_eq!(
+            decoded.sidecar.messages["idless-tools"].blocks[1]
+                .native_id
+                .as_deref(),
+            Some(second_id.as_str())
+        );
+        message.content.remove(0);
+
+        let encoded = encode_opencode(&[message], &decoded.sidecar, None);
+        assert_eq!(encoded[0]["parts"], json!([raw[0]["parts"][1].clone()]));
+    }
+
+    #[test]
+    fn completed_and_error_attachments_round_trip_with_native_polarity() {
+        let raw = vec![
+            json!({
+                "info": { "id": "completed-attachment", "role": "assistant" },
+                "parts": [{
+                    "type": "tool",
+                    "callID": "call-ok",
+                    "tool": "read",
+                    "state": {
+                        "status": "completed",
+                        "input": {},
+                        "output": "done",
+                        "attachments": [{
+                            "mime": "image/png",
+                            "url": "data:image/png;base64,b2s=",
+                            "vendor": "keep-ok"
+                        }],
+                        "time": { "start": 1, "end": 2 }
+                    }
+                }]
+            }),
+            json!({
+                "info": { "id": "error-attachment", "role": "assistant" },
+                "parts": [{
+                    "type": "tool",
+                    "callID": "call-err",
+                    "tool": "read",
+                    "state": {
+                        "status": "error",
+                        "input": {},
+                        "error": "failed",
+                        "attachments": [
+                            {
+                                "mime": "image/png",
+                                "url": "data:image/png;base64,ZXJy",
+                                "vendor": "keep-error"
+                            },
+                            { "type": "vendor-attachment", "payload": { "keep": true } }
+                        ],
+                        "time": { "start": 3, "end": 4 }
+                    }
+                }]
+            }),
+        ];
+        let decoded = decode_opencode(&raw);
+        let completed_output = match &decoded.messages[0].ck.content[1].kind {
+            CkKind::ToolResult { output, .. } => output,
+            _ => panic!("expected completed tool result"),
+        };
+        let error_output = match &decoded.messages[1].ck.content[1].kind {
+            CkKind::ToolResult { output, .. } => output,
+            _ => panic!("expected error tool result"),
+        };
+        assert!(matches!(
+            completed_output.kind,
+            CkOutputKind::Content { .. }
+        ));
+        assert!(matches!(
+            error_output.kind,
+            CkOutputKind::ErrorContent { .. }
+        ));
+        assert_eq!(
+            encode_opencode(
+                &decoded
+                    .messages
+                    .iter()
+                    .map(|message| message.ck.clone())
+                    .collect::<Vec<_>>(),
+                &decoded.sidecar,
+                None,
+            ),
+            raw
+        );
+
+        let mut error_message = decoded.messages[1].ck.clone();
+        let result = &mut error_message.content[1];
+        let CkKind::ToolResult { output, .. } = &mut result.kind else {
+            panic!("expected error tool result");
+        };
+        let CkOutputKind::ErrorContent { blocks } = &mut output.kind else {
+            panic!("expected ErrorContent");
+        };
+        let ResultBlockKind::Text { text } = &mut blocks[0].kind else {
+            panic!("expected leading text block");
+        };
+        *text = "tagged failure".to_string();
+        result.mark_modified();
+        error_message.mark_modified();
+        let encoded = encode_opencode(&[error_message], &decoded.sidecar, None);
+        assert_eq!(encoded[0]["parts"][0]["state"]["status"], "error");
+        assert_eq!(encoded[0]["parts"][0]["state"]["error"], "tagged failure");
+        assert_eq!(
+            encoded[0]["parts"][0]["state"]["attachments"],
+            raw[1]["parts"][0]["state"]["attachments"]
+        );
+        assert_eq!(
+            encoded[0]["parts"][0]["state"]["time"],
+            raw[1]["parts"][0]["state"]["time"]
+        );
+    }
+
+    #[test]
+    fn adjacent_fresh_call_and_result_coalesce_for_message_v2_conversion() {
+        let call = CkWireMessage::from_parts(
+            "assistant",
+            vec![CkWireBlock::bare(CkKind::ToolCall {
+                id: "call-7".to_string(),
+                name: "inspect".to_string(),
+                input: json!({ "path": "artifact.bin" }),
+                provider_executed: false,
+            })],
+            None,
+            ProviderExtras::new(),
+            HarnessMeta::default(),
+        );
+        let result = CkWireMessage::from_parts(
+            "tool",
+            vec![CkWireBlock::bare(CkKind::ToolResult {
+                id: "call-7".to_string(),
+                tool_name: "inspect".to_string(),
+                output: CkToolOutput::bare(CkOutputKind::Text {
+                    text: "done".to_string(),
+                }),
+                provider_executed: false,
+            })],
+            None,
+            ProviderExtras::new(),
+            HarnessMeta::default(),
+        );
+
+        let encoded = encode_opencode(&[call, result], &DecodeSidecar::new(HARNESS), None);
+        assert_eq!(encoded.len(), 1);
+        assert_eq!(encoded[0]["info"]["role"], "assistant");
+        assert_eq!(encoded[0]["parts"][0]["callID"], "call-7");
+        assert_eq!(encoded[0]["parts"][0]["tool"], "inspect");
+        assert_eq!(
+            encoded[0]["parts"][0]["state"]["input"],
+            json!({ "path": "artifact.bin" })
+        );
+        assert_eq!(encoded[0]["parts"][0]["state"]["status"], "completed");
+        assert_eq!(encoded[0]["parts"][0]["state"]["output"], "done");
     }
 
     #[test]
@@ -1208,6 +1629,10 @@ mod tests {
         let decoded = decode_opencode(&raw);
 
         assert!(decoded.messages[0].ck.meta.synthetic);
+        assert_eq!(
+            encode_opencode(&[decoded.messages[0].ck.clone()], &decoded.sidecar, None),
+            raw
+        );
     }
 
     #[test]
