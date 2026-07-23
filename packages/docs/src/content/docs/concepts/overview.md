@@ -56,6 +56,7 @@ Magic Context runs in [two effective modes](/concepts/session-modes/): primary s
 
 - [Historian](/concepts/historian/) — how compartments work, when the historian fires, what you see
 - [Memory](/concepts/memory/) — the 5 categories, how memories are written and recalled
+- [Memory mural](/concepts/mural/) — experimental image of overflow memories on vision models
 - [Dreamer](/concepts/dreamer/) — overnight maintenance tasks and scheduling
 - [Context reduction](/concepts/context-reduction/) — tagging, `ctx_reduce`, nudges, and safety nets
 - [Cache architecture](/concepts/cache-architecture/) — why the layout preserves prompt caching

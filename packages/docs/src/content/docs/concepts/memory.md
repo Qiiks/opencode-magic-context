@@ -47,6 +47,8 @@ Active memories render into a `<project-memory>` block that the agent sees every
 
 Memories are ordered by category priority, then by recency within each category. Memories already visible in the rendered session history are filtered from search results to avoid duplication.
 
+When the text budget trims memories away, the optional experimental [memory mural](/concepts/mural/) can attach a single image of those overflow memories to the cached context baseline (vision models only).
+
 ## Retrieval-count promotion
 
 Each memory tracks how many times the agent has retrieved it via `ctx_search`. Memories with higher retrieval counts are more likely to be kept during dreamer maintenance — they've proven useful. Memories with zero retrievals and low seen counts are candidates for archival.

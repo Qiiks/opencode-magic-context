@@ -812,6 +812,37 @@ boundary-timestamp lookup equivalent to OpenCode's message table. Pi therefore o
 these attributes while retaining temporal gap markers derived from Pi message data.
 Cached defer passes in both harnesses continue replaying their previously rendered bytes.
 
+---
+
+## 26. Memory mural image: same HARD-fold contract, different message envelope
+
+**Both harnesses** share `resolveMuralWire` (feature flag + vision gate + on-demand
+deterministic PNG with text-hash change detection). The mural injects only on a
+HARD m[0] materialization; defer passes replay the baked-in `<memory-mural>`
+marker and image bytes without re-rendering. Restart-safe replay reloads the PNG
+from `mural_manifest` when the cached m[0] text still carries the marker.
+
+**OpenCode:** prepends a synthetic user head with a `file` part
+(`mime: image/png`, `url: data:image/png;base64,…`, `synthetic: true`).
+
+**Pi:** prepends a synthetic user entry with Pi's native image content block
+(`{ type: "image", data: <raw base64>, mimeType: "image/png" }`). Pi provider
+serializers rebuild the data-URL form for the wire. Same PNG bytes; different
+envelope because Pi's `AgentMessage` shape has no OpenCode-style file parts.
+
+**Vision gate:** both call `modelSupportsVision` via the shared models.dev /
+SDK metadata cache. Pi-native provider prefixes (`openai-codex/…`,
+`google-antigravity/…`) are translated to the canonical OpenCode form before
+lookup. Pi does not warm that cache (see §14); when metadata is absent the gate
+**fails closed** (text-only baseline, no throw). A Pi-only install therefore
+never injects the mural image until vision metadata is available; OpenCode warms
+the cache from its SDK at startup.
+
+**Config:** both honor `experimental.mural.enabled` (and `experimental.mural.model`
+for the compress-cues dreamer task). No intentional per-provider image-part
+blacklist today — every Pi serializer path that accepts user image content takes
+raw base64 the same way.
+
 ## Pending parity
 
 - Last-known-good transform capture and replay for OpenCode and rust-mode sessions is pending for Pi.
