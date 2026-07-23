@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { log } from "../../shared/logger";
-import type { Database } from "../../shared/sqlite";
+import type { Database, Statement } from "../../shared/sqlite";
 import { withPrivilegedWriter } from "../../shared/sqlite";
 
 export const AUTHORITY_DOMAINS = ["memories", "notes"] as const;
@@ -1019,19 +1019,259 @@ function installStagedLiveMemorySnapshot(db: Database, generation: string): bool
     return true;
 }
 
+interface MirrorPageStatements {
+    identityByModule: Statement;
+    insertIdentity: Statement;
+    deleteLiveMemory: Statement;
+    deletePendingReferencesForMemory: Statement;
+    deleteIdentity: Statement;
+    sharedIdentity: Statement;
+    memoryById: Statement;
+    memoryIdByStoreId: Statement;
+    memoryCandidates: Statement;
+    insertMemory: Statement;
+    liveMemoryMatches: Statement;
+    deleteMemoryEmbeddings: Statement;
+    deleteMemory: Statement;
+    liveMemorySnapshot: Statement;
+    upsertLiveMemory: Statement;
+    updateMemory: Statement;
+    updateSuperseded: Statement;
+    deletePendingReference: Statement;
+    upsertPendingReference: Statement;
+    deleteMemoryVerifications: Statement;
+    insertMemoryVerification: Statement;
+    noteById: Statement;
+    noteIdByStoreId: Statement;
+    insertNote: Statement;
+    deleteNote: Statement;
+    deleteNoteRevisions: Statement;
+    updateNote: Statement;
+    upsertNoteRevision: Statement;
+    translateMemoryReferences: Statement;
+    clearTranslatedReferences: Statement;
+    repairPending: Statement;
+    markRepairPending: Statement;
+    clearRepairPending: Statement;
+    repairCandidates: Statement;
+    repairMemory: Statement;
+    updateCursor: Statement;
+    contextStoreUuid: string | null;
+}
+
+function ensureMemoryRepairState(db: Database): void {
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS mirror_memory_repair_state (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            dirty INTEGER NOT NULL DEFAULT 0 CHECK(dirty IN (0, 1)),
+            updated_at INTEGER NOT NULL DEFAULT 0
+        );
+    `);
+    db.prepare(
+        "INSERT OR IGNORE INTO mirror_memory_repair_state(id, dirty, updated_at) VALUES (1, 0, 0)",
+    ).run();
+}
+
+function markMemoryRepairPending(db: Database): void {
+    ensureMemoryRepairState(db);
+    db.prepare("UPDATE mirror_memory_repair_state SET dirty = 1, updated_at = ? WHERE id = 1").run(
+        Date.now(),
+    );
+}
+
+function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
+    return {
+        identityByModule: db.prepare(
+            "SELECT context_row_id FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?",
+        ),
+        insertIdentity: db.prepare(
+            "INSERT OR IGNORE INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES (?, ?, ?, ?)",
+        ),
+        deleteLiveMemory: db.prepare(
+            "DELETE FROM mirror_live_memory_rows WHERE module_project = ? AND module_row_id = ?",
+        ),
+        deletePendingReferencesForMemory: db.prepare(
+            "DELETE FROM mirror_pending_references WHERE domain = ? AND module_project = ? AND (module_row_id = ? OR target_module_row_id = ?)",
+        ),
+        deleteIdentity: db.prepare(
+            "DELETE FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?",
+        ),
+        sharedIdentity: db.prepare(
+            "SELECT 1 FROM mirror_identity WHERE domain = ? AND context_row_id = ? LIMIT 1",
+        ),
+        memoryById: db.prepare(
+            `SELECT project_path, category, content, normalized_hash, importance, scope, shareable,
+                    source_session_id, source_type, seen_count, retrieval_count, first_seen_at,
+                    created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at,
+                    verification_status, verified_at, classified_at, superseded_by_memory_id,
+                    merged_from, metadata_json
+               FROM memories WHERE id = ?`,
+        ),
+        memoryIdByStoreId: db.prepare("SELECT id FROM memories WHERE id = ? AND project_path = ?"),
+        memoryCandidates: db.prepare(
+            "SELECT id FROM memories WHERE project_path = ? AND category = ? AND normalized_hash = ? ORDER BY id",
+        ),
+        insertMemory: db.prepare(
+            "INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, ?, '', '', 0, 0, 0, 0)",
+        ),
+        liveMemoryMatches: db.prepare(
+            `SELECT module_project, module_row_id FROM mirror_live_memory_rows
+              WHERE module_project = ? AND category = ? AND normalized_hash = ?
+              ORDER BY module_row_id LIMIT 2`,
+        ),
+        deleteMemoryEmbeddings: db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?"),
+        deleteMemory: db.prepare("DELETE FROM memories WHERE id = ?"),
+        liveMemorySnapshot: db.prepare(
+            "SELECT full_row_snapshot FROM mirror_live_memory_rows WHERE module_project = ? AND module_row_id = ?",
+        ),
+        upsertLiveMemory: db.prepare(
+            `INSERT INTO mirror_live_memory_rows(
+                 module_project, module_row_id, category, normalized_hash, full_row_snapshot
+             ) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(module_project, module_row_id) DO UPDATE SET
+                 category = excluded.category,
+                 normalized_hash = excluded.normalized_hash,
+                 full_row_snapshot = excluded.full_row_snapshot`,
+        ),
+        updateMemory: db.prepare(
+            `UPDATE memories SET project_path = ?, category = ?, content = ?, normalized_hash = ?,
+             importance = ?, scope = ?, shareable = ?, source_session_id = ?, source_type = ?,
+             seen_count = ?, retrieval_count = ?, first_seen_at = ?, created_at = ?, updated_at = ?,
+             last_seen_at = ?, last_retrieved_at = ?, status = ?, expires_at = ?,
+             verification_status = ?, verified_at = ?, classified_at = ?, superseded_by_memory_id = ?,
+             merged_from = ?, metadata_json = ? WHERE id = ?`,
+        ),
+        updateSuperseded: db.prepare(
+            "UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?",
+        ),
+        deletePendingReference: db.prepare(
+            "DELETE FROM mirror_pending_references WHERE domain = 'memories' AND module_project = ? AND module_row_id = ?",
+        ),
+        upsertPendingReference: db.prepare(
+            "INSERT INTO mirror_pending_references(domain, module_project, module_row_id, target_module_row_id) VALUES ('memories', ?, ?, ?) ON CONFLICT(domain, module_project, module_row_id) DO UPDATE SET target_module_row_id = excluded.target_module_row_id",
+        ),
+        deleteMemoryVerifications: db.prepare(
+            "DELETE FROM memory_verifications WHERE memory_id = ?",
+        ),
+        insertMemoryVerification: db.prepare(
+            "INSERT INTO memory_verifications(memory_id, file_path, verified_at, mapped_at) VALUES (?, ?, 0, ?)",
+        ),
+        noteById: db.prepare("SELECT * FROM notes WHERE id = ?"),
+        noteIdByStoreId: db.prepare(
+            "SELECT id FROM notes WHERE id = ? AND type = 'smart' AND project_path = ?",
+        ),
+        insertNote: db.prepare(
+            "INSERT INTO notes (type, status, content, project_path, session_id, created_at, updated_at) VALUES ('smart', 'active', '', ?, ?, 0, 0)",
+        ),
+        deleteNote: db.prepare("DELETE FROM notes WHERE id = ?"),
+        deleteNoteRevisions: db.prepare(
+            "DELETE FROM mirror_note_revisions WHERE module_project = ? AND module_row_id = ?",
+        ),
+        updateNote: db.prepare(
+            `UPDATE notes SET type = ?, status = ?, project_path = ?, session_id = ?, content = ?,
+             surface_condition = ?, ready_at = ?, ready_reason = ?, manifest_json = ?, compiled_check = ?,
+             check_hash = ?, check_cron = ?, check_failure_count = ?, check_network_failure_count = ?,
+             check_quarantined_until = ?, check_next_due_at = ?, check_compiled_at = ?, check_false_since_at = ?,
+             check_last_liveness_at = ?, last_checked_at = ?, check_status = ?, check_version = ?,
+             policy_version = ?, anchor_block_id = ?, anchor_ordinal = ?, created_at = ?, updated_at = ? WHERE id = ?`,
+        ),
+        upsertNoteRevision: db.prepare(
+            "INSERT INTO mirror_note_revisions(module_project, module_row_id, context_row_id, status_version) VALUES (?, ?, ?, ?) ON CONFLICT(module_project, module_row_id) DO UPDATE SET context_row_id = excluded.context_row_id, status_version = excluded.status_version",
+        ),
+        translateMemoryReferences: db.prepare(
+            `UPDATE memories
+                SET superseded_by_memory_id = (
+                    SELECT target.context_row_id
+                      FROM mirror_pending_references pending
+                      JOIN mirror_identity source
+                        ON source.domain = pending.domain
+                       AND source.module_project = pending.module_project
+                       AND source.module_row_id = pending.module_row_id
+                      JOIN mirror_identity target
+                        ON target.domain = pending.domain
+                       AND target.module_project = pending.module_project
+                       AND target.module_row_id = pending.target_module_row_id
+                     WHERE pending.domain = 'memories'
+                       AND source.context_row_id = memories.id
+                )
+              WHERE id IN (
+                    SELECT source.context_row_id
+                      FROM mirror_pending_references pending
+                      JOIN mirror_identity source
+                        ON source.domain = pending.domain
+                       AND source.module_project = pending.module_project
+                       AND source.module_row_id = pending.module_row_id
+                      JOIN mirror_identity target
+                        ON target.domain = pending.domain
+                       AND target.module_project = pending.module_project
+                       AND target.module_row_id = pending.target_module_row_id
+                     WHERE pending.domain = 'memories'
+              )`,
+        ),
+        clearTranslatedReferences: db.prepare(
+            `DELETE FROM mirror_pending_references
+              WHERE domain = 'memories'
+                AND EXISTS (
+                    SELECT 1
+                      FROM mirror_identity source
+                      JOIN mirror_identity target
+                        ON target.domain = source.domain
+                       AND target.module_project = source.module_project
+                       AND target.module_row_id = mirror_pending_references.target_module_row_id
+                     WHERE source.domain = mirror_pending_references.domain
+                       AND source.module_project = mirror_pending_references.module_project
+                       AND source.module_row_id = mirror_pending_references.module_row_id
+                )`,
+        ),
+        repairPending: db.prepare("SELECT dirty FROM mirror_memory_repair_state WHERE id = 1"),
+        markRepairPending: db.prepare(
+            "UPDATE mirror_memory_repair_state SET dirty = 1, updated_at = ? WHERE id = 1",
+        ),
+        clearRepairPending: db.prepare(
+            "UPDATE mirror_memory_repair_state SET dirty = 0, updated_at = ? WHERE id = 1",
+        ),
+        repairCandidates: db.prepare(
+            `SELECT memory.id, live.full_row_snapshot
+               FROM memories memory
+               JOIN mirror_identity identity
+                 ON identity.domain = 'memories'
+                AND identity.context_row_id = memory.id
+               JOIN mirror_live_memory_rows live
+                 ON live.module_project = identity.module_project
+                AND live.module_row_id = identity.module_row_id
+               JOIN authority_managed managed
+                 ON managed.project_path = memory.project_path
+                  OR managed.project_path = identity.module_project
+              WHERE (memory.source_type IS NULL OR memory.importance IS NULL)
+                AND live.full_row_snapshot IS NOT NULL`,
+        ),
+        repairMemory: db.prepare(
+            `UPDATE memories
+                SET source_type = COALESCE(?, source_type),
+                    importance = COALESCE(?, importance)
+              WHERE id = ?`,
+        ),
+        updateCursor: db.prepare(
+            "INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES (?, ?, ?) ON CONFLICT(domain) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
+        ),
+        contextStoreUuid: getContextStoreUuid(db),
+    };
+}
+
 function mirrorIdentity(
     db: Database,
     domain: AuthorityDomain,
     moduleProject: string,
     moduleRowId: number,
+    statements?: MirrorPageStatements,
 ): { context_row_id: number } | null {
     return (
-        (db
-            .prepare(
+        ((
+            statements?.identityByModule ??
+            db.prepare(
                 "SELECT context_row_id FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?",
             )
-            .get(domain, moduleProject, moduleRowId) as { context_row_id: number } | undefined) ??
-        null
+        ).get(domain, moduleProject, moduleRowId) as { context_row_id: number } | undefined) ?? null
     );
 }
 
@@ -1041,13 +1281,17 @@ function rememberIdentity(
     moduleProject: string,
     moduleRowId: number,
     contextRowId: number,
+    statements?: MirrorPageStatements,
 ): void {
-    const existing = mirrorIdentity(db, domain, moduleProject, moduleRowId);
+    const existing = mirrorIdentity(db, domain, moduleProject, moduleRowId, statements);
     if (existing) return;
     // A context row has one canonical module identity. A duplicate feed row may
     // still update that row, but it must not claim a second identity for it.
-    db.prepare(
-        "INSERT OR IGNORE INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES (?, ?, ?, ?)",
+    (
+        statements?.insertIdentity ??
+        db.prepare(
+            "INSERT OR IGNORE INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES (?, ?, ?, ?)",
+        )
     ).run(domain, moduleProject, moduleRowId, contextRowId);
 }
 
@@ -1057,20 +1301,22 @@ function contextMemoryId(
     moduleProject: string,
     row: Record<string, unknown>,
     moduleRowId: number,
+    statements?: MirrorPageStatements,
 ): number {
-    const mapped = mirrorIdentity(db, domain, moduleProject, moduleRowId);
+    const mapped = mirrorIdentity(db, domain, moduleProject, moduleRowId, statements);
     if (mapped) return mapped.context_row_id;
     const sourceUuid = rowNullableString(row, "context_store_uuid");
     const sourceId = rowNumber(row, "context_row_id", -1);
-    const localStoreUuid = getContextStoreUuid(db);
+    const localStoreUuid = statements?.contextStoreUuid ?? getContextStoreUuid(db);
     // A module row id is meaningful only inside the context database that minted it;
     // matching the number in another store could silently bind this project to foreign data.
     if (sourceUuid && sourceUuid === localStoreUuid && sourceId >= 0) {
-        const existing = db
-            .prepare("SELECT id FROM memories WHERE id = ? AND project_path = ?")
-            .get(sourceId, moduleProject) as { id?: number } | undefined;
+        const existing = (
+            statements?.memoryIdByStoreId ??
+            db.prepare("SELECT id FROM memories WHERE id = ? AND project_path = ?")
+        ).get(sourceId, moduleProject) as { id?: number } | undefined;
         if (existing?.id !== undefined) {
-            rememberIdentity(db, domain, moduleProject, moduleRowId, existing.id);
+            rememberIdentity(db, domain, moduleProject, moduleRowId, existing.id, statements);
             return existing.id;
         }
     }
@@ -1080,69 +1326,64 @@ function contextMemoryId(
     const normalizedHash = rowString(row, "normalized_hash");
     const category = rowString(row, "category", "CONSTRAINTS");
     if (normalizedHash) {
-        const candidates = db
-            .prepare(
+        const candidates = (
+            statements?.memoryCandidates ??
+            db.prepare(
                 "SELECT id FROM memories WHERE project_path = ? AND category = ? AND normalized_hash = ? ORDER BY id",
             )
-            .all(moduleProject, category, normalizedHash) as Array<{ id?: number }>;
+        ).all(moduleProject, category, normalizedHash) as Array<{ id?: number }>;
         if (candidates.length === 1 && candidates[0]?.id !== undefined) {
-            rememberIdentity(db, domain, moduleProject, moduleRowId, candidates[0].id);
+            rememberIdentity(db, domain, moduleProject, moduleRowId, candidates[0].id, statements);
             return candidates[0].id;
         }
     }
-    const result = db
-        .prepare(
+    const result = (
+        statements?.insertMemory ??
+        db.prepare(
             "INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, ?, '', '', 0, 0, 0, 0)",
         )
-        .run(moduleProject, rowString(row, "category", "CONSTRAINTS"));
+    ).run(moduleProject, rowString(row, "category", "CONSTRAINTS"));
     const contextId = Number(result.lastInsertRowid);
-    rememberIdentity(db, domain, moduleProject, moduleRowId, contextId);
+    rememberIdentity(db, domain, moduleProject, moduleRowId, contextId, statements);
     return contextId;
 }
 
-function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
+function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPageStatements): void {
     const row = feed.full_row_snapshot;
     const moduleProject = rowString(row, "project_path");
     if (!moduleProject) throw new Error("memory feed snapshot has no project_path");
     if (feed.op === "tombstone") {
-        db.prepare(
-            "DELETE FROM mirror_live_memory_rows WHERE module_project = ? AND module_row_id = ?",
-        ).run(moduleProject, feed.module_row_id);
+        statements.deleteLiveMemory.run(moduleProject, feed.module_row_id);
         // Drop pending refs even when the tombstoned module row was never mapped
         // locally; otherwise a forward reference to a never-seen target leaks forever.
-        db.prepare(
-            "DELETE FROM mirror_pending_references WHERE domain = ? AND module_project = ? AND (module_row_id = ? OR target_module_row_id = ?)",
-        ).run(feed.domain, moduleProject, feed.module_row_id, feed.module_row_id);
-        const mapped = mirrorIdentity(db, feed.domain, moduleProject, feed.module_row_id);
+        statements.deletePendingReferencesForMemory.run(
+            feed.domain,
+            moduleProject,
+            feed.module_row_id,
+            feed.module_row_id,
+        );
+        const mapped = mirrorIdentity(
+            db,
+            feed.domain,
+            moduleProject,
+            feed.module_row_id,
+            statements,
+        );
         if (!mapped) return;
-        db.prepare(
-            "DELETE FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?",
-        ).run(feed.domain, moduleProject, feed.module_row_id);
-        const shared = db
-            .prepare(
-                "SELECT 1 FROM mirror_identity WHERE domain = ? AND context_row_id = ? LIMIT 1",
-            )
-            .get(feed.domain, mapped.context_row_id);
+        statements.deleteIdentity.run(feed.domain, moduleProject, feed.module_row_id);
+        const shared = statements.sharedIdentity.get(feed.domain, mapped.context_row_id);
         // A cleanup tombstone for one legacy twin must not delete the context row
         // still owned by another module identity for the same source memory.
         if (shared) return;
-        const contextRow = db
-            .prepare("SELECT project_path, category, normalized_hash FROM memories WHERE id = ?")
-            .get(mapped.context_row_id) as
+        const contextRow = statements.memoryById.get(mapped.context_row_id) as
             | { project_path?: string; category?: string; normalized_hash?: string }
             | undefined;
         if (contextRow?.project_path && contextRow.category && contextRow.normalized_hash) {
-            const liveMatches = db
-                .prepare(
-                    `SELECT module_project, module_row_id FROM mirror_live_memory_rows
-                     WHERE module_project = ? AND category = ? AND normalized_hash = ?
-                     ORDER BY module_row_id LIMIT 2`,
-                )
-                .all(
-                    contextRow.project_path,
-                    contextRow.category,
-                    contextRow.normalized_hash,
-                ) as Array<{ module_project: string; module_row_id: number }>;
+            const liveMatches = statements.liveMemoryMatches.all(
+                contextRow.project_path,
+                contextRow.category,
+                contextRow.normalized_hash,
+            ) as Array<{ module_project: string; module_row_id: number }>;
             if (liveMatches.length === 1 && liveMatches[0]) {
                 // Feed inserts can race for the mirror's one identity slot. Rechecking live
                 // content after removing the tombstoned owner preserves the canonical row
@@ -1153,52 +1394,44 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
                     liveMatches[0].module_project,
                     liveMatches[0].module_row_id,
                     mapped.context_row_id,
+                    statements,
                 );
                 return;
             }
         }
-        db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(mapped.context_row_id);
-        db.prepare("DELETE FROM memories WHERE id = ?").run(mapped.context_row_id);
+        statements.deleteMemoryEmbeddings.run(mapped.context_row_id);
+        statements.deleteMemory.run(mapped.context_row_id);
         return;
     }
 
-    const storedLive = db
-        .prepare(
-            "SELECT full_row_snapshot FROM mirror_live_memory_rows WHERE module_project = ? AND module_row_id = ?",
-        )
-        .get(moduleProject, feed.module_row_id) as
+    const storedLive = statements.liveMemorySnapshot.get(moduleProject, feed.module_row_id) as
         | { full_row_snapshot?: string | null }
         | undefined;
     const snapshotJson =
         !isCompleteMemorySnapshot(row) && storedLive?.full_row_snapshot
             ? storedLive.full_row_snapshot
             : JSON.stringify(row);
-    db.prepare(
-        `INSERT INTO mirror_live_memory_rows(
-             module_project, module_row_id, category, normalized_hash, full_row_snapshot
-         ) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(module_project, module_row_id) DO UPDATE SET
-             category = excluded.category,
-             normalized_hash = excluded.normalized_hash,
-             full_row_snapshot = excluded.full_row_snapshot`,
-    ).run(
+    statements.upsertLiveMemory.run(
         moduleProject,
         feed.module_row_id,
         rowString(row, "category", "CONSTRAINTS"),
         rowString(row, "normalized_hash"),
         snapshotJson,
     );
-    const contextId = contextMemoryId(db, feed.domain, moduleProject, row, feed.module_row_id);
-    const existing = db
-        .prepare(
-            `SELECT project_path, category, content, normalized_hash, importance, scope, shareable,
-                    source_session_id, source_type, seen_count, retrieval_count, first_seen_at,
-                    created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at,
-                    verification_status, verified_at, classified_at, superseded_by_memory_id,
-                    merged_from, metadata_json
-               FROM memories WHERE id = ?`,
-        )
-        .get(contextId) as
+    const metadataClobberRisk =
+        (hasSnapshotField(row, "source_type") && rowNullableString(row, "source_type") === null) ||
+        (hasSnapshotField(row, "importance") &&
+            !(typeof row.importance === "number" && Number.isFinite(row.importance)));
+    if (metadataClobberRisk) statements.markRepairPending.run(Date.now());
+    const contextId = contextMemoryId(
+        db,
+        feed.domain,
+        moduleProject,
+        row,
+        feed.module_row_id,
+        statements,
+    );
+    const existing = statements.memoryById.get(contextId) as
         | {
               project_path?: string;
               category?: string;
@@ -1248,14 +1481,7 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
 
     // A feed update is allowed to be a sparse legacy snapshot. An absent property means
     // "unchanged"; only a property explicitly present as null is a genuine clear.
-    db.prepare(
-        `UPDATE memories SET project_path = ?, category = ?, content = ?, normalized_hash = ?,
-         importance = ?, scope = ?, shareable = ?, source_session_id = ?, source_type = ?,
-         seen_count = ?, retrieval_count = ?, first_seen_at = ?, created_at = ?, updated_at = ?,
-         last_seen_at = ?, last_retrieved_at = ?, status = ?, expires_at = ?,
-         verification_status = ?, verified_at = ?, classified_at = ?, superseded_by_memory_id = ?,
-         merged_from = ?, metadata_json = ? WHERE id = ?`,
-    ).run(
+    statements.updateMemory.run(
         has("project_path")
             ? rowString(row, "project_path")
             : (existing?.project_path ?? moduleProject),
@@ -1302,28 +1528,24 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
             "memories",
             moduleProject,
             row.superseded_by_memory_id,
+            statements,
         );
         if (translated) {
-            db.prepare("UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?").run(
-                translated.context_row_id,
-                contextId,
-            );
-            db.prepare(
-                "DELETE FROM mirror_pending_references WHERE domain = 'memories' AND module_project = ? AND module_row_id = ?",
-            ).run(moduleProject, feed.module_row_id);
+            statements.updateSuperseded.run(translated.context_row_id, contextId);
+            statements.deletePendingReference.run(moduleProject, feed.module_row_id);
         } else {
-            db.prepare(
-                "INSERT INTO mirror_pending_references(domain, module_project, module_row_id, target_module_row_id) VALUES ('memories', ?, ?, ?) ON CONFLICT(domain, module_project, module_row_id) DO UPDATE SET target_module_row_id = excluded.target_module_row_id",
-            ).run(moduleProject, feed.module_row_id, row.superseded_by_memory_id);
+            statements.upsertPendingReference.run(
+                moduleProject,
+                feed.module_row_id,
+                row.superseded_by_memory_id,
+            );
         }
     } else if (hasSuperseded) {
-        db.prepare(
-            "DELETE FROM mirror_pending_references WHERE domain = 'memories' AND module_project = ? AND module_row_id = ?",
-        ).run(moduleProject, feed.module_row_id);
+        statements.deletePendingReference.run(moduleProject, feed.module_row_id);
     }
     const appliedHash = has("normalized_hash") ? rowString(row, "normalized_hash") : previousHash;
     if (previousHash !== appliedHash && appliedHash !== undefined) {
-        db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(contextId);
+        statements.deleteMemoryEmbeddings.run(contextId);
     }
     // Store mapping changes in the regular memory feed so maps owned by this module are preserved
     // when data is synchronized back into the database. Rows without a `mapping` property are
@@ -1336,41 +1558,24 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow): void {
                   ),
               ]
             : [""];
-        db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(contextId);
-        const insert = db.prepare(
-            "INSERT INTO memory_verifications(memory_id, file_path, verified_at, mapped_at) VALUES (?, ?, 0, ?)",
-        );
+        statements.deleteMemoryVerifications.run(contextId);
         for (const file of files.length > 0 ? files : [""]) {
-            insert.run(contextId, file, rowNumber(row, "updated_at", Date.now()));
+            statements.insertMemoryVerification.run(
+                contextId,
+                file,
+                rowNumber(row, "updated_at", Date.now()),
+            );
         }
     }
 }
 
-function repairNullClobberedMemoryRows(db: Database): void {
-    const candidates = db
-        .prepare(
-            `SELECT memory.id, live.full_row_snapshot
-               FROM memories memory
-               JOIN mirror_identity identity
-                 ON identity.domain = 'memories'
-                AND identity.context_row_id = memory.id
-               JOIN mirror_live_memory_rows live
-                 ON live.module_project = identity.module_project
-                AND live.module_row_id = identity.module_row_id
-               JOIN authority_managed managed
-                 ON managed.project_path = memory.project_path
-                  OR managed.project_path = identity.module_project
-              WHERE (memory.source_type IS NULL OR memory.importance IS NULL)
-                AND live.full_row_snapshot IS NOT NULL
-              LIMIT 1000`,
-        )
-        .all() as Array<{ id: number; full_row_snapshot?: string | null }>;
-    const repair = db.prepare(
-        `UPDATE memories
-            SET source_type = COALESCE(?, source_type),
-                importance = COALESCE(?, importance)
-          WHERE id = ?`,
-    );
+function repairNullClobberedMemoryRows(statements: MirrorPageStatements): void {
+    const pending = statements.repairPending.get() as { dirty?: number } | undefined;
+    if (pending?.dirty !== 1) return;
+    const candidates = statements.repairCandidates.all() as Array<{
+        id: number;
+        full_row_snapshot?: string | null;
+    }>;
     for (const candidate of candidates) {
         if (!candidate.full_row_snapshot) continue;
         let snapshot: Record<string, unknown>;
@@ -1392,93 +1597,80 @@ function repairNullClobberedMemoryRows(db: Database): void {
                 ? snapshot.importance
                 : null;
         if (sourceType === null && importance === null) continue;
-        // This bounded, idempotent repair handles stores where older sparse mapping records
-        // overwrote source_type and importance in context.db with null before the mirror began
-        // preserving existing values. It restores those fields when the source snapshot provides them.
-        repair.run(sourceType, importance, candidate.id);
+        // This idempotent repair handles stores where sparse mapping records overwrote
+        // source_type and importance with null before the mirror retained full snapshots.
+        statements.repairMemory.run(sourceType, importance, candidate.id);
     }
+    // The candidate query is an intentional full pass only while dirty. Clearing the flag
+    // makes subsequent mirror pages avoid the unindexed scan entirely.
+    statements.clearRepairPending.run(Date.now());
 }
 
-function contextNoteId(db: Database, feed: ChangefeedRow, moduleProject: string): number {
-    const mapped = mirrorIdentity(db, feed.domain, moduleProject, feed.module_row_id);
+function contextNoteId(
+    db: Database,
+    feed: ChangefeedRow,
+    moduleProject: string,
+    statements?: MirrorPageStatements,
+): number {
+    const mapped = mirrorIdentity(db, feed.domain, moduleProject, feed.module_row_id, statements);
     if (mapped) return mapped.context_row_id;
     const row = feed.full_row_snapshot;
     const sourceId = rowNumber(row, "context_row_id", -1);
     const sourceUuid = rowNullableString(row, "context_store_uuid");
-    const localStoreUuid = getContextStoreUuid(db);
+    const localStoreUuid = statements?.contextStoreUuid ?? getContextStoreUuid(db);
     if (sourceUuid && sourceUuid === localStoreUuid && sourceId >= 0) {
-        const existing = db
-            .prepare("SELECT id FROM notes WHERE id = ? AND type = 'smart' AND project_path = ?")
-            .get(sourceId, moduleProject) as { id?: number } | undefined;
+        const existing = (
+            statements?.noteIdByStoreId ??
+            db.prepare("SELECT id FROM notes WHERE id = ? AND type = 'smart' AND project_path = ?")
+        ).get(sourceId, moduleProject) as { id?: number } | undefined;
         if (existing?.id !== undefined) {
-            rememberIdentity(db, feed.domain, moduleProject, feed.module_row_id, existing.id);
+            rememberIdentity(
+                db,
+                feed.domain,
+                moduleProject,
+                feed.module_row_id,
+                existing.id,
+                statements,
+            );
             return existing.id;
         }
     }
-    const result = db
-        .prepare(
+    const result = (
+        statements?.insertNote ??
+        db.prepare(
             "INSERT INTO notes (type, status, content, project_path, session_id, created_at, updated_at) VALUES ('smart', 'active', '', ?, ?, 0, 0)",
         )
-        .run(moduleProject, rowNullableString(row, "session_id"));
+    ).run(moduleProject, rowNullableString(row, "session_id"));
     const contextId = Number(result.lastInsertRowid);
-    rememberIdentity(db, feed.domain, moduleProject, feed.module_row_id, contextId);
+    rememberIdentity(db, feed.domain, moduleProject, feed.module_row_id, contextId, statements);
     return contextId;
 }
 
-function translateMemoryReferences(db: Database): void {
-    const pending = db
-        .prepare(
-            `SELECT pending.module_project, pending.module_row_id, pending.target_module_row_id,
-                    source.context_row_id AS source_context_id,
-                    target.context_row_id AS target_context_id
-               FROM mirror_pending_references pending
-               JOIN mirror_identity source
-                 ON source.domain = pending.domain
-                AND source.module_project = pending.module_project
-                AND source.module_row_id = pending.module_row_id
-               JOIN mirror_identity target
-                 ON target.domain = pending.domain
-                AND target.module_project = pending.module_project
-                AND target.module_row_id = pending.target_module_row_id
-              WHERE pending.domain = 'memories'`,
-        )
-        .all() as Array<{
-        module_project: string;
-        module_row_id: number;
-        target_module_row_id: number;
-        source_context_id: number;
-        target_context_id: number;
-    }>;
-    const update = db.prepare("UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?");
-    const clear = db.prepare(
-        "DELETE FROM mirror_pending_references WHERE domain = 'memories' AND module_project = ? AND module_row_id = ?",
-    );
-    for (const reference of pending) {
-        update.run(reference.target_context_id, reference.source_context_id);
-        clear.run(reference.module_project, reference.module_row_id);
-    }
+function translateMemoryReferences(statements: MirrorPageStatements): void {
+    statements.translateMemoryReferences.run();
+    statements.clearTranslatedReferences.run();
 }
 
-function applyNoteRow(db: Database, feed: ChangefeedRow): void {
+function applyNoteRow(db: Database, feed: ChangefeedRow, statements: MirrorPageStatements): void {
     const row = feed.full_row_snapshot;
     const moduleProject = rowString(row, "project_path");
     if (!moduleProject) throw new Error("note feed snapshot has no project_path");
     if (feed.op === "tombstone") {
-        const mapped = mirrorIdentity(db, feed.domain, moduleProject, feed.module_row_id);
+        const mapped = mirrorIdentity(
+            db,
+            feed.domain,
+            moduleProject,
+            feed.module_row_id,
+            statements,
+        );
         if (!mapped) return;
-        db.prepare("DELETE FROM notes WHERE id = ?").run(mapped.context_row_id);
-        db.prepare(
-            "DELETE FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?",
-        ).run(feed.domain, moduleProject, feed.module_row_id);
-        db.prepare(
-            "DELETE FROM mirror_note_revisions WHERE module_project = ? AND module_row_id = ?",
-        ).run(moduleProject, feed.module_row_id);
+        statements.deleteNote.run(mapped.context_row_id);
+        statements.deleteIdentity.run(feed.domain, moduleProject, feed.module_row_id);
+        statements.deleteNoteRevisions.run(moduleProject, feed.module_row_id);
         return;
     }
-    const contextId = contextNoteId(db, feed, moduleProject);
-    const existing = db.prepare("SELECT * FROM notes WHERE id = ?").get(contextId) as
-        | Record<string, unknown>
-        | undefined;
+    const contextId = contextNoteId(db, feed, moduleProject, statements);
+    const existing = statements.noteById.get(contextId) as Record<string, unknown> | undefined;
     // Historical v23 feed rows contain only the small note surface. Preserve every
     // rich TS-owned column that is absent from such a snapshot, while still honoring
     // explicit nulls in current complete rows.
@@ -1494,14 +1686,7 @@ function applyNoteRow(db: Database, feed: ChangefeedRow): void {
     const moduleStatus = rowString(effectiveRow, "status", "active");
     const contextStatus =
         moduleStatus === "surfaced" || moduleStatus === "surfacing" ? "ready" : moduleStatus;
-    db.prepare(
-        `UPDATE notes SET type = ?, status = ?, project_path = ?, session_id = ?, content = ?,
-         surface_condition = ?, ready_at = ?, ready_reason = ?, manifest_json = ?, compiled_check = ?,
-         check_hash = ?, check_cron = ?, check_failure_count = ?, check_network_failure_count = ?,
-         check_quarantined_until = ?, check_next_due_at = ?, check_compiled_at = ?, check_false_since_at = ?,
-         check_last_liveness_at = ?, last_checked_at = ?, check_status = ?, check_version = ?,
-         policy_version = ?, anchor_block_id = ?, anchor_ordinal = ?, created_at = ?, updated_at = ? WHERE id = ?`,
-    ).run(
+    statements.updateNote.run(
         rowString(effectiveRow, "type", "smart"),
         contextStatus,
         moduleProject,
@@ -1537,9 +1722,12 @@ function applyNoteRow(db: Database, feed: ChangefeedRow): void {
         rowNumber(effectiveRow, "updated_at_ms"),
         contextId,
     );
-    db.prepare(
-        "INSERT INTO mirror_note_revisions(module_project, module_row_id, context_row_id, status_version) VALUES (?, ?, ?, ?) ON CONFLICT(module_project, module_row_id) DO UPDATE SET context_row_id = excluded.context_row_id, status_version = excluded.status_version",
-    ).run(moduleProject, feed.module_row_id, contextId, rowNumber(effectiveRow, "status_version"));
+    statements.upsertNoteRevision.run(
+        moduleProject,
+        feed.module_row_id,
+        contextId,
+        rowNumber(effectiveRow, "status_version"),
+    );
 }
 
 export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): number {
@@ -1551,26 +1739,57 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
             `mirror cursor mismatch for ${page.domain}: expected ${durableCursor}, got ${page.cursor}`,
         );
     }
+    if (page.next_cursor < durableCursor) {
+        throw new Error("mirror page moved its cursor backwards");
+    }
+
+    const resnapshotState = page.domain === "memories" ? memoryResnapshotState(db) : null;
+    const hasNewRows = page.rows.some(
+        (feed) => feed.domain === page.domain && feed.feed_seq > durableCursor,
+    );
+    // When replaying memories from cursor 0, this transaction must perform the
+    // resnapshot state compare-and-swap. While a resnapshot is pending, it must also
+    // prevent tombstones from being applied prematurely. Other pages with no new rows
+    // do not change any invariants.
+    const replayMustRun =
+        page.domain === "memories" &&
+        resnapshotState !== null &&
+        resnapshotState.status !== "complete" &&
+        (durableCursor === 0 || page.rows.some((feed) => feed.op === "tombstone"));
+    if (!hasNewRows && !replayMustRun) {
+        if (page.next_cursor <= durableCursor) return durableCursor;
+        withPrivilegedWriter(db, () => {
+            db.prepare(
+                "INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES (?, ?, ?) ON CONFLICT(domain) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
+            ).run(page.domain, page.next_cursor, Date.now());
+        });
+        return page.next_cursor;
+    }
+
     let nextCursor = durableCursor;
     withPrivilegedWriter(db, () => {
         db.transaction(() => {
-            const resnapshotState = page.domain === "memories" ? memoryResnapshotState(db) : null;
+            ensureMemoryRepairState(db);
+            const statements = prepareMirrorPageStatements(db);
+            const currentResnapshotState =
+                page.domain === "memories" ? memoryResnapshotState(db) : null;
             let resnapshotStatus =
-                page.domain === "memories" ? (resnapshotState?.status ?? null) : "complete";
+                page.domain === "memories" ? (currentResnapshotState?.status ?? null) : "complete";
             if (
                 page.domain === "memories" &&
                 durableCursor === 0 &&
-                resnapshotState &&
+                currentResnapshotState &&
                 resnapshotStatus !== "complete"
             ) {
                 // A cursor-zero replay observes every insert before its tombstone, so it is
                 // equivalent to a live resnapshot and may safely enable destructive cleanup.
+                statements.markRepairPending.run(Date.now());
                 if (
                     !casMemoryResnapshotState(
                         db,
-                        resnapshotState,
+                        currentResnapshotState,
                         "complete",
-                        resnapshotState.generation,
+                        currentResnapshotState.generation,
                     )
                 ) {
                     throw new Error("memory mirror resnapshot ownership changed during replay");
@@ -1591,12 +1810,14 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
                 if (feed.domain !== page.domain || feed.feed_seq <= nextCursor) continue;
                 const projectPath = rowString(feed.full_row_snapshot, "project_path");
                 if (projectPath) touchedProjects.add(projectPath);
-                if (feed.domain === "memories") applyMemoryRow(db, feed);
-                else applyNoteRow(db, feed);
+                if (feed.domain === "memories") applyMemoryRow(db, feed, statements);
+                else applyNoteRow(db, feed, statements);
                 nextCursor = feed.feed_seq;
             }
-            translateMemoryReferences(db);
-            if (page.domain === "memories") repairNullClobberedMemoryRows(db);
+            if (page.domain === "memories") {
+                translateMemoryReferences(statements);
+                repairNullClobberedMemoryRows(statements);
+            }
             for (const projectPath of touchedProjects) {
                 bumpDomainMutationEpoch(db, projectPath, page.domain);
             }
@@ -1604,9 +1825,7 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
                 throw new Error("mirror page moved its cursor backwards");
             }
             nextCursor = Math.max(nextCursor, page.next_cursor);
-            db.prepare(
-                "INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES (?, ?, ?) ON CONFLICT(domain) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
-            ).run(page.domain, nextCursor, Date.now());
+            statements.updateCursor.run(page.domain, nextCursor, Date.now());
         }).immediate();
     });
     return nextCursor;
@@ -1622,11 +1841,21 @@ export async function ensureLiveMemoryResnapshot(args: {
     while (true) {
         const observed = memoryResnapshotState(args.db);
         if (!observed || observed.status === "complete") return;
+        if (observed.status === "resnapshotting") {
+            // A resnapshot retains complete source rows used by the one-shot metadata heal.
+            withPrivilegedWriter(args.db, () => markMemoryRepairPending(args.db));
+        }
         if (observed.status === "pending_check" && !upgradeMemoryMirrorNeedsResnapshot(args.db)) {
             let completed = false;
             withPrivilegedWriter(args.db, () => {
                 args.db
                     .transaction(() => {
+                        // The mirror migration can leave source metadata incomplete,
+                        // while a non-complete resnapshot means the complete source rows
+                        // needed to repair it may still be available. Mark a metadata-
+                        // healing pass for the next mirror page before completing the
+                        // resnapshot.
+                        markMemoryRepairPending(args.db);
                         completed = casMemoryResnapshotState(
                             args.db,
                             observed,
@@ -1669,6 +1898,7 @@ export async function ensureLiveMemoryResnapshot(args: {
                         generation,
                     );
                     if (claimed) {
+                        markMemoryRepairPending(args.db);
                         args.db
                             .prepare("DELETE FROM mirror_live_staging WHERE generation != ?")
                             .run(generation);
