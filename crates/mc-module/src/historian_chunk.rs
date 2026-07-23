@@ -263,7 +263,12 @@ impl Builder {
             return true;
         };
         let block_text = format_block(&block);
-        let block_tokens = estimate_tokens(&block_text);
+        let separator_tokens = if self.lines.is_empty() {
+            0
+        } else {
+            estimate_tokens("\n")
+        };
+        let block_tokens = estimate_tokens(&block_text) + separator_tokens;
         if self.total_tokens + block_tokens > self.budget && self.total_tokens > 0 {
             self.current_block = Some(block);
             return false;
@@ -1712,6 +1717,52 @@ mod tests {
     }
 
     #[test]
+    fn separator_accounting_keeps_joined_32k_chunk_within_budget() {
+        let messages: Vec<_> = (1..=3_000)
+            .map(|ordinal| {
+                let role = if ordinal % 2 == 0 {
+                    "assistant"
+                } else {
+                    "user"
+                };
+                msg(
+                    &format!("m{ordinal}"),
+                    ordinal,
+                    role,
+                    vec![text(&format!(
+                        "I implemented the cache transform for raw message {ordinal} in src/hooks/magic-context/transform.ts, checked the invariant, diagnosed provider behavior, and recorded benchmark evidence for the production path."
+                    ))],
+                )
+            })
+            .collect();
+        let budget = 32_000;
+        let built = project_and_build(&messages, 1, budget, 3_001);
+        let joined_tokens = estimate_tokens(&built.text);
+
+        assert_eq!(built.chunk.lines.len(), 706);
+        assert_eq!(built.token_estimate, 31_992);
+        assert_eq!(joined_tokens, built.token_estimate);
+        assert!(joined_tokens <= budget);
+        assert_eq!(
+            truncate_historian_input_if_needed(&built.text, budget),
+            built.text
+        );
+    }
+
+    #[test]
+    fn forced_overflow_preserves_existing_truncation_output() {
+        let root: GoldenRoot =
+            serde_json::from_str(include_str!("../testdata/historian-chunk-golden.json")).unwrap();
+        let case = &root.truncation_cases[0];
+
+        assert!(estimate_tokens(&case.input) > case.budget);
+        assert_eq!(
+            truncate_historian_input_if_needed(&case.input, case.budget),
+            case.expected
+        );
+    }
+
+    #[test]
     fn truncation_uses_marker_and_keeps_multibyte_boundaries() {
         let input = "αβγ🙂 historian chunk ".repeat(80);
         let budget = estimate_tokens(HISTORIAN_TRUNCATION_MARKER) + 12;
@@ -1769,9 +1820,17 @@ mod tests {
                 "{} count",
                 case.label
             );
+            let separator_tokens = built.text.matches('\n').count() * estimate_tokens("\n");
             assert_eq!(
-                built.token_estimate, case.expected.token_estimate,
-                "{} tokens",
+                built.token_estimate,
+                case.expected.token_estimate + separator_tokens,
+                "{} separator-aware tokens",
+                case.label
+            );
+            assert_eq!(
+                built.token_estimate,
+                estimate_tokens(&built.text),
+                "{} joined tokens",
                 case.label
             );
             assert_eq!(built.text, case.expected.text, "{} text", case.label);
