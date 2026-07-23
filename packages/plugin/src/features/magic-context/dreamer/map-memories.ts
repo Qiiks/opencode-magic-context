@@ -72,6 +72,7 @@ export interface MapMemoriesResult {
     independent: number;
     batches: number;
     remaining: number;
+    complete: boolean;
 }
 
 /** Resolve the unmapped active memories into prompt inputs (with path seeds). */
@@ -98,7 +99,13 @@ function loadUnmappedInputs(
 }
 
 export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesResult> {
-    const result: MapMemoriesResult = { mapped: 0, independent: 0, batches: 0, remaining: 0 };
+    const result: MapMemoriesResult = {
+        mapped: 0,
+        independent: 0,
+        batches: 0,
+        remaining: 0,
+        complete: true,
+    };
     const inputs = loadUnmappedInputs(args.db, args.projectIdentity, args.sessionDirectory);
     if (inputs.length === 0) return result;
 
@@ -127,8 +134,9 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
             result.remaining -= counts.mapped + counts.independent;
             result.batches += 1;
         }
+        result.complete = result.remaining === 0;
         log(
-            `[dreamer] map-memories: mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining}`,
+            `[dreamer] map-memories: mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}`,
         );
         return result;
     } finally {

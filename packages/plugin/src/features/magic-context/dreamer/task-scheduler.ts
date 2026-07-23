@@ -210,7 +210,10 @@ function readRetrospectiveWatermark(
 }
 
 /** Record a transient failure: keep next_due_at so it hot-retries next tick,
- *  until MAX_TASK_RETRIES is exceeded, then advance to the next cron slot. */
+ *  until MAX_TASK_RETRIES is exceeded, then advance to the next cron slot.
+ *  Incomplete manifest drains use this path too: the retry cap prevents one
+ *  permanently failing unit from starving the slot forever, at the cost of
+ *  leaving its residue for the next scheduled slot after the cap is reached. */
 function recordTransientFailure(
     db: Database,
     projectIdentity: string,

@@ -115,6 +115,8 @@ export interface ClassifyResult {
     changed: number;
     chunks: number;
     stage: 1 | 2 | 3;
+    remaining: number;
+    complete: boolean;
 }
 
 interface ClassifyCandidate {
@@ -219,7 +221,14 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
 
     // Stage 1: too small a pool to score meaningfully.
     if (active.length < MIN_POOL_TO_CLASSIFY) {
-        return { classified: 0, changed: 0, chunks: 0, stage: 1 };
+        return {
+            classified: 0,
+            changed: 0,
+            chunks: 0,
+            stage: 1,
+            remaining: 0,
+            complete: true,
+        };
     }
 
     let stage: 2 | 3;
@@ -246,7 +255,14 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
         anchors = stratifiedAnchors(classified, STAGE3_ANCHOR_COUNT);
     }
 
-    const result: ClassifyResult = { classified: 0, changed: 0, chunks: 0, stage };
+    const result: ClassifyResult = {
+        classified: 0,
+        changed: 0,
+        chunks: 0,
+        stage,
+        remaining: toClassify.length,
+        complete: toClassify.length === 0,
+    };
     if (toClassify.length === 0) {
         log(`[dreamer] classify: stage=${stage} nothing to classify`);
         return result;
@@ -278,10 +294,12 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
             );
             result.classified += counts.classified;
             result.changed += counts.changed;
+            result.remaining -= counts.classified;
             result.chunks += 1;
         }
+        result.complete = result.remaining === 0;
         log(
-            `[dreamer] classify: stage=${stage} classified=${result.classified} changed=${result.changed} chunks=${result.chunks}`,
+            `[dreamer] classify: stage=${stage} classified=${result.classified} changed=${result.changed} chunks=${result.chunks} remaining=${result.remaining} complete=${result.complete}`,
         );
         return result;
     } finally {

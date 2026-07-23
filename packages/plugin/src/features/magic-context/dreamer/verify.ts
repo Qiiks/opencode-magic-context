@@ -79,6 +79,8 @@ export interface VerifyResult {
     archived: number;
     batches: number;
     inScope: number;
+    remaining: number;
+    complete: boolean;
     mode: string;
 }
 
@@ -89,6 +91,8 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
         archived: 0,
         batches: 0,
         inScope: 0,
+        remaining: 0,
+        complete: true,
         mode: "incremental",
     };
 
@@ -100,6 +104,7 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
     });
     result.mode = gate.mode;
     result.inScope = gate.inScope.length;
+    result.remaining = gate.inScope.length;
     log(
         `[dreamer] ${args.forceBroad ? "verify-broad" : "verify"} gate: mode=${gate.mode} in_scope=${gate.inScope.length} skipped=${gate.skippedIds.length} reason=${gate.reason}`,
     );
@@ -126,10 +131,12 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
             result.verified += counts.verified;
             result.updated += counts.updated;
             result.archived += counts.archived;
+            result.remaining -= counts.verified + counts.updated + counts.archived;
             result.batches += 1;
         }
+        result.complete = result.remaining === 0;
         log(
-            `[dreamer] ${args.forceBroad ? "verify-broad" : "verify"}: verified=${result.verified} updated=${result.updated} archived=${result.archived} batches=${result.batches}`,
+            `[dreamer] ${args.forceBroad ? "verify-broad" : "verify"}: verified=${result.verified} updated=${result.updated} archived=${result.archived} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}`,
         );
         return result;
     } finally {

@@ -16,6 +16,33 @@ import {
 } from "./classify";
 import { acquireLease } from "./lease";
 
+function assistantMessages(text: string) {
+    return [
+        {
+            info: { role: "assistant", time: { created: Date.now() } },
+            parts: [{ type: "text", text }],
+        },
+    ];
+}
+
+function successfulClassifyClient(onPrompt?: () => void) {
+    let manifest = "";
+    return {
+        session: {
+            create: async () => ({ data: { id: "classify-child" } }),
+            prompt: async (args: { body?: { parts?: Array<{ text?: string }> } }) => {
+                const prompt = args.body?.parts?.[0]?.text ?? "";
+                const ids = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) => Number(match[1]));
+                manifest = `<classify>${ids.map((id) => `<memory id="${id}" importance="80" scope="project" shareable="true"/>`).join("")}</classify>`;
+                onPrompt?.();
+                return {};
+            },
+            messages: async () => ({ data: assistantMessages(manifest) }),
+            delete: async () => ({}),
+        },
+    };
+}
+
 function freshDb(): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
@@ -37,6 +64,78 @@ function classifyArgs(db: Database, projectIdentity: string): ClassifyArgs {
         leaseKey,
         deadline: Date.now() + 60_000,
     };
+}
+
+describe("runClassify disposition", () => {
+    test("banks a completed chunk and reports the deadline remainder", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-deadline";
+            addMemoriesForDisposition(db, projectIdentity, 101);
+            const args = classifyArgs(db, projectIdentity);
+            args.client = successfulClassifyClient(() => {
+                args.deadline = Date.now() - 1;
+            }) as never;
+
+            const result = await runClassify(args);
+
+            expect(result.classified).toBe(100);
+            expect(result.remaining).toBe(1);
+            expect(result.complete).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("reports complete after fully draining the selected set", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-complete";
+            addMemoriesForDisposition(db, projectIdentity, 10);
+            const args = classifyArgs(db, projectIdentity);
+            args.client = successfulClassifyClient() as never;
+
+            const result = await runClassify(args);
+            expect(result.classified).toBe(10);
+            expect(result.remaining).toBe(0);
+            expect(result.complete).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("reports a swallowed chunk failure as incomplete", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-failure";
+            addMemoriesForDisposition(db, projectIdentity, 10);
+            const args = classifyArgs(db, projectIdentity);
+            args.client = {
+                session: {
+                    create: async () => {
+                        throw new Error("provider unavailable");
+                    },
+                },
+            } as never;
+
+            const result = await runClassify(args);
+            expect(result.complete).toBe(false);
+            expect(result.remaining).toBe(10);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+function addMemoriesForDisposition(db: Database, projectIdentity: string, count: number): void {
+    for (let index = 0; index < count; index += 1) {
+        insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "ARCHITECTURE",
+            content: `Classification fact ${index}.`,
+            sourceSessionId: "ses",
+        });
+    }
 }
 
 describe("applyClassifications", () => {
@@ -189,7 +288,14 @@ describe("module-backed classification", () => {
                 }),
             );
 
-            expect(result).toEqual({ classified: 10, changed: 10, chunks: 1, stage: 2 });
+            expect(result).toEqual({
+                classified: 10,
+                changed: 10,
+                chunks: 1,
+                stage: 2,
+                remaining: 0,
+                complete: true,
+            });
             const taskCall = calls.find((call) => call.method === "dreamer.run_task");
             const applyCall = calls.find((call) => call.method === "memory.set_classification");
             expect(

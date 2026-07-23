@@ -320,6 +320,7 @@ describe("task-scheduler — runDueTasksForProject", () => {
         expect(ran).toEqual(["verify"]);
         const state = getTaskScheduleState(db, PROJECT, "verify");
         expect(state?.lastStatus).toBe("completed");
+        expect(state?.lastRunAt).toBeGreaterThanOrEqual(now);
         expect(state?.nextDueAt).toBeGreaterThan(now);
     });
 
@@ -506,6 +507,7 @@ describe("task-scheduler — runDueTasksForProject", () => {
             await runDueTasksForProject({ db, projectIdentity: PROJECT, tasks, executor, now });
             const s = getTaskScheduleState(db, PROJECT, "verify");
             expect(s?.retryCount).toBe(attempt);
+            expect(s?.lastRunAt).toBeNull();
             expect(s?.nextDueAt).toBeLessThan(now); // still due
         }
         // Attempt 4 exceeds MAX_TASK_RETRIES=3 → advance + reset.

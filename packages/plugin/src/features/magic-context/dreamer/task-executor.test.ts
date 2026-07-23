@@ -454,6 +454,127 @@ describe("createDreamTaskExecutor — classify-memories", () => {
     });
 });
 
+describe("createDreamTaskExecutor — compress-cues", () => {
+    test("parks MODULE authority before any provider call", async () => {
+        db = freshDb();
+        const project = "/repo/module-cues";
+        ensureContextStoreUuid(db);
+        insertMemory(db, {
+            projectPath: project,
+            category: "ARCHITECTURE",
+            content: "A cue candidate that must not be sent to a provider.",
+        });
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "must-not-create" } })),
+                prompt: mock(async () => ({})),
+            },
+        };
+        const authorityStatus = mock(async () => ({
+            authority: { state: "MODULE", generation: 12 },
+        }));
+        const moduleCall = mock(async () => ({}));
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            experimentalMural: { enabled: true },
+            moduleClient: { authorityStatus, call: moduleCall } as never,
+        });
+        const leaseKey = leaseKeyFor("compress-cues", project);
+        expect(acquireLease(db, "holder-module-cues", leaseKey)).toBe(true);
+
+        const result = await executor(
+            { task: "compress-cues", schedule: "0 7 * * *", timeoutMinutes: 20 },
+            { db, projectIdentity: project, holderId: "holder-module-cues", leaseKey },
+        );
+
+        expect(result.status).toBe("failed");
+        expect(result.transient).toBe(true);
+        expect(result.error).toContain("MODULE memory authority has no cue write facade");
+        expect(authorityStatus).toHaveBeenCalledTimes(1);
+        expect(client.session.create).not.toHaveBeenCalled();
+        expect(client.session.prompt).not.toHaveBeenCalled();
+        expect(moduleCall).not.toHaveBeenCalled();
+    });
+
+    test("reports a structural membership failure as transient", async () => {
+        db = freshDb();
+        const project = "/repo/malformed-cues";
+        insertMemory(db, {
+            projectPath: project,
+            category: "ARCHITECTURE",
+            content: "A cue candidate omitted by the manifest.",
+        });
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "cue-child" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({ data: assistantMessages("<cues></cues>") })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            experimentalMural: { enabled: true },
+        });
+        const leaseKey = leaseKeyFor("compress-cues", project);
+        expect(acquireLease(db, "holder-malformed-cues", leaseKey)).toBe(true);
+
+        const result = await executor(
+            { task: "compress-cues", schedule: "0 7 * * *", timeoutMinutes: 20 },
+            { db, projectIdentity: project, holderId: "holder-malformed-cues", leaseKey },
+        );
+
+        expect(result.status).toBe("failed");
+        expect(result.transient).toBe(true);
+        expect(result.error).toContain("1 selected memories remain");
+        expect(client.session.prompt).toHaveBeenCalledTimes(1);
+    });
+
+    test("reports a fully drained cue set as completed", async () => {
+        db = freshDb();
+        const project = "/repo/complete-cues";
+        const memory = insertMemory(db, {
+            projectPath: project,
+            category: "ARCHITECTURE",
+            content: "A cue candidate completed by the manifest.",
+        });
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "cue-child" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({
+                    data: assistantMessages(
+                        `<cues><cue id="${memory.id}">completed anchor</cue></cues>`,
+                    ),
+                })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            experimentalMural: { enabled: true },
+        });
+        const leaseKey = leaseKeyFor("compress-cues", project);
+        expect(acquireLease(db, "holder-complete-cues", leaseKey)).toBe(true);
+
+        const result = await executor(
+            { task: "compress-cues", schedule: "0 7 * * *", timeoutMinutes: 20 },
+            { db, projectIdentity: project, holderId: "holder-complete-cues", leaseKey },
+        );
+
+        expect(result).toEqual({ status: "completed" });
+    });
+});
+
 describe("createDreamTaskExecutor — retrospective", () => {
     test("retrospective memory insert leaves project memory epoch unchanged", () => {
         db = freshDb();

@@ -11,6 +11,7 @@ import { log } from "../../../shared/logger";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { runLeaseGuardedWrite, startLeaseHeartbeat } from "../dreamer/lease";
+import { assertManifestCoversExactly } from "../dreamer/manifest-parser";
 import { getMemoriesByProject, type Memory } from "../memory";
 import {
     buildCompressCuesPrompt,
@@ -66,6 +67,8 @@ export interface CompressCuesResult {
     /** Cues the model returned that failed per-cue validation and were skipped. */
     skipped: number;
     chunks: number;
+    remaining: number;
+    complete: boolean;
 }
 
 /** A memory selected for (re)compression plus the content hash captured at
@@ -107,7 +110,13 @@ function selectCandidates(db: Database, projectIdentity: string): CueCandidate[]
 
 export async function runCompressCues(args: CompressCuesArgs): Promise<CompressCuesResult> {
     const candidates = selectCandidates(args.db, args.projectIdentity);
-    const result: CompressCuesResult = { compressed: 0, skipped: 0, chunks: 0 };
+    const result: CompressCuesResult = {
+        compressed: 0,
+        skipped: 0,
+        chunks: 0,
+        remaining: candidates.length,
+        complete: candidates.length === 0,
+    };
     if (candidates.length === 0) {
         log(`[dreamer] compress-cues: nothing to compress for ${args.projectIdentity}`);
         return result;
@@ -135,10 +144,12 @@ export async function runCompressCues(args: CompressCuesArgs): Promise<CompressC
             );
             result.compressed += counts.compressed;
             result.skipped += counts.skipped;
+            result.remaining -= counts.compressed;
             result.chunks += 1;
         }
+        result.complete = result.remaining === 0;
         log(
-            `[dreamer] compress-cues: compressed=${result.compressed} skipped=${result.skipped} chunks=${result.chunks}`,
+            `[dreamer] compress-cues: compressed=${result.compressed} skipped=${result.skipped} chunks=${result.chunks} remaining=${result.remaining} complete=${result.complete}`,
         );
         return result;
     } finally {
@@ -256,12 +267,17 @@ export function applyCues(
 ): { compressed: number; skipped: number } {
     const byId = new Map(chunk.map((candidate) => [candidate.memory.id, candidate]));
     const parsed = parseCuesManifest(manifestText);
+    assertManifestCoversExactly(
+        parsed.map((entry) => entry.id),
+        new Set(byId.keys()),
+        "cues",
+    );
     let compressed = 0;
     let skipped = 0;
     runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
         for (const entry of parsed) {
             const candidate = byId.get(entry.id);
-            if (!candidate) continue; // cue for a memory not in this chunk — ignore
+            if (!candidate) throw new Error(`cues manifest contains unknown id ${entry.id}`);
             const failure = validateCue(entry.cue, candidate.memory.importance ?? 50);
             if (failure) {
                 skipped += 1;

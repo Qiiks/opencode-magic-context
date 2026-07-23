@@ -217,6 +217,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         let moduleRoute: Awaited<ReturnType<typeof resolveDreamerModuleRoute>>;
         if (
             config.task === "map-memories" ||
+            config.task === "compress-cues" ||
             config.task === "verify" ||
             config.task === "verify-broad" ||
             config.task === "retrospective"
@@ -304,6 +305,13 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     recordRun("completed", null);
                     return { status: "completed" };
                 }
+                if (moduleRoute) {
+                    const reason =
+                        "compress-cues parked: MODULE memory authority has no cue write facade";
+                    log(`[dreamer] compress-cues: skipped (${reason})`);
+                    recordRun("failed", reason);
+                    return { status: "failed", transient: true, error: reason };
+                }
                 // Model ladder mirrors classify: task override → experimental.mural
                 // model (the cue COMPRESSOR model) → dreamer model → session model.
                 const result = await runCompressCues({
@@ -318,10 +326,15 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     model: config.model ?? deps.experimentalMural.model ?? deps.dreamerModel,
                     fallbackModels: config.fallbackModels,
                 });
-                recordRun("completed", null);
                 log(
-                    `[dreamer] compress-cues: compressed=${result.compressed} skipped=${result.skipped} chunks=${result.chunks}`,
+                    `[dreamer] compress-cues: compressed=${result.compressed} skipped=${result.skipped} chunks=${result.chunks} remaining=${result.remaining}`,
                 );
+                if (!result.complete) {
+                    const error = `compress-cues incomplete: ${result.remaining} selected memories remain`;
+                    recordRun("failed", error);
+                    return { status: "failed", transient: true, error };
+                }
+                recordRun("completed", null);
                 return { status: "completed" };
             }
 
@@ -360,16 +373,21 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     fallbackModels: config.fallbackModels,
                     moduleRoute,
                 });
-                recordRun("completed", null);
                 log(
                     `[dreamer] map-memories: mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining}`,
                 );
+                if (!result.complete) {
+                    const error = `map-memories incomplete: ${result.remaining} selected memories remain`;
+                    recordRun("failed", error);
+                    return { status: "failed", transient: true, error };
+                }
+                recordRun("completed", null);
                 return { status: "completed" };
             }
 
             if (config.task === "verify" || config.task === "verify-broad") {
                 const memoryBefore = getMemoryCountsByStatus(db, projectIdentity);
-                await runVerify({
+                const result = await runVerify({
                     db,
                     client: deps.client,
                     projectIdentity,
@@ -384,6 +402,13 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     language: config.language ?? deps.language,
                     moduleRoute,
                 });
+                if (!result.complete) {
+                    const error = `${config.task} incomplete: ${result.remaining} selected memories remain`;
+                    recordRun("failed", error, {
+                        memoryChanges: computeMemoryDelta(memoryBefore),
+                    });
+                    return { status: "failed", transient: true, error };
+                }
                 recordRun("completed", null, {
                     memoryChanges: computeMemoryDelta(memoryBefore),
                 });
@@ -457,10 +482,15 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     fallbackModels: config.fallbackModels,
                     ...moduleArgs,
                 });
-                recordRun("completed", null);
                 log(
-                    `[dreamer] classify-memories: stage=${result.stage} classified=${result.classified} changed=${result.changed} chunks=${result.chunks}`,
+                    `[dreamer] classify-memories: stage=${result.stage} classified=${result.classified} changed=${result.changed} chunks=${result.chunks} remaining=${result.remaining}`,
                 );
+                if (!result.complete) {
+                    const error = `classify-memories incomplete: ${result.remaining} selected memories remain`;
+                    recordRun("failed", error);
+                    return { status: "failed", transient: true, error };
+                }
+                recordRun("completed", null);
                 return { status: "completed" };
             }
 

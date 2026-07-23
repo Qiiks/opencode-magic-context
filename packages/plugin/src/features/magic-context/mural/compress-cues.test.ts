@@ -9,13 +9,40 @@ import { getMemoryById, insertMemory, updateMemoryContent } from "../memory";
 import { computeNormalizedHash } from "../memory/normalize-hash";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
-import { applyCues, type CompressCuesArgs } from "./compress-cues";
+import { applyCues, type CompressCuesArgs, runCompressCues } from "./compress-cues";
 import {
     computeCueContentHash,
     getMuralCueState,
     memoryNeedsCue,
     setMuralCue,
 } from "./storage-mural-cues";
+
+function assistantMessages(text: string) {
+    return [
+        {
+            info: { role: "assistant", time: { created: Date.now() } },
+            parts: [{ type: "text", text }],
+        },
+    ];
+}
+
+function successfulCueClient(onPrompt?: () => void) {
+    let manifest = "";
+    return {
+        session: {
+            create: async () => ({ data: { id: "cue-child" } }),
+            prompt: async (args: { body?: { parts?: Array<{ text?: string }> } }) => {
+                const prompt = args.body?.parts?.[0]?.text ?? "";
+                const ids = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) => Number(match[1]));
+                manifest = `<cues>${ids.map((id) => `<cue id="${id}">anchor ${id}</cue>`).join("")}</cues>`;
+                onPrompt?.();
+                return {};
+            },
+            messages: async () => ({ data: assistantMessages(manifest) }),
+            delete: async () => ({}),
+        },
+    };
+}
 
 function freshDb(): Database {
     const db = new Database(":memory:");
@@ -39,6 +66,84 @@ function cueArgs(db: Database, projectIdentity: string): CompressCuesArgs {
         deadline: Date.now() + 60_000,
     };
 }
+
+describe("runCompressCues disposition", () => {
+    test("banks a completed chunk and reports the deadline remainder", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:cues-deadline";
+            for (let index = 0; index < 41; index += 1) {
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content: `Cue fact ${index}.`,
+                    sourceSessionId: "ses",
+                });
+            }
+            const args = cueArgs(db, projectIdentity);
+            args.client = successfulCueClient(() => {
+                args.deadline = Date.now() - 1;
+            }) as never;
+
+            const result = await runCompressCues(args);
+
+            expect(result.compressed).toBe(40);
+            expect(result.remaining).toBe(1);
+            expect(result.complete).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("reports complete after fully draining the selected set", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:cues-complete";
+            insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Cue fact.",
+                sourceSessionId: "ses",
+            });
+            const args = cueArgs(db, projectIdentity);
+            args.client = successfulCueClient() as never;
+
+            const result = await runCompressCues(args);
+            expect(result.compressed).toBe(1);
+            expect(result.remaining).toBe(0);
+            expect(result.complete).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("reports a swallowed chunk failure as incomplete", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:cues-failure";
+            insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Cue fact.",
+                sourceSessionId: "ses",
+            });
+            const args = cueArgs(db, projectIdentity);
+            args.client = {
+                session: {
+                    create: async () => {
+                        throw new Error("provider unavailable");
+                    },
+                },
+            } as never;
+
+            const result = await runCompressCues(args);
+            expect(result.complete).toBe(false);
+            expect(result.remaining).toBe(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
 
 describe("mural cue storage", () => {
     test("setMuralCue writes cue + hash; getMuralCueState reads them back", () => {
@@ -158,7 +263,19 @@ describe("applyCues (per-cue validation, skip-not-reject, hash-race)", () => {
         }
     });
 
-    test("ignores a cue for a memory outside the chunk", () => {
+    test.each([
+        ["missing", (_id: number) => `<cues></cues>`, /missing id/],
+        [
+            "duplicate",
+            (id: number) => `<cues><cue id="${id}">one</cue><cue id="${id}">two</cue></cues>`,
+            /duplicate id/,
+        ],
+        [
+            "foreign",
+            (id: number) => `<cues><cue id="${id}">ok</cue><cue id="99999">stray</cue></cues>`,
+            /unknown id/,
+        ],
+    ])("rejects %s manifest membership before writing", (_kind, manifestFor, error) => {
         const db = freshDb();
         try {
             const memory = insertMemory(db, {
@@ -168,9 +285,11 @@ describe("applyCues (per-cue validation, skip-not-reject, hash-race)", () => {
                 sourceSessionId: "s",
             });
             const chunk = [{ memory, contentHash: computeCueContentHash(memory.content) }];
-            const manifest = `<cues><cue id="${memory.id}">ok</cue><cue id="99999">stray</cue></cues>`;
-            const result = applyCues(cueArgs(db, "git:p"), chunk, manifest);
-            expect(result.compressed).toBe(1);
+
+            expect(() => applyCues(cueArgs(db, "git:p"), chunk, manifestFor(memory.id))).toThrow(
+                error,
+            );
+            expect(getMuralCueState(db, [memory.id]).get(memory.id)?.cue ?? null).toBeNull();
         } finally {
             closeQuietly(db);
         }

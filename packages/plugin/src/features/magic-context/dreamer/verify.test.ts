@@ -23,7 +23,7 @@ import {
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { acquireLease } from "./lease";
-import { applyVerifyManifest, type VerifyArgs } from "./verify";
+import { applyVerifyManifest, runVerify, type VerifyArgs } from "./verify";
 
 const tempDirs: string[] = [];
 
@@ -64,6 +64,112 @@ afterEach(() => {
     for (const dir of tempDirs.splice(0)) {
         rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
+});
+
+function assistantMessages(text: string) {
+    return [
+        {
+            info: { role: "assistant", time: { created: Date.now() } },
+            parts: [{ type: "text", text }],
+        },
+    ];
+}
+
+function successfulVerifyClient(onPrompt?: () => void) {
+    let manifest = "";
+    return {
+        session: {
+            create: async () => ({ data: { id: "verify-child" } }),
+            prompt: async (args: { body?: { parts?: Array<{ text?: string }> } }) => {
+                const prompt = args.body?.parts?.[0]?.text ?? "";
+                const ids = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) => Number(match[1]));
+                manifest = `<verify>${ids.map((id) => `<verified id="${id}" files="src/fact.ts"/>`).join("")}</verify>`;
+                onPrompt?.();
+                return {};
+            },
+            messages: async () => ({ data: assistantMessages(manifest) }),
+            delete: async () => ({}),
+        },
+    };
+}
+
+function addMappedMemories(db: Database, projectIdentity: string, count: number): void {
+    for (let index = 0; index < count; index += 1) {
+        const memory = insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "ARCHITECTURE",
+            content: `Mapped fact ${index}.`,
+            sourceSessionId: "ses",
+        });
+        recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1_000);
+    }
+}
+
+describe("runVerify disposition", () => {
+    test("banks a completed batch and reports the deadline remainder", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-deadline";
+            const dir = tempProject();
+            addMappedMemories(db, projectIdentity, 51);
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.forceBroad = true;
+            args.client = successfulVerifyClient(() => {
+                args.deadline = Date.now() - 1;
+            }) as never;
+
+            const result = await runVerify(args);
+
+            expect(result.verified).toBe(50);
+            expect(result.remaining).toBe(1);
+            expect(result.complete).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("reports complete after fully draining the selected set", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-complete";
+            const dir = tempProject();
+            addMappedMemories(db, projectIdentity, 1);
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.forceBroad = true;
+            args.client = successfulVerifyClient() as never;
+
+            const result = await runVerify(args);
+            expect(result.verified).toBe(1);
+            expect(result.remaining).toBe(0);
+            expect(result.complete).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("reports a swallowed batch failure as incomplete", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-failure";
+            const dir = tempProject();
+            addMappedMemories(db, projectIdentity, 1);
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.forceBroad = true;
+            args.client = {
+                session: {
+                    create: async () => {
+                        throw new Error("provider unavailable");
+                    },
+                },
+            } as never;
+
+            const result = await runVerify(args);
+            expect(result.complete).toBe(false);
+            expect(result.remaining).toBe(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
 });
 
 describe("applyVerifyManifest", () => {
