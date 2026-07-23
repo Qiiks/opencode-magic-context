@@ -5433,7 +5433,7 @@ impl McHandler {
                 parsed.messages.iter().map(|m| m.ck.clone()).collect(),
                 parsed.full_array_fingerprint.clone(),
             );
-            attach_native_messages(&mut response, &parsed, 0);
+            attach_native_messages(&mut response, &parsed, 0, None);
             return respond(serde_json::to_value(response).unwrap_or(Value::Null));
         }
         if self.dreamer_run_registered(&parsed.session_id) {
@@ -5445,7 +5445,7 @@ impl McHandler {
                         parsed.messages.iter().map(|m| m.ck.clone()).collect(),
                         parsed.full_array_fingerprint.clone(),
                     );
-                    attach_native_messages(&mut response, &parsed, 0);
+                    attach_native_messages(&mut response, &parsed, 0, None);
                     return respond(serde_json::to_value(response).unwrap_or(Value::Null));
                 }
                 Err(BindingError::Unbound) => {
@@ -5770,6 +5770,7 @@ impl McHandler {
         let post_attach_started_at = Instant::now();
         let revert_epoch = result.revert_epoch;
         let reasoning_watermark = result.reasoning_watermark;
+        let mutation_exempt_mid = result.mutation_exempt_mid;
         let mut response = result.response;
         if response.committed {
             self.guidance_dates
@@ -5788,6 +5789,7 @@ impl McHandler {
                 &parsed,
                 reasoning_watermark,
                 &tag_numbers,
+                mutation_exempt_mid.as_deref(),
             );
         }
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
@@ -8448,12 +8450,14 @@ fn attach_native_messages(
     response: &mut transform::TransformResponse,
     request: &TransformRequest,
     reasoning_watermark: u64,
+    mutation_exempt_mid: Option<&str>,
 ) {
     attach_native_messages_with_tags(
         response,
         request,
         reasoning_watermark,
         &std::collections::BTreeMap::new(),
+        mutation_exempt_mid,
     );
 }
 
@@ -8480,6 +8484,7 @@ fn attach_native_messages_with_tags(
     request: &TransformRequest,
     reasoning_watermark: u64,
     tag_numbers: &std::collections::BTreeMap<String, u64>,
+    mutation_exempt_mid: Option<&str>,
 ) {
     if !request.serve_native {
         return;
@@ -8495,8 +8500,12 @@ fn attach_native_messages_with_tags(
         .iter()
         .map(|message| message.deref().clone())
         .collect::<Vec<_>>();
-    let mut native_messages =
-        codec::encode_opencode_with_session(&served_messages, &sidecar, Some(&request.session_id));
+    let mut native_messages = codec::encode_opencode_with_session(
+        &served_messages,
+        &sidecar,
+        Some(&request.session_id),
+        mutation_exempt_mid,
+    );
     if let Some(profile) = SerializerProfile::parse(&request.serializer_profile) {
         transform::clear_served_native_reasoning_with_tags(
             profile,
@@ -11662,6 +11671,7 @@ mod tests {
             &parsed,
             reasoning_watermark,
             &old_tag_numbers,
+            None,
         );
         assert_eq!(replay.native_messages, Some(actual_native));
     }

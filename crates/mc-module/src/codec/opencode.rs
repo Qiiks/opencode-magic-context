@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
@@ -221,8 +221,12 @@ pub fn decode_opencode_with_sidecar(
     }
 }
 
-pub fn encode_opencode(messages: &[CkWireMessage], sidecar: &DecodeSidecar) -> Vec<MessageV2Json> {
-    encode_opencode_impl(messages, sidecar, None, false)
+pub fn encode_opencode(
+    messages: &[CkWireMessage],
+    sidecar: &DecodeSidecar,
+    mutation_exempt_mid: Option<&str>,
+) -> Vec<MessageV2Json> {
+    encode_opencode_impl(messages, sidecar, None, false, mutation_exempt_mid)
 }
 
 /// Encode CK messages back to OpenCode while optionally supplying the session id used by
@@ -233,8 +237,9 @@ pub fn encode_opencode_with_session(
     messages: &[CkWireMessage],
     sidecar: &DecodeSidecar,
     session_id: Option<&str>,
+    mutation_exempt_mid: Option<&str>,
 ) -> Vec<MessageV2Json> {
-    encode_opencode_impl(messages, sidecar, session_id, true)
+    encode_opencode_impl(messages, sidecar, session_id, true, mutation_exempt_mid)
 }
 
 fn encode_opencode_impl(
@@ -242,8 +247,8 @@ fn encode_opencode_impl(
     sidecar: &DecodeSidecar,
     session_id: Option<&str>,
     preserve_compaction: bool,
+    mutation_exempt_mid: Option<&str>,
 ) -> Vec<MessageV2Json> {
-    let mutation_exempt_mid = latest_reasoning_assistant_mid(messages);
     let mut encoded = Vec::with_capacity(messages.len());
     let mut synthetic_index = 0;
     let mut index = 0;
@@ -275,49 +280,6 @@ fn encode_opencode_impl(
         index += 1;
     }
     encoded
-}
-
-/// Anthropic verifies the latest assistant reasoning blocks against the original response.
-/// Returning its retained ingress value avoids re-encoding that message after transform.
-fn latest_reasoning_assistant_mid(messages: &[CkWireMessage]) -> Option<&str> {
-    messages
-        .iter()
-        .rev()
-        .find(|message| !message.meta.synthetic && message.role == "assistant")
-        .filter(|message| {
-            message
-                .content
-                .iter()
-                .find(|block| !is_reasoning_ignored_block(block))
-                .is_some_and(|block| {
-                    matches!(
-                        &block.kind,
-                        CkKind::Reasoning { .. } | CkKind::RedactedReasoning { .. }
-                    )
-                })
-        })
-        .and_then(|message| message.meta.harness_id.as_deref())
-}
-
-fn is_reasoning_ignored_block(block: &CkWireBlock) -> bool {
-    if matches!(&block.kind, CkKind::Text { text } if text.is_empty()) {
-        return true;
-    }
-    matches!(
-        &block.kind,
-        CkKind::Opaque(opaque)
-            if matches!(
-                opaque.kind.as_str(),
-                "step-start"
-                    | "step-finish"
-                    | "snapshot"
-                    | "patch"
-                    | "agent"
-                    | "retry"
-                    | "subtask"
-                    | "compaction"
-            )
-    )
 }
 
 fn decode_tool_part(
@@ -522,24 +484,60 @@ fn encode_with_meta(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let block_meta_by_index: BTreeMap<usize, &BlockMeta> = meta
+    let mut meta_cursor = 0;
+    let matched_metas = msg
+        .content
+        .iter()
+        .map(|block| {
+            let match_index = meta.blocks[meta_cursor..]
+                .iter()
+                .position(|block_meta| block_matches_meta(block, block_meta))
+                .map(|offset| meta_cursor + offset);
+            if let Some(match_index) = match_index {
+                meta_cursor = match_index + 1;
+                Some(&meta.blocks[match_index])
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let retained_native_indices = matched_metas
+        .iter()
+        .filter_map(|block_meta| block_meta.and_then(|block_meta| block_meta.native_index))
+        .collect::<BTreeSet<_>>();
+    let decoded_native_indices = meta
         .blocks
         .iter()
-        .map(|block_meta| (block_meta.block_index, block_meta))
-        .collect();
+        .filter_map(|block_meta| block_meta.native_index)
+        .collect::<BTreeSet<_>>();
 
-    for (block_index, block) in msg.content.iter().enumerate() {
-        if let Some(block_meta) = block_meta_by_index.get(&block_index) {
-            if let Some(part_index) = block_meta.native_index {
-                if let Some(part) = parts.get_mut(part_index) {
+    for (block, block_meta) in msg.content.iter().zip(matched_metas) {
+        if let Some(part_index) = block_meta.and_then(|block_meta| block_meta.native_index) {
+            if let Some(part) = parts.get_mut(part_index) {
+                // Reasoning parts may contain provider signatures, so changing their bytes could
+                // invalidate verification. Preserve the matched native reasoning part exactly;
+                // apply updates only to separately mapped sibling parts.
+                if !matches!(
+                    &block.kind,
+                    CkKind::Reasoning { .. } | CkKind::RedactedReasoning { .. }
+                ) {
                     update_part_from_block(part, block);
-                    continue;
                 }
+                continue;
             }
         }
         parts.push(render_block_as_part(block));
     }
 
+    parts = parts
+        .into_iter()
+        .enumerate()
+        .filter_map(|(part_index, part)| {
+            let decoded_block_was_removed = decoded_native_indices.contains(&part_index)
+                && !retained_native_indices.contains(&part_index);
+            (!decoded_block_was_removed).then_some(part)
+        })
+        .collect();
     if !preserve_compaction {
         parts.retain(|part| part.get("type").and_then(Value::as_str) != Some("compaction"));
     }
@@ -559,7 +557,34 @@ fn encode_with_meta(
             "parts": parts,
         });
     }
-    raw
+    if raw == meta.raw {
+        meta.raw.clone()
+    } else {
+        raw
+    }
+}
+
+fn block_matches_meta(block: &CkWireBlock, meta: &BlockMeta) -> bool {
+    match &block.kind {
+        CkKind::Text { text } => {
+            meta.kind == "text"
+                || (text.is_empty()
+                    && matches!(meta.kind.as_str(), "reasoning" | "redacted_reasoning"))
+        }
+        CkKind::Reasoning { .. } => meta.kind == "reasoning",
+        CkKind::RedactedReasoning { .. } => {
+            matches!(meta.kind.as_str(), "reasoning" | "redacted_reasoning")
+        }
+        CkKind::ToolCall { id, .. } => {
+            meta.kind == "tool_call" && meta.native_id.as_deref().is_none_or(|native| native == id)
+        }
+        CkKind::ToolResult { id, .. } => {
+            meta.kind == "tool_result"
+                && meta.native_id.as_deref().is_none_or(|native| native == id)
+        }
+        CkKind::Media(_) => meta.kind == "file",
+        CkKind::Opaque(opaque) => meta.kind == opaque.kind,
+    }
 }
 
 fn update_part_from_block(part: &mut Value, block: &CkWireBlock) {
@@ -968,7 +993,7 @@ mod tests {
             CkKind::Text { ref text } if text.is_empty()
         ));
         assert_eq!(
-            encode_opencode(&[decoded.messages[0].ck.clone()], &decoded.sidecar),
+            encode_opencode(&[decoded.messages[0].ck.clone()], &decoded.sidecar, None),
             raw
         );
     }
@@ -1011,7 +1036,7 @@ mod tests {
             "msg_boundary"
         );
         assert_eq!(decoded.boundary.as_ref().unwrap().part_index, Some(1));
-        let encoded = encode_opencode(&[decoded.messages[0].ck.clone()], &decoded.sidecar);
+        let encoded = encode_opencode(&[decoded.messages[0].ck.clone()], &decoded.sidecar, None);
         let encoded_parts = encoded[0].get("parts").and_then(Value::as_array).unwrap();
         assert!(encoded_parts
             .iter()
@@ -1019,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_assistant_reasoning_keeps_ingress_bytes_verbatim() {
+    fn resolved_reasoning_exemption_and_completed_sibling_mutation_are_distinct() {
         let raw = vec![
             json!({
                 "info": { "id": "msg_old", "role": "assistant" },
@@ -1045,32 +1070,32 @@ mod tests {
             .iter()
             .map(|message| message.ck.clone())
             .collect::<Vec<_>>();
-        output[1].content.swap(0, 1);
+
+        let untouched = encode_opencode_with_session(
+            &output,
+            &decoded.sidecar,
+            Some("ses_live"),
+            Some("msg_latest"),
+        );
+        assert_eq!(
+            untouched[1], raw[1],
+            "the transform-resolved live exemption replays untouched ingress exactly"
+        );
+
         let latest_text = output[1]
             .content
             .iter_mut()
             .find(|block| matches!(&block.kind, CkKind::Text { .. }))
             .unwrap();
         latest_text.kind = CkKind::Text {
-            text: "mutated latest answer".to_string(),
+            text: "§7§ mutated latest answer".to_string(),
         };
-
-        let latest_meta = meta_for_ck(&decoded.sidecar, &output[1], 1).unwrap();
-        let naive = encode_with_meta(&output[1], latest_meta, true);
-        assert_ne!(
-            naive, raw[1],
-            "the mutation trigger must differ before the exemption"
-        );
-        assert_eq!(
-            naive["parts"][1]["type"], "step-start",
-            "naive index-based encode changes the signed reasoning part"
-        );
-
-        let served = encode_opencode_with_session(&output, &decoded.sidecar, Some("ses_live"));
-        assert_eq!(
-            served[1], raw[1],
-            "latest signed assistant must retain ingress bytes"
-        );
+        let served =
+            encode_opencode_with_session(&output, &decoded.sidecar, Some("ses_live"), None);
+        assert_eq!(served[1]["parts"][1], raw[1]["parts"][1]);
+        assert_eq!(served[1]["parts"][3], raw[1]["parts"][3]);
+        assert_eq!(served[1]["parts"][2]["text"], "§7§ mutated latest answer");
+        assert_eq!(served[1]["info"]["providerField"], "keep");
     }
 
     #[test]
@@ -1090,7 +1115,6 @@ mod tests {
             .map(|message| message.ck.clone())
             .collect::<Vec<_>>();
 
-        assert_eq!(latest_reasoning_assistant_mid(&output), None);
         output[0].content[1].kind = CkKind::Text {
             text: "§18240§ answer".to_string(),
         };
@@ -1098,7 +1122,8 @@ mod tests {
             text: String::new(),
         };
 
-        let served = encode_opencode_with_session(&output, &decoded.sidecar, Some("ses_live"));
+        let served =
+            encode_opencode_with_session(&output, &decoded.sidecar, Some("ses_live"), None);
         assert_eq!(served[0]["parts"][1]["text"], "§18240§ answer");
         assert_eq!(served[0]["parts"][2]["type"], "text");
         assert_eq!(served[0]["parts"][2]["text"], "");
