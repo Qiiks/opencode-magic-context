@@ -3195,6 +3195,7 @@ impl McHandler {
             &store,
             &parsed.messages,
             &live,
+            &projection.identity_by_mid,
             HistorianAssemblerConfig {
                 session_id: parsed.session_id.clone(),
                 project_path: project_path.to_string(),
@@ -3350,6 +3351,7 @@ impl McHandler {
             &store,
             &parsed.messages,
             &live,
+            &projection.identity_by_mid,
             HistorianAssemblerConfig {
                 session_id: parsed.session_id.clone(),
                 project_path: project_path.clone(),
@@ -12762,7 +12764,18 @@ mod tests {
             default_test_config(),
             resolver,
         );
+        let selected_range_identities = vec![mc_store::HistorianSelectedMessageIdentity {
+            mid: "m10".to_string(),
+            block_identities: vec![mc_store::BlockIdentity {
+                kind_tag: "text".to_string(),
+                byte_fingerprint: "m10-content".to_string(),
+            }],
+        }];
         let meta = ModuleMeta {
+            block_identity_by_mid: selected_range_identities
+                .iter()
+                .map(|selected| (selected.mid.clone(), selected.block_identities.clone()))
+                .collect(),
             historian: HistorianDurableState {
                 state: HistorianPhase::Publishing,
                 firing_seq: 7,
@@ -12771,6 +12784,7 @@ mod tests {
                     to_ordinal: 12,
                 }),
                 chunk_fingerprint: "fp".to_string(),
+                selected_range_identities: selected_range_identities.clone(),
                 producer_session_id: Some("producer".to_string()),
                 producer_run_id: Some("run".to_string()),
                 fired_at_ms: Some(1),
@@ -12793,6 +12807,7 @@ mod tests {
                     firing_seq: 7,
                     producer_run_id: "run".to_string(),
                     chunk_fingerprint: "fp".to_string(),
+                    selected_range_identities,
                 },
                 project_path: project.to_str().unwrap(),
                 compartments: &[stored_comp(1, 10, 12, "m12#0", "summary")],
@@ -15320,14 +15335,18 @@ mod tests {
         parsed.session_id = session_id.to_string();
         parsed.serializer_profile = SerializerProfile::ClaudeCodeAnthropic.wire_id().to_string();
         let retained_bytes = serde_json::to_vec(&parsed).unwrap().len();
-        let revert_epoch = handler
-            .store
-            .get()
-            .unwrap()
-            .load(session_id)
-            .unwrap()
-            .meta
-            .revert_epoch;
+        let projection = crate::ck_wire::project_messages(&parsed.messages).unwrap();
+        let store = handler.store.get().unwrap();
+        let loaded = store.load(session_id).unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.block_identity_by_mid
+            .extend(projection.identity_by_mid);
+        let revert_epoch = meta.revert_epoch;
+        if meta != loaded.meta {
+            store
+                .commit(session_id, loaded.row_version, &loaded.core, &meta)
+                .unwrap();
+        }
         let mut snapshots = handler
             .transform_snapshots
             .lock()
@@ -18233,19 +18252,40 @@ mod tests {
         assert!(sessions.lock().unwrap().is_empty());
     }
 
+    fn seeded_historian_identities() -> Vec<mc_store::HistorianSelectedMessageIdentity> {
+        vec![mc_store::HistorianSelectedMessageIdentity {
+            mid: "seeded-mid".to_string(),
+            block_identities: vec![mc_store::BlockIdentity {
+                kind_tag: "text".to_string(),
+                byte_fingerprint: "seeded-content".to_string(),
+            }],
+        }]
+    }
+
     fn seed_awaiting(store: &McStore, messages: &[CkIngressMessage]) {
-        let live = crate::ck_wire::project_messages(messages).unwrap().blocks;
+        let canonical_messages = transform_request(messages.to_vec(), 1, 200_000).messages;
+        let projection = crate::ck_wire::project_messages(&canonical_messages).unwrap();
         let chunk = historian_chunk::build_historian_chunk(
-            messages,
-            &live,
+            &canonical_messages,
+            &projection.blocks,
             1,
             DEFAULT_HISTORIAN_CHUNK_TOKENS,
             4,
         );
         let fingerprint_items: Vec<_> = chunk.snapshot.iter().map(|item| item.as_item()).collect();
         let fingerprint = historian::compute_chunk_fingerprint(&fingerprint_items);
+        let selected_range_identities = canonical_messages
+            .iter()
+            .filter(|message| !message.ck.meta.synthetic && (1..=3).contains(&message.ordinal))
+            .map(|message| mc_store::HistorianSelectedMessageIdentity {
+                mid: message.mid.clone(),
+                block_identities: projection.identity_by_mid[&message.mid].clone(),
+            })
+            .collect();
         let loaded = store.load("ses").unwrap();
         let mut meta = loaded.meta;
+        meta.block_identity_by_mid
+            .extend(projection.identity_by_mid);
         meta.historian = HistorianDurableState {
             state: HistorianPhase::AwaitingProducer,
             firing_seq: 1,
@@ -18254,6 +18294,7 @@ mod tests {
                 to_ordinal: 3,
             }),
             chunk_fingerprint: fingerprint,
+            selected_range_identities,
             producer_session_id: Some("producer-session".to_string()),
             producer_run_id: Some("run-reattach".to_string()),
             fired_at_ms: Some(1),
@@ -18270,6 +18311,11 @@ mod tests {
     fn seed_historian_phase(store: &McStore, phase: HistorianPhase) {
         let loaded = store.load("ses").unwrap();
         let mut meta = loaded.meta;
+        let selected_range_identities = seeded_historian_identities();
+        for selected in &selected_range_identities {
+            meta.block_identity_by_mid
+                .insert(selected.mid.clone(), selected.block_identities.clone());
+        }
         meta.historian = HistorianDurableState {
             state: phase,
             firing_seq: 1,
@@ -18278,6 +18324,7 @@ mod tests {
                 to_ordinal: 3,
             }),
             chunk_fingerprint: "seeded-fingerprint".to_string(),
+            selected_range_identities,
             producer_session_id: Some("producer-session".to_string()),
             producer_run_id: Some("run-stale".to_string()),
             fired_at_ms: Some(1),
@@ -18307,6 +18354,7 @@ mod tests {
             1,
             3,
             "seeded-fingerprint".to_string(),
+            Vec::new(),
             0,
             1,
         )
@@ -18596,6 +18644,7 @@ mod tests {
                     firing_seq: 1,
                     producer_run_id: "run-stale".to_string(),
                     chunk_fingerprint: "seeded-fingerprint".to_string(),
+                    selected_range_identities: seeded_historian_identities(),
                 },
                 project_path: "git:proj",
                 compartments: &[stored_comp(1, 10, 20, "m20", "summary")],
