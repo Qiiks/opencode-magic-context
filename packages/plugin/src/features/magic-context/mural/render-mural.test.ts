@@ -3,8 +3,10 @@ import { describe, expect, test } from "bun:test";
 import {
     MURAL_HEIGHT,
     MURAL_ROOM_WIDTH,
+    MURAL_VISION_TILE,
     MURAL_WIDTH,
     type MuralRenderEntry,
+    muralImageTokenEstimateForDimensions,
     renderMural,
 } from "./render-mural";
 
@@ -12,6 +14,15 @@ const CATEGORIES = ["PROJECT_RULES", "ARCHITECTURE", "CONSTRAINTS", "CONFIG_VALU
 
 function longestLine(text: string): number {
     return Math.max(...text.split("\n").map((line) => [...line.replace(/\s+$/, "")].length), 0);
+}
+
+function syntheticEntries(count: number): MuralRenderEntry[] {
+    return Array.from({ length: count }, (_, index) => ({
+        id: index + 1,
+        category: CATEGORIES[index % CATEGORIES.length]!,
+        importance: 80,
+        cue: `cue ${index} anchor→target relation`,
+    }));
 }
 
 describe("deterministic mural renderer", () => {
@@ -28,6 +39,28 @@ describe("deterministic mural renderer", () => {
         expect(first.sha256Input).toBe(second.sha256Input);
         expect(first.png.slice(0, 8)).toEqual(new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]));
         expect([MURAL_WIDTH, MURAL_HEIGHT]).toEqual([1092, 1092]);
+    });
+
+    test("sizes sparse pools to their content and keeps a full pool at the cap", () => {
+        for (const count of [7, 50, 200]) {
+            const result = renderMural(syntheticEntries(count));
+            expect(result.width % MURAL_VISION_TILE).toBe(0);
+            expect(result.height % MURAL_VISION_TILE).toBe(0);
+            if (count === 7) {
+                // One 72-character column is 360 pixels; the snapped canvas has
+                // no reason to reserve the old three-column width.
+                expect(result.width).toBe(364);
+                expect(result.width).toBeLessThan(MURAL_WIDTH / 2);
+                expect(
+                    muralImageTokenEstimateForDimensions(result.width, result.height),
+                ).toBeLessThan(300);
+            } else if (count === 50) {
+                expect(result.width).toBeLessThan(MURAL_WIDTH);
+                expect(result.height).toBeLessThan(MURAL_HEIGHT);
+            } else {
+                expect([result.width, result.height]).toEqual([MURAL_WIDTH, MURAL_HEIGHT]);
+            }
+        }
     });
 
     test("fills all three columns on a 300-cue fixture (>80% line occupancy)", () => {

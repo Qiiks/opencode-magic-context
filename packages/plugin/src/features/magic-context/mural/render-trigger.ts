@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 
+import { log } from "../../../shared/logger";
 import { modelSupportsVision } from "../../../shared/models-dev-cache";
 import type { Database } from "../../../shared/sqlite";
 import { DEFAULT_MURAL_MEMORY_BUDGET } from "./mural-selection";
-import { MURAL_HEIGHT, MURAL_WIDTH, renderMural } from "./render-mural";
+import { renderMural } from "./render-mural";
 import type { MuralWireOptions } from "./resolve-mural";
-import { resolveMural } from "./resolve-mural";
+import { getMuralCoverage, resolveMural } from "./resolve-mural";
 import { getMural, upsertMural } from "./storage-mural";
 
 /**
@@ -22,6 +23,8 @@ import { getMural, upsertMural } from "./storage-mural";
  */
 
 export const DETERMINISTIC_MURAL_MODEL = "deterministic";
+export const MIN_MURAL_CUED_MEMORIES = 15;
+export const MIN_MURAL_COVERAGE = 0.5;
 
 export interface EnsureMuralResult {
     /** True when a resolved cue pool exists (the mural block should be injected). */
@@ -32,6 +35,18 @@ export interface EnsureMuralResult {
     contentHash?: string;
     /** True when this call re-rendered + upserted (the text changed or was new). */
     rerendered: boolean;
+    /** Set when the coverage gate intentionally omitted the mural. */
+    skipReason?: string;
+    width?: number;
+    height?: number;
+}
+
+/** A mural is useful with enough cues or broad enough pool coverage. */
+export function muralCoverageGate(cuedMemoryCount: number, activeMemoryCount: number): boolean {
+    return (
+        cuedMemoryCount >= MIN_MURAL_CUED_MEMORIES ||
+        cuedMemoryCount >= MIN_MURAL_COVERAGE * activeMemoryCount
+    );
 }
 
 /**
@@ -47,11 +62,23 @@ export function ensureMuralRendered(
     projectIdentity: string,
     budgetTokens: number = DEFAULT_MURAL_MEMORY_BUDGET,
 ): EnsureMuralResult {
+    const coverage = getMuralCoverage(db, projectIdentity);
+    if (
+        coverage.activeMemoryCount === 0 ||
+        !muralCoverageGate(coverage.cuedMemoryCount, coverage.activeMemoryCount)
+    ) {
+        const skipReason =
+            coverage.activeMemoryCount === 0
+                ? "no active memories"
+                : `only ${coverage.cuedMemoryCount}/${coverage.activeMemoryCount} active memories have current cues (requires ${MIN_MURAL_CUED_MEMORIES} cues or ${MIN_MURAL_COVERAGE * 100}% coverage)`;
+        log(`[mural] skipped for ${projectIdentity}: ${skipReason}`);
+        return { hasMural: false, rerendered: false, skipReason };
+    }
+
     const entries = resolveMural(db, projectIdentity, budgetTokens);
     if (entries.length === 0) {
-        // Empty cue pool → no mural block. Leave any stale stored row alone (the
-        // dashboard can still show the last render); the injection path omits the
-        // block when hasMural is false.
+        // Empty overflow pool → no mural block. Leave any stale stored row alone
+        // so the dashboard can still show the last render.
         return { hasMural: false, rerendered: false };
     }
 
@@ -62,13 +89,20 @@ export function ensureMuralRendered(
     const textHash = createHash("sha256").update(rendered.sha256Input).digest("hex");
 
     const existing = getMural(db, projectIdentity);
-    if (existing && existing.contentHash === textHash) {
+    if (
+        existing &&
+        existing.contentHash === textHash &&
+        existing.width === rendered.width &&
+        existing.height === rendered.height
+    ) {
         // Unchanged: reuse the stored PNG (already the right bytes) without re-encoding.
         return {
             hasMural: true,
             dataUrl: `data:image/png;base64,${existing.image.toString("base64")}`,
             contentHash: existing.contentHash,
             rerendered: false,
+            width: existing.width,
+            height: existing.height,
         };
     }
 
@@ -82,8 +116,8 @@ export function ensureMuralRendered(
         renderedAt: Date.now(),
         model: DETERMINISTIC_MURAL_MODEL,
         memoryIds: rendered.renderedIds,
-        width: MURAL_WIDTH,
-        height: MURAL_HEIGHT,
+        width: rendered.width,
+        height: rendered.height,
     });
 
     return {
@@ -91,6 +125,8 @@ export function ensureMuralRendered(
         dataUrl: rendered.dataUrl,
         contentHash: textHash,
         rerendered: true,
+        width: rendered.width,
+        height: rendered.height,
     };
 }
 

@@ -23,6 +23,37 @@ export interface ResolvedMuralEntry {
     cue: string;
 }
 
+export interface MuralCoverage {
+    /** Active and permanent memories eligible for mural cueing. */
+    activeMemoryCount: number;
+    /** Eligible memories with a non-null compressed cue generated for current content. */
+    cuedMemoryCount: number;
+}
+
+/** Count current cues across the full active and permanent memory pool before
+ * limiting it to the overflow subset used to build the mural. */
+export function getMuralCoverage(db: Database, projectIdentity: string): MuralCoverage {
+    const memories = getMemoriesByProject(db, projectIdentity, ["active", "permanent"]);
+    const cueState = getMuralCueState(
+        db,
+        memories.map((memory) => memory.id),
+    );
+    let cuedMemoryCount = 0;
+    for (const memory of memories) {
+        const state = cueState.get(memory.id);
+        if (
+            state &&
+            typeof state.cue === "string" &&
+            state.cue.trim() !== "" &&
+            state.hash !== null &&
+            state.hash === computeCueContentHash(memory.content)
+        ) {
+            cuedMemoryCount += 1;
+        }
+    }
+    return { activeMemoryCount: memories.length, cuedMemoryCount };
+}
+
 /**
  * Compute the deterministic mural entry list for a project — the zero-LLM half
  * of the cutover, callable any time.

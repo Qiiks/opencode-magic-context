@@ -8,8 +8,9 @@ import { insertMemory, setMemoryClassification } from "../memory";
 import type { Memory } from "../memory/types";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
-import { ensureMuralRendered } from "./render-trigger";
+import { ensureMuralRendered, muralCoverageGate } from "./render-trigger";
 import { resolveMural } from "./resolve-mural";
+import { getMural } from "./storage-mural";
 import { computeCueContentHash, setMuralCue } from "./storage-mural-cues";
 
 function freshDb(): Database {
@@ -128,6 +129,40 @@ describe("resolveMural", () => {
     });
 });
 
+describe("mural coverage gate", () => {
+    test("requires 15 cues unless at least half of the active pool is cued", () => {
+        expect(muralCoverageGate(14, 100)).toBe(false);
+        expect(muralCoverageGate(15, 100)).toBe(true);
+        expect(muralCoverageGate(7, 10)).toBe(true);
+        expect(muralCoverageGate(6, 13)).toBe(false);
+    });
+
+    test("skips rendering and explains a near-empty cue pool", () => {
+        const db = freshDb();
+        try {
+            const project = "git:coverage-gate";
+            for (let i = 0; i < 40; i++) {
+                if (i < 10) {
+                    seedCuedMemory(db, project, "ARCHITECTURE", `cued fact ${i}`, 50);
+                } else {
+                    insertMemory(db, {
+                        projectPath: project,
+                        category: "ARCHITECTURE",
+                        content: `uncued fact ${i}`,
+                        sourceSessionId: "s",
+                    });
+                }
+            }
+            const result = ensureMuralRendered(db, project, 1);
+            expect(result.hasMural).toBe(false);
+            expect(result.rerendered).toBe(false);
+            expect(result.skipReason).toContain("10/40");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
 describe("ensureMuralRendered (on-demand render + change detection)", () => {
     test("first render stores a row; unchanged pool does not re-render", () => {
         const db = freshDb();
@@ -146,6 +181,9 @@ describe("ensureMuralRendered (on-demand render + change detection)", () => {
             expect(first.hasMural).toBe(true);
             expect(first.rerendered).toBe(true);
             expect(first.dataUrl).toBeDefined();
+            const stored = getMural(db, project);
+            expect(stored?.width).toBe(first.width);
+            expect(stored?.height).toBe(first.height);
 
             // Same pool → same text hash → no re-render, same data URL bytes.
             const second = ensureMuralRendered(db, project, 100);

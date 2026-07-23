@@ -1,7 +1,10 @@
 import { deflateSync } from "node:zlib";
 
+/** Maximum canvas extent; sparse renders use only the needed snapped extent. */
 export const MURAL_WIDTH = 1_092;
 export const MURAL_HEIGHT = 1_092;
+/** Anthropic vision image-token tiles are 28 pixels on each side. */
+export const MURAL_VISION_TILE = 28;
 export const MURAL_FONT = "spleen-5x8";
 export const MURAL_CELL_WIDTH = 5;
 export const MURAL_CELL_HEIGHT = 8;
@@ -19,7 +22,7 @@ export type MuralCategory = string;
 
 /** A flat mural entry to render. No rooms, no merges — resolveMural produces a
  *  pre-ordered flat list (category band → importance DESC → id ASC) and the
- *  renderer packs it deterministically into the fixed image. */
+ *  renderer packs it deterministically into the capped image. */
 export interface MuralRenderEntry {
     id: number;
     category: MuralCategory;
@@ -43,12 +46,15 @@ export interface MuralRenderResult {
     placements: Map<number, { category: MuralCategory; column: number; line: number }>;
     layoutItems: MuralLayoutItem[];
     renderedIds: number[];
-    /** Entries trimmed because the fixed image filled before reaching them. */
+    /** Entries trimmed because the capped image filled before reaching them. */
     droppedIds: number[];
     categoryLineUsage: Record<string, number>;
     /** Content lines actually placed in the grid (excludes blank cells). Used to
      *  assert the three-column fill occupancy. */
     filledLineCount: number;
+    /** PNG dimensions after content cropping and vision-tile snapping. */
+    width: number;
+    height: number;
 }
 
 type Cursor = { column: number; row: number };
@@ -215,6 +221,8 @@ interface LayoutResult {
     droppedIds: number[];
     usage: Record<string, number>;
     filledLineCount: number;
+    columnCount: number;
+    rowCount: number;
 }
 
 function renderLayout(entries: readonly MuralRenderEntry[]): LayoutResult {
@@ -277,8 +285,17 @@ function renderLayout(entries: readonly MuralRenderEntry[]): LayoutResult {
 
     const droppedIds = entries.filter((entry) => !placedIds.has(entry.id)).map((entry) => entry.id);
 
-    const textLines = Array.from({ length: MURAL_ROWS }, (_, row) =>
-        Array.from({ length: MURAL_COLUMNS }, (_, column) =>
+    let columnCount = 0;
+    let rowCount = 0;
+    for (let column = 0; column < MURAL_COLUMNS; column++) {
+        for (let row = 0; row < MURAL_ROWS; row++) {
+            if (!grid[column]?.[row]) continue;
+            columnCount = Math.max(columnCount, column + 1);
+            rowCount = Math.max(rowCount, row + 1);
+        }
+    }
+    const textLines = Array.from({ length: rowCount }, (_, row) =>
+        Array.from({ length: columnCount }, (_, column) =>
             (grid[column]?.[row] ?? "").padEnd(MURAL_ROOM_WIDTH),
         ).join(" "),
     );
@@ -291,6 +308,8 @@ function renderLayout(entries: readonly MuralRenderEntry[]): LayoutResult {
         droppedIds,
         usage,
         filledLineCount,
+        columnCount,
+        rowCount,
     };
 }
 
@@ -314,17 +333,17 @@ function pngChunk(type: string, data: Uint8Array): Uint8Array {
     return output;
 }
 
-function encodeRgbPng(pixels: Uint8Array): Uint8Array {
-    const raw = new Uint8Array((MURAL_WIDTH * 3 + 1) * MURAL_HEIGHT);
-    for (let y = 0; y < MURAL_HEIGHT; y++) {
-        const rawStart = y * (MURAL_WIDTH * 3 + 1);
+function encodeRgbPng(pixels: Uint8Array, width: number, height: number): Uint8Array {
+    const raw = new Uint8Array((width * 3 + 1) * height);
+    for (let y = 0; y < height; y++) {
+        const rawStart = y * (width * 3 + 1);
         raw[rawStart] = 0;
-        raw.set(pixels.subarray(y * MURAL_WIDTH * 3, (y + 1) * MURAL_WIDTH * 3), rawStart + 1);
+        raw.set(pixels.subarray(y * width * 3, (y + 1) * width * 3), rawStart + 1);
     }
     const ihdr = new Uint8Array(13);
     const header = new DataView(ihdr.buffer);
-    header.setUint32(0, MURAL_WIDTH);
-    header.setUint32(4, MURAL_HEIGHT);
+    header.setUint32(0, width);
+    header.setUint32(4, height);
     ihdr[8] = 8;
     ihdr[9] = 2;
     const signature = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -423,6 +442,8 @@ function glyph(character: string): readonly string[] {
 
 function drawGlyph(
     pixels: Uint8Array,
+    width: number,
+    height: number,
     x: number,
     y: number,
     character: string,
@@ -435,8 +456,8 @@ function drawGlyph(
             if (pattern[column] !== "█" && pattern[column] !== "1") continue;
             const px = x + column;
             const py = y + row;
-            if (px < 0 || py < 0 || px >= MURAL_WIDTH || py >= MURAL_HEIGHT) continue;
-            const offset = (py * MURAL_WIDTH + px) * 3;
+            if (px < 0 || py < 0 || px >= width || py >= height) continue;
+            const offset = (py * width + px) * 3;
             pixels[offset] = color[0]!;
             pixels[offset + 1] = color[1]!;
             pixels[offset + 2] = color[2]!;
@@ -446,18 +467,22 @@ function drawGlyph(
 
 function drawText(
     pixels: Uint8Array,
+    width: number,
+    height: number,
     x: number,
     y: number,
     text: string,
     color: readonly [number, number, number],
 ): void {
     [...text].forEach((character, index) => {
-        drawGlyph(pixels, x + index * MURAL_CELL_WIDTH, y, character, color);
+        drawGlyph(pixels, width, height, x + index * MURAL_CELL_WIDTH, y, character, color);
     });
 }
 
 function fillRect(
     pixels: Uint8Array,
+    canvasWidth: number,
+    canvasHeight: number,
     x: number,
     y: number,
     width: number,
@@ -466,16 +491,27 @@ function fillRect(
 ): void {
     const left = Math.max(0, x);
     const top = Math.max(0, y);
-    const right = Math.min(MURAL_WIDTH, x + width);
-    const bottom = Math.min(MURAL_HEIGHT, y + height);
+    const right = Math.min(canvasWidth, x + width);
+    const bottom = Math.min(canvasHeight, y + height);
     for (let py = top; py < bottom; py++) {
         for (let px = left; px < right; px++) {
-            const offset = (py * MURAL_WIDTH + px) * 3;
+            const offset = (py * canvasWidth + px) * 3;
             pixels[offset] = color[0]!;
             pixels[offset + 1] = color[1]!;
             pixels[offset + 2] = color[2]!;
         }
     }
+}
+
+/** Round a content extent up to a complete vision tile without exceeding the cap. */
+function snapDimensionToVisionTile(contentPixels: number, maximum: number): number {
+    return Math.min(
+        maximum,
+        Math.max(
+            MURAL_VISION_TILE,
+            Math.ceil(contentPixels / MURAL_VISION_TILE) * MURAL_VISION_TILE,
+        ),
+    );
 }
 
 /**
@@ -486,17 +522,26 @@ function fillRect(
  */
 export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderResult {
     const layout = renderLayout(entries);
-    const pixels = new Uint8Array(MURAL_WIDTH * MURAL_HEIGHT * 3).fill(255);
-    const contentWidth = MURAL_COLUMNS * MURAL_ROOM_WIDTH + MURAL_COLUMN_GAP * (MURAL_COLUMNS - 1);
-    const left = Math.floor((MURAL_WIDTH - contentWidth * MURAL_CELL_WIDTH) / 2);
-    for (let column = 0; column < MURAL_COLUMNS; column++) {
-        for (let row = 0; row < MURAL_ROWS; row++) {
+    const contentWidth =
+        layout.columnCount === 0
+            ? 0
+            : layout.columnCount * MURAL_ROOM_WIDTH * MURAL_CELL_WIDTH +
+              MURAL_COLUMN_GAP * (layout.columnCount - 1) * MURAL_CELL_WIDTH;
+    const contentHeight = layout.rowCount * MURAL_LINE_PITCH;
+    const width = snapDimensionToVisionTile(contentWidth, MURAL_WIDTH);
+    const height = snapDimensionToVisionTile(contentHeight, MURAL_HEIGHT);
+    const pixels = new Uint8Array(width * height * 3).fill(255);
+    const left = Math.floor((width - contentWidth) / 2);
+    for (let column = 0; column < layout.columnCount; column++) {
+        for (let row = 0; row < layout.rowCount; row++) {
             const text = layout.grid[column]?.[row] ?? "";
             const isCategory = text.includes("<") && text.includes(">");
             const category = isCategory ? text.match(/<([^>]+)>/)?.[1] : undefined;
             if (isCategory)
                 fillRect(
                     pixels,
+                    width,
+                    height,
                     left + column * (MURAL_ROOM_WIDTH + MURAL_COLUMN_GAP) * MURAL_CELL_WIDTH,
                     row * MURAL_LINE_PITCH,
                     MURAL_ROOM_WIDTH * MURAL_CELL_WIDTH,
@@ -510,6 +555,8 @@ export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderRe
                   : BODY_INK;
             drawText(
                 pixels,
+                width,
+                height,
                 left + column * (MURAL_ROOM_WIDTH + MURAL_COLUMN_GAP) * MURAL_CELL_WIDTH,
                 row * MURAL_LINE_PITCH,
                 text,
@@ -517,7 +564,7 @@ export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderRe
             );
         }
     }
-    const png = encodeRgbPng(pixels);
+    const png = encodeRgbPng(pixels, width, height);
     const dataUrl = `data:image/png;base64,${Buffer.from(png).toString("base64")}`;
     return {
         png,
@@ -530,7 +577,16 @@ export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderRe
         droppedIds: layout.droppedIds,
         categoryLineUsage: layout.usage,
         filledLineCount: layout.filledLineCount,
+        width,
+        height,
     };
 }
 
-export const muralImageTokenEstimate = Math.ceil((MURAL_WIDTH * MURAL_HEIGHT) / 750);
+export function muralImageTokenEstimateForDimensions(width: number, height: number): number {
+    return Math.ceil((width * height) / 750);
+}
+
+export const muralImageTokenEstimate = muralImageTokenEstimateForDimensions(
+    MURAL_WIDTH,
+    MURAL_HEIGHT,
+);
