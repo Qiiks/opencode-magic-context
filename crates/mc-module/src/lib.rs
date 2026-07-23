@@ -56,14 +56,14 @@ use chrono::{Local, TimeZone};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use mc_store::{
     canonical_root, validate_state_import_compartments, AuthoritySeedRow, DeferredExecuteState,
-    HistorianPhase, InsertMemoryInput, MappingUpdate, McStore, McStoreError, ModuleDropSeedRow,
-    ModuleMemoryMutationRow, ModuleMemoryRow, ModuleStateSyncError, ModuleStateSyncRequest,
-    ModuleStripSeedRow, ModuleWorkspaceMemberRow, ModuleWorkspaceRow, NoteCasOutcome,
-    NoteEvaluationInput, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop,
-    PendingAgentDropSeedRow, PendingCompactionMarkerState, RecordWrapupCommandOutcome,
-    StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
-    StoredCompartment, StoredMemoryMutation, StoredNote, TagNumberRow, TodoStateSetOutcome,
-    UserHintSeedRow, VerificationUpdate, WrapupCommandRecord,
+    FacadeMutationOutcome, HistorianPhase, InsertMemoryInput, MappingUpdate, McStore, McStoreError,
+    ModuleDropSeedRow, ModuleMemoryMutationRow, ModuleMemoryRow, ModuleStateSyncError,
+    ModuleStateSyncRequest, ModuleStripSeedRow, ModuleWorkspaceMemberRow, ModuleWorkspaceRow,
+    NoteCasOutcome, NoteEvaluationInput, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput,
+    PendingAgentDrop, PendingAgentDropSeedRow, PendingCompactionMarkerState,
+    RecordWrapupCommandOutcome, StateImportError, StateImportPreflight, StateImportValidationError,
+    StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote, TagNumberRow,
+    TodoStateSetOutcome, UserHintSeedRow, VerificationUpdate, WrapupCommandRecord,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -1837,6 +1837,9 @@ pub struct McHandler {
     /// Module-minted zero-tool dreamer sessions. Prefixes are diagnostics only;
     /// only registered ids may bypass transform after route validation.
     active_dreamer_runs: Arc<Mutex<HashSet<String>>>,
+    /// Back-compat facade callers may omit the host tool-call id. Warn once per resolved session
+    /// while the transport shim is upgraded, without rejecting the mutation.
+    missing_facade_command_id_sessions: Mutex<HashSet<String>>,
 }
 
 #[async_trait]
@@ -2240,6 +2243,7 @@ impl McHandler {
             transform_pages: Mutex::new(TransformPageCoordinator::default()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
+            missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
         }
     }
 
@@ -2318,6 +2322,7 @@ impl McHandler {
             transform_pages: Mutex::new(TransformPageCoordinator::default()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
+            missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
         }
     }
 
@@ -7608,6 +7613,18 @@ impl McHandler {
         }
     }
 
+    fn log_missing_facade_command_id(&self, session_id: &str, tool: &str, action: &str) {
+        let mut sessions = self
+            .missing_facade_command_id_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if sessions.insert(session_id.to_string()) {
+            eprintln!(
+                "mc-module: {tool} {action} facade mutation omitted command_id for session {session_id}; accepting for transport compatibility"
+            );
+        }
+    }
+
     fn bind_facade_route_for_write(
         &self,
         channel: u16,
@@ -7762,13 +7779,9 @@ impl McHandler {
         {
             return tool_error_result(format!("Error: {error}."));
         }
+        let is_mutation = matches!(action, "write" | "update" | "archive" | "merge");
         let facade_scope = match self
-            .resolve_facade_scope(
-                channel,
-                Some(args),
-                "memories",
-                matches!(action, "write" | "update" | "archive" | "merge"),
-            )
+            .resolve_facade_scope(channel, Some(args), "memories", is_mutation)
             .await
         {
             Ok(scope) => scope,
@@ -7783,7 +7796,7 @@ impl McHandler {
         };
         let memory_project = facade_scope.memory_project_path.as_str();
         let conversation_key = facade_scope.conversation_key.as_str();
-        if matches!(action, "write" | "update" | "archive" | "merge") {
+        if is_mutation {
             if let Err(error) = store.enforce_facade_project_vocabulary(
                 facade_scope.route_project_root.as_str(),
                 memory_project,
@@ -7792,6 +7805,18 @@ impl McHandler {
                 return tool_error_result(format!("Error: {error}"));
             }
         }
+        let command_id = if is_mutation {
+            match command_id_from_facade_request(request, args) {
+                Ok(command_id) => command_id,
+                Err(error) => return tool_error_result(format!("Error: {error}.")),
+            }
+        } else {
+            None
+        };
+        if is_mutation && command_id.is_none() {
+            self.log_missing_facade_command_id(conversation_key, "ctx_memory", action);
+        }
+
         match action {
             "write" => {
                 let Some(category) = non_empty_string_arg(args, "category") else {
@@ -7810,35 +7835,40 @@ impl McHandler {
                         "Error: 'content' is required when action is 'write'.",
                     );
                 };
-                match store.with_facade_mutation(
-                    facade_scope.route_project_root.as_str(),
+                facade_command_outcome(
+                    store.with_facade_command(
+                        facade_scope.route_project_root.as_str(),
+                        memory_project,
+                        "memories",
+                        conversation_key,
+                        "ctx_memory",
+                        action,
+                        command_id.as_deref(),
+                        |tx| {
+                            let id = tx
+                                .insert_memory(InsertMemoryInput {
+                                    project_path: memory_project,
+                                    route_project_root: Some(
+                                        facade_scope.route_project_root.as_str(),
+                                    ),
+                                    category,
+                                    content,
+                                    source_session_id: Some(conversation_key),
+                                    source_type: Some("agent"),
+                                    importance: Some(50),
+                                    expires_at: None,
+                                    metadata_json: None,
+                                    now_ms: now_ms(),
+                                })
+                                .map_err(|error| error.to_string())?;
+                            facade_text_response(
+                                format!("Saved memory [ID: {id}] in {category}."),
+                                false,
+                            )
+                        },
+                    ),
                     "memories",
-                    || {
-                        store.insert_memory(InsertMemoryInput {
-                            project_path: memory_project,
-                            route_project_root: Some(facade_scope.route_project_root.as_str()),
-                            category,
-                            content,
-                            source_session_id: Some(conversation_key),
-                            source_type: Some("agent"),
-                            importance: Some(50),
-                            expires_at: None,
-                            metadata_json: None,
-                            now_ms: now_ms(),
-                        })
-                    },
-                ) {
-                    Ok(id) => {
-                        mcp_text_result(format!("Saved memory [ID: {id}] in {category}."), false)
-                    }
-                    Err(error) if store_error_is_authority_draining(&error) => {
-                        authority_draining_error("memories")
-                    }
-                    Err(error) => HandlerOutcome::Error {
-                        code: "memory_store_failed".to_string(),
-                        message: error.to_string(),
-                    },
-                }
+                )
             }
             "update" => {
                 let Some(id) = single_memory_id(args, "update") else {
@@ -7851,20 +7881,31 @@ impl McHandler {
                         "Error: 'content' is required when action is 'update'.",
                     );
                 };
-                match store.with_facade_mutation(
-                    facade_scope.route_project_root.as_str(),
-                    "memories",
-                    || memory_tool::update_memory(store, memory_project, id, content, now_ms()),
-                ) {
-                    Ok(memory) => mcp_text_result(
-                        format!("Updated memory [ID: {}] in {}.", memory.id, memory.category),
-                        false,
+                facade_command_outcome(
+                    store.with_facade_command(
+                        facade_scope.route_project_root.as_str(),
+                        memory_project,
+                        "memories",
+                        conversation_key,
+                        "ctx_memory",
+                        action,
+                        command_id.as_deref(),
+                        |tx| {
+                            let memory = tx
+                                .update_memory_content(memory_project, id, content, now_ms())
+                                .map_err(|error| error.to_string())?
+                                .ok_or_else(|| format!("memory {id} was not found"))?;
+                            facade_text_response(
+                                format!(
+                                    "Updated memory [ID: {}] in {}.",
+                                    memory.id, memory.category
+                                ),
+                                false,
+                            )
+                        },
                     ),
-                    Err(error) if store_error_is_authority_draining(&error) => {
-                        authority_draining_error("memories")
-                    }
-                    Err(error) => tool_error_result(format!("Error: {error}")),
-                }
+                    "memories",
+                )
             }
             "archive" => {
                 let ids = memory_ids(args, "archive");
@@ -7874,25 +7915,35 @@ impl McHandler {
                     );
                 }
                 let reason = string_arg(args, "reason");
-                let archived = match store.with_facade_mutation(
-                    facade_scope.route_project_root.as_str(),
+                facade_command_outcome(
+                    store.with_facade_command(
+                        facade_scope.route_project_root.as_str(),
+                        memory_project,
+                        "memories",
+                        conversation_key,
+                        "ctx_memory",
+                        action,
+                        command_id.as_deref(),
+                        |tx| {
+                            let archived = tx
+                                .archive_memories(memory_project, &ids, reason, now_ms())
+                                .map_err(|error| error.to_string())?
+                                .ok_or_else(|| "memories could not be archived".to_string())?;
+                            if archived.is_empty() {
+                                facade_text_response(
+                                    "No active memories needed archiving.".to_string(),
+                                    false,
+                                )
+                            } else {
+                                facade_text_response(
+                                    format!("Archived memory IDs [{}].", join_i64s(&archived)),
+                                    false,
+                                )
+                            }
+                        },
+                    ),
                     "memories",
-                    || memory_tool::archive_memories(store, memory_project, &ids, reason, now_ms()),
-                ) {
-                    Ok(archived) => archived,
-                    Err(error) if store_error_is_authority_draining(&error) => {
-                        return authority_draining_error("memories");
-                    }
-                    Err(error) => return tool_error_result(format!("Error: {error}")),
-                };
-                if archived.is_empty() {
-                    mcp_text_result("No active memories needed archiving.".to_string(), false)
-                } else {
-                    mcp_text_result(
-                        format!("Archived memory IDs [{}].", join_i64s(&archived)),
-                        false,
-                    )
-                }
+                )
             }
             "merge" => {
                 let Some((target_id, source_ids)) = merge_ids(args) else {
@@ -7905,34 +7956,39 @@ impl McHandler {
                         "Error: 'content' is required when action is 'merge'.",
                     );
                 };
-                match store.with_facade_mutation(
-                    facade_scope.route_project_root.as_str(),
-                    "memories",
-                    || {
-                        memory_tool::merge_memories(
-                            store,
-                            memory_project,
-                            target_id,
-                            &source_ids,
-                            content,
-                            now_ms(),
-                        )
-                    },
-                ) {
-                    Ok(memory) => mcp_text_result(
-                        format!(
-                            "Merged memories into [ID: {}] in {}; superseded [{}].",
-                            memory.id,
-                            memory.category,
-                            join_i64s(&source_ids)
-                        ),
-                        false,
+                facade_command_outcome(
+                    store.with_facade_command(
+                        facade_scope.route_project_root.as_str(),
+                        memory_project,
+                        "memories",
+                        conversation_key,
+                        "ctx_memory",
+                        action,
+                        command_id.as_deref(),
+                        |tx| {
+                            let memory = tx
+                                .merge_memories(
+                                    memory_project,
+                                    target_id,
+                                    &source_ids,
+                                    content,
+                                    now_ms(),
+                                )
+                                .map_err(|error| error.to_string())?
+                                .ok_or_else(|| format!("memory {target_id} was not found"))?;
+                            facade_text_response(
+                                format!(
+                                    "Merged memories into [ID: {}] in {}; superseded [{}].",
+                                    memory.id,
+                                    memory.category,
+                                    join_i64s(&source_ids)
+                                ),
+                                false,
+                            )
+                        },
                     ),
-                    Err(error) if store_error_is_authority_draining(&error) => {
-                        authority_draining_error("memories")
-                    }
-                    Err(error) => tool_error_result(format!("Error: {error}")),
-                }
+                    "memories",
+                )
             }
             "get" => {
                 let ids = memory_ids(args, "get");
@@ -8235,13 +8291,9 @@ impl McHandler {
         let action = string_arg(args, "action")
             .or_else(|| non_empty_string_arg(args, "content").map(|_| "write"))
             .unwrap_or("read");
+        let is_mutation = matches!(action, "write" | "update" | "dismiss");
         let facade_scope = match self
-            .resolve_facade_scope(
-                channel,
-                Some(args),
-                "notes",
-                matches!(action, "write" | "update" | "dismiss"),
-            )
+            .resolve_facade_scope(channel, Some(args), "notes", is_mutation)
             .await
         {
             Ok(scope) => scope,
@@ -8255,7 +8307,7 @@ impl McHandler {
         let session = facade_scope.conversation_key.as_str();
         let filter = string_arg(args, "filter");
         let now = now_ms();
-        if matches!(action, "write" | "update" | "dismiss") {
+        if is_mutation {
             if let Err(error) = store.enforce_facade_project_vocabulary(
                 facade_scope.route_project_root.as_str(),
                 project,
@@ -8263,6 +8315,17 @@ impl McHandler {
             ) {
                 return tool_error_result(format!("Error: {error}"));
             }
+        }
+        let command_id = if is_mutation {
+            match command_id_from_facade_request(request, args) {
+                Ok(command_id) => command_id,
+                Err(error) => return tool_error_result(format!("Error: {error}.")),
+            }
+        } else {
+            None
+        };
+        if is_mutation && command_id.is_none() {
+            self.log_missing_facade_command_id(session, "ctx_note", action);
         }
 
         match action {
@@ -8280,58 +8343,73 @@ impl McHandler {
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
                 if let Some(condition) = condition {
-                    match store.with_facade_mutation(
-                        facade_scope.route_project_root.as_str(),
-                        "notes",
-                        || {
-                            store.insert_project_note(NoteWriteInput {
-                                project_path: project,
-                                route_project_root: Some(facade_scope.route_project_root.as_str()),
-                                session_id: Some(session),
-                                content,
-                                surface_condition: Some(condition),
-                                anchor_block_id: anchor.as_deref(),
-                                anchor_ordinal: None,
-                                now_ms: now,
-                            })
-                        },
-                    ) {
-                        Ok(note) => mcp_text_result(
-                            format!(
-                                "Created smart note #{}. Dreamer will evaluate the condition during nightly runs:\n- Content: {}\n- Condition: {}",
-                                note.id, note.content, condition
-                            ),
-                            false,
+                    facade_command_outcome(
+                        store.with_facade_command(
+                            facade_scope.route_project_root.as_str(),
+                            project,
+                            "notes",
+                            session,
+                            "ctx_note",
+                            action,
+                            command_id.as_deref(),
+                            |tx| {
+                                let note = tx
+                                    .insert_project_note(NoteWriteInput {
+                                        project_path: project,
+                                        route_project_root: Some(
+                                            facade_scope.route_project_root.as_str(),
+                                        ),
+                                        session_id: Some(session),
+                                        content,
+                                        surface_condition: Some(condition),
+                                        anchor_block_id: anchor.as_deref(),
+                                        anchor_ordinal: None,
+                                        now_ms: now,
+                                    })
+                                    .map_err(|error| error.to_string())?;
+                                facade_text_response(
+                                    format!(
+                                        "Created smart note #{}. Dreamer will evaluate the condition during nightly runs:\n- Content: {}\n- Condition: {}",
+                                        note.id, note.content, condition
+                                    ),
+                                    false,
+                                )
+                            },
                         ),
-                        Err(error) if store_error_is_authority_draining(&error) => {
-                            authority_draining_error("notes")
-                        }
-                        Err(error) => tool_error_result(format!("Error: {error}")),
-                    }
-                } else {
-                    match store.with_facade_mutation(
-                        facade_scope.route_project_root.as_str(),
                         "notes",
-                        || {
-                            store.insert_note(NoteInput {
-                                project_path: project,
-                                route_project_root: Some(facade_scope.route_project_root.as_str()),
-                                session_id: session,
-                                content,
-                                surface_condition: None,
-                                anchor_block_id: anchor.as_deref(),
-                                now_ms: now,
-                            })
-                        },
-                    ) {
-                        Ok(note) => {
-                            mcp_text_result(format!("Saved session note #{}.", note.id), false)
-                        }
-                        Err(error) if store_error_is_authority_draining(&error) => {
-                            authority_draining_error("notes")
-                        }
-                        Err(error) => tool_error_result(format!("Error: {error}")),
-                    }
+                    )
+                } else {
+                    facade_command_outcome(
+                        store.with_facade_command(
+                            facade_scope.route_project_root.as_str(),
+                            project,
+                            "notes",
+                            session,
+                            "ctx_note",
+                            action,
+                            command_id.as_deref(),
+                            |tx| {
+                                let note = tx
+                                    .insert_note(NoteInput {
+                                        project_path: project,
+                                        route_project_root: Some(
+                                            facade_scope.route_project_root.as_str(),
+                                        ),
+                                        session_id: session,
+                                        content,
+                                        surface_condition: None,
+                                        anchor_block_id: anchor.as_deref(),
+                                        now_ms: now,
+                                    })
+                                    .map_err(|error| error.to_string())?;
+                                facade_text_response(
+                                    format!("Saved session note #{}.", note.id),
+                                    false,
+                                )
+                            },
+                        ),
+                        "notes",
+                    )
                 }
             }
             "read" => {
@@ -8437,33 +8515,43 @@ impl McHandler {
                         "Error: Note #{note_id} not found in your session/project or has no compatible fields to update."
                     ));
                 };
-                match store.with_facade_mutation(
-                    facade_scope.route_project_root.as_str(),
-                    "notes",
-                    || {
-                        store.update_note_cas(
-                            project,
-                            note_id,
-                            &current.status,
-                            current.status_version,
-                            content,
-                            condition.map(Some),
-                            now,
-                        )
-                    },
-                ) {
-                    Ok(NoteCasOutcome::Applied(note)) => mcp_text_result(
-                        format!("Updated note #{}: {}", note.id, note.content),
-                        false,
+                facade_command_outcome(
+                    store.with_facade_command(
+                        facade_scope.route_project_root.as_str(),
+                        project,
+                        "notes",
+                        session,
+                        "ctx_note",
+                        action,
+                        command_id.as_deref(),
+                        |tx| {
+                            match tx
+                                .update_note_cas(
+                                    project,
+                                    note_id,
+                                    &current.status,
+                                    current.status_version,
+                                    content,
+                                    condition.map(Some),
+                                    now,
+                                )
+                                .map_err(|error| error.to_string())?
+                            {
+                                NoteCasOutcome::Applied(note) => facade_text_response(
+                                    format!("Updated note #{}: {}", note.id, note.content),
+                                    false,
+                                ),
+                                NoteCasOutcome::Conflict { .. } => Ok(facade_text_response(
+                                    format!(
+                                        "Error: Note #{note_id} changed concurrently; retry with a fresh read."
+                                    ),
+                                    true,
+                                )?),
+                            }
+                        },
                     ),
-                    Ok(NoteCasOutcome::Conflict { .. }) => tool_error_result(format!(
-                        "Error: Note #{note_id} changed concurrently; retry with a fresh read."
-                    )),
-                    Err(error) if store_error_is_authority_draining(&error) => {
-                        authority_draining_error("notes")
-                    }
-                    Err(error) => tool_error_result(format!("Error: {error}")),
-                }
+                    "notes",
+                )
             }
             "dismiss" => {
                 let Some(note_id) = i64_arg(args, "note_id").filter(|id| *id > 0) else {
@@ -8471,28 +8559,36 @@ impl McHandler {
                         "Error: 'note_id' is required when action is 'dismiss'.",
                     );
                 };
-                match store.with_facade_mutation(
-                    facade_scope.route_project_root.as_str(),
+                let resolution = string_arg(args, "content");
+                facade_command_outcome(
+                    store.with_facade_command(
+                        facade_scope.route_project_root.as_str(),
+                        project,
+                        "notes",
+                        session,
+                        "ctx_note",
+                        action,
+                        command_id.as_deref(),
+                        |tx| {
+                            let dismissed = tx
+                                .dismiss_note(project, session, note_id, resolution, now)
+                                .map_err(|error| error.to_string())?;
+                            match dismissed {
+                                Some(_) => facade_text_response(
+                                    format!("Note #{note_id} dismissed."),
+                                    false,
+                                ),
+                                None => facade_text_response(
+                                    format!(
+                                        "Error: Note #{note_id} not found in your session/project or already dismissed."
+                                    ),
+                                    true,
+                                ),
+                            }
+                        },
+                    ),
                     "notes",
-                    || {
-                        store.dismiss_note(
-                            project,
-                            session,
-                            note_id,
-                            string_arg(args, "content"),
-                            now,
-                        )
-                    },
-                ) {
-                    Ok(Some(_)) => mcp_text_result(format!("Note #{note_id} dismissed."), false),
-                    Ok(None) => tool_error_result(format!(
-                        "Error: Note #{note_id} not found in your session/project or already dismissed."
-                    )),
-                    Err(error) if store_error_is_authority_draining(&error) => {
-                        authority_draining_error("notes")
-                    }
-                    Err(error) => tool_error_result(format!("Error: {error}")),
-                }
+                )
             }
             _ => tool_error_result("Error: Unknown ctx_note action.".to_string()),
         }
@@ -9752,6 +9848,73 @@ fn command_id_from_agent_drops_request(request: &Value) -> Result<String, String
         ));
     }
     Ok(command_id.to_string())
+}
+
+/// Read the host's tool-use identity from either the facade envelope or its argument object.
+/// Older THALAMUS callers omit every field, so absence remains an accepted compatibility path.
+fn command_id_from_facade_request(
+    request: &Value,
+    args: &Map<String, Value>,
+) -> Result<Option<String>, String> {
+    const FIELDS: [&str; 7] = [
+        "command_id",
+        "tool_use_id",
+        "tool_call_id",
+        "toolCallId",
+        "call_id",
+        "callId",
+        "callID",
+    ];
+    let raw = FIELDS
+        .iter()
+        .find_map(|field| request.get(*field).and_then(Value::as_str))
+        .or_else(|| {
+            FIELDS
+                .iter()
+                .find_map(|field| args.get(*field).and_then(Value::as_str))
+        });
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let command_id = raw.trim();
+    if command_id.is_empty() {
+        return Err("'command_id' must be a nonempty string".to_string());
+    }
+    if command_id.len() > MAX_AGENT_DROPS_COMMAND_ID_BYTES {
+        return Err(format!(
+            "'command_id' exceeds the {MAX_AGENT_DROPS_COMMAND_ID_BYTES}-byte limit"
+        ));
+    }
+    Ok(Some(command_id.to_string()))
+}
+
+fn facade_text_response(text: impl Into<String>, is_error: bool) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&json!({
+        "content": [{ "type": "text", "text": text.into() }],
+        "isError": is_error,
+    }))
+    .map_err(|error| error.to_string())
+}
+
+fn facade_command_outcome(
+    result: Result<FacadeMutationOutcome, McStoreError>,
+    domain: &str,
+) -> HandlerOutcome {
+    match result {
+        Ok(FacadeMutationOutcome::Applied(bytes)) => HandlerOutcome::Response(bytes),
+        Ok(FacadeMutationOutcome::Duplicate(bytes)) => {
+            let Ok(mut envelope) = serde_json::from_slice::<Value>(&bytes) else {
+                return HandlerOutcome::Response(bytes);
+            };
+            if let Some(object) = envelope.as_object_mut() {
+                object.insert("replayed".to_string(), Value::Bool(true));
+                return respond(envelope);
+            }
+            HandlerOutcome::Response(bytes)
+        }
+        Err(error) if store_error_is_authority_draining(&error) => authority_draining_error(domain),
+        Err(error) => tool_error_result(format!("Error: {error}")),
+    }
 }
 
 fn authority_source_path(
@@ -14259,6 +14422,164 @@ mod tests {
         assert!(
             feed.rows.len() >= 6,
             "every mutation must append changefeed state"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_mutation_commands_replay_each_memory_and_note_action_without_advancing_state() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, _project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(7, binding("/route/facade-ledger", "token"));
+        let project = "/route/facade-ledger";
+
+        async fn call_and_replay(
+            handler: &McHandler,
+            store: &McStore,
+            name: &str,
+            action: &str,
+            command_id: &str,
+            arguments: Value,
+        ) {
+            let first = call_facade(handler, name, arguments.clone()).await;
+            let first_bytes = match first {
+                HandlerOutcome::Response(bytes) => bytes,
+                other => panic!("first {name}/{action} failed: {other:?}"),
+            };
+            let mut retry_arguments = arguments;
+            retry_arguments["command_id"] = json!(command_id);
+            let retry = call_facade(handler, name, retry_arguments).await;
+            let retry_body = tool_body(retry);
+            let mut original_body: Value = serde_json::from_slice(&first_bytes).unwrap();
+            assert_eq!(
+                store
+                    .facade_mutation_ledger_response("session", name, action, command_id)
+                    .unwrap(),
+                Some(first_bytes),
+                "ledger must retain the exact first response for {name}/{action}"
+            );
+            original_body["replayed"] = Value::Bool(true);
+            assert_eq!(retry_body, original_body);
+        }
+
+        call_and_replay(
+            &handler,
+            &store,
+            "ctx_memory",
+            "write",
+            "memory-write",
+            json!({
+                "action": "write",
+                "category": "CONSTRAINTS",
+                "content": "first",
+                "command_id": "memory-write"
+            }),
+        )
+        .await;
+        let memory_revision_after_write =
+            crate::m1_compose::m1_revision_signal(&store, project, "session").unwrap();
+        call_and_replay(
+            &handler,
+            &store,
+            "ctx_memory",
+            "update",
+            "memory-update",
+            json!({
+                "action": "update",
+                "ids": [1],
+                "content": "updated",
+                "command_id": "memory-update"
+            }),
+        )
+        .await;
+        let memory_revision_after_update =
+            crate::m1_compose::m1_revision_signal(&store, project, "session").unwrap();
+        assert_ne!(memory_revision_after_update, memory_revision_after_write);
+        let memory_feed_after_update = store
+            .pull_changefeed("memories", 0, 100)
+            .unwrap()
+            .rows
+            .len();
+        call_and_replay(
+            &handler,
+            &store,
+            "ctx_memory",
+            "archive",
+            "memory-archive",
+            json!({
+                "action": "archive",
+                "ids": [1],
+                "command_id": "memory-archive"
+            }),
+        )
+        .await;
+        let memory_revision_after_archive =
+            crate::m1_compose::m1_revision_signal(&store, project, "session").unwrap();
+        assert_ne!(memory_revision_after_archive, memory_revision_after_update);
+        assert_eq!(
+            store
+                .pull_changefeed("memories", 0, 100)
+                .unwrap()
+                .rows
+                .len(),
+            memory_feed_after_update + 1
+        );
+
+        call_and_replay(
+            &handler,
+            &store,
+            "ctx_note",
+            "write",
+            "note-write",
+            json!({
+                "action": "write",
+                "content": "remember this",
+                "command_id": "note-write"
+            }),
+        )
+        .await;
+        let note_revision_after_write = store.max_note_status_version(project).unwrap();
+        let note_feed_after_write = store.pull_changefeed("notes", 0, 100).unwrap().rows.len();
+        call_and_replay(
+            &handler,
+            &store,
+            "ctx_note",
+            "update",
+            "note-update",
+            json!({
+                "action": "update",
+                "note_id": 1,
+                "content": "updated note",
+                "command_id": "note-update"
+            }),
+        )
+        .await;
+        let note_revision_after_update = store.max_note_status_version(project).unwrap();
+        assert_eq!(note_revision_after_update, note_revision_after_write + 1);
+        assert_eq!(
+            store.pull_changefeed("notes", 0, 100).unwrap().rows.len(),
+            note_feed_after_write + 1
+        );
+        call_and_replay(
+            &handler,
+            &store,
+            "ctx_note",
+            "dismiss",
+            "note-dismiss",
+            json!({
+                "action": "dismiss",
+                "note_id": 1,
+                "command_id": "note-dismiss"
+            }),
+        )
+        .await;
+        let note_revision_after_dismiss = store.max_note_status_version(project).unwrap();
+        assert_eq!(note_revision_after_dismiss, note_revision_after_update + 1);
+        assert_eq!(
+            store.pull_changefeed("notes", 0, 100).unwrap().rows.len(),
+            note_feed_after_write + 2
         );
     }
 

@@ -2,6 +2,8 @@ export type RustAuthorityDomain = "memories" | "notes";
 export type RustAuthorityState = "TS" | "PREPARING" | "MODULE" | "DRAINING";
 
 export interface RustNoteToolRequest {
+    /** Host MCP tool-use id; absent only for legacy THALAMUS callers. */
+    commandId?: string;
     sessionId: string;
     projectRoot: string;
     projectPath: string;
@@ -17,6 +19,8 @@ export interface RustNoteToolRequest {
 }
 
 export interface RustMemoryToolRequest {
+    /** Host MCP tool-use id; absent only for legacy THALAMUS callers. */
+    commandId?: string;
     sessionId: string;
     projectRoot: string;
     projectPath: string;
@@ -27,6 +31,23 @@ export interface RustMemoryToolRequest {
     category?: string;
     ids?: number[];
     reason?: string;
+}
+
+export function toolCallIdFromContext(context: unknown): string | undefined {
+    if (context === null || typeof context !== "object") return undefined;
+    const record = context as Record<string, unknown>;
+    for (const field of [
+        "callID",
+        "callId",
+        "toolUseId",
+        "toolCallId",
+        "tool_use_id",
+        "tool_call_id",
+    ]) {
+        const value = record[field];
+        if (typeof value === "string" && value.trim()) return value.trim();
+    }
+    return undefined;
 }
 
 export interface RustToolBackends {

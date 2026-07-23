@@ -697,6 +697,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                           },
                       }),
                   note: ({
+                      commandId,
                       sessionId,
                       projectRoot,
                       memoryProject,
@@ -715,6 +716,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                           body: {
                               name: "ctx_note",
                               arguments: {
+                                  ...(commandId ? { command_id: commandId } : {}),
                                   action,
                                   content,
                                   memory_project: memoryProject,
@@ -727,6 +729,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                           },
                       }),
                   memory: ({
+                      commandId,
                       sessionId,
                       projectRoot,
                       memoryProject,
@@ -743,6 +746,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                           body: {
                               name: "ctx_memory",
                               arguments: {
+                                  ...(commandId ? { command_id: commandId } : {}),
                                   action,
                                   content,
                                   category,

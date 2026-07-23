@@ -12,7 +12,10 @@ import {
     updateNote,
 } from "../../features/magic-context/storage";
 import type { RustNoteToolRequest, RustToolBackends } from "../../plugin/rust-tool-backends";
-import { isRustAuthorityDrainingError } from "../../plugin/rust-tool-backends";
+import {
+    isRustAuthorityDrainingError,
+    toolCallIdFromContext,
+} from "../../plugin/rust-tool-backends";
 import type { Database } from "../../shared/sqlite";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_NOTE_DESCRIPTION } from "./constants";
@@ -300,7 +303,9 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 ) {
                     return "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not written.";
                 }
+                const commandId = toolCallIdFromContext(toolContext);
                 const request: RustNoteToolRequest = {
+                    ...(commandId ? { commandId } : {}),
                     sessionId,
                     projectRoot: toolContext.directory,
                     projectPath: projectIdentity,
