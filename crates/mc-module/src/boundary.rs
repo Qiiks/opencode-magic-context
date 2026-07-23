@@ -654,14 +654,31 @@ pub fn chunked_message_estimate(
     eligible_end_ordinal: Option<u64>,
     budget_stop: f64,
 ) -> ChunkEstimate {
-    let mut ordered = messages.to_vec();
+    let mut token_estimator = estimate_tokens;
+    chunked_message_estimate_with_estimator(
+        messages,
+        start_ordinal,
+        eligible_end_ordinal,
+        budget_stop,
+        &mut token_estimator,
+    )
+}
+
+fn chunked_message_estimate_with_estimator(
+    messages: &[BoundaryMsg],
+    start_ordinal: u64,
+    eligible_end_ordinal: Option<u64>,
+    budget_stop: f64,
+    token_estimator: &mut dyn FnMut(&str) -> usize,
+) -> ChunkEstimate {
+    let mut ordered = messages.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|message| message.message_ordinal);
     let total_message_count = ordered
         .iter()
         .map(|message| message.message_ordinal)
         .max()
         .unwrap_or(ordered.len() as u64);
-    let mut builder = ChunkBuilder::new(budget_stop);
+    let mut builder = ChunkBuilder::new(budget_stop, token_estimator);
 
     for message in &ordered {
         if eligible_end_ordinal.is_some_and(|end| message.message_ordinal >= end) {
@@ -690,7 +707,20 @@ pub fn check_compartment_trigger(
         return no_fire();
     }
     let index = TokenIndex::new(messages);
-    check_compartment_trigger_with_index(messages, ctx, &index)
+    let mut token_estimator = estimate_tokens;
+    check_compartment_trigger_with_index(messages, ctx, &index, &mut token_estimator)
+}
+
+pub(crate) fn check_compartment_trigger_with_token_estimator(
+    messages: &[BoundaryMsg],
+    ctx: &TriggerContext,
+    token_estimator: &mut dyn FnMut(&str) -> usize,
+) -> TriggerDecision {
+    if ctx.compartment_in_progress {
+        return no_fire();
+    }
+    let index = TokenIndex::new(messages);
+    check_compartment_trigger_with_index(messages, ctx, &index, token_estimator)
 }
 
 #[cfg(test)]
@@ -702,13 +732,15 @@ pub(crate) fn check_compartment_trigger_retokenized_reference(
         return no_fire();
     }
     let index = TokenIndex::new_retokenized(messages);
-    check_compartment_trigger_with_index(messages, ctx, &index)
+    let mut token_estimator = estimate_tokens;
+    check_compartment_trigger_with_index(messages, ctx, &index, &mut token_estimator)
 }
 
 fn check_compartment_trigger_with_index(
     messages: &[BoundaryMsg],
     ctx: &TriggerContext,
     index: &TokenIndex,
+    token_estimator: &mut dyn FnMut(&str) -> usize,
 ) -> TriggerDecision {
     let trigger_budget = ctx.boundary.trigger_budget.unwrap_or_else(|| {
         derive_trigger_budget(
@@ -737,11 +769,12 @@ fn check_compartment_trigger_with_index(
     let scan_budget =
         MIN_PROACTIVE_TAIL_TOKEN_ESTIMATE.max(trigger_budget * TAIL_SIZE_TRIGGER_MULTIPLIER);
     let chunk = if has_protected_eligible_head {
-        chunked_message_estimate(
+        chunked_message_estimate_with_estimator(
             messages,
             boundary.eligible_head.start,
             Some(boundary.protected_start_ordinal),
             scan_budget,
+            token_estimator,
         )
     } else {
         ChunkEstimate {
@@ -1423,8 +1456,9 @@ struct ChunkBlock {
     is_tool_only: bool,
 }
 
-struct ChunkBuilder {
+struct ChunkBuilder<'a> {
     budget_stop: f64,
+    token_estimator: &'a mut dyn FnMut(&str) -> usize,
     total_tokens: f64,
     measured_tokens: f64,
     messages_processed: usize,
@@ -1438,10 +1472,11 @@ struct ChunkBuilder {
     stopped_early: bool,
 }
 
-impl ChunkBuilder {
-    fn new(budget_stop: f64) -> Self {
+impl<'a> ChunkBuilder<'a> {
+    fn new(budget_stop: f64, token_estimator: &'a mut dyn FnMut(&str) -> usize) -> Self {
         Self {
             budget_stop,
+            token_estimator,
             total_tokens: 0.0,
             measured_tokens: 0.0,
             messages_processed: 0,
@@ -1558,7 +1593,7 @@ impl ChunkBuilder {
             return true;
         };
         let block_text = format_block(&current_block);
-        let block_tokens = estimate_tokens(&block_text) as f64;
+        let block_tokens = (self.token_estimator)(&block_text) as f64;
         if self.total_tokens + block_tokens > self.budget_stop && self.total_tokens > 0.0 {
             self.current_block = Some(current_block);
             self.stopped_early = true;

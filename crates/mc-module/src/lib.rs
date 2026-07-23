@@ -275,6 +275,7 @@ const STATE_IMPORT_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
 const STATE_IMPORT_MAX_PENDING: usize = 64;
 const STATE_IMPORT_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const TRANSFORM_SNAPSHOT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const BOUNDARY_TOKEN_CACHE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 const ACTIVE_SNAPSHOT_LEASE_BUDGET_BYTES: usize = TRANSFORM_SNAPSHOT_BUDGET_BYTES;
 const MAX_ACTIVE_SNAPSHOT_LEASES: usize = 8;
 /// InFlight snapshot markers have no byte charge, so they need their own count bound:
@@ -1619,6 +1620,157 @@ impl TransformSnapshotCache {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundaryTokenCacheEntry {
+    byte_size: usize,
+    content_hash: [u8; 32],
+    token_count: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BoundaryTokenCacheSnapshot {
+    entries: HashMap<String, BoundaryTokenCacheEntry>,
+    formatted_tokens: HashMap<[u8; 32], usize>,
+    hits: usize,
+    misses: usize,
+}
+
+impl BoundaryTokenCacheSnapshot {
+    fn token_count(&mut self, block_id: &str, bytes: &str) -> usize {
+        // Block ids survive replay and same-length content edits are valid for live-tail blocks,
+        // so length alone cannot prove that a cached token count still describes these bytes.
+        let content_hash: [u8; 32] = Sha256::digest(bytes.as_bytes()).into();
+        if let Some(entry) = self.entries.get(block_id) {
+            if entry.byte_size == bytes.len() && entry.content_hash == content_hash {
+                self.hits = self.hits.saturating_add(1);
+                return entry.token_count;
+            }
+        }
+        let token_count = mc_tokenizer::estimate_tokens(bytes);
+        self.misses = self.misses.saturating_add(1);
+        self.entries.insert(
+            block_id.to_string(),
+            BoundaryTokenCacheEntry {
+                byte_size: bytes.len(),
+                content_hash,
+                token_count,
+            },
+        );
+        token_count
+    }
+
+    fn formatted_token_count(&mut self, bytes: &str) -> usize {
+        let content_hash: [u8; 32] = Sha256::digest(bytes.as_bytes()).into();
+        if let Some(token_count) = self.formatted_tokens.get(&content_hash) {
+            return *token_count;
+        }
+        let token_count = mc_tokenizer::estimate_tokens(bytes);
+        self.formatted_tokens.insert(content_hash, token_count);
+        token_count
+    }
+
+    fn retain_projection(&mut self, projection: &crate::ck_wire::FlatProjection) {
+        let active_ids = projection
+            .blocks
+            .iter()
+            .filter(|block| !block.synthetic)
+            .map(|block| block.id.as_str())
+            .collect::<HashSet<_>>();
+        self.entries
+            .retain(|block_id, _| active_ids.contains(block_id.as_str()));
+    }
+
+    fn retained_bytes(&self) -> usize {
+        let source_bytes = self
+            .entries
+            .keys()
+            // Include a conservative per-entry allowance for the HashMap bucket and owned key.
+            .map(|block_id| block_id.len() + std::mem::size_of::<BoundaryTokenCacheEntry>() + 64)
+            .sum::<usize>();
+        source_bytes
+            + self.formatted_tokens.len()
+                * (std::mem::size_of::<[u8; 32]>() + std::mem::size_of::<usize>() + 64)
+    }
+}
+
+#[derive(Debug)]
+struct BoundaryTokenCacheSession {
+    retained_bytes: usize,
+    entries: HashMap<String, BoundaryTokenCacheEntry>,
+    formatted_tokens: HashMap<[u8; 32], usize>,
+}
+
+#[derive(Debug)]
+struct BoundaryTokenCache {
+    sessions: HashMap<String, BoundaryTokenCacheSession>,
+    lru: VecDeque<String>,
+    retained_bytes: usize,
+    max_retained_bytes: usize,
+}
+
+impl BoundaryTokenCache {
+    fn new(max_retained_bytes: usize) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            lru: VecDeque::new(),
+            retained_bytes: 0,
+            max_retained_bytes,
+        }
+    }
+
+    fn remove(&mut self, session_id: &str) {
+        if let Some(session) = self.sessions.remove(session_id) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+        }
+        self.lru.retain(|candidate| candidate != session_id);
+    }
+
+    fn snapshot(&mut self, session_id: &str) -> BoundaryTokenCacheSnapshot {
+        let (entries, formatted_tokens) = self
+            .sessions
+            .get(session_id)
+            .map(|session| (session.entries.clone(), session.formatted_tokens.clone()))
+            .unwrap_or_default();
+        if !entries.is_empty() || !formatted_tokens.is_empty() {
+            self.lru.retain(|candidate| candidate != session_id);
+            self.lru.push_back(session_id.to_string());
+        }
+        BoundaryTokenCacheSnapshot {
+            entries,
+            formatted_tokens,
+            ..BoundaryTokenCacheSnapshot::default()
+        }
+    }
+
+    fn replace(&mut self, session_id: &str, snapshot: BoundaryTokenCacheSnapshot) {
+        self.remove(session_id);
+        let retained_bytes = snapshot.retained_bytes();
+        if (snapshot.entries.is_empty() && snapshot.formatted_tokens.is_empty())
+            || retained_bytes > self.max_retained_bytes
+        {
+            return;
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.sessions.insert(
+            session_id.to_string(),
+            BoundaryTokenCacheSession {
+                retained_bytes,
+                entries: snapshot.entries,
+                formatted_tokens: snapshot.formatted_tokens,
+            },
+        );
+        self.lru.push_back(session_id.to_string());
+        while self.retained_bytes > self.max_retained_bytes {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            if let Some(session) = self.sessions.remove(&oldest) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+            }
+        }
+    }
+}
+
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (route channel → {project, session}).
 pub struct McHandler {
@@ -1634,6 +1786,7 @@ pub struct McHandler {
     recomp_sessions: Arc<Mutex<HashSet<String>>>,
     transform_snapshots: Arc<Mutex<TransformSnapshotCache>>,
     serialized_outputs: Mutex<SerializedOutputCache>,
+    boundary_tokens: Mutex<BoundaryTokenCache>,
     scheduler_observations: Mutex<HashMap<String, SchedulerObservation>>,
     guidance_dates: Mutex<HashMap<String, String>>,
     #[cfg(test)]
@@ -2050,6 +2203,7 @@ impl McHandler {
                 TRANSFORM_SNAPSHOT_BUDGET_BYTES,
             ))),
             serialized_outputs: Mutex::new(SerializedOutputCache::default()),
+            boundary_tokens: Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES)),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -2134,6 +2288,7 @@ impl McHandler {
                 TRANSFORM_SNAPSHOT_BUDGET_BYTES,
             ))),
             serialized_outputs: Mutex::new(SerializedOutputCache::default()),
+            boundary_tokens: Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES)),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
             guidance_now_ms: Mutex::new(None),
@@ -2194,6 +2349,10 @@ impl McHandler {
             self.serialized_outputs
                 .lock()
                 .expect("serialized output cache mutex")
+                .remove(&session_id);
+            self.boundary_tokens
+                .lock()
+                .expect("boundary token cache mutex")
                 .remove(&session_id);
         }
     }
@@ -2323,6 +2482,10 @@ impl McHandler {
             self.serialized_outputs
                 .lock()
                 .expect("serialized output cache mutex")
+                .remove(&session);
+            self.boundary_tokens
+                .lock()
+                .expect("boundary token cache mutex")
                 .remove(&session);
         }
     }
@@ -2871,14 +3034,15 @@ impl McHandler {
                 last_failure,
             });
         }
-        let boundary_messages = boundary_messages(parsed, projection);
-        trigger_timer.timings.tokenized_blocks =
-            trigger_timer.timings.tokenized_blocks.saturating_add(
-                boundary_messages
-                    .iter()
-                    .map(|message| message.blocks.len())
-                    .sum::<usize>(),
-            );
+        let CachedBoundaryMessages {
+            messages: boundary_messages,
+            tokenized_blocks,
+            mut token_cache_snapshot,
+        } = boundary_messages(parsed, projection, &self.boundary_tokens);
+        trigger_timer.timings.tokenized_blocks = trigger_timer
+            .timings
+            .tokenized_blocks
+            .saturating_add(tokenized_blocks);
         let last_compartment_end_ordinal = store
             .load_compartments(&parsed.session_id)
             .ok()
@@ -2897,27 +3061,36 @@ impl McHandler {
             input_tokens,
             context_limit,
         );
-        let trigger = boundary::check_compartment_trigger(
-            &boundary_messages,
-            &TriggerContext {
-                boundary: BoundaryContext {
-                    context_limit,
-                    execute_threshold_percentage: cfg.execute_threshold_percentage,
-                    usage_percentage,
-                    usage_input_tokens: input_tokens,
-                    last_compartment_end_ordinal,
-                    prior_boundary_ordinal: last_compartment_end_ordinal.unwrap_or(0),
-                    migration_floor_active: last_compartment_end_ordinal.unwrap_or(0) > 0,
-                    emergency_tail_scale: None,
-                    trigger_budget: None,
-                    fold_is_only_reclaim,
+        let trigger = {
+            let mut formatted_token_estimator =
+                |bytes: &str| token_cache_snapshot.formatted_token_count(bytes);
+            boundary::check_compartment_trigger_with_token_estimator(
+                &boundary_messages,
+                &TriggerContext {
+                    boundary: BoundaryContext {
+                        context_limit,
+                        execute_threshold_percentage: cfg.execute_threshold_percentage,
+                        usage_percentage,
+                        usage_input_tokens: input_tokens,
+                        last_compartment_end_ordinal,
+                        prior_boundary_ordinal: last_compartment_end_ordinal.unwrap_or(0),
+                        migration_floor_active: last_compartment_end_ordinal.unwrap_or(0) > 0,
+                        emergency_tail_scale: None,
+                        trigger_budget: None,
+                        fold_is_only_reclaim,
+                    },
+                    projected_post_drop_percentage,
+                    compartment_in_progress: loaded.meta.historian.state != HistorianPhase::Idle,
+                    commit_cluster_trigger_enabled: DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED,
+                    min_commit_clusters: DEFAULT_MIN_COMMIT_CLUSTERS,
                 },
-                projected_post_drop_percentage,
-                compartment_in_progress: loaded.meta.historian.state != HistorianPhase::Idle,
-                commit_cluster_trigger_enabled: DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED,
-                min_commit_clusters: DEFAULT_MIN_COMMIT_CLUSTERS,
-            },
-        );
+                &mut formatted_token_estimator,
+            )
+        };
+        self.boundary_tokens
+            .lock()
+            .expect("boundary token cache mutex")
+            .replace(&parsed.session_id, token_cache_snapshot);
         let progress = trigger
             .progress
             .as_ref()
@@ -3978,6 +4151,10 @@ impl McHandler {
             .lock()
             .expect("serialized output cache mutex")
             .remove(&session_id);
+        self.boundary_tokens
+            .lock()
+            .expect("boundary token cache mutex")
+            .remove(&session_id);
         // A transform generation is an in-memory fence for cached raw snapshots. Marking
         // this session in-flight prevents an already assembled historian from acquiring
         // a ready snapshot after the durable revert epoch has been bumped.
@@ -4529,7 +4706,13 @@ impl McHandler {
                 )
             }
         };
-        let boundary_messages = wrapup_boundary_messages(&parsed, &projection);
+        let boundary_messages =
+            wrapup_boundary_messages(&parsed, &projection, &self.boundary_tokens);
+        self.boundary_tokens
+            .lock()
+            .expect("boundary token cache mutex")
+            .replace(&parsed.session_id, boundary_messages.token_cache_snapshot);
+        let boundary_messages = boundary_messages.messages;
         let initial_compartments = initial_snapshot.compartments;
         let initial_end = initial_compartments
             .iter()
@@ -9732,44 +9915,41 @@ fn wrapup_has_remaining_messages(
 fn wrapup_boundary_messages(
     parsed: &TransformRequest,
     projection: &crate::ck_wire::FlatProjection,
-) -> Vec<BoundaryMsg> {
-    parsed
-        .messages
-        .iter()
-        .filter(|message| !message.ck.meta.synthetic)
-        .map(|message| BoundaryMsg {
-            message_ordinal: message.ordinal,
-            message_id: message.mid.clone(),
-            role: Role::from_provider(&message.ck.role),
-            blocks: projection
-                .blocks
-                .iter()
-                .filter(|block| block.mid == message.mid && !block.synthetic)
-                .map(|block| BoundaryBlock {
-                    id: block.id.clone(),
-                    ordinal: block.ordinal,
-                    kind: sel_kind_for_flat(block),
-                    provider_executed: block.provider_executed,
-                    byte_size: block.bytes.len(),
-                    arc_id: block.arc_id.clone(),
-                    original: block.bytes.clone(),
-                    original_token_count: mc_tokenizer::estimate_tokens(&block.bytes),
-                    rendered: None,
-                    ignored: false,
-                })
-                .collect(),
-        })
-        .collect()
+    token_cache: &Mutex<BoundaryTokenCache>,
+) -> CachedBoundaryMessages {
+    cached_boundary_messages(parsed, projection, token_cache, true)
 }
 
 fn boundary_messages(
     parsed: &TransformRequest,
     projection: &crate::ck_wire::FlatProjection,
-) -> Vec<BoundaryMsg> {
-    parsed
+    token_cache: &Mutex<BoundaryTokenCache>,
+) -> CachedBoundaryMessages {
+    cached_boundary_messages(parsed, projection, token_cache, false)
+}
+
+struct CachedBoundaryMessages {
+    messages: Vec<BoundaryMsg>,
+    tokenized_blocks: usize,
+    token_cache_snapshot: BoundaryTokenCacheSnapshot,
+}
+
+fn cached_boundary_messages(
+    parsed: &TransformRequest,
+    projection: &crate::ck_wire::FlatProjection,
+    token_cache: &Mutex<BoundaryTokenCache>,
+    include_system: bool,
+) -> CachedBoundaryMessages {
+    let mut cache_snapshot = token_cache
+        .lock()
+        .expect("boundary token cache mutex")
+        .snapshot(&parsed.session_id);
+    let messages = parsed
         .messages
         .iter()
-        .filter(|message| !message.ck.meta.synthetic && message.ck.role != "system")
+        .filter(|message| {
+            !message.ck.meta.synthetic && (include_system || message.ck.role != "system")
+        })
         .map(|message| BoundaryMsg {
             message_ordinal: message.ordinal,
             message_id: message.mid.clone(),
@@ -9785,14 +9965,21 @@ fn boundary_messages(
                     provider_executed: block.provider_executed,
                     byte_size: block.bytes.len(),
                     arc_id: block.arc_id.clone(),
+                    original_token_count: cache_snapshot.token_count(&block.id, &block.bytes),
                     original: block.bytes.clone(),
-                    original_token_count: mc_tokenizer::estimate_tokens(&block.bytes),
                     rendered: None,
                     ignored: false,
                 })
                 .collect(),
         })
-        .collect()
+        .collect();
+    cache_snapshot.retain_projection(projection);
+    let tokenized_blocks = cache_snapshot.misses;
+    CachedBoundaryMessages {
+        messages,
+        tokenized_blocks,
+        token_cache_snapshot: cache_snapshot,
+    }
 }
 
 fn sel_kind_for_flat(block: &crate::ck_wire::FlatBlock) -> SelKind {
@@ -10224,6 +10411,23 @@ mod tests {
         assert!((pct - 80.0).abs() < 0.01, "pct={pct}");
     }
 
+    fn trigger_ingress_fixture(
+        message_count: usize,
+        payload_bytes: usize,
+    ) -> Vec<CkIngressMessage> {
+        (0..message_count)
+            .map(|index| {
+                let text = format!("message {index}: {}", "x".repeat(payload_bytes));
+                ck_with_role(
+                    &format!("m-{index}"),
+                    index as u64 + 1,
+                    if index % 2 == 0 { "user" } else { "assistant" },
+                    &text,
+                )
+            })
+            .collect()
+    }
+
     fn trigger_messages_fixture(message_count: usize, payload_bytes: usize) -> Vec<BoundaryMsg> {
         (0..message_count)
             .map(|index| {
@@ -10332,63 +10536,132 @@ mod tests {
     }
 
     #[test]
-    fn historian_trigger_token_reuse_matches_retokenized_production_shape() {
-        let messages = trigger_messages_fixture(1_400, 24);
-        let cases = [
-            ("empty", Vec::new(), Vec::new()),
-            ("pending", vec![pending_drop("m-100#0")], Vec::new()),
-            (
-                "frozen",
-                vec![pending_drop("m-100#0")],
-                vec![frozen_drop("m-100#0"), frozen_drop("retired#0")],
-            ),
-        ];
-        for (label, pending, frozen) in cases {
-            let reference_projection = projected_post_drop_percentage_retokenized_reference(
-                &messages, &pending, &frozen, 140_000.0, 200_000.0,
-            );
-            let optimized_projection =
-                projected_post_drop_percentage(&messages, &pending, &frozen, 140_000.0, 200_000.0);
-            assert_eq!(
-                optimized_projection, reference_projection,
-                "projection: {label}"
-            );
+    fn boundary_token_cache_hash_fences_same_length_edits_and_evicts_lru() {
+        let mut cache = BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES);
+        let mut cold = cache.snapshot("ses-a");
+        let cold_tokens = cold.token_count("m-1#0", "aaaaaaaa");
+        assert_eq!((cold.hits, cold.misses), (0, 1));
+        cache.replace("ses-a", cold);
 
-            let context = TriggerContext {
-                boundary: BoundaryContext {
-                    context_limit: 200_000.0,
-                    execute_threshold_percentage: 65.0,
-                    usage_percentage: 70.0,
-                    usage_input_tokens: 140_000.0,
-                    last_compartment_end_ordinal: None,
-                    prior_boundary_ordinal: 0,
-                    migration_floor_active: false,
-                    emergency_tail_scale: None,
-                    trigger_budget: Some(4_000.0),
-                    fold_is_only_reclaim: false,
-                },
-                projected_post_drop_percentage: optimized_projection,
-                compartment_in_progress: false,
-                commit_cluster_trigger_enabled: true,
-                min_commit_clusters: 2,
-            };
-            let mut reference_context = context.clone();
-            reference_context.projected_post_drop_percentage = reference_projection;
-            assert_eq!(
-                boundary::check_compartment_trigger(&messages, &context),
-                boundary::check_compartment_trigger_retokenized_reference(
-                    &messages,
-                    &reference_context,
+        let mut edited = cache.snapshot("ses-a");
+        let edited_tokens = edited.token_count("m-1#0", "a b c d ");
+        assert_ne!(
+            cold_tokens, edited_tokens,
+            "fixture must change token count"
+        );
+        assert_eq!(edited_tokens, mc_tokenizer::estimate_tokens("a b c d "));
+        assert_eq!(
+            (edited.hits, edited.misses),
+            (0, 1),
+            "equal byte length cannot reuse a changed block"
+        );
+        cache.replace("ses-a", edited);
+
+        let mut warm = cache.snapshot("ses-a");
+        warm.token_count("m-1#0", "a b c d ");
+        assert_eq!((warm.hits, warm.misses), (1, 0));
+        let one_session_bytes = warm.retained_bytes();
+        let formatted = "[1] U:  a b c d";
+        let formatted_tokens = warm.formatted_token_count(formatted);
+        assert_eq!(formatted_tokens, mc_tokenizer::estimate_tokens(formatted));
+        assert_eq!(warm.formatted_token_count(formatted), formatted_tokens);
+        assert_eq!(warm.formatted_tokens.len(), 1);
+
+        let mut bounded = BoundaryTokenCache::new(one_session_bytes);
+        let mut first = bounded.snapshot("first");
+        first.token_count("m-1#0", "first");
+        bounded.replace("first", first);
+        let mut second = bounded.snapshot("second");
+        second.token_count("m-2#0", "other");
+        bounded.replace("second", second);
+        assert!(!bounded.sessions.contains_key("first"));
+        assert!(bounded.sessions.contains_key("second"));
+    }
+
+    #[test]
+    fn historian_trigger_token_reuse_matches_retokenized_production_shape() {
+        let cold_request = transform_request(trigger_ingress_fixture(1_400, 24), 140_000, 200_000);
+        let cold_projection = crate::ck_wire::project_messages(&cold_request.messages).unwrap();
+        let warm_request = transform_request(trigger_ingress_fixture(1_401, 24), 140_000, 200_000);
+        let warm_projection = crate::ck_wire::project_messages(&warm_request.messages).unwrap();
+        let token_cache = Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES));
+        let cold = boundary_messages(&cold_request, &cold_projection, &token_cache);
+        assert_eq!(cold.tokenized_blocks, 1_400);
+        token_cache
+            .lock()
+            .unwrap()
+            .replace(&cold_request.session_id, cold.token_cache_snapshot);
+        let warm = boundary_messages(&warm_request, &warm_projection, &token_cache);
+        assert_eq!(
+            warm.tokenized_blocks, 1,
+            "only the appended block retokenizes"
+        );
+
+        for (pass, messages) in [("cold", cold.messages), ("warm", warm.messages)] {
+            let cases = [
+                ("empty", Vec::new(), Vec::new()),
+                ("pending", vec![pending_drop("m-100#0")], Vec::new()),
+                (
+                    "frozen",
+                    vec![pending_drop("m-100#0")],
+                    vec![frozen_drop("m-100#0"), frozen_drop("retired#0")],
                 ),
-                "trigger decision and progress: {label}",
-            );
+            ];
+            for (case, pending, frozen) in cases {
+                let reference_projection = projected_post_drop_percentage_retokenized_reference(
+                    &messages, &pending, &frozen, 140_000.0, 200_000.0,
+                );
+                let optimized_projection = projected_post_drop_percentage(
+                    &messages, &pending, &frozen, 140_000.0, 200_000.0,
+                );
+                assert_eq!(
+                    optimized_projection, reference_projection,
+                    "projection: {pass}/{case}"
+                );
+
+                let context = TriggerContext {
+                    boundary: BoundaryContext {
+                        context_limit: 200_000.0,
+                        execute_threshold_percentage: 65.0,
+                        usage_percentage: 70.0,
+                        usage_input_tokens: 140_000.0,
+                        last_compartment_end_ordinal: None,
+                        prior_boundary_ordinal: 0,
+                        migration_floor_active: false,
+                        emergency_tail_scale: None,
+                        trigger_budget: Some(4_000.0),
+                        fold_is_only_reclaim: false,
+                    },
+                    projected_post_drop_percentage: optimized_projection,
+                    compartment_in_progress: false,
+                    commit_cluster_trigger_enabled: true,
+                    min_commit_clusters: 2,
+                };
+                let mut reference_context = context.clone();
+                reference_context.projected_post_drop_percentage = reference_projection;
+                assert_eq!(
+                    boundary::check_compartment_trigger(&messages, &context),
+                    boundary::check_compartment_trigger_retokenized_reference(
+                        &messages,
+                        &reference_context,
+                    ),
+                    "trigger decision and progress: {pass}/{case}",
+                );
+            }
         }
     }
 
     #[test]
     #[ignore = "run manually to compare production-sized historian trigger cost"]
     fn historian_trigger_token_reuse_benchmark() {
-        let template = trigger_messages_fixture(1_400, 2_048);
+        let reference_cold = trigger_messages_fixture(1_400, 2_048);
+        let reference_warm = trigger_messages_fixture(1_401, 2_048);
+        let cold_request =
+            transform_request(trigger_ingress_fixture(1_400, 2_048), 100_000, 200_000);
+        let cold_projection = crate::ck_wire::project_messages(&cold_request.messages).unwrap();
+        let warm_request =
+            transform_request(trigger_ingress_fixture(1_401, 2_048), 100_000, 200_000);
+        let warm_projection = crate::ck_wire::project_messages(&warm_request.messages).unwrap();
         let context = TriggerContext {
             boundary: BoundaryContext {
                 context_limit: 200_000.0,
@@ -10407,51 +10680,108 @@ mod tests {
             commit_cluster_trigger_enabled: true,
             min_commit_clusters: 2,
         };
-        let mut before = Vec::new();
-        let mut after = Vec::new();
+        let mut before_cold = Vec::new();
+        let mut before_warm = Vec::new();
+        let mut after_cold = Vec::new();
+        let mut after_warm = Vec::new();
+        let mut warm_boundary_build = Vec::new();
+        let mut warm_trigger_scan = Vec::new();
         for _ in 0..3 {
-            let started_at = Instant::now();
-            let reference_messages = template.clone();
-            let projected = projected_post_drop_percentage_retokenized_reference(
-                &reference_messages,
-                &[],
-                &[],
-                100_000.0,
-                200_000.0,
-            );
-            let mut reference_context = context.clone();
-            reference_context.projected_post_drop_percentage = projected;
-            std::hint::black_box(boundary::check_compartment_trigger_retokenized_reference(
-                std::hint::black_box(&reference_messages),
-                std::hint::black_box(&reference_context),
-            ));
-            before.push(started_at.elapsed().as_secs_f64() * 1_000.0);
-
-            let started_at = Instant::now();
-            let mut optimized_messages = template.clone();
-            for block in optimized_messages
-                .iter_mut()
-                .flat_map(|message| &mut message.blocks)
-            {
-                block.original_token_count = mc_tokenizer::estimate_tokens(&block.original);
+            for (template, samples) in [
+                (&reference_cold, &mut before_cold),
+                (&reference_warm, &mut before_warm),
+            ] {
+                let started_at = Instant::now();
+                let messages = template.clone();
+                let projected = projected_post_drop_percentage_retokenized_reference(
+                    &messages,
+                    &[],
+                    &[],
+                    100_000.0,
+                    200_000.0,
+                );
+                let mut reference_context = context.clone();
+                reference_context.projected_post_drop_percentage = projected;
+                std::hint::black_box(boundary::check_compartment_trigger_retokenized_reference(
+                    std::hint::black_box(&messages),
+                    std::hint::black_box(&reference_context),
+                ));
+                samples.push(started_at.elapsed().as_secs_f64() * 1_000.0);
             }
+
+            let token_cache =
+                Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES));
+            let started_at = Instant::now();
+            let mut cold = boundary_messages(&cold_request, &cold_projection, &token_cache);
+            assert_eq!(cold.tokenized_blocks, 1_400);
             let projected =
-                projected_post_drop_percentage(&optimized_messages, &[], &[], 100_000.0, 200_000.0);
+                projected_post_drop_percentage(&cold.messages, &[], &[], 100_000.0, 200_000.0);
             let mut optimized_context = context.clone();
             optimized_context.projected_post_drop_percentage = projected;
-            std::hint::black_box(boundary::check_compartment_trigger(
-                std::hint::black_box(&optimized_messages),
-                std::hint::black_box(&optimized_context),
-            ));
-            after.push(started_at.elapsed().as_secs_f64() * 1_000.0);
+            {
+                let mut cold_token_estimator =
+                    |bytes: &str| cold.token_cache_snapshot.formatted_token_count(bytes);
+                std::hint::black_box(boundary::check_compartment_trigger_with_token_estimator(
+                    std::hint::black_box(&cold.messages),
+                    std::hint::black_box(&optimized_context),
+                    &mut cold_token_estimator,
+                ));
+            }
+            token_cache
+                .lock()
+                .unwrap()
+                .replace(&cold_request.session_id, cold.token_cache_snapshot);
+            after_cold.push(started_at.elapsed().as_secs_f64() * 1_000.0);
+
+            let started_at = Instant::now();
+            let mut warm = boundary_messages(&warm_request, &warm_projection, &token_cache);
+            warm_boundary_build.push(started_at.elapsed().as_secs_f64() * 1_000.0);
+            assert_eq!(warm.tokenized_blocks, 1);
+            let projected =
+                projected_post_drop_percentage(&warm.messages, &[], &[], 100_000.0, 200_000.0);
+            optimized_context.projected_post_drop_percentage = projected;
+            let trigger_started_at = Instant::now();
+            {
+                let mut warm_token_estimator =
+                    |bytes: &str| warm.token_cache_snapshot.formatted_token_count(bytes);
+                std::hint::black_box(boundary::check_compartment_trigger_with_token_estimator(
+                    std::hint::black_box(&warm.messages),
+                    std::hint::black_box(&optimized_context),
+                    &mut warm_token_estimator,
+                ));
+            }
+            warm_trigger_scan.push(trigger_started_at.elapsed().as_secs_f64() * 1_000.0);
+            token_cache
+                .lock()
+                .unwrap()
+                .replace(&warm_request.session_id, warm.token_cache_snapshot);
+            after_warm.push(started_at.elapsed().as_secs_f64() * 1_000.0);
         }
-        before.sort_by(f64::total_cmp);
-        after.sort_by(f64::total_cmp);
+        before_cold.sort_by(f64::total_cmp);
+        before_warm.sort_by(f64::total_cmp);
+        after_cold.sort_by(f64::total_cmp);
+        after_warm.sort_by(f64::total_cmp);
+        warm_boundary_build.sort_by(f64::total_cmp);
+        warm_trigger_scan.sort_by(f64::total_cmp);
         eprintln!(
-            "historian-trigger messages=1400 payload_bytes=2048 before_ms={:.1} after_ms={:.1}",
-            before[1], after[1],
+            "historian-trigger messages=1400 payload_bytes=2048 before_cold_ms={:.1} \
+             before_warm_append_ms={:.1} after_cold_ms={:.1} after_warm_append_ms={:.1} \
+             warm_boundary_ms={:.1} warm_scan_ms={:.1}",
+            before_cold[1],
+            before_warm[1],
+            after_cold[1],
+            after_warm[1],
+            warm_boundary_build[1],
+            warm_trigger_scan[1],
         );
-        assert!(after[1] < before[1], "before={before:?} after={after:?}");
+        assert!(
+            after_warm[1] < after_cold[1],
+            "after_cold={after_cold:?} after_warm={after_warm:?}"
+        );
+        assert!(
+            after_warm[1] < 150.0,
+            "warm trigger target missed: after_warm={after_warm:?}"
+        );
     }
 
     #[test]
@@ -11793,6 +12123,8 @@ mod tests {
         assert!(response["timings"]["trigger_ms"].is_number());
         assert_eq!(response["timings"]["trigger_tokenized_blocks"], 1);
         assert!(response["timings"]["post_attach"].is_number());
+        let warm = call_transform_request(&handler, request(vec![ck("m1", 1, "hello")])).await;
+        assert_eq!(warm["timings"]["trigger_tokenized_blocks"], 0);
         assert_eq!(
             store.tag_number_query_count_for_test(),
             0,
