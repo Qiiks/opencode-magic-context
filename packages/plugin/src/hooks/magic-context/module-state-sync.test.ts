@@ -15,6 +15,7 @@ import {
 } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { setProjectState } from "../../features/magic-context/storage-project-state";
+import { insertUserMemory } from "../../features/magic-context/user-memory/storage-user-memory";
 import {
     insertTag,
     updateTagDropMode,
@@ -25,6 +26,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     buildModuleStateSyncPayload,
     buildPagedModuleStateSyncPayloads,
+    type ModuleStateSyncState,
     loadModuleWatermarks,
     mirrorModuleCompartments,
     syncModuleState,
@@ -296,6 +298,117 @@ describe("module state external epochs", () => {
                 project_user_profile_version: 4,
             }),
         );
+    });
+});
+
+describe("module state sync section deltas", () => {
+    function createWorkspace(db: Database): void {
+        db.exec(
+            `INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
+             VALUES (1, 'shared', 0, 0, '["CONSTRAINTS"]');
+             INSERT INTO workspace_members
+                 (workspace_id, project_path, display_name, display_path, added_at)
+             VALUES
+                 (1, '/tmp/project', 'project', '/tmp/project', 0),
+                 (1, '/tmp/foreign', 'foreign', '/tmp/foreign', 0);`,
+        );
+        setProjectState(db, "/tmp/project", { projectMemoryEpoch: 1 });
+        setProjectState(db, "/tmp/foreign", { projectMemoryEpoch: 1 });
+    }
+
+    async function buildDeltaPayload(args: {
+        db: Database;
+        state: ModuleStateSyncState;
+        sessionId: string;
+        force?: boolean;
+    }): Promise<Record<string, unknown>> {
+        const payload = await buildModuleStateSyncPayload({
+            state: args.state,
+            pass: {
+                db: args.db,
+                sessionId: args.sessionId,
+                projectPath: "/tmp/project",
+                nowMs: 1,
+            },
+            force: args.force ?? false,
+            options: { stateSyncDeltas: true },
+        });
+        expect(payload).not.toBeNull();
+        expect(typeof payload).toBe("object");
+        if (!payload || typeof payload !== "object" || "method" in payload === false) {
+            throw new Error("expected a state-sync payload");
+        }
+        return payload.params as Record<string, unknown>;
+    }
+
+    it("omits unchanged profile and workspace sections but preserves explicit changes", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-state-sync-deltas";
+        createWorkspace(db);
+        insertUserMemory(db, "likes deltas", []);
+        setProjectState(db, "__global__", { projectUserProfileVersion: 1 });
+        const baseline = loadModuleWatermarks({ db, sessionId, projectPath: "/tmp/project" });
+        const state = {
+            ...syncState(),
+            lastAckedWatermarks: baseline,
+            seedPassPending: false,
+        };
+
+        updateSessionMeta(db, sessionId, { lastTodoState: '[{"content":"todo"}]' });
+        const unrelated = await buildDeltaPayload({ db, state, sessionId });
+        expect(unrelated).not.toHaveProperty("user_profile");
+        expect(unrelated).not.toHaveProperty("workspace");
+
+        setProjectState(db, "__global__", { projectUserProfileVersion: 2 });
+        const profileChanged = await buildDeltaPayload({ db, state, sessionId });
+        expect(profileChanged.user_profile).toEqual(["likes deltas"]);
+        expect(profileChanged).not.toHaveProperty("workspace");
+        state.lastAckedWatermarks = loadModuleWatermarks({
+            db,
+            sessionId,
+            projectPath: "/tmp/project",
+        });
+
+        setProjectState(db, "/tmp/foreign", { projectMemoryEpoch: 2 });
+        const workspaceChanged = await buildDeltaPayload({ db, state, sessionId });
+        expect(workspaceChanged).toHaveProperty("workspace");
+        expect(workspaceChanged).not.toHaveProperty("user_profile");
+
+        const forced = await buildDeltaPayload({ db, state, sessionId, force: true });
+        expect(forced.user_profile).toEqual(["likes deltas"]);
+        expect(forced.workspace).toEqual(expect.objectContaining({ members: expect.any(Array) }));
+    });
+
+    it("uses omitted sections only after the module advertises the delta capability", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-state-sync-capability";
+        const baseline = loadModuleWatermarks({ db, sessionId, projectPath: "/tmp/project" });
+        updateSessionMeta(db, sessionId, { lastTodoState: '[{"content":"todo"}]' });
+        const state = {
+            ...syncState(),
+            lastAckedWatermarks: baseline,
+            seedPassPending: false,
+        };
+        const calls: unknown[] = [];
+        await syncModuleState({
+            client: {
+                async stateSyncCapabilities() {
+                    return { state_sync_deltas: true };
+                },
+                async call(args) {
+                    calls.push(args.body);
+                    return { result: { shadow_seq: 1 } };
+                },
+            },
+            state,
+            pass: { db, sessionId, projectPath: "/tmp/project", nowMs: 1 },
+            projectRoot: "/tmp/project",
+            force: false,
+        });
+        expect(calls).toHaveLength(1);
+        const body = calls[0] as Record<string, unknown>;
+        expect(body).not.toHaveProperty("user_profile");
+        expect(body).not.toHaveProperty("workspace");
     });
 });
 

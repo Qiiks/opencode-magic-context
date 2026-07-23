@@ -631,6 +631,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                   const transport = new SubcModuleTransport();
                   const client: RustModeModuleClient = {
                       call: (args) => transport.call(args),
+                      stateSyncCapabilities: (args) => transport.stateSyncCapabilities(args),
                       closeSession: (sessionId) => transport.closeSession(sessionId),
                       authorityStatus: (args) => transport.authorityStatus(args),
                       authorityPrepare: (args) => transport.authorityPrepare(args),

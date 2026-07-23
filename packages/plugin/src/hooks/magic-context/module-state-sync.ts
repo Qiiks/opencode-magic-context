@@ -65,6 +65,9 @@ export interface ModuleWatermarks {
     last_todo_state_hash: string;
     project_memory_epoch: number;
     project_user_profile_version: number;
+    /** Fingerprint of the current workspace epoch, used to determine whether cached
+     * state-sync markers are still valid. */
+    workspace_fingerprint?: string | null;
     reasoning_cleared_through_tag?: number;
 }
 
@@ -151,7 +154,7 @@ export interface ModuleStateSyncPayload {
         compartments: unknown[];
         memories?: unknown[];
         memory_mutations?: unknown[];
-        user_profile: string[];
+        user_profile?: string[];
         workspace?: ModuleWorkspacePayload | null;
         last_todo_state?: string;
         project_memory_epoch?: number;
@@ -203,6 +206,8 @@ export interface ModuleStateSyncOptions {
     authorityState?: "TS" | "PREPARING" | "MODULE" | "DRAINING";
     /** Enable the authority sender's one-time durable-sequence adoption. */
     authority?: boolean;
+    /** Set only after the module status/hello advertises state_sync_deltas. */
+    stateSyncDeltas?: boolean;
     /** Share adoption state across every authority sync attempt in one transform pass. */
     authoritySeqAdoption?: { used: boolean };
 }
@@ -400,6 +405,7 @@ export function loadModuleWatermarks(args: {
         project_user_profile_version:
             getProjectState(args.db, GLOBAL_USER_PROFILE_PROJECT_PATH)?.projectUserProfileVersion ??
             0,
+        workspace_fingerprint: workspace.workspace?.fingerprint ?? null,
         reasoning_cleared_through_tag: sessionMeta.clearedReasoningThroughTag ?? 0,
     };
 }
@@ -417,6 +423,7 @@ export function moduleWatermarksEqual(
         left.last_todo_state_hash === right.last_todo_state_hash &&
         left.project_memory_epoch === right.project_memory_epoch &&
         left.project_user_profile_version === right.project_user_profile_version &&
+        (left.workspace_fingerprint ?? null) === (right.workspace_fingerprint ?? null) &&
         (left.reasoning_cleared_through_tag ?? 0) === (right.reasoning_cleared_through_tag ?? 0)
     );
 }
@@ -1133,6 +1140,7 @@ export async function buildModuleStateSyncPayload(args: {
               last_todo_state_hash: "",
               project_memory_epoch: 0,
               project_user_profile_version: 0,
+              workspace_fingerprint: null,
               reasoning_cleared_through_tag: 0,
           }
         : (args.state.lastAckedWatermarks ?? {
@@ -1143,6 +1151,7 @@ export async function buildModuleStateSyncPayload(args: {
               last_todo_state_hash: "",
               project_memory_epoch: 0,
               project_user_profile_version: 0,
+              workspace_fingerprint: null,
               reasoning_cleared_through_tag: 0,
           });
     const rawById = new Map<string, RawMessageParts | null>();
@@ -1164,7 +1173,14 @@ export async function buildModuleStateSyncPayload(args: {
         (args.force || currentWatermarks.memory_mutation_id > acked.memory_mutation_id);
     const profileChanged =
         args.force ||
-        currentWatermarks.project_user_profile_version > acked.project_user_profile_version;
+        currentWatermarks.project_user_profile_version !== acked.project_user_profile_version;
+    const workspaceFingerprintChanged =
+        args.force ||
+        !Object.prototype.hasOwnProperty.call(acked, "workspace_fingerprint") ||
+        (currentWatermarks.workspace_fingerprint ?? null) !== (acked.workspace_fingerprint ?? null);
+    const useStateSyncDeltas = args.options?.stateSyncDeltas === true;
+    const includeUserProfile = !useStateSyncDeltas || profileChanged;
+    const includeWorkspace = !useStateSyncDeltas || workspaceFingerprintChanged;
 
     const compartments: unknown[] = [];
     let serializedCount = 0;
@@ -1263,7 +1279,7 @@ export async function buildModuleStateSyncPayload(args: {
                   nowMs: args.pass.nowMs,
               })
         : [];
-    const userProfile = profileChanged
+    const userProfile = includeUserProfile && profileChanged
         ? getActiveUserMemories(args.pass.db).map((memory) => memory.content)
         : [];
     const memoryMutations =
@@ -1420,8 +1436,8 @@ export async function buildModuleStateSyncPayload(args: {
             expected_shadow_seq: args.state.lastAckedSeq,
             compartments,
             ...(omitAuthorityMemorySections ? {} : { memories, memory_mutations: memoryMutations }),
-            user_profile: userProfile,
-            workspace: workspace.workspace,
+            ...(includeUserProfile ? { user_profile: userProfile } : {}),
+            ...(includeWorkspace ? { workspace: workspace.workspace } : {}),
             last_todo_state: sessionMeta.lastTodoState ?? "",
             project_memory_epoch: currentWatermarks.project_memory_epoch,
             user_profile_version: currentWatermarks.project_user_profile_version,
@@ -1441,6 +1457,11 @@ export async function buildModuleStateSyncPayload(args: {
 }
 
 export interface ModuleStateSyncClient {
+    /** Capability probe is optional so older/test transports retain legacy wire semantics. */
+    stateSyncCapabilities?(args: {
+        sessionId: string;
+        projectRoot: string;
+    }): Promise<{ state_sync_deltas?: boolean }>;
     call(args: {
         sessionId: string;
         projectRoot: string;
@@ -1516,12 +1537,27 @@ export async function syncModuleState(args: {
 }): Promise<ModuleWatermarks | null> {
     let force = args.force;
     const adoption = args.options?.authoritySeqAdoption ?? { used: false };
+    let stateSyncDeltas = args.options?.stateSyncDeltas;
+    if (stateSyncDeltas === undefined && args.client.stateSyncCapabilities) {
+        try {
+            stateSyncDeltas =
+                (await args.client.stateSyncCapabilities({
+                    sessionId: args.pass.sessionId,
+                    projectRoot: args.projectRoot,
+                })).state_sync_deltas === true;
+        } catch {
+            // If the capability check fails, assume the module does not support
+            // state_sync_deltas and send the older payload format with its state-sync
+            // fields always present.
+            stateSyncDeltas = false;
+        }
+    }
     for (;;) {
         const payload = await buildModuleStateSyncPayload({
             state: args.state,
             pass: args.pass,
             force,
-            options: args.options,
+            options: { ...args.options, stateSyncDeltas },
         });
         if (payload === null) return null;
         if (

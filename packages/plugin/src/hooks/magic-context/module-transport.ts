@@ -138,6 +138,22 @@ export class SubcModuleTransport {
     private backoffMs = CONNECT_BACKOFF_INITIAL_MS;
     private connectionGeneration = 0;
 
+    async stateSyncCapabilities(args: {
+        sessionId: string;
+        projectRoot: string;
+    }): Promise<{ state_sync_deltas?: boolean }> {
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "session.status",
+            body: { method: "session.status", v: 1, session_id: args.sessionId },
+        });
+        const raw = isRecord(response) ? response : {};
+        const value = isRecord(raw.result) ? raw.result : raw;
+        const epochs = isRecord(value.epochs) ? value.epochs : {};
+        return { state_sync_deltas: epochs.state_sync_deltas === true };
+    }
+
     constructor(
         connectionFile?: string,
         moduleId = DEFAULT_MODULE_ID,

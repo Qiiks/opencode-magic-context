@@ -3543,7 +3543,11 @@ pub struct ModuleStateSyncRequest<'a> {
     pub memories: &'a [ModuleMemoryRow],
     pub memory_mutations: &'a [ModuleMemoryMutationRow],
     pub user_profile: &'a [String],
+    /// False means the sender omitted the profile section; true includes Some(empty) clears.
+    pub user_profile_present: bool,
     pub workspace: Option<&'a ModuleWorkspaceRow>,
+    /// False means the sender omitted the workspace section; true includes an explicit clear.
+    pub workspace_present: bool,
     pub last_todo_state: Option<String>,
     pub project_memory_epoch: Option<u64>,
     pub user_profile_version: Option<u64>,
@@ -6986,7 +6990,9 @@ impl McStore {
             for compartment in request.compartments {
                 upsert_compartment_tx(tx, request.session_id, compartment)?;
             }
-            replace_workspace_tx(tx, request.project_path, request.workspace)?;
+            if request.workspace_present {
+                replace_workspace_tx(tx, request.project_path, request.workspace)?;
+            }
             // Each authority pool has exactly one writer. When the module owns memories, this
             // state-sync lane can only mirror module changes back to TypeScript; applying the
             // TypeScript view here would let a stale sender overwrite module-authored fields.
@@ -7015,7 +7021,9 @@ impl McStore {
                     request.memory_mutations,
                 )?;
             }
-            replace_authority_user_profile_tx(tx, request.user_profile)?;
+            if request.user_profile_present {
+                replace_authority_user_profile_tx(tx, request.user_profile)?;
+            }
 
             let in_session_watermark_changed = meta.shadow_acked_watermarks != request.acked_watermarks;
             meta.last_todo_state = request.last_todo_state.clone();
@@ -16647,6 +16655,141 @@ mod shadow_tests {
             .any(|row| row.module_row_id == 2 && row.op == "tombstone"));
     }
 
+    fn apply_state_sync_sections(
+        store: &McStore,
+        expected_shadow_seq: u64,
+        user_profile: Option<&[String]>,
+        workspace_present: bool,
+        workspace: Option<&ModuleWorkspaceRow>,
+    ) {
+        store
+            .apply_authority_state_sync(ModuleStateSyncRequest {
+                session_id: "section-delta-session",
+                project_path: "project",
+                shadow_generation: 0,
+                expected_shadow_seq,
+                seed_boundary_id: None,
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
+                compartments: &[],
+                memories: &[],
+                memory_mutations: &[],
+                user_profile: user_profile.unwrap_or(&[]),
+                user_profile_present: user_profile.is_some(),
+                workspace,
+                workspace_present,
+                last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
+                acked_watermarks: serde_json::json!({"section_seq": expected_shadow_seq}),
+            })
+            .unwrap();
+    }
+
+    type SectionSnapshot = (Vec<(i64, String)>, Vec<(i64, String, String)>);
+
+    fn section_snapshot(store: &McStore) -> SectionSnapshot {
+        store
+            .inner
+            .with_conn(|conn| {
+                let profiles = conn
+                    .prepare("SELECT id, content FROM mc_user_memories ORDER BY id")?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<Vec<(i64, String)>, _>>()?;
+                let workspaces = conn
+                    .prepare(
+                        "SELECT workspace.id, member.project_path, member.display_name
+                           FROM mc_workspaces workspace
+                           JOIN mc_workspace_members member ON member.workspace_id = workspace.id
+                          ORDER BY workspace.id, member.project_path",
+                    )?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect::<Result<Vec<(i64, String, String)>, _>>()?;
+                Ok((profiles, workspaces))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn state_sync_sections_distinguish_absent_empty_and_legacy_always_present() {
+        let workspace_a = ModuleWorkspaceRow {
+            name: "workspace-a".to_string(),
+            share_categories: vec!["CONSTRAINTS".to_string()],
+            members: vec![ModuleWorkspaceMemberRow {
+                project_path: "project".to_string(),
+                display_name: "project".to_string(),
+                display_path: "project".to_string(),
+            }],
+        };
+        let workspace_b = ModuleWorkspaceRow {
+            name: "workspace-b".to_string(),
+            ..workspace_a.clone()
+        };
+        let profile_a = vec!["profile-a".to_string()];
+        let profile_b = vec!["profile-b".to_string()];
+
+        let mixed_dir = tempfile::tempdir().unwrap();
+        let mixed = store(mixed_dir.path());
+        apply_state_sync_sections(&mixed, 0, Some(&profile_a), true, Some(&workspace_a));
+        let before_absent = section_snapshot(&mixed);
+        apply_state_sync_sections(&mixed, 1, None, false, None);
+        assert_eq!(
+            section_snapshot(&mixed),
+            before_absent,
+            "absent sections must be untouched"
+        );
+        apply_state_sync_sections(&mixed, 2, Some(&profile_b), true, Some(&workspace_b));
+        let mixed_final = section_snapshot(&mixed);
+
+        let always_dir = tempfile::tempdir().unwrap();
+        let always = store(always_dir.path());
+        apply_state_sync_sections(&always, 0, Some(&profile_a), true, Some(&workspace_a));
+        apply_state_sync_sections(&always, 1, Some(&profile_a), true, Some(&workspace_a));
+        apply_state_sync_sections(&always, 2, Some(&profile_b), true, Some(&workspace_b));
+        let always_final = section_snapshot(&always);
+        assert_eq!(
+            mixed_final.0.iter().map(|row| &row.1).collect::<Vec<_>>(),
+            vec![&"profile-b".to_string()]
+        );
+        assert_eq!(
+            mixed_final.1.iter().map(|row| &row.1).collect::<Vec<_>>(),
+            vec![&"project".to_string()]
+        );
+        assert_eq!(
+            mixed_final.0.iter().map(|row| &row.1).collect::<Vec<_>>(),
+            always_final.0.iter().map(|row| &row.1).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            mixed_final
+                .1
+                .iter()
+                .map(|row| (&row.1, &row.2))
+                .collect::<Vec<_>>(),
+            always_final
+                .1
+                .iter()
+                .map(|row| (&row.1, &row.2))
+                .collect::<Vec<_>>(),
+        );
+
+        apply_state_sync_sections(&mixed, 3, Some(&[]), true, None);
+        assert_eq!(section_snapshot(&mixed), (Vec::new(), Vec::new()));
+    }
+
     #[test]
     fn authority_state_sync_adopts_seed_identity_instead_of_inserting_a_twin() {
         let dir = tempfile::tempdir().unwrap();
@@ -16699,7 +16842,9 @@ mod shadow_tests {
                 memories: &[incoming],
                 memory_mutations: &[],
                 user_profile: &[],
+                user_profile_present: true,
                 workspace: None,
+                workspace_present: true,
                 last_todo_state: None,
                 project_memory_epoch: None,
                 user_profile_version: None,
@@ -16805,7 +16950,9 @@ mod shadow_tests {
                     memories: &[incoming],
                     memory_mutations: &[],
                     user_profile: &[],
+                    user_profile_present: true,
                     workspace: None,
+                    workspace_present: true,
                     last_todo_state: None,
                     project_memory_epoch: None,
                     user_profile_version: None,
@@ -16907,7 +17054,9 @@ mod shadow_tests {
                     memories: &[incoming],
                     memory_mutations: &[],
                     user_profile: &[],
+                    user_profile_present: true,
                     workspace: None,
+                    workspace_present: true,
                     last_todo_state: None,
                     project_memory_epoch: None,
                     user_profile_version: None,
@@ -18137,7 +18286,9 @@ mod shadow_tests {
                 memories: &[],
                 memory_mutations: &[],
                 user_profile: &[],
+                user_profile_present: true,
                 workspace: None,
+                workspace_present: true,
                 last_todo_state: Some("first".to_string()),
                 project_memory_epoch: None,
                 user_profile_version: None,
@@ -18172,7 +18323,9 @@ mod shadow_tests {
                 memories: &[],
                 memory_mutations: &[],
                 user_profile: &[],
+                user_profile_present: true,
                 workspace: None,
+                workspace_present: true,
                 last_todo_state: Some("second".to_string()),
                 project_memory_epoch: None,
                 user_profile_version: None,

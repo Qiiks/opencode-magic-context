@@ -1382,7 +1382,13 @@ export function createRustModeTransform(
                     }
                 }
                 await syncModuleState({
-                    client: { call: callModule },
+                    client: {
+                        call: callModule,
+                        stateSyncCapabilities: options.moduleClient.stateSyncCapabilities
+                            ? (capabilityArgs) =>
+                                  options.moduleClient.stateSyncCapabilities!(capabilityArgs)
+                            : undefined,
+                    },
                     state,
                     pass: syncPass,
                     projectRoot,

@@ -285,6 +285,15 @@ const MAX_IN_FLIGHT_SNAPSHOT_ENTRIES: usize = 4_096;
 const WRAPUP_REQUEST_MARGIN: Duration = Duration::from_secs(5);
 const HISTORIAN_SIDE_CHANNEL_DRAIN_PER_KIND: usize = 32;
 
+fn deserialize_nullable_workspace<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<ModuleWorkspaceWire>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<ModuleWorkspaceWire>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Deserialize)]
 struct ModuleStateSyncWire {
     #[serde(default)]
@@ -310,9 +319,10 @@ struct ModuleStateSyncWire {
     #[serde(default)]
     memory_mutations: Vec<ModuleMemoryMutationWire>,
     #[serde(default)]
-    user_profile: Vec<String>,
-    #[serde(default)]
-    workspace: Option<ModuleWorkspaceWire>,
+    user_profile: Option<Vec<String>>,
+    /// None means omitted; Some(None) is an explicit workspace clear.
+    #[serde(default, deserialize_with = "deserialize_nullable_workspace")]
+    workspace: Option<Option<ModuleWorkspaceWire>>,
     #[serde(default)]
     last_todo_state: Option<String>,
     #[serde(default)]
@@ -4344,6 +4354,13 @@ impl McHandler {
             // `last_divergence` field so stable status reads cannot imply a fresh bust.
             "pass_trace": pass_trace,
             "tail_identity_re_adopt_count": loaded.meta.tail_identity_re_adopt_count,
+            "epochs": {
+                "memory_render_epoch": MEMORY_RENDER_FORMAT_EPOCH,
+                "compartment_render_epoch": COMPARTMENT_RENDER_FORMAT_EPOCH,
+                "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
+                "tagger_epoch": TAGGER_FEATURE_EPOCH,
+                "state_sync_deltas": true,
+            },
             "usage": {
                 "current_total_input_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.current_total_input_tokens),
                 "context_limit_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.context_limit_tokens),
@@ -5555,6 +5572,7 @@ impl McHandler {
                         "compartment_render_epoch": COMPARTMENT_RENDER_FORMAT_EPOCH,
                         "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
                         "tagger_epoch": TAGGER_FEATURE_EPOCH,
+                        "state_sync_deltas": true,
                     },
                 })),
                 Err(e) => HandlerOutcome::Error {
@@ -5617,6 +5635,7 @@ impl McHandler {
                 "compartment_render_epoch": COMPARTMENT_RENDER_FORMAT_EPOCH,
                 "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
                 "tagger_epoch": TAGGER_FEATURE_EPOCH,
+                "state_sync_deltas": true,
             },
         }))
     }
@@ -6541,8 +6560,12 @@ impl McHandler {
         &self,
         binding: &SessionBinding,
         store: &McStore,
-        parsed: ModuleStateSyncWire,
+        mut parsed: ModuleStateSyncWire,
     ) -> HandlerOutcome {
+        let user_profile_present = parsed.user_profile.is_some();
+        let user_profile = parsed.user_profile.take().unwrap_or_default();
+        let workspace_present = parsed.workspace.is_some();
+        let workspace = parsed.workspace.take().flatten();
         let drop_seeds: Vec<ModuleDropSeedRow> = parsed
             .drop_seeds
             .into_iter()
@@ -6610,9 +6633,9 @@ impl McHandler {
             }
         };
         let store_project_path = authority_project.as_deref().unwrap_or(&root_path);
-        let has_workspace = parsed.workspace.is_some();
+        let has_workspace = workspace.is_some();
         let (workspace, member_paths) =
-            match prepare_authority_workspace(store_project_path, parsed.workspace) {
+            match prepare_authority_workspace(store_project_path, workspace) {
                 Ok(prepared) => prepared,
                 Err(error) => return invalid_params_error(error),
             };
@@ -6696,8 +6719,10 @@ impl McHandler {
             compartments: &compartments,
             memories: &memories,
             memory_mutations: &memory_mutations,
-            user_profile: &parsed.user_profile,
+            user_profile: &user_profile,
+            user_profile_present,
             workspace: workspace.as_ref(),
+            workspace_present,
             last_todo_state: parsed.last_todo_state,
             project_memory_epoch: parsed.project_memory_epoch,
             user_profile_version: parsed.user_profile_version,
@@ -9130,7 +9155,7 @@ fn assemble_state_sync_seed(
     let mut note_nudge_anchors = Vec::new();
     let mut note_nudge_anchors_present = false;
     let mut strip_seeds = Vec::new();
-    let mut user_profile = Vec::new();
+    let mut user_profile = None;
     for mut batch in batches {
         compartments.append(&mut batch.compartments);
         memories.append(&mut batch.memories);
@@ -9143,7 +9168,11 @@ fn assemble_state_sync_seed(
             note_nudge_anchors.extend(anchors);
         }
         strip_seeds.append(&mut batch.strip_seeds);
-        user_profile.append(&mut batch.user_profile);
+        if let Some(mut profile) = batch.user_profile.take() {
+            user_profile
+                .get_or_insert_with(Vec::new)
+                .append(&mut profile);
+        }
     }
     compartments.append(&mut final_batch.compartments);
     memories.append(&mut final_batch.memories);
@@ -9156,7 +9185,9 @@ fn assemble_state_sync_seed(
         note_nudge_anchors.extend(anchors);
     }
     strip_seeds.append(&mut final_batch.strip_seeds);
-    user_profile.append(&mut final_batch.user_profile);
+    if let Some(profile) = final_batch.user_profile.take() {
+        user_profile.get_or_insert_with(Vec::new).extend(profile);
+    }
     ModuleStateSyncWire {
         session_id: final_batch.session_id,
         shadow_generation: generation,
@@ -12635,6 +12666,7 @@ mod tests {
             status["epochs"]["tagger_epoch"],
             json!(TAGGER_FEATURE_EPOCH)
         );
+        assert_eq!(status["epochs"]["state_sync_deltas"], json!(true));
         assert_eq!(status["pass_trace"]["receive_count"], 1);
         assert_eq!(status["pass_trace"]["reject_count"], 1);
         assert_eq!(
@@ -15322,6 +15354,7 @@ mod tests {
         ));
         assert!(session_status["pass_trace"]["first_divergence"].is_null());
         assert!(session_status["pass_trace"]["last_divergence"].is_string());
+        assert_eq!(session_status["epochs"]["state_sync_deltas"], json!(true));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -19309,6 +19342,88 @@ mod tests {
             .load_active_memories(route_project_root, 0)
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_sync_wire_sections_preserve_absent_rows_and_clear_explicit_empty() {
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let project_path = project.to_string_lossy().to_string();
+
+        let present = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "method": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "workspace": {
+                        "fingerprint": "wire-workspace-v1",
+                        "members": [
+                            {"project_path": project_path.clone(), "share_categories": ["CONSTRAINTS"]},
+                            {"project_path": "foreign", "share_categories": ["CONSTRAINTS"]}
+                        ]
+                    },
+                    "user_profile": ["wire-profile-v1"],
+                    "acked_watermarks": {}
+                }),
+            )
+            .await;
+        assert!(
+            matches!(present, HandlerOutcome::Response(_)),
+            "{present:?}"
+        );
+        let before_absent = store.workspace_fingerprint(&project_path, 0).unwrap();
+
+        let absent = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "method": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 1,
+                    "acked_watermarks": {}
+                }),
+            )
+            .await;
+        assert!(matches!(absent, HandlerOutcome::Response(_)), "{absent:?}");
+        assert_eq!(
+            store.workspace_fingerprint(&project_path, 0).unwrap(),
+            before_absent,
+            "omitted workspace section must preserve the stored workspace"
+        );
+        let transformed_before_clear = call_transform_request(
+            &handler,
+            request(vec![ck("wire-profile-message", 0, "wire profile input")]),
+        )
+        .await;
+        assert!(m0_text(&transformed_before_clear).contains("wire-profile-v1"));
+
+        let explicit_empty = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "method": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 2,
+                    "workspace": null,
+                    "user_profile": [],
+                    "acked_watermarks": {}
+                }),
+            )
+            .await;
+        assert!(
+            matches!(explicit_empty, HandlerOutcome::Response(_)),
+            "{explicit_empty:?}"
+        );
+        assert_ne!(
+            store.workspace_fingerprint(&project_path, 0).unwrap(),
+            before_absent
+        );
+        assert_eq!(store.load("ses").unwrap().meta.shadow_seq, 3);
     }
 
     #[tokio::test]
