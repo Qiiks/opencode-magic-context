@@ -28,6 +28,7 @@ const HANDSHAKE_TIMEOUT_MS = 2_000;
 const MODULE_SEND_TIMEOUT_MS = 15_000;
 const SERIAL_LANE_MAX_WAITERS = 16;
 const SERIAL_LANE_MIN_REMAINING_MS = 25;
+const CANONICAL_ROOT_CACHE_MAX_ENTRIES = 256;
 
 function getDefaultConnectionFile(): string {
     return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
@@ -532,7 +533,11 @@ export class SubcModuleTransport {
      *  path is gone (canonicalization must never fail a request). */
     private canonicalRoot(root: string): string {
         const cached = this.canonicalRootCache.get(root);
-        if (cached !== undefined) return cached;
+        if (cached !== undefined) {
+            this.canonicalRootCache.delete(root);
+            this.canonicalRootCache.set(root, cached);
+            return cached;
+        }
         let resolved = root;
         try {
             resolved = realpathSync.native(root);
@@ -540,6 +545,11 @@ export class SubcModuleTransport {
             // Gone or unreadable roots keep their observed spelling.
         }
         this.canonicalRootCache.set(root, resolved);
+        while (this.canonicalRootCache.size > CANONICAL_ROOT_CACHE_MAX_ENTRIES) {
+            const oldestRoot = this.canonicalRootCache.keys().next().value as string | undefined;
+            if (oldestRoot === undefined) break;
+            this.canonicalRootCache.delete(oldestRoot);
+        }
         return resolved;
     }
 

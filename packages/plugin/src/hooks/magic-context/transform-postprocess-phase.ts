@@ -494,10 +494,11 @@ export function evaluateEmergencyFailClosed(input: {
     emergencyRecoveryOrigin: "provider_overflow" | "proactive_model_shrink" | null;
     foldMaterializedThisPass: boolean;
     finalWireEstimate?: { tokens: number; trusted: boolean };
-    provenLimitTokens?: number;
+    /** A current-model limit parsed from a provider overflow response, never a catalog fallback. */
+    providerProvenLimitTokens?: number;
 }): EmergencyFailClosedDecision {
     const estimate = input.finalWireEstimate;
-    const limit = input.provenLimitTokens;
+    const limit = input.providerProvenLimitTokens;
     if (
         input.emergencyRecoveryArmed &&
         estimate?.trusted === true &&

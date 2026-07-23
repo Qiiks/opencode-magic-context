@@ -225,6 +225,73 @@ describe("LKG transform replay", () => {
         expect(validateLkgSeam(prefix, tail, "openai")).toBe(false);
     });
 
+    test("declines Anthropic replay when adjacent assistants would merge signed thinking runs", () => {
+        resetLkgSlotsForTest();
+        captureSlot("anthropic-invalid", {
+            jsonPrefix: JSON.stringify([
+                assistant("a-prefix", 1, [
+                    { type: "thinking", thinking: "first signed trace", signature: "sig-a" },
+                    { type: "text", text: "first response" },
+                ]),
+            ]),
+            inputIdSeq: ["u-anchor"],
+            lastInputMessageId: "u-anchor",
+            modelKey: "anthropic/claude-test",
+            providerKey: "anthropic",
+            capturedAt: 1,
+        });
+        const current = [
+            user("u-anchor", 2, { providerID: "anthropic", modelID: "claude-test" }),
+            assistant("a-tail", 3, [
+                { type: "thinking", thinking: "second signed trace", signature: "sig-b" },
+                { type: "text", text: "second response" },
+            ]),
+        ];
+
+        expect(
+            replayLkg({
+                sessionId: "anthropic-invalid",
+                messages: current,
+                modelKey: "anthropic/claude-test",
+                providerKey: "anthropic",
+            }),
+        ).toEqual({ ok: false, reason: "lkg_anthropic_reasoning_run_invalid" });
+        expect(getSlot("anthropic-invalid")).toBeUndefined();
+    });
+
+    test("serves an Anthropic replay with one leading thinking block in an assistant run", () => {
+        resetLkgSlotsForTest();
+        captureSlot("anthropic-valid", {
+            jsonPrefix: JSON.stringify([
+                assistant("a-prefix", 1, [
+                    { type: "thinking", thinking: "signed trace", signature: "sig-a" },
+                    { type: "text", text: "first response" },
+                ]),
+            ]),
+            inputIdSeq: ["u-anchor"],
+            lastInputMessageId: "u-anchor",
+            modelKey: "anthropic/claude-test",
+            providerKey: "anthropic",
+            capturedAt: 1,
+        });
+        const current = [
+            user("u-anchor", 2, { providerID: "anthropic", modelID: "claude-test" }),
+            assistant("a-tail", 3, [{ type: "text", text: "second response" }]),
+        ];
+
+        const replay = replayLkg({
+            sessionId: "anthropic-valid",
+            messages: current,
+            modelKey: "anthropic/claude-test",
+            providerKey: "anthropic",
+        });
+        expect(replay.ok).toBe(true);
+        if (replay.ok) expect(replay.messages.map((message) => message.info.id)).toEqual([
+            "a-prefix",
+            "a-tail",
+        ]);
+    });
+
     test("outermost handler rethrows emergency fail-closed errors", async () => {
         const handler = createMessagesTransformHandler({
             magicContext: {
