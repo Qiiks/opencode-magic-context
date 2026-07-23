@@ -1073,6 +1073,7 @@ pub struct TransformWithProjection {
     pub trim_mismatch: Option<TrimMismatch>,
     pub revert_epoch: u64,
     pub reasoning_watermark: u64,
+    pub mutation_exempt_mid: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1660,8 +1661,12 @@ fn apply_once(
             let passthrough_overlay = tagging_active.then(|| {
                 tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends)
             });
-            let passthrough_messages =
-                pending_passthrough_messages(&projection, req, passthrough_overlay.as_ref());
+            let passthrough_messages = pending_passthrough_messages(
+                &projection,
+                req,
+                passthrough_overlay.as_ref(),
+                mutation_exempt_mid,
+            );
             let served_fingerprints = served_output_fingerprints(&passthrough_messages);
             let first_divergence = divergence::first_divergence(
                 &loaded.meta.served_output_fingerprint,
@@ -1703,6 +1708,7 @@ fn apply_once(
             return Ok(pending_passthrough_result(PendingPassthroughArgs {
                 projection,
                 req,
+                mutation_exempt_mid: mutation_exempt_mid.map(str::to_string),
                 row_version,
                 revert_epoch: next_meta.revert_epoch,
                 reasoning_watermark: next_meta
@@ -1744,8 +1750,12 @@ fn apply_once(
         meta.last_committed_pass_at_ms = ctx.now_ms;
         let passthrough_overlay = tagging_active
             .then(|| tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends));
-        let passthrough_messages =
-            pending_passthrough_messages(&projection, req, passthrough_overlay.as_ref());
+        let passthrough_messages = pending_passthrough_messages(
+            &projection,
+            req,
+            passthrough_overlay.as_ref(),
+            mutation_exempt_mid,
+        );
         let served_fingerprints = served_output_fingerprints(&passthrough_messages);
         let first_divergence = divergence::first_divergence(
             &loaded.meta.served_output_fingerprint,
@@ -1785,6 +1795,7 @@ fn apply_once(
         return Ok(pending_passthrough_result(PendingPassthroughArgs {
             projection,
             req,
+            mutation_exempt_mid: mutation_exempt_mid.map(str::to_string),
             row_version,
             revert_epoch: meta.revert_epoch,
             reasoning_watermark: meta
@@ -3102,6 +3113,7 @@ fn apply_once(
         reasoning_watermark: meta
             .reasoning_cleared_through_tag
             .max(meta.reasoning_cleared_through_ordinal),
+        mutation_exempt_mid: mutation_exempt_mid.map(str::to_string),
         response: TransformResponse {
             status: TransformStatus::Ok,
             served_from: ServedFrom::Transform,
@@ -4335,6 +4347,7 @@ fn pending_rewrite_detail(session_id: &str, fingerprint: &str, ambiguous: bool) 
 struct PendingPassthroughArgs<'a> {
     projection: FlatProjection,
     req: &'a TransformRequest,
+    mutation_exempt_mid: Option<String>,
     row_version: u64,
     revert_epoch: u64,
     reasoning_watermark: u64,
@@ -4352,12 +4365,8 @@ fn pending_passthrough_messages(
     projection: &FlatProjection,
     req: &TransformRequest,
     tag_overlay: Option<&TagOverlayState>,
+    mutation_exempt_mid: Option<&str>,
 ) -> Vec<ServedMessage> {
-    let mutation_exempt_mid = latest_assistant_mutation_exempt_mid(
-        &req.messages,
-        SerializerProfile::parse(&req.serializer_profile),
-        req.mid_turn,
-    );
     let blocks_by_mid = projection_blocks_by_mid(projection);
     req.messages
         .iter()
@@ -4382,6 +4391,7 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
     let PendingPassthroughArgs {
         projection,
         req,
+        mutation_exempt_mid,
         row_version,
         revert_epoch,
         reasoning_watermark,
@@ -4411,6 +4421,7 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         trim_mismatch,
         revert_epoch,
         reasoning_watermark,
+        mutation_exempt_mid,
         response,
     }
 }
@@ -10257,6 +10268,198 @@ mod tests {
             serde_json::to_vec(&request.messages[1].ck).unwrap(),
             "a merged latest assistant must follow the serializer healing rule"
         );
+    }
+
+    #[test]
+    fn completed_reasoning_first_execute_encodes_tagged_sibling_natively() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let raw = vec![
+            json!({
+                "info": { "id": "assistant-reasoning", "role": "assistant", "providerField": "keep" },
+                "parts": [
+                    {
+                        "type": "reasoning",
+                        "text": "signed thinking",
+                        "metadata": { "anthropic": { "signature": "signature-verbatim" } },
+                        "providerField": "reasoning-verbatim"
+                    },
+                    { "type": "text", "text": "answer", "providerField": "text-keep" }
+                ]
+            }),
+            json!({
+                "info": { "id": "user-after", "role": "user" },
+                "parts": [{ "type": "text", "text": "next prompt" }]
+            }),
+        ];
+        let decoded = crate::codec::decode_opencode(&raw);
+        let sidecar = decoded.sidecar;
+        let mut request = with_usage(
+            active_opencode_req("reasoning-tagged", "cfg0", decoded.messages),
+            70,
+            100,
+        );
+        request.provider_id = Some("anthropic".to_string());
+        request.serve_native = true;
+        request.native_messages = Some(raw.clone());
+        let context = pctx("git:proj", "/nonexistent-docs", 0);
+        let estimate = |value: &str| value.len();
+
+        let boot = apply_once_with_estimator(&store, &request, &context, estimate, None).unwrap();
+        assert_eq!(boot.response.action, "HARD");
+        let untouched_messages = boot
+            .response
+            .messages()
+            .iter()
+            .map(|message| message.deref().clone())
+            .collect::<Vec<_>>();
+        let untouched = crate::codec::encode_opencode_with_session(
+            &untouched_messages,
+            &sidecar,
+            Some("reasoning-tagged"),
+            boot.mutation_exempt_mid.as_deref(),
+        );
+        let untouched_assistant = untouched
+            .iter()
+            .find(|message| message["info"]["id"] == "assistant-reasoning")
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(untouched_assistant).unwrap(),
+            serde_json::to_vec(&raw[0]).unwrap()
+        );
+
+        let active = apply_once_with_estimator(&store, &request, &context, estimate, None).unwrap();
+        assert_eq!(active.response.action, "SOFT+");
+        store.arm_soft_refresh("reasoning-tagged").unwrap();
+        let execute =
+            apply_once_with_estimator(&store, &request, &context, estimate, None).unwrap();
+        assert_eq!(execute.scheduler_pass, scheduler::PassDecision::Execute);
+        assert_eq!(execute.mutation_exempt_mid, None);
+        let served_messages = execute
+            .response
+            .messages()
+            .iter()
+            .map(|message| message.deref().clone())
+            .collect::<Vec<_>>();
+        let ck_assistant = served_messages
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("assistant-reasoning"))
+            .unwrap();
+        let ck_text = ck_assistant
+            .content
+            .iter()
+            .find_map(|block| match &block.kind {
+                ck_wire::CkKind::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(ck_text.starts_with('§'));
+        let native = crate::codec::encode_opencode_with_session(
+            &served_messages,
+            &sidecar,
+            Some("reasoning-tagged"),
+            execute.mutation_exempt_mid.as_deref(),
+        );
+        let native_assistant = native
+            .iter()
+            .find(|message| message["info"]["id"] == "assistant-reasoning")
+            .unwrap();
+        assert_eq!(native_assistant["parts"][0], raw[0]["parts"][0]);
+        assert_eq!(native_assistant["parts"][1]["text"], ck_text);
+        assert_eq!(native_assistant["parts"][1]["providerField"], "text-keep");
+    }
+
+    #[test]
+    fn completed_reasoning_first_defer_replays_frozen_tool_reduction_natively() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let raw = vec![
+            json!({
+                "info": { "id": "assistant-tool", "role": "assistant" },
+                "parts": [
+                    {
+                        "type": "reasoning",
+                        "text": "signed thinking",
+                        "metadata": { "anthropic": { "signature": "tool-signature-verbatim" } }
+                    },
+                    {
+                        "type": "tool",
+                        "callID": "call-tool",
+                        "tool": "bash",
+                        "state": {
+                            "status": "completed",
+                            "input": { "command": "printf output" },
+                            "output": "large tool output"
+                        }
+                    }
+                ]
+            }),
+            json!({
+                "info": { "id": "user-after-tool", "role": "user" },
+                "parts": [{ "type": "text", "text": "continue" }]
+            }),
+        ];
+        let decoded = crate::codec::decode_opencode(&raw);
+        let sidecar = decoded.sidecar;
+        let mut request = with_usage(
+            active_opencode_req("reasoning-reduction", "cfg0", decoded.messages),
+            70,
+            100,
+        );
+        request.provider_id = Some("anthropic".to_string());
+        request.serve_native = true;
+        request.native_messages = Some(raw.clone());
+        request.protected_tags = 0;
+        let context = pctx("git:proj", "/nonexistent-docs", 0);
+        let estimate = |value: &str| value.len();
+
+        let boot = apply_once_with_estimator(&store, &request, &context, estimate, None).unwrap();
+        assert_eq!(boot.response.action, "HARD");
+        let active = apply_once_with_estimator(&store, &request, &context, estimate, None).unwrap();
+        assert_eq!(active.response.action, "SOFT+");
+        request.render_config = "cfg1".to_string();
+        let mut execute_context = pctx("git:proj", "/nonexistent-docs", 0);
+        execute_context.injected_reductions = with_reductions(vec![
+            reduce("assistant-tool#1", "drop", "[dropped]"),
+            reduce("assistant-tool#2", "drop", "[dropped]"),
+        ]);
+        let execute =
+            apply_once_with_estimator(&store, &request, &execute_context, estimate, None).unwrap();
+        assert_eq!(execute.scheduler_pass, scheduler::PassDecision::Execute);
+        assert_eq!(execute.response.action, "HARD");
+
+        request = with_usage(request, 20, 100);
+        let defer = apply_once_with_estimator(&store, &request, &context, estimate, None).unwrap();
+        assert_eq!(defer.scheduler_pass, scheduler::PassDecision::Defer);
+        assert_eq!(defer.mutation_exempt_mid, None);
+        assert_eq!(defer.response.action, "SOFT+");
+        let served_messages = defer
+            .response
+            .messages()
+            .iter()
+            .map(|message| message.deref().clone())
+            .collect::<Vec<_>>();
+        let ck_assistant = served_messages
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("assistant-tool"))
+            .unwrap();
+        assert_eq!(ck_assistant.content.len(), 1);
+        assert!(matches!(
+            ck_assistant.content[0].kind,
+            ck_wire::CkKind::Reasoning { .. }
+        ));
+        let native = crate::codec::encode_opencode_with_session(
+            &served_messages,
+            &sidecar,
+            Some("reasoning-reduction"),
+            defer.mutation_exempt_mid.as_deref(),
+        );
+        let native_assistant = native
+            .iter()
+            .find(|message| message["info"]["id"] == "assistant-tool")
+            .unwrap();
+        assert_eq!(native_assistant["parts"].as_array().unwrap().len(), 1);
+        assert_eq!(native_assistant["parts"][0], raw[0]["parts"][0]);
     }
 
     #[test]

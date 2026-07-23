@@ -80,8 +80,8 @@ mod tests {
             assert!(decoded.boundary.is_some());
 
             let ck_messages: Vec<_> = decoded.messages.iter().map(|msg| msg.ck.clone()).collect();
-            let encoded = encode_opencode(&ck_messages, &decoded.sidecar);
-            let encoded_again = encode_opencode(&ck_messages, &decoded.sidecar);
+            let encoded = encode_opencode(&ck_messages, &decoded.sidecar, None);
+            let encoded_again = encode_opencode(&ck_messages, &decoded.sidecar, None);
             assert_eq!(encoded, encoded_again);
             assert_eq!(encoded, strip_opencode_compaction(case.messages));
         }
@@ -116,7 +116,7 @@ mod tests {
         output.extend(decoded.messages.iter().map(|message| message.ck.clone()));
 
         let encoded =
-            encode_opencode_with_session(&output, &decoded.sidecar, Some(&golden.session_id));
+            encode_opencode_with_session(&output, &decoded.sidecar, Some(&golden.session_id), None);
         assert_eq!(encoded[0], golden.m0);
         assert_eq!(encoded[1], golden.m1);
         assert_eq!(encoded[2], golden.synthetic_todo);
