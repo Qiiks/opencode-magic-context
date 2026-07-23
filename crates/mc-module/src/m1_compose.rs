@@ -52,16 +52,6 @@ impl From<McStoreError> for M1ComposeError {
     }
 }
 
-/// The union project identities for a session's project: the workspace union when the
-/// project is in a workspace, else just the project itself. Used by both tiers so the
-/// memory watermarks + corrections span the same set the m0 baseline did.
-fn union_paths(store: &McStore, project_path: &str) -> Result<Vec<String>, McStoreError> {
-    Ok(match store.resolve_workspace_membership(project_path)? {
-        Some(m) => m.union_identities,
-        None => vec![project_path.to_string()],
-    })
-}
-
 fn in_session_revision(
     max_memory_id: i64,
     max_memory_mutation_id: i64,
@@ -178,29 +168,27 @@ pub fn m1_revision_signal_parts_for_pass_timed(
     session_id: &str,
     user_profile_version: u64,
     memory_enabled: bool,
-    now_ms: i64,
+    _now_ms: i64,
     timings: Option<&mut M1RevisionReadTimings>,
 ) -> Result<M1RevisionSignal, McStoreError> {
-    let memories_started_at = Instant::now();
-    let (max_memory_id, max_memory_mutation_id) = if memory_enabled {
-        let paths = union_paths(store, project_path)?;
-        (
-            store.max_memory_id(&paths)?,
-            store.max_memory_mutation_id(&paths)?,
-        )
-    } else {
-        (0, 0)
-    };
-    let memories_ms = memories_started_at.elapsed().as_secs_f64() * 1_000.0;
-    let max_compartment_seq = store.max_compartment_seq(session_id)?;
-    let notes_started_at = Instant::now();
-    let note_status_version = store.max_note_status_version(note_project_path)?;
-    let notes_ms = notes_started_at.elapsed().as_secs_f64() * 1_000.0;
+    let snapshot_started_at = Instant::now();
+    let snapshot = store.load_m1_revision_snapshot(
+        project_path,
+        note_project_path,
+        session_id,
+        memory_enabled,
+    )?;
+    let snapshot_ms = snapshot_started_at.elapsed().as_secs_f64() * 1_000.0;
     if let Some(timings) = timings {
-        timings.memories_ms += memories_ms;
-        timings.notes_ms += notes_ms;
+        // The store deliberately keeps these reads in one transaction, so report the complete
+        // snapshot cost under the existing memory family rather than timing fictitious subreads.
+        timings.memories_ms += snapshot_ms;
     }
 
+    let max_memory_id = snapshot.max_memory_id;
+    let max_memory_mutation_id = snapshot.max_memory_mutation_id;
+    let max_compartment_seq = snapshot.max_compartment_seq;
+    let note_status_version = snapshot.note_status_version;
     let revision = in_session_revision(
         max_memory_id,
         max_memory_mutation_id,
@@ -209,7 +197,8 @@ pub fn m1_revision_signal_parts_for_pass_timed(
         user_profile_version,
     );
 
-    let workspace_fingerprint = store.workspace_fingerprint(project_path, now_ms)?;
+    let workspace_fingerprint =
+        store.workspace_fingerprint_for_membership(snapshot.membership.as_ref());
     let mut external = DefaultHasher::new();
     "mc-m1-external-v1".hash(&mut external);
     workspace_fingerprint.hash(&mut external);

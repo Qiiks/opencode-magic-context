@@ -3147,9 +3147,9 @@ impl McHandler {
             .tokenized_blocks
             .saturating_add(tokenized_blocks);
         let last_compartment_end_ordinal = store
-            .load_compartments(&parsed.session_id)
+            .max_compartment_end_ordinal(&parsed.session_id)
             .ok()
-            .and_then(|cs| cs.iter().map(|c| c.end_message as u64).max());
+            .and_then(|ordinal| (ordinal > 0).then_some(ordinal as u64));
         let (context_limit, input_tokens, usage_percentage) = usage_numbers(parsed.usage.as_ref());
         let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile)
             .expect("serializer_profile validated upstream");
@@ -4206,8 +4206,8 @@ impl McHandler {
                 }
             }
         };
-        let compartments = match store.load_compartments(&session_id) {
-            Ok(compartments) => compartments,
+        let has_compartments = match store.has_compartments(&session_id) {
+            Ok(has_compartments) => has_compartments,
             Err(error) => {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
@@ -4215,7 +4215,7 @@ impl McHandler {
                 }
             }
         };
-        let never_minted = compartments.is_empty() && loaded.core.boundary_id.trim().is_empty();
+        let never_minted = !has_compartments && loaded.core.boundary_id.trim().is_empty();
         if never_minted {
             return match store.record_recomp_command(
                 &session_id,
@@ -4941,11 +4941,8 @@ impl McHandler {
                     }
                 }
             }
-            let current_end = match store.load_compartments(&session_id) {
-                Ok(compartments) => compartments
-                    .iter()
-                    .map(|compartment| compartment.end_message as u64)
-                    .max(),
+            let current_end = match store.max_compartment_end_ordinal(&session_id) {
+                Ok(ordinal) => (ordinal > 0).then_some(ordinal as u64),
                 Err(error) => {
                     return HandlerOutcome::Error {
                         code: "store_load_failed".to_string(),
@@ -5033,14 +5030,10 @@ impl McHandler {
                     }));
                     match self.run_wrapup_firing(task, deadline).await {
                         Ok(historian::HistorianDriveOutcome::Completed(_)) => {
-                            let after_end = store.load_compartments(&session_id).ok().and_then(
-                                |compartments| {
-                                    compartments
-                                        .iter()
-                                        .map(|compartment| compartment.end_message as u64)
-                                        .max()
-                                },
-                            );
+                            let after_end = store
+                                .max_compartment_end_ordinal(&session_id)
+                                .ok()
+                                .and_then(|ordinal| (ordinal > 0).then_some(ordinal as u64));
                             if after_end <= current_end {
                                 failure = Some((
                                     RetryableWrapupReason::SnapshotUnavailable,

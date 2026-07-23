@@ -1996,6 +1996,25 @@ const MIGRATIONS: &[Migration] = &[
             ON mc_facade_mutation_ledger(identity_scope, created_at_ms DESC, tool, action, command_id);
     ",
     },
+    Migration {
+        version: 42,
+        // Materialization reads use these predicates and orderings on every relevant pass. The
+        // indexes preserve render order while leaving expiry/status checks as residual filters;
+        // that avoids a per-pass temporary sort without duplicating wide payload columns.
+        statements: "
+        CREATE INDEX IF NOT EXISTS idx_mc_compartments_session_end_message
+            ON mc_compartments(session_id, end_message);
+        CREATE INDEX IF NOT EXISTS idx_mc_memories_project_render_order
+            ON mc_memories(project_path, COALESCE(importance, 50) DESC, id ASC);
+        CREATE INDEX IF NOT EXISTS idx_mc_notes_project_status_updated
+            ON mc_notes(project_path, status, updated_at_ms DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_mc_historian_side_channel_outbox_order
+            ON mc_historian_side_channel_outbox(
+                session_id, kind, delivered_at_ms,
+                firing_seq, source_start, source_end, item_index, next_attempt_at_ms
+            );
+    ",
+    },
 ];
 
 /// Apply the route-to-identity vocabulary law inside the caller's fenced transaction.
@@ -2081,6 +2100,66 @@ pub struct WorkspaceMembership {
     pub share_categories: Vec<String>,
     /// project_path → display_name, for repo-attributing a foreign memory on render.
     pub display_name_by_path: std::collections::HashMap<String, String>,
+}
+
+fn workspace_membership_from_connection(
+    conn: &rusqlite::Connection,
+    project_path: &str,
+) -> rusqlite::Result<Option<WorkspaceMembership>> {
+    let workspace: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT w.id, w.share_categories
+               FROM mc_workspace_members m
+               JOIN mc_workspaces w ON w.id = m.workspace_id
+              WHERE m.project_path = ?1",
+            params![project_path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((workspace_id, share_categories_json)) = workspace else {
+        return Ok(None);
+    };
+
+    let mut statement = conn.prepare(
+        "SELECT project_path, display_name FROM mc_workspace_members
+          WHERE workspace_id = ?1 ORDER BY project_path ASC",
+    )?;
+    let members: Vec<(String, String)> = statement
+        .query_map(params![workspace_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let union_identities = members.iter().map(|(path, _)| path.clone()).collect();
+    let display_name_by_path = members.into_iter().collect();
+    let share_categories = serde_json::from_str(&share_categories_json).unwrap_or_default();
+
+    Ok(Some(WorkspaceMembership {
+        union_identities,
+        own_identity: project_path.to_string(),
+        share_categories,
+        display_name_by_path,
+    }))
+}
+
+fn workspace_fingerprint_from_membership(membership: Option<&WorkspaceMembership>) -> String {
+    let Some(membership) = membership else {
+        return String::new();
+    };
+    // Membership rows are sorted by project_path; sorting categories makes policy order
+    // independent as well.
+    let mut shared = membership.share_categories.clone();
+    shared.sort_unstable();
+    let mut out = String::from("ws[");
+    for identity in &membership.union_identities {
+        out.push_str(&format!("m:{}:{};", identity.len(), identity));
+    }
+    out.push_str("|share:");
+    for category in &shared {
+        out.push_str(&format!("{}:{};", category.len(), category));
+    }
+    // Expiry is frozen at the last materialization timestamp and is intentionally excluded from
+    // the workspace identity. Because time passing alone does not change that identity, expiry is
+    // applied during the next normal hard materialization pass.
+    out.push(']');
+    out
 }
 
 /// A memory mutation-log entry. `update` is non-terminal (the memory is still present
@@ -3024,6 +3103,16 @@ pub struct MemoryRevision {
 pub struct MemoryRenderSnapshot {
     pub memories: Vec<StoredMemory>,
     pub revision: MemoryRevision,
+}
+
+/// The read-consistent inputs used by the module's per-pass m1 revision signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct M1RevisionSnapshot {
+    pub membership: Option<WorkspaceMembership>,
+    pub max_memory_id: i64,
+    pub max_memory_mutation_id: i64,
+    pub max_compartment_seq: i64,
+    pub note_status_version: i64,
 }
 
 /// A project memory row projected for rendering into the prompt.
@@ -5664,9 +5753,9 @@ impl McStore {
             let tags_ms = tags_started_at.elapsed().as_secs_f64() * 1_000.0;
             let temporal_started_at = Instant::now();
             let temporal_marks = {
-                let mut statement = transaction.prepare(
+                let mut statement = transaction.prepare_cached(
                     "SELECT block_id, marker_text, created_at FROM mc_temporal_marks
-                     WHERE session_id = ?1 ORDER BY created_at ASC, block_id ASC",
+                      WHERE session_id = ?1 ORDER BY created_at ASC, block_id ASC",
                 )?;
                 let rows = statement
                     .query_map(params![session_id], |row| {
@@ -5682,9 +5771,9 @@ impl McStore {
             let temporal_ms = temporal_started_at.elapsed().as_secs_f64() * 1_000.0;
             let user_hints_started_at = Instant::now();
             let user_hints = {
-                let mut statement = transaction.prepare(
+                let mut statement = transaction.prepare_cached(
                     "SELECT block_id, hint_text, created_at FROM mc_user_hints
-                     WHERE session_id = ?1 ORDER BY created_at ASC, block_id ASC",
+                      WHERE session_id = ?1 ORDER BY created_at ASC, block_id ASC",
                 )?;
                 let rows = statement
                     .query_map(params![session_id], |row| {
@@ -5700,9 +5789,9 @@ impl McStore {
             let user_hints_ms = user_hints_started_at.elapsed().as_secs_f64() * 1_000.0;
             let channel1_started_at = Instant::now();
             let channel1_appends = {
-                let mut statement = transaction.prepare(
+                let mut statement = transaction.prepare_cached(
                     "SELECT block_id, reminder_text, fired_at_ms FROM mc_channel1_appends
-                     WHERE session_id = ?1 ORDER BY fired_at_ms ASC, block_id ASC",
+                      WHERE session_id = ?1 ORDER BY fired_at_ms ASC, block_id ASC",
                 )?;
                 let rows = statement
                     .query_map(params![session_id], |row| {
@@ -6109,7 +6198,7 @@ impl McStore {
         session_id: &str,
     ) -> Result<Vec<PendingAgentDrop>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT p.id, p.target_id, p.queued_at, p.command_id,
                         l.first_applied_at_ms
                  FROM pending_agent_drops p
@@ -7905,7 +7994,7 @@ impl McStore {
         session_id: &str,
     ) -> Result<Vec<StoredCompartment>, McStoreError> {
         let rows = self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
                         start_date, end_date, title, content, p1, p2, p3, p4, importance,
                         episode_type, legacy, created_at
@@ -7919,8 +8008,10 @@ impl McStore {
         Ok(rows)
     }
 
-    /// Return the newest ordinal covered by a persisted compacted compartment.
-    pub fn last_compacted_ordinal(&self, session_id: &str) -> Result<i64, McStoreError> {
+    /// Return the greatest message ordinal covered by a session's compartments without
+    /// materializing the wide compartment rows. The migration-42 index covers both the session
+    /// predicate and the aggregate value.
+    pub fn max_compartment_end_ordinal(&self, session_id: &str) -> Result<i64, McStoreError> {
         self.inner
             .with_conn(|conn| {
                 conn.query_row(
@@ -7932,6 +8023,11 @@ impl McStore {
                 )
             })
             .map_err(Into::into)
+    }
+
+    /// Return the newest ordinal covered by a persisted compacted compartment.
+    pub fn last_compacted_ordinal(&self, session_id: &str) -> Result<i64, McStoreError> {
+        self.max_compartment_end_ordinal(session_id)
     }
 
     /// Read only the compacted rows intersecting a range. The SQL limit is intentional: facade
@@ -8096,6 +8192,78 @@ impl McStore {
             )
         })?;
         Ok(max)
+    }
+
+    /// Read the membership and all m1 revision watermarks from one SQLite read transaction.
+    /// Memory watermarks cover the same workspace union used by render, while note and
+    /// compartment watermarks retain their existing project/session scopes.
+    pub fn load_m1_revision_snapshot(
+        &self,
+        project_path: &str,
+        note_project_path: &str,
+        session_id: &str,
+        memory_enabled: bool,
+    ) -> Result<M1RevisionSnapshot, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                let transaction = conn.unchecked_transaction()?;
+                let membership = workspace_membership_from_connection(&transaction, project_path)?;
+                let project_paths = if memory_enabled {
+                    membership
+                        .as_ref()
+                        .map(|value| value.union_identities.clone())
+                        .unwrap_or_else(|| vec![project_path.to_string()])
+                } else {
+                    Vec::new()
+                };
+
+                let (max_memory_id, max_memory_mutation_id) = if project_paths.is_empty() {
+                    (0, 0)
+                } else {
+                    let mut projects = project_paths;
+                    projects.sort_unstable();
+                    projects.dedup();
+                    let placeholders = std::iter::repeat_n("?", projects.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let max_memory_id = transaction.query_row(
+                        &format!(
+                            "SELECT COALESCE(MAX(id), 0) FROM mc_memories
+                          WHERE project_path IN ({placeholders})"
+                        ),
+                        rusqlite::params_from_iter(projects.iter()),
+                        |row| row.get(0),
+                    )?;
+                    let max_memory_mutation_id = transaction.query_row(
+                        &format!(
+                            "SELECT COALESCE(MAX(id), 0) FROM mc_memory_mutation_log
+                          WHERE project_path IN ({placeholders})"
+                        ),
+                        rusqlite::params_from_iter(projects.iter()),
+                        |row| row.get(0),
+                    )?;
+                    (max_memory_id, max_memory_mutation_id)
+                };
+                let max_compartment_seq = transaction.query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM mc_compartments WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )?;
+                let note_status_version = transaction.query_row(
+                    "SELECT COALESCE(MAX(status_version), 0) FROM mc_notes WHERE project_path = ?1",
+                    params![note_project_path],
+                    |row| row.get(0),
+                )?;
+                transaction.commit()?;
+                Ok(M1RevisionSnapshot {
+                    membership,
+                    max_memory_id,
+                    max_memory_mutation_id,
+                    max_compartment_seq,
+                    note_status_version,
+                })
+            })
+            .map_err(Into::into)
     }
 
     /// Replace a session's entire compartment set in one fenced transaction. The
@@ -9244,10 +9412,10 @@ impl McStore {
         limit: usize,
     ) -> Result<Vec<HistorianSideChannelOutboxRow>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare_cached(
                 "SELECT firing_seq, source_start, source_end, item_index, payload_json,
                         attempt_count
-                   FROM mc_historian_side_channel_outbox
+                   FROM mc_historian_side_channel_outbox INDEXED BY idx_mc_historian_side_channel_outbox_order
                   WHERE session_id = ?1 AND kind = ?2 AND delivered_at_ms IS NULL
                     AND next_attempt_at_ms <= ?3
                   ORDER BY firing_seq, source_start, source_end, item_index
@@ -9612,43 +9780,9 @@ impl McStore {
         &self,
         project_path: &str,
     ) -> Result<Option<WorkspaceMembership>, McStoreError> {
-        let membership = self.inner.with_conn(|conn| {
-            // which workspace (if any) does this project belong to?
-            let ws: Option<(i64, String)> = conn
-                .query_row(
-                    "SELECT w.id, w.share_categories
-                       FROM mc_workspace_members m
-                       JOIN mc_workspaces w ON w.id = m.workspace_id
-                      WHERE m.project_path = ?1",
-                    params![project_path],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            let Some((workspace_id, share_categories_json)) = ws else {
-                return Ok(None);
-            };
-
-            let mut stmt = conn.prepare(
-                "SELECT project_path, display_name FROM mc_workspace_members
-                  WHERE workspace_id = ?1 ORDER BY project_path ASC",
-            )?;
-            let members: Vec<(String, String)> = stmt
-                .query_map(params![workspace_id], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let union_identities: Vec<String> = members.iter().map(|(p, _)| p.clone()).collect();
-            let display_name_by_path = members.into_iter().collect();
-            let share_categories: Vec<String> =
-                serde_json::from_str(&share_categories_json).unwrap_or_default();
-
-            Ok(Some(WorkspaceMembership {
-                union_identities,
-                own_identity: project_path.to_string(),
-                share_categories,
-                display_name_by_path,
-            }))
-        })?;
-        Ok(membership)
+        self.inner
+            .with_conn(|conn| workspace_membership_from_connection(conn, project_path))
+            .map_err(Into::into)
     }
 
     /// A DETERMINISTIC fingerprint of the project's workspace membership + share policy.
@@ -9669,26 +9803,17 @@ impl McStore {
         project_path: &str,
         _now_ms: i64,
     ) -> Result<String, McStoreError> {
-        let Some(m) = self.resolve_workspace_membership(project_path)? else {
-            return Ok(String::new());
-        };
-        // resolve_workspace_membership returns members sorted by project_path; sort the
-        // share categories too so the policy axis is order-independent.
-        let mut shared = m.share_categories.clone();
-        shared.sort_unstable();
-        let mut out = String::from("ws[");
-        for id in &m.union_identities {
-            out.push_str(&format!("m:{}:{};", id.len(), id));
-        }
-        out.push_str("|share:");
-        for cat in &shared {
-            out.push_str(&format!("{}:{};", cat.len(), cat));
-        }
-        // Expiry is frozen at the last materialization timestamp and therefore is
-        // intentionally absent from workspace identity. Time passing alone must ride
-        // the next natural HARD, not evict the provider cache eagerly.
-        out.push(']');
-        Ok(out)
+        let membership = self.resolve_workspace_membership(project_path)?;
+        Ok(workspace_fingerprint_from_membership(membership.as_ref()))
+    }
+
+    /// Build the workspace fingerprint from membership already read by a caller's snapshot.
+    /// This avoids resolving the same membership a second time during a per-pass signal read.
+    pub fn workspace_fingerprint_for_membership(
+        &self,
+        membership: Option<&WorkspaceMembership>,
+    ) -> String {
+        workspace_fingerprint_from_membership(membership)
     }
 
     /// Load render-eligible memories across a workspace UNION: every member's `active` +
@@ -15047,7 +15172,7 @@ mod tests {
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=41).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=42).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -15062,6 +15187,35 @@ mod tests {
             })
             .unwrap();
         assert_eq!(fresh_versions, expected_versions);
+        let render_indexes = fresh
+            .inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT name FROM sqlite_master
+                      WHERE type = 'index'
+                        AND name IN (
+                            'idx_mc_compartments_session_end_message',
+                            'idx_mc_memories_project_render_order',
+                            'idx_mc_notes_project_status_updated',
+                            'idx_mc_historian_side_channel_outbox_order'
+                        )
+                      ORDER BY name",
+                )?;
+                let rows = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(
+            render_indexes,
+            vec![
+                "idx_mc_compartments_session_end_message",
+                "idx_mc_historian_side_channel_outbox_order",
+                "idx_mc_memories_project_render_order",
+                "idx_mc_notes_project_status_updated",
+            ]
+        );
         assert!(fresh_versions.contains(&30));
         let fresh_has_table = fresh
             .inner
@@ -15545,6 +15699,233 @@ mod tests {
 
         // distinct sessions are isolated
         assert!(store.load_compartments("ses_b").unwrap().is_empty());
+    }
+
+    #[test]
+    fn max_compartment_end_ordinal_matches_full_compartment_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let compartments = vec![
+            StoredCompartment {
+                sequence: 1,
+                start_message: 1,
+                end_message: 8,
+                title: "first".into(),
+                content: "one".into(),
+                ..Default::default()
+            },
+            StoredCompartment {
+                sequence: 2,
+                start_message: 9,
+                end_message: 23,
+                title: "second".into(),
+                content: "two".into(),
+                ..Default::default()
+            },
+        ];
+        store
+            .replace_compartments("ordinal-session", &compartments)
+            .unwrap();
+
+        let full_max = store
+            .load_compartments("ordinal-session")
+            .unwrap()
+            .iter()
+            .map(|compartment| compartment.end_message)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            store
+                .max_compartment_end_ordinal("ordinal-session")
+                .unwrap(),
+            full_max
+        );
+        assert_eq!(
+            store.max_compartment_end_ordinal("empty-session").unwrap(),
+            0
+        );
+
+        let details = store
+            .inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "EXPLAIN QUERY PLAN
+                     SELECT COALESCE(MAX(end_message), 0)
+                       FROM mc_compartments WHERE session_id = ?1",
+                )?;
+                let rows = statement
+                    .query_map(params!["ordinal-session"], |row| row.get::<_, String>(3))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains("USING COVERING INDEX idx_mc_compartments_session_end_message")
+            }),
+            "compartment max must use the covering end-ordinal index: {details:?}"
+        );
+    }
+
+    #[test]
+    fn m1_revision_snapshot_matches_individual_watermarks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let own = "git:m1-own";
+        let foreign = "git:m1-foreign";
+        store
+            .seed_workspace_member("m1-workspace", own, "[\"CONSTRAINTS\"]")
+            .unwrap();
+        store
+            .seed_workspace_member("m1-workspace", foreign, "[\"CONSTRAINTS\"]")
+            .unwrap();
+        store.seed_memory(7, own, "CONSTRAINTS", "own", 50).unwrap();
+        store
+            .seed_memory(11, foreign, "CONSTRAINTS", "foreign", 50)
+            .unwrap();
+        store
+            .seed_mutation(own, "update", 7, "own updated")
+            .unwrap();
+        store
+            .seed_mutation(foreign, "update", 11, "foreign updated")
+            .unwrap();
+        store
+            .replace_compartments(
+                "m1-session",
+                &[StoredCompartment {
+                    sequence: 4,
+                    start_message: 1,
+                    end_message: 9,
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        let note = store
+            .insert_project_note(NoteWriteInput {
+                project_path: own,
+                route_project_root: None,
+                session_id: Some("m1-session"),
+                content: "m1 note",
+                surface_condition: None,
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "UPDATE mc_notes SET status_version = 6 WHERE id = ?1",
+                    params![note.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let snapshot = store
+            .load_m1_revision_snapshot(own, own, "m1-session", true)
+            .unwrap();
+        let membership = snapshot.membership.clone().unwrap();
+        assert_eq!(membership.union_identities, vec![foreign, own]);
+        assert_eq!(membership.share_categories, vec!["CONSTRAINTS"]);
+        assert_eq!(
+            snapshot.max_memory_id,
+            store.max_memory_id(&membership.union_identities).unwrap()
+        );
+        assert_eq!(
+            snapshot.max_memory_mutation_id,
+            store
+                .max_memory_mutation_id(&membership.union_identities)
+                .unwrap()
+        );
+        assert_eq!(
+            snapshot.max_compartment_seq,
+            store.max_compartment_seq("m1-session").unwrap()
+        );
+        assert_eq!(
+            snapshot.note_status_version,
+            store.max_note_status_version(own).unwrap()
+        );
+        assert_eq!(
+            store.workspace_fingerprint_for_membership(snapshot.membership.as_ref()),
+            store.workspace_fingerprint(own, 0).unwrap()
+        );
+
+        let disabled = store
+            .load_m1_revision_snapshot(own, own, "m1-session", false)
+            .unwrap();
+        assert_eq!(disabled.membership, snapshot.membership);
+        assert_eq!(disabled.max_memory_id, 0);
+        assert_eq!(disabled.max_memory_mutation_id, 0);
+        assert_eq!(disabled.max_compartment_seq, snapshot.max_compartment_seq);
+        assert_eq!(disabled.note_status_version, snapshot.note_status_version);
+    }
+
+    #[test]
+    fn render_order_indexes_remove_per_pass_temporary_sorts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let (memory_details, note_details, outbox_details) = store
+            .inner
+            .with_conn(|conn| {
+                let mut memory = conn.prepare(
+                    "EXPLAIN QUERY PLAN
+                     SELECT id, project_path, category, content, importance, status,
+                            expires_at, superseded_by_memory_id, updated_at
+                       FROM mc_memories
+                      WHERE project_path = ?1
+                        AND status IN ('active', 'permanent')
+                        AND (expires_at IS NULL OR expires_at > ?2)
+                      ORDER BY COALESCE(importance, 50) DESC, id ASC",
+                )?;
+                let memory_details = memory
+                    .query_map(params!["git:render", 0], |row| row.get::<_, String>(3))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut notes = conn.prepare(
+                    "EXPLAIN QUERY PLAN
+                     SELECT id, project_path, type, session_id, content, status,
+                            updated_at_ms
+                       FROM mc_notes
+                      WHERE project_path = ?1 AND status IN ('active')
+                        AND (type = 'smart' OR session_id = ?2)
+                      ORDER BY updated_at_ms DESC, id DESC LIMIT ?3 OFFSET ?4",
+                )?;
+                let note_details = notes
+                    .query_map(params!["git:render", "render-session", 25, 0], |row| {
+                        row.get::<_, String>(3)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut outbox = conn.prepare(
+                    "EXPLAIN QUERY PLAN
+                     SELECT firing_seq, source_start, source_end, item_index, payload_json,
+                            attempt_count
+                       FROM mc_historian_side_channel_outbox INDEXED BY idx_mc_historian_side_channel_outbox_order
+                      WHERE session_id = ?1 AND kind = ?2 AND delivered_at_ms IS NULL
+                        AND next_attempt_at_ms <= ?3
+                      ORDER BY firing_seq, source_start, source_end, item_index
+                      LIMIT ?4",
+                )?;
+                let outbox_details = outbox
+                    .query_map(params!["render-session", "event", 0, 32], |row| {
+                        row.get::<_, String>(3)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((memory_details, note_details, outbox_details))
+            })
+            .unwrap();
+        for (name, details) in [
+            ("memory render", memory_details),
+            ("visible notes", note_details),
+            ("historian outbox", outbox_details),
+        ] {
+            assert!(
+                !details
+                    .iter()
+                    .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+                "{name} query still sorts through a temporary b-tree: {details:?}"
+            );
+        }
     }
 
     fn insert_memory(
@@ -17837,7 +18218,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=41).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=42).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)
