@@ -12,8 +12,8 @@ use std::time::Duration;
 use mc_store::{
     FactCandidate, HistorianChunkRange, HistorianDurableState, HistorianEventCandidate,
     HistorianPhase, HistorianPrimerCandidate, HistorianPublishError, HistorianPublishPredicate,
-    HistorianPublishRequest, HistorianPublishResult, HistorianUserMemoryCandidate, McStore,
-    McStoreError, StoredCompartment,
+    HistorianPublishRequest, HistorianPublishResult, HistorianSelectedMessageIdentity,
+    HistorianUserMemoryCandidate, McStore, McStoreError, StoredCompartment,
 };
 
 use crate::historian_producer::{
@@ -249,6 +249,7 @@ pub fn fire(
     from_ordinal: u64,
     to_ordinal: u64,
     chunk_fingerprint: String,
+    selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
     expected_revert_epoch: u64,
     fired_at_ms: i64,
 ) -> Result<FireOutcome, HistorianStateError> {
@@ -270,6 +271,7 @@ pub fn fire(
             to_ordinal,
         }),
         chunk_fingerprint,
+        selected_range_identities,
         producer_session_id: None,
         producer_run_id: None,
         fired_at_ms: Some(fired_at_ms),
@@ -382,6 +384,7 @@ pub fn publish_predicate(
         firing_seq: state.firing_seq,
         producer_run_id,
         chunk_fingerprint: state.chunk_fingerprint.clone(),
+        selected_range_identities: state.selected_range_identities.clone(),
     })
 }
 
@@ -870,6 +873,7 @@ pub struct HistorianFireRequest<'a> {
     pub from_ordinal: u64,
     pub to_ordinal: u64,
     pub chunk_fingerprint: &'a str,
+    pub selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
     pub expected_revert_epoch: u64,
     pub observed_chunk_fingerprint: &'a str,
     pub validation_chunk: &'a HistorianChunk,
@@ -1185,6 +1189,7 @@ where
             request.from_ordinal,
             request.to_ordinal,
             request.chunk_fingerprint.to_string(),
+            request.selected_range_identities.clone(),
             request.expected_revert_epoch,
             request.now_ms,
         )? {
@@ -1922,6 +1927,45 @@ mod tests {
             .unwrap();
     }
 
+    fn test_selected_range_identities() -> Vec<HistorianSelectedMessageIdentity> {
+        ["m2", "m3"]
+            .into_iter()
+            .map(|mid| HistorianSelectedMessageIdentity {
+                mid: mid.to_string(),
+                block_identities: vec![mc_store::BlockIdentity {
+                    kind_tag: "text".to_string(),
+                    byte_fingerprint: format!("{mid}-content-a"),
+                }],
+            })
+            .collect()
+    }
+
+    fn test_meta_with_historian(historian: HistorianDurableState) -> ModuleMeta {
+        let mut meta = ModuleMeta {
+            historian,
+            ..Default::default()
+        };
+        for selected in test_selected_range_identities() {
+            meta.block_identity_by_mid
+                .insert(selected.mid, selected.block_identities);
+        }
+        meta
+    }
+
+    fn seed_test_selected_range_identities(store: &McStore) {
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta.clone();
+        for selected in test_selected_range_identities() {
+            meta.block_identity_by_mid
+                .insert(selected.mid, selected.block_identities);
+        }
+        if meta != loaded.meta {
+            store
+                .commit("ses", loaded.row_version, &loaded.core, &meta)
+                .unwrap();
+        }
+    }
+
     #[derive(Default)]
     struct ScriptedProducer {
         starts: VecDeque<Result<RunHandle, HistorianProducerError>>,
@@ -1933,6 +1977,7 @@ mod tests {
         await_run_ids: Vec<String>,
         cancels: Vec<String>,
         closes: usize,
+        on_await_output: Option<Box<dyn FnOnce() + Send>>,
     }
 
     impl ScriptedProducer {
@@ -1948,6 +1993,11 @@ mod tests {
 
         fn with_status(mut self, result: Result<RunState, HistorianProducerError>) -> Self {
             self.statuses.push_back(result);
+            self
+        }
+
+        fn with_await_output_hook(mut self, hook: impl FnOnce() + Send + 'static) -> Self {
+            self.on_await_output = Some(Box::new(hook));
             self
         }
     }
@@ -1980,6 +2030,9 @@ mod tests {
             run_id: &str,
         ) -> Result<ProducerOutput, HistorianProducerError> {
             self.await_run_ids.push(run_id.to_string());
+            if let Some(hook) = self.on_await_output.take() {
+                hook();
+            }
             self.outputs
                 .pop_front()
                 .expect("scripted output result available")
@@ -2059,6 +2112,7 @@ mod tests {
         chunk: &'a HistorianChunk,
         prior: &'a [StoredCompartmentRange],
     ) -> HistorianFireRequest<'a> {
+        seed_test_selected_range_identities(store);
         HistorianFireRequest {
             store,
             session_id: "ses",
@@ -2070,6 +2124,7 @@ mod tests {
             from_ordinal: 2,
             to_ordinal: 4,
             chunk_fingerprint: "fp",
+            selected_range_identities: test_selected_range_identities(),
             expected_revert_epoch: 0,
             observed_chunk_fingerprint: "fp",
             validation_chunk: chunk,
@@ -2116,6 +2171,7 @@ mod tests {
                 to_ordinal: 4,
             }),
             chunk_fingerprint: "fp".into(),
+            selected_range_identities: test_selected_range_identities(),
             producer_session_id: Some("producer-session".into()),
             producer_run_id: Some("run-3".into()),
             fired_at_ms: Some(10),
@@ -2175,6 +2231,93 @@ mod tests {
         assert_eq!(c2.end_message_id, "m3#0");
         assert_eq!(c2.p1.as_deref(), Some("second arc full and exact"));
         assert_eq!(c2.created_at, 123);
+    }
+
+    #[tokio::test]
+    async fn selected_range_identity_drift_during_await_rejects_without_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(store(dir.path()));
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let hook_store = std::sync::Arc::clone(&store);
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Ok(producer_output(historian_xml("stale summary"))))
+            .with_await_output_hook(move || {
+                let loaded = hook_store.load("ses").unwrap();
+                let mut meta = loaded.meta;
+                meta.block_identity_by_mid.get_mut("m2").unwrap()[0].byte_fingerprint =
+                    "m2-content-b".to_string();
+                hook_store
+                    .commit("ses", loaded.row_version, &loaded.core, &meta)
+                    .unwrap();
+            });
+
+        let error = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            HistorianDriveError::State(HistorianStateError::Publish(
+                HistorianPublishError::FenceRejected { .. }
+            ))
+        ));
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(loaded.meta.historian.state, HistorianPhase::Idle);
+        assert_eq!(loaded.meta.historian.failure_backoff_at_ms, None);
+        assert_eq!(loaded.meta.publication_floor_ordinal, None);
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+        assert!(store
+            .load_chunk_transcripts_for_range("ses", 2, 4)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn tail_identity_extension_during_await_still_publishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(store(dir.path()));
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let hook_store = std::sync::Arc::clone(&store);
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Ok(producer_output(historian_xml("current summary"))))
+            .with_await_output_hook(move || {
+                let loaded = hook_store.load("ses").unwrap();
+                let mut meta = loaded.meta;
+                meta.block_identity_by_mid.insert(
+                    "m5".to_string(),
+                    vec![mc_store::BlockIdentity {
+                        kind_tag: "text".to_string(),
+                        byte_fingerprint: "later-content".to_string(),
+                    }],
+                );
+                hook_store
+                    .commit("ses", loaded.row_version, &loaded.core, &meta)
+                    .unwrap();
+            });
+
+        let outcome = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, HistorianDriveOutcome::Completed(_)));
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(loaded.meta.publication_floor_ordinal, Some(4));
+        assert!(loaded.meta.block_identity_by_mid.contains_key("m5"));
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -2580,7 +2723,16 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 0, 1).unwrap()
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            0,
+            1,
+        )
+        .unwrap()
         {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
@@ -2591,10 +2743,7 @@ mod tests {
                 "ses",
                 None,
                 &CoreState::default(),
-                &ModuleMeta {
-                    historian: awaiting,
-                    ..Default::default()
-                },
+                &test_meta_with_historian(awaiting),
             )
             .unwrap();
         let mut producer = ScriptedProducer::default()
@@ -2619,6 +2768,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reattach_equal_length_identity_drift_rejects_before_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            0,
+            1,
+        )
+        .unwrap()
+        {
+            FireOutcome::Fired(state) => state,
+            FireOutcome::Busy(_) => unreachable!(),
+        };
+        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        store
+            .commit(
+                "ses",
+                None,
+                &CoreState::default(),
+                &test_meta_with_historian(awaiting),
+            )
+            .unwrap();
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta;
+        meta.block_identity_by_mid.get_mut("m2").unwrap()[0].byte_fingerprint =
+            "m2-content-b".to_string();
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let mut producer = ScriptedProducer::default()
+            .with_status(Ok(RunState::Terminal))
+            .with_output(Ok(producer_output(historian_xml("stale replay summary"))));
+
+        let error =
+            reattach_historian_producer(&mut producer, reattach_request(&store, &chunk, &prior))
+                .await
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            HistorianDriveError::State(HistorianStateError::Publish(
+                HistorianPublishError::FenceRejected { .. }
+            ))
+        ));
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(loaded.meta.historian.state, HistorianPhase::Idle);
+        assert_eq!(loaded.meta.historian.failure_backoff_at_ms, None);
+        assert_eq!(loaded.meta.publication_floor_ordinal, None);
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn concurrent_lineages_reattach_and_publish_in_isolated_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -2637,11 +2845,20 @@ mod tests {
             store
                 .replace_compartments(lineage, &[comp(1, 1, 1, "m1", "C1 summary")])
                 .unwrap();
-            let fired =
-                match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 0, 1).unwrap() {
-                    FireOutcome::Fired(state) => state,
-                    FireOutcome::Busy(_) => unreachable!(),
-                };
+            let fired = match fire(
+                &HistorianDurableState::default(),
+                2,
+                4,
+                "fp".into(),
+                test_selected_range_identities(),
+                0,
+                1,
+            )
+            .unwrap()
+            {
+                FireOutcome::Fired(state) => state,
+                FireOutcome::Busy(_) => unreachable!(),
+            };
             let awaiting =
                 producer_started(&fired, producer_session.to_string(), run_id.to_string()).unwrap();
             store
@@ -2649,10 +2866,7 @@ mod tests {
                     lineage,
                     None,
                     &CoreState::default(),
-                    &ModuleMeta {
-                        historian: awaiting,
-                        ..Default::default()
-                    },
+                    &test_meta_with_historian(awaiting),
                 )
                 .unwrap();
         }
@@ -2735,7 +2949,16 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 0, 1).unwrap()
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            0,
+            1,
+        )
+        .unwrap()
         {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
@@ -2746,10 +2969,7 @@ mod tests {
                 "ses",
                 None,
                 &CoreState::default(),
-                &ModuleMeta {
-                    historian: awaiting,
-                    ..Default::default()
-                },
+                &test_meta_with_historian(awaiting),
             )
             .unwrap();
         let mut producer = ScriptedProducer::default()
@@ -2775,7 +2995,16 @@ mod tests {
     async fn reattach_missing_abandons_and_releases_single_flight() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 0, 1).unwrap()
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            0,
+            1,
+        )
+        .unwrap()
         {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
@@ -2786,10 +3015,7 @@ mod tests {
                 "ses",
                 None,
                 &CoreState::default(),
-                &ModuleMeta {
-                    historian: awaiting,
-                    ..Default::default()
-                },
+                &test_meta_with_historian(awaiting),
             )
             .unwrap();
         let chunk = historian_chunk();
@@ -2809,7 +3035,7 @@ mod tests {
         let state = store.load("ses").unwrap().meta.historian;
         assert_eq!(state.state, HistorianPhase::Idle);
         assert!(matches!(
-            fire(&state, 2, 4, "fp2".into(), 0, 2).unwrap(),
+            fire(&state, 2, 4, "fp2".into(), Vec::new(), 0, 2).unwrap(),
             FireOutcome::Fired(_)
         ));
     }
@@ -3067,7 +3293,7 @@ mod tests {
         assert_eq!(state.state, HistorianPhase::Idle);
         assert_eq!(state.failure_backoff_at_ms, Some(999));
         assert!(matches!(
-            fire(&state, 2, 4, "fp2".into(), 0, 124).unwrap(),
+            fire(&state, 2, 4, "fp2".into(), Vec::new(), 0, 124).unwrap(),
             FireOutcome::Fired(_)
         ));
     }
@@ -3083,7 +3309,16 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 0, 1).unwrap()
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            0,
+            1,
+        )
+        .unwrap()
         {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
@@ -3094,10 +3329,7 @@ mod tests {
                 "ses",
                 None,
                 &CoreState::default(),
-                &ModuleMeta {
-                    historian: awaiting,
-                    ..Default::default()
-                },
+                &test_meta_with_historian(awaiting),
             )
             .unwrap();
         let mut producer = ScriptedProducer::default()
@@ -3411,6 +3643,10 @@ mod tests {
 
         // Drive the state machine to a publishing row and publish the validated chunk.
         let mut meta = store.load("ses").unwrap().meta;
+        for selected in test_selected_range_identities() {
+            meta.block_identity_by_mid
+                .insert(selected.mid, selected.block_identities);
+        }
         meta.historian = HistorianDurableState {
             state: HistorianPhase::Publishing,
             firing_seq: 1,
@@ -3419,6 +3655,7 @@ mod tests {
                 to_ordinal: 4,
             }),
             chunk_fingerprint: "fp".into(),
+            selected_range_identities: test_selected_range_identities(),
             producer_session_id: Some("ps".into()),
             producer_run_id: Some("run-1".into()),
             fired_at_ms: Some(1),
@@ -3490,10 +3727,7 @@ mod tests {
                     session_id,
                     None,
                     &mc_core::CoreState::default(),
-                    &mc_store::ModuleMeta {
-                        historian: publishing_state(),
-                        ..Default::default()
-                    },
+                    &test_meta_with_historian(publishing_state()),
                 )
                 .unwrap();
             let state = store.load(session_id).unwrap();
@@ -3588,14 +3822,14 @@ mod tests {
     #[test]
     fn pure_state_machine_happy_path_and_single_flight() {
         let idle = HistorianDurableState::default();
-        let fired = match fire(&idle, 2, 5, "fp".into(), 0, 100).unwrap() {
+        let fired = match fire(&idle, 2, 5, "fp".into(), Vec::new(), 0, 100).unwrap() {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => panic!("idle state must fire"),
         };
         assert_eq!(fired.state, HistorianPhase::Firing);
         assert_eq!(fired.firing_seq, 1);
         assert!(matches!(
-            fire(&fired, 6, 7, "other".into(), 0, 101).unwrap(),
+            fire(&fired, 6, 7, "other".into(), Vec::new(), 0, 101).unwrap(),
             FireOutcome::Busy(_)
         ));
 
@@ -3614,7 +3848,7 @@ mod tests {
             last_failure: Some("stale failure".into()),
             ..HistorianDurableState::default()
         };
-        let fired = match fire(&idle, 2, 5, "fp".into(), 0, 100).unwrap() {
+        let fired = match fire(&idle, 2, 5, "fp".into(), Vec::new(), 0, 100).unwrap() {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => panic!("idle state must fire"),
         };
@@ -3628,10 +3862,7 @@ mod tests {
     fn fingerprint_mismatch_at_publish_abandons_and_releases_single_flight() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        let meta = ModuleMeta {
-            historian: publishing_state(),
-            ..Default::default()
-        };
+        let meta = test_meta_with_historian(publishing_state());
         store
             .commit("ses", None, &CoreState::default(), &meta)
             .unwrap();
@@ -3677,7 +3908,7 @@ mod tests {
             "fingerprint cleanup must use the store's fenced abandon primitive"
         );
         assert!(matches!(
-            fire(&after, 6, 7, "new".into(), 0, 1000).unwrap(),
+            fire(&after, 6, 7, "new".into(), Vec::new(), 0, 1000).unwrap(),
             FireOutcome::Fired(_)
         ));
     }
@@ -3689,6 +3920,7 @@ mod tests {
             2,
             5,
             "fp".into(),
+            Vec::new(),
             42,
             100,
         )
@@ -3708,8 +3940,7 @@ mod tests {
         let store = store(dir.path());
         let meta = ModuleMeta {
             revert_epoch: 1,
-            historian: publishing_state(),
-            ..Default::default()
+            ..test_meta_with_historian(publishing_state())
         };
         store
             .commit("ses", None, &CoreState::default(), &meta)
@@ -3760,7 +3991,16 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 7, 1).unwrap()
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            7,
+            1,
+        )
+        .unwrap()
         {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
@@ -3773,8 +4013,7 @@ mod tests {
                 &CoreState::default(),
                 &ModuleMeta {
                     revert_epoch: 8,
-                    historian: awaiting,
-                    ..Default::default()
+                    ..test_meta_with_historian(awaiting)
                 },
             )
             .unwrap();
@@ -3806,7 +4045,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let awaiting = producer_started(
-            &match fire(&HistorianDurableState::default(), 1, 3, "fp".into(), 0, 10).unwrap() {
+            &match fire(
+                &HistorianDurableState::default(),
+                1,
+                3,
+                "fp".into(),
+                test_selected_range_identities(),
+                0,
+                10,
+            )
+            .unwrap()
+            {
                 FireOutcome::Fired(state) => state,
                 FireOutcome::Busy(_) => unreachable!(),
             },
@@ -3814,10 +4063,7 @@ mod tests {
             "run-1".into(),
         )
         .unwrap();
-        let meta = ModuleMeta {
-            historian: awaiting,
-            ..Default::default()
-        };
+        let meta = test_meta_with_historian(awaiting);
         store
             .commit("ses", None, &CoreState::default(), &meta)
             .unwrap();
@@ -3843,10 +4089,7 @@ mod tests {
     fn restart_mid_publishing_with_committed_tx_detects_idle() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        let meta = ModuleMeta {
-            historian: publishing_state(),
-            ..Default::default()
-        };
+        let meta = test_meta_with_historian(publishing_state());
         store
             .commit("ses", None, &CoreState::default(), &meta)
             .unwrap();
@@ -3894,14 +4137,19 @@ mod tests {
         run_transform(&store, &request);
         let before = run_transform(&store, &request);
 
+        let mut meta = store.load("ses").unwrap().meta;
+        let selected_range_identities = vec![HistorianSelectedMessageIdentity {
+            mid: "t2".to_string(),
+            block_identities: meta.block_identity_by_mid["t2"].clone(),
+        }];
         let mut state = publishing_state();
         state.chunk_range = Some(HistorianChunkRange {
             from_ordinal: 2,
             to_ordinal: 2,
         });
         state.chunk_fingerprint = "tail-fp".into();
+        state.selected_range_identities = selected_range_identities.clone();
         state.producer_run_id = Some("run-3".into());
-        let mut meta = store.load("ses").unwrap().meta;
         meta.historian = state;
         let row_version = store
             .commit(
@@ -3915,6 +4163,7 @@ mod tests {
             firing_seq: 3,
             producer_run_id: "run-3".into(),
             chunk_fingerprint: "tail-fp".into(),
+            selected_range_identities,
         };
         store
             .publish_historian_chunk(HistorianPublishRequest {

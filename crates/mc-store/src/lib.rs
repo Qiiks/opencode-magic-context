@@ -2116,6 +2116,15 @@ pub struct HistorianChunkRange {
     pub to_ordinal: u64,
 }
 
+/// Content-sensitive identity for one message selected into a historian firing.
+/// The outer firing vector preserves message order; each block vector preserves
+/// the canonical block order already tracked by [`ModuleMeta::block_identity_by_mid`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistorianSelectedMessageIdentity {
+    pub mid: String,
+    pub block_identities: Vec<BlockIdentity>,
+}
+
 /// The durable historian state stored inside [`ModuleMeta`]. Idle keeps
 /// `firing_seq` as the monotonic last-issued sequence and clears the in-flight
 /// identifiers; abandon paths additionally set `failure_backoff_at_ms`.
@@ -2129,6 +2138,11 @@ pub struct HistorianDurableState {
     pub chunk_range: Option<HistorianChunkRange>,
     #[serde(default)]
     pub chunk_fingerprint: String,
+    /// Durable content identities for exactly the message range sent to the producer.
+    /// Publication compares these with the current store metadata inside the write
+    /// transaction, allowing later tail extension while rejecting selected-byte drift.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
     #[serde(default)]
     pub producer_session_id: Option<String>,
     #[serde(default)]
@@ -2163,6 +2177,7 @@ impl Default for HistorianDurableState {
             firing_seq: 0,
             chunk_range: None,
             chunk_fingerprint: String::new(),
+            selected_range_identities: Vec::new(),
             producer_session_id: None,
             producer_run_id: None,
             fired_at_ms: None,
@@ -2256,6 +2271,7 @@ pub struct HistorianPublishPredicate {
     pub firing_seq: u64,
     pub producer_run_id: String,
     pub chunk_fingerprint: String,
+    pub selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3817,6 +3833,7 @@ enum AuthorityFinishDrainOutcome {
 enum PublishTxnOutcome {
     Committed(HistorianPublishResult),
     CasConflict { found: u64, reason: Option<String> },
+    FenceRejected(String),
     StateMismatch(HistorianDurableState),
     InvalidState(String),
     Serde(String),
@@ -8006,7 +8023,8 @@ impl McStore {
             let historian = &meta.historian;
             let predicate_matches = historian.firing_seq == predicate.firing_seq
                 && historian.producer_run_id.as_deref() == Some(predicate.producer_run_id.as_str())
-                && historian.chunk_fingerprint == predicate.chunk_fingerprint;
+                && historian.chunk_fingerprint == predicate.chunk_fingerprint
+                && historian.selected_range_identities == predicate.selected_range_identities;
             if !predicate_matches || historian.state == HistorianPhase::Idle {
                 return Ok(AbandonHistorianTxnOutcome::Unchanged);
             }
@@ -8107,9 +8125,28 @@ impl McStore {
             let predicate_matches = meta.historian.firing_seq == predicate.firing_seq
                 && meta.historian.producer_run_id.as_deref()
                     == Some(predicate.producer_run_id.as_str())
-                && meta.historian.chunk_fingerprint == predicate.chunk_fingerprint;
+                && meta.historian.chunk_fingerprint == predicate.chunk_fingerprint
+                && meta.historian.selected_range_identities == predicate.selected_range_identities;
             if !predicate_matches {
                 return Ok(PublishTxnOutcome::StateMismatch(meta.historian));
+            }
+
+            // `chunk_fingerprint` remains a readable structural diagnostic; exact
+            // content freshness is verified using the durable block identities. An empty
+            // vector means the firing predates selected-range identity persistence, so it
+            // cannot establish that the selected content is still current.
+            if predicate.selected_range_identities.is_empty() {
+                return Ok(PublishTxnOutcome::FenceRejected(
+                    "historian firing has no selected-range content identities".to_string(),
+                ));
+            }
+            if let Some(changed) = predicate.selected_range_identities.iter().find(|selected| {
+                meta.block_identity_by_mid.get(&selected.mid) != Some(&selected.block_identities)
+            }) {
+                return Ok(PublishTxnOutcome::FenceRejected(format!(
+                    "selected historian message {} changed after firing",
+                    changed.mid
+                )));
             }
 
             if meta.revert_epoch != request.expected_revert_epoch {
@@ -8180,6 +8217,9 @@ impl McStore {
                     found,
                     reason,
                 })
+            }
+            PublishTxnOutcome::FenceRejected(reason) => {
+                Err(HistorianPublishError::FenceRejected { reason })
             }
             PublishTxnOutcome::StateMismatch(found) => Err(HistorianPublishError::StateMismatch {
                 expected: Box::new(predicate.clone()),
@@ -14879,8 +14919,23 @@ mod tests {
         assert_eq!(contents, vec!["new fact", "already active"]);
     }
 
+    fn selected_range_identities() -> Vec<HistorianSelectedMessageIdentity> {
+        vec![HistorianSelectedMessageIdentity {
+            mid: "m10".to_string(),
+            block_identities: vec![BlockIdentity {
+                kind_tag: "text".to_string(),
+                byte_fingerprint: "content-a".to_string(),
+            }],
+        }]
+    }
+
     fn publishing_meta() -> ModuleMeta {
+        let selected_range_identities = selected_range_identities();
         ModuleMeta {
+            block_identity_by_mid: selected_range_identities
+                .iter()
+                .map(|selected| (selected.mid.clone(), selected.block_identities.clone()))
+                .collect(),
             historian: HistorianDurableState {
                 state: HistorianPhase::Publishing,
                 firing_seq: 7,
@@ -14889,6 +14944,7 @@ mod tests {
                     to_ordinal: 20,
                 }),
                 chunk_fingerprint: "fp".into(),
+                selected_range_identities,
                 producer_session_id: Some("producer-session".into()),
                 producer_run_id: Some("run-1".into()),
                 fired_at_ms: Some(123),
@@ -14906,6 +14962,7 @@ mod tests {
             firing_seq: 7,
             producer_run_id: "run-1".into(),
             chunk_fingerprint: "fp".into(),
+            selected_range_identities: selected_range_identities(),
         }
     }
 
@@ -15693,6 +15750,55 @@ mod tests {
             .unwrap();
         assert_eq!(page.len(), 5);
         assert!(page.iter().all(|note| note.project_path == "git:proj"));
+    }
+
+    #[test]
+    fn publish_historian_chunk_rejects_selected_identity_drift_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let mut meta = publishing_meta();
+        meta.block_identity_by_mid.get_mut("m10").unwrap()[0].byte_fingerprint =
+            "content-b".to_string();
+        store
+            .commit("ses", None, &CoreState::default(), &meta)
+            .unwrap();
+        let expected = store.load("ses").unwrap().row_version;
+
+        let error = store
+            .publish_historian_chunk(HistorianPublishRequest {
+                session_id: "ses",
+                expected_row_version: expected,
+                expected_revert_epoch: 0,
+                predicate: &publish_predicate(),
+                project_path: "git:proj",
+                compartments: &[publish_compartment()],
+                facts: &[FactCandidate {
+                    category: "ARCHITECTURE".into(),
+                    content: "should not insert".into(),
+                    ..Default::default()
+                }],
+                promote_facts: true,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
+                publication_floor_ordinal: 21,
+                chunk_transcript: Some("stale transcript"),
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, HistorianPublishError::FenceRejected { .. }));
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(loaded.meta.historian.state, HistorianPhase::Publishing);
+        assert_eq!(loaded.meta.publication_floor_ordinal, None);
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+        assert!(store
+            .load_chunk_transcripts_for_range("ses", 10, 21)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .load_active_memories("git:proj", i64::MAX)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

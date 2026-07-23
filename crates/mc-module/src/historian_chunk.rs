@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
 use chrono::{Local, TimeZone};
-use mc_store::{McStore, StoredCompartment};
+use mc_store::{BlockIdentity, HistorianSelectedMessageIdentity, McStore, StoredCompartment};
 use mc_tokenizer::estimate_tokens;
 use regex::Regex;
 use serde_json::Value;
@@ -435,6 +435,9 @@ pub enum HistorianNoFireReason {
         token_estimate: usize,
         minimum: usize,
     },
+    MissingBlockIdentity {
+        message_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -443,6 +446,7 @@ pub struct AssembledHistorianFiring {
     pub model_chain: Vec<String>,
     pub chunk: HistorianBuiltChunk,
     pub chunk_fingerprint: String,
+    pub selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
     pub expected_revert_epoch: u64,
     pub prior_compartments: Vec<StoredCompartmentRange>,
     pub validate_options: ValidateOptions,
@@ -476,6 +480,7 @@ impl AssembledHistorianFiring {
             from_ordinal: self.from_ordinal,
             to_ordinal: self.to_ordinal,
             chunk_fingerprint: &self.chunk_fingerprint,
+            selected_range_identities: self.selected_range_identities.clone(),
             expected_revert_epoch: self.expected_revert_epoch,
             observed_chunk_fingerprint: &self.chunk_fingerprint,
             validation_chunk: &self.chunk.chunk,
@@ -501,6 +506,7 @@ pub fn assemble_historian_firing(
     store: &McStore,
     messages: &[CkIngressMessage],
     live: &[FlatBlock],
+    block_identities_by_mid: &BTreeMap<String, Vec<BlockIdentity>>,
     config: HistorianAssemblerConfig,
     now_ms: i64,
 ) -> Result<AssembleHistorianFiringOutcome, mc_store::McStoreError> {
@@ -582,6 +588,25 @@ pub fn assemble_historian_firing(
         ));
     }
 
+    let mut selected_range_identities = Vec::new();
+    for message in messages.iter().filter(|message| {
+        !message.ck.meta.synthetic
+            && message.ordinal >= chunk.chunk.start_index
+            && message.ordinal <= chunk.chunk.end_index
+    }) {
+        let Some(block_identities) = block_identities_by_mid.get(&message.mid) else {
+            return Ok(AssembleHistorianFiringOutcome::NoFire(
+                HistorianNoFireReason::MissingBlockIdentity {
+                    message_id: message.mid.clone(),
+                },
+            ));
+        };
+        selected_range_identities.push(HistorianSelectedMessageIdentity {
+            mid: message.mid.clone(),
+            block_identities: block_identities.clone(),
+        });
+    }
+
     let boundary_dates = native_boundary_dates(messages);
     let reference_blocks = build_reference_blocks_from_stored(
         &config.session_id,
@@ -619,6 +644,7 @@ pub fn assemble_historian_firing(
             from_ordinal: chunk.chunk.start_index,
             to_ordinal: chunk.chunk.end_index,
             chunk_fingerprint,
+            selected_range_identities,
             expected_revert_epoch,
             prior_compartments,
             validate_options: ValidateOptions {
@@ -1407,6 +1433,7 @@ mod tests {
             &store,
             &messages,
             &projection.blocks,
+            &projection.identity_by_mid,
             HistorianAssemblerConfig {
                 session_id: "ses-below-budget".to_string(),
                 project_path: "/proj".to_string(),
@@ -1461,6 +1488,7 @@ mod tests {
             &store,
             &messages,
             &projection.blocks,
+            &projection.identity_by_mid,
             HistorianAssemblerConfig {
                 session_id: "ses-fold-only".to_string(),
                 project_path: "/proj".to_string(),
@@ -1540,6 +1568,7 @@ mod tests {
             &store,
             &messages,
             &projection.blocks,
+            &projection.identity_by_mid,
             HistorianAssemblerConfig {
                 session_id: "ses-sparse".to_string(),
                 project_path: "/proj".to_string(),
