@@ -60,6 +60,8 @@ const TRUNCATION_SENTINEL: &str = "...[truncated]";
 const TARGET_FRACTION: f64 = 0.30;
 /// Newest `ceil(0.20 × n)` of each of T1/T2 are reserved (never evicted).
 const TIER_RECENCY_RESERVE: f64 = 0.20;
+/// Skip arcs too small to recover meaningful tokens during pressure-triggered reclamation.
+const AGE_RECLAIM_MIN_TOKENS: usize = 250;
 /// Minimum reclaim to justify an emergency cache bust (tokens).
 const EMERGENCY_REARM_MIN_TOKENS: f64 = 2000.0;
 /// Byte→token estimate for the emergency reclaim math (matches the TS nudge).
@@ -124,6 +126,8 @@ pub struct SelItem {
     pub provider_executed: bool,
     /// Bytes this block contributes to reclaim accounting (output/content bytes).
     pub byte_size: usize,
+    /// Persisted tag-token estimate for this block, when one exists.
+    pub token_count: Option<usize>,
     /// The arc this block belongs to, for arc-atomic emission: every block in a tool
     /// arc carries the paired ToolCall block's `mid#block_index`; non-arc blocks carry
     /// `None`. The raw provider tool-call id is only a pairing hint at ingress and is
@@ -147,6 +151,8 @@ pub struct SelectionContext {
     /// The two-pass watermark: tool items with `ordinal <= last_execute_ordinal` are
     /// age-drop candidates (0 = none).
     pub last_execute_ordinal: u64,
+    /// True only for a scheduler execute caused by a context-pressure threshold crossing.
+    pub scheduler_pressure_execute: bool,
     /// Emergency idempotence latch: the input-token reading at the prior emergency
     /// drop (0 if never), and whether any emergency drop has happened.
     pub prior_input_sample: f64,
@@ -207,6 +213,8 @@ struct ToolArc {
     /// Adjacent Reasoning block ids dropped with the arc, + their bytes.
     reasoning_ids: Vec<String>,
     reasoning_bytes: usize,
+    /// Persisted tag-token total; legacy arcs with no estimate remain reclaimable.
+    reclaim_tokens: Option<usize>,
     /// True once ANY block of the arc is already frozen/reduced (arc is inactive).
     reduced: bool,
 }
@@ -266,9 +274,18 @@ fn group_arcs(items: &[SelItem], frozen: &HashSet<String>) -> Vec<ToolArc> {
             result_bytes: 0,
             reasoning_ids: Vec::new(),
             reasoning_bytes: 0,
+            reclaim_tokens: None,
             reduced: false,
         });
         entry.ordinal = entry.ordinal.min(item.ordinal);
+        if let Some(token_count) = item.token_count {
+            entry.reclaim_tokens = Some(
+                entry
+                    .reclaim_tokens
+                    .unwrap_or(0)
+                    .saturating_add(token_count),
+            );
+        }
         if frozen.contains(&item.id) {
             entry.reduced = true;
         }
@@ -564,13 +581,27 @@ fn select_supersession(arcs: &[&ToolArc]) -> HashMap<String, ArcIntent> {
 
 /// 1.4 Age-based two-pass: tool arcs whose age (ToolCall ordinal) is at/under the
 /// last-execute watermark. Add-only (the watermark advances forward). Returns arc ids.
-fn select_two_pass(arcs: &[&ToolArc], last_execute_ordinal: u64) -> HashSet<String> {
-    if last_execute_ordinal == 0 {
+fn select_two_pass(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<String> {
+    if !ctx.scheduler_pressure_execute || ctx.last_execute_ordinal == 0 {
         return HashSet::new();
     }
+    let newest_todowrite = arcs
+        .iter()
+        .filter(|arc| arc.name == "todowrite")
+        .max_by(|left, right| {
+            left.ordinal
+                .cmp(&right.ordinal)
+                .then_with(|| left.arc_id.cmp(&right.arc_id))
+        })
+        .map(|arc| arc.arc_id.as_str());
     arcs.iter()
-        .filter(|a| a.ordinal <= last_execute_ordinal)
-        .map(|a| a.arc_id.clone())
+        .filter(|arc| arc.ordinal <= ctx.last_execute_ordinal)
+        .filter(|arc| {
+            arc.reclaim_tokens
+                .is_none_or(|tokens| tokens >= AGE_RECLAIM_MIN_TOKENS)
+        })
+        .filter(|arc| Some(arc.arc_id.as_str()) != newest_todowrite)
+        .map(|arc| arc.arc_id.clone())
         .collect()
 }
 
@@ -780,7 +811,7 @@ pub fn select_reductions(
         PassClass::Execute => {
             // Order = two-pass (drop) → control-plane (drop) → edit (edit_marker).
             // drop wins: a later edit_marker never overrides an assigned drop.
-            for arc_id in select_two_pass(&active_arcs, ctx.last_execute_ordinal) {
+            for arc_id in select_two_pass(&active_arcs, ctx) {
                 arc_shapes.insert(arc_id, ArcShape::FullDrop);
             }
             if cfg.smart_drops {
@@ -916,6 +947,7 @@ mod tests {
             },
             provider_executed: false,
             byte_size: bytes,
+            token_count: None,
             arc_id: Some(id),
         }
     }
@@ -929,6 +961,7 @@ mod tests {
             },
             provider_executed: false,
             byte_size: bytes,
+            token_count: None,
             arc_id: Some(call_block_id(mid)),
         }
     }
@@ -940,6 +973,7 @@ mod tests {
             kind: SelKind::Reasoning,
             provider_executed: false,
             byte_size: bytes,
+            token_count: None,
             arc_id: Some(call_block_id(mid)),
         }
     }
@@ -961,6 +995,7 @@ mod tests {
             },
             provider_executed: false,
             byte_size: bytes,
+            token_count: None,
             arc_id: Some(arc_id.to_string()),
         }
     }
@@ -980,6 +1015,7 @@ mod tests {
             },
             provider_executed: false,
             byte_size: bytes,
+            token_count: None,
             arc_id: Some(arc_id.to_string()),
         }
     }
@@ -991,6 +1027,7 @@ mod tests {
             ceiling_tokens: 0.0,
             protected_cutoff_ordinal: 0,
             last_execute_ordinal: 0,
+            scheduler_pressure_execute: pass == PassClass::Execute,
             prior_input_sample: 0.0,
             has_prior_drop: false,
             agent_drop_ids: Vec::new(),
@@ -1009,6 +1046,7 @@ mod tests {
             kind: SelKind::Text,
             provider_executed: false,
             byte_size: 128,
+            token_count: None,
             arc_id: None,
         }];
         let mut ctx = base_ctx(PassClass::Execute);
@@ -1077,6 +1115,7 @@ mod tests {
         kind: serde_json::Value,
         provider_executed: bool,
         byte_size: usize,
+        token_count: Option<usize>,
         arc_id: Option<String>,
     }
     #[derive(Deserialize)]
@@ -1086,6 +1125,7 @@ mod tests {
         ceiling_tokens: f64,
         protected_cutoff_ordinal: u64,
         last_execute_ordinal: u64,
+        scheduler_pressure_execute: bool,
         prior_input_sample: f64,
         has_prior_drop: bool,
         agent_drop_ids: Vec<String>,
@@ -1154,6 +1194,7 @@ mod tests {
                     kind: parse_kind(&i.kind),
                     provider_executed: i.provider_executed,
                     byte_size: i.byte_size,
+                    token_count: i.token_count,
                     arc_id: i.arc_id.clone(),
                 })
                 .collect();
@@ -1195,6 +1236,7 @@ mod tests {
                 ceiling_tokens: case.ctx.ceiling_tokens,
                 protected_cutoff_ordinal: case.ctx.protected_cutoff_ordinal,
                 last_execute_ordinal: case.ctx.last_execute_ordinal,
+                scheduler_pressure_execute: case.ctx.scheduler_pressure_execute,
                 prior_input_sample: case.ctx.prior_input_sample,
                 has_prior_drop: case.ctx.has_prior_drop,
                 agent_drop_ids: case.ctx.agent_drop_ids.clone(),
@@ -1228,6 +1270,31 @@ mod tests {
     }
 
     // --- CK-model unit tests (no TS equivalent) ---
+
+    #[test]
+    fn age_reclaim_requires_scheduler_pressure_even_on_an_existing_bust() {
+        let mut result = tool_result("c1", 1, "bash", 2_000);
+        result.token_count = Some(300);
+        let items = vec![
+            tool_call("c1", 1, "bash", serde_json::json!({}), 50),
+            result,
+        ];
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.last_execute_ordinal = 1;
+        ctx.pass_already_busting = true;
+        ctx.scheduler_pressure_execute = false;
+
+        assert!(
+            select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default(),)
+                .is_empty()
+        );
+
+        ctx.scheduler_pressure_execute = true;
+        assert!(
+            !select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default(),)
+                .is_empty()
+        );
+    }
 
     #[test]
     fn provider_executed_arc_never_targeted() {
@@ -1604,6 +1671,7 @@ mod tests {
             kind: SelKind::Text,
             provider_executed: false,
             byte_size: 100,
+            token_count: None,
             arc_id: None,
         }];
         let mut ctx = base_ctx(PassClass::Execute);
@@ -1628,6 +1696,7 @@ mod tests {
                 kind: SelKind::Text,
                 provider_executed: false,
                 byte_size: 100,
+                token_count: None,
                 arc_id: None,
             },
             SelItem {
@@ -1636,6 +1705,7 @@ mod tests {
                 kind: SelKind::Text,
                 provider_executed: false,
                 byte_size: 100,
+                token_count: None,
                 arc_id: None,
             },
         ];
@@ -1667,6 +1737,7 @@ mod tests {
                 kind,
                 provider_executed: false,
                 byte_size: 100,
+                token_count: None,
                 arc_id: None,
             })
             .collect::<Vec<_>>();

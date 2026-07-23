@@ -272,7 +272,9 @@ export {
     type SubagentTotals,
 } from "./storage-subagent-invocations";
 export {
+    AGE_RECLAIM_MIN_TOKENS,
     type ActiveTagTokenAggregate,
+    type AgeReclaimToolTag,
     adoptFallbackTagMessageId,
     adoptPiFallbackMessageTag,
     adoptPiFallbackToolOwnerTag,
@@ -282,6 +284,7 @@ export {
     findPiFallbackToolOwnerTags,
     getActiveTagsBySession,
     getActiveTagTokenAggregate,
+    getActiveToolTagsForAgeReclaim,
     getActiveTagTokenTotalsByMessage,
     getAllStatusTagTokenTotalsFlat,
     getMaxDroppedTagNumber,

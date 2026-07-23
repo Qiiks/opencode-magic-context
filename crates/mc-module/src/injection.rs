@@ -470,6 +470,7 @@ mod tests {
             },
             provider_executed: false,
             byte_size: 0,
+            token_count: None,
             arc_id: Some(id.to_string()),
         }
     }

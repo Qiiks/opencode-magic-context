@@ -268,6 +268,8 @@ pub struct SchedulerInputs {
 pub struct SchedulerOutcome {
     /// Execute/defer/force/emergency pass class.
     pub pass: PassDecision,
+    /// True only when this pass executes because the configured usage threshold was crossed.
+    pub pressure_execute: bool,
     /// True when the hard idle-TTL predicate fired and should be materialized.
     pub idle_ttl_fired: bool,
     /// Updated emergency drain latch state for the caller to persist.
@@ -607,6 +609,8 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
         inputs.model_key.as_deref(),
         inputs.context_limit,
     );
+    let pressure_execute_requested =
+        inputs.usage.percentage > 0.0 && inputs.usage.percentage >= threshold;
     let mut pass =
         if base == BaseDecision::Execute || idle_ttl_fired || inputs.deferred_execute.is_some() {
             PassDecision::Execute
@@ -631,6 +635,7 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
         inputs.deferred_execute.clone(),
         inputs.boundary_bypass,
     );
+    let pressure_execute = pressure_execute_requested && pass != PassDecision::Defer;
     let drain_latch = advance_drain_latch(
         inputs.drain_latch,
         inputs.usage.percentage,
@@ -648,6 +653,7 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
 
     SchedulerOutcome {
         pass,
+        pressure_execute,
         idle_ttl_fired,
         drain_latch,
         deferred_execute,
@@ -1170,6 +1176,7 @@ mod tests {
         let boundary = decide(&inputs);
         assert!(boundary.idle_ttl_fired);
         assert_eq!(boundary.pass, PassDecision::Execute);
+        assert!(!boundary.pressure_execute);
 
         inputs.usage.percentage = 0.0;
         inputs.usage.input_tokens = 0.0;

@@ -947,7 +947,7 @@ export async function runPostTransformPhase(
             updateSessionMeta(args.db, args.sessionId, { lastResponseTime: Date.now() });
         }
 
-        const toolReclaimExecutePass = args.schedulerDecision === "execute" || m0HardFoldThisPass;
+        const toolReclaimExecutePass = args.schedulerDecision === "execute";
         const alreadyMutatingThisPass = pendingOpsDidMutate || heuristicOrReasoningDidMutate;
         let autoReclaimTargetCount = 0;
         let autoReclaimDidMutate = false;

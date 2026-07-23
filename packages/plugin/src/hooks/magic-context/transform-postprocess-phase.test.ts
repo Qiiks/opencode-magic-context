@@ -1473,6 +1473,87 @@ describe("two-pass tool reclaim", () => {
         );
     });
 
+    it("keeps sub-floor arcs while reclaiming a larger sibling", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-reclaim-size-floor";
+        const trigger = makeToolMessage("tool-1");
+        const small = makeToolMessage("tool-2");
+        const large = makeToolMessage("tool-3");
+        insertTag(db, sessionId, "tool-1", "tool", 4000, 1, 0, "edit");
+        insertTag(db, sessionId, "tool-2", "tool", 4000, 2, 0, "bash", 0, null, null, {
+            tokenCount: 249,
+            inputTokenCount: 0,
+            reasoningTokenCount: 0,
+        });
+        insertTag(db, sessionId, "tool-3", "tool", 4000, 3, 0, "read", 0, null, null, {
+            tokenCount: 250,
+            inputTokenCount: 0,
+            reasoningTokenCount: 0,
+        });
+        queuePendingOp(db, sessionId, 1, "drop", 1);
+        advanceToolReclaimWatermark(db, sessionId, 3);
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, [trigger, small, large], {
+                schedulerDecision: "execute",
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: new Map([
+                    [1, makeDropTarget(trigger)],
+                    [2, makeDropTarget(small)],
+                    [3, makeDropTarget(large)],
+                ]),
+                sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            }),
+        );
+
+        const statuses = tagStatuses(sessionId);
+        expect(statuses.get(1)).toBe("dropped");
+        expect(statuses.get(2)).toBe("active");
+        expect(statuses.get(3)).toBe("dropped");
+    });
+
+    it("keeps the newest todowrite arc while reclaiming an older one", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-reclaim-newest-todowrite";
+        const trigger = makeToolMessage("tool-1");
+        const older = makeToolMessage("tool-2");
+        const newest = makeToolMessage("tool-3");
+        insertTag(db, sessionId, "tool-1", "tool", 4000, 1, 0, "edit");
+        insertTag(db, sessionId, "tool-2", "tool", 4000, 2, 0, "todowrite", 0, null, null, {
+            tokenCount: 300,
+            inputTokenCount: 0,
+            reasoningTokenCount: 0,
+        });
+        insertTag(db, sessionId, "tool-3", "tool", 4000, 3, 0, "todowrite", 0, null, null, {
+            tokenCount: 300,
+            inputTokenCount: 0,
+            reasoningTokenCount: 0,
+        });
+        queuePendingOp(db, sessionId, 1, "drop", 1);
+        advanceToolReclaimWatermark(db, sessionId, 3);
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, [trigger, older, newest], {
+                schedulerDecision: "execute",
+                smartDrops: false,
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: new Map([
+                    [1, makeDropTarget(trigger)],
+                    [2, makeDropTarget(older)],
+                    [3, makeDropTarget(newest)],
+                ]),
+                sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            }),
+        );
+
+        const statuses = tagStatuses(sessionId);
+        expect(statuses.get(1)).toBe("dropped");
+        expect(statuses.get(2)).toBe("dropped");
+        expect(statuses.get(3)).toBe("active");
+    });
+
     it("does not persist a synthetic drop for an absent old DB tag", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
@@ -1779,7 +1860,7 @@ describe("known m[0] hard-fold folds the execute pass in", () => {
         );
     });
 
-    it("drains two-pass reclaim and advances its watermark on a DEFER scheduler pass when m[0] HARD-folds", async () => {
+    it("drains pending ops but not two-pass reclaim or its watermark on a low-usage TTL fold", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-hardfold-reclaim-drain";
@@ -1813,7 +1894,8 @@ describe("known m[0] hard-fold folds the execute pass in", () => {
                     historyBudgetTokens: 98_000,
                     hardSignals: {
                         ...BASE_HARD,
-                        modelKey: "anthropic/sonnet",
+                        cacheExpired: true,
+                        lastResponseTime: Number.MAX_SAFE_INTEGER,
                     },
                 },
             }),
@@ -1823,9 +1905,9 @@ describe("known m[0] hard-fold folds the execute pass in", () => {
             getTagsBySession(db, sessionId).map((tag) => [tag.tagNumber, tag.status]),
         );
         expect(statuses.get(1)).toBe("dropped");
-        expect(statuses.get(2)).toBe("dropped");
+        expect(statuses.get(2)).toBe("active");
         expect(statuses.get(3)).toBe("active");
-        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(3);
+        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(2);
 
         const deferReplayBytes = JSON.stringify(messages);
         await runPostTransformPhase(

@@ -2136,12 +2136,23 @@ fn apply_once(
                 || hard_fold_requested
                 || cached_m1_missing_due,
         );
+    // Hard advisory requests use the normal Execute path so queued work can be processed
+    // during the fold, but only context pressure reported by the scheduler enables age reclaim.
     let selection_class = if producer_gate && !ordinary_historian_veto {
         selection_pass_class(scheduler_outcome.pass)
     } else {
         PassClass::Defer
     };
-    let tail_for_selection = tail_sel_items(&live, loaded.meta.coverage_ordinal);
+    let tag_tokens_by_block: HashMap<&str, usize> = tag_rows
+        .iter()
+        .filter_map(|row| {
+            usize::try_from(row.token_count)
+                .ok()
+                .map(|tokens| (row.block_id.as_str(), tokens))
+        })
+        .collect();
+    let tail_for_selection =
+        tail_sel_items(&live, loaded.meta.coverage_ordinal, &tag_tokens_by_block);
     let mut protected_block_ids = if tagging_surface_requested {
         newest_active_tag_block_ids(
             &loaded.core,
@@ -2206,6 +2217,7 @@ fn apply_once(
                 } else {
                     loaded.meta.last_execute_ordinal
                 },
+                scheduler_pressure_execute: scheduler_outcome.pressure_execute,
                 prior_input_sample: loaded.meta.last_emergency_input_sample,
                 has_prior_drop: loaded.meta.has_prior_emergency_drop,
                 agent_drop_ids,
@@ -2645,7 +2657,8 @@ fn apply_once(
                     coverage_shrank(loaded.meta.coverage_ordinal, comp.coverage_ordinal);
                 if coverage_shrunk_on_bust && tail_reclaim_enabled {
                     let todo_started_at = Instant::now();
-                    let post_truncate_tail = tail_sel_items(&live, comp.coverage_ordinal);
+                    let post_truncate_tail =
+                        tail_sel_items(&live, comp.coverage_ordinal, &tag_tokens_by_block);
                     capture_todo_state_on_bust(&mut meta, &post_truncate_tail, true);
                     todo_ms += elapsed_ms(todo_started_at);
                 }
@@ -2963,19 +2976,12 @@ fn apply_once(
     }
     timings.compose_m0m1 = elapsed_ms(compose_m0m1_started_at);
 
-    // The two-pass watermark advances on EVERY scheduler execute-class decision
-    // (Execute/Force85/Emergency95), not only on passes that froze reductions: this
-    // execute's tail is the NEXT execute's age-drop candidate set, so a zero-drop execute
-    // must still stamp the max ordinal or completed arcs never age in. It does NOT advance
-    // when the producer gate opened via a hard advisory on a scheduler-Defer pass
-    // (first-fold, render-config change): those busts are not execute cadence, and
-    // stamping there would age the current tail into the very next execute. The write may
-    // be the only meta change on the pass — a metadata-only commit with byte-identical
-    // output, not a cache bust. Held back under reconcile (the watermark may be stale-high
-    // against a store about to be re-cut; the re-cut arm re-clamps it).
-    let scheduler_execute_class =
-        tail_reclaim_enabled && !matches!(scheduler_outcome.pass, scheduler::PassDecision::Defer);
-    if scheduler_execute_class && !loaded.core.reconcile_pending {
+    // The two-pass watermark advances on every genuine pressure execute, even if the
+    // sweep selected nothing. TTL/model/epoch folds and low-usage refresh executes do not
+    // move it: they may drain queued work, but are not age-reclaim cadence. Held back under
+    // reconcile because the watermark may be stale-high against a store about to be re-cut.
+    let pressure_execute = tail_reclaim_enabled && scheduler_outcome.pressure_execute;
+    if pressure_execute && !loaded.core.reconcile_pending {
         meta.last_execute_ordinal = tail_for_selection
             .iter()
             .map(|item| item.ordinal)
@@ -4201,7 +4207,7 @@ fn synth_region(key: &str, payload: String) -> FrozenUnit {
     }
 }
 
-fn sel_item_from_flat(block: &FlatBlock) -> SelItem {
+fn sel_item_from_flat(block: &FlatBlock, tag_tokens_by_block: &HashMap<&str, usize>) -> SelItem {
     let kind = match &block.wire.kind {
         ck_wire::CkKind::ToolCall { name, input, .. } => SelKind::ToolCall {
             name: name.clone(),
@@ -4222,14 +4228,19 @@ fn sel_item_from_flat(block: &FlatBlock) -> SelItem {
         kind,
         provider_executed: block.provider_executed,
         byte_size: block.bytes.len(),
+        token_count: tag_tokens_by_block.get(block.id.as_str()).copied(),
         arc_id: block.arc_id.clone(),
     }
 }
 
-fn tail_sel_items(live: &[&FlatBlock], coverage: Option<u64>) -> Vec<SelItem> {
+fn tail_sel_items(
+    live: &[&FlatBlock],
+    coverage: Option<u64>,
+    tag_tokens_by_block: &HashMap<&str, usize>,
+) -> Vec<SelItem> {
     live.iter()
         .filter(|block| is_tail(block.ordinal(), coverage))
-        .map(|block| sel_item_from_flat(block))
+        .map(|block| sel_item_from_flat(block, tag_tokens_by_block))
         .collect()
 }
 
@@ -10659,6 +10670,43 @@ mod tests {
     }
 
     #[test]
+    fn low_usage_ttl_fold_neither_age_reclaims_nor_advances_the_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let large_output = "large tool output ".repeat(400);
+        let messages = vec![
+            item("a", 1, "covered head"),
+            assistant_tool_call("m1", 2, "call_age"),
+            tool_result("m2", 3, "call_age", &large_output),
+            item("m9", 9, "newest user text"),
+        ];
+        let boot = run(&s, &req("ses", "cfg0", messages.clone()), &spine());
+        assert_eq!(boot.action, "HARD");
+
+        let mut loaded = s.load("ses").unwrap();
+        loaded.meta.last_execute_ordinal = 9;
+        s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 300_002);
+        ctx.observed_last_response_at_ms = Some(1);
+        let ttl_fold = transform(&s, &req("ses", "cfg0", messages), &ctx).unwrap();
+        assert_eq!(ttl_fold.action, "HARD");
+        let after = s.load("ses").unwrap();
+        assert_eq!(after.meta.last_execute_ordinal, 9);
+        assert!(
+            after
+                .core
+                .frozen_units
+                .iter()
+                .all(|unit| !unit.key.starts_with("red:m1#") && !unit.key.starts_with("red:m2#")),
+            "an idle-TTL fold must not run the pressure-only age sweep"
+        );
+    }
+
+    #[test]
     fn zero_drop_execute_watermark_ages_arcs_into_next_execute() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -10668,10 +10716,11 @@ mod tests {
         // the post-coverage tail.
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
             .unwrap();
+        let large_output = "large tool output ".repeat(400);
         let msgs = vec![
             item("a", 1, "covered head"),
             assistant_tool_call("m1", 2, "call_age"),
-            tool_result("m2", 3, "call_age", "big tool output payload"),
+            tool_result("m2", 3, "call_age", &large_output),
             item("m9", 9, "newest user text"),
         ];
         let boot = run(&s, &req("ses", "cfg0", msgs.clone()), &spine());
