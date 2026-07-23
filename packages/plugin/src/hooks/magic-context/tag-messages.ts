@@ -298,23 +298,23 @@ function getReasoningTokenCount(parts: ThinkingLikePart[]): number {
     return tokens;
 }
 
-function estimateInputByteSize(input: unknown): number {
+function serializeToolInput(input: unknown): string | null {
     try {
-        return JSON.stringify(input).length;
+        return JSON.stringify(input) ?? null;
     } catch {
-        return 0;
+        return null;
     }
 }
 
+function estimateInputByteSize(serializedInput: string | null): number {
+    return serializedInput?.length ?? 0;
+}
+
 /** Real-tokenizer count for a tool input payload (string or JSON-serializable). */
-function estimateInputTokenCount(input: unknown): number {
+function estimateInputTokenCount(input: unknown, serializedInput: string | null): number {
     if (input === undefined || input === null) return 0;
-    try {
-        const s = typeof input === "string" ? input : JSON.stringify(input);
-        return s ? estimateTokens(s) : 0;
-    } catch {
-        return 0;
-    }
+    const tokenText = typeof input === "string" ? input : serializedInput;
+    return tokenText ? estimateTokens(tokenText) : 0;
 }
 
 /**
@@ -348,11 +348,12 @@ function extractToolTagMetadata(part: unknown): {
                 : null;
     const state = isRecord(part.state) ? part.state : null;
     const input = state?.input ?? part.args ?? part.input ?? {};
+    const serializedInput = serializeToolInput(input);
 
     return {
         toolName,
-        inputByteSize: estimateInputByteSize(input),
-        inputTokenCount: estimateInputTokenCount(input),
+        inputByteSize: estimateInputByteSize(serializedInput),
+        inputTokenCount: estimateInputTokenCount(input, serializedInput),
     };
 }
 

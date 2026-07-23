@@ -3,6 +3,7 @@
 import { beforeEach, describe, expect, it, mock } from "bun:test";
 import {
     clearOldReasoning,
+    replayStrippedInlineThinking,
     stripClearedReasoning,
     stripDroppedPlaceholderMessages,
     stripInlineThinking,
@@ -999,5 +1000,85 @@ describe("strip-content", () => {
                 expect(a2.parts[0]).toEqual(SENTINEL);
             });
         });
+    });
+
+    it("matches the pre-guard replay and placeholder output on a mixed fixture", () => {
+        const fixture = [
+            message("user-placeholder", "user", [{ type: "text", text: "[dropped §1§]" }]),
+            message("reasoning-image", "assistant", [
+                { type: "reasoning", text: "signed reasoning", signature: "sig" },
+                { type: "text", text: "clean answer without inline tags" },
+                { type: "file", mime: "image/png", url: "data:image/png;base64,AAAA" },
+            ]),
+            message("dropped", "assistant", [
+                { type: "text", text: "[dropped §2§]\n[dropped §3§]" },
+            ]),
+            message("merged-a", "assistant", [
+                { type: "text", text: "<thinking>hidden</thinking>visible" },
+            ]),
+            message("merged-b", "assistant", [{ type: "text", text: "<think>brief</think>tail" }]),
+        ];
+        const before = structuredClone(fixture) as MessageLike[];
+        const guarded = structuredClone(fixture) as MessageLike[];
+        const tagMap = (messages: MessageLike[]) =>
+            new Map(messages.map((entry, index) => [entry, index + 1] as const));
+        const inlinePattern = /<(?:thinking|think)>[\s\S]*?<\/(?:thinking|think)>\s*/g;
+
+        let oldInlineCount = 0;
+        for (const entry of before) {
+            if (entry.info.role !== "assistant") continue;
+            for (const part of entry.parts) {
+                if (
+                    typeof part !== "object" ||
+                    part === null ||
+                    (part as { type?: unknown }).type !== "text" ||
+                    typeof (part as { text?: unknown }).text !== "string"
+                ) {
+                    continue;
+                }
+                const textPart = part as { text: string };
+                const cleaned = textPart.text.replace(inlinePattern, "");
+                if (cleaned !== textPart.text) {
+                    textPart.text = cleaned;
+                    oldInlineCount += 1;
+                }
+            }
+        }
+        const droppedPattern = /^\[dropped §\d+§\](?:\s*\[dropped §\d+§\])*$/;
+        let oldDroppedCount = 0;
+        for (const entry of before) {
+            if (entry.info.role === "user") continue;
+            let hasContent = false;
+            let hasNonDropped = false;
+            for (const part of entry.parts) {
+                if (typeof part !== "object" || part === null) continue;
+                const record = part as { type?: unknown; text?: unknown };
+                if (
+                    (record.type === "text" || record.type === "reasoning") &&
+                    typeof record.text === "string"
+                ) {
+                    hasContent = true;
+                    const trimmed = record.text.trim();
+                    if (trimmed.length > 0 && !droppedPattern.test(trimmed)) {
+                        hasNonDropped = true;
+                        break;
+                    }
+                } else {
+                    hasNonDropped = true;
+                    break;
+                }
+            }
+            if (hasContent && !hasNonDropped) {
+                entry.parts = [{ type: "text", text: "" }];
+                oldDroppedCount += 1;
+            }
+        }
+
+        const guardedInlineCount = replayStrippedInlineThinking(guarded, tagMap(guarded), 99);
+        const guardedDropped = stripDroppedPlaceholderMessages(guarded, "anthropic");
+
+        expect(guardedInlineCount).toBe(oldInlineCount);
+        expect(guardedDropped.stripped).toBe(oldDroppedCount);
+        expect(JSON.stringify(guarded)).toBe(JSON.stringify(before));
     });
 });
