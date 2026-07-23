@@ -1930,6 +1930,20 @@ fn apply_once(
         overflow_error_text: req.provider_error.clone(),
     });
     timings.decide += elapsed_ms(decide_scheduler_started_at);
+    // A trusted final-wire measurement can only clear a latch that was already
+    // active before this pass. It never participates in the ≥95% arming path.
+    if loaded.meta.emergency_drain_active
+        && effective_usage.final_wire_trusted
+        && effective_usage.final_wire_input_tokens.saturating_mul(100)
+            < effective_usage.context_limit_tokens.saturating_mul(80)
+        && effective_usage.context_limit_tokens > 0
+    {
+        scheduler_outcome.drain_latch.active_since_ms = None;
+        eprintln!(
+            "emergency disarm: trusted final-wire {} under limit {}",
+            effective_usage.final_wire_input_tokens, effective_usage.context_limit_tokens
+        );
+    }
     // A flush requests work on the next pass, not a new m0 fold. Promote only a normal
     // defer to Execute; mandatory bootstrap, epoch, and pressure decisions retain priority.
     if loaded.meta.soft_refresh_pending && scheduler_outcome.pass == scheduler::PassDecision::Defer
@@ -7764,6 +7778,7 @@ mod tests {
             effective_context_limit_tokens(&ModuleUsage {
                 current_total_input_tokens: 1,
                 context_limit_tokens: 500,
+                ..ModuleUsage::default()
             }),
             200_000.0
         );
@@ -7771,6 +7786,7 @@ mod tests {
             effective_context_limit_tokens(&ModuleUsage {
                 current_total_input_tokens: 1,
                 context_limit_tokens: 0,
+                ..ModuleUsage::default()
             }),
             200_000.0
         );
@@ -7778,6 +7794,7 @@ mod tests {
             effective_context_limit_tokens(&ModuleUsage {
                 current_total_input_tokens: 1,
                 context_limit_tokens: crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT,
+                ..ModuleUsage::default()
             }),
             crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT as f64
         );
@@ -8547,6 +8564,8 @@ mod tests {
         request.usage = Some(ModuleUsage {
             current_total_input_tokens: input,
             context_limit_tokens: limit,
+            final_wire_input_tokens: 0,
+            final_wire_trusted: false,
         });
         request
     }
@@ -9297,6 +9316,8 @@ mod tests {
         first.usage = Some(ModuleUsage {
             current_total_input_tokens: 100,
             context_limit_tokens: 1000,
+            final_wire_input_tokens: 0,
+            final_wire_trusted: false,
         });
         run(&s, &first, &spine());
         assert_eq!(
@@ -9304,6 +9325,7 @@ mod tests {
             Some(ModuleUsage {
                 current_total_input_tokens: 100,
                 context_limit_tokens: 1000,
+                ..ModuleUsage::default()
             })
         );
 
@@ -9311,6 +9333,8 @@ mod tests {
         lower.usage = Some(ModuleUsage {
             current_total_input_tokens: 50,
             context_limit_tokens: 1000,
+            final_wire_input_tokens: 0,
+            final_wire_trusted: false,
         });
         run(&s, &lower, &spine());
         assert_eq!(
@@ -9341,6 +9365,8 @@ mod tests {
         zero.usage = Some(ModuleUsage {
             current_total_input_tokens: 0,
             context_limit_tokens: 0,
+            final_wire_input_tokens: 0,
+            final_wire_trusted: false,
         });
         run(&s, &zero, &spine());
         assert_eq!(
@@ -9352,6 +9378,51 @@ mod tests {
                 .current_total_input_tokens,
             50,
             "all-zero usage also falls back to persisted"
+        );
+    }
+
+    #[test]
+    fn trusted_final_wire_disarms_only_an_existing_emergency_latch() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let session = "trusted-final-wire";
+        run(
+            &s,
+            &req(session, "cfg0", vec![item("m1", 1, "hello")]),
+            &spine(),
+        );
+        let set_latch = |active: bool| {
+            let loaded = s.load(session).unwrap();
+            let mut meta = loaded.meta;
+            meta.emergency_drain_active = active;
+            meta.emergency_drain_entered_at_ms = if active { 1 } else { 0 };
+            s.commit(session, loaded.row_version, &loaded.core, &meta)
+                .unwrap();
+        };
+        let request = |trusted: bool| {
+            let mut request = req(session, "cfg0", vec![item("m1", 1, "hello")]);
+            request.usage = Some(ModuleUsage {
+                current_total_input_tokens: 95_000,
+                context_limit_tokens: 100_000,
+                final_wire_input_tokens: 14_000,
+                final_wire_trusted: trusted,
+            });
+            request
+        };
+
+        set_latch(true);
+        run(&s, &request(true), &spine());
+        assert!(!s.load(session).unwrap().meta.emergency_drain_active);
+
+        set_latch(true);
+        run(&s, &request(false), &spine());
+        assert!(s.load(session).unwrap().meta.emergency_drain_active);
+
+        set_latch(false);
+        run(&s, &request(true), &spine());
+        assert!(
+            s.load(session).unwrap().meta.emergency_drain_active,
+            "trusted estimates must not change the normal ≥95% arming path"
         );
     }
 

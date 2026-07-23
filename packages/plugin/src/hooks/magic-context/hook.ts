@@ -623,10 +623,11 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const sidekickRunnable = isSidekickRunnable(deps.config);
     const sidekickConfig = sidekickRunnable ? deps.config.sidekick : undefined;
     const rustMemorySyncRequestedSessions = new Set<string>();
-    const rustModeModuleClient =
+    // Build the same subc-backed client for the TS recovery arm. Constructing the
+    // transport is inert; it connects only if a marker actually needs draining.
+    const authorityRecoveryModuleClient =
         deps.rustModeModuleClient ??
-        (deps.config.transform_mode === "rust"
-            ? (() => {
+        (() => {
                   const transport = new SubcModuleTransport();
                   const client: RustModeModuleClient = {
                       call: (args) => transport.call(args),
@@ -664,9 +665,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                           return { max_sequence: maxSequence, compartments };
                       },
                   };
-                  return client;
-              })()
-            : undefined);
+                   return client;
+               })();
+    const rustModeModuleClient =
+        deps.config.transform_mode === "rust" ? authorityRecoveryModuleClient : undefined;
     const rustToolBackends: RustToolBackends | undefined =
         deps.config.transform_mode === "rust" && rustModeModuleClient
             ? {
@@ -923,6 +925,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         maybeAutoEmbedSession,
         transformMode: deps.config.transform_mode,
         rustModeModuleClient,
+        tsAuthorityRecoveryModuleClient: authorityRecoveryModuleClient,
         rustMemorySyncRequestedSessions,
         onRustModeParked: notifyRustModeParked,
         onRustModeProjectPrepared: ensureModuleNoteEvaluationBridge,

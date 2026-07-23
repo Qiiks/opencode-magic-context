@@ -1245,6 +1245,36 @@ describe("emergency fail-closed decision", () => {
             }),
         ).toEqual({ shouldAbort: false, reason: "below-emergency-band" });
     });
+
+    it("disarms an armed latch when a trusted final wire is safely below the proven limit", () => {
+        expect(
+            evaluateEmergencyFailClosed({
+                usagePercentage: 95,
+                emergencyRecoveryArmed: true,
+                emergencyRecoveryOrigin: "provider_overflow",
+                foldMaterializedThisPass: false,
+                finalWireEstimate: { tokens: 14_000, trusted: true },
+                provenLimitTokens: 100_000,
+            }),
+        ).toEqual({
+            shouldAbort: false,
+            reason: "trusted-final-wire-disarm",
+            disarm: { finalWireTokens: 14_000, provenLimitTokens: 100_000 },
+        });
+    });
+
+    it("keeps provider-overflow blocking when the final-wire estimate is untrusted", () => {
+        expect(
+            evaluateEmergencyFailClosed({
+                usagePercentage: 95,
+                emergencyRecoveryArmed: true,
+                emergencyRecoveryOrigin: "provider_overflow",
+                foldMaterializedThisPass: false,
+                finalWireEstimate: { tokens: 14_000, trusted: false },
+                provenLimitTokens: 100_000,
+            }),
+        ).toEqual({ shouldAbort: true, reason: "provider-overflow-abort" });
+    });
 });
 
 describe("confirmed emergency abort", () => {

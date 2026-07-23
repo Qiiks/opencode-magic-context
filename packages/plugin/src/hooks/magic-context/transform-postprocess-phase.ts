@@ -483,7 +483,9 @@ export async function abortSessionFailClosed(
 
 export interface EmergencyFailClosedDecision {
     shouldAbort: boolean;
-    reason: "below-emergency-band" | "provider-overflow-abort" | "proceed";
+    reason: "below-emergency-band" | "provider-overflow-abort" | "proceed" | "trusted-final-wire-disarm";
+    /** Trusted current-pass wire evidence that lets the caller clear its durable latch. */
+    disarm?: { finalWireTokens: number; provenLimitTokens: number };
 }
 
 export function evaluateEmergencyFailClosed(input: {
@@ -491,7 +493,25 @@ export function evaluateEmergencyFailClosed(input: {
     emergencyRecoveryArmed: boolean;
     emergencyRecoveryOrigin: "provider_overflow" | "proactive_model_shrink" | null;
     foldMaterializedThisPass: boolean;
+    finalWireEstimate?: { tokens: number; trusted: boolean };
+    provenLimitTokens?: number;
 }): EmergencyFailClosedDecision {
+    const estimate = input.finalWireEstimate;
+    const limit = input.provenLimitTokens;
+    if (
+        input.emergencyRecoveryArmed &&
+        estimate?.trusted === true &&
+        typeof limit === "number" &&
+        Number.isFinite(limit) &&
+        limit > 0 &&
+        estimate.tokens < limit * 0.8
+    ) {
+        return {
+            shouldAbort: false,
+            reason: "trusted-final-wire-disarm",
+            disarm: { finalWireTokens: estimate.tokens, provenLimitTokens: limit },
+        };
+    }
     if (input.usagePercentage < 95) {
         return { shouldAbort: false, reason: "below-emergency-band" };
     }

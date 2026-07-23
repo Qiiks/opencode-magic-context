@@ -280,6 +280,7 @@ pub fn fire(
         last_failure: current.last_failure.clone(),
         // A fire resolves whatever skip reason preceded it.
         last_no_fire: None,
+        consecutive_publish_failures: current.consecutive_publish_failures,
     }))
 }
 
@@ -323,7 +324,9 @@ pub fn tx_committed(
     current: &HistorianDurableState,
 ) -> Result<HistorianDurableState, HistorianStateError> {
     require_phase(current, HistorianPhase::Publishing, "tx_committed")?;
-    Ok(idle_after_success(current.firing_seq))
+    let mut next = idle_after_success(current.firing_seq);
+    next.consecutive_publish_failures = 0;
+    Ok(next)
 }
 
 pub fn tx_conflict(
@@ -357,6 +360,7 @@ pub fn abandon_with_detail(
         firing_seq: current.firing_seq,
         failure_backoff_at_ms: Some(failure_backoff_at_ms),
         last_failure: detail.or_else(|| current.last_failure.clone()),
+        consecutive_publish_failures: current.consecutive_publish_failures,
         ..HistorianDurableState::default()
     }
 }
@@ -575,7 +579,16 @@ pub fn publish_validated_chunk(
                 },
             ))
         }
-        Err(err) => Err(err.into()),
+        Err(err) => {
+            // The publish error occurs after the producer has completed its work, so
+            // leave the producer run available for the normal recovery path instead of
+            // abandoning it. Record the failure so repeated publication errors remain visible.
+            let _ = store.record_historian_publish_failure_if_matching(
+                request.session_id,
+                request.predicate,
+            );
+            Err(err.into())
+        }
     }
 }
 
@@ -1662,7 +1675,15 @@ fn abandon_matching_run_without_cooldown(
     predicate: &HistorianPublishPredicate,
     detail: Option<String>,
 ) -> Result<Option<u64>, HistorianStateError> {
-    Ok(store.abandon_historian_run_if_matching(session_id, predicate, None, detail.as_deref())?)
+    Ok(
+        store.abandon_historian_run_if_matching_with_publish_failure(
+            session_id,
+            predicate,
+            None,
+            detail.as_deref(),
+            true,
+        )?,
+    )
 }
 
 fn abandon_matching_run_with_detail(
@@ -1672,12 +1693,15 @@ fn abandon_matching_run_with_detail(
     failure_backoff_at_ms: i64,
     detail: Option<String>,
 ) -> Result<Option<u64>, HistorianStateError> {
-    Ok(store.abandon_historian_run_if_matching(
-        session_id,
-        predicate,
-        Some(failure_backoff_at_ms),
-        detail.as_deref(),
-    )?)
+    Ok(
+        store.abandon_historian_run_if_matching_with_publish_failure(
+            session_id,
+            predicate,
+            Some(failure_backoff_at_ms),
+            detail.as_deref(),
+            true,
+        )?,
+    )
 }
 
 #[cfg(test)]
@@ -2179,6 +2203,7 @@ mod tests {
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
+            consecutive_publish_failures: 0,
         }
     }
 
@@ -3663,6 +3688,7 @@ mod tests {
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
+            consecutive_publish_failures: 0,
         };
         let rv = store
             .commit(
