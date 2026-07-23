@@ -109,6 +109,8 @@ pub struct BlockMeta {
     pub native_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_fingerprint: Option<String>,
     pub raw: Value,
 }
 
@@ -132,27 +134,147 @@ impl MatchedBlockMetas<'_> {
     }
 }
 
+const BLOCK_IDENTITY_NAMESPACE: &str = "_cortexkit_codec";
+const BLOCK_INDEX_KEY: &str = "blockIndex";
+const NATIVE_INDEX_KEY: &str = "nativeIndex";
+const FINGERPRINT_KEY: &str = "decodedFingerprint";
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct AlignmentScore {
+    origin_matches: usize,
+    total_matches: usize,
+}
+
+impl AlignmentScore {
+    fn with_match(self, origin_match: bool) -> Self {
+        Self {
+            origin_matches: self.origin_matches + usize::from(origin_match),
+            total_matches: self.total_matches + 1,
+        }
+    }
+}
+
+pub(crate) fn decoded_block_fingerprint(block: &CkWireBlock) -> String {
+    let mut canonical = block.clone();
+    canonical.provider_extras.remove(BLOCK_IDENTITY_NAMESPACE);
+    canonical.mark_modified();
+    stable_hash(&serde_json::to_value(canonical).unwrap_or(Value::Null))
+}
+
+pub(crate) fn stamp_block_identity(
+    block: &mut CkWireBlock,
+    block_index: usize,
+    native_index: usize,
+    fingerprint: &str,
+) {
+    let identity = block
+        .provider_extras
+        .entry(BLOCK_IDENTITY_NAMESPACE.to_string())
+        .or_default();
+    identity.insert(BLOCK_INDEX_KEY.to_string(), Value::from(block_index));
+    identity.insert(NATIVE_INDEX_KEY.to_string(), Value::from(native_index));
+    identity.insert(
+        FINGERPRINT_KEY.to_string(),
+        Value::String(fingerprint.to_string()),
+    );
+    block.mark_modified();
+}
+
+fn stamped_block_identity(block: &CkWireBlock) -> Option<(usize, usize, &str)> {
+    let identity = block.provider_extras.get(BLOCK_IDENTITY_NAMESPACE)?;
+    let block_index = identity.get(BLOCK_INDEX_KEY)?.as_u64()?.try_into().ok()?;
+    let native_index = identity.get(NATIVE_INDEX_KEY)?.as_u64()?.try_into().ok()?;
+    let fingerprint = identity.get(FINGERPRINT_KEY)?.as_str()?;
+    Some((block_index, native_index, fingerprint))
+}
+
+pub(crate) fn block_is_unchanged(block: &CkWireBlock, meta: &BlockMeta) -> bool {
+    meta.content_fingerprint
+        .as_deref()
+        .is_some_and(|fingerprint| decoded_block_fingerprint(block) == fingerprint)
+}
+
+fn alignment_candidate(
+    block: &CkWireBlock,
+    block_index: usize,
+    meta: &BlockMeta,
+    kind_matches: bool,
+) -> Option<bool> {
+    if let Some((origin_block_index, origin_native_index, fingerprint)) =
+        stamped_block_identity(block)
+    {
+        let origin_matches = origin_block_index == meta.block_index
+            && Some(origin_native_index) == meta.native_index
+            && meta.content_fingerprint.as_deref() == Some(fingerprint);
+        return origin_matches.then_some(true);
+    }
+
+    if kind_matches
+        && meta
+            .content_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| decoded_block_fingerprint(block) == fingerprint)
+    {
+        return Some(false);
+    }
+
+    // For sidecars written before fingerprints existed, match by position only when the block
+    // index is unchanged. This keeps old sessions readable without re-enabling the old fallback
+    // that inferred matches by scanning nearby blocks of the same kind after deletions.
+    (meta.content_fingerprint.is_none() && block_index == meta.block_index && kind_matches)
+        .then_some(false)
+}
+
 pub(crate) fn match_block_metas<'a>(
     blocks: &[CkWireBlock],
     metas: &'a [BlockMeta],
     mut matches: impl FnMut(&CkWireBlock, &BlockMeta) -> bool,
 ) -> MatchedBlockMetas<'a> {
-    let mut meta_cursor = 0;
-    let by_block = blocks
-        .iter()
-        .map(|block| {
-            let match_index = metas[meta_cursor..]
-                .iter()
-                .position(|meta| matches(block, meta))
-                .map(|offset| meta_cursor + offset);
-            if let Some(match_index) = match_index {
-                meta_cursor = match_index + 1;
-                Some(&metas[match_index])
-            } else {
-                None
+    let mut candidates = vec![vec![None; metas.len()]; blocks.len()];
+    for (block_index, block) in blocks.iter().enumerate() {
+        for (meta_index, meta) in metas.iter().enumerate() {
+            let kind_matches = matches(block, meta);
+            candidates[block_index][meta_index] =
+                alignment_candidate(block, block_index, meta, kind_matches);
+        }
+    }
+
+    // Origin indexes are stamped onto decoded blocks and survive reductions, overlays, and
+    // deletion compaction through CkWireBlock::provider_extras. The fingerprint stored beside
+    // that index is always the pre-mutation decoded fingerprint, so a mutated survivor aligns
+    // with its own native meta rather than being compared by its current bytes. The LCS-style
+    // walk preserves native order and refuses the former same-kind adjacency fallback.
+    let mut scores = vec![vec![AlignmentScore::default(); metas.len() + 1]; blocks.len() + 1];
+    for block_index in (0..blocks.len()).rev() {
+        for meta_index in (0..metas.len()).rev() {
+            let mut best =
+                scores[block_index + 1][meta_index].max(scores[block_index][meta_index + 1]);
+            if let Some(origin_match) = candidates[block_index][meta_index] {
+                best = best.max(scores[block_index + 1][meta_index + 1].with_match(origin_match));
             }
-        })
-        .collect::<Vec<_>>();
+            scores[block_index][meta_index] = best;
+        }
+    }
+
+    let mut by_block = vec![None; blocks.len()];
+    let (mut block_index, mut meta_index) = (0, 0);
+    while block_index < blocks.len() && meta_index < metas.len() {
+        if let Some(origin_match) = candidates[block_index][meta_index] {
+            let matched_score = scores[block_index + 1][meta_index + 1].with_match(origin_match);
+            if matched_score == scores[block_index][meta_index] {
+                by_block[block_index] = Some(&metas[meta_index]);
+                block_index += 1;
+                meta_index += 1;
+                continue;
+            }
+        }
+        if scores[block_index + 1][meta_index] >= scores[block_index][meta_index + 1] {
+            block_index += 1;
+        } else {
+            meta_index += 1;
+        }
+    }
+
     let retained_native_indices = by_block
         .iter()
         .filter_map(|meta| meta.and_then(|meta| meta.native_index))
@@ -205,14 +327,19 @@ pub fn meta_for_ck<'a>(
         })
 }
 
+pub(crate) fn is_synthetic_part(part: &Value) -> bool {
+    part.get("synthetic")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || part
+            .get("syntheticTodoMarker")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
 fn is_synthetic_message(meta: &HarnessMessageMeta) -> bool {
     let Some(parts) = meta.raw.get("parts").and_then(Value::as_array) else {
         return false;
     };
-    !parts.is_empty()
-        && parts.iter().all(|part| {
-            part.get("synthetic")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        })
+    !parts.is_empty() && parts.iter().all(is_synthetic_part)
 }
