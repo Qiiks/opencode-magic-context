@@ -6276,6 +6276,27 @@ impl McHandler {
                 },
                 phase => phase,
             };
+            let phase = match phase {
+                StateSyncSeedPhase::Collecting(pending)
+                    if batch_index == 0
+                        && (pending.seed_id != seed_id
+                            || pending.generation != seed_generation
+                            || pending.expected_seq != parsed.expected_shadow_seq
+                            || pending.total != batch_total) =>
+                {
+                    // A sender rebuilding after a lost acknowledgement starts a fresh
+                    // attempt at batch zero. Replace the stale collector while holding
+                    // the coordinator lock, and release its bytes before charging the
+                    // new first batch in the AwaitingSeed arm below.
+                    let stale = StateSyncSeedPhase::Collecting(pending);
+                    seeds.release_phase(&stale);
+                    StateSyncSeedPhase::AwaitingSeed {
+                        generation: seed_generation,
+                        expected_seq: parsed.expected_shadow_seq,
+                    }
+                }
+                phase => phase,
+            };
             match phase {
                 StateSyncSeedPhase::Idle => {
                     seeds.set_phase(&binding.session, StateSyncSeedPhase::Idle);
@@ -19517,6 +19538,123 @@ mod tests {
             let response = handler.dispatch_value(channel, final_page).await;
             assert!(matches!(response, HandlerOutcome::Response(_)));
         }
+    }
+
+    #[tokio::test]
+    async fn paged_state_sync_seed_replaces_stale_collector_after_lost_ack() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(state, default_test_config());
+        let session = "ses";
+
+        let mut old_first = paged_seed_batch(session, "lost-ack", 0, 0, 0, 3, vec![]);
+        old_first["user_profile"] = json!(["old first"]);
+        let mut old_second = paged_seed_batch(session, "lost-ack", 0, 0, 1, 3, vec![]);
+        old_second["user_profile"] = json!(["old second"]);
+        assert_eq!(
+            call_dispatch_request(&handler, old_first).await["next_expected_index"],
+            json!(1)
+        );
+        assert_eq!(
+            call_dispatch_request(&handler, old_second).await["next_expected_index"],
+            json!(2)
+        );
+
+        let mut replacement_first = paged_seed_batch(session, "replacement", 0, 0, 0, 3, vec![]);
+        replacement_first["user_profile"] = json!(["new first"]);
+        let replacement_first_bytes = serde_json::to_vec(&replacement_first).unwrap().len();
+        assert_eq!(
+            call_dispatch_request(&handler, replacement_first).await["next_expected_index"],
+            json!(1)
+        );
+        assert_eq!(seed_accounting(&handler).0, replacement_first_bytes);
+
+        let mut replacement_second = paged_seed_batch(session, "replacement", 0, 0, 1, 3, vec![]);
+        replacement_second["user_profile"] = json!(["new second"]);
+        let mut replacement_final = paged_seed_batch(session, "replacement", 0, 0, 2, 3, vec![]);
+        replacement_final["user_profile"] = json!(["new final"]);
+        assert_eq!(
+            call_dispatch_request(&handler, replacement_second).await["next_expected_index"],
+            json!(2)
+        );
+        let completed = call_dispatch_request(&handler, replacement_final).await;
+
+        assert_eq!(completed["shadow_seq"], json!(1));
+        assert_eq!(
+            store.load_active_user_memories().unwrap(),
+            vec!["new first", "new second", "new final"]
+        );
+        assert_eq!(seed_accounting(&handler), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn paged_state_sync_seed_full_retry_replaces_later_batch_timeout() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(state, default_test_config());
+        let session = "ses";
+
+        let mut interrupted = paged_seed_batch(session, "timed-out", 0, 0, 0, 3, vec![]);
+        interrupted["user_profile"] = json!(["interrupted"]);
+        assert_eq!(
+            call_dispatch_request(&handler, interrupted).await["next_expected_index"],
+            json!(1)
+        );
+
+        let mut retry_first = paged_seed_batch(session, "full-retry", 0, 0, 0, 2, vec![]);
+        retry_first["user_profile"] = json!(["retry first"]);
+        let mut retry_final = paged_seed_batch(session, "full-retry", 0, 0, 1, 2, vec![]);
+        retry_final["user_profile"] = json!(["retry final"]);
+        assert_eq!(
+            call_dispatch_request(&handler, retry_first).await["next_expected_index"],
+            json!(1)
+        );
+        let completed = call_dispatch_request(&handler, retry_final).await;
+
+        assert_eq!(completed["shadow_seq"], json!(1));
+        assert_eq!(
+            store.load_active_user_memories().unwrap(),
+            vec!["retry first", "retry final"]
+        );
+        assert_eq!(seed_accounting(&handler), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn paged_state_sync_seed_midstream_crossover_still_errors() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(state, default_test_config());
+        let session = "ses";
+
+        let first = paged_seed_batch(session, "active", 0, 0, 0, 4, vec![]);
+        assert_eq!(
+            call_dispatch_request(&handler, first).await["next_expected_index"],
+            json!(1)
+        );
+        let foreign_midstream = paged_seed_batch(session, "foreign", 0, 0, 3, 4, vec![]);
+
+        assert_eq!(
+            error_code(handler.dispatch_value(7, foreign_midstream).await),
+            "state_sync_seed_attempt_mismatch"
+        );
+        assert_eq!(seed_accounting(&handler), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn paged_state_sync_seed_completed_result_cache_is_unchanged() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(state, default_test_config());
+        let session = "ses";
+
+        let first = paged_seed_batch(session, "cached", 0, 0, 0, 2, vec![]);
+        let final_batch = paged_seed_batch(session, "cached", 0, 0, 1, 2, vec![]);
+        assert_eq!(
+            call_dispatch_request(&handler, first).await["next_expected_index"],
+            json!(1)
+        );
+        let completed = call_dispatch_request(&handler, final_batch.clone()).await;
+        let redriven = call_dispatch_request(&handler, final_batch).await;
+
+        assert_eq!(redriven, completed);
+        assert_eq!(store.load(session).unwrap().meta.shadow_seq, 1);
+        assert_eq!(seed_accounting(&handler), (0, 0));
     }
 
     #[tokio::test]
