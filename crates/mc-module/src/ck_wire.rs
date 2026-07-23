@@ -386,7 +386,7 @@ fn extract_file_path(input: &Value) -> Option<String> {
         .find_map(|key| obj.get(*key).and_then(Value::as_str).map(str::to_string))
 }
 
-fn fingerprint_digest(content_hash: &[u8; 32]) -> String {
+pub(crate) fn fingerprint_digest(content_hash: &[u8; 32]) -> String {
     let mut out = String::with_capacity(content_hash.len() * 2);
     for byte in content_hash {
         let _ = write!(&mut out, "{byte:02x}");
@@ -397,6 +397,23 @@ fn fingerprint_digest(content_hash: &[u8; 32]) -> String {
 pub(crate) fn fingerprint(bytes: &str) -> String {
     let content_hash: [u8; 32] = Sha256::digest(bytes.as_bytes()).into();
     fingerprint_digest(&content_hash)
+}
+
+/// Hex fingerprint + serialized length when `served` is still the projected block wire.
+///
+/// Projection stores SHA-256 of the same `serde_json::to_string(CkWireBlock)` basis that
+/// divergence attribution uses. Reuse that digest only when the served wire is still
+/// identical (including retained ingress bytes); modified/reduced/overlaid blocks must
+/// re-hash.
+pub(crate) fn fingerprint_from_projected_wire(
+    served: &CkWireBlock,
+    projected: Option<&FlatBlock>,
+) -> Option<(String, usize)> {
+    let flat = projected?;
+    if &flat.wire != served {
+        return None;
+    }
+    Some((fingerprint_digest(&flat.content_hash), flat.bytes.len()))
 }
 
 pub fn duplicate_ids(blocks: &[FlatBlock]) -> Option<String> {

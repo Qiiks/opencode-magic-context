@@ -109,6 +109,19 @@ pub struct ServedMessage {
 
 impl ServedMessage {
     fn from_message(message: CkWireMessage) -> Self {
+        Self::from_message_reusing(message, None)
+    }
+
+    /// Build a served message, reusing each projected block's retained content hash when
+    /// the served wire is still identical to that projection block.
+    ///
+    /// Divergence fingerprints hash the same serialized `CkWireBlock` basis the
+    /// projection already hashed into `FlatBlock.content_hash`. Overlaid, reduced, or
+    /// otherwise rewritten blocks fall back to a fresh serialize+hash.
+    fn from_message_reusing(
+        message: CkWireMessage,
+        projected_blocks: Option<&[&FlatBlock]>,
+    ) -> Self {
         let canonical = serde_json::to_value(&message)
             .expect("CK wire messages must always have a JSON representation");
         let canonical_bytes =
@@ -116,7 +129,21 @@ impl ServedMessage {
         let block_fingerprints = message
             .content
             .iter()
-            .map(|block| {
+            .enumerate()
+            .map(|(served_index, block)| {
+                let projected = projected_blocks.and_then(|blocks| {
+                    blocks
+                        .iter()
+                        .find(|flat| flat.block_index == served_index)
+                        .copied()
+                        .or_else(|| {
+                            // Full-drop paths compact content indexes; match by wire value.
+                            blocks.iter().copied().find(|flat| &flat.wire == block)
+                        })
+                });
+                if let Some(fp) = ck_wire::fingerprint_from_projected_wire(block, projected) {
+                    return fp;
+                }
                 let serialized = serde_json::to_string(block)
                     .expect("CK wire blocks must always have a JSON representation");
                 (ck_wire::fingerprint(&serialized), serialized.len())
@@ -4446,8 +4473,12 @@ fn pending_passthrough_messages(
     req.messages
         .iter()
         .map(|message| {
+            let blocks = blocks_by_mid
+                .get(message.mid.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             let mut rendered = message.ck.clone();
-            if let Some(blocks) = blocks_by_mid.get(message.mid.as_str()) {
+            if !blocks.is_empty() {
                 apply_tag_overlay_to_message(
                     &mut rendered,
                     message,
@@ -4457,7 +4488,7 @@ fn pending_passthrough_messages(
                     mutation_exempt_mid == Some(message.mid.as_str()),
                 );
             }
-            ServedMessage::from_message(rendered)
+            ServedMessage::from_message_reusing(rendered, (!blocks.is_empty()).then_some(blocks))
         })
         .collect()
 }
@@ -4587,16 +4618,166 @@ struct TagMintWork {
     tokenized_bytes: usize,
 }
 
+/// Monotonic scan cursor for tag minting over a retained projection sequence.
+///
+/// Keyed on each block's id + content hash so an unchanged prefix keeps its frontier
+/// across defer passes; a content or identity change anywhere before the frontier
+/// invalidates it. Frozen-target membership is part of the decision key because an
+/// unfreeze can make a previously skipped block mintable again.
+#[derive(Debug, Clone, Default)]
+struct TagMintFrontierMemo {
+    block_keys: Vec<[u8; 32]>,
+    frozen_key: [u8; 32],
+    /// Identity of the tag-id set the frontier assumed was durable. A rejected pass
+    /// never commits its speculative mints, so the next load sees a different set and
+    /// the memo invalidates instead of skipping untagged blocks.
+    tagged_key: [u8; 32],
+    /// First index that may still need a mint decision for the retained sequence.
+    frontier: usize,
+    /// Candidate count for blocks strictly before `frontier` (matches a full scan).
+    candidates_before_frontier: usize,
+}
+
+fn tag_mint_block_key(block: &FlatBlock) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(block.id.as_bytes());
+    hasher.update(block.content_hash);
+    hasher.finalize().into()
+}
+
+fn tag_mint_id_set_key<'a>(ids: impl IntoIterator<Item = &'a str>) -> [u8; 32] {
+    let mut sorted = ids.into_iter().collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mut hasher = Sha256::new();
+    for id in sorted {
+        hasher.update(id.as_bytes());
+        hasher.update([0]);
+    }
+    hasher.finalize().into()
+}
+
+fn tag_mint_frozen_key(frozen: &HashSet<String>) -> [u8; 32] {
+    tag_mint_id_set_key(frozen.iter().map(String::as_str))
+}
+
+/// A block is resolved for frontier purposes when it will not receive a new mint
+/// under the current frozen set: already tagged, frozen-reduced, or not taggable.
+/// Mutation-exempt mids are temporary and do not advance the frontier past them.
+fn tag_mint_block_resolved(
+    block: &FlatBlock,
+    frozen: &HashSet<String>,
+    existing_tag_ids: &HashSet<&str>,
+) -> bool {
+    existing_tag_ids.contains(block.id.as_str())
+        || frozen.contains(block.id.as_str())
+        || taggable_source(block).is_none()
+}
+
+fn tag_mint_frontier_start(
+    projection: &FlatProjection,
+    frozen: &HashSet<String>,
+    existing_tag_ids: &HashSet<&str>,
+    memo: Option<&TagMintFrontierMemo>,
+) -> Option<(usize, usize)> {
+    let memo = memo?;
+    if memo.frozen_key != tag_mint_frozen_key(frozen) {
+        return None;
+    }
+    if memo.tagged_key != tag_mint_id_set_key(existing_tag_ids.iter().copied()) {
+        return None;
+    }
+    let limit = memo
+        .frontier
+        .min(memo.block_keys.len())
+        .min(projection.blocks.len());
+    for (index, block) in projection.blocks.iter().take(limit).enumerate() {
+        if memo.block_keys.get(index).copied() != Some(tag_mint_block_key(block)) {
+            return None;
+        }
+    }
+    Some((limit, memo.candidates_before_frontier))
+}
+
+fn tag_mint_count_candidates_before(
+    projection: &FlatProjection,
+    frozen: &HashSet<String>,
+    existing_tag_ids: &HashSet<&str>,
+    end: usize,
+) -> usize {
+    let mut count = 0usize;
+    for block in projection.blocks.iter().take(end) {
+        if frozen.contains(block.id.as_str()) {
+            continue;
+        }
+        if existing_tag_ids.contains(block.id.as_str()) || taggable_source(block).is_some() {
+            count = count.saturating_add(1);
+        }
+    }
+    count
+}
+
+fn tag_mint_frontier_store(
+    memo: &mut TagMintFrontierMemo,
+    projection: &FlatProjection,
+    frozen: &HashSet<String>,
+    existing_tag_ids: &HashSet<&str>,
+    newly_minted: &HashSet<&str>,
+) {
+    memo.block_keys = projection.blocks.iter().map(tag_mint_block_key).collect();
+    memo.frozen_key = tag_mint_frozen_key(frozen);
+    // Assume this pass's mints become durable. If the commit is rejected, the next
+    // load's existing tag set diverges from tagged_key and the frontier is ignored.
+    let mut tagged = existing_tag_ids.clone();
+    for id in newly_minted {
+        tagged.insert(*id);
+    }
+    memo.tagged_key = tag_mint_id_set_key(tagged.iter().copied());
+    memo.frontier = projection
+        .blocks
+        .iter()
+        .position(|block| !tag_mint_block_resolved(block, frozen, &tagged))
+        .unwrap_or(projection.blocks.len());
+    memo.candidates_before_frontier =
+        tag_mint_count_candidates_before(projection, frozen, &tagged, memo.frontier);
+}
+
+#[cfg(test)]
 fn tag_mint_inputs(
     projection: &FlatProjection,
     core: &CoreState,
     mutation_exempt_mid: Option<&str>,
     existing_tag_ids: &HashSet<&str>,
 ) -> TagMintWork {
+    tag_mint_inputs_from(
+        projection,
+        core,
+        mutation_exempt_mid,
+        existing_tag_ids,
+        None,
+    )
+}
+
+fn tag_mint_inputs_from(
+    projection: &FlatProjection,
+    core: &CoreState,
+    mutation_exempt_mid: Option<&str>,
+    existing_tag_ids: &HashSet<&str>,
+    frontier_memo: Option<&mut TagMintFrontierMemo>,
+) -> TagMintWork {
     let frozen = frozen_red_targets(core);
-    let mut work = TagMintWork::default();
-    for block in &projection.blocks {
-        if frozen.contains(&block.id) || mutation_exempt_mid == Some(block.mid.as_str()) {
+    let (start, prefix_candidates) = tag_mint_frontier_start(
+        projection,
+        &frozen,
+        existing_tag_ids,
+        frontier_memo.as_deref(),
+    )
+    .unwrap_or((0, 0));
+    let mut work = TagMintWork {
+        candidate_count: prefix_candidates,
+        ..TagMintWork::default()
+    };
+    for block in projection.blocks.iter().skip(start) {
+        if frozen.contains(block.id.as_str()) || mutation_exempt_mid == Some(block.mid.as_str()) {
             continue;
         }
         if existing_tag_ids.contains(block.id.as_str()) {
@@ -4615,7 +4796,22 @@ fn tag_mint_inputs(
             source_bytes: source.as_bytes().to_vec(),
         });
     }
+    if let Some(memo) = frontier_memo {
+        let newly_minted = work
+            .inputs
+            .iter()
+            .map(|input| input.block_id.as_str())
+            .collect::<HashSet<_>>();
+        tag_mint_frontier_store(memo, projection, &frozen, existing_tag_ids, &newly_minted);
+    }
     work
+}
+
+/// Process-wide per-session mint frontier. Invalidated when the retained projection
+/// prefix or frozen-target set no longer matches the memoized sequence identity.
+fn tag_mint_frontier_cache() -> &'static Mutex<HashMap<String, TagMintFrontierMemo>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, TagMintFrontierMemo>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn append_tag_mint_rows(
@@ -5178,7 +5374,26 @@ fn compute_active_overlay_decisions(
             .iter()
             .map(|row| row.block_id.as_str())
             .collect::<HashSet<_>>();
-        tag_mint_inputs(projection, core, mutation_exempt_mid, &existing_tag_ids)
+        // Snapshot the session frontier outside the tokenizer walk so a slow mint
+        // does not hold the process-wide cache lock.
+        let mut memo = tag_mint_frontier_cache()
+            .lock()
+            .expect("tag mint frontier cache mutex")
+            .get(&req.session_id)
+            .cloned()
+            .unwrap_or_default();
+        let work = tag_mint_inputs_from(
+            projection,
+            core,
+            mutation_exempt_mid,
+            &existing_tag_ids,
+            Some(&mut memo),
+        );
+        tag_mint_frontier_cache()
+            .lock()
+            .expect("tag mint frontier cache mutex")
+            .insert(req.session_id.clone(), memo);
+        work
     };
     let tag_mint_candidates = tag_mint_work.candidate_count;
     let tag_mint_tokenized_bytes = tag_mint_work.tokenized_bytes;
@@ -7315,7 +7530,13 @@ fn build_output_with_tags_inner(
                         &mut rendered,
                     );
                 }
-                (Some(ServedMessage::from_message(rendered)), false)
+                (
+                    Some(ServedMessage::from_message_reusing(
+                        rendered,
+                        (!blocks.is_empty()).then_some(blocks),
+                    )),
+                    false,
+                )
             } else {
                 (None, false)
             };
@@ -8716,6 +8937,162 @@ mod tests {
         let mut wire = serde_json::to_value(response).unwrap();
         wire.as_object_mut().unwrap().remove("timings");
         wire
+    }
+
+    fn assert_same_tag_mint_work(left: &TagMintWork, right: &TagMintWork) {
+        assert_eq!(left.candidate_count, right.candidate_count);
+        assert_eq!(left.tokenized_bytes, right.tokenized_bytes);
+        assert_eq!(left.inputs.len(), right.inputs.len());
+        for (a, b) in left.inputs.iter().zip(right.inputs.iter()) {
+            assert_eq!(a.block_id, b.block_id);
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.token_count, b.token_count);
+            assert_eq!(a.source_bytes, b.source_bytes);
+        }
+    }
+
+    /// Projection content_hash reuse and tag-mint frontier scanning must not change
+    /// served bytes or divergence attribution rows versus the prior full-rehash /
+    /// full-scan algorithms.
+    #[test]
+    fn parked_p2_fingerprint_reuse_and_tag_frontier_match_baseline() {
+        // --- unit: fingerprint reuse vs forced rehash on a mixed message ---
+        let multi = wire_item("user", "multi", 0, &["alpha", "beta"]);
+        let multi_proj = project_messages(std::slice::from_ref(&multi)).unwrap();
+        let multi_blocks: Vec<&FlatBlock> = multi_proj.blocks.iter().collect();
+        let mut multi_rendered = multi.ck.clone();
+        // Overlay only the second text block so the first stays projection-identical.
+        if let ck_wire::CkKind::Text { text } = &mut multi_rendered.content[1].kind {
+            *text = format!("\u{a7}2\u{a7} {text}");
+        }
+        multi_rendered.content[1].mark_modified();
+        multi_rendered.mark_modified();
+
+        let reused =
+            ServedMessage::from_message_reusing(multi_rendered.clone(), Some(&multi_blocks));
+        let baseline = ServedMessage::from_message(multi_rendered);
+        assert_eq!(
+            reused.block_fingerprints.as_ref(),
+            baseline.block_fingerprints.as_ref(),
+            "projection hash reuse must yield the same divergence fingerprints"
+        );
+        assert_eq!(
+            reused.canonical_bytes.as_ref(),
+            baseline.canonical_bytes.as_ref(),
+            "canonical served bytes must stay identical under hash reuse"
+        );
+        // First block must actually hit the reuse path (same digest as FlatBlock).
+        assert_eq!(
+            reused.block_fingerprints[0].0,
+            ck_wire::fingerprint_digest(&multi_blocks[0].content_hash)
+        );
+        assert_ne!(
+            reused.block_fingerprints[1].0,
+            ck_wire::fingerprint_digest(&multi_blocks[1].content_hash),
+            "overlaid block must re-hash rather than reuse the pre-overlay digest"
+        );
+
+        // --- unit: tag-mint frontier memo vs full scan across append-only passes ---
+        let mut memo = TagMintFrontierMemo::default();
+        let core = CoreState::default();
+        let pass1 = project_messages(&[
+            wire_item("user", "t0", 0, &["first"]),
+            wire_item("assistant", "t1", 1, &["second"]),
+        ])
+        .unwrap();
+        let empty_tags: HashSet<&str> = HashSet::new();
+        let full1 = tag_mint_inputs(&pass1, &core, None, &empty_tags);
+        let memo1 = tag_mint_inputs_from(&pass1, &core, None, &empty_tags, Some(&mut memo));
+        assert_same_tag_mint_work(&memo1, &full1);
+        assert!(memo.frontier > 0);
+
+        let owned_ids: Vec<String> = full1.inputs.iter().map(|i| i.block_id.clone()).collect();
+        let existing: HashSet<&str> = owned_ids.iter().map(String::as_str).collect();
+
+        let pass2 = project_messages(&[
+            wire_item("user", "t0", 0, &["first"]),
+            wire_item("assistant", "t1", 1, &["second"]),
+            wire_item("user", "t2", 2, &["third append"]),
+        ])
+        .unwrap();
+        let full2 = tag_mint_inputs(&pass2, &core, None, &existing);
+        let memo2 = tag_mint_inputs_from(&pass2, &core, None, &existing, Some(&mut memo));
+        assert_same_tag_mint_work(&memo2, &full2);
+        assert_eq!(memo2.inputs.len(), 1, "only the appended block mints");
+
+        // --- e2e: tags + divergence-active mixed fixture ---
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "p2-fingerprints-frontier";
+        let bootstrap = active_cc_req(
+            session,
+            "cfg0",
+            vec![
+                wire_item("user", "m0", 0, &["plan the work"]),
+                wire_item("assistant", "m1", 1, &["working on it"]),
+            ],
+        );
+        let first = run(&store, &bootstrap, &spine());
+        assert_eq!(first.surface_state, SurfaceState::Transition);
+        assert!(first.first_divergence.is_none());
+
+        let active = active_cc_req(
+            session,
+            "cfg0",
+            vec![
+                wire_item("user", "m0", 0, &["plan the work"]),
+                wire_item("assistant", "m1", 1, &["working on it"]),
+                wire_item("user", "m2", 2, &["continue with details"]),
+            ],
+        );
+        let second = run(&store, &active, &spine());
+        assert_eq!(second.surface_state, SurfaceState::Active);
+        let joined = serde_json::to_string(second.messages()).unwrap();
+        assert!(
+            joined.contains("\u{a7}1\u{a7}"),
+            "active tagging must prefix served text: {joined}"
+        );
+
+        // Stable defer: no divergence, tags retained, output byte-stable.
+        let stable = run(&store, &active, &spine());
+        assert!(stable.first_divergence.is_none());
+        assert_eq!(
+            serde_json::to_value(stable.messages()).unwrap(),
+            serde_json::to_value(second.messages()).unwrap()
+        );
+
+        // Divergence-active rewrite of a middle message.
+        let diverged = active_cc_req(
+            session,
+            "cfg0",
+            vec![
+                wire_item("user", "m0", 0, &["plan the work"]),
+                wire_item("assistant", "m1", 1, &["CHANGED middle content"]),
+                wire_item("user", "m2", 2, &["continue with details"]),
+            ],
+        );
+        let third = run(&store, &diverged, &spine());
+        let row = third
+            .first_divergence
+            .as_ref()
+            .expect("middle content change must attribute");
+        assert_eq!(row.kind, divergence::DivergenceKind::ContentChanged);
+        assert_eq!(row.block_id_old.as_deref(), Some("m1"));
+        assert_eq!(row.block_id_new.as_deref(), Some("m1"));
+
+        // Fingerprints stored for the diverged pass match a forced-rehash rebuild of
+        // the same served messages (proves attribution rows stay on the same basis).
+        let loaded = store.load(session).unwrap();
+        let forced_messages: Vec<ServedMessage> = third
+            .messages()
+            .iter()
+            .map(|m| ServedMessage::from_message(std::ops::Deref::deref(m).clone()))
+            .collect();
+        let forced_fps = served_output_fingerprints(&forced_messages);
+        assert_eq!(
+            forced_fps, loaded.meta.served_output_fingerprint,
+            "stored divergence fingerprints must match forced re-hash of served output"
+        );
     }
 
     fn synthetic_text(r: &TransformResponse, index: usize) -> &str {
