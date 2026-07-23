@@ -2168,6 +2168,10 @@ pub struct HistorianDurableState {
     /// block, so the skip branch must be readable from the state dump. Cleared on fire.
     #[serde(default)]
     pub last_no_fire: Option<String>,
+    /// Consecutive failures on the historian publication path. This is diagnostic-only
+    /// state: it makes repeated fence/outbox failures visible without affecting bytes.
+    #[serde(default)]
+    pub consecutive_publish_failures: u32,
 }
 
 impl Default for HistorianDurableState {
@@ -2185,6 +2189,7 @@ impl Default for HistorianDurableState {
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
+            consecutive_publish_failures: 0,
         }
     }
 }
@@ -2411,6 +2416,11 @@ pub struct ModuleUsage {
     pub current_total_input_tokens: u64,
     #[serde(default)]
     pub context_limit_tokens: u64,
+    /// Host final-wire estimate used only to clear an already armed emergency latch.
+    #[serde(default)]
+    pub final_wire_input_tokens: u64,
+    #[serde(default)]
+    pub final_wire_trusted: bool,
 }
 
 impl ModuleUsage {
@@ -8005,6 +8015,26 @@ impl McStore {
         failure_backoff_at_ms: Option<i64>,
         detail: Option<&str>,
     ) -> Result<Option<u64>, McStoreError> {
+        self.abandon_historian_run_if_matching_with_publish_failure(
+            session_id,
+            predicate,
+            failure_backoff_at_ms,
+            detail,
+            false,
+        )
+    }
+
+    /// Release a matching run and optionally record a failed publish attempt.
+    /// Publication errors can occur after the producer succeeded, so this counter
+    /// lives with the durable historian state rather than producer diagnostics.
+    pub fn abandon_historian_run_if_matching_with_publish_failure(
+        &self,
+        session_id: &str,
+        predicate: &HistorianPublishPredicate,
+        failure_backoff_at_ms: Option<i64>,
+        detail: Option<&str>,
+        count_publish_failure: bool,
+    ) -> Result<Option<u64>, McStoreError> {
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
                 .query_row(
@@ -8047,6 +8077,11 @@ impl McStore {
                 firing_seq: historian.firing_seq,
                 failure_backoff_at_ms,
                 last_failure,
+                consecutive_publish_failures: if count_publish_failure {
+                    historian.consecutive_publish_failures.saturating_add(1)
+                } else {
+                    historian.consecutive_publish_failures
+                },
                 ..HistorianDurableState::default()
             };
             let next = current.max(0) as u64 + 1;
@@ -8062,6 +8097,59 @@ impl McStore {
             Ok(AbandonHistorianTxnOutcome::Committed(next))
         })?;
 
+        match outcome {
+            AbandonHistorianTxnOutcome::Unchanged => Ok(None),
+            AbandonHistorianTxnOutcome::Committed(row_version) => Ok(Some(row_version)),
+            AbandonHistorianTxnOutcome::Serde(error) => Err(McStoreError::Serde(error)),
+        }
+    }
+
+    /// Increment publication health without changing the in-flight state. This covers
+    /// failures before a publish transaction can safely abandon the producer run, such
+    /// as side-channel outbox preparation errors.
+    pub fn record_historian_publish_failure_if_matching(
+        &self,
+        session_id: &str,
+        predicate: &HistorianPublishPredicate,
+    ) -> Result<Option<u64>, McStoreError> {
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            let row = tx
+                .query_row(
+                    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
+                    params![session_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let Some((current, meta_json)) = row else {
+                return Ok(AbandonHistorianTxnOutcome::Unchanged);
+            };
+            let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
+                Ok(meta) => meta,
+                Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
+            };
+            let historian = &meta.historian;
+            let predicate_matches = historian.firing_seq == predicate.firing_seq
+                && historian.producer_run_id.as_deref() == Some(predicate.producer_run_id.as_str())
+                && historian.chunk_fingerprint == predicate.chunk_fingerprint
+                && historian.selected_range_identities == predicate.selected_range_identities;
+            if !predicate_matches {
+                return Ok(AbandonHistorianTxnOutcome::Unchanged);
+            }
+            meta.historian.consecutive_publish_failures = meta
+                .historian
+                .consecutive_publish_failures
+                .saturating_add(1);
+            let next = current.max(0) as u64 + 1;
+            let meta_json = match serde_json::to_string(&meta) {
+                Ok(json) => json,
+                Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
+            };
+            tx.execute(
+                "UPDATE mc_cache_state SET row_version = ?2, meta = ?3 WHERE session_id = ?1 AND row_version = ?4",
+                params![session_id, next as i64, meta_json, current],
+            )?;
+            Ok(AbandonHistorianTxnOutcome::Committed(next))
+        })?;
         match outcome {
             AbandonHistorianTxnOutcome::Unchanged => Ok(None),
             AbandonHistorianTxnOutcome::Committed(row_version) => Ok(Some(row_version)),
@@ -14952,9 +15040,52 @@ mod tests {
                 failure_backoff_at_ms: Some(456),
                 last_failure: None,
                 last_no_fire: None,
+                consecutive_publish_failures: 0,
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn historian_publish_failure_counter_accumulates_and_success_state_resets() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(directory.path())).unwrap();
+        let predicate = publish_predicate();
+        let mut meta = publishing_meta();
+        store
+            .commit("publish-health", None, &CoreState::default(), &meta)
+            .unwrap();
+
+        for expected_failures in 1..=3 {
+            let loaded = store.load("publish-health").unwrap();
+            meta = publishing_meta();
+            meta.historian.consecutive_publish_failures =
+                loaded.meta.historian.consecutive_publish_failures;
+            store
+                .commit("publish-health", loaded.row_version, &loaded.core, &meta)
+                .unwrap();
+            store
+                .abandon_historian_run_if_matching_with_publish_failure(
+                    "publish-health",
+                    &predicate,
+                    None,
+                    Some("publication failed"),
+                    true,
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .load("publish-health")
+                    .unwrap()
+                    .meta
+                    .historian
+                    .consecutive_publish_failures,
+                expected_failures,
+            );
+        }
+
+        let successful = idle_historian_after_success(predicate.firing_seq);
+        assert_eq!(successful.consecutive_publish_failures, 0);
     }
 
     fn publish_predicate() -> HistorianPublishPredicate {

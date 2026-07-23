@@ -25,6 +25,7 @@ import { writeRustTransformDecision } from "../../features/magic-context/transfo
 import type { ContextUsage } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
 import { resolveCtxReduceAvailability } from "./ctx-reduce-availability";
+import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     resolveExecuteThreshold,
@@ -821,7 +822,7 @@ function buildTransformBody(args: {
     input: unknown[];
     nativeMessages: unknown[];
     passInputs: Record<string, unknown>;
-    usage: Record<string, number>;
+    usage: Record<string, number | boolean>;
     modelKey: string | null;
     providerId: string | null;
     systemPromptHash: string;
@@ -1447,6 +1448,19 @@ export function createRustModeTransform(
                     fingerprint: `${ckFingerprint}|${nativeFingerprint}`,
                 };
             })();
+            // Final-wire estimation is only needed while the host's durable overflow
+            // latch is armed. It can then clear that latch, never arm one, so normal
+            // large-payload passes avoid an unnecessary full-wire tokenization.
+            const finalWireEstimate =
+                passInputs.emergency_recovery_armed === true
+                    ? estimateFinalWireInputTokens({
+                          messages,
+                          systemPromptTokens: sessionMeta.systemPromptTokens,
+                          providerID: model?.providerID,
+                          modelID: model?.modelID,
+                          agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                      })
+                    : undefined;
             let body = buildTransformBody({
                 sessionId,
                 input: encodedInput,
@@ -1460,7 +1474,11 @@ export function createRustModeTransform(
                       }
                     : undefined,
                 passInputs,
-                usage: passUsage(usage, contextLimit),
+                usage: {
+                    ...passUsage(usage, contextLimit),
+                    final_wire_input_tokens: finalWireEstimate?.tokens ?? 0,
+                    final_wire_trusted: finalWireEstimate?.trusted === true,
+                },
                 modelKey: modelKey ?? null,
                 providerId: model?.providerID ?? null,
                 systemPromptHash: sessionMeta.systemPromptHash ?? "",
@@ -1526,7 +1544,11 @@ export function createRustModeTransform(
                     nativeMessages: messages,
                     fullArrayFingerprint: pendingWireCache.fingerprint,
                     passInputs,
-                    usage: passUsage(usage, contextLimit),
+                    usage: {
+                        ...passUsage(usage, contextLimit),
+                        final_wire_input_tokens: finalWireEstimate?.tokens ?? 0,
+                        final_wire_trusted: finalWireEstimate?.trusted === true,
+                    },
                     modelKey: modelKey ?? null,
                     providerId: model?.providerID ?? null,
                     systemPromptHash: sessionMeta.systemPromptHash ?? "",
@@ -1636,7 +1658,11 @@ export function createRustModeTransform(
                         nativeMessages: messages,
                         fullArrayFingerprint: pendingWireCache.fingerprint,
                         passInputs,
-                        usage: passUsage(usage, contextLimit),
+                        usage: {
+                            ...passUsage(usage, contextLimit),
+                            final_wire_input_tokens: finalWireEstimate?.tokens ?? 0,
+                            final_wire_trusted: finalWireEstimate?.trusted === true,
+                        },
                         modelKey: modelKey ?? null,
                         providerId: model?.providerID ?? null,
                         systemPromptHash: sessionMeta.systemPromptHash ?? "",

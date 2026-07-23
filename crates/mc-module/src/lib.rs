@@ -4248,6 +4248,12 @@ impl McHandler {
             "inactive"
         };
         let historian = historian_status_summary(&loaded.meta.historian);
+        let consecutive_publish_failures = loaded.meta.historian.consecutive_publish_failures;
+        let publish_health = if consecutive_publish_failures >= 3 {
+            format!("publish health degraded: {consecutive_publish_failures} consecutive failures")
+        } else {
+            format!("publish failures: {consecutive_publish_failures}")
+        };
         // When the Rust module is active, it manages the frozen m0 in its own store
         // instead of the harness SQLite cache. Report the exact session-history slice so
         // status attribution does not estimate size by summing all raw-history p1 rows.
@@ -4303,7 +4309,7 @@ impl McHandler {
             .then(|| now_ms().saturating_sub(loaded.meta.m1_pending_since_ms.unwrap_or(now_ms())));
         let summary = sanitize_status_text(
             &format!(
-                "session {short_session} (last active {age}): {} {}, coverage ordinal {coverage}, boundary {boundary}, {} pending {}, {} {}, pending m1 delta {}, last historian: {historian}, surface {surface}",
+                "session {short_session} (last active {age}): {} {}, coverage ordinal {coverage}, boundary {boundary}, {} pending {}, {} {}, pending m1 delta {}, last historian: {historian}, {publish_health}, surface {surface}",
                 compartment_count,
                 plural_word(compartment_count, "compartment"),
                 pending_drop_count,
@@ -4330,6 +4336,10 @@ impl McHandler {
             "pending_drop_count": pending_drop_count,
             "pending_m1_delta": pending_m1_delta,
             "pending_m1_age_ms": pending_m1_age_ms,
+            "historian": {
+                "consecutive_publish_failures": consecutive_publish_failures,
+                "publish_health_degraded": consecutive_publish_failures >= 3,
+            },
             // Keep the current-pass attribution separate from the explicitly historical
             // `last_divergence` field so stable status reads cannot imply a fresh bust.
             "pass_trace": pass_trace,
@@ -10413,6 +10423,8 @@ mod tests {
         let tiny = ModuleUsage {
             current_total_input_tokens: 50_000,
             context_limit_tokens: 500,
+            final_wire_input_tokens: 0,
+            final_wire_trusted: false,
         };
         let (limit, _, pct) = usage_numbers(Some(&tiny));
         assert_eq!(limit, 200_000.0);
@@ -10421,6 +10433,8 @@ mod tests {
         let ok = ModuleUsage {
             current_total_input_tokens: 133_000,
             context_limit_tokens: 167_000,
+            final_wire_input_tokens: 0,
+            final_wire_trusted: false,
         };
         let (limit, _, pct) = usage_numbers(Some(&ok));
         assert_eq!(limit, 167_000.0);
@@ -10429,6 +10443,8 @@ mod tests {
         let one_m = ModuleUsage {
             current_total_input_tokens: 800_000,
             context_limit_tokens: 1_000_000,
+            final_wire_input_tokens: 0,
+            final_wire_trusted: false,
         };
         let (limit, _, pct) = usage_numbers(Some(&one_m));
         assert_eq!(limit, 1_000_000.0);
@@ -11912,6 +11928,7 @@ mod tests {
             "usage": ModuleUsage {
                 current_total_input_tokens,
                 context_limit_tokens,
+                ..ModuleUsage::default()
             },
             "messages": messages,
         })
@@ -12813,6 +12830,7 @@ mod tests {
                 failure_backoff_at_ms: None,
                 last_failure: None,
                 last_no_fire: None,
+                consecutive_publish_failures: 0,
             },
             ..Default::default()
         };
@@ -13494,7 +13512,7 @@ mod tests {
                 "serializer_profile": "owned-llmrunner",
                 "session_id": key_a,
                 "render_config": "cfg0",
-                "usage": ModuleUsage { current_total_input_tokens: 1, context_limit_tokens: 100 },
+                "usage": ModuleUsage { current_total_input_tokens: 1, context_limit_tokens: 100, ..ModuleUsage::default() },
                 "messages": [ck("a1", 1, "raw a"), ck("a2", 2, "tail a")],
             }),
         )
@@ -13508,7 +13526,7 @@ mod tests {
                 "serializer_profile": "owned-llmrunner",
                 "session_id": key_b,
                 "render_config": "cfg0",
-                "usage": ModuleUsage { current_total_input_tokens: 1, context_limit_tokens: 100 },
+                "usage": ModuleUsage { current_total_input_tokens: 1, context_limit_tokens: 100, ..ModuleUsage::default() },
                 "messages": [ck("b1", 1, "raw b"), ck("b2", 2, "tail b")],
             }),
         )
@@ -13527,7 +13545,7 @@ mod tests {
                 "serializer_profile": "owned-llmrunner",
                 "session_id": suffix_key,
                 "render_config": "cfg0",
-                "usage": ModuleUsage { current_total_input_tokens: 1, context_limit_tokens: 100 },
+                "usage": ModuleUsage { current_total_input_tokens: 1, context_limit_tokens: 100, ..ModuleUsage::default() },
                 "messages": [ck("s1", 1, "not a child producer session")],
             }),
         )
@@ -15578,6 +15596,43 @@ mod tests {
             status["compartment_tokens"],
             json!(mc_tokenizer::estimate_tokens(&history))
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_status_surfaces_publish_failure_health_and_reset() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        call_transform_request(&handler, request(vec![ck("m1", 1, "hello")])).await;
+
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta;
+        meta.historian.consecutive_publish_failures = 3;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let degraded = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
+        ));
+        assert_eq!(degraded["historian"]["consecutive_publish_failures"], 3);
+        assert_eq!(degraded["historian"]["publish_health_degraded"], true);
+        assert!(degraded["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("publish health degraded"));
+
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta;
+        meta.historian.consecutive_publish_failures = 0;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let recovered = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
+        ));
+        assert_eq!(recovered["historian"]["consecutive_publish_failures"], 0);
+        assert_eq!(recovered["historian"]["publish_health_degraded"], false);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -18323,6 +18378,7 @@ mod tests {
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
+            consecutive_publish_failures: 0,
         };
         store
             .commit("ses", loaded.row_version, &loaded.core, &meta)
@@ -18353,6 +18409,7 @@ mod tests {
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
+            consecutive_publish_failures: 0,
         };
         store
             .commit("ses", loaded.row_version, &loaded.core, &meta)

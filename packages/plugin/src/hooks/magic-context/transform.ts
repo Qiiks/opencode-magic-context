@@ -4,6 +4,14 @@ import {
     resolveProjectIdentityForSession,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
+import {
+    checksumAuthoritySeedRows,
+    drainAuthority,
+    ensureContextStoreUuid,
+    getAuthorityManagedMarker,
+    type AuthorityModuleClient,
+} from "../../features/magic-context/context-authority";
+import { bumpProjectMemoryEpoch } from "../../features/magic-context/storage-project-state";
 import { scheduleReconciliation } from "../../features/magic-context/message-index-async";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import { parseCacheTtl } from "../../features/magic-context/scheduler";
@@ -47,7 +55,7 @@ import type { ContextUsage, SchedulerDecision } from "../../features/magic-conte
 import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
-import { sessionLog } from "../../shared/logger";
+import { log, sessionLog } from "../../shared/logger";
 import { getSdkContextLimit } from "../../shared/models-dev-cache";
 import { applyMidTurnDeferral, detectMidTurnBypassReason } from "./boundary-execution";
 import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
@@ -285,6 +293,156 @@ function findNewestUserModel(
     return null;
 }
 
+type TsAuthorityRecoveryOutcome = "completed" | "retryable";
+
+const tsAuthorityRecoveryStateByProject = new Map<string, "running" | "complete">();
+const tsAuthorityMismatchLoggedProjects = new Set<string>();
+const tsAuthorityUnreachableLoggedProjects = new Set<string>();
+
+function authorityModuleForProject(
+    module: RustModeModuleClient,
+    projectRoot: string,
+): AuthorityModuleClient {
+    if (!module.authorityStatus || !module.authorityDrain || !module.mirrorPull) {
+        throw new Error(
+            "the module does not expose authority.status, authority.drain, and mirror.pull",
+        );
+    }
+    return {
+        authorityStatus: (request) => module.authorityStatus!({ ...request, projectRoot }),
+        authorityPrepare: (request) => {
+            if (!module.authorityPrepare) {
+                throw new Error("the module does not expose authority.prepare");
+            }
+            return module.authorityPrepare({ ...request, projectRoot });
+        },
+        authorityDrain: (request) => module.authorityDrain!({ ...request, projectRoot }),
+        mirrorPull: (request) => module.mirrorPull!({ ...request, projectRoot }),
+    };
+}
+
+/**
+ * Restore a project to TypeScript ownership after its transform_mode setting no
+ * longer selects Rust. The durable marker keeps writes fenced until the module
+ * confirms every module-owned domain has drained back through its normal protocol.
+ */
+export async function recoverTsAuthorityProject(args: {
+    db: ContextDatabase;
+    projectPath: string;
+    projectRoot: string;
+    module: RustModeModuleClient;
+}): Promise<TsAuthorityRecoveryOutcome> {
+    const module = authorityModuleForProject(args.module, args.projectRoot);
+    const domains = ["memories", "notes"] as const;
+    const statuses = await Promise.all(
+        domains.map(async (domain) => ({
+            domain,
+            authority: (
+                await module.authorityStatus({
+                    context_store_uuid: ensureContextStoreUuid(args.db),
+                    project: args.projectPath,
+                    domain,
+                })
+            ).authority,
+        })),
+    );
+
+    let drainedDomain = false;
+    for (const { domain, authority } of statuses) {
+        if (!authority || authority.state === "TS") continue;
+        // The module's begin route owns MODULE → DRAINING. Calling drainAuthority
+        // preserves the lease, mirror replay, checksum, and recovery choreography.
+        if (authority.state !== "MODULE" && authority.state !== "DRAINING") {
+            return "retryable";
+        }
+        let drained: Awaited<ReturnType<typeof drainAuthority>> | undefined;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            drained = await drainAuthority({
+                db: args.db,
+                projectPath: args.projectPath,
+                domain,
+                module,
+                checksum: () => {
+                    const table = domain === "memories" ? "memories" : "notes";
+                    const rows = args.db
+                        .prepare(
+                            `SELECT * FROM ${table} WHERE project_path = ? ORDER BY id ASC`,
+                        )
+                        .all(args.projectPath)
+                        .filter(
+                            (row): row is Record<string, unknown> =>
+                                row !== null && typeof row === "object",
+                        );
+                    return checksumAuthoritySeedRows(rows);
+                },
+            });
+            if (!("code" in drained)) break;
+        }
+        if (!drained || "code" in drained) return "retryable";
+        drainedDomain = true;
+    }
+
+    // drainAuthority removes the shared marker only after every domain is TS.
+    // After a completed replay, bump the project memory epoch once so the memory
+    // view re-renders any changes mirrored during recovery.
+    if (drainedDomain && !getAuthorityManagedMarker(args.db, args.projectPath)) {
+        bumpProjectMemoryEpoch(args.db, args.projectPath);
+        return "completed";
+    }
+    return "retryable";
+}
+
+function scheduleTsAuthorityRecovery(args: {
+    db: ContextDatabase;
+    projectPath: string;
+    projectRoot: string;
+    module?: RustModeModuleClient;
+}): void {
+    if (!getAuthorityManagedMarker(args.db, args.projectPath)) return;
+    if (tsAuthorityRecoveryStateByProject.has(args.projectPath)) return;
+
+    if (!tsAuthorityMismatchLoggedProjects.has(args.projectPath)) {
+        tsAuthorityMismatchLoggedProjects.add(args.projectPath);
+        log(
+            `[magic-context] project ${args.projectPath} is module-authority-managed but transform_mode is TS; draining authority back to TypeScript`,
+        );
+    }
+    if (!args.module) {
+        tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
+        if (!tsAuthorityUnreachableLoggedProjects.has(args.projectPath)) {
+            tsAuthorityUnreachableLoggedProjects.add(args.projectPath);
+            log(
+                `[magic-context] authority recovery for ${args.projectPath} cannot reach subc; writes remain fenced. Run magic-context doctor drain-authority ${args.projectRoot} with rust mode or restore subc connectivity.`,
+            );
+        }
+        return;
+    }
+
+    tsAuthorityRecoveryStateByProject.set(args.projectPath, "running");
+    void Promise.resolve()
+        .then(() => recoverTsAuthorityProject({ ...args, module: args.module! }))
+        .then((outcome) => {
+            if (outcome === "completed") {
+                tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
+                log(`[magic-context] authority drain complete for project ${args.projectPath}`);
+            } else {
+                // A bounded contention result is durable and resumable. Do not cache it
+                // so the next project setup can resume the module's DRAINING state.
+                tsAuthorityRecoveryStateByProject.delete(args.projectPath);
+            }
+        })
+        .catch((error) => {
+            tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
+            if (!tsAuthorityUnreachableLoggedProjects.has(args.projectPath)) {
+                tsAuthorityUnreachableLoggedProjects.add(args.projectPath);
+                log(
+                    `[magic-context] authority recovery for ${args.projectPath} cannot reach subc; writes remain fenced. Run magic-context doctor drain-authority ${args.projectRoot} with rust mode or restore subc connectivity.`,
+                    error,
+                );
+            }
+        });
+}
+
 export interface TransformDeps {
     tagger: Tagger;
     scheduler: Scheduler;
@@ -426,6 +584,11 @@ export interface TransformDeps {
     /** Test-only opt-out for transform-wire fixtures without the authority protocol. */
     rustModeAllowAuthorityProtocolBypassForTests?: boolean;
     rustModeProjectRoot?: string;
+    /**
+     * Module route used only to recover a project whose config changed from Rust
+     * transforms back to TypeScript while the durable authority marker remains.
+     */
+    tsAuthorityRecoveryModuleClient?: RustModeModuleClient;
     onRustModeParked?: (sessionId: string, message: string) => void;
     onRustModeProjectPrepared?: (projectPath: string) => void;
     rustMemorySyncRequestedSessions?: Set<string>;
@@ -1218,6 +1381,21 @@ export function createTransform(deps: TransformDeps) {
         if (sessionDirectory) {
             maybeSendProjectIdentityWarning(deps, sessionId, sessionDirectory, notificationParams);
         }
+        // Keep the marker lookup in the same identity vocabulary that Rust authority
+        // setup used: memory-enabled projects use their MC identity, never a raw path.
+        // Scheduling only starts background recovery; this transform continues normally.
+        const authorityProjectPath =
+            (deps.memoryConfig?.enabled ? projectIdentity : undefined) ??
+            deps.projectPath ??
+            sessionProjectIdentity;
+        if (authorityProjectPath) {
+            scheduleTsAuthorityRecovery({
+                db,
+                projectPath: authorityProjectPath,
+                projectRoot: sessionDirectory || memoryProjectDirectory,
+                module: deps.tsAuthorityRecoveryModuleClient,
+            });
+        }
         // Persist only host-resolved session bindings. The launch-directory
         // fallback keeps transforms non-fatal, but storing it as ownership would
         // let a transient SDK failure permanently mis-scope chunk backfills.
@@ -1830,7 +2008,16 @@ export function createTransform(deps: TransformDeps) {
             emergencyRecoveryArmed,
             emergencyRecoveryOrigin,
             foldMaterializedThisPass: postTransformResult.historianFoldMaterializedThisPass,
+            finalWireEstimate,
+            provenLimitTokens: resolvedContextLimit,
         });
+        if (emergencyFailClosed.disarm) {
+            clearEmergencyRecovery(db, sessionId);
+            sessionLog(
+                sessionId,
+                `emergency disarm: trusted final-wire ${emergencyFailClosed.disarm.finalWireTokens} under limit ${emergencyFailClosed.disarm.provenLimitTokens}`,
+            );
+        }
         if (emergencyFailClosed.shouldAbort) {
             if (!deps.client) {
                 throw new EmergencyFailClosedError(

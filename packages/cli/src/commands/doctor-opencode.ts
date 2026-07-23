@@ -54,6 +54,7 @@ import {
 } from "../lib/redaction";
 import { runV22BackfillCommands, type V22BackfillCommandArgs } from "../lib/v22-backfill-commands";
 import { clearPluginCache } from "./doctor-opencode-cache";
+import { reportAuthorityMarkers } from "./doctor-authority";
 
 const CLI_PACKAGE_NAME = "@cortexkit/magic-context";
 
@@ -627,6 +628,21 @@ export async function runDoctor(
         failCount++;
         issues++;
     };
+
+    const authorityDbPath = join(getMagicContextStorageDir(), "context.db");
+    let authorityDb: ReturnType<typeof openExistingContextDatabase> = null;
+    try {
+        authorityDb = openExistingContextDatabase(authorityDbPath, { readonly: true });
+        if (authorityDb) {
+            await reportAuthorityMarkers({ db: authorityDb, info: log.info, warn });
+        } else {
+            log.info("Authority: no context database found");
+        }
+    } catch (error) {
+        warn(`Authority check unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+        authorityDb?.close();
+    }
 
     // 1. Check OpenCode is installed. Keep every rung so a stale CLI cannot
     // hide a newer install that the user actually runs.
