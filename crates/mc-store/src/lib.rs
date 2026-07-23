@@ -1944,6 +1944,35 @@ const MIGRATIONS: &[Migration] = &[
         // field keeps the last actual divergence available to diagnostics with its origin.
         statements: "ALTER TABLE mc_pass_trace ADD COLUMN last_divergence TEXT NULL;",
     },
+    Migration {
+        version: 40,
+        // Historian side channels are independently committed after the compartment CAS. Queue
+        // every accepted item in that CAS so a later SQLite failure or process exit cannot turn a
+        // successful compartment publish into silent event, Primer, or user-observation loss.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_historian_side_channel_outbox (
+            session_id          TEXT NOT NULL,
+            firing_seq         INTEGER NOT NULL,
+            kind               TEXT NOT NULL
+                CHECK (kind IN ('event', 'primer', 'user_observation')),
+            source_start       INTEGER NOT NULL,
+            source_end         INTEGER NOT NULL,
+            item_index         INTEGER NOT NULL,
+            payload_json       TEXT NOT NULL,
+            attempt_count      INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at_ms INTEGER,
+            last_error         TEXT,
+            delivered_at_ms    INTEGER,
+            created_at_ms      INTEGER NOT NULL,
+            PRIMARY KEY (session_id, firing_seq, kind, source_start, source_end, item_index)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_historian_side_channel_outbox_due
+            ON mc_historian_side_channel_outbox(
+                session_id, kind, delivered_at_ms, next_attempt_at_ms, firing_seq, item_index
+            );
+    ",
+    },
 ];
 
 /// Apply the route-to-identity vocabulary law inside the caller's fenced transaction.
@@ -2175,7 +2204,7 @@ pub struct FactCandidate {
 
 /// A historian event retained for a future module-to-TS mirror. `at_compartment` keeps the
 /// producer's one-based anchor even when the module-side compartment surrogate is unavailable.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianEventCandidate {
     pub kind: String,
     pub at_compartment: Option<u64>,
@@ -2188,7 +2217,7 @@ pub struct HistorianEventCandidate {
 /// A primer candidate records a question that should remain available across sessions, along with
 /// the project, session, and source-compartment information needed to trace where it came from.
 /// Its fields match the corresponding TypeScript primer record.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianPrimerCandidate {
     pub project_path: String,
     pub session_id: String,
@@ -2203,7 +2232,7 @@ pub struct HistorianPrimerCandidate {
 
 /// A privacy-gated user observation candidate. It is intentionally not a project memory:
 /// the TS review task owns promotion after the user opts into collection.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianUserMemoryCandidate {
     pub content: String,
     pub session_id: String,
@@ -2233,6 +2262,19 @@ pub struct HistorianPublishPredicate {
 pub struct HistorianPublishResult {
     pub row_version: u64,
     pub promoted_refs: Vec<PromotedRef>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistorianSideChannelDrainResult {
+    pub attempted: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistorianSideChannelStatus {
+    pub pending_count: usize,
+    pub last_failure: Option<String>,
 }
 
 /// Session data read atomically for historian assembly. The epoch must be snapped
@@ -3776,6 +3818,35 @@ enum PublishTxnOutcome {
     Serde(String),
 }
 
+const HISTORIAN_SIDE_CHANNEL_KINDS: [&str; 3] = ["event", "primer", "user_observation"];
+const HISTORIAN_SIDE_CHANNEL_DRAIN_PER_KIND: usize = 32;
+const HISTORIAN_SIDE_CHANNEL_MAX_BACKOFF_MS: i64 = 60_000;
+const HISTORIAN_SIDE_CHANNEL_ERROR_CAP: usize = 2_000;
+
+#[derive(Debug)]
+struct HistorianSideChannelOutboxRow {
+    session_id: String,
+    id: HistorianSideChannelOutboxId,
+    payload_json: String,
+    attempt_count: u32,
+}
+
+#[derive(Debug)]
+struct HistorianSideChannelPendingItem {
+    id: HistorianSideChannelOutboxId,
+    payload_json: String,
+    created_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct HistorianSideChannelOutboxId {
+    firing_seq: u64,
+    kind: String,
+    source_start: u64,
+    source_end: u64,
+    item_index: usize,
+}
+
 enum AbandonHistorianTxnOutcome {
     Unchanged,
     Committed(u64),
@@ -4106,6 +4177,8 @@ pub struct McStore {
     authority_project_resolution_fail_once: std::sync::atomic::AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
     tag_number_query_count: std::sync::atomic::AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    historian_side_channel_fail_once: Mutex<BTreeSet<String>>,
 }
 
 fn valid_drop_seed_block_id(block_id: &str) -> bool {
@@ -4346,6 +4419,8 @@ impl McStore {
             authority_project_resolution_fail_once: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
             tag_number_query_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            historian_side_channel_fail_once: Mutex::new(BTreeSet::new()),
         };
         store.repair_migration_30_authority_routes()?;
         store.prune_transform_session_roots()?;
@@ -4621,6 +4696,18 @@ impl McStore {
     pub fn fail_next_authority_project_resolution_for_test(&self) {
         self.authority_project_resolution_fail_once
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_historian_side_channel_for_test(&self, kind: &str) {
+        assert!(
+            HISTORIAN_SIDE_CHANNEL_KINDS.contains(&kind),
+            "unknown historian side-channel kind: {kind}"
+        );
+        self.historian_side_channel_fail_once
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(kind.to_string());
     }
 
     /// Reject a facade write that crosses the route's active authority identity.
@@ -7239,6 +7326,10 @@ impl McStore {
                 "DELETE FROM mc_user_memory_candidates WHERE session_id = ?1",
                 params![session_id],
             )?;
+            tx.execute(
+                "DELETE FROM mc_historian_side_channel_outbox WHERE session_id = ?1",
+                params![session_id],
+            )?;
             let next_version = current as u64 + 1;
             tx.execute(
                 "UPDATE mc_cache_state
@@ -7385,6 +7476,13 @@ impl McStore {
                 "DELETE FROM mc_user_memory_candidates
                   WHERE session_id = ?1
                     AND source_compartment_start > COALESCE(
+                        (SELECT MAX(end_message) FROM mc_compartments WHERE session_id = ?1), -1)",
+                params![session_id],
+            )?;
+            tx.execute(
+                "DELETE FROM mc_historian_side_channel_outbox
+                  WHERE session_id = ?1
+                    AND source_start > COALESCE(
                         (SELECT MAX(end_message) FROM mc_compartments WHERE session_id = ?1), -1)",
                 params![session_id],
             )?;
@@ -7962,6 +8060,8 @@ impl McStore {
         let session_id = request.session_id;
         let expected_row_version = request.expected_row_version;
         let predicate = request.predicate;
+        let side_channel_items =
+            historian_side_channel_pending_items(&request).map_err(HistorianPublishError::Serde)?;
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
                 .query_row(
@@ -8033,9 +8133,7 @@ impl McStore {
             } else {
                 Vec::new()
             };
-            // TS writes extracted events as part of the compartment transaction. Keep the
-            // insert best-effort so a malformed side-channel row cannot strand the publish.
-            let _ = insert_historian_events_tx(tx, session_id, request.events);
+            enqueue_historian_side_channels_tx(tx, session_id, &side_channel_items)?;
 
             meta.publication_floor_ordinal = Some(
                 meta.publication_floor_ordinal
@@ -8063,11 +8161,12 @@ impl McStore {
 
         match outcome {
             PublishTxnOutcome::Committed(result) => {
-                // Primers and user observations are post-commit side channels in the TS
-                // publisher. Separate transactions preserve that atomicity boundary.
-                let _ = self.persist_historian_side_channels(
-                    request.primer_candidates,
-                    request.user_memory_candidates,
+                // The accepted payload is already durable beside the compartment commit. Drain
+                // each kind independently now; any failure remains queued for a later transform.
+                let _ = self.drain_historian_side_channels(
+                    session_id,
+                    current_time_ms(),
+                    HISTORIAN_SIDE_CHANNEL_DRAIN_PER_KIND,
                 );
                 Ok(result)
             }
@@ -8089,83 +8188,255 @@ impl McStore {
         }
     }
 
-    /// Persist the TS publisher's post-commit side channels. Each table gets its own
-    /// transaction because observations and primers are intentionally not coupled to the
-    /// compartment CAS transaction on the reference path.
-    fn persist_historian_side_channels(
+    /// Drain due historian side-channel work without coupling any target table to another.
+    /// A successful target write marks the outbox row delivered in the same transaction; the
+    /// acknowledgement row is deleted only after that commit, so restart replay is idempotent.
+    pub fn drain_historian_side_channels(
         &self,
-        primers: &[HistorianPrimerCandidate],
-        observations: &[HistorianUserMemoryCandidate],
+        session_id: &str,
+        now_ms: i64,
+        per_kind_limit: usize,
+    ) -> Result<HistorianSideChannelDrainResult, McStoreError> {
+        let mut result = HistorianSideChannelDrainResult::default();
+        let mut bookkeeping_error = None;
+        self.delete_delivered_historian_side_channels(session_id)?;
+        if per_kind_limit == 0 {
+            return Ok(result);
+        }
+
+        for kind in HISTORIAN_SIDE_CHANNEL_KINDS {
+            let rows = self.load_due_historian_side_channels(
+                session_id,
+                kind,
+                now_ms,
+                per_kind_limit.min(HISTORIAN_SIDE_CHANNEL_DRAIN_PER_KIND),
+            )?;
+            for row in rows {
+                result.attempted += 1;
+                match self.deliver_historian_side_channel(&row, now_ms) {
+                    Ok(()) => {
+                        result.succeeded += 1;
+                        if let Err(error) = self.delete_delivered_historian_side_channel(&row) {
+                            bookkeeping_error.get_or_insert(error);
+                        }
+                    }
+                    Err(error) => {
+                        result.failed += 1;
+                        if let Err(record_error) =
+                            self.record_historian_side_channel_failure(&row, now_ms, &error)
+                        {
+                            bookkeeping_error.get_or_insert(record_error);
+                        }
+                    }
+                }
+            }
+        }
+
+        match bookkeeping_error {
+            Some(error) => Err(error),
+            None => Ok(result),
+        }
+    }
+
+    pub fn historian_side_channel_status(
+        &self,
+        session_id: &str,
+    ) -> Result<HistorianSideChannelStatus, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*),
+                        (SELECT last_error
+                           FROM mc_historian_side_channel_outbox recent
+                          WHERE recent.session_id = ?1
+                            AND recent.delivered_at_ms IS NULL
+                            AND recent.last_error IS NOT NULL
+                          ORDER BY recent.last_attempt_at_ms DESC, recent.firing_seq DESC,
+                                   recent.item_index DESC
+                          LIMIT 1)
+                   FROM mc_historian_side_channel_outbox pending
+                  WHERE pending.session_id = ?1 AND pending.delivered_at_ms IS NULL",
+                params![session_id],
+                |row| {
+                    Ok(HistorianSideChannelStatus {
+                        pending_count: row.get::<_, i64>(0)?.max(0) as usize,
+                        last_failure: row.get(1)?,
+                    })
+                },
+            )
+        })?)
+    }
+
+    fn load_due_historian_side_channels(
+        &self,
+        session_id: &str,
+        kind: &str,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<HistorianSideChannelOutboxRow>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT firing_seq, source_start, source_end, item_index, payload_json,
+                        attempt_count
+                   FROM mc_historian_side_channel_outbox
+                  WHERE session_id = ?1 AND kind = ?2 AND delivered_at_ms IS NULL
+                    AND next_attempt_at_ms <= ?3
+                  ORDER BY firing_seq, source_start, source_end, item_index
+                  LIMIT ?4",
+            )?;
+            let rows =
+                statement.query_map(params![session_id, kind, now_ms, limit as i64], |row| {
+                    Ok(HistorianSideChannelOutboxRow {
+                        session_id: session_id.to_string(),
+                        id: HistorianSideChannelOutboxId {
+                            firing_seq: row.get::<_, i64>(0)?.max(0) as u64,
+                            kind: kind.to_string(),
+                            source_start: row.get::<_, i64>(1)?.max(0) as u64,
+                            source_end: row.get::<_, i64>(2)?.max(0) as u64,
+                            item_index: row.get::<_, i64>(3)?.max(0) as usize,
+                        },
+                        payload_json: row.get(4)?,
+                        attempt_count: row.get::<_, i64>(5)?.max(0) as u32,
+                    })
+                })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?)
+    }
+
+    fn deliver_historian_side_channel(
+        &self,
+        row: &HistorianSideChannelOutboxRow,
+        now_ms: i64,
     ) -> Result<(), McStoreError> {
-        if !primers.is_empty() {
-            self.inner.with_conn_fenced(|tx| {
-                for candidate in primers {
-                    let question = candidate.question.trim();
-                    if question.is_empty() {
-                        continue;
-                    }
-                    let normalized = question
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .to_lowercase();
-                    tx.execute(
-                        "INSERT INTO mc_primer_candidates
-                           (project_path, harness, session_id, question, normalized_question,
-                            source_compartment_start, source_compartment_end,
-                            source_start_message_id, source_end_message_id,
-                            source_message_time, created_at)
-                         VALUES (?1, 'module', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                         ON CONFLICT(project_path, harness, session_id,
-                                     source_start_message_id, source_end_message_id)
-                         DO UPDATE SET question = excluded.question,
-                                       normalized_question = excluded.normalized_question,
-                                       source_compartment_start = excluded.source_compartment_start,
-                                       source_compartment_end = excluded.source_compartment_end,
-                                       source_message_time = excluded.source_message_time,
-                                       created_at = MIN(mc_primer_candidates.created_at,
-                                                        excluded.created_at)",
-                        params![
-                            candidate.project_path,
-                            candidate.session_id,
-                            question,
-                            normalized,
-                            candidate.source_compartment_start.map(|v| v as i64),
-                            candidate.source_compartment_end.map(|v| v as i64),
-                            candidate.source_start_message_id,
-                            candidate.source_end_message_id,
-                            candidate.source_message_time,
-                            candidate.created_at,
-                        ],
-                    )?;
-                }
-                Ok(())
-            })?;
+        #[cfg(any(test, feature = "test-support"))]
+        if self
+            .historian_side_channel_fail_once
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&row.id.kind)
+        {
+            return Err(McStoreError::Serde(format!(
+                "injected historian {} side-channel failure",
+                row.id.kind
+            )));
         }
-        if !observations.is_empty() {
-            self.inner.with_conn_fenced(|tx| {
-                for candidate in observations {
-                    let content = candidate.content.trim();
-                    if content.is_empty() {
-                        continue;
-                    }
-                    tx.execute(
-                        "INSERT INTO mc_user_memory_candidates
-                           (content, session_id, source_compartment_start,
-                            source_compartment_end, created_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![
-                            content,
-                            candidate.session_id,
-                            candidate.source_compartment_start.map(|v| v as i64),
-                            candidate.source_compartment_end.map(|v| v as i64),
-                            candidate.created_at,
-                        ],
+
+        match row.id.kind.as_str() {
+            "event" => {
+                let candidate: HistorianEventCandidate = serde_json::from_str(&row.payload_json)
+                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
+                self.inner.with_conn_fenced(|tx| {
+                    insert_historian_events_tx(
+                        tx,
+                        &row.session_id,
+                        std::slice::from_ref(&candidate),
                     )?;
-                }
-                Ok(())
-            })?;
+                    mark_historian_side_channel_delivered_tx(tx, row, now_ms)
+                })?;
+            }
+            "primer" => {
+                let candidate: HistorianPrimerCandidate =
+                    serde_json::from_str(&row.payload_json)
+                        .map_err(|error| McStoreError::Serde(error.to_string()))?;
+                self.inner.with_conn_fenced(|tx| {
+                    insert_historian_primer_tx(tx, &candidate)?;
+                    mark_historian_side_channel_delivered_tx(tx, row, now_ms)
+                })?;
+            }
+            "user_observation" => {
+                let candidate: HistorianUserMemoryCandidate =
+                    serde_json::from_str(&row.payload_json)
+                        .map_err(|error| McStoreError::Serde(error.to_string()))?;
+                self.inner.with_conn_fenced(|tx| {
+                    insert_historian_user_observation_tx(tx, &candidate)?;
+                    mark_historian_side_channel_delivered_tx(tx, row, now_ms)
+                })?;
+            }
+            other => {
+                return Err(McStoreError::Serde(format!(
+                    "unknown historian side-channel kind {other:?}"
+                )))
+            }
         }
+        Ok(())
+    }
+
+    fn record_historian_side_channel_failure(
+        &self,
+        row: &HistorianSideChannelOutboxRow,
+        now_ms: i64,
+        error: &McStoreError,
+    ) -> Result<(), McStoreError> {
+        let exponent = row.attempt_count.min(6);
+        let delay_ms = 1_000_i64
+            .saturating_mul(1_i64 << exponent)
+            .min(HISTORIAN_SIDE_CHANNEL_MAX_BACKOFF_MS);
+        let next_attempt_at_ms = now_ms.saturating_add(delay_ms);
+        let error = error
+            .to_string()
+            .chars()
+            .take(HISTORIAN_SIDE_CHANNEL_ERROR_CAP)
+            .collect::<String>();
+        self.inner.with_conn_fenced(|tx| {
+            tx.execute(
+                "UPDATE mc_historian_side_channel_outbox
+                    SET attempt_count = attempt_count + 1, next_attempt_at_ms = ?7,
+                        last_attempt_at_ms = ?8, last_error = ?9
+                  WHERE session_id = ?1 AND firing_seq = ?2 AND kind = ?3
+                    AND source_start = ?4 AND source_end = ?5 AND item_index = ?6
+                    AND delivered_at_ms IS NULL",
+                params![
+                    row.session_id,
+                    row.id.firing_seq as i64,
+                    row.id.kind,
+                    row.id.source_start as i64,
+                    row.id.source_end as i64,
+                    row.id.item_index as i64,
+                    next_attempt_at_ms,
+                    now_ms,
+                    error,
+                ],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn delete_delivered_historian_side_channels(
+        &self,
+        session_id: &str,
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            tx.execute(
+                "DELETE FROM mc_historian_side_channel_outbox
+                  WHERE session_id = ?1 AND delivered_at_ms IS NOT NULL",
+                params![session_id],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn delete_delivered_historian_side_channel(
+        &self,
+        row: &HistorianSideChannelOutboxRow,
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            tx.execute(
+                "DELETE FROM mc_historian_side_channel_outbox
+                  WHERE session_id = ?1 AND firing_seq = ?2 AND kind = ?3
+                    AND source_start = ?4 AND source_end = ?5 AND item_index = ?6
+                    AND delivered_at_ms IS NOT NULL",
+                params![
+                    row.session_id,
+                    row.id.firing_seq as i64,
+                    row.id.kind,
+                    row.id.source_start as i64,
+                    row.id.source_end as i64,
+                    row.id.item_index as i64,
+                ],
+            )?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -11237,6 +11508,204 @@ fn insert_historian_events_tx(
     Ok(())
 }
 
+fn historian_side_channel_pending_items(
+    request: &HistorianPublishRequest<'_>,
+) -> Result<Vec<HistorianSideChannelPendingItem>, String> {
+    let default_start = request
+        .compartments
+        .iter()
+        .map(|compartment| compartment.start_message.max(0) as u64)
+        .min()
+        .unwrap_or_else(|| request.publication_floor_ordinal.saturating_sub(1));
+    let default_end = request
+        .compartments
+        .iter()
+        .map(|compartment| compartment.end_message.max(0) as u64)
+        .max()
+        .unwrap_or(default_start);
+    let created_at_ms = current_time_ms();
+    let mut items = Vec::new();
+
+    for (item_index, event) in request.events.iter().enumerate() {
+        let source = event.compartment_id.and_then(|sequence| {
+            request
+                .compartments
+                .iter()
+                .find(|compartment| compartment.sequence.max(0) as u64 == sequence)
+        });
+        items.push(HistorianSideChannelPendingItem {
+            id: HistorianSideChannelOutboxId {
+                firing_seq: request.predicate.firing_seq,
+                kind: "event".to_string(),
+                source_start: source
+                    .map(|compartment| compartment.start_message.max(0) as u64)
+                    .unwrap_or(default_start),
+                source_end: source
+                    .map(|compartment| compartment.end_message.max(0) as u64)
+                    .unwrap_or(default_end),
+                item_index,
+            },
+            payload_json: serde_json::to_string(event).map_err(|error| error.to_string())?,
+            created_at_ms,
+        });
+    }
+    for (item_index, primer) in request.primer_candidates.iter().enumerate() {
+        if primer.question.trim().is_empty() {
+            continue;
+        }
+        items.push(HistorianSideChannelPendingItem {
+            id: HistorianSideChannelOutboxId {
+                firing_seq: request.predicate.firing_seq,
+                kind: "primer".to_string(),
+                source_start: primer.source_compartment_start.unwrap_or(default_start),
+                source_end: primer.source_compartment_end.unwrap_or(default_end),
+                item_index,
+            },
+            payload_json: serde_json::to_string(primer).map_err(|error| error.to_string())?,
+            created_at_ms,
+        });
+    }
+    for (item_index, observation) in request.user_memory_candidates.iter().enumerate() {
+        if observation.content.trim().is_empty() {
+            continue;
+        }
+        items.push(HistorianSideChannelPendingItem {
+            id: HistorianSideChannelOutboxId {
+                firing_seq: request.predicate.firing_seq,
+                kind: "user_observation".to_string(),
+                source_start: observation
+                    .source_compartment_start
+                    .unwrap_or(default_start),
+                source_end: observation.source_compartment_end.unwrap_or(default_end),
+                item_index,
+            },
+            payload_json: serde_json::to_string(observation).map_err(|error| error.to_string())?,
+            created_at_ms,
+        });
+    }
+    Ok(items)
+}
+
+fn enqueue_historian_side_channels_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    items: &[HistorianSideChannelPendingItem],
+) -> rusqlite::Result<()> {
+    for item in items {
+        tx.execute(
+            "INSERT INTO mc_historian_side_channel_outbox
+                 (session_id, firing_seq, kind, source_start, source_end, item_index,
+                  payload_json, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                session_id,
+                item.id.firing_seq as i64,
+                item.id.kind,
+                item.id.source_start as i64,
+                item.id.source_end as i64,
+                item.id.item_index as i64,
+                item.payload_json,
+                item.created_at_ms,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn mark_historian_side_channel_delivered_tx(
+    tx: &rusqlite::Transaction<'_>,
+    row: &HistorianSideChannelOutboxRow,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    let changed = tx.execute(
+        "UPDATE mc_historian_side_channel_outbox
+            SET delivered_at_ms = ?7, last_attempt_at_ms = ?7, last_error = NULL
+          WHERE session_id = ?1 AND firing_seq = ?2 AND kind = ?3
+            AND source_start = ?4 AND source_end = ?5 AND item_index = ?6
+            AND delivered_at_ms IS NULL",
+        params![
+            row.session_id,
+            row.id.firing_seq as i64,
+            row.id.kind,
+            row.id.source_start as i64,
+            row.id.source_end as i64,
+            row.id.item_index as i64,
+            now_ms,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    Ok(())
+}
+
+fn insert_historian_primer_tx(
+    tx: &rusqlite::Transaction<'_>,
+    candidate: &HistorianPrimerCandidate,
+) -> rusqlite::Result<()> {
+    let question = candidate.question.trim();
+    if question.is_empty() {
+        return Ok(());
+    }
+    let normalized = question
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    tx.execute(
+        "INSERT INTO mc_primer_candidates
+           (project_path, harness, session_id, question, normalized_question,
+            source_compartment_start, source_compartment_end,
+            source_start_message_id, source_end_message_id,
+            source_message_time, created_at)
+         VALUES (?1, 'module', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(project_path, harness, session_id,
+                     source_start_message_id, source_end_message_id)
+         DO UPDATE SET question = excluded.question,
+                       normalized_question = excluded.normalized_question,
+                       source_compartment_start = excluded.source_compartment_start,
+                       source_compartment_end = excluded.source_compartment_end,
+                       source_message_time = excluded.source_message_time,
+                       created_at = MIN(mc_primer_candidates.created_at, excluded.created_at)",
+        params![
+            candidate.project_path,
+            candidate.session_id,
+            question,
+            normalized,
+            candidate.source_compartment_start.map(|value| value as i64),
+            candidate.source_compartment_end.map(|value| value as i64),
+            candidate.source_start_message_id,
+            candidate.source_end_message_id,
+            candidate.source_message_time,
+            candidate.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_historian_user_observation_tx(
+    tx: &rusqlite::Transaction<'_>,
+    candidate: &HistorianUserMemoryCandidate,
+) -> rusqlite::Result<()> {
+    let content = candidate.content.trim();
+    if content.is_empty() {
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO mc_user_memory_candidates
+           (content, session_id, source_compartment_start, source_compartment_end, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            content,
+            candidate.session_id,
+            candidate.source_compartment_start.map(|value| value as i64),
+            candidate.source_compartment_end.map(|value| value as i64),
+            candidate.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
 fn append_compartments_tx(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
@@ -13187,7 +13656,7 @@ mod tests {
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=39).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=40).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -13252,6 +13721,22 @@ mod tests {
             })
             .unwrap();
         assert_eq!(fresh_migration_19_tables, 3);
+        let fresh_has_historian_side_channel_outbox = fresh
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT name FROM sqlite_master
+                      WHERE type = 'table' AND name = 'mc_historian_side_channel_outbox'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .unwrap();
+        assert_eq!(
+            fresh_has_historian_side_channel_outbox.as_deref(),
+            Some("mc_historian_side_channel_outbox")
+        );
 
         let migrated_dir = tempfile::tempdir().unwrap();
         let path = migrated_dir.path().join("store.db");
@@ -13359,6 +13844,22 @@ mod tests {
             })
             .unwrap();
         assert_eq!(migrated_migration_19_tables, 3);
+        let migrated_has_historian_side_channel_outbox = migrated
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT name FROM sqlite_master
+                      WHERE type = 'table' AND name = 'mc_historian_side_channel_outbox'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .unwrap();
+        assert_eq!(
+            migrated_has_historian_side_channel_outbox.as_deref(),
+            Some("mc_historian_side_channel_outbox")
+        );
         let migrated_date_columns = migrated
             .inner
             .with_conn(|conn| {
@@ -14571,6 +15072,163 @@ mod tests {
     }
 
     #[test]
+    fn historian_side_channel_faults_are_isolated_and_retryable_per_kind() {
+        for failed_kind in HISTORIAN_SIDE_CHANNEL_KINDS {
+            let dir = tempfile::tempdir().unwrap();
+            let store = McStore::open(&descriptor(dir.path())).unwrap();
+            store
+                .commit("ses", None, &CoreState::default(), &publishing_meta())
+                .unwrap();
+            store.fail_next_historian_side_channel_for_test(failed_kind);
+            let event = HistorianEventCandidate {
+                kind: "trajectory_correction".into(),
+                at_compartment: Some(1),
+                compartment_id: Some(0),
+                fields_json: "{\"detail\":\"fixed\"}".into(),
+                created_at: 123,
+                harness: "module".into(),
+            };
+            let primer = HistorianPrimerCandidate {
+                project_path: "git:proj".into(),
+                session_id: "ses".into(),
+                question: "How is publication recovered?".into(),
+                source_compartment_start: Some(10),
+                source_compartment_end: Some(20),
+                source_start_message_id: "m10".into(),
+                source_end_message_id: "m20".into(),
+                source_message_time: 123,
+                created_at: 123,
+            };
+            let observation = HistorianUserMemoryCandidate {
+                content: "The user prefers explicit recovery semantics.".into(),
+                session_id: "ses".into(),
+                source_compartment_start: Some(10),
+                source_compartment_end: Some(20),
+                created_at: 123,
+            };
+            let expected = store.load("ses").unwrap().row_version;
+
+            store
+                .publish_historian_chunk(HistorianPublishRequest {
+                    session_id: "ses",
+                    expected_row_version: expected,
+                    expected_revert_epoch: 0,
+                    predicate: &publish_predicate(),
+                    project_path: "git:proj",
+                    compartments: &[publish_compartment()],
+                    facts: &[],
+                    promote_facts: true,
+                    events: std::slice::from_ref(&event),
+                    primer_candidates: std::slice::from_ref(&primer),
+                    user_memory_candidates: std::slice::from_ref(&observation),
+                    publication_floor_ordinal: 21,
+                    chunk_transcript: None,
+                })
+                .unwrap();
+
+            assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+            assert_eq!(
+                store.load_compartment_events("ses").unwrap().len(),
+                usize::from(failed_kind != "event")
+            );
+            assert_eq!(
+                store.load_primer_candidates("ses").unwrap().len(),
+                usize::from(failed_kind != "primer")
+            );
+            assert_eq!(
+                store.load_user_memory_candidates("ses").unwrap().len(),
+                usize::from(failed_kind != "user_observation")
+            );
+            if failed_kind == "primer" {
+                assert_eq!(
+                    store.load_user_memory_candidates("ses").unwrap().len(),
+                    1,
+                    "a failed Primer write must not suppress user observations"
+                );
+            }
+            let pending = store.historian_side_channel_status("ses").unwrap();
+            assert_eq!(pending.pending_count, 1);
+            assert!(pending
+                .last_failure
+                .as_deref()
+                .is_some_and(|error| error.contains(failed_kind)));
+
+            let retry = store
+                .drain_historian_side_channels("ses", i64::MAX, 32)
+                .unwrap();
+            assert_eq!(retry.succeeded, 1);
+            assert_eq!(store.load_compartment_events("ses").unwrap().len(), 1);
+            assert_eq!(store.load_primer_candidates("ses").unwrap().len(), 1);
+            assert_eq!(store.load_user_memory_candidates("ses").unwrap().len(), 1);
+            assert_eq!(
+                store
+                    .historian_side_channel_status("ses")
+                    .unwrap()
+                    .pending_count,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn historian_side_channel_outbox_recovers_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let store = McStore::open(&descriptor).unwrap();
+        store
+            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .unwrap();
+        store.fail_next_historian_side_channel_for_test("event");
+        let event = HistorianEventCandidate {
+            kind: "causal_incident".into(),
+            fields_json: "{}".into(),
+            created_at: 123,
+            harness: "module".into(),
+            ..Default::default()
+        };
+        let expected = store.load("ses").unwrap().row_version;
+        store
+            .publish_historian_chunk(HistorianPublishRequest {
+                session_id: "ses",
+                expected_row_version: expected,
+                expected_revert_epoch: 0,
+                predicate: &publish_predicate(),
+                project_path: "git:proj",
+                compartments: &[publish_compartment()],
+                facts: &[],
+                promote_facts: true,
+                events: std::slice::from_ref(&event),
+                primer_candidates: &[],
+                user_memory_candidates: &[],
+                publication_floor_ordinal: 21,
+                chunk_transcript: None,
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .historian_side_channel_status("ses")
+                .unwrap()
+                .pending_count,
+            1
+        );
+        drop(store);
+
+        let reopened = McStore::open(&descriptor).unwrap();
+        let recovery = reopened
+            .drain_historian_side_channels("ses", i64::MAX, 32)
+            .unwrap();
+        assert_eq!(recovery.succeeded, 1);
+        assert_eq!(reopened.load_compartment_events("ses").unwrap().len(), 1);
+        assert_eq!(
+            reopened
+                .historian_side_channel_status("ses")
+                .unwrap()
+                .pending_count,
+            0
+        );
+    }
+
+    #[test]
     fn publish_historian_chunk_persists_transcript_inside_cas() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
@@ -14611,6 +15269,11 @@ mod tests {
         store
             .commit("ses", None, &CoreState::default(), &publishing_meta())
             .unwrap();
+        let event = HistorianEventCandidate {
+            kind: "orphan".into(),
+            fields_json: "{}".into(),
+            ..Default::default()
+        };
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
                 session_id: "ses",
@@ -14621,7 +15284,7 @@ mod tests {
                 compartments: &[publish_compartment()],
                 facts: &[],
                 promote_facts: true,
-                events: &[],
+                events: std::slice::from_ref(&event),
                 primer_candidates: &[],
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
@@ -14633,6 +15296,15 @@ mod tests {
             .load_chunk_transcripts_for_range("ses", 10, 21)
             .unwrap()
             .is_empty());
+        assert!(store.load_compartment_events("ses").unwrap().is_empty());
+        assert_eq!(
+            store
+                .historian_side_channel_status("ses")
+                .unwrap()
+                .pending_count,
+            0,
+            "a rejected CAS must not leave side-channel work behind"
+        );
     }
 
     #[test]
@@ -15493,7 +16165,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=39).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=40).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)
