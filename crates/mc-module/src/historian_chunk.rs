@@ -386,7 +386,7 @@ pub fn build_historian_chunk(
         .map(|block| ChunkSnapshotOwnedItem {
             id: block.id.clone(),
             kind: block.kind_tag.clone(),
-            bytes: block.bytes.clone(),
+            bytes: block.bytes.to_string(),
         })
         .collect();
     HistorianBuiltChunk {
