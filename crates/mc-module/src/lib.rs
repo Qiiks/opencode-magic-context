@@ -7547,9 +7547,13 @@ impl McHandler {
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty());
         if let Some(command_id) = command_id {
-            if let Ok(Some(recorded)) = store.load_dream_task_command(&binding.session, command_id)
-            {
-                return replay_dream_task_response(&recorded.response_json);
+            if let Some(replayed) = replayed_memory_apply_command(
+                store,
+                &binding.session,
+                "set_verification",
+                command_id,
+            ) {
+                return replayed;
             }
         }
         let Some(context_store_uuid) = args.get("context_store_uuid").and_then(Value::as_str)
@@ -7579,8 +7583,8 @@ impl McHandler {
             };
             updates.push(VerificationUpdate {
                 memory_id,
-                content_hash_at_prompt: hash.into(),
-                verification_status: status.into(),
+                content_hash_at_prompt: hash.to_string(),
+                verification_status: status.to_string(),
                 updated_content: row
                     .get("updated_content")
                     .and_then(Value::as_str)
@@ -7591,48 +7595,37 @@ impl McHandler {
                     .map(str::to_owned),
             });
         }
-        match store.with_facade_mutation(&route_root, "memories", || {
-            store.set_memory_verification(
-                context_store_uuid,
+        let now = now_ms();
+        dream_apply_command_outcome(
+            store.with_facade_command(
+                &route_root,
                 memory_project,
-                authority_generation,
-                &updates,
-                now_ms(),
-            )
-        }) {
-            Ok(result) => {
-                let response = json!({ "ok": true, "accepted": result.accepted, "rejected": result.rejected.iter().map(|row| json!({"memory_id": row.memory_id, "reason": row.reason})).collect::<Vec<_>>() });
-                if let Some(command_id) = command_id {
-                    match store.record_dream_task_command(
-                        &binding.session,
-                        command_id,
-                        &response.to_string(),
-                        now_ms(),
-                    ) {
-                        Ok(recorded) => replay_dream_task_response(&recorded.response_json),
-                        Err(error) => HandlerOutcome::Error {
-                            code: "dreamer_ledger_failed".into(),
-                            message: error.to_string(),
-                        },
-                    }
-                } else {
-                    respond(response)
-                }
-            }
-            Err(McStoreError::AuthorityGenerationMismatch { expected, found }) => {
-                HandlerOutcome::Error {
-                    code: "authority_generation_mismatch".into(),
-                    message: format!("authority generation is {found}, request used {expected}"),
-                }
-            }
-            Err(McStoreError::AuthorityStateMismatch { found, .. }) if found == "DRAINING" => {
-                authority_draining_error("memories")
-            }
-            Err(error) => HandlerOutcome::Error {
-                code: "verification_apply_failed".into(),
-                message: error.to_string(),
-            },
-        }
+                "memories",
+                &binding.session,
+                "memory",
+                "set_verification",
+                command_id,
+                |tx| {
+                    let result = tx.set_memory_verification(
+                        context_store_uuid,
+                        memory_project,
+                        authority_generation,
+                        &updates,
+                        now,
+                    )?;
+                    serde_json::to_vec(&json!({
+                        "ok": true,
+                        "accepted": result.accepted,
+                        "rejected": result.rejected.iter().map(|row| json!({
+                            "memory_id": row.memory_id,
+                            "reason": row.reason,
+                        })).collect::<Vec<_>>(),
+                    }))
+                    .map_err(|error| error.to_string())
+                },
+            ),
+            "verification_apply_failed",
+        )
     }
 
     async fn handle_memory_set_mapping(&self, channel: u16, request: &Value) -> HandlerOutcome {
@@ -7658,9 +7651,10 @@ impl McHandler {
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty());
         if let Some(command_id) = command_id {
-            if let Ok(Some(recorded)) = store.load_dream_task_command(&binding.session, command_id)
+            if let Some(replayed) =
+                replayed_memory_apply_command(store, &binding.session, "set_mapping", command_id)
             {
-                return replay_dream_task_response(&recorded.response_json);
+                return replayed;
             }
         }
         let Some(context_store_uuid) = args.get("context_store_uuid").and_then(Value::as_str)
@@ -7698,52 +7692,41 @@ impl McHandler {
             };
             updates.push(MappingUpdate {
                 memory_id,
-                content_hash_at_prompt: hash.into(),
+                content_hash_at_prompt: hash.to_string(),
                 mapped_files,
             });
         }
-        match store.with_facade_mutation(&route_root, "memories", || {
-            store.set_memory_mapping(
-                context_store_uuid,
+        let now = now_ms();
+        dream_apply_command_outcome(
+            store.with_facade_command(
+                &route_root,
                 memory_project,
-                authority_generation,
-                &updates,
-                now_ms(),
-            )
-        }) {
-            Ok(result) => {
-                let response = json!({ "ok": true, "accepted": result.accepted, "rejected": result.rejected.iter().map(|row| json!({"memory_id": row.memory_id, "reason": row.reason})).collect::<Vec<_>>() });
-                if let Some(command_id) = command_id {
-                    match store.record_dream_task_command(
-                        &binding.session,
-                        command_id,
-                        &response.to_string(),
-                        now_ms(),
-                    ) {
-                        Ok(recorded) => replay_dream_task_response(&recorded.response_json),
-                        Err(error) => HandlerOutcome::Error {
-                            code: "dreamer_ledger_failed".into(),
-                            message: error.to_string(),
-                        },
-                    }
-                } else {
-                    respond(response)
-                }
-            }
-            Err(McStoreError::AuthorityGenerationMismatch { expected, found }) => {
-                HandlerOutcome::Error {
-                    code: "authority_generation_mismatch".into(),
-                    message: format!("authority generation is {found}, request used {expected}"),
-                }
-            }
-            Err(McStoreError::AuthorityStateMismatch { found, .. }) if found == "DRAINING" => {
-                authority_draining_error("memories")
-            }
-            Err(error) => HandlerOutcome::Error {
-                code: "mapping_apply_failed".into(),
-                message: error.to_string(),
-            },
-        }
+                "memories",
+                &binding.session,
+                "memory",
+                "set_mapping",
+                command_id,
+                |tx| {
+                    let result = tx.set_memory_mapping(
+                        context_store_uuid,
+                        memory_project,
+                        authority_generation,
+                        &updates,
+                        now,
+                    )?;
+                    serde_json::to_vec(&json!({
+                        "ok": true,
+                        "accepted": result.accepted,
+                        "rejected": result.rejected.iter().map(|row| json!({
+                            "memory_id": row.memory_id,
+                            "reason": row.reason,
+                        })).collect::<Vec<_>>(),
+                    }))
+                    .map_err(|error| error.to_string())
+                },
+            ),
+            "mapping_apply_failed",
+        )
     }
 
     async fn handle_facade_value(&self, channel: u16, request: Value) -> HandlerOutcome {
@@ -10171,6 +10154,55 @@ fn facade_text_response(text: impl Into<String>, is_error: bool) -> Result<Vec<u
         "isError": is_error,
     }))
     .map_err(|error| error.to_string())
+}
+
+fn replayed_memory_apply_command(
+    store: &McStore,
+    session_id: &str,
+    action: &str,
+    command_id: &str,
+) -> Option<HandlerOutcome> {
+    if let Ok(Some(response)) =
+        store.facade_mutation_ledger_response(session_id, "memory", action, command_id)
+    {
+        return Some(HandlerOutcome::Response(response));
+    }
+    store
+        .load_dream_task_command(session_id, command_id)
+        .ok()
+        .flatten()
+        .map(|recorded| replay_dream_task_response(&recorded.response_json))
+}
+
+fn dream_apply_command_outcome(
+    result: Result<FacadeMutationOutcome, McStoreError>,
+    failure_code: &str,
+) -> HandlerOutcome {
+    match result {
+        Ok(FacadeMutationOutcome::Applied(bytes) | FacadeMutationOutcome::Duplicate(bytes)) => {
+            HandlerOutcome::Response(bytes)
+        }
+        Err(error) if store_error_is_authority_draining(&error) => {
+            authority_draining_error("memories")
+        }
+        Err(error) if error.to_string().contains("authority_generation_mismatch:") => {
+            HandlerOutcome::Error {
+                code: "authority_generation_mismatch".to_string(),
+                message: "memory authority generation changed while applying the command"
+                    .to_string(),
+            }
+        }
+        Err(error) if error.to_string().contains("authority_state_mismatch:") => {
+            HandlerOutcome::Error {
+                code: "authority_state_mismatch".to_string(),
+                message: "memory authority state changed while applying the command".to_string(),
+            }
+        }
+        Err(error) => HandlerOutcome::Error {
+            code: failure_code.to_string(),
+            message: error.to_string(),
+        },
+    }
 }
 
 fn facade_command_outcome(
@@ -15110,6 +15142,10 @@ mod tests {
         };
         assert_eq!(verified_body["accepted"], json!([verified_id]));
         assert_eq!(verified_body["rejected"].as_array().unwrap().len(), 3);
+        let verified_feed_head = store
+            .pull_changefeed("memories", 0, 1000)
+            .unwrap()
+            .next_cursor;
         let after_verified =
             crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
         assert_eq!(
@@ -15126,7 +15162,15 @@ mod tests {
         };
         assert_eq!(
             replay_body, verified_body,
-            "command replay must not append another mutation"
+            "command replay must return the stored terminal response"
+        );
+        assert_eq!(
+            store
+                .pull_changefeed("memories", 0, 1000)
+                .unwrap()
+                .next_cursor,
+            verified_feed_head,
+            "verification replay must not emit another feed row"
         );
 
         let before_update =
@@ -15166,6 +15210,10 @@ mod tests {
             "command_id": "mapping-once", "rows": [{"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "mapped_files": ["src/lib.rs", "src/lib.rs"]}]
         })).await;
         assert!(matches!(mapping, HandlerOutcome::Response(_)));
+        let mapping_feed_head = store
+            .pull_changefeed("memories", 0, 1000)
+            .unwrap()
+            .next_cursor;
         let mapping_replay = call_facade(&handler, "memory.set_mapping", json!({
             "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
             "command_id": "mapping-once", "rows": [{"memory_id": verified_id, "content_hash_at_prompt": "stale", "mapped_files": null}]
@@ -15173,6 +15221,14 @@ mod tests {
         assert!(
             matches!(mapping_replay, HandlerOutcome::Response(_)),
             "mapping command replay must be idempotent"
+        );
+        assert_eq!(
+            store
+                .pull_changefeed("memories", 0, 1000)
+                .unwrap()
+                .next_cursor,
+            mapping_feed_head,
+            "mapping replay must not emit another feed row"
         );
         let feed = store.pull_changefeed("memories", 0, 1000).unwrap();
         assert!(feed

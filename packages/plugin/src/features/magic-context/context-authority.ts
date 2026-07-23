@@ -1168,7 +1168,7 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
             "DELETE FROM memory_verifications WHERE memory_id = ?",
         ),
         insertMemoryVerification: db.prepare(
-            "INSERT INTO memory_verifications(memory_id, file_path, verified_at, mapped_at) VALUES (?, ?, 0, ?)",
+            "INSERT INTO memory_verifications(memory_id, file_path, verified_at, mapped_at) VALUES (?, ?, ?, ?)",
         ),
         noteById: db.prepare("SELECT * FROM notes WHERE id = ?"),
         noteIdByStoreId: db.prepare(
@@ -1561,24 +1561,21 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
     if (previousHash !== appliedHash && appliedHash !== undefined) {
         statements.deleteMemoryEmbeddings.run(contextId);
     }
-    // Store mapping changes in the regular memory feed so maps owned by this module are preserved
-    // when data is synchronized back into the database. Rows without a `mapping` property are
-    // ordinary memory updates and must not create mapping verification records.
+    // Mapping snapshots replace the whole side table. An array is a durable mapping (an empty
+    // array is the file-independent sentinel); null is a mapping tombstone and leaves no rows.
     if (has("mapping")) {
-        const files = Array.isArray(row.mapping)
-            ? [
-                  ...new Set(
-                      row.mapping.filter((file): file is string => typeof file === "string").sort(),
-                  ),
-              ]
-            : [""];
         statements.deleteMemoryVerifications.run(contextId);
-        for (const file of files.length > 0 ? files : [""]) {
-            statements.insertMemoryVerification.run(
-                contextId,
-                file,
-                rowNumber(row, "updated_at", Date.now()),
-            );
+        if (Array.isArray(row.mapping)) {
+            const files = [
+                ...new Set(
+                    row.mapping.filter((file): file is string => typeof file === "string").sort(),
+                ),
+            ];
+            const verifiedAt = rowNumber(row, "verified_at");
+            const mappedAt = rowNumber(row, "updated_at", Date.now());
+            for (const file of files.length > 0 ? files : [""]) {
+                statements.insertMemoryVerification.run(contextId, file, verifiedAt, mappedAt);
+            }
         }
     }
 }

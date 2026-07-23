@@ -299,6 +299,7 @@ describe("memory authority protocol", () => {
                         content: "mapped memory",
                         normalized_hash: "module-hash",
                         status: "active",
+                        verified_at: 1234,
                         mapping: ["src/lib.rs", "src/lib.rs"],
                         context_store_uuid: storeUuid,
                         context_row_id: contextMemory.id,
@@ -307,9 +308,35 @@ describe("memory authority protocol", () => {
             ],
         };
         applyMirrorPage({ db: database, page });
-        expect(
-            getMemoryVerifications(database, [contextMemory.id]).get(contextMemory.id)?.files,
-        ).toEqual(["src/lib.rs"]);
+        const verification = getMemoryVerifications(database, [contextMemory.id]).get(
+            contextMemory.id,
+        );
+        expect(verification?.files).toEqual(["src/lib.rs"]);
+        expect(verification?.verifiedAt).toBe(1234);
+
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 1,
+                next_cursor: 2,
+                has_more: false,
+                rows: [
+                    {
+                        ...page.rows[0]!,
+                        feed_seq: 2,
+                        full_row_snapshot: {
+                            ...page.rows[0]!.full_row_snapshot,
+                            mapping: null,
+                            verified_at: 2000,
+                        },
+                    },
+                ],
+            },
+        });
+        expect(getMemoryVerifications(database, [contextMemory.id]).has(contextMemory.id)).toBe(
+            false,
+        );
     });
     test("preserves source metadata across the historical 9397 mapping sequence", () => {
         const database = db();
