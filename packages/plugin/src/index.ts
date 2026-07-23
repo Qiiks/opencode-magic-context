@@ -16,6 +16,10 @@ import { runSessionProjectBackfill } from "./features/magic-context/session-proj
 import { SIDEKICK_SYSTEM_PROMPT } from "./features/magic-context/sidekick/agent";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smart-notes/compiler-prompt";
 import {
+    createFailClosedController,
+    getLastHookInitFailure,
+} from "./features/magic-context/fail-closed-block";
+import {
     getSchemaFenceRejection,
     isDatabasePersisted,
     openDatabase,
@@ -163,17 +167,67 @@ const server: Plugin = async (ctx) => {
         rustModeModuleClient,
     });
 
+    // Mutable holder so a healed storage reopen can install real hooks without
+    // rebuilding the outer messages-transform wrapper.
+    const magicContextRuntime: {
+        magicContext: typeof hooks.magicContext;
+        rustToolBackends: typeof hooks.rustToolBackends;
+    } = {
+        magicContext: hooks.magicContext,
+        rustToolBackends: hooks.rustToolBackends,
+    };
+
+    // Loud fail-closed gate: when the user enabled MC but storage cannot open
+    // (schema fence / migration hard failure), block primary transforms instead
+    // of silently unregistering hooks and falling through to native compaction.
+    const failClosed = createFailClosedController();
+    const failClosedBlockingEnabled =
+        pluginConfig.enabled === true && pluginConfig.fail_closed_blocking !== false;
+    if (pluginConfig.enabled === true && !magicContextRuntime.magicContext) {
+        const initFailure = getLastHookInitFailure();
+        if (initFailure?.type === "storage") {
+            failClosed.arm(initFailure.reason);
+            log(
+                `[magic-context] fail-closed blocking armed (${initFailure.reason.kind}); primary sessions will error until storage recovers or the build is upgraded`,
+            );
+        }
+    }
+
+    const tryReopenStorage = async (): Promise<boolean> => {
+        if (magicContextRuntime.magicContext) {
+            failClosed.clear();
+            return true;
+        }
+        try {
+            const reopened = await createSessionHooksAsync({
+                ctx,
+                pluginConfig,
+                liveSessionState,
+                rustModeModuleClient,
+            });
+            if (!reopened.magicContext) return false;
+            magicContextRuntime.magicContext = reopened.magicContext;
+            magicContextRuntime.rustToolBackends = reopened.rustToolBackends;
+            failClosed.clear();
+            log("[magic-context] storage re-probe succeeded; Magic Context runtime restored");
+            return true;
+        } catch (error) {
+            log(`[magic-context] storage re-probe failed: ${error}`);
+            return false;
+        }
+    };
+
     const tools = createToolRegistry({
         ctx,
         pluginConfig,
-        rustToolBackends: hooks.rustToolBackends,
+        rustToolBackends: magicContextRuntime.rustToolBackends,
     });
 
     // v22 deferred legacy-memory identity backfill. createSessionHooks() opens
     // the shared DB and runs migrations before returning a non-null hook, so
     // this fire-and-forget runner starts only after the schema is ready. Its
     // batch transactions serialize naturally with concurrent ctx_memory writes.
-    if (pluginConfig.enabled && hooks.magicContext) {
+    if (pluginConfig.enabled && magicContextRuntime.magicContext) {
         try {
             const db = openDatabase();
             if (db && isDatabasePersisted(db)) {
@@ -191,7 +245,7 @@ const server: Plugin = async (ctx) => {
     // Gated like the v22 backfill above: a conflict-disabled plugin must not
     // touch storage at all (openDatabase() would CREATE context.db, breaking
     // the disabled-path invariant that no state is written).
-    if (pluginConfig.enabled && hooks.magicContext) {
+    if (pluginConfig.enabled && magicContextRuntime.magicContext) {
         scheduleAfterBootQuiet(() => {
             void (async () => {
                 const db = openDatabase();
@@ -435,7 +489,11 @@ const server: Plugin = async (ctx) => {
     return {
         tool: tools,
         event: createEventHandler({
-            magicContext: hooks.magicContext,
+            magicContext: {
+                event: async (input) => {
+                    await magicContextRuntime.magicContext?.event?.(input);
+                },
+            },
             autoUpdateChecker: createAutoUpdateCheckerHook(ctx, {
                 autoUpdate: pluginConfig.auto_update !== false,
                 signal: autoUpdateAbort.signal,
@@ -480,13 +538,21 @@ const server: Plugin = async (ctx) => {
             },
         }),
         "experimental.chat.messages.transform": createMessagesTransformHandler({
-            magicContext: hooks.magicContext,
+            magicContext: magicContextRuntime.magicContext,
+            getMagicContext: () => magicContextRuntime.magicContext,
+            failClosed,
+            failClosedBlockingEnabled,
+            internalChildSessions: liveSessionState.internalChildSessions,
+            tryReopenStorage,
         }) as unknown as NonNullable<Hooks["experimental.chat.messages.transform"]>,
         "experimental.chat.system.transform": async (input, output) => {
-            await hooks.magicContext?.["experimental.chat.system.transform"]?.(input, output);
+            await magicContextRuntime.magicContext?.["experimental.chat.system.transform"]?.(
+                input,
+                output,
+            );
         },
         "command.execute.before": async (input, output) => {
-            await hooks.magicContext?.["command.execute.before"]?.(input, output);
+            await magicContextRuntime.magicContext?.["command.execute.before"]?.(input, output);
         },
         "chat.message": async (input, _output) => {
             // Update tool-def measurement latch before delegating to magic-context
@@ -503,7 +569,7 @@ const server: Plugin = async (ctx) => {
             if (provId && modId && agent) {
                 lastChatContext = { providerID: provId, modelID: modId, agentName: agent };
             }
-            await hooks.magicContext?.["chat.message"]?.(input);
+            await magicContextRuntime.magicContext?.["chat.message"]?.(input);
         },
         "tool.definition": async (input, output) => {
             // Attribute tool schema tokens to the most recent chat-message context.
@@ -525,10 +591,10 @@ const server: Plugin = async (ctx) => {
             );
         },
         "tool.execute.after": async (input, output) => {
-            await hooks.magicContext?.["tool.execute.after"]?.(input, output);
+            await magicContextRuntime.magicContext?.["tool.execute.after"]?.(input, output);
         },
         "experimental.text.complete": async (input, output) => {
-            await hooks.magicContext?.["experimental.text.complete"]?.(input, output);
+            await magicContextRuntime.magicContext?.["experimental.text.complete"]?.(input, output);
         },
         config: async (config) => {
             try {

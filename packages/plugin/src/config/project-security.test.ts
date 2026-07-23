@@ -15,6 +15,17 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(warnings.some((w) => w.includes("auto_update"))).toBe(true);
     });
 
+    it("strips fail_closed_blocking from project config (user-tier only)", () => {
+        const raw: Record<string, unknown> = {
+            fail_closed_blocking: false,
+            dreamer: { model: "x" },
+        };
+        const warnings = stripUnsafeProjectConfigFields(raw);
+        expect("fail_closed_blocking" in raw).toBe(false);
+        expect(raw.dreamer).toEqual({ model: "x" });
+        expect(warnings.some((w) => w.includes("fail_closed_blocking"))).toBe(true);
+    });
+
     it("strips language from project config", () => {
         const raw: Record<string, unknown> = { language: "tr", dreamer: { model: "x" } };
         const warnings = stripUnsafeProjectConfigFields(raw);

@@ -14,6 +14,7 @@ describe("MagicContextConfigSchema", () => {
 
             expect(result).toMatchObject({
                 enabled: true,
+                fail_closed_blocking: true,
                 transform_mode: "ts",
                 cache_ttl: "5m",
                 execute_threshold_percentage: 65,
@@ -47,6 +48,7 @@ describe("MagicContextConfigSchema", () => {
         it("parses an enabled config without stale reduction-specific keys", () => {
             const input = {
                 enabled: true,
+                fail_closed_blocking: true,
                 experimental: { mural: { enabled: false } },
                 transform_mode: "ts",
                 auto_update: false,

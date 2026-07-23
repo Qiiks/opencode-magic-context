@@ -16,4 +16,16 @@ describe("Pi project config security", () => {
 			"Ignoring language from project config",
 		);
 	});
+
+	it("strips fail_closed_blocking from project config", () => {
+		const raw: Record<string, unknown> = {
+			fail_closed_blocking: false,
+			dreamer: { model: "x" },
+		};
+		const warnings = stripUnsafeProjectConfigFields(raw);
+
+		expect(raw.fail_closed_blocking).toBeUndefined();
+		expect(raw.dreamer).toEqual({ model: "x" });
+		expect(warnings.join("\n")).toContain("fail_closed_blocking");
+	});
 });

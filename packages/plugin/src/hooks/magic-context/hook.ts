@@ -39,12 +39,19 @@ import {
 } from "../../features/magic-context/project-embedding-registry";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import {
+    clearHookInitFailure,
+    recordHookInitFailure,
+} from "../../features/magic-context/fail-closed-block";
+import {
     getDatabasePersistenceError,
     getSessionsWithPendingMarker,
     isDatabasePersisted,
     openDatabase,
 } from "../../features/magic-context/storage";
-import { openDatabaseAsync } from "../../features/magic-context/storage-db";
+import {
+    getSchemaFenceRejection,
+    openDatabaseAsync,
+} from "../../features/magic-context/storage-db";
 import type { Tagger } from "../../features/magic-context/tagger";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
@@ -206,6 +213,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const contextUsageMap = new Map<string, { usage: ContextUsage; updatedAt: number }>();
     let db: Database;
     try {
+        // Clear any prior init-failure latch so a successful reopen (or a
+        // non-storage null like home-directory) does not leave a stale arm.
+        clearHookInitFailure();
         const opened = deps.openDatabaseForHook ? deps.openDatabaseForHook() : openDatabase();
         if (!opened || !isDatabasePersisted(opened)) {
             const reason =
@@ -216,6 +226,17 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 reason,
             );
             notifyMagicContextDisabled(deps.client, reason);
+            const fence = getSchemaFenceRejection();
+            recordHookInitFailure({
+                type: "storage",
+                reason: fence
+                    ? {
+                          kind: "schema_fence",
+                          persistedVersion: fence.persistedVersion,
+                          supportedVersion: fence.supportedVersion,
+                      }
+                    : { kind: "storage_failure", cause: reason },
+            });
             return null;
         }
         db = opened;
@@ -223,12 +244,19 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         const reason = getErrorMessage(error);
         log("[magic-context] hook failed to open storage; disabling feature:", error);
         notifyMagicContextDisabled(deps.client, reason);
+        clearHookInitFailure();
+        recordHookInitFailure({
+            type: "storage",
+            reason: { kind: "storage_failure", cause: reason },
+        });
         return null;
     }
 
     const projectPath = resolveProjectIdentityForSession(deps.directory);
     if (!projectPath) {
         log("[magic-context] not binding a project identity for the user's home directory");
+        clearHookInitFailure();
+        recordHookInitFailure({ type: "no_project" });
         return null;
     }
 
@@ -1307,11 +1335,17 @@ export async function createMagicContextHookAsync(
 ): Promise<ReturnType<typeof createMagicContextHook>> {
     let database: Database | null;
     try {
+        clearHookInitFailure();
         database = await openDatabaseAsync();
     } catch (error) {
         const reason = getErrorMessage(error);
         log("[magic-context] hook failed to open storage; disabling feature:", error);
         notifyMagicContextDisabled(deps.client, reason);
+        clearHookInitFailure();
+        recordHookInitFailure({
+            type: "storage",
+            reason: { kind: "storage_failure", cause: reason },
+        });
         return null;
     }
     return createMagicContextHook({

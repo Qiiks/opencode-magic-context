@@ -98,6 +98,7 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 |--------|------|---------|-------------|
 | `enabled` | `boolean` | `true` | Master toggle. |
 | `auto_update` | `boolean` | `true` | User-config-only plugin self-update toggle; project configs cannot disable it. |
+| `fail_closed_blocking` | `boolean` | `true` | User-config-only. When Magic Context cannot operate (schema fence mismatch, storage open/migration failure), block the primary-session prompt with a loud recovery error instead of silently degrading to native compaction. Set `false` only to restore the old degrade-silently behavior (not recommended). Project configs cannot set this. |
 | `language` | `string` | unset | User-config-only output language for Magic Context generated prose and primary guidance, as a 2-letter ISO 639-1 code, for example `"tr"`, `"es"`, or `"pt"`. Structural tokens stay in English. |
 | `cache_ttl` | `string` or `object` | `"5m"` | Time after a response before applying pending ops. String or per-model map. |
 | `protected_tags` | `number` (1–100) | `20` | Last N active tags immune from immediate dropping. |
@@ -112,6 +113,18 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | `keep_subagents` | `boolean` | `false` | Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success, so their full transcript stays in the host session store for inspection. Kept sessions accumulate until cleared manually — leave `false` for normal use. |
 | `todowrite` | `object` | See below | **Pi only.** Controls Magic Context's built-in `todowrite` tool and persistent task overlay. OpenCode has its own built-in `todowrite`, so this setting has no effect there. |
 | `sqlite` | `object` | See below | Per-connection SQLite tuning for Magic Context's own `context.db`. |
+
+### `fail_closed_blocking`
+
+When Magic Context is enabled but cannot open its shared database — most often a **schema fence** (another harness upgraded `context.db` past this build) or a hard storage/migration failure — the default is to **block the primary turn loudly** with both version numbers (when known) and:
+
+```bash
+npx @cortexkit/magic-context@latest doctor
+```
+
+rather than unregistering hooks and letting OpenCode/Pi native compaction run with no user-visible signal. Transient `SQLITE_BUSY` / `SQLITE_LOCKED` still pass through. Internal OpenCode agents (`title` / `summary` / `compaction`), Magic Context hidden children, and Pi subagent processes are not blocked. A healed storage open is re-probed periodically so service can resume without restart.
+
+Set `fail_closed_blocking: false` in **user config only** to restore silent degrade (not recommended). Project configs cannot set this field.
 
 ### `language`
 

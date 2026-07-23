@@ -22,10 +22,12 @@
  *   6. Drains deferred compaction markers via Pi's `appendCompaction()`
  *      surface (Pi's analogue of OpenCode's compaction-marker injection).
  *
- * Error handling: any thrown error is caught and logged, then the
+ * Error handling: ordinary thrown errors are caught and logged, then the
  * original messages pass through unmodified — the same fail-open
  * philosophy as the OpenCode `messages-transform` wrapper (see
- * AUDIT-KNOWN-ISSUES.md for the documented tradeoff).
+ * AUDIT-KNOWN-ISSUES.md for the documented tradeoff). FailClosedBlockingError
+ * is rethrown so deterministic inoperability cannot silently degrade to
+ * native compaction.
  */
 
 import * as crypto from "node:crypto";
@@ -40,6 +42,7 @@ import {
 	releaseCompartmentLease,
 	renewCompartmentLease,
 } from "@magic-context/core/features/magic-context/compartment-lease";
+import { isFailClosedBlockingError } from "@magic-context/core/features/magic-context/fail-closed-block";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
@@ -3011,6 +3014,9 @@ export function registerPiContextHandler(
 				messages: typeof event.messages;
 			};
 		} catch (err) {
+			// Loud fail-closed / emergency aborts must reach the user — do not
+			// swallow into native-compaction fallthrough.
+			if (isFailClosedBlockingError(err)) throw err;
 			const message = err instanceof Error ? err.message : String(err);
 			const stack = err instanceof Error ? err.stack : undefined;
 			log(

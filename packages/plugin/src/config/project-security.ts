@@ -190,6 +190,8 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  * Closes:
  *  - `auto_update` — a repo must not suppress plugin self-updates (which can
  *    carry security fixes).
+ *  - `fail_closed_blocking` — a repo must not un-block (or force-block) the
+ *    loud inoperability gate; only the user may restore silent degrade.
  *  - `language`: a repo must not inject prompt text through a user preference.
  *  - `sqlite` — `sqlite.cache_size_mb` / `mmap_size_mb` become PRAGMAs on the
  *    process-global shared DB handle (one connection across every project in the
@@ -216,6 +218,13 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         delete projectRaw.auto_update;
         warnings.push(
             "Ignoring auto_update from project config (security: this setting only honors user-level config).",
+        );
+    }
+
+    if ("fail_closed_blocking" in projectRaw) {
+        delete projectRaw.fail_closed_blocking;
+        warnings.push(
+            "Ignoring fail_closed_blocking from project config (security: only user-level config may disable or force the loud inoperability gate).",
         );
     }
 

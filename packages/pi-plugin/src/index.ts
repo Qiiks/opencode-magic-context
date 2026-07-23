@@ -47,7 +47,12 @@ import {
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
 import {
+	type FailClosedReason,
+	formatFailClosedBlockingMessage,
+} from "@magic-context/core/features/magic-context/fail-closed-block";
+import {
 	applySqliteTuningPragmas,
+	getSchemaFenceRejection,
 	openDatabaseAsync,
 	setSqlitePragmaConfig,
 } from "@magic-context/core/features/magic-context/storage-db";
@@ -86,6 +91,7 @@ import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import { resolveFallbackChain } from "@magic-context/core/shared/resolve-fallbacks";
 
 import { handlePiCloneSessionStart } from "./clone-inheritance";
+import { registerPiFailClosedSurface } from "./fail-closed-pi";
 import {
 	type PiSidekickConfig,
 	registerCtxAugCommand,
@@ -618,37 +624,82 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const dbPath = join(storageDir, "context.db");
 
 	let db: ContextDatabase | null | undefined;
+	let openFailureCause: string | null = null;
 	try {
 		db = await openDatabaseAsync();
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
+		openFailureCause = err instanceof Error ? err.message : String(err);
+		db = null;
+	}
+
+	// openDatabase() returns null on the schema fence (DB newer than this binary).
+	// Genuine open/migration exceptions are caught above. Either way Magic Context
+	// cannot operate — when fail_closed_blocking is on (default), register a loud
+	// blocking surface instead of silently skipping hooks (native compaction).
+	if (!db) {
+		const projectDirForConfig = process.cwd();
+		ensureConfigLocationsMigrated(projectDirForConfig);
+		const early = loadPiConfig({ cwd: projectDirForConfig });
+		if (!early.config.enabled) {
+			info("plugin DISABLED via config (enabled: false) — skipping registration");
+			return;
+		}
+		const fence = getSchemaFenceRejection();
+		const reason: FailClosedReason = fence
+			? {
+					kind: "schema_fence",
+					persistedVersion: fence.persistedVersion,
+					supportedVersion: fence.supportedVersion,
+				}
+			: {
+					kind: "storage_failure",
+					cause:
+						openFailureCause ??
+						`storage unavailable at ${dbPath} (cache schema newer than this binary, or open failed)`,
+				};
+		if (early.config.fail_closed_blocking === false) {
+			warn(
+				`Magic Context (pi) storage unavailable at ${dbPath}: ${formatFailClosedBlockingMessage(reason)}. ` +
+					"fail_closed_blocking=false — degrading silently (hooks not registered).",
+			);
+			return;
+		}
 		warn(
-			`Magic Context (pi) failed to open SQLite store at ${dbPath}: ${message}. ` +
-				"Plugin will not register hooks; storage path is unwritable or corrupt.",
+			`Magic Context (pi) storage unavailable at ${dbPath}: ${formatFailClosedBlockingMessage(reason)}`,
 		);
+		let fullRuntimeStarted = false;
+		registerPiFailClosedSurface(pi, {
+			reason,
+			tryReopen: async () => {
+				try {
+					return await openDatabaseAsync();
+				} catch {
+					return null;
+				}
+			},
+			onRecovered: async (recoveredDb) => {
+				if (fullRuntimeStarted) return;
+				fullRuntimeStarted = true;
+				await startPiMagicContextRuntime(pi, recoveredDb, dbPath);
+			},
+		});
 		return;
 	}
 
-	// openDatabase() FAILS CLOSED by returning null (not throwing) on the schema
-	// fence — when the shared cross-harness DB has been migrated to a schema newer
-	// than this binary supports (e.g. a newer OpenCode/Pi build ran a migration).
-	// The try/catch above only catches genuine open exceptions, so without this
-	// guard `db` is null and the very next call (runDeferredV22Backfill) would
-	// crash the whole Pi process. Degrade gracefully instead: skip hook
-	// registration until the binary is upgraded. The detailed reason is already
-	// logged by openDatabase ("storage fatal: … newer than this binary supports").
-	if (!db) {
-		warn(
-			`Magic Context (pi) storage unavailable at ${dbPath} (cache schema is newer than this binary supports). ` +
-				"A pinned or stale plugin is likely sharing this database with a newer instance. " +
-				"Plugin will not register hooks; run 'npx @cortexkit/magic-context@latest doctor --force' " +
-				"(or update Pi/OpenCode) and restart to recover.",
-		);
-		return;
-	}
-	// Non-null const alias: `db` is a `let` (reassigned during open), so TS
-	// won't carry the `!db` narrowing into the closures below. Capture it.
-	const database: ContextDatabase = db;
+	await startPiMagicContextRuntime(pi, db, dbPath);
+}
+
+/**
+ * Full Pi Magic Context registration after a successful storage open.
+ * Extracted so a healed re-probe from the fail-closed surface can start the
+ * runtime without requiring a process restart.
+ */
+async function startPiMagicContextRuntime(
+	pi: ExtensionAPI,
+	database: ContextDatabase,
+	dbPath: string,
+): Promise<void> {
+	const db = database;
 
 	// v22 deferred legacy-memory identity backfill. openDatabase() has already
 	// run migrations; the runner is fire-and-forget and logs failures without

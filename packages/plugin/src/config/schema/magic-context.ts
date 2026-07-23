@@ -445,6 +445,13 @@ export interface MagicContextConfig {
      *  of deleting them on success. For short-term inspection/data collection;
      *  kept sessions accumulate until manually cleared. Default false. */
     keep_subagents: boolean;
+    /**
+     * When true (default), deterministic inoperability (schema fence, storage
+     * open/migration failure) blocks the primary-session transform with a loud
+     * recovery error instead of silently falling through to native compaction.
+     * USER config only — project tier cannot set this. Not recommended to disable.
+     */
+    fail_closed_blocking: boolean;
     /** Pi-only controls for Magic Context's OpenCode-parity todowrite surface. */
     todowrite: {
         enabled: boolean;
@@ -747,6 +754,12 @@ export const MagicContextConfigSchema = z
             .default(false)
             .describe(
                 "Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect.",
+            ),
+        fail_closed_blocking: z
+            .boolean()
+            .default(true)
+            .describe(
+                "When Magic Context cannot operate (schema fence mismatch, storage open/migration failure), block the primary-session prompt with a loud recovery error instead of silently degrading to native compaction. Default true. Set false only to restore the old degrade-silently behavior (not recommended). USER-LEVEL ONLY — ignored in project config for security. Requires a restart.",
             ),
         todowrite: z
             .object({

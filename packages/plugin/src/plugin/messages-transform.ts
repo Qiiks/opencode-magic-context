@@ -1,3 +1,9 @@
+import {
+    type FailClosedController,
+    isFailClosedBlockingError,
+    resolveAgentNameFromMessages,
+    shouldBypassFailClosedBlock,
+} from "../features/magic-context/fail-closed-block";
 import { getOrCreateSessionMeta, openDatabase } from "../features/magic-context/storage";
 import {
     getOverflowState,
@@ -24,6 +30,13 @@ type MessageWithParts = {
 
 type MessagesTransformOutput = { messages: MessageWithParts[] };
 
+type MagicContextTransformHooks = {
+    "experimental.chat.messages.transform"?: (
+        input: Record<string, never>,
+        output: MessagesTransformOutput,
+    ) => Promise<void>;
+} | null;
+
 function replaceMessagesInPlace(output: MessagesTransformOutput, next: MessageWithParts[]): void {
     if (output.messages !== next) output.messages.splice(0, output.messages.length, ...next);
 }
@@ -35,6 +48,10 @@ function replaceMessagesInPlace(output: MessagesTransformOutput, next: MessageWi
  * https://github.com/cortexkit/magic-context/issues/23
  *
  * Error handling is tiered:
+ *
+ * - **FailClosedBlockingError / EmergencyFailClosedError**: Intentional loud
+ *   aborts. Rethrown so the TUI surfaces the message and the turn does not
+ *   silently fall through to native compaction.
  *
  * - **SQLITE_BUSY**: Transient, expected from concurrent plugin processes
  *   (second OpenCode instance, long dreamer/historian child session, slow
@@ -54,23 +71,47 @@ function replaceMessagesInPlace(output: MessagesTransformOutput, next: MessageWi
  *     3. Return with messages unmodified for this pass.
  *
  * Ordinary transform failures are not rethrown because OpenCode's Effect pipeline
- * turns thrown errors into user-visible prompt failures. EmergencyFailClosedError
- * is the intentional exception and is rethrown. We accept degraded behavior
- * (no injection / no drops this turn) rather than blocking the user.
+ * turns thrown errors into user-visible prompt failures. FailClosedBlockingError
+ * and EmergencyFailClosedError are the intentional exceptions and are rethrown.
+ * We accept degraded behavior (no injection / no drops this turn) rather than
+ * blocking the user for ordinary bugs — but deterministic inoperability must
+ * block loudly when fail_closed_blocking is on.
  *
  * Correctness is preserved because all persistent state mutations inside
  * the inner transform are idempotent across passes.
  */
 export function createMessagesTransformHandler(args: {
-    magicContext: {
-        "experimental.chat.messages.transform"?: (
-            input: Record<string, never>,
-            output: MessagesTransformOutput,
-        ) => Promise<void>;
-    } | null;
+    magicContext: MagicContextTransformHooks;
+    /**
+     * Optional live getter so a healed storage reopen can swap in real hooks
+     * without rebuilding the outer wrapper.
+     */
+    getMagicContext?: () => MagicContextTransformHooks;
+    failClosed?: FailClosedController | null;
+    failClosedBlockingEnabled?: boolean;
+    internalChildSessions?: Set<string>;
+    tryReopenStorage?: () => boolean | Promise<boolean>;
 }): (input: Record<string, never>, output: MessagesTransformOutput) => Promise<MessageWithParts[]> {
     return async (input, output): Promise<MessageWithParts[]> => {
         const sessionId = resolveSessionId(output);
+        const agent = resolveAgentNameFromMessages(output.messages);
+        const isInternalChild =
+            typeof sessionId === "string" &&
+            sessionId.length > 0 &&
+            args.internalChildSessions?.has(sessionId) === true;
+
+        if (args.failClosed) {
+            await args.failClosed.enforce({
+                blockingEnabled: args.failClosedBlockingEnabled !== false,
+                exempt: shouldBypassFailClosedBlock({
+                    agent,
+                    isInternalChildSession: isInternalChild,
+                }),
+                tryReopen: args.tryReopenStorage,
+            });
+        }
+
+        const magicContext = args.getMagicContext ? args.getMagicContext() : args.magicContext;
         const slotAtEntry = sessionId ? getSlot(sessionId) : undefined;
         const entry = slotAtEntry
             ? (() => {
@@ -87,10 +128,12 @@ export function createMessagesTransformHandler(args: {
               })()
             : null;
         try {
-            await args.magicContext?.["experimental.chat.messages.transform"]?.(input, output);
+            await magicContext?.["experimental.chat.messages.transform"]?.(input, output);
             return output.messages;
         } catch (error) {
-            if (error instanceof EmergencyFailClosedError) throw error;
+            if (error instanceof EmergencyFailClosedError || isFailClosedBlockingError(error)) {
+                throw error;
+            }
             if (sessionId && slotAtEntry && !entry) {
                 dropSlot(sessionId, "lkg_invalidated_reshape");
                 sessionLog(sessionId, "lkg_invalidated_reshape");
