@@ -55,8 +55,8 @@ use tokio::sync::Notify;
 use chrono::{Local, TimeZone};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use mc_store::{
-    canonical_root, validate_state_import_compartments, DeferredExecuteState, HistorianPhase,
-    InsertMemoryInput, MappingUpdate, McStore, McStoreError, ModuleDropSeedRow,
+    canonical_root, validate_state_import_compartments, AuthoritySeedRow, DeferredExecuteState,
+    HistorianPhase, InsertMemoryInput, MappingUpdate, McStore, McStoreError, ModuleDropSeedRow,
     ModuleMemoryMutationRow, ModuleMemoryRow, ModuleStateSyncError, ModuleStateSyncRequest,
     ModuleStripSeedRow, ModuleWorkspaceMemberRow, ModuleWorkspaceRow, NoteCasOutcome,
     NoteEvaluationInput, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop,
@@ -5224,8 +5224,7 @@ impl McHandler {
         let Some(rows) = request.get("rows").and_then(Value::as_array) else {
             return invalid_params_error("authority.seed requires a rows array");
         };
-        let mut seeded = 0usize;
-        let mut module_row_ids = Vec::with_capacity(rows.len());
+        let mut seed_rows = Vec::with_capacity(rows.len());
         for row in rows {
             let source_row_id = row
                 .get("source_row_id")
@@ -5246,21 +5245,24 @@ impl McHandler {
                         .to_string(),
                 };
             }
-            let module_row_id =
-                match store.seed_authority_row(context_store_uuid, domain, source_row_id, snapshot)
-                {
-                    Ok(id) => id,
-                    Err(error) => {
-                        return HandlerOutcome::Error {
-                            code: "authority_seed_failed".to_string(),
-                            message: error.to_string(),
-                        };
-                    }
-                };
-            module_row_ids.push(module_row_id);
-            seeded += 1;
+            seed_rows.push(AuthoritySeedRow {
+                source_row_id,
+                snapshot: snapshot.clone(),
+            });
         }
-        respond(json!({ "ok": true, "seeded": seeded, "module_row_ids": module_row_ids }))
+        let module_row_ids =
+            match store.seed_authority_rows(context_store_uuid, project, domain, &seed_rows) {
+                Ok(ids) => ids,
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "authority_seed_failed".to_string(),
+                        message: error.to_string(),
+                    };
+                }
+            };
+        respond(
+            json!({ "ok": true, "seeded": module_row_ids.len(), "module_row_ids": module_row_ids }),
+        )
     }
 
     fn handle_authority_drain_value(&self, request: &Value, method: &str) -> HandlerOutcome {
@@ -14020,6 +14022,55 @@ mod tests {
         )
         .await;
         assert_eq!(acked["authority"]["state"], "MODULE");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authority_seed_bad_middle_row_fails_loudly_without_partial_frame() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let checksum_before = store
+            .authority_seed_checksum("store-uuid", "/repo", "memories")
+            .unwrap();
+        let outcome = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "method": "authority.seed",
+                    "context_store_uuid": "store-uuid",
+                    "project": "/repo",
+                    "domain": "memories",
+                    "rows": [
+                        {
+                            "source_row_id": 1,
+                            "snapshot": {
+                                "id": 1,
+                                "project_path": "/repo",
+                                "content": "valid"
+                            }
+                        },
+                        {
+                            "source_row_id": 2,
+                            "snapshot": {
+                                "id": 2,
+                                "project_path": "/other",
+                                "content": "invalid project"
+                            }
+                        }
+                    ]
+                }),
+            )
+            .await;
+        let (code, message) = error_frame(outcome);
+        assert_eq!(code, "authority_seed_project_mismatch");
+        assert!(message.contains("project_path"));
+        assert_eq!(store.authority_seed_transaction_count_for_test(), 0);
+        let checksum_after = store
+            .authority_seed_checksum("store-uuid", "/repo", "memories")
+            .unwrap();
+        assert_eq!(
+            checksum_after, checksum_before,
+            "validation failure must not commit a valid prefix"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

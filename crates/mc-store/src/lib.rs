@@ -4209,6 +4209,10 @@ pub struct McStore {
     #[cfg(any(test, feature = "test-support"))]
     tag_number_query_count: std::sync::atomic::AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
+    authority_seed_transaction_count: std::sync::atomic::AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    authority_seed_resolution_pass_count: std::sync::atomic::AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
     historian_side_channel_fail_once: Mutex<BTreeSet<String>>,
 }
 
@@ -4450,6 +4454,10 @@ impl McStore {
             authority_project_resolution_fail_once: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
             tag_number_query_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            authority_seed_transaction_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            authority_seed_resolution_pass_count: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             historian_side_channel_fail_once: Mutex::new(BTreeSet::new()),
         };
@@ -10859,6 +10867,10 @@ impl McStore {
 
     /// Upsert a seeded context row by its durable source key. The source key is
     /// intentionally independent of the module's integer id allocation.
+    ///
+    /// This compatibility wrapper keeps the original one-row API for tests and older
+    /// callers. The authority wire path uses [`Self::seed_authority_rows`] so one frame
+    /// owns one fenced transaction.
     pub fn seed_authority_row(
         &self,
         context_store_uuid: &str,
@@ -10866,12 +10878,60 @@ impl McStore {
         source_row_id: i64,
         snapshot: &Value,
     ) -> Result<i64, McStoreError> {
+        let project = snapshot
+            .get("project_path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let row = AuthoritySeedRow {
+            source_row_id,
+            snapshot: snapshot.clone(),
+        };
+        self.seed_authority_rows(
+            context_store_uuid,
+            project,
+            domain,
+            std::slice::from_ref(&row),
+        )?
+        .into_iter()
+        .next()
+        .ok_or_else(|| McStoreError::Serde("authority seed returned no module row id".to_string()))
+    }
+
+    /// Seed every row in one authority wire frame under one epoch-fenced transaction.
+    ///
+    /// The transaction carries the same active store fence that each old per-row call
+    /// carried. N rows under one fence is equivalent to N fences here: seeding is a
+    /// single-writer operation per project, and the fence rejects strictly-newer epochs.
+    /// A frame is validated and committed atomically, so a bad row fails loudly without
+    /// leaving a partially applied frame behind.
+    pub fn seed_authority_rows(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        domain: &str,
+        rows: &[AuthoritySeedRow],
+    ) -> Result<Vec<i64>, McStoreError> {
         validate_authority_domain(domain)?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
         match domain {
-            "memories" => self.seed_memory_snapshot(context_store_uuid, source_row_id, snapshot),
-            "notes" => self.seed_note_snapshot(context_store_uuid, source_row_id, snapshot),
+            "memories" => self.seed_memory_snapshots(context_store_uuid, project, rows),
+            "notes" => self.seed_note_snapshots(context_store_uuid, project, rows),
             _ => unreachable!(),
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn authority_seed_transaction_count_for_test(&self) -> usize {
+        self.authority_seed_transaction_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn authority_seed_resolution_pass_count_for_test(&self) -> usize {
+        self.authority_seed_resolution_pass_count
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn authority_seed_checksum(
@@ -10905,208 +10965,313 @@ impl McStore {
         Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
     }
 
-    fn seed_memory_snapshot(
+    fn seed_memory_snapshots(
         &self,
         context_store_uuid: &str,
-        source_row_id: i64,
-        snapshot: &Value,
-    ) -> Result<i64, McStoreError> {
-        let object = snapshot.as_object().ok_or_else(|| {
-            McStoreError::Serde("memory seed snapshot must be an object".to_string())
-        })?;
-        let text = |name: &str| object.get(name).and_then(Value::as_str);
-        let integer = |name: &str| object.get(name).and_then(Value::as_i64);
-        let project = text("project_path").unwrap_or_default().to_string();
-        let snapshot_json = serde_json::to_string(snapshot)
-            .map_err(|error| McStoreError::Serde(error.to_string()))?;
-        let id = self.inner.with_conn_fenced(|tx| {
-            let target_source_row_id = integer("superseded_by_memory_id");
-            let superseded_by_memory_id = match target_source_row_id {
-                Some(target_source_row_id) => tx
-                    .query_row(
-                        "SELECT id FROM mc_memories WHERE context_store_uuid = ?1 AND context_row_id = ?2",
-                        params![context_store_uuid, target_source_row_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()?,
-                None => None,
-            };
-            tx.execute(
-                "INSERT INTO mc_memories
-                    (project_path, category, content, normalized_hash, importance, scope, shareable,
-                     source_session_id, source_type, seen_count, retrieval_count, first_seen_at,
-                     created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at,
-                     verification_status, verified_at, classified_at, superseded_by_memory_id,
-                     merged_from, metadata_json, context_store_uuid, context_row_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                         ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
-                 ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
-                    project_path=excluded.project_path, category=excluded.category,
-                    content=excluded.content, normalized_hash=excluded.normalized_hash,
-                    importance=excluded.importance, scope=excluded.scope, shareable=excluded.shareable,
-                    source_session_id=excluded.source_session_id, source_type=excluded.source_type,
-                    seen_count=excluded.seen_count, retrieval_count=excluded.retrieval_count,
-                    first_seen_at=excluded.first_seen_at, created_at=excluded.created_at,
-                    updated_at=excluded.updated_at, last_seen_at=excluded.last_seen_at,
-                    last_retrieved_at=excluded.last_retrieved_at, status=excluded.status,
-                    expires_at=excluded.expires_at, verification_status=excluded.verification_status,
-                    verified_at=excluded.verified_at, classified_at=excluded.classified_at,
-                    superseded_by_memory_id=excluded.superseded_by_memory_id,
-                    merged_from=excluded.merged_from, metadata_json=excluded.metadata_json",
-                params![
-                    project,
-                    text("category").unwrap_or_default(),
-                    text("content").unwrap_or_default(),
-                    text("normalized_hash").unwrap_or_default(),
-                    integer("importance"),
-                    text("scope").unwrap_or("project"),
-                    integer("shareable").unwrap_or(0),
-                    text("source_session_id"),
-                    text("source_type").unwrap_or("historian"),
-                    integer("seen_count").unwrap_or(1),
-                    integer("retrieval_count").unwrap_or(0),
-                    integer("first_seen_at").unwrap_or(0),
-                    integer("created_at").unwrap_or(0),
-                    integer("updated_at").unwrap_or(0),
-                    integer("last_seen_at").unwrap_or(0),
-                    integer("last_retrieved_at"),
-                    text("status").unwrap_or("active"),
-                    integer("expires_at"),
-                    text("verification_status").unwrap_or("unverified"),
-                    integer("verified_at"),
-                    integer("classified_at"),
-                    superseded_by_memory_id,
-                     text("merged_from"),
-                    text("metadata_json"),
-                    context_store_uuid,
-                    source_row_id,
-                ],
-            )?;
-            let id: i64 = tx.query_row(
-                "SELECT id FROM mc_memories WHERE context_store_uuid = ?1 AND context_row_id = ?2",
-                params![context_store_uuid, source_row_id],
-                |row| row.get(0),
-            )?;
-            match (target_source_row_id, superseded_by_memory_id) {
-                (Some(target), None) => {
-                    tx.execute(
-                        "INSERT INTO mc_authority_pending_memory_references(
-                            context_store_uuid, project, domain, source_context_row_id, target_context_row_id
-                         ) VALUES (?1, ?2, 'memories', ?3, ?4)
-                         ON CONFLICT(context_store_uuid, project, domain, source_context_row_id)
-                         DO UPDATE SET target_context_row_id = excluded.target_context_row_id",
-                        params![context_store_uuid, project, source_row_id, target],
-                    )?;
+        project: &str,
+        rows: &[AuthoritySeedRow],
+    ) -> Result<Vec<i64>, McStoreError> {
+        let prepared = rows
+            .iter()
+            .map(|row| {
+                let object = row.snapshot.as_object().ok_or_else(|| {
+                    McStoreError::Serde("memory seed snapshot must be an object".to_string())
+                })?;
+                if object.get("project_path").and_then(Value::as_str) != Some(project) {
+                    return Err(McStoreError::Serde(
+                        "memory seed snapshot project_path did not match the authority project"
+                            .to_string(),
+                    ));
                 }
-                _ => {
-                    tx.execute(
-                        "DELETE FROM mc_authority_pending_memory_references
-                          WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'
-                            AND source_context_row_id = ?3",
-                        params![context_store_uuid, project, source_row_id],
-                    )?;
-                }
-            }
-            let pending = {
-                let mut statement = tx.prepare(
-                    "SELECT source_context_row_id, target_context_row_id
-                       FROM mc_authority_pending_memory_references
-                      WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
+                let snapshot_json = serde_json::to_string(&row.snapshot)
+                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
+                let mapping_json = object
+                    .get("mapping")
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
+                Ok((row.source_row_id, snapshot_json, mapping_json))
+            })
+            .collect::<Result<Vec<_>, McStoreError>>()?;
+
+        #[cfg(any(test, feature = "test-support"))]
+        self.authority_seed_transaction_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        self.inner
+            .with_conn_fenced(|tx| {
+                let mut memory_upsert = tx.prepare(
+                    "INSERT INTO mc_memories
+                        (project_path, category, content, normalized_hash, importance, scope, shareable,
+                         source_session_id, source_type, seen_count, retrieval_count, first_seen_at,
+                         created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at,
+                         verification_status, verified_at, classified_at, superseded_by_memory_id,
+                         merged_from, metadata_json, context_store_uuid, context_row_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                             ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+                     ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
+                        project_path=excluded.project_path, category=excluded.category,
+                        content=excluded.content, normalized_hash=excluded.normalized_hash,
+                        importance=excluded.importance, scope=excluded.scope, shareable=excluded.shareable,
+                        source_session_id=excluded.source_session_id, source_type=excluded.source_type,
+                        seen_count=excluded.seen_count, retrieval_count=excluded.retrieval_count,
+                        first_seen_at=excluded.first_seen_at, created_at=excluded.created_at,
+                        updated_at=excluded.updated_at, last_seen_at=excluded.last_seen_at,
+                        last_retrieved_at=excluded.last_retrieved_at, status=excluded.status,
+                        expires_at=excluded.expires_at, verification_status=excluded.verification_status,
+                        verified_at=excluded.verified_at, classified_at=excluded.classified_at,
+                        superseded_by_memory_id=excluded.superseded_by_memory_id,
+                        merged_from=excluded.merged_from, metadata_json=excluded.metadata_json",
                 )?;
-                let rows = statement
-                    .query_map(params![context_store_uuid, project], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                rows
-            };
-            for (source, target) in pending {
-                let translated = tx
-                    .query_row(
-                        "SELECT id FROM mc_memories
-                          WHERE context_store_uuid = ?1 AND project_path = ?2 AND context_row_id = ?3",
-                        params![context_store_uuid, project, target],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()?;
-                let Some(translated) = translated else { continue };
-                tx.execute(
-                    "UPDATE mc_memories SET superseded_by_memory_id = ?1
-                      WHERE context_store_uuid = ?2 AND project_path = ?3 AND context_row_id = ?4",
-                    params![translated, context_store_uuid, project, source],
+                let mut memory_by_source = tx.prepare(
+                    "SELECT id FROM mc_memories
+                       WHERE context_store_uuid = ?1 AND project_path = ?2 AND context_row_id = ?3",
                 )?;
-                tx.execute(
+                let mut pending_upsert = tx.prepare(
+                    "INSERT INTO mc_authority_pending_memory_references(
+                         context_store_uuid, project, domain, source_context_row_id, target_context_row_id
+                     ) VALUES (?1, ?2, 'memories', ?3, ?4)
+                     ON CONFLICT(context_store_uuid, project, domain, source_context_row_id)
+                     DO UPDATE SET target_context_row_id = excluded.target_context_row_id",
+                )?;
+                let mut pending_delete = tx.prepare(
                     "DELETE FROM mc_authority_pending_memory_references
-                      WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'
-                        AND source_context_row_id = ?3",
-                    params![context_store_uuid, project, source],
+                       WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'
+                         AND source_context_row_id = ?3",
                 )?;
-            }
-            if let Some(mapping) = object.get("mapping") {
-                let mapped_files_json = serde_json::to_string(mapping)
-                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                let mut mapping_upsert = tx.prepare(
+                    "INSERT INTO mc_memory_mappings(memory_id, project_path, mapped_files_json, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(memory_id) DO UPDATE SET
+                         project_path = excluded.project_path,
+                         mapped_files_json = excluded.mapped_files_json,
+                         updated_at = excluded.updated_at",
+                )?;
+                let mut mapping_delete = tx.prepare(
+                    "DELETE FROM mc_memory_mappings WHERE memory_id = ?1",
+                )?;
+                let mut seed_row_upsert = tx.prepare(
+                    "INSERT INTO mc_authority_seed_rows(
+                         context_store_uuid, project, domain, source_row_id, snapshot_json
+                     ) VALUES (?1, ?2, 'memories', ?3, ?4)
+                     ON CONFLICT(context_store_uuid, project, domain, source_row_id)
+                     DO UPDATE SET snapshot_json = excluded.snapshot_json",
+                )?;
+                let mut module_row_ids = Vec::with_capacity(rows.len());
+
+                for ((source_row_id, snapshot_json, mapping_json), row) in prepared.iter().zip(rows) {
+                    let object = row.snapshot.as_object().expect("validated memory seed object");
+                    let text = |name: &str| object.get(name).and_then(Value::as_str);
+                    let integer = |name: &str| object.get(name).and_then(Value::as_i64);
+                    let target_source_row_id = integer("superseded_by_memory_id");
+                    let superseded_by_memory_id = match target_source_row_id {
+                        Some(target) => memory_by_source
+                            .query_row(params![context_store_uuid, project, target], |row| {
+                                row.get::<_, i64>(0)
+                            })
+                            .optional()?,
+                        None => None,
+                    };
+                    memory_upsert.execute(params![
+                        project,
+                        text("category").unwrap_or_default(),
+                        text("content").unwrap_or_default(),
+                        text("normalized_hash").unwrap_or_default(),
+                        integer("importance"),
+                        text("scope").unwrap_or("project"),
+                        integer("shareable").unwrap_or(0),
+                        text("source_session_id"),
+                        text("source_type").unwrap_or("historian"),
+                        integer("seen_count").unwrap_or(1),
+                        integer("retrieval_count").unwrap_or(0),
+                        integer("first_seen_at").unwrap_or(0),
+                        integer("created_at").unwrap_or(0),
+                        integer("updated_at").unwrap_or(0),
+                        integer("last_seen_at").unwrap_or(0),
+                        integer("last_retrieved_at"),
+                        text("status").unwrap_or("active"),
+                        integer("expires_at"),
+                        text("verification_status").unwrap_or("unverified"),
+                        integer("verified_at"),
+                        integer("classified_at"),
+                        superseded_by_memory_id,
+                        text("merged_from"),
+                        text("metadata_json"),
+                        context_store_uuid,
+                        source_row_id,
+                    ])?;
+                    let module_row_id: i64 = memory_by_source.query_row(
+                        params![context_store_uuid, project, source_row_id],
+                        |row| row.get(0),
+                    )?;
+                    if let (Some(target), None) = (target_source_row_id, superseded_by_memory_id) {
+                        pending_upsert.execute(params![
+                            context_store_uuid,
+                            project,
+                            source_row_id,
+                            target,
+                        ])?;
+                    } else {
+                        pending_delete.execute(params![context_store_uuid, project, source_row_id])?;
+                    }
+                    if let Some(mapped_files_json) = mapping_json {
+                        mapping_upsert.execute(params![
+                            module_row_id,
+                            project,
+                            mapped_files_json,
+                            integer("updated_at").unwrap_or(0),
+                        ])?;
+                    } else {
+                        mapping_delete.execute(params![module_row_id])?;
+                    }
+                    seed_row_upsert.execute(params![
+                        context_store_uuid,
+                        project,
+                        source_row_id,
+                        snapshot_json,
+                    ])?;
+                    module_row_ids.push(module_row_id);
+                }
+                drop((
+                    memory_upsert,
+                    memory_by_source,
+                    pending_upsert,
+                    pending_delete,
+                    mapping_upsert,
+                    mapping_delete,
+                    seed_row_upsert,
+                ));
+
+                // Resolve all staged forward references after the complete frame is present.
+                // The UPDATE and DELETE are one set-based pass over the pending relation; no
+                // per-memory SELECT/UPDATE loop remains on the seed hot path.
+                #[cfg(any(test, feature = "test-support"))]
+                self.authority_seed_resolution_pass_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 tx.execute(
-                    "INSERT INTO mc_memory_mappings(memory_id, project_path, mapped_files_json, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(memory_id) DO UPDATE SET project_path = excluded.project_path, mapped_files_json = excluded.mapped_files_json, updated_at = excluded.updated_at",
-                    params![id, project, mapped_files_json, integer("updated_at").unwrap_or(0)],
+                    "UPDATE mc_memories AS source
+                        SET superseded_by_memory_id = (
+                            SELECT target.id
+                              FROM mc_authority_pending_memory_references pending
+                              JOIN mc_memories target
+                                ON target.context_store_uuid = pending.context_store_uuid
+                               AND target.project_path = pending.project
+                               AND target.context_row_id = pending.target_context_row_id
+                             WHERE pending.context_store_uuid = ?1
+                               AND pending.project = ?2
+                               AND pending.domain = 'memories'
+                               AND pending.source_context_row_id = source.context_row_id
+                        )
+                      WHERE source.context_store_uuid = ?1
+                        AND source.project_path = ?2
+                        AND EXISTS (
+                            SELECT 1
+                              FROM mc_authority_pending_memory_references pending
+                              JOIN mc_memories target
+                                ON target.context_store_uuid = pending.context_store_uuid
+                               AND target.project_path = pending.project
+                               AND target.context_row_id = pending.target_context_row_id
+                             WHERE pending.context_store_uuid = ?1
+                               AND pending.project = ?2
+                               AND pending.domain = 'memories'
+                               AND pending.source_context_row_id = source.context_row_id
+                        )",
+                    params![context_store_uuid, project],
                 )?;
-            } else {
-                tx.execute("DELETE FROM mc_memory_mappings WHERE memory_id = ?1", params![id])?;
-            }
-            tx.execute(
-                "INSERT INTO mc_authority_seed_rows(context_store_uuid, project, domain, source_row_id, snapshot_json) VALUES (?1, ?2, 'memories', ?3, ?4) ON CONFLICT(context_store_uuid, project, domain, source_row_id) DO UPDATE SET snapshot_json = excluded.snapshot_json",
-                params![context_store_uuid, project, source_row_id, snapshot_json],
-            )?;
-            Ok(id)
-        })?;
-        Ok(id)
+                tx.execute(
+                    "DELETE FROM mc_authority_pending_memory_references AS pending
+                      WHERE pending.context_store_uuid = ?1
+                        AND pending.project = ?2
+                        AND pending.domain = 'memories'
+                        AND EXISTS (
+                            SELECT 1 FROM mc_memories target
+                             WHERE target.context_store_uuid = pending.context_store_uuid
+                               AND target.project_path = pending.project
+                               AND target.context_row_id = pending.target_context_row_id
+                        )",
+                    params![context_store_uuid, project],
+                )?;
+                Ok(module_row_ids)
+            })
+            .map_err(Into::into)
     }
 
-    fn seed_note_snapshot(
+    fn seed_note_snapshots(
         &self,
         context_store_uuid: &str,
-        source_row_id: i64,
-        snapshot: &Value,
-    ) -> Result<i64, McStoreError> {
-        let object = snapshot.as_object().ok_or_else(|| {
-            McStoreError::Serde("note seed snapshot must be an object".to_string())
-        })?;
-        let text = |name: &str| object.get(name).and_then(Value::as_str);
-        let integer = |name: &str| object.get(name).and_then(Value::as_i64);
-        let project = text("project_path").unwrap_or_default().to_string();
-        let snapshot_json = serde_json::to_string(snapshot)
-            .map_err(|error| McStoreError::Serde(error.to_string()))?;
-        let id = self.with_note_conn_fenced(&project, |tx| {
-            tx.execute(
-                &format!(
-"INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS}) VALUES (
-                              ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                              ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                              ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
-                     ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
-                        type=excluded.type, project_path=excluded.project_path,
-                        session_id=excluded.session_id, content=excluded.content,
-                        status=excluded.status, surface_condition=excluded.surface_condition,
-                        ready_at=excluded.ready_at, ready_reason=excluded.ready_reason,
-                        manifest_json=excluded.manifest_json, compiled_check=excluded.compiled_check,
-                        check_hash=excluded.check_hash, check_cron=excluded.check_cron,
-                        check_failure_count=excluded.check_failure_count,
-                        check_network_failure_count=excluded.check_network_failure_count,
-                        check_quarantined_until=excluded.check_quarantined_until,
-                        check_next_due_at=excluded.check_next_due_at, check_compiled_at=excluded.check_compiled_at,
-                        check_false_since_at=excluded.check_false_since_at,
-                        check_last_liveness_at=excluded.check_last_liveness_at,
-                        last_checked_at=excluded.last_checked_at, check_status=excluded.check_status,
-                        check_version=excluded.check_version, policy_version=excluded.policy_version,
-                        harness=excluded.harness, anchor_block_id=excluded.anchor_block_id,
-                        anchor_ordinal=excluded.anchor_ordinal, dismissed_at=excluded.dismissed_at,
-                        dismissal_resolution=excluded.dismissal_resolution,
-                        status_version=excluded.status_version, created_at_ms=excluded.created_at_ms,
-                        updated_at_ms=excluded.updated_at_ms"
-                ),
-                params![
-                          text("type").unwrap_or("smart"),
+        project: &str,
+        rows: &[AuthoritySeedRow],
+    ) -> Result<Vec<i64>, McStoreError> {
+        let prepared = rows
+            .iter()
+            .map(|row| {
+                let object = row.snapshot.as_object().ok_or_else(|| {
+                    McStoreError::Serde("note seed snapshot must be an object".to_string())
+                })?;
+                if object.get("project_path").and_then(Value::as_str) != Some(project) {
+                    return Err(McStoreError::Serde(
+                        "note seed snapshot project_path did not match the authority project"
+                            .to_string(),
+                    ));
+                }
+                let snapshot_json = serde_json::to_string(&row.snapshot)
+                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
+                Ok((row.source_row_id, snapshot_json))
+            })
+            .collect::<Result<Vec<_>, McStoreError>>()?;
+
+        #[cfg(any(test, feature = "test-support"))]
+        self.authority_seed_transaction_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        self.with_note_conn_fenced(project, |tx| {
+            let mut note_upsert = tx.prepare(&format!(
+                "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS}) VALUES (
+                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
+                     ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+                 ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
+                    type=excluded.type, project_path=excluded.project_path,
+                    session_id=excluded.session_id, content=excluded.content,
+                    status=excluded.status, surface_condition=excluded.surface_condition,
+                    ready_at=excluded.ready_at, ready_reason=excluded.ready_reason,
+                    manifest_json=excluded.manifest_json, compiled_check=excluded.compiled_check,
+                    check_hash=excluded.check_hash, check_cron=excluded.check_cron,
+                    check_failure_count=excluded.check_failure_count,
+                    check_network_failure_count=excluded.check_network_failure_count,
+                    check_quarantined_until=excluded.check_quarantined_until,
+                    check_next_due_at=excluded.check_next_due_at, check_compiled_at=excluded.check_compiled_at,
+                    check_false_since_at=excluded.check_false_since_at,
+                    check_last_liveness_at=excluded.check_last_liveness_at,
+                    last_checked_at=excluded.last_checked_at, check_status=excluded.check_status,
+                    check_version=excluded.check_version, policy_version=excluded.policy_version,
+                    harness=excluded.harness, anchor_block_id=excluded.anchor_block_id,
+                    anchor_ordinal=excluded.anchor_ordinal, dismissed_at=excluded.dismissed_at,
+                    dismissal_resolution=excluded.dismissal_resolution,
+                    status_version=excluded.status_version, created_at_ms=excluded.created_at_ms,
+                    updated_at_ms=excluded.updated_at_ms"
+            ))?;
+            let mut note_by_source = tx.prepare(
+                "SELECT id FROM mc_notes
+                   WHERE context_store_uuid = ?1 AND project_path = ?2 AND context_row_id = ?3",
+            )?;
+            let mut seed_row_upsert = tx.prepare(
+                "INSERT INTO mc_authority_seed_rows(
+                     context_store_uuid, project, domain, source_row_id, snapshot_json
+                 ) VALUES (?1, ?2, 'notes', ?3, ?4)
+                 ON CONFLICT(context_store_uuid, project, domain, source_row_id)
+                 DO UPDATE SET snapshot_json = excluded.snapshot_json",
+            )?;
+            let mut module_row_ids = Vec::with_capacity(rows.len());
+
+            for ((source_row_id, snapshot_json), row) in prepared.iter().zip(rows) {
+                let object = row.snapshot.as_object().expect("validated note seed object");
+                let text = |name: &str| object.get(name).and_then(Value::as_str);
+                let integer = |name: &str| object.get(name).and_then(Value::as_i64);
+                note_upsert.execute(params![
+                    text("type").unwrap_or("smart"),
                     project,
-                          text("session_id"),
+                    text("session_id"),
                     text("content").unwrap_or(""),
                     text("status").unwrap_or("active"),
                     text("surface_condition"),
@@ -11124,33 +11289,34 @@ impl McStore {
                     integer("check_false_since_at"),
                     integer("check_last_liveness_at"),
                     integer("last_checked_at"),
-                          text("check_status").unwrap_or("uncompiled"),
-                          integer("check_version").unwrap_or(0),
-                          integer("policy_version").unwrap_or(1),
+                    text("check_status").unwrap_or("uncompiled"),
+                    integer("check_version").unwrap_or(0),
+                    integer("policy_version").unwrap_or(1),
                     text("harness").unwrap_or("module"),
                     text("anchor_block_id"),
                     integer("anchor_ordinal"),
                     integer("dismissed_at"),
                     text("dismissal_resolution"),
                     integer("status_version").unwrap_or(0),
-                          integer("created_at_ms").or_else(|| integer("created_at")).unwrap_or(0),
-                          integer("updated_at_ms").or_else(|| integer("updated_at")).unwrap_or(0),
+                    integer("created_at_ms").or_else(|| integer("created_at")).unwrap_or(0),
+                    integer("updated_at_ms").or_else(|| integer("updated_at")).unwrap_or(0),
                     context_store_uuid,
                     source_row_id,
-                ],
-            )?;
-            let id = tx.query_row(
-                "SELECT id FROM mc_notes WHERE context_store_uuid = ?1 AND context_row_id = ?2",
-                params![context_store_uuid, source_row_id],
-                |row| row.get(0),
-            )?;
-            tx.execute(
-                "INSERT INTO mc_authority_seed_rows(context_store_uuid, project, domain, source_row_id, snapshot_json) VALUES (?1, ?2, 'notes', ?3, ?4) ON CONFLICT(context_store_uuid, project, domain, source_row_id) DO UPDATE SET snapshot_json = excluded.snapshot_json",
-                params![context_store_uuid, project, source_row_id, snapshot_json],
-            )?;
-            Ok(id)
-        })?;
-        Ok(id)
+                ])?;
+                let module_row_id: i64 = note_by_source.query_row(
+                    params![context_store_uuid, project, source_row_id],
+                    |row| row.get(0),
+                )?;
+                seed_row_upsert.execute(params![
+                    context_store_uuid,
+                    project,
+                    source_row_id,
+                    snapshot_json,
+                ])?;
+                module_row_ids.push(module_row_id);
+            }
+            Ok(module_row_ids)
+        })
     }
 
     /// Pull a bounded, ordered feed page. The cursor is a global feed sequence;
@@ -16994,28 +17160,406 @@ mod shadow_tests {
                 "superseded_by_memory_id": superseded_by,
             })
         };
-        let source = store
-            .seed_authority_row("store-uuid", "memories", 100, &snapshot(100, Some(200)))
+        let rows = [
+            AuthoritySeedRow {
+                source_row_id: 100,
+                snapshot: snapshot(100, Some(200)),
+            },
+            AuthoritySeedRow {
+                source_row_id: 101,
+                snapshot: snapshot(101, Some(200)),
+            },
+            AuthoritySeedRow {
+                source_row_id: 200,
+                snapshot: snapshot(200, None),
+            },
+        ];
+        let before_passes = store.authority_seed_resolution_pass_count_for_test();
+        let ids = store
+            .seed_authority_rows("store-uuid", "project", "memories", &rows)
             .unwrap();
         assert_eq!(
-            store
-                .get_memory_full(source)
-                .unwrap()
-                .unwrap()
-                .superseded_by_memory_id,
-            None,
-            "an unresolved context.db id must never be stored as a module id"
+            store.authority_seed_resolution_pass_count_for_test(),
+            before_passes + 1,
+            "a frame resolves all pending references with one set-based pass"
         );
-        let target = store
-            .seed_authority_row("store-uuid", "memories", 200, &snapshot(200, None))
+        let target = *ids.last().unwrap();
+        for source in ids.iter().take(2) {
+            assert_eq!(
+                store
+                    .get_memory_full(*source)
+                    .unwrap()
+                    .unwrap()
+                    .superseded_by_memory_id,
+                Some(target),
+                "forward references must translate to the module id"
+            );
+        }
+        let pending: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_authority_pending_memory_references",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn authority_seed_frame_uses_one_fenced_transaction_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let rows = (1..=8)
+            .map(|source_row_id| AuthoritySeedRow {
+                source_row_id,
+                snapshot: serde_json::json!({
+                    "id": source_row_id,
+                    "project_path": "project",
+                    "category": "CONSTRAINTS",
+                    "content": format!("memory {source_row_id}"),
+                    "normalized_hash": format!("h{source_row_id}"),
+                    "status": "active"
+                }),
+            })
+            .collect::<Vec<_>>();
+        let before = store.authority_seed_transaction_count_for_test();
+        let first = store
+            .seed_authority_rows("store-uuid", "project", "memories", &rows)
             .unwrap();
         assert_eq!(
+            store.authority_seed_transaction_count_for_test(),
+            before + 1,
+            "one wire frame must use one fenced transaction regardless of row count"
+        );
+        let state_before_retry = store
+            .authority_seed_checksum("store-uuid", "project", "memories")
+            .unwrap();
+        let second = store
+            .seed_authority_rows("store-uuid", "project", "memories", &rows)
+            .unwrap();
+        assert_eq!(
+            first, second,
+            "re-seeding a frame reuses source-key identities"
+        );
+        assert_eq!(
+            store.authority_seed_transaction_count_for_test(),
+            before + 2
+        );
+        assert_eq!(
             store
-                .get_memory_full(source)
+                .authority_seed_checksum("store-uuid", "project", "memories")
+                .unwrap(),
+            state_before_retry,
+            "re-seeding the same frame must be a no-op"
+        );
+        let note_rows = [
+            AuthoritySeedRow {
+                source_row_id: 900,
+                snapshot: serde_json::json!({
+                    "id": 900,
+                    "project_path": "project",
+                    "session_id": "session-a",
+                    "content": "note a",
+                    "status": "ready"
+                }),
+            },
+            AuthoritySeedRow {
+                source_row_id: 901,
+                snapshot: serde_json::json!({
+                    "id": 901,
+                    "project_path": "project",
+                    "session_id": "session-b",
+                    "content": "note b",
+                    "status": "active"
+                }),
+            },
+        ];
+        store
+            .seed_authority_rows("store-uuid", "project", "notes", &note_rows)
+            .unwrap();
+        assert_eq!(
+            store.authority_seed_transaction_count_for_test(),
+            before + 3,
+            "notes in one wire frame must also use one fenced transaction"
+        );
+    }
+
+    fn legacy_seed_memory_row(
+        store: &McStore,
+        context_store_uuid: &str,
+        source_row_id: i64,
+        snapshot: &Value,
+    ) -> i64 {
+        let object = snapshot.as_object().unwrap();
+        let text = |name: &str| object.get(name).and_then(Value::as_str);
+        let integer = |name: &str| object.get(name).and_then(Value::as_i64);
+        let project = text("project_path").unwrap_or_default().to_string();
+        let snapshot_json = serde_json::to_string(snapshot).unwrap();
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                let target_source_row_id = integer("superseded_by_memory_id");
+                let superseded_by_memory_id = match target_source_row_id {
+                    Some(target_source_row_id) => tx
+                        .query_row(
+                            "SELECT id FROM mc_memories WHERE context_store_uuid = ?1 AND context_row_id = ?2",
+                            params![context_store_uuid, target_source_row_id],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()?,
+                    None => None,
+                };
+                tx.execute(
+                    "INSERT INTO mc_memories
+                        (project_path, category, content, normalized_hash, importance, scope, shareable,
+                         source_session_id, source_type, seen_count, retrieval_count, first_seen_at,
+                         created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at,
+                         verification_status, verified_at, classified_at, superseded_by_memory_id,
+                         merged_from, metadata_json, context_store_uuid, context_row_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                             ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+                     ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
+                        project_path=excluded.project_path, category=excluded.category,
+                        content=excluded.content, normalized_hash=excluded.normalized_hash,
+                        importance=excluded.importance, scope=excluded.scope, shareable=excluded.shareable,
+                        source_session_id=excluded.source_session_id, source_type=excluded.source_type,
+                        seen_count=excluded.seen_count, retrieval_count=excluded.retrieval_count,
+                        first_seen_at=excluded.first_seen_at, created_at=excluded.created_at,
+                        updated_at=excluded.updated_at, last_seen_at=excluded.last_seen_at,
+                        last_retrieved_at=excluded.last_retrieved_at, status=excluded.status,
+                        expires_at=excluded.expires_at, verification_status=excluded.verification_status,
+                        verified_at=excluded.verified_at, classified_at=excluded.classified_at,
+                        superseded_by_memory_id=excluded.superseded_by_memory_id,
+                        merged_from=excluded.merged_from, metadata_json=excluded.metadata_json",
+                    params![
+                        project,
+                        text("category").unwrap_or_default(),
+                        text("content").unwrap_or_default(),
+                        text("normalized_hash").unwrap_or_default(),
+                        integer("importance"),
+                        text("scope").unwrap_or("project"),
+                        integer("shareable").unwrap_or(0),
+                        text("source_session_id"),
+                        text("source_type").unwrap_or("historian"),
+                        integer("seen_count").unwrap_or(1),
+                        integer("retrieval_count").unwrap_or(0),
+                        integer("first_seen_at").unwrap_or(0),
+                        integer("created_at").unwrap_or(0),
+                        integer("updated_at").unwrap_or(0),
+                        integer("last_seen_at").unwrap_or(0),
+                        integer("last_retrieved_at"),
+                        text("status").unwrap_or("active"),
+                        integer("expires_at"),
+                        text("verification_status").unwrap_or("unverified"),
+                        integer("verified_at"),
+                        integer("classified_at"),
+                        superseded_by_memory_id,
+                        text("merged_from"),
+                        text("metadata_json"),
+                        context_store_uuid,
+                        source_row_id,
+                    ],
+                )?;
+                let id: i64 = tx.query_row(
+                    "SELECT id FROM mc_memories WHERE context_store_uuid = ?1 AND context_row_id = ?2",
+                    params![context_store_uuid, source_row_id],
+                    |row| row.get(0),
+                )?;
+                match (target_source_row_id, superseded_by_memory_id) {
+                    (Some(target), None) => {
+                        tx.execute(
+                            "INSERT INTO mc_authority_pending_memory_references(
+                                context_store_uuid, project, domain, source_context_row_id, target_context_row_id
+                             ) VALUES (?1, ?2, 'memories', ?3, ?4)
+                             ON CONFLICT(context_store_uuid, project, domain, source_context_row_id)
+                             DO UPDATE SET target_context_row_id = excluded.target_context_row_id",
+                            params![context_store_uuid, project, source_row_id, target],
+                        )?;
+                    }
+                    _ => {
+                        tx.execute(
+                            "DELETE FROM mc_authority_pending_memory_references
+                              WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'
+                                AND source_context_row_id = ?3",
+                            params![context_store_uuid, project, source_row_id],
+                        )?;
+                    }
+                }
+                let pending = {
+                    let mut statement = tx.prepare(
+                        "SELECT source_context_row_id, target_context_row_id
+                           FROM mc_authority_pending_memory_references
+                          WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
+                    )?;
+                    let rows = statement
+                        .query_map(params![context_store_uuid, project], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    rows
+                };
+                for (source, target) in pending {
+                    let translated = tx
+                        .query_row(
+                            "SELECT id FROM mc_memories
+                              WHERE context_store_uuid = ?1 AND project_path = ?2 AND context_row_id = ?3",
+                            params![context_store_uuid, project, target],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()?;
+                    let Some(translated) = translated else { continue };
+                    tx.execute(
+                        "UPDATE mc_memories SET superseded_by_memory_id = ?1
+                          WHERE context_store_uuid = ?2 AND project_path = ?3 AND context_row_id = ?4",
+                        params![translated, context_store_uuid, project, source],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM mc_authority_pending_memory_references
+                          WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'
+                            AND source_context_row_id = ?3",
+                        params![context_store_uuid, project, source],
+                    )?;
+                }
+                if let Some(mapping) = object.get("mapping") {
+                    let mapped_files_json = serde_json::to_string(mapping).map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?;
+                    tx.execute(
+                        "INSERT INTO mc_memory_mappings(memory_id, project_path, mapped_files_json, updated_at)
+                         VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(memory_id) DO UPDATE SET project_path = excluded.project_path,
+                             mapped_files_json = excluded.mapped_files_json, updated_at = excluded.updated_at",
+                        params![id, project, mapped_files_json, integer("updated_at").unwrap_or(0)],
+                    )?;
+                } else {
+                    tx.execute("DELETE FROM mc_memory_mappings WHERE memory_id = ?1", params![id])?;
+                }
+                tx.execute(
+                    "INSERT INTO mc_authority_seed_rows(context_store_uuid, project, domain, source_row_id, snapshot_json)
+                     VALUES (?1, ?2, 'memories', ?3, ?4)
+                     ON CONFLICT(context_store_uuid, project, domain, source_row_id)
+                     DO UPDATE SET snapshot_json = excluded.snapshot_json",
+                    params![context_store_uuid, project, source_row_id, snapshot_json],
+                )?;
+                Ok(id)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn authority_seed_batch_matches_legacy_per_row_seed_final_state() {
+        let snapshot = |source_id: i64, superseded_by: Option<i64>| {
+            serde_json::json!({
+                "id": source_id,
+                "project_path": "project",
+                "category": "CONSTRAINTS",
+                "content": format!("memory {source_id}"),
+                "normalized_hash": format!("h{source_id}"),
+                "importance": source_id,
+                "scope": "project",
+                "shareable": 0,
+                "status": "active",
+                "superseded_by_memory_id": superseded_by,
+                "mapping": [format!("file-{source_id}")],
+                "updated_at": source_id
+            })
+        };
+        let rows = vec![
+            AuthoritySeedRow {
+                source_row_id: 100,
+                snapshot: snapshot(100, Some(200)),
+            },
+            AuthoritySeedRow {
+                source_row_id: 200,
+                snapshot: snapshot(200, None),
+            },
+        ];
+        let state = |store: &McStore| {
+            store
+                .inner
+                .with_conn(|conn| {
+                    let memories = conn
+                        .prepare(
+                            "SELECT json_object('source', context_row_id, 'project', project_path,
+                               'content', content, 'hash', normalized_hash,
+                               'importance', importance, 'target', superseded_by_memory_id,
+                               'mapping', (SELECT mapped_files_json FROM mc_memory_mappings mapping
+                                             WHERE mapping.memory_id = mc_memories.id))
+                               FROM mc_memories ORDER BY context_row_id",
+                        )?
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mappings = conn
+                        .prepare(
+                            "SELECT memory_id || ':' || project_path || ':' || mapped_files_json
+                               FROM mc_memory_mappings ORDER BY memory_id",
+                        )?
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let pending = conn
+                        .prepare(
+                            "SELECT source_context_row_id || ':' || target_context_row_id
+                               FROM mc_authority_pending_memory_references ORDER BY source_context_row_id",
+                        )?
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((memories, mappings, pending))
+                })
                 .unwrap()
-                .unwrap()
-                .superseded_by_memory_id,
-            Some(target)
+        };
+
+        let sequential_dir = tempfile::tempdir().unwrap();
+        let sequential = store(sequential_dir.path());
+        for row in &rows {
+            legacy_seed_memory_row(&sequential, "store-uuid", row.source_row_id, &row.snapshot);
+        }
+        let batch_dir = tempfile::tempdir().unwrap();
+        let batch = store(batch_dir.path());
+        batch
+            .seed_authority_rows("store-uuid", "project", "memories", &rows)
+            .unwrap();
+        assert_eq!(state(&batch), state(&sequential));
+    }
+
+    #[test]
+    fn authority_seed_batch_rejects_a_bad_row_without_partial_application() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let rows = [
+            AuthoritySeedRow {
+                source_row_id: 1,
+                snapshot: serde_json::json!({
+                    "id": 1,
+                    "project_path": "project",
+                    "content": "valid"
+                }),
+            },
+            AuthoritySeedRow {
+                source_row_id: 2,
+                snapshot: serde_json::json!({
+                    "id": 2,
+                    "project_path": "other",
+                    "content": "invalid project"
+                }),
+            },
+        ];
+        let error = store
+            .seed_authority_rows("store-uuid", "project", "memories", &rows)
+            .unwrap_err();
+        assert!(error.to_string().contains("project_path"));
+        assert_eq!(store.authority_seed_transaction_count_for_test(), 0);
+        let count: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM mc_memories", [], |row| row.get(0))
+            })
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a failed frame must not leave a valid prefix behind"
         );
     }
 

@@ -504,17 +504,31 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
                     domain,
                     rows: page,
                 });
-                for (const [index, moduleRowId] of (seedResponse.module_row_ids ?? []).entries()) {
-                    const sourceRowId = seedSourceRowId(page[index]);
-                    if (sourceRowId !== null) {
-                        rememberIdentity(
-                            args.db,
-                            domain,
-                            args.projectPath,
-                            moduleRowId,
-                            sourceRowId,
-                        );
-                    }
+                const identities = (seedResponse.module_row_ids ?? [])
+                    .map((moduleRowId, index) => ({
+                        moduleRowId,
+                        sourceRowId: seedSourceRowId(page[index]),
+                    }))
+                    .filter(
+                        (identity): identity is {
+                            moduleRowId: number;
+                            sourceRowId: number;
+                        } => identity.sourceRowId !== null,
+                    );
+                if (identities.length > 0) {
+                    // Seed identities are one response batch: keeping the SELECT+insert
+                    // sequence in one local transaction prevents one SQLite write lock per row.
+                    args.db.transaction(() => {
+                        for (const identity of identities) {
+                            rememberIdentity(
+                                args.db,
+                                domain,
+                                args.projectPath,
+                                identity.moduleRowId,
+                                identity.sourceRowId,
+                            );
+                        }
+                    }).immediate();
                 }
             }
             const digest = args.checksum?.(domain, rows) ?? checksumAuthoritySeedRows(rows);
