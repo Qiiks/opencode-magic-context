@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use serde_json::{json, Map, Value};
 
 use crate::ck_wire::{
@@ -9,8 +7,8 @@ use crate::ck_wire::{
 };
 
 use super::sidecar::{
-    meta_for_ck, stable_hash_prefix, BlockMeta, DecodeSidecar, DecodedHarnessMessages,
-    ExtractedBoundary, HarnessMessageMeta,
+    match_block_metas, meta_for_ck, stable_hash_prefix, BlockMeta, DecodeSidecar,
+    DecodedHarnessMessages, ExtractedBoundary, HarnessMessageMeta, MatchedBlockMetas,
 };
 
 pub type PiSessionEntryJson = Value;
@@ -130,9 +128,9 @@ pub fn encode_pi(messages: &[CkWireMessage], sidecar: &DecodeSidecar) -> Vec<PiS
     messages
         .iter()
         .enumerate()
-        .map(|(index, msg)| match meta_for_ck(sidecar, msg, index) {
+        .filter_map(|(index, msg)| match meta_for_ck(sidecar, msg, index) {
             Some(meta) => encode_with_meta(msg, meta),
-            None => encode_new_message(msg),
+            None => Some(encode_new_message(msg)),
         })
         .collect()
 }
@@ -362,25 +360,29 @@ fn decode_opaque_entry(
     CkIngressMessage { mid, ordinal, ck }
 }
 
-fn encode_with_meta(msg: &CkWireMessage, meta: &HarnessMessageMeta) -> Value {
+fn encode_with_meta(msg: &CkWireMessage, meta: &HarnessMessageMeta) -> Option<Value> {
     let mut raw = meta.raw.clone();
+    let matched_metas = match_block_metas(&msg.content, &meta.blocks, block_matches_meta);
     if meta.role == "toolResult" || raw.get("role").and_then(Value::as_str) == Some("toolResult") {
+        let (_, matched_meta) = msg
+            .content
+            .iter()
+            .zip(&matched_metas.by_block)
+            .find(|(block, _)| matches!(&block.kind, CkKind::ToolResult { .. }))?;
         if let Some(message) = pi_message_mut(&mut raw) {
-            update_tool_result_message(message, msg);
+            update_tool_result_message(message, msg, matched_meta.is_some());
         } else {
-            update_tool_result_message(&mut raw, msg);
+            update_tool_result_message(&mut raw, msg, matched_meta.is_some());
         }
-        return raw;
+        return Some(if raw == meta.raw {
+            meta.raw.clone()
+        } else {
+            raw
+        });
     }
 
-    let block_meta_by_index: BTreeMap<usize, &BlockMeta> = meta
-        .blocks
-        .iter()
-        .map(|block_meta| (block_meta.block_index, block_meta))
-        .collect();
-
     if let Some(message) = pi_message_mut(&mut raw) {
-        update_pi_message_content(message, msg, &block_meta_by_index);
+        update_pi_message_content(message, msg, &matched_metas);
     } else if matches!(
         msg.content.first().map(|b| &b.kind),
         Some(CkKind::Opaque(_))
@@ -388,16 +390,55 @@ fn encode_with_meta(msg: &CkWireMessage, meta: &HarnessMessageMeta) -> Value {
         if let CkKind::Opaque(opaque) = &msg.content[0].kind {
             raw = opaque.raw.clone();
         }
+    } else if msg.content.is_empty() {
+        return None;
     }
-    raw
+    Some(if raw == meta.raw {
+        meta.raw.clone()
+    } else {
+        raw
+    })
+}
+
+fn block_matches_meta(block: &CkWireBlock, meta: &BlockMeta) -> bool {
+    match &block.kind {
+        CkKind::Text { text } => {
+            meta.kind == "text"
+                || (text.is_empty()
+                    && matches!(meta.kind.as_str(), "reasoning" | "redacted_reasoning"))
+        }
+        CkKind::Reasoning { .. } => meta.kind == "reasoning",
+        CkKind::RedactedReasoning { .. } => {
+            matches!(meta.kind.as_str(), "reasoning" | "redacted_reasoning")
+        }
+        CkKind::ToolCall { id, .. } => {
+            meta.kind == "tool_call"
+                && meta.native_id.as_deref().is_none_or(|native| {
+                    let (canonical, _) = canonical_tool_id(native);
+                    canonical == id.as_str()
+                })
+        }
+        CkKind::ToolResult { id, .. } => {
+            meta.kind == "tool_result"
+                && meta.native_id.as_deref().is_none_or(|native| {
+                    let (canonical, _) = canonical_tool_id(native);
+                    canonical == id.as_str()
+                })
+        }
+        CkKind::Media(_) => meta.kind == "image",
+        CkKind::Opaque(opaque) => meta.kind == opaque.kind,
+    }
 }
 
 fn update_pi_message_content(
     message: &mut Value,
     msg: &CkWireMessage,
-    block_meta_by_index: &BTreeMap<usize, &BlockMeta>,
+    matched_metas: &MatchedBlockMetas<'_>,
 ) {
-    if msg.role == "user" && message.get("content").is_some_and(Value::is_string) {
+    if msg.role == "user"
+        && msg.content.len() == 1
+        && message.get("content").is_some_and(Value::is_string)
+    {
         if let Some(CkWireBlock {
             kind: CkKind::Text { text },
             ..
@@ -413,22 +454,30 @@ fn update_pi_message_content(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    for (block_index, block) in msg.content.iter().enumerate() {
-        if let Some(block_meta) = block_meta_by_index.get(&block_index) {
-            if let Some(part_index) = block_meta.native_index {
-                if let Some(part) = parts.get_mut(part_index) {
+    for (block, block_meta) in msg.content.iter().zip(&matched_metas.by_block) {
+        if let Some(part_index) = block_meta.and_then(|block_meta| block_meta.native_index) {
+            if let Some(part) = parts.get_mut(part_index) {
+                if !matches!(
+                    &block.kind,
+                    CkKind::Reasoning { .. } | CkKind::RedactedReasoning { .. }
+                ) {
                     update_content_part(part, block);
-                    continue;
                 }
+                continue;
             }
         }
         parts.push(render_block_as_content_part(block));
     }
+    parts = matched_metas.remove_unretained_native_parts(parts);
     set_value(message, "content", Value::Array(parts));
 }
 
-fn update_tool_result_message(raw: &mut Value, msg: &CkWireMessage) {
-    let Some(block) = msg.content.first() else {
+fn update_tool_result_message(raw: &mut Value, msg: &CkWireMessage, preserve_existing_id: bool) {
+    let Some(block) = msg
+        .content
+        .iter()
+        .find(|block| matches!(&block.kind, CkKind::ToolResult { .. }))
+    else {
         return;
     };
     if let CkKind::ToolResult {
@@ -438,7 +487,9 @@ fn update_tool_result_message(raw: &mut Value, msg: &CkWireMessage) {
         ..
     } = &block.kind
     {
-        let existing = string_field(raw, "toolCallId");
+        let existing = preserve_existing_id
+            .then(|| string_field(raw, "toolCallId"))
+            .flatten();
         set_string(raw, "role", "toolResult");
         set_string(
             raw,
@@ -524,7 +575,7 @@ fn update_content_part(part: &mut Value, block: &CkWireBlock) {
 fn encode_new_message(msg: &CkWireMessage) -> Value {
     if msg.role == "tool" {
         let mut raw = json!({ "role": "toolResult", "content": [] });
-        update_tool_result_message(&mut raw, msg);
+        update_tool_result_message(&mut raw, msg, false);
         return raw;
     }
     let role = &msg.role;
@@ -1055,6 +1106,139 @@ mod tests {
             encode_pi(&[decoded.messages[0].ck.clone()], &decoded.sidecar),
             raw
         );
+    }
+
+    #[test]
+    fn adjacent_tool_deletion_matches_the_surviving_native_id() {
+        let raw = vec![json!({
+            "role": "assistant",
+            "content": [
+                { "type": "text", "text": "head" },
+                { "type": "toolCall", "id": "call-a|item-a", "name": "first", "arguments": { "a": 1 } },
+                { "type": "toolCall", "id": "call-b|item-b", "name": "second", "arguments": { "b": 2 } },
+                { "type": "text", "text": "tail" }
+            ],
+            "api": "responses",
+            "provider": "openai",
+            "model": "gpt-test",
+            "responseId": "resp-tools",
+            "usage": {},
+            "stopReason": "toolUse",
+            "timestamp": 8
+        })];
+        let decoded = decode_pi(&raw);
+        let mut message = decoded.messages[0].ck.clone();
+        message.content.remove(1);
+
+        let encoded = encode_pi(&[message], &decoded.sidecar);
+        let content = encoded[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0], raw[0]["content"][0]);
+        assert_eq!(content[1], raw[0]["content"][2]);
+        assert_eq!(content[2], raw[0]["content"][3]);
+    }
+
+    #[test]
+    fn leading_deletion_does_not_shift_the_next_block_onto_the_removed_slot() {
+        let raw = vec![json!({
+            "role": "assistant",
+            "content": [
+                { "type": "toolCall", "id": "call-a", "name": "first", "arguments": {} },
+                { "type": "text", "text": "survivor", "textSignature": "sig-survivor" }
+            ],
+            "timestamp": 9
+        })];
+        let decoded = decode_pi(&raw);
+        let mut message = decoded.messages[0].ck.clone();
+        message.content.remove(0);
+
+        let encoded = encode_pi(&[message], &decoded.sidecar);
+        assert_eq!(encoded[0]["content"], json!([raw[0]["content"][1].clone()]));
+    }
+
+    #[test]
+    fn duplicate_kind_adjacency_removes_only_the_deleted_text() {
+        let raw = vec![json!({
+            "role": "assistant",
+            "content": [
+                { "type": "text", "text": "a" },
+                { "type": "text", "text": "b" },
+                { "type": "text", "text": "c" }
+            ],
+            "timestamp": 10
+        })];
+        let decoded = decode_pi(&raw);
+        let mut message = decoded.messages[0].ck.clone();
+        message.content.remove(1);
+
+        let encoded = encode_pi(&[message], &decoded.sidecar);
+        assert_eq!(
+            encoded[0]["content"],
+            json!([
+                { "type": "text", "text": "a" },
+                { "type": "text", "text": "c" }
+            ])
+        );
+    }
+
+    #[test]
+    fn frozen_deletion_replay_is_byte_stable() {
+        let raw = vec![json!({
+            "role": "assistant",
+            "content": [
+                { "type": "toolCall", "id": "call-a", "name": "first", "arguments": {} },
+                { "type": "toolCall", "id": "call-b", "name": "second", "arguments": {} }
+            ],
+            "timestamp": 11
+        })];
+        let decoded = decode_pi(&raw);
+        let mut message = decoded.messages[0].ck.clone();
+        message.content.remove(0);
+
+        let first = encode_pi(&[message.clone()], &decoded.sidecar);
+        let replay = encode_pi(&[message], &decoded.sidecar);
+        assert_eq!(replay, first);
+        assert_eq!(first[0]["content"], json!([raw[0]["content"][1].clone()]));
+    }
+
+    #[test]
+    fn untouched_message_replays_the_exact_retained_raw_value() {
+        let raw = vec![json!({
+            "type": "message",
+            "id": "entry-byte-identity",
+            "vendorEnvelope": { "unknown": [1, 2, 3] },
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "text",
+                    "text": "unchanged",
+                    "textSignature": "sig",
+                    "vendorPart": { "keep": true }
+                }],
+                "timestamp": 12,
+                "vendorMessage": "keep"
+            }
+        })];
+        let decoded = decode_pi(&raw);
+        let encoded = encode_pi(&[decoded.messages[0].ck.clone()], &decoded.sidecar);
+        assert_eq!(encoded, raw);
+    }
+
+    #[test]
+    fn deleted_tool_result_does_not_replay_the_retained_raw_entry() {
+        let raw = vec![json!({
+            "role": "toolResult",
+            "toolCallId": "call-a",
+            "toolName": "first",
+            "content": [{ "type": "text", "text": "done" }],
+            "isError": false,
+            "timestamp": 13
+        })];
+        let decoded = decode_pi(&raw);
+        let mut message = decoded.messages[0].ck.clone();
+        message.content.clear();
+
+        assert!(encode_pi(&[message], &decoded.sidecar).is_empty());
     }
 
     #[test]

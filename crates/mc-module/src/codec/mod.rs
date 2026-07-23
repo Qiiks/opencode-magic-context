@@ -14,7 +14,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use serde::Deserialize;
-    use serde_json::Value;
+    use serde_json::{json, Value};
 
     use crate::ck_wire::CkWireMessage;
     use crate::injection::build_synthetic_todo_pair;
@@ -159,6 +159,45 @@ mod tests {
             assert_eq!(encoded, encoded_again);
             assert_eq!(encoded, strip_pi_compaction(case.entries));
         }
+    }
+
+    #[test]
+    fn codec_conformance_removes_leading_native_blocks_without_reindex_drift() {
+        let opencode_raw = vec![json!({
+            "info": { "id": "msg-tools", "role": "assistant" },
+            "parts": [
+                {
+                    "type": "tool",
+                    "callID": "call-a",
+                    "tool": "first",
+                    "state": { "status": "pending", "input": {} }
+                },
+                { "type": "text", "text": "survivor" }
+            ]
+        })];
+        let opencode_decoded = decode_opencode(&opencode_raw);
+        let mut opencode_message = opencode_decoded.messages[0].ck.clone();
+        opencode_message.content.remove(0);
+        assert_eq!(
+            encode_opencode(&[opencode_message], &opencode_decoded.sidecar, None,)[0]["parts"],
+            json!([{ "type": "text", "text": "survivor" }])
+        );
+
+        let pi_raw = vec![json!({
+            "role": "assistant",
+            "content": [
+                { "type": "toolCall", "id": "call-a", "name": "first", "arguments": {} },
+                { "type": "text", "text": "survivor" }
+            ],
+            "timestamp": 1
+        })];
+        let pi_decoded = decode_pi(&pi_raw);
+        let mut pi_message = pi_decoded.messages[0].ck.clone();
+        pi_message.content.remove(0);
+        assert_eq!(
+            encode_pi(&[pi_message], &pi_decoded.sidecar)[0]["content"],
+            json!([{ "type": "text", "text": "survivor" }])
+        );
     }
 
     fn assert_coverage_or_recorded_missing(

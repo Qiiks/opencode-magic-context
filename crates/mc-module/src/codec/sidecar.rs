@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::ck_wire::CkIngressMessage;
+use crate::ck_wire::{CkIngressMessage, CkWireBlock};
 
 /// A decoded compaction marker from a harness transcript.
 ///
@@ -110,6 +110,60 @@ pub struct BlockMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
     pub raw: Value,
+}
+
+pub(crate) struct MatchedBlockMetas<'a> {
+    pub(crate) by_block: Vec<Option<&'a BlockMeta>>,
+    retained_native_indices: BTreeSet<usize>,
+    decoded_native_indices: BTreeSet<usize>,
+}
+
+impl MatchedBlockMetas<'_> {
+    pub(crate) fn remove_unretained_native_parts<T>(&self, parts: Vec<T>) -> Vec<T> {
+        parts
+            .into_iter()
+            .enumerate()
+            .filter_map(|(native_index, part)| {
+                let decoded_block_was_removed = self.decoded_native_indices.contains(&native_index)
+                    && !self.retained_native_indices.contains(&native_index);
+                (!decoded_block_was_removed).then_some(part)
+            })
+            .collect()
+    }
+}
+
+pub(crate) fn match_block_metas<'a>(
+    blocks: &[CkWireBlock],
+    metas: &'a [BlockMeta],
+    mut matches: impl FnMut(&CkWireBlock, &BlockMeta) -> bool,
+) -> MatchedBlockMetas<'a> {
+    let mut meta_cursor = 0;
+    let by_block = blocks
+        .iter()
+        .map(|block| {
+            let match_index = metas[meta_cursor..]
+                .iter()
+                .position(|meta| matches(block, meta))
+                .map(|offset| meta_cursor + offset);
+            if let Some(match_index) = match_index {
+                meta_cursor = match_index + 1;
+                Some(&metas[match_index])
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let retained_native_indices = by_block
+        .iter()
+        .filter_map(|meta| meta.and_then(|meta| meta.native_index))
+        .collect();
+    let decoded_native_indices = metas.iter().filter_map(|meta| meta.native_index).collect();
+
+    MatchedBlockMetas {
+        by_block,
+        retained_native_indices,
+        decoded_native_indices,
+    }
 }
 
 pub fn stable_hash(value: &Value) -> String {

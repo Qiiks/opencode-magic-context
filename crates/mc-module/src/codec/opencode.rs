@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 
@@ -9,8 +9,8 @@ use crate::ck_wire::{
 };
 
 use super::sidecar::{
-    meta_for_ck, stable_hash_prefix, BlockMeta, DecodeSidecar, DecodedHarnessMessages,
-    ExtractedBoundary, HarnessMessageMeta,
+    match_block_metas, meta_for_ck, stable_hash_prefix, BlockMeta, DecodeSidecar,
+    DecodedHarnessMessages, ExtractedBoundary, HarnessMessageMeta,
 };
 
 pub type MessageV2Json = Value;
@@ -484,34 +484,9 @@ fn encode_with_meta(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut meta_cursor = 0;
-    let matched_metas = msg
-        .content
-        .iter()
-        .map(|block| {
-            let match_index = meta.blocks[meta_cursor..]
-                .iter()
-                .position(|block_meta| block_matches_meta(block, block_meta))
-                .map(|offset| meta_cursor + offset);
-            if let Some(match_index) = match_index {
-                meta_cursor = match_index + 1;
-                Some(&meta.blocks[match_index])
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    let retained_native_indices = matched_metas
-        .iter()
-        .filter_map(|block_meta| block_meta.and_then(|block_meta| block_meta.native_index))
-        .collect::<BTreeSet<_>>();
-    let decoded_native_indices = meta
-        .blocks
-        .iter()
-        .filter_map(|block_meta| block_meta.native_index)
-        .collect::<BTreeSet<_>>();
+    let matched_metas = match_block_metas(&msg.content, &meta.blocks, block_matches_meta);
 
-    for (block, block_meta) in msg.content.iter().zip(matched_metas) {
+    for (block, block_meta) in msg.content.iter().zip(&matched_metas.by_block) {
         if let Some(part_index) = block_meta.and_then(|block_meta| block_meta.native_index) {
             if let Some(part) = parts.get_mut(part_index) {
                 // Reasoning parts may contain provider signatures, so changing their bytes could
@@ -529,15 +504,7 @@ fn encode_with_meta(
         parts.push(render_block_as_part(block));
     }
 
-    parts = parts
-        .into_iter()
-        .enumerate()
-        .filter_map(|(part_index, part)| {
-            let decoded_block_was_removed = decoded_native_indices.contains(&part_index)
-                && !retained_native_indices.contains(&part_index);
-            (!decoded_block_was_removed).then_some(part)
-        })
-        .collect();
+    parts = matched_metas.remove_unretained_native_parts(parts);
     if !preserve_compaction {
         parts.retain(|part| part.get("type").and_then(Value::as_str) != Some("compaction"));
     }
