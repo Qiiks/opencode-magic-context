@@ -2080,7 +2080,6 @@ const MIGRATIONS: &[Migration] = &[
                 tag_count = excluded.tag_count,
                 max_tag_number = excluded.max_tag_number;
         END;
->>>>>>> alfonso/task/bg_d41511b6-r12-perf-p0-session-tag-baseline-cache
     ",
     },
 ];
