@@ -2956,6 +2956,7 @@ pub struct SessionStatusSnapshot {
     pub pending_drop_count: usize,
     pub tag_count: usize,
     pub pass_trace: Option<PassTrace>,
+    pub compartment_page: Option<CompartmentPage>,
 }
 
 /// A bounded chronological page of module-owned compartments.
@@ -5750,6 +5751,7 @@ impl McStore {
     pub fn load_session_status_snapshot(
         &self,
         session_id: &str,
+        compartment_page: Option<(i64, usize)>,
     ) -> Result<SessionStatusSnapshot, McStoreError> {
         let snapshot = self.inner.with_conn(|conn| {
             let transaction = conn.unchecked_transaction()?;
@@ -5798,6 +5800,35 @@ impl McStore {
                 )
                 .map(|value| value.max(0) as usize)
             };
+            let compartment_page = compartment_page
+                .map(|(after_sequence, limit)| {
+                    let max_sequence = transaction
+                        .query_row(
+                            "SELECT MAX(sequence) FROM mc_compartments WHERE session_id = ?1",
+                            params![session_id],
+                            |row| row.get::<_, Option<i64>>(0),
+                        )?
+                        .map_or(after_sequence, |max| max.max(after_sequence));
+                    let mut statement = transaction.prepare(
+                        "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
+                                start_date, end_date, title, content, p1, p2, p3, p4, importance,
+                                episode_type, legacy, created_at
+                           FROM mc_compartments
+                          WHERE session_id = ?1 AND sequence > ?2
+                          ORDER BY sequence ASC LIMIT ?3",
+                    )?;
+                    let compartments = statement
+                        .query_map(
+                            params![session_id, after_sequence, i64::try_from(limit).unwrap_or(i64::MAX)],
+                            Self::stored_compartment_from_row,
+                        )?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok::<CompartmentPage, rusqlite::Error>(CompartmentPage {
+                        compartments,
+                        max_sequence,
+                    })
+                })
+                .transpose()?;
             let pass_trace = transaction
                 .query_row(
                     "SELECT last_received_at_ms, last_completed_at_ms, last_reject_error,
@@ -5825,6 +5856,7 @@ impl McStore {
                 pending_drop_count: count("pending_agent_drops")?,
                 tag_count: count("mc_tags")?,
                 pass_trace,
+                compartment_page,
             };
             transaction.commit()?;
             Ok(snapshot)

@@ -247,6 +247,8 @@ const SESSION_UNRESOLVED_MESSAGE: &str =
 const OPENCODE_HARNESS: &str = "opencode";
 const STATE_SYNC_SEED_MAX_ID_BYTES: usize = 128;
 const STATE_SYNC_SEED_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
+/// Release partial state-sync seeds whose sender stopped before completing the page sequence.
+const STATE_SYNC_SEED_COLLECTOR_TTL: Duration = Duration::from_secs(10 * 60);
 // These bounds apply to every live transform page so no session can bypass the
 // handler-wide staging budget.
 const TRANSFORM_PAGE_MAX_BYTES: usize = 512 * 1024;
@@ -503,6 +505,7 @@ struct PendingStateSyncSeed {
     digests: Vec<String>,
     batches: Vec<ModuleStateSyncWire>,
     bytes: usize,
+    last_activity: Instant,
 }
 
 #[derive(Debug)]
@@ -602,6 +605,23 @@ impl StateSyncSeedCoordinator {
     fn evict(&mut self, session_id: &str) {
         self.discard_pending(session_id);
         self.sessions.remove(session_id);
+    }
+
+    fn evict_stale_collectors(&mut self, now: Instant) {
+        let stale_sessions = self
+            .sessions
+            .iter()
+            .filter_map(|(session_id, session)| {
+                let StateSyncSeedPhase::Collecting(seed) = &session.phase else {
+                    return None;
+                };
+                (now.saturating_duration_since(seed.last_activity) >= STATE_SYNC_SEED_COLLECTOR_TTL)
+                    .then(|| session_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for session_id in stale_sessions {
+            self.evict(&session_id);
+        }
     }
 }
 
@@ -1822,6 +1842,8 @@ pub struct McHandler {
     #[cfg(test)]
     status_snapshot_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
+    state_sync_seed_now: Mutex<Option<Instant>>,
+    #[cfg(test)]
     classification_before_apply_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     connect_failure_commit_hook: ConnectFailureCommitHook,
     #[cfg(test)]
@@ -2242,6 +2264,8 @@ impl McHandler {
             #[cfg(test)]
             status_snapshot_hook: Mutex::new(None),
             #[cfg(test)]
+            state_sync_seed_now: Mutex::new(None),
+            #[cfg(test)]
             classification_before_apply_hook: Mutex::new(None),
             connect_failure_commit_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -2322,6 +2346,7 @@ impl McHandler {
             wrapup_operation_budget: Mutex::new(None),
             unknown_module_retry_delay: Mutex::new(None),
             status_snapshot_hook: Mutex::new(None),
+            state_sync_seed_now: Mutex::new(None),
             classification_before_apply_hook: Mutex::new(None),
             connect_failure_commit_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -4264,6 +4289,17 @@ impl McHandler {
             Some(store) => store,
             None => return store_unavailable_error(),
         };
+        let include_compartments_after_seq = match request.get("include_compartments_after_seq") {
+            Some(value) => {
+                let Some(after_sequence) = value.as_i64().filter(|value| *value >= -1) else {
+                    return invalid_params_error(
+                        "include_compartments_after_seq must be an integer >= -1",
+                    );
+                };
+                Some((after_sequence, SESSION_STATUS_COMPARTMENT_PAGE_LIMIT))
+            }
+            None => None,
+        };
         let sample_wrapup_latch = || {
             self.wrapup_sessions
                 .lock()
@@ -4272,15 +4308,16 @@ impl McHandler {
                 .map(|session| (Arc::as_ptr(&session.token) as usize, session.rounds))
         };
         let latch_before = sample_wrapup_latch();
-        let mut snapshot = match store.load_session_status_snapshot(&session_id) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return HandlerOutcome::Error {
-                    code: "store_load_failed".to_string(),
-                    message: error.to_string(),
+        let mut snapshot =
+            match store.load_session_status_snapshot(&session_id, include_compartments_after_seq) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".to_string(),
+                        message: error.to_string(),
+                    }
                 }
-            }
-        };
+            };
         #[cfg(test)]
         if let Some(hook) = self
             .status_snapshot_hook
@@ -4294,7 +4331,9 @@ impl McHandler {
         if latch_before != wrapup_latch {
             // Holding the latch mutex across SQLite I/O would block wrapup progress. A single
             // bounded re-read instead places the durable snapshot after the observed latch edge.
-            snapshot = match store.load_session_status_snapshot(&session_id) {
+            snapshot = match store
+                .load_session_status_snapshot(&session_id, include_compartments_after_seq)
+            {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     return HandlerOutcome::Error {
@@ -4310,6 +4349,7 @@ impl McHandler {
         let pending_drop_count = snapshot.pending_drop_count;
         let tag_count = snapshot.tag_count;
         let pass_trace = snapshot.pass_trace;
+        let compartment_page = snapshot.compartment_page;
         let coverage = loaded
             .meta
             .coverage_ordinal
@@ -4434,25 +4474,7 @@ impl McHandler {
                 "context_limit_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.context_limit_tokens),
             },
         });
-        if let Some(after_sequence) = request.get("include_compartments_after_seq") {
-            let Some(after_sequence) = after_sequence.as_i64().filter(|value| *value >= -1) else {
-                return invalid_params_error(
-                    "include_compartments_after_seq must be an integer >= -1",
-                );
-            };
-            let page = match store.load_compartments_after(
-                &session_id,
-                after_sequence,
-                SESSION_STATUS_COMPARTMENT_PAGE_LIMIT,
-            ) {
-                Ok(page) => page,
-                Err(error) => {
-                    return HandlerOutcome::Error {
-                        code: "store_load_failed".to_string(),
-                        message: error.to_string(),
-                    }
-                }
-            };
+        if let Some(page) = compartment_page {
             let compartments = page
                 .compartments
                 .into_iter()
@@ -6147,6 +6169,18 @@ impl McHandler {
         respond_transform(&parsed.session_id, response)
     }
 
+    fn state_sync_seed_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = *self
+            .state_sync_seed_now
+            .lock()
+            .expect("state sync seed clock mutex")
+        {
+            return now;
+        }
+        Instant::now()
+    }
+
     #[cfg(test)]
     async fn handle_transform_for_test(&self, channel: u16, request: Value) -> HandlerOutcome {
         let inbound_bytes = serde_json::to_vec(&request)
@@ -6384,6 +6418,8 @@ impl McHandler {
 
         let action = {
             let mut seeds = self.state_sync_seeds.lock().expect("state sync seed mutex");
+            let activity_at = self.state_sync_seed_now();
+            seeds.evict_stale_collectors(activity_at);
             let phase = {
                 let state = seeds.sessions.entry(binding.session.clone()).or_default();
                 std::mem::replace(&mut state.phase, StateSyncSeedPhase::Idle)
@@ -6491,6 +6527,7 @@ impl McHandler {
                                 digests: vec![digest],
                                 batches: vec![parsed],
                                 bytes: batch_bytes,
+                                last_activity: activity_at,
                             }),
                         );
                         StageAction::Ack(1)
@@ -6516,6 +6553,7 @@ impl McHandler {
                             .is_some_and(|accepted| accepted == &digest);
                         if matches {
                             let next_index = pending.next_index;
+                            pending.last_activity = activity_at;
                             seeds.set_phase(
                                 &binding.session,
                                 StateSyncSeedPhase::Collecting(pending),
@@ -6553,6 +6591,7 @@ impl McHandler {
                         }
                         pending.bytes = next_seed_bytes.unwrap_or(usize::MAX);
                         seeds.total_staged_bytes = next_total_bytes.unwrap_or(usize::MAX);
+                        pending.last_activity = activity_at;
                         pending.next_index += 1;
                         pending.digests.push(digest.clone());
                         pending.batches.push(parsed);
@@ -16820,6 +16859,19 @@ mod tests {
             )
             .unwrap();
 
+        let hook_store = Arc::clone(&store);
+        *handler
+            .status_snapshot_hook
+            .lock()
+            .expect("status snapshot hook mutex") = Some(Box::new(move || {
+            hook_store
+                .append_compartments(
+                    "ses",
+                    &[stored_comp(56, 56, 56, "m56", "appended during status")],
+                )
+                .unwrap();
+        }));
+
         let body = tool_body(handler.handle_session_status_value(
             7,
             &json!({
@@ -16830,6 +16882,7 @@ mod tests {
             }),
         ));
         let compartments = body["compartments"].as_array().unwrap();
+        assert_eq!(body["compartment_count"], json!(compartments.len() + 5),);
         assert_eq!(compartments.len(), 50);
         assert_eq!(compartments[0]["sequence"], json!(1));
         assert_eq!(compartments[49]["sequence"], json!(50));
@@ -16846,8 +16899,8 @@ mod tests {
                 "include_compartments_after_seq": 50,
             }),
         ));
-        assert_eq!(tail["compartments"].as_array().unwrap().len(), 5);
-        assert_eq!(tail["max_sequence"], json!(55));
+        assert_eq!(tail["compartments"].as_array().unwrap().len(), 6);
+        assert_eq!(tail["max_sequence"], json!(56));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -20567,6 +20620,71 @@ mod tests {
             vec!["new first", "new second", "new final"]
         );
         assert_eq!(seed_accounting(&handler), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn paged_state_sync_seed_eviction_releases_lost_sender_bytes() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) = handler_with_store(state, default_test_config());
+        let initial_now = Instant::now();
+        *handler
+            .state_sync_seed_now
+            .lock()
+            .expect("state sync seed clock mutex") = Some(initial_now);
+
+        handler.bind_route(8, binding(project.to_str().unwrap(), "dead"));
+        handler.bind_route(9, binding(project.to_str().unwrap(), "live"));
+        let dead_first = paged_seed_batch("dead", "lost", 0, 0, 0, 2, vec![]);
+        let dead_bytes = serde_json::to_vec(&dead_first).unwrap().len();
+        assert_eq!(
+            match handler.dispatch_value(8, dead_first).await {
+                HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+                other => panic!("unexpected handler outcome: {other:?}"),
+            }["next_expected_index"],
+            json!(1)
+        );
+        assert_eq!(seed_accounting(&handler), (dead_bytes, 0));
+
+        *handler
+            .state_sync_seed_now
+            .lock()
+            .expect("state sync seed clock mutex") =
+            Some(initial_now + STATE_SYNC_SEED_COLLECTOR_TTL + Duration::from_secs(1));
+        let live_first = paged_seed_batch("live", "active", 0, 0, 0, 2, vec![]);
+        let live_bytes = serde_json::to_vec(&live_first).unwrap().len();
+        assert_eq!(
+            match handler.dispatch_value(9, live_first).await {
+                HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+                other => panic!("unexpected handler outcome: {other:?}"),
+            }["next_expected_index"],
+            json!(1)
+        );
+        assert_eq!(seed_accounting(&handler), (live_bytes, 0));
+
+        let live_final = paged_seed_batch("live", "active", 0, 0, 1, 2, vec![]);
+        assert_eq!(
+            match handler.dispatch_value(9, live_final).await {
+                HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+                other => panic!("unexpected handler outcome: {other:?}"),
+            }["ok"],
+            json!(true)
+        );
+        assert_eq!(seed_accounting(&handler), (0, 0));
+
+        let fresh_dead = paged_seed_batch("dead", "fresh", 0, 0, 0, 2, vec![]);
+        let fresh_dead_bytes = serde_json::to_vec(&fresh_dead).unwrap().len();
+        assert_eq!(
+            match handler.dispatch_value(8, fresh_dead).await {
+                HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+                other => panic!("unexpected handler outcome: {other:?}"),
+            }["next_expected_index"],
+            json!(1)
+        );
+        assert_eq!(seed_accounting(&handler), (fresh_dead_bytes, 0));
+        assert_eq!(
+            store.load_active_user_memories().unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[tokio::test]
