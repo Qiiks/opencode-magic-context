@@ -79,6 +79,7 @@ function protocol(seedCalls: { bytes: number[] }): AuthorityModuleClient {
 describe("memory authority protocol", () => {
     test("historical sparse note feed rows preserve rich local columns", () => {
         const database = db();
+        const localStoreUuid = ensureContextStoreUuid(database);
         withPrivilegedWriter(database, () => {
             database
                 .prepare(
@@ -104,7 +105,7 @@ describe("memory authority protocol", () => {
                         op: "insert",
                         module_row_id: 9,
                         full_row_snapshot: {
-                            context_store_uuid: "store",
+                            context_store_uuid: localStoreUuid,
                             context_row_id: 41,
                             project_path: "/repo",
                             session_id: "session",
@@ -130,6 +131,143 @@ describe("memory authority protocol", () => {
             check_version: 7,
             policy_version: 3,
         });
+    });
+
+    test("foreign-store note ids allocate a fresh row without clobbering a local collision", () => {
+        const database = db();
+        const localStoreUuid = ensureContextStoreUuid(database);
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    "INSERT INTO notes (id, type, status, content, project_path, session_id, created_at, updated_at) VALUES (41, 'smart', 'ready', 'local note', '/repo', 'local-session', 10, 20)",
+                )
+                .run();
+        });
+
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "notes",
+                cursor: 0,
+                next_cursor: 1,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "notes",
+                        op: "insert",
+                        module_row_id: 9,
+                        full_row_snapshot: {
+                            context_store_uuid: `${localStoreUuid}-foreign`,
+                            context_row_id: 41,
+                            project_path: "/repo",
+                            session_id: "foreign-session",
+                            content: "foreign note",
+                            status: "active",
+                            created_at_ms: 30,
+                            updated_at_ms: 40,
+                        },
+                        content_hash: null,
+                    },
+                ],
+            },
+        });
+
+        expect(
+            database.prepare("SELECT id, content, session_id FROM notes ORDER BY id").all(),
+        ).toEqual([
+            { id: 41, content: "local note", session_id: "local-session" },
+            { id: 42, content: "foreign note", session_id: "foreign-session" },
+        ]);
+        expect(
+            database
+                .prepare(
+                    "SELECT context_row_id FROM mirror_identity WHERE domain = 'notes' AND module_project = '/repo' AND module_row_id = 9",
+                )
+                .get(),
+        ).toEqual({ context_row_id: 42 });
+    });
+
+    test("matching-store note ids reuse the source row and mapped tombstones remove it", () => {
+        const database = db();
+        const localStoreUuid = ensureContextStoreUuid(database);
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    "INSERT INTO notes (id, type, status, content, project_path, session_id, created_at, updated_at) VALUES (51, 'smart', 'active', 'before mirror', '/repo', 'session', 10, 20)",
+                )
+                .run();
+        });
+        const snapshot = {
+            context_store_uuid: localStoreUuid,
+            context_row_id: 51,
+            project_path: "/repo",
+            session_id: "session",
+            content: "after mirror",
+            status: "ready",
+            created_at_ms: 10,
+            updated_at_ms: 30,
+        };
+
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "notes",
+                cursor: 0,
+                next_cursor: 1,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "notes",
+                        op: "update",
+                        module_row_id: 11,
+                        full_row_snapshot: snapshot,
+                        content_hash: null,
+                    },
+                ],
+            },
+        });
+
+        expect(database.prepare("SELECT id, content FROM notes").all()).toEqual([
+            { id: 51, content: "after mirror" },
+        ]);
+        expect(
+            database
+                .prepare(
+                    "SELECT context_row_id FROM mirror_identity WHERE domain = 'notes' AND module_project = '/repo' AND module_row_id = 11",
+                )
+                .get(),
+        ).toEqual({ context_row_id: 51 });
+
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "notes",
+                cursor: 1,
+                next_cursor: 2,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 2,
+                        domain: "notes",
+                        op: "tombstone",
+                        module_row_id: 11,
+                        full_row_snapshot: snapshot,
+                        content_hash: null,
+                    },
+                ],
+            },
+        });
+
+        expect(database.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
+        expect(
+            database
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM mirror_identity WHERE domain = 'notes' AND module_project = '/repo' AND module_row_id = 11",
+                )
+                .get(),
+        ).toEqual({ count: 0 });
     });
 
     test("mapping feed rows round-trip into the verification side table", () => {

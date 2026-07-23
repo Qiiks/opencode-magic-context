@@ -1405,7 +1405,8 @@ function contextNoteId(db: Database, feed: ChangefeedRow, moduleProject: string)
     const row = feed.full_row_snapshot;
     const sourceId = rowNumber(row, "context_row_id", -1);
     const sourceUuid = rowNullableString(row, "context_store_uuid");
-    if (sourceUuid && sourceId >= 0) {
+    const localStoreUuid = getContextStoreUuid(db);
+    if (sourceUuid && sourceUuid === localStoreUuid && sourceId >= 0) {
         const existing = db
             .prepare("SELECT id FROM notes WHERE id = ? AND type = 'smart' AND project_path = ?")
             .get(sourceId, moduleProject) as { id?: number } | undefined;
