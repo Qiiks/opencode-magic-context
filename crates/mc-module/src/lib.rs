@@ -361,6 +361,9 @@ struct ModuleStateSyncWire {
     strip_seed_skipped: usize,
     #[serde(default)]
     reasoning_cleared_through_tag: Option<u64>,
+    /// Host capability for creating smart notes. Omitted means unavailable.
+    #[serde(default)]
+    note_evaluation_available: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1829,6 +1832,9 @@ pub struct McHandler {
     /// lock-free map) is appropriate because writes are rare (once per route open/close)
     /// and reads are one cheap lookup per transform.
     bindings: Mutex<HashMap<u16, SessionBinding>>,
+    /// Per-project evaluator capability asserted by the host's state-sync payload. Absence is
+    /// fail-closed so a Rust-authority smart note cannot become permanently pending.
+    note_evaluation_capabilities: Mutex<HashMap<String, bool>>,
     /// Validated transform channel → (session, route root). The root is part of provenance;
     /// a cache row for the same session cannot authenticate a facade opened on another root.
     transform_route_channels: Mutex<HashMap<u16, (String, PathBuf)>>,
@@ -2238,6 +2244,7 @@ impl McHandler {
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
+            note_evaluation_capabilities: Mutex::new(HashMap::new()),
             transform_route_channels: Mutex::new(HashMap::new()),
             transform_session_roots: Mutex::new(HashMap::new()),
             state_sync_seeds: Mutex::new(StateSyncSeedCoordinator::default()),
@@ -2316,6 +2323,7 @@ impl McHandler {
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
+            note_evaluation_capabilities: Mutex::new(HashMap::new()),
             transform_route_channels: Mutex::new(HashMap::new()),
             transform_session_roots: Mutex::new(HashMap::new()),
             state_sync_seeds: Mutex::new(StateSyncSeedCoordinator::default()),
@@ -2340,10 +2348,14 @@ impl McHandler {
                 let still_bound = bindings
                     .values()
                     .any(|candidate| candidate.session == previous.session);
-                (!still_bound).then_some(previous.session)
+                (!still_bound).then_some(previous)
             })
         };
-        if let Some(session_id) = replacement {
+        if let Some(previous) = replacement.as_ref() {
+            self.clear_note_evaluation_capability_if_unbound(&previous.project_root);
+        }
+        let replacement_session = replacement.map(|previous| previous.session);
+        if let Some(session_id) = replacement_session {
             self.state_sync_seeds
                 .lock()
                 .expect("state sync seed mutex")
@@ -2368,6 +2380,45 @@ impl McHandler {
                 .lock()
                 .expect("boundary token cache mutex")
                 .remove(&session_id);
+        }
+    }
+
+    fn note_evaluation_capability_key(project_root: &Path) -> String {
+        canonical_root(project_root).to_string_lossy().into_owned()
+    }
+
+    fn set_note_evaluation_capability(&self, project_root: &Path, available: bool) {
+        self.note_evaluation_capabilities
+            .lock()
+            .expect("note evaluation capability mutex")
+            .insert(
+                Self::note_evaluation_capability_key(project_root),
+                available,
+            );
+    }
+
+    fn note_evaluation_capability(&self, project_root: &Path) -> bool {
+        self.note_evaluation_capabilities
+            .lock()
+            .expect("note evaluation capability mutex")
+            .get(&Self::note_evaluation_capability_key(project_root))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn clear_note_evaluation_capability_if_unbound(&self, project_root: &Path) {
+        let key = Self::note_evaluation_capability_key(project_root);
+        let still_bound = self
+            .bindings
+            .lock()
+            .expect("bindings mutex")
+            .values()
+            .any(|binding| Self::note_evaluation_capability_key(&binding.project_root) == key);
+        if !still_bound {
+            self.note_evaluation_capabilities
+                .lock()
+                .expect("note evaluation capability mutex")
+                .remove(&key);
         }
     }
 
@@ -2460,15 +2511,23 @@ impl McHandler {
             .lock()
             .expect("transform route channels mutex")
             .remove(&channel);
-        let last_session_route = {
+        let (removed_root, last_session_route) = {
             let mut bindings = self.bindings.lock().expect("bindings mutex");
-            bindings.remove(&channel).and_then(|binding| {
+            let removed = bindings.remove(&channel);
+            let last_session_route = removed.as_ref().and_then(|binding| {
                 let still_bound = bindings
                     .values()
                     .any(|candidate| candidate.session == binding.session);
-                (!still_bound).then_some(binding.session)
-            })
+                (!still_bound).then_some(binding.session.clone())
+            });
+            (
+                removed.map(|binding| binding.project_root),
+                last_session_route,
+            )
         };
+        if let Some(root) = removed_root {
+            self.clear_note_evaluation_capability_if_unbound(&root);
+        }
         if let Some(session) = last_session_route {
             if session.starts_with("mc-dreamer:") {
                 self.unregister_dreamer_run(&session);
@@ -6589,6 +6648,7 @@ impl McHandler {
         store: &McStore,
         mut parsed: ModuleStateSyncWire,
     ) -> HandlerOutcome {
+        let note_evaluation_available = parsed.note_evaluation_available.unwrap_or(false);
         let user_profile_present = parsed.user_profile.is_some();
         let user_profile = parsed.user_profile.take().unwrap_or_default();
         let workspace_present = parsed.workspace.is_some();
@@ -6755,22 +6815,28 @@ impl McHandler {
             user_profile_version: parsed.user_profile_version,
             acked_watermarks,
         }) {
-            Ok(result) => respond(json!({
-                "ok": true,
-                "shadow_generation": result.shadow_generation,
-                "shadow_seq": result.shadow_seq,
-                "row_version": result.row_version,
-                "memories_skipped": result.memories_skipped,
-                "drop_seeds_skipped": result.drop_seeds_skipped,
-                "pending_agent_drops_seeded": result.pending_agent_drops_seeded,
-                "pending_agent_drops_skipped": result.pending_agent_drops_skipped,
-                "user_hint_seeds_seeded": result.user_hint_seeds_seeded,
-                "auto_search_hint_skipped": result.auto_search_hint_skipped,
-                "note_nudge_anchors_seeded": result.note_nudge_anchors_seeded,
-                "todo_synthetic_anchor_seeded": result.todo_synthetic_anchor_seeded,
-                "emergency_latches_seeded": result.emergency_latches_seeded,
-                "strip_seeds_skipped": result.strip_seeds_skipped,
-            })),
+            Ok(result) => {
+                self.set_note_evaluation_capability(
+                    &binding.project_root,
+                    note_evaluation_available,
+                );
+                respond(json!({
+                    "ok": true,
+                    "shadow_generation": result.shadow_generation,
+                    "shadow_seq": result.shadow_seq,
+                    "row_version": result.row_version,
+                    "memories_skipped": result.memories_skipped,
+                    "drop_seeds_skipped": result.drop_seeds_skipped,
+                    "pending_agent_drops_seeded": result.pending_agent_drops_seeded,
+                    "pending_agent_drops_skipped": result.pending_agent_drops_skipped,
+                    "user_hint_seeds_seeded": result.user_hint_seeds_seeded,
+                    "auto_search_hint_skipped": result.auto_search_hint_skipped,
+                    "note_nudge_anchors_seeded": result.note_nudge_anchors_seeded,
+                    "todo_synthetic_anchor_seeded": result.todo_synthetic_anchor_seeded,
+                    "emergency_latches_seeded": result.emergency_latches_seeded,
+                    "strip_seeds_skipped": result.strip_seeds_skipped,
+                }))
+            }
             Err(ModuleStateSyncError::GenerationMismatch { expected, found }) => {
                 HandlerOutcome::Error {
                     code: "state_sync_generation_mismatch".to_string(),
@@ -8096,16 +8162,41 @@ impl McHandler {
                 "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
             );
         }
-        let compartments = match store.load_compartments(session_id) {
+        let last_compacted_ordinal = match store.last_compacted_ordinal(session_id) {
+            Ok(ordinal) => ordinal,
+            Err(error) => return tool_error_result(format!("Error: {error}")),
+        };
+        if last_compacted_ordinal < start {
+            return mcp_text_result(
+                format!(
+                    "No compacted compartments found in range {start}-{end}. The range may be live tail, outside this session's history, or compacted before transcript capture."
+                ),
+                false,
+            );
+        }
+        let bounded_end = end
+            .min(last_compacted_ordinal)
+            .min(start.saturating_add(CTX_EXPAND_MAX_ORDINAL_SPAN - 1));
+        let compartments = match store.load_compartments_for_range(
+            session_id,
+            start,
+            bounded_end,
+            CTX_EXPAND_MAX_ROWS,
+        ) {
             Ok(compartments) => compartments,
             Err(error) => return tool_error_result(format!("Error: {error}")),
         };
-        let transcripts = match store.load_chunk_transcripts_for_range(session_id, start, end) {
+        let transcripts = match store.load_chunk_transcripts_for_range_bounded(
+            session_id,
+            start,
+            bounded_end,
+            CTX_EXPAND_MAX_ROWS,
+        ) {
             Ok(transcripts) => transcripts,
             Err(error) => return tool_error_result(format!("Error: {error}")),
         };
         mcp_text_result(
-            render_range_expand(start, end, &compartments, &transcripts),
+            render_range_expand(start, bounded_end, &compartments, &transcripts),
             false,
         )
     }
@@ -8307,6 +8398,13 @@ impl McHandler {
                 let condition = string_arg(args, "surface_condition")
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
+                if condition.is_some()
+                    && !self.note_evaluation_capability(Path::new(&facade_scope.route_project_root))
+                {
+                    return tool_error_result(
+                        "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not written.",
+                    );
+                }
                 if let Some(condition) = condition {
                     match store.with_facade_mutation(
                         facade_scope.route_project_root.as_str(),
@@ -9226,6 +9324,10 @@ fn assemble_state_sync_seed(
     generation: u64,
     expected_seq: u64,
 ) -> ModuleStateSyncWire {
+    let batched_note_evaluation_available = batches
+        .iter()
+        .rev()
+        .find_map(|batch| batch.note_evaluation_available);
     let mut final_batch = batches.pop().expect("final seed batch");
     let mut compartments = Vec::new();
     let mut memories = Vec::new();
@@ -9303,6 +9405,9 @@ fn assemble_state_sync_seed(
         strip_seeds,
         strip_seed_skipped: final_batch.strip_seed_skipped,
         reasoning_cleared_through_tag: final_batch.reasoning_cleared_through_tag,
+        note_evaluation_available: final_batch
+            .note_evaluation_available
+            .or(batched_note_evaluation_available),
     }
 }
 
@@ -9420,6 +9525,9 @@ const MAX_SHORT_FIELD_BYTES: usize = 4 * 1024;
 const MAX_QUERY_BYTES: usize = 1024;
 const MAX_MEMORY_IDS: usize = 100;
 const CTX_EXPAND_BYTE_BUDGET: usize = 15_000 * 4;
+const CTX_EXPAND_MAX_ORDINAL_SPAN: i64 = 10_000;
+const CTX_EXPAND_MAX_ROWS: usize = 64;
+const CTX_EXPAND_TRUNCATION_MARKER: &str = "\n\n[truncated at the ~15,000-token ctx_expand budget]";
 /// Accepted write categories — the canonical V2 taxonomy, single-sourced from the
 /// renderer's category order so the facade and the render path never disagree.
 use crate::memory_render::MEMORY_CATEGORY_ORDER as MEMORY_CATEGORIES;
@@ -9521,13 +9629,36 @@ fn truncate_expand_output(mut output: String) -> String {
     if output.len() <= CTX_EXPAND_BYTE_BUDGET {
         return output;
     }
-    let mut boundary = CTX_EXPAND_BYTE_BUDGET;
+    let mut boundary = CTX_EXPAND_BYTE_BUDGET.saturating_sub(CTX_EXPAND_TRUNCATION_MARKER.len());
     while !output.is_char_boundary(boundary) {
         boundary -= 1;
     }
     output.truncate(boundary);
-    output.push_str("\n\n[truncated at the ~15,000-token ctx_expand budget]");
+    output.push_str(CTX_EXPAND_TRUNCATION_MARKER);
     output
+}
+
+fn append_expand_piece(output: &mut String, piece: &str) -> bool {
+    if output.len().saturating_add(piece.len()) <= CTX_EXPAND_BYTE_BUDGET {
+        output.push_str(piece);
+        return true;
+    }
+    let available = CTX_EXPAND_BYTE_BUDGET.saturating_sub(
+        output
+            .len()
+            .saturating_add(CTX_EXPAND_TRUNCATION_MARKER.len()),
+    );
+    let mut boundary = piece.len().min(available);
+    while !piece.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    output.push_str(&piece[..boundary]);
+    output.push_str(CTX_EXPAND_TRUNCATION_MARKER);
+    false
+}
+
+fn append_expand_line(output: &mut String, line: &str) -> bool {
+    append_expand_piece(output, line) && append_expand_piece(output, "\n")
 }
 
 fn render_message_expand(row: StoredChunkTranscript, message: i64) -> String {
@@ -9565,29 +9696,32 @@ fn render_range_expand(
             "No compacted compartments found in range {start}-{end}. The range may be live tail, outside this session's history, or compacted before transcript capture."
         );
     }
-    let mut lines = vec![format!(
-        "Messages {start}-{end} from persisted historian chunk transcripts:"
-    )];
+
+    let mut output = format!("Messages {start}-{end} from persisted historian chunk transcripts:");
     for compartment in matching {
-        lines.push(String::new());
-        lines.push(format!(
-            "### Compartment {} ({}-{})",
-            compartment.sequence, compartment.start_message, compartment.end_message
-        ));
-        match transcripts
+        if !append_expand_piece(&mut output, "\n\n")
+            || !append_expand_line(
+                &mut output,
+                &format!(
+                    "### Compartment {} ({}-{})",
+                    compartment.sequence, compartment.start_message, compartment.end_message
+                ),
+            )
+        {
+            break;
+        }
+        let transcript = transcripts
             .iter()
             .find(|row| row.compartment_seq == compartment.sequence)
-        {
-            Some(row) => lines.push(row.transcript.clone().unwrap_or_else(|| {
-                "[no longer recoverable: transcript bytes could not be decompressed]".to_string()
-            })),
-            None => lines.push(
-                "[no longer recoverable: this compartment transcript was evicted or was not recorded]"
-                    .to_string(),
-            ),
+            .and_then(|row| row.transcript.as_deref())
+            .unwrap_or(
+                "[no longer recoverable: this compartment transcript was evicted or was not recorded]",
+            );
+        if !append_expand_piece(&mut output, transcript) {
+            break;
         }
     }
-    truncate_expand_output(lines.join("\n"))
+    truncate_expand_output(output)
 }
 
 fn render_notes(
@@ -12935,6 +13069,75 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn smart_note_writes_require_the_host_evaluator_capability() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, _store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let refused = call_facade(
+            &handler,
+            "ctx_note",
+            json!({
+                "action": "write",
+                "content": "pending without evaluator",
+                "surface_condition": "when evaluated",
+            }),
+        )
+        .await;
+        let refused_text = tool_text(refused);
+        assert!(refused_text.contains("Smart-note evaluation is unavailable"));
+
+        let plain = call_facade(
+            &handler,
+            "ctx_note",
+            json!({"action": "write", "content": "plain note is allowed"}),
+        )
+        .await;
+        assert!(!tool_is_error(plain));
+
+        let state_sync = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "method": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "acked_watermarks": {},
+                    "note_evaluation_available": true,
+                }),
+            )
+            .await;
+        assert!(
+            matches!(state_sync, HandlerOutcome::Response(_)),
+            "{state_sync:?}"
+        );
+
+        let accepted = call_facade(
+            &handler,
+            "ctx_note",
+            json!({
+                "action": "write",
+                "content": "smart note with evaluator",
+                "surface_condition": "when evaluated",
+            }),
+        )
+        .await;
+        let accepted_text = tool_text(accepted);
+        assert!(accepted_text.contains("Created smart note"));
+
+        let plain_with_capability = call_facade(
+            &handler,
+            "ctx_note",
+            json!({"action": "write", "content": "plain note still works"}),
+        )
+        .await;
+        assert!(!tool_is_error(plain_with_capability));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn ctx_expand_and_ctx_note_facades_are_session_scoped() {
         let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
         let (handler, store, _dir, project) = handler_with_store_and_resolver(
@@ -13000,10 +13203,33 @@ mod tests {
             })
             .unwrap();
 
+        let state_sync = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "method": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "acked_watermarks": {},
+                    "note_evaluation_available": true,
+                }),
+            )
+            .await;
+        assert!(
+            matches!(state_sync, HandlerOutcome::Response(_)),
+            "{state_sync:?}"
+        );
+
         let expanded =
             tool_text(call_facade(&handler, "ctx_expand", json!({"start": 10, "end": 12})).await);
         assert!(expanded.contains("Compartment 1 (10-12)"));
         assert!(expanded.contains("U: exact prompt text"));
+        let giant_range = tool_text(
+            call_facade(&handler, "ctx_expand", json!({"start": 1, "end": i64::MAX})).await,
+        );
+        assert!(giant_range.contains("Messages 1-12"));
+        assert!(giant_range.len() <= CTX_EXPAND_BYTE_BUDGET);
         let message = tool_text(call_facade(&handler, "ctx_expand", json!({"message": 11})).await);
         assert!(message.contains("chunk-builder view"));
 

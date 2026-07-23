@@ -22,7 +22,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::{Read, Write};
+use std::io::{Cursor, Error, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -393,6 +393,10 @@ const NS: &str = "mc_cache";
 /// Sentinel row_version meaning "no row present" (COALESCE default inside the txn).
 const NO_ROW: i64 = -1;
 const MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES: usize = 256 * 1024;
+/// Cap decompression so a small compressed row cannot allocate an unbounded transcript.
+const MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES: usize = 512 * 1024;
+const CHUNK_TRANSCRIPT_TRUNCATION_MARKER: &str =
+    "\n[truncated: transcript exceeded the inflated-byte limit]";
 const MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES: i64 = 8 * 1024 * 1024;
 
 fn current_time_ms() -> i64 {
@@ -7150,6 +7154,59 @@ impl McStore {
         Ok(rows)
     }
 
+    /// Return the newest ordinal covered by a persisted compacted compartment.
+    pub fn last_compacted_ordinal(&self, session_id: &str) -> Result<i64, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COALESCE(MAX(end_message), 0)
+                       FROM mc_compartments
+                      WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+            })
+            .map_err(Into::into)
+    }
+
+    /// Read only the compacted rows intersecting a range. The SQL limit is intentional: facade
+    /// expansion must not materialize every historical compartment before applying its response
+    /// budget.
+    pub fn load_compartments_for_range(
+        &self,
+        session_id: &str,
+        start: i64,
+        end: i64,
+        limit: usize,
+    ) -> Result<Vec<StoredCompartment>, McStoreError> {
+        if limit == 0 || start > end {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.inner
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
+                            start_date, end_date, title, content, p1, p2, p3, p4, importance,
+                            episode_type, legacy, created_at
+                       FROM mc_compartments
+                      WHERE session_id = ?1
+                        AND end_message >= ?2
+                        AND start_message <= ?3
+                      ORDER BY sequence ASC
+                      LIMIT ?4",
+                )?;
+                let mapped = stmt
+                    .query_map(
+                        params![session_id, start, end, limit],
+                        Self::stored_compartment_from_row,
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(mapped)
+            })
+            .map_err(Into::into)
+    }
+
     /// Read the next chronological compartment page and the highest sequence currently
     /// published for the session. The caller supplies the protocol page cap.
     pub fn load_compartments_after(
@@ -9185,6 +9242,23 @@ impl McStore {
         start: i64,
         end: i64,
     ) -> Result<Vec<StoredChunkTranscript>, McStoreError> {
+        self.load_chunk_transcripts_for_range_bounded(session_id, start, end, usize::MAX)
+    }
+
+    /// Read and decompress at most `limit` transcript rows. Callers serving bounded responses
+    /// should use this variant so the database query and decompression work are bounded before
+    /// rendering starts.
+    pub fn load_chunk_transcripts_for_range_bounded(
+        &self,
+        session_id: &str,
+        start: i64,
+        end: i64,
+        limit: usize,
+    ) -> Result<Vec<StoredChunkTranscript>, McStoreError> {
+        if limit == 0 || start > end {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT compartment_seq, start_ordinal, end_ordinal, transcript_deflate, created_at_ms
@@ -9192,10 +9266,11 @@ impl McStore {
                   WHERE session_id = ?1
                     AND end_ordinal >= ?2
                     AND start_ordinal <= ?3
-                  ORDER BY compartment_seq ASC",
+                  ORDER BY compartment_seq ASC
+                  LIMIT ?4",
             )?;
             let mapped = stmt
-                .query_map(params![session_id, start, end], |r| {
+                .query_map(params![session_id, start, end, limit], |r| {
                     let blob: Vec<u8> = r.get(3)?;
                     Ok(StoredChunkTranscript {
                         compartment_seq: r.get(0)?,
@@ -10082,7 +10157,7 @@ impl McStore {
     pub fn search_notes_like(
         &self,
         project_path: &str,
-        _session_id: &str,
+        session_id: &str,
         query: &str,
     ) -> Result<Vec<StoredNoteSearchRow>, McStoreError> {
         if query.trim().is_empty() {
@@ -10093,14 +10168,15 @@ impl McStore {
             let mut stmt = conn.prepare(
                 "SELECT id, content, status, surface_condition, updated_at_ms
                    FROM mc_notes
-                   WHERE project_path = ?1
-                     AND (LOWER(content) LIKE ?2 ESCAPE '\\'
-                       OR LOWER(COALESCE(surface_condition, '')) LIKE ?2 ESCAPE '\\')
+                  WHERE project_path = ?1
+                    AND (type = 'smart' OR session_id = ?3)
+                    AND (LOWER(content) LIKE ?2 ESCAPE '\\'
+                      OR LOWER(COALESCE(surface_condition, '')) LIKE ?2 ESCAPE '\\')
                   ORDER BY updated_at_ms DESC, id DESC
                   LIMIT 100",
             )?;
             let mapped = stmt
-                .query_map(params![project_path, pattern], |r| {
+                .query_map(params![project_path, pattern, session_id], |r| {
                     Ok(StoredNoteSearchRow {
                         id: r.get(0)?,
                         content: r.get(1)?,
@@ -12112,9 +12188,44 @@ fn compress_transcript(transcript: &str) -> std::io::Result<Vec<u8>> {
 }
 
 fn decompress_transcript(blob: &[u8]) -> std::io::Result<String> {
-    let mut decoder = DeflateDecoder::new(blob);
+    let decoder = DeflateDecoder::new(blob);
+    // Read only a small suffix beyond the output cap so a UTF-8 code point split at the cap can
+    // be discarded cleanly without allowing the decompressor to grow an unbounded buffer.
+    let mut limited = decoder.take((MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES + 4) as u64);
+    let mut inflated_prefix = Vec::new();
+    limited.read_to_end(&mut inflated_prefix)?;
+    let valid_len = match std::str::from_utf8(&inflated_prefix) {
+        Ok(_) => inflated_prefix.len(),
+        Err(error)
+            if error.valid_up_to() >= MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES.saturating_sub(4) =>
+        {
+            error.valid_up_to()
+        }
+        Err(error) => {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "transcript is not valid UTF-8 at byte {}",
+                    error.valid_up_to()
+                ),
+            ));
+        }
+    };
+    let mut output_len = valid_len.min(MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES);
+    while std::str::from_utf8(&inflated_prefix[..output_len]).is_err() {
+        output_len -= 1;
+    }
+    let truncated = output_len < inflated_prefix.len()
+        || inflated_prefix.len() > MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES;
+    let mut reader = Cursor::new(&inflated_prefix[..output_len])
+        .take(MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES as u64);
     let mut out = String::new();
-    decoder.read_to_string(&mut out)?;
+    reader.read_to_string(&mut out)?;
+    if !truncated {
+        return Ok(out);
+    }
+
+    out.push_str(CHUNK_TRANSCRIPT_TRUNCATION_MARKER);
     Ok(out)
 }
 
@@ -15708,6 +15819,178 @@ mod tests {
             .load_chunk_transcripts_for_range("ses", 10, 21)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn bounded_transcript_reads_limit_rows_and_inflated_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        store
+            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .unwrap();
+        let compartments = (0..8)
+            .map(|index| StoredCompartment {
+                start_message: 10 + index * 2,
+                end_message: 11 + index * 2,
+                end_message_id: format!("m{}", 11 + index * 2),
+                title: format!("bounded {index}"),
+                content: "summary".to_string(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let expected = store.load("ses").unwrap().row_version;
+        store
+            .publish_historian_chunk(HistorianPublishRequest {
+                session_id: "ses",
+                expected_row_version: expected,
+                expected_revert_epoch: 0,
+                predicate: &publish_predicate(),
+                project_path: "git:proj",
+                compartments: &compartments,
+                facts: &[],
+                promote_facts: true,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
+                publication_floor_ordinal: 25,
+                chunk_transcript: Some("U: bounded row"),
+            })
+            .unwrap();
+
+        assert_eq!(store.last_compacted_ordinal("ses").unwrap(), 25);
+        assert_eq!(
+            store
+                .load_compartments_for_range("ses", 1, 100, 3)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            store
+                .load_chunk_transcripts_for_range_bounded("ses", 1, 100, 3)
+                .unwrap()
+                .len(),
+            3
+        );
+
+        let oversized = "a🙂".repeat(MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES / 5 + 100_000);
+        assert!(
+            compress_transcript(&oversized).unwrap().len() < MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES
+        );
+        let loaded = store.load("ses").unwrap();
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &publishing_meta())
+            .unwrap();
+        let expected = store.load("ses").unwrap().row_version;
+        store
+            .publish_historian_chunk(HistorianPublishRequest {
+                session_id: "ses",
+                expected_row_version: expected,
+                expected_revert_epoch: 0,
+                predicate: &publish_predicate(),
+                project_path: "git:proj",
+                compartments: &[StoredCompartment {
+                    start_message: 100,
+                    end_message: 101,
+                    end_message_id: "m101".to_string(),
+                    title: "inflated".to_string(),
+                    content: "summary".to_string(),
+                    ..Default::default()
+                }],
+                facts: &[],
+                promote_facts: true,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
+                publication_floor_ordinal: 101,
+                chunk_transcript: Some(&oversized),
+            })
+            .unwrap();
+        let transcript = store
+            .load_chunk_transcripts_for_range("ses", 100, 101)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .transcript
+            .unwrap();
+        assert!(transcript.contains(CHUNK_TRANSCRIPT_TRUNCATION_MARKER.trim()));
+        assert!(
+            transcript.len()
+                <= MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES + CHUNK_TRANSCRIPT_TRUNCATION_MARKER.len()
+        );
+    }
+
+    #[test]
+    fn note_search_is_scoped_to_the_requested_composite_session_and_smart_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:shared-project";
+        let session_a = "conversation:alpha:instance-a";
+        let session_b = "conversation:beta:instance-b";
+        let note_a = store
+            .insert_note(NoteInput {
+                project_path: project,
+                route_project_root: None,
+                session_id: session_a,
+                content: "only alpha session detail",
+                surface_condition: None,
+                anchor_block_id: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        let note_b = store
+            .insert_note(NoteInput {
+                project_path: project,
+                route_project_root: None,
+                session_id: session_b,
+                content: "only beta session detail",
+                surface_condition: None,
+                anchor_block_id: None,
+                now_ms: 2,
+            })
+            .unwrap();
+        let smart = store
+            .insert_project_note(NoteWriteInput {
+                project_path: project,
+                route_project_root: None,
+                session_id: Some(session_a),
+                content: "shared project guidance",
+                surface_condition: Some("shared condition"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                now_ms: 3,
+            })
+            .unwrap();
+
+        let ids_a = store
+            .search_notes_like(project, session_a, "detail")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids_a, BTreeSet::from([note_a.id]));
+        let ids_b = store
+            .search_notes_like(project, session_b, "detail")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids_b, BTreeSet::from([note_b.id]));
+
+        let ids_a = store
+            .search_notes_like(project, session_a, "shared")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<BTreeSet<_>>();
+        let ids_b = store
+            .search_notes_like(project, session_b, "shared")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids_a, BTreeSet::from([smart.id]));
+        assert_eq!(ids_b, BTreeSet::from([smart.id]));
     }
 
     #[test]
