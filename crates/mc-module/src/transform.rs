@@ -1870,10 +1870,16 @@ fn apply_once(
         ctx.note_project_path,
         &req.session_id,
         loaded.meta.user_profile_version,
+        ctx.memory_enabled,
         ctx.now_ms,
         Some(&mut m1_revision_read_timings),
     )?;
     let mut current_m1_digest = m1_signal.revision;
+    // Pre-gate memory-off sessions stored an ungated digest and have no durable gate marker.
+    // The next natural bust adopts the gated digest; the mismatch does not authorize a bust now.
+    let memory_gate_digest_transition = !ctx.memory_enabled
+        && !loaded.meta.memory_disabled
+        && current_m1_digest != loaded.meta.m1_revision;
     let external_revision_changed = loaded.meta.initialized
         && loaded.meta.m1_external_revision != 0
         && m1_signal.external_revision != loaded.meta.m1_external_revision;
@@ -2401,6 +2407,7 @@ fn apply_once(
                                 ctx.note_project_path,
                                 &req.session_id,
                                 loaded.meta.user_profile_version,
+                                ctx.memory_enabled,
                                 ctx.now_ms,
                                 Some(&mut m1_revision_read_timings),
                             )?;
@@ -2525,6 +2532,7 @@ fn apply_once(
                     run_started: false,
                 });
                 meta.initialized = true;
+                meta.memory_disabled = !ctx.memory_enabled;
                 meta.last_render_config = effective_render_config;
                 meta.last_provider_id = req.provider_id.clone().unwrap_or_default();
                 meta.last_model_key = req.model_key.clone().unwrap_or_default();
@@ -2556,6 +2564,7 @@ fn apply_once(
                     ctx.note_project_path,
                     &req.session_id,
                     loaded.meta.user_profile_version,
+                    ctx.memory_enabled,
                     ctx.now_ms,
                     Some(&mut m1_revision_read_timings),
                 )?;
@@ -2566,8 +2575,12 @@ fn apply_once(
                 meta.m1_pending_since_ms = None;
             }
             PassPlan::Soft => {
-                commit_memory_revision =
-                    Some(memory_revision_fence(store, ctx.project_path, &m1_signal)?);
+                meta.memory_disabled = !ctx.memory_enabled;
+                commit_memory_revision = if ctx.memory_enabled {
+                    Some(memory_revision_fence(store, ctx.project_path, &m1_signal)?)
+                } else {
+                    None
+                };
                 // EXPENSIVE bust-only: compose the m1 delta body from the store against the
                 // watermarks the last HARD froze (incl. the FROZEN expiry cutoff). A
                 // reduction-only SOFT recomposes byte-identical m1 (watermarks unchanged), so
@@ -2717,6 +2730,7 @@ fn apply_once(
                         ctx.note_project_path,
                         &req.session_id,
                         loaded.meta.user_profile_version,
+                        ctx.memory_enabled,
                         ctx.now_ms,
                         Some(&mut m1_revision_read_timings),
                     )?;
@@ -2808,10 +2822,11 @@ fn apply_once(
                         ctx.note_project_path,
                         &req.session_id,
                         loaded.meta.user_profile_version,
+                        ctx.memory_enabled,
                         ctx.now_ms,
                         Some(&mut m1_revision_read_timings),
                     )?;
-                    if m1_has_content {
+                    if m1_has_content || memory_gate_digest_transition {
                         meta.m1_revision = applied_m1_signal.revision;
                     }
                     if m1.profile_rendered {
@@ -7728,7 +7743,7 @@ fn action_str(plan: &PassPlan, _core: &CoreState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::m1_compose::m1_revision_signal;
+    use crate::m1_compose::{m1_revision_signal, m1_revision_signal_parts_for_pass};
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
     use mc_store::{
@@ -11961,6 +11976,80 @@ mod tests {
             "{}",
             m1_bytes(&soft)
         );
+    }
+
+    #[test]
+    fn memory_off_absorbs_legacy_digest_without_leaking_and_reenable_hard_restores_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        s.seed_workspace_member("ws", "git:proj", "[\"CONSTRAINTS\"]")
+            .unwrap();
+        s.seed_workspace_member("ws", "git:foreign", "[\"CONSTRAINTS\"]")
+            .unwrap();
+        s.seed_memory(5, "git:proj", "ARCHITECTURE", "private baseline rule", 70)
+            .unwrap();
+        let off_request = req("ses", "cfg-memory-off", vec![item("m1msg", 1, "raw")]);
+        let mut off_ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        off_ctx.memory_enabled = false;
+
+        let boot = transform(&s, &off_request, &off_ctx).unwrap();
+        assert_eq!(boot.action, "HARD");
+        assert!(!m0_bytes(&boot).contains("private baseline rule"));
+        assert_eq!(m1_bytes(&boot), M1_PLACEHOLDER);
+
+        // Simulate metadata written by the pre-gate implementation. Its memory-off HARD stored
+        // zero watermarks in m0 but persisted the ungated memory digest as the m1 baseline.
+        let gated_signal =
+            m1_revision_signal_parts_for_pass(&s, "git:proj", "git:proj", "ses", 0, false, 0)
+                .unwrap();
+        let ungated_signal =
+            m1_revision_signal_parts_for_pass(&s, "git:proj", "git:proj", "ses", 0, true, 0)
+                .unwrap();
+        assert_ne!(gated_signal.revision, ungated_signal.revision);
+        let loaded = s.load("ses").unwrap();
+        let mut legacy_meta = loaded.meta.clone();
+        legacy_meta.m1_revision = ungated_signal.revision;
+        legacy_meta.memory_disabled = false;
+        s.commit("ses", loaded.row_version, &loaded.core, &legacy_meta)
+            .unwrap();
+
+        // Memory can change again before upgrade code sees the session. The gated digest remains
+        // stable, and the old cache mismatch is still pending work rather than permission to bust.
+        s.seed_memory(6, "git:foreign", "CONSTRAINTS", "first shared rule", 70)
+            .unwrap();
+        let deferred = transform(&s, &off_request, &off_ctx).unwrap();
+        assert_eq!(deferred.action, "SOFT+");
+        assert!(!deferred.committed);
+        assert_eq!(m1_bytes(&deferred), M1_PLACEHOLDER);
+
+        // An independently scheduled execute absorbs the gated digest without rendering memory.
+        let execute_request = with_usage(off_request.clone(), 70, 100);
+        let migrated = transform(&s, &execute_request, &off_ctx).unwrap();
+        assert_eq!(migrated.action, "SOFT");
+        assert_eq!(m1_bytes(&migrated), M1_PLACEHOLDER);
+        let migrated_meta = s.load("ses").unwrap().meta;
+        assert_eq!(migrated_meta.m1_revision, gated_signal.revision);
+        assert!(migrated_meta.memory_disabled);
+
+        // Later workspace-memory churn is revision-neutral and cannot populate or bust m1.
+        s.seed_memory(7, "git:foreign", "CONSTRAINTS", "new shared rule", 70)
+            .unwrap();
+        let after_churn = transform(&s, &off_request, &off_ctx).unwrap();
+        assert_eq!(after_churn.action, "SOFT+");
+        assert!(!after_churn.committed);
+        assert_eq!(m1_bytes(&after_churn), M1_PLACEHOLDER);
+
+        // The coordinator includes the memory gate in its render-config fingerprint. Re-enabling
+        // therefore differs from the last fold and forces a HARD rebuild from the current memories.
+        let on_request = req("ses", "cfg-memory-on", vec![item("m1msg", 1, "raw")]);
+        let on_ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        let reenabled = transform(&s, &on_request, &on_ctx).unwrap();
+        assert_eq!(reenabled.action, "HARD");
+        assert!(m0_bytes(&reenabled).contains("private baseline rule"));
+        assert_eq!(m1_bytes(&reenabled), M1_PLACEHOLDER);
+        assert!(!s.load("ses").unwrap().meta.memory_disabled);
     }
 
     #[test]

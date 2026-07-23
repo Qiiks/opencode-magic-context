@@ -62,6 +62,32 @@ fn union_paths(store: &McStore, project_path: &str) -> Result<Vec<String>, McSto
     })
 }
 
+fn in_session_revision(
+    max_memory_id: i64,
+    max_memory_mutation_id: i64,
+    max_compartment_seq: i64,
+    note_status_version: i64,
+    user_profile_version: u64,
+) -> u64 {
+    let mut in_session = DefaultHasher::new();
+    // Preserve the old digest format when both new inputs are zero, so sessions created
+    // before these inputs existed do not appear changed solely because the signal gained fields.
+    if note_status_version == 0 && user_profile_version == 0 {
+        "mc-m1-rev-v1".hash(&mut in_session);
+        max_memory_id.hash(&mut in_session);
+        max_memory_mutation_id.hash(&mut in_session);
+        max_compartment_seq.hash(&mut in_session);
+    } else {
+        "mc-m1-in-session-v2".hash(&mut in_session);
+        max_memory_id.hash(&mut in_session);
+        max_memory_mutation_id.hash(&mut in_session);
+        max_compartment_seq.hash(&mut in_session);
+        note_status_version.hash(&mut in_session);
+        user_profile_version.hash(&mut in_session);
+    }
+    in_session.finish() | 1
+}
+
 /// The cheap per-pass revision signal, split into two lanes:
 ///
 /// * `revision` is the IN-SESSION lane. Memory inserts/updates, the mutation log, note
@@ -109,7 +135,7 @@ pub fn m1_revision_signal_parts(
     project_path: &str,
     session_id: &str,
 ) -> Result<M1RevisionSignal, McStoreError> {
-    m1_revision_signal_parts_for_pass(store, project_path, project_path, session_id, 0, 0)
+    m1_revision_signal_parts_for_pass(store, project_path, project_path, session_id, 0, true, 0)
 }
 
 /// Query-family timings for the lightweight per-pass m1 revision signal.
@@ -127,6 +153,7 @@ pub fn m1_revision_signal_parts_for_pass(
     note_project_path: &str,
     session_id: &str,
     user_profile_version: u64,
+    memory_enabled: bool,
     now_ms: i64,
 ) -> Result<M1RevisionSignal, McStoreError> {
     m1_revision_signal_parts_for_pass_timed(
@@ -135,6 +162,7 @@ pub fn m1_revision_signal_parts_for_pass(
         note_project_path,
         session_id,
         user_profile_version,
+        memory_enabled,
         now_ms,
         None,
     )
@@ -142,19 +170,27 @@ pub fn m1_revision_signal_parts_for_pass(
 
 /// The timed variant keeps the established revision bytes while exposing the memory and note
 /// query families that every transform pass reads before its scheduler decision.
+#[allow(clippy::too_many_arguments)]
 pub fn m1_revision_signal_parts_for_pass_timed(
     store: &McStore,
     project_path: &str,
     note_project_path: &str,
     session_id: &str,
     user_profile_version: u64,
+    memory_enabled: bool,
     now_ms: i64,
     timings: Option<&mut M1RevisionReadTimings>,
 ) -> Result<M1RevisionSignal, McStoreError> {
     let memories_started_at = Instant::now();
-    let paths = union_paths(store, project_path)?;
-    let max_memory_id = store.max_memory_id(&paths)?;
-    let max_memory_mutation_id = store.max_memory_mutation_id(&paths)?;
+    let (max_memory_id, max_memory_mutation_id) = if memory_enabled {
+        let paths = union_paths(store, project_path)?;
+        (
+            store.max_memory_id(&paths)?,
+            store.max_memory_mutation_id(&paths)?,
+        )
+    } else {
+        (0, 0)
+    };
     let memories_ms = memories_started_at.elapsed().as_secs_f64() * 1_000.0;
     let max_compartment_seq = store.max_compartment_seq(session_id)?;
     let notes_started_at = Instant::now();
@@ -165,22 +201,13 @@ pub fn m1_revision_signal_parts_for_pass_timed(
         timings.notes_ms += notes_ms;
     }
 
-    let mut in_session = DefaultHasher::new();
-    // Preserve the old digest format when both new inputs are zero, so sessions created
-    // before these inputs existed do not appear changed solely because the signal gained fields.
-    if note_status_version == 0 && user_profile_version == 0 {
-        "mc-m1-rev-v1".hash(&mut in_session);
-        max_memory_id.hash(&mut in_session);
-        max_memory_mutation_id.hash(&mut in_session);
-        max_compartment_seq.hash(&mut in_session);
-    } else {
-        "mc-m1-in-session-v2".hash(&mut in_session);
-        max_memory_id.hash(&mut in_session);
-        max_memory_mutation_id.hash(&mut in_session);
-        max_compartment_seq.hash(&mut in_session);
-        note_status_version.hash(&mut in_session);
-        user_profile_version.hash(&mut in_session);
-    }
+    let revision = in_session_revision(
+        max_memory_id,
+        max_memory_mutation_id,
+        max_compartment_seq,
+        note_status_version,
+        user_profile_version,
+    );
 
     let workspace_fingerprint = store.workspace_fingerprint(project_path, now_ms)?;
     let mut external = DefaultHasher::new();
@@ -188,7 +215,7 @@ pub fn m1_revision_signal_parts_for_pass_timed(
     workspace_fingerprint.hash(&mut external);
 
     Ok(M1RevisionSignal {
-        revision: in_session.finish() | 1,
+        revision,
         external_revision: external.finish() | 1,
         max_compartment_seq,
         max_memory_id,
@@ -285,17 +312,6 @@ pub fn compose_m1_from_store(
     temporal_awareness: bool,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Result<M1Composition, M1ComposeError> {
-    // Resolve the workspace membership ONCE from the calling project (mirrors the m0
-    // compose). Re-resolving from a union path is WRONG: the union list is sorted, so its
-    // first element is the lexicographically-first member, NOT necessarily this project —
-    // using it as `own_identity` would treat this project's own (non-shared-category)
-    // memories as foreign and filter them out.
-    let membership = store.resolve_workspace_membership(project_path)?;
-    let paths: Vec<String> = match &membership {
-        Some(m) => m.union_identities.clone(),
-        None => vec![project_path.to_string()],
-    };
-
     // --- new compartments (seq past the folded watermark) at P1 + coverage extension ---
     // Store-only ordering deliberately allows sparse ordinal gaps; transform has
     // the live array and rejects any coverage advance that would trim present,
@@ -326,70 +342,82 @@ pub fn compose_m1_from_store(
         _ => None,
     };
 
-    // --- memory-updates (corrections to in-m0 memories, past the cursor) ---
-    let mutations = store.memory_mutations_for_render(
-        &paths,
-        meta.memory_mutation_cursor,
-        &meta.rendered_memory_ids,
-    )?;
-    let baseline_ids: HashSet<i64> = meta.rendered_memory_ids.iter().copied().collect();
+    let (mutations, memory_updates_block, new_memories_block) = if memory_enabled {
+        // Resolve membership from the calling project. The sorted union's first member is not
+        // necessarily the caller, so using it as `own_identity` would hide own private categories.
+        let membership = store.resolve_workspace_membership(project_path)?;
+        let paths = membership
+            .as_ref()
+            .map(|workspace| workspace.union_identities.clone())
+            .unwrap_or_else(|| vec![project_path.to_string()]);
 
-    // Read the render-eligible pool through the exact same project/workspace visibility,
-    // lifecycle, and frozen-expiry predicate as m0. A merge replacement may predate the
-    // folded max-memory watermark, so the ordinary new-memory lane cannot discover it.
-    let eligible_memories =
-        load_render_eligible_memories(store, membership.as_ref(), project_path, now_ms)?;
-    let eligible_ids: HashSet<i64> = eligible_memories.iter().map(|memory| memory.id).collect();
-    let mut replacement_ids = mutations
-        .iter()
-        .filter(|mutation| mutation.mutation_type == "superseded")
-        .filter_map(|mutation| mutation.superseded_by_id)
-        .filter(|id| !baseline_ids.contains(id) && eligible_ids.contains(id))
-        .collect::<Vec<_>>();
-    replacement_ids.sort_unstable();
-    replacement_ids.dedup();
-    if replacement_ids.len() > MAX_MERGE_REPLACEMENTS_PER_DELTA {
-        eprintln!(
-            "mc-module: m1 merge replacement cap exceeded session={} replacements={} cap={}",
-            session_id,
-            replacement_ids.len(),
-            MAX_MERGE_REPLACEMENTS_PER_DELTA
+        // --- memory-updates (corrections to in-m0 memories, past the cursor) ---
+        let mutations = store.memory_mutations_for_render(
+            &paths,
+            meta.memory_mutation_cursor,
+            &meta.rendered_memory_ids,
+        )?;
+        let baseline_ids: HashSet<i64> = meta.rendered_memory_ids.iter().copied().collect();
+
+        // Read through m0's visibility, lifecycle, and frozen-expiry predicates. A merge target
+        // may predate the folded max-memory watermark, so additions alone cannot discover it.
+        let eligible_memories =
+            load_render_eligible_memories(store, membership.as_ref(), project_path, now_ms)?;
+        let eligible_ids: HashSet<i64> = eligible_memories.iter().map(|memory| memory.id).collect();
+        let mut replacement_ids = mutations
+            .iter()
+            .filter(|mutation| mutation.mutation_type == "superseded")
+            .filter_map(|mutation| mutation.superseded_by_id)
+            .filter(|id| !baseline_ids.contains(id) && eligible_ids.contains(id))
+            .collect::<Vec<_>>();
+        replacement_ids.sort_unstable();
+        replacement_ids.dedup();
+        if replacement_ids.len() > MAX_MERGE_REPLACEMENTS_PER_DELTA {
+            eprintln!(
+                "mc-module: m1 merge replacement cap exceeded session={} replacements={} cap={}",
+                session_id,
+                replacement_ids.len(),
+                MAX_MERGE_REPLACEMENTS_PER_DELTA
+            );
+            replacement_ids.truncate(MAX_MERGE_REPLACEMENTS_PER_DELTA);
+        }
+        let replacement_ids: HashSet<i64> = replacement_ids.into_iter().collect();
+
+        // Additions keep the 25% sub-budget. Merge replacements are corrections to baseline
+        // facts and ride outside it so a source cannot become a removal-only delta solely
+        // because its existing target was budget-trimmed from m0.
+        let additive_candidates = eligible_memories
+            .iter()
+            .filter(|memory| memory.id > meta.max_memory_id)
+            .filter(|memory| !replacement_ids.contains(&memory.id))
+            .cloned()
+            .collect();
+        let source_name_by_id = membership
+            .as_ref()
+            .map(|workspace| workspace_source_names(&eligible_memories, workspace))
+            .unwrap_or_default();
+        let mut delta_memories = trim_memories_to_budget(
+            additive_candidates,
+            None,
+            &source_name_by_id,
+            (memory_budget_tokens.max(1.0) * 0.25).floor().max(1.0),
+            estimate_tokens,
         );
-        replacement_ids.truncate(MAX_MERGE_REPLACEMENTS_PER_DELTA);
-    }
-    let replacement_ids: HashSet<i64> = replacement_ids.into_iter().collect();
+        delta_memories.extend(
+            eligible_memories
+                .into_iter()
+                .filter(|memory| replacement_ids.contains(&memory.id)),
+        );
 
-    // Additive memories keep the 25% sub-budget. Merge replacements are corrections to
-    // baseline facts and ride outside that trim, so a rendered source cannot become a
-    // removal-only delta merely because its existing target was budget-trimmed from m0.
-    let additive_candidates = eligible_memories
-        .iter()
-        .filter(|memory| memory.id > meta.max_memory_id)
-        .filter(|memory| !replacement_ids.contains(&memory.id))
-        .cloned()
-        .collect();
-    let source_name_by_id = membership
-        .as_ref()
-        .map(|workspace| workspace_source_names(&eligible_memories, workspace))
-        .unwrap_or_default();
-    let mut delta_memories = trim_memories_to_budget(
-        additive_candidates,
-        None,
-        &source_name_by_id,
-        (memory_budget_tokens.max(1.0) * 0.25).floor().max(1.0),
-        estimate_tokens,
-    );
-    delta_memories.extend(
-        eligible_memories
-            .into_iter()
-            .filter(|memory| replacement_ids.contains(&memory.id)),
-    );
-
-    let mut resolvable_ids = baseline_ids;
-    resolvable_ids.extend(delta_memories.iter().map(|memory| memory.id));
-    let memory_updates_block = render_memory_updates(&mutations, &resolvable_ids);
-    let new_memories_block =
-        render_memory_block(&delta_memories, "new-memories", &source_name_by_id);
+        let mut resolvable_ids = baseline_ids;
+        resolvable_ids.extend(delta_memories.iter().map(|memory| memory.id));
+        let memory_updates_block = render_memory_updates(&mutations, &resolvable_ids);
+        let new_memories_block =
+            render_memory_block(&delta_memories, "new-memories", &source_name_by_id);
+        (mutations, memory_updates_block, new_memories_block)
+    } else {
+        (Vec::new(), String::new(), String::new())
+    };
 
     // Profile rows and their version arrive together through state sync. Render the block only
     // after a version change, and leave the applied version behind when trimming leaves no body
@@ -549,6 +577,114 @@ mod tests {
             .unwrap();
         let s2 = m1_revision_signal(&store, p, "ses").unwrap();
         assert_ne!(s1, s2, "new compartment → signal moves");
+    }
+
+    #[test]
+    fn disabled_memory_inputs_do_not_move_revision_but_compartments_still_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:proj";
+        let foreign = "git:foreign";
+        store
+            .seed_workspace_member("ws", project, "[\"CONSTRAINTS\"]")
+            .unwrap();
+        store
+            .seed_workspace_member("ws", foreign, "[\"CONSTRAINTS\"]")
+            .unwrap();
+        let before =
+            m1_revision_signal_parts_for_pass(&store, project, project, "ses", 0, false, 0)
+                .unwrap();
+
+        let memory = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "private rule", 1))
+            .unwrap();
+        store
+            .update_memory_content(project, memory, "changed private rule", 2)
+            .unwrap();
+        let foreign_memory = store
+            .insert_memory(insert_input(
+                foreign,
+                "CONSTRAINTS",
+                "shared private rule",
+                3,
+            ))
+            .unwrap();
+        store
+            .update_memory_content(foreign, foreign_memory, "changed shared rule", 4)
+            .unwrap();
+        let after_memory =
+            m1_revision_signal_parts_for_pass(&store, project, project, "ses", 0, false, 0)
+                .unwrap();
+        assert_eq!(after_memory.revision, before.revision);
+        assert_eq!(after_memory.max_memory_id, 0);
+        assert_eq!(after_memory.max_memory_mutation_id, 0);
+        let enabled_after_memory =
+            m1_revision_signal_parts_for_pass(&store, project, project, "ses", 0, true, 0).unwrap();
+        assert_ne!(enabled_after_memory.revision, before.revision);
+
+        store
+            .replace_compartments("ses", &[comp(1, 1, 9, "m9")])
+            .unwrap();
+        let after_compartment =
+            m1_revision_signal_parts_for_pass(&store, project, project, "ses", 0, false, 0)
+                .unwrap();
+        assert_ne!(after_compartment.revision, after_memory.revision);
+    }
+
+    #[test]
+    fn disabled_memory_lane_renders_no_additions_or_corrections() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:proj";
+        let foreign = "git:foreign";
+        store
+            .seed_workspace_member("ws", project, "[\"CONSTRAINTS\"]")
+            .unwrap();
+        store
+            .seed_workspace_member("ws", foreign, "[\"CONSTRAINTS\"]")
+            .unwrap();
+        let baseline = store
+            .insert_memory(insert_input(
+                project,
+                "CONSTRAINTS",
+                "baseline private rule",
+                1,
+            ))
+            .unwrap();
+        let folded_max = store.max_memory_id(&[project.to_string()]).unwrap();
+        let folded_cursor = store
+            .max_memory_mutation_id(&[project.to_string()])
+            .unwrap();
+        store
+            .update_memory_content(project, baseline, "corrected private rule", 2)
+            .unwrap();
+        store
+            .insert_memory(insert_input(project, "ARCHITECTURE", "new private rule", 3))
+            .unwrap();
+        store
+            .insert_memory(insert_input(foreign, "CONSTRAINTS", "new shared rule", 4))
+            .unwrap();
+
+        let meta = meta_after_hard(0, None, folded_max, folded_cursor, vec![baseline]);
+        let m1 = compose_m1_from_store(
+            &store,
+            project,
+            project,
+            "ses",
+            &meta,
+            0,
+            false,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+
+        assert_eq!(m1.body, M1_PLACEHOLDER);
+        assert_eq!(m1.memory_update_count, 0);
+        assert!(!m1.body.contains("private rule"));
+        assert!(!m1.body.contains("shared rule"));
     }
 
     #[test]

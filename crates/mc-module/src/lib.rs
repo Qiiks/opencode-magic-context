@@ -4073,6 +4073,7 @@ impl McHandler {
             &binding.project_root.to_string_lossy(),
             &session_id,
             loaded.meta.user_profile_version,
+            !loaded.meta.memory_disabled,
             now_ms(),
         ) {
             Ok(signal) => Some(signal),

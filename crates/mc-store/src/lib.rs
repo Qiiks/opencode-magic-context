@@ -2583,6 +2583,10 @@ pub struct ModuleMeta {
     /// cache. 0 is retained for pre-materialization metadata.
     #[serde(default)]
     pub m1_revision: u64,
+    /// The last materializing pass had cross-session memory disabled. The negative form keeps
+    /// pre-field metadata and fresh default state compatible with the historical enabled mode.
+    #[serde(default)]
+    pub memory_disabled: bool,
     /// External render lane fingerprint applied by the last HARD fold. Workspace changes
     /// remain eager-HARD and are kept separate from the deferred in-session lane.
     #[serde(default)]
