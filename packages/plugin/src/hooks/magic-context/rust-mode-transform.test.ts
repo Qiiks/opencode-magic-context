@@ -49,6 +49,61 @@ const unregisters: Array<() => void> = [];
 const availabilityDataHomes: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
+type LegacySnapshotField = string | number | boolean | symbol;
+
+function legacyMessageContentFields(
+    value: unknown,
+    fields: LegacySnapshotField[] = [],
+): LegacySnapshotField[] {
+    const tags = __rustModeTransformTest.snapshotTags;
+    if (value === null) fields.push(tags.null);
+    else if (typeof value === "string") fields.push(tags.string, value);
+    else if (typeof value === "number") fields.push(tags.number, value);
+    else if (typeof value === "boolean") fields.push(tags.boolean, value);
+    else if (value === undefined || typeof value === "function" || typeof value === "symbol") {
+        fields.push(tags.undefined);
+    } else if (Array.isArray(value)) {
+        fields.push(tags.array, value.length);
+        for (const item of value) legacyMessageContentFields(item, fields);
+    } else if (typeof value === "object") {
+        const entries = Object.entries(value).filter(
+            ([, child]) =>
+                child !== undefined && typeof child !== "function" && typeof child !== "symbol",
+        );
+        fields.push(tags.object, entries.length);
+        for (const [key, child] of entries) {
+            fields.push(tags.key, key);
+            legacyMessageContentFields(child, fields);
+        }
+    } else fields.push(tags.undefined);
+    return fields;
+}
+
+function sameSnapshotFields(
+    left: readonly LegacySnapshotField[],
+    right: readonly LegacySnapshotField[],
+): boolean {
+    return (
+        left.length === right.length && left.every((field, index) => Object.is(field, right[index]))
+    );
+}
+
+function seededRandom(seed: number): () => number {
+    let state = seed >>> 0;
+    return () => {
+        state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+        return state / 0x1_0000_0000;
+    };
+}
+
+function randomText(random: () => number, length: number): string {
+    let text = "";
+    for (let index = 0; index < length; index += 1) {
+        text += String.fromCharCode(97 + Math.floor(random() * 26));
+    }
+    return text;
+}
+
 afterEach(() => {
     closeReadOnlySessionDb();
     transformDecisionTest.reset();
@@ -315,7 +370,7 @@ describe("Rust mode authority adapter", () => {
                 moduleElapsedMs: 8.765,
             }),
         ).toBe(
-            "rust pass: decision=HARD reason=first_render served_from=transform in=4 out=3 applied=true elapsed=12.3 ms module=8.8 ms stages=ordinal_resolve:0.0 state_sync:0.0 clone:0.0 wire_build:0.0 transport:0.0 transport_pages:0 apply:0.0 lkg_snapshot:0.0 other:12.3",
+            "rust pass: decision=HARD reason=first_render served_from=transform in=4 out=3 applied=true elapsed=12.3 ms module=8.8 ms stages=prefix_guard:0.0 ordinal_resolve:0.0 state_sync:0.0 clone:0.0 wire_build:0.0 transport:0.0 transport_pages:0 apply:0.0 lkg_snapshot:0.0 other:12.3",
         );
     });
 
@@ -1629,6 +1684,93 @@ describe("delta prefix-mutation guard", () => {
         expect(requestBodies[1]?.tail_delta).toBeUndefined();
         expect(requestBodies[1]?.native_messages).toEqual(mutated);
         expect(JSON.stringify(requestBodies[1]?.messages)).toContain('"query":"bravo"');
+    });
+
+    it("matches the legacy snapshot comparator across 500 randomized deep mutations", () => {
+        const random = seededRandom(0x5eed_c0de);
+        for (let caseIndex = 0; caseIndex < 500; caseIndex += 1) {
+            const chainDepth = 2 + Math.floor(random() * 5);
+            let payload: Record<string, unknown> = {
+                alpha: randomText(random, 8),
+                beta: randomText(random, 12),
+                gamma: [null, undefined, randomText(random, 6), Math.floor(random() * 10_000)],
+                delta: { enabled: random() > 0.5, count: Math.floor(random() * 100) },
+            };
+            for (let depth = 0; depth < chainDepth; depth += 1) {
+                payload = {
+                    alpha: payload,
+                    beta: randomText(random, 10),
+                    gamma: [depth, randomText(random, 7)],
+                    delta: null,
+                };
+            }
+            const original = {
+                info: {
+                    id: `random-message-${caseIndex}`,
+                    role: caseIndex % 2 === 0 ? "assistant" : "user",
+                },
+                parts: [
+                    { type: "text", text: randomText(random, 20) },
+                    {
+                        type: "tool",
+                        callID: `call-${caseIndex}`,
+                        state: {
+                            status: "completed",
+                            input: { query: randomText(random, 9), limit: caseIndex % 17 },
+                            output: randomText(random, 24),
+                        },
+                    },
+                ],
+                payload,
+            } as MessageLike & { payload: Record<string, unknown> };
+            const snapshot = __rustModeTransformTest.messageContentSnapshot(original);
+            const legacyOriginal = legacyMessageContentFields(original);
+            expect(sameSnapshotFields(legacyOriginal, snapshot.fields)).toBe(true);
+            expect(__rustModeTransformTest.messageMatchesContentSnapshot(original, snapshot)).toBe(
+                true,
+            );
+
+            const mutated = structuredClone(original);
+            const mutationDepth = Math.floor(random() * chainDepth);
+            let parent: Record<string, unknown> = mutated;
+            let parentKey = "payload";
+            let target = mutated.payload;
+            for (let depth = 0; depth < mutationDepth; depth += 1) {
+                parent = target;
+                parentKey = "alpha";
+                target = target.alpha as Record<string, unknown>;
+            }
+            switch (caseIndex % 5) {
+                case 0:
+                    target[`added_${caseIndex}`] = randomText(random, 5);
+                    break;
+                case 1:
+                    delete target.beta;
+                    break;
+                case 2:
+                    target.beta = [target.beta, { retyped: true }];
+                    break;
+                case 3: {
+                    const reordered = Object.fromEntries(Object.entries(target).reverse());
+                    parent[parentKey] = reordered;
+                    break;
+                }
+                default: {
+                    const prior = String(target.beta);
+                    target.beta = `${prior.slice(0, -1)}${prior.endsWith("z") ? "y" : "z"}`;
+                    break;
+                }
+            }
+
+            const legacyMutated = legacyMessageContentFields(mutated);
+            const legacyVerdict = sameSnapshotFields(legacyMutated, snapshot.fields);
+            const cursorVerdict = __rustModeTransformTest.messageMatchesContentSnapshot(
+                mutated,
+                snapshot,
+            );
+            expect(cursorVerdict).toBe(legacyVerdict);
+            expect(cursorVerdict).toBe(false);
+        }
     });
 
     it("checks a 1,400-message multi-megabyte prefix within the steady-pass budget", () => {
