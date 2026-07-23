@@ -111,6 +111,10 @@ pub struct BoundaryBlock {
     /// rendered reduction placeholder. The raw session still contains these bytes,
     /// and the historian would read these bytes if the trigger fired.
     pub original: String,
+    /// Token count for `original`, computed once while constructing this pass's boundary input.
+    /// Keeping it beside the source lets projected-drop and boundary walks share the same exact
+    /// measurement instead of running byte-BPE repeatedly over an unchanged multi-megabyte tail.
+    pub original_token_count: usize,
     /// Optional rendered form after reduction. It is deliberately ignored by every
     /// decision function and exists only to make the raw-byte invariant testable.
     pub rendered: Option<String>,
@@ -411,6 +415,14 @@ pub fn resolve_protected_tail_boundary(
     ctx: &BoundaryContext,
 ) -> BoundaryResolution {
     let index = TokenIndex::new(messages);
+    resolve_protected_tail_boundary_with_index(messages, ctx, &index)
+}
+
+fn resolve_protected_tail_boundary_with_index(
+    messages: &[BoundaryMsg],
+    ctx: &BoundaryContext,
+    index: &TokenIndex,
+) -> BoundaryResolution {
     let raw_message_count = index.raw_message_count;
     let offset = compartment_offset(ctx.last_compartment_end_ordinal, messages).unwrap_or(1);
     let usage_percentage = clamp_percentage(ctx.usage_percentage);
@@ -457,7 +469,7 @@ pub fn resolve_protected_tail_boundary(
     let mut fenced_by_open_arc = first_fence.open_arc;
     boundary = first_fence.boundary;
 
-    let snapped = semantic_snap_boundary(messages, &index, boundary, scaled_n, offset);
+    let snapped = semantic_snap_boundary(messages, index, boundary, scaled_n, offset);
     if snapped != boundary {
         boundary_reason = "semantic-snap".to_string();
     }
@@ -497,7 +509,7 @@ pub fn resolve_protected_tail_boundary(
         // On verbatim-tail profiles, folding is the only reclaim path, while the newest message
         // is still forwarded in full. Keep the newest message and its tool pair out of the
         // fold so the live turn cannot become a durable compartment boundary.
-        let newest_floor = newest_message_protected_floor(&arcs, &index);
+        let newest_floor = newest_message_protected_floor(&arcs, index);
         protected_tail_start = protected_tail_start.min(newest_floor).max(offset);
         protected_tail_start = index.clamp_ordinal(protected_tail_start);
     }
@@ -509,7 +521,7 @@ pub fn resolve_protected_tail_boundary(
         ctx.execute_threshold_percentage,
     );
     let head = apply_head_cap(HeadCapArgs {
-        index: &index,
+        index,
         protected_tail_start,
         offset,
         arcs: &arcs,
@@ -677,7 +689,27 @@ pub fn check_compartment_trigger(
     if ctx.compartment_in_progress {
         return no_fire();
     }
+    let index = TokenIndex::new(messages);
+    check_compartment_trigger_with_index(messages, ctx, &index)
+}
 
+#[cfg(test)]
+pub(crate) fn check_compartment_trigger_retokenized_reference(
+    messages: &[BoundaryMsg],
+    ctx: &TriggerContext,
+) -> TriggerDecision {
+    if ctx.compartment_in_progress {
+        return no_fire();
+    }
+    let index = TokenIndex::new_retokenized(messages);
+    check_compartment_trigger_with_index(messages, ctx, &index)
+}
+
+fn check_compartment_trigger_with_index(
+    messages: &[BoundaryMsg],
+    ctx: &TriggerContext,
+    index: &TokenIndex,
+) -> TriggerDecision {
     let trigger_budget = ctx.boundary.trigger_budget.unwrap_or_else(|| {
         derive_trigger_budget(
             ctx.boundary.context_limit,
@@ -698,7 +730,7 @@ pub fn check_compartment_trigger(
     let mut primary_ctx = ctx.boundary.clone();
     primary_ctx.trigger_budget = Some(trigger_budget);
     primary_ctx.emergency_tail_scale = None;
-    let boundary = resolve_protected_tail_boundary(messages, &primary_ctx);
+    let boundary = resolve_protected_tail_boundary_with_index(messages, &primary_ctx, index);
     let has_protected_eligible_head =
         boundary.eligible_head.start < boundary.protected_start_ordinal;
 
@@ -751,7 +783,8 @@ pub fn check_compartment_trigger(
         };
         let mut scaled_ctx = primary_ctx;
         scaled_ctx.emergency_tail_scale = Some(scale);
-        let scaled_boundary = resolve_protected_tail_boundary(messages, &scaled_ctx);
+        let scaled_boundary =
+            resolve_protected_tail_boundary_with_index(messages, &scaled_ctx, index);
         if has_runnable_compartment_window(
             &scaled_boundary,
             ctx.boundary.usage_percentage,
@@ -912,12 +945,25 @@ struct TokenIndex {
 
 impl TokenIndex {
     fn new(messages: &[BoundaryMsg]) -> Self {
+        Self::from_block_tokens(messages, |block| block.original_token_count)
+    }
+
+    #[cfg(test)]
+    fn new_retokenized(messages: &[BoundaryMsg]) -> Self {
+        Self::from_block_tokens(messages, |block| estimate_tokens(&block.original))
+    }
+
+    fn from_block_tokens(
+        messages: &[BoundaryMsg],
+        mut block_tokens: impl FnMut(&BoundaryBlock) -> usize,
+    ) -> Self {
         let mut totals_by_ordinal = BTreeMap::new();
         for message in messages {
             let total = message
                 .blocks
                 .iter()
-                .map(|block| estimate_tokens(&block.original) as f64)
+                .map(&mut block_tokens)
+                .map(|tokens| tokens as f64)
                 .sum::<f64>();
             *totals_by_ordinal
                 .entry(message.message_ordinal)
@@ -1974,6 +2020,7 @@ mod tests {
                         byte_size: block.byte_size,
                         arc_id: block.arc_id.clone(),
                         original: block.original.clone(),
+                        original_token_count: estimate_tokens(&block.original),
                         rendered: block.rendered.clone(),
                         ignored: block.ignored.unwrap_or(false),
                     })
@@ -2217,6 +2264,7 @@ mod tests {
                 byte_size: text.len(),
                 arc_id: None,
                 original: text.to_string(),
+                original_token_count: estimate_tokens(text),
                 rendered: None,
                 ignored: false,
             }],
@@ -2239,6 +2287,7 @@ mod tests {
                 byte_size: 32,
                 arc_id: Some(arc_id.to_string()),
                 original: "{\"description\":\"run build\"}".to_string(),
+                original_token_count: estimate_tokens("{\"description\":\"run build\"}"),
                 rendered: None,
                 ignored: false,
             }],
@@ -2260,6 +2309,7 @@ mod tests {
                 byte_size: text.len(),
                 arc_id: Some(arc_id.to_string()),
                 original: text.to_string(),
+                original_token_count: estimate_tokens(text),
                 rendered: None,
                 ignored: false,
             }],
@@ -2419,6 +2469,7 @@ mod tests {
                     byte_size: 16,
                     arc_id: Some((*arc).to_string()),
                     original: "{}".to_string(),
+                    original_token_count: estimate_tokens("{}"),
                     rendered: None,
                     ignored: false,
                 })
@@ -2440,6 +2491,7 @@ mod tests {
                     byte_size: 21_000,
                     arc_id: Some((*arc).to_string()),
                     original: "result ".repeat(3_000),
+                    original_token_count: estimate_tokens(&"result ".repeat(3_000)),
                     rendered: None,
                     ignored: false,
                 })

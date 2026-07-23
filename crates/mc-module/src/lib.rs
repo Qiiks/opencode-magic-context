@@ -1785,9 +1785,27 @@ enum PreparedHistorianAction {
     FireReady(Box<PreparedHistorianFiring>),
 }
 
-struct HistorianPrepareContext {
+struct HistorianPrepareContext<'a> {
     now: i64,
     snapshot_generation: u64,
+    timings: &'a mut HistorianTriggerTimings,
+}
+
+#[derive(Default)]
+struct HistorianTriggerTimings {
+    elapsed_ms: f64,
+    tokenized_blocks: usize,
+}
+
+struct HistorianTriggerTimer<'a> {
+    started_at: Instant,
+    timings: &'a mut HistorianTriggerTimings,
+}
+
+impl Drop for HistorianTriggerTimer<'_> {
+    fn drop(&mut self) {
+        self.timings.elapsed_ms += self.started_at.elapsed().as_secs_f64() * 1_000.0;
+    }
 }
 
 struct WrapupPrepareContext {
@@ -2783,12 +2801,17 @@ impl McHandler {
         binding: &SessionBinding,
         project_path: &str,
         projection: &crate::ck_wire::FlatProjection,
-        prepare: HistorianPrepareContext,
+        prepare: HistorianPrepareContext<'_>,
     ) -> PreparedHistorianAction {
         let HistorianPrepareContext {
             now,
             snapshot_generation,
+            timings,
         } = prepare;
+        let trigger_timer = HistorianTriggerTimer {
+            started_at: Instant::now(),
+            timings,
+        };
         let loaded = match store.load(&parsed.session_id) {
             Ok(loaded) => loaded,
             Err(e) => {
@@ -2849,6 +2872,13 @@ impl McHandler {
             });
         }
         let boundary_messages = boundary_messages(parsed, projection);
+        trigger_timer.timings.tokenized_blocks =
+            trigger_timer.timings.tokenized_blocks.saturating_add(
+                boundary_messages
+                    .iter()
+                    .map(|message| message.blocks.len())
+                    .sum::<usize>(),
+            );
         let last_compartment_end_ordinal = store
             .load_compartments(&parsed.session_id)
             .ok()
@@ -2857,6 +2887,16 @@ impl McHandler {
         let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile)
             .expect("serializer_profile validated upstream");
         let fold_is_only_reclaim = !tail_reclaim(serializer_profile);
+        let pending_drops = store
+            .load_pending_agent_drops(&parsed.session_id)
+            .unwrap_or_default();
+        let projected_post_drop_percentage = projected_post_drop_percentage(
+            &boundary_messages,
+            &pending_drops,
+            &loaded.core.frozen_units,
+            input_tokens,
+            context_limit,
+        );
         let trigger = boundary::check_compartment_trigger(
             &boundary_messages,
             &TriggerContext {
@@ -2872,15 +2912,7 @@ impl McHandler {
                     trigger_budget: None,
                     fold_is_only_reclaim,
                 },
-                projected_post_drop_percentage: projected_post_drop_percentage(
-                    &boundary_messages,
-                    &store
-                        .load_pending_agent_drops(&parsed.session_id)
-                        .unwrap_or_default(),
-                    &loaded.core.frozen_units,
-                    input_tokens,
-                    context_limit,
-                ),
+                projected_post_drop_percentage,
                 compartment_in_progress: loaded.meta.historian.state != HistorianPhase::Idle,
                 commit_cluster_trigger_enabled: DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED,
                 min_commit_clusters: DEFAULT_MIN_COMMIT_CLUSTERS,
@@ -5629,6 +5661,7 @@ impl McHandler {
         {
             hook();
         }
+        let mut trigger_timings = HistorianTriggerTimings::default();
         let diagnostics = if parsed.is_subagent {
             HistorianDiagnostics {
                 fired: false,
@@ -5648,6 +5681,7 @@ impl McHandler {
                 HistorianPrepareContext {
                     now: pass_now,
                     snapshot_generation,
+                    timings: &mut trigger_timings,
                 },
             ) {
                 PreparedHistorianAction::Complete(diagnostics) => diagnostics,
@@ -5673,6 +5707,7 @@ impl McHandler {
                             HistorianPrepareContext {
                                 now: pass_now,
                                 snapshot_generation,
+                                timings: &mut trigger_timings,
                             },
                         ) {
                             PreparedHistorianAction::Complete(diagnostics) => diagnostics,
@@ -5735,6 +5770,7 @@ impl McHandler {
                 HistorianPrepareContext {
                     now: pass_now,
                     snapshot_generation,
+                    timings: &mut trigger_timings,
                 },
             ) {
                 PreparedHistorianAction::Complete(diagnostics) => diagnostics,
@@ -5811,6 +5847,8 @@ impl McHandler {
                 retained_bytes,
             );
         if let Some(timings) = response.timings.as_mut() {
+            timings.trigger_ms = trigger_timings.elapsed_ms;
+            timings.trigger_tokenized_blocks = trigger_timings.tokenized_blocks;
             timings.post_attach = post_attach_started_at.elapsed().as_secs_f64() * 1_000.0;
         }
         respond_transform(&parsed.session_id, response)
@@ -9715,6 +9753,7 @@ fn wrapup_boundary_messages(
                     byte_size: block.bytes.len(),
                     arc_id: block.arc_id.clone(),
                     original: block.bytes.clone(),
+                    original_token_count: mc_tokenizer::estimate_tokens(&block.bytes),
                     rendered: None,
                     ignored: false,
                 })
@@ -9747,6 +9786,7 @@ fn boundary_messages(
                     byte_size: block.bytes.len(),
                     arc_id: block.arc_id.clone(),
                     original: block.bytes.clone(),
+                    original_token_count: mc_tokenizer::estimate_tokens(&block.bytes),
                     rendered: None,
                     ignored: false,
                 })
@@ -9802,6 +9842,9 @@ fn projected_post_drop_percentage(
     if context_limit <= 0.0 {
         return None;
     }
+    if pending_drops.is_empty() {
+        return Some(input_tokens.max(0.0) / context_limit * 100.0);
+    }
 
     let frozen_sizes = frozen_units
         .iter()
@@ -9817,14 +9860,13 @@ fn projected_post_drop_percentage(
     let mut current_sizes = HashMap::<String, f64>::new();
     for message in messages {
         for block in &message.blocks {
-            let raw = mc_tokenizer::estimate_tokens(&block.original) as f64;
             current_sizes.insert(
                 block.id.clone(),
                 frozen_sizes
                     .get(&block.id)
                     .copied()
                     .map(|tokens| tokens as f64)
-                    .unwrap_or(raw),
+                    .unwrap_or(block.original_token_count as f64),
             );
         }
     }
@@ -10182,6 +10224,236 @@ mod tests {
         assert!((pct - 80.0).abs() < 0.01, "pct={pct}");
     }
 
+    fn trigger_messages_fixture(message_count: usize, payload_bytes: usize) -> Vec<BoundaryMsg> {
+        (0..message_count)
+            .map(|index| {
+                let original = format!("message {index}: {}", "x".repeat(payload_bytes));
+                BoundaryMsg {
+                    message_ordinal: index as u64 + 1,
+                    message_id: format!("m-{index}"),
+                    role: if index % 2 == 0 {
+                        Role::User
+                    } else {
+                        Role::Assistant
+                    },
+                    blocks: vec![BoundaryBlock {
+                        id: format!("m-{index}#0"),
+                        ordinal: index as u64 + 1,
+                        kind: SelKind::Text,
+                        provider_executed: false,
+                        byte_size: original.len(),
+                        arc_id: None,
+                        original_token_count: mc_tokenizer::estimate_tokens(&original),
+                        original,
+                        rendered: None,
+                        ignored: false,
+                    }],
+                }
+            })
+            .collect()
+    }
+
+    fn projected_post_drop_percentage_retokenized_reference(
+        messages: &[BoundaryMsg],
+        pending_drops: &[PendingAgentDrop],
+        frozen_units: &[mc_core::FrozenUnit],
+        input_tokens: f64,
+        context_limit: f64,
+    ) -> Option<f64> {
+        if context_limit <= 0.0 {
+            return None;
+        }
+        let frozen_sizes = frozen_units
+            .iter()
+            .filter_map(|unit| {
+                unit.key.strip_prefix("red:").map(|target| {
+                    (
+                        target.to_string(),
+                        mc_tokenizer::estimate_tokens(&unit.frozen_payload),
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
+        let mut current_sizes = HashMap::<String, f64>::new();
+        for message in messages {
+            for block in &message.blocks {
+                let raw = mc_tokenizer::estimate_tokens(&block.original) as f64;
+                current_sizes.insert(
+                    block.id.clone(),
+                    frozen_sizes
+                        .get(&block.id)
+                        .copied()
+                        .map(|tokens| tokens as f64)
+                        .unwrap_or(raw),
+                );
+            }
+        }
+        for (target, tokens) in &frozen_sizes {
+            current_sizes
+                .entry(target.clone())
+                .or_insert(*tokens as f64);
+        }
+        let active_tokens: f64 = current_sizes.values().sum();
+        if active_tokens <= 0.0 {
+            return None;
+        }
+        let pending_ids = pending_drops
+            .iter()
+            .map(|drop| drop.target_id.as_str())
+            .collect::<HashSet<_>>();
+        let pending_tokens: f64 = pending_ids
+            .into_iter()
+            .filter_map(|target| current_sizes.get(target))
+            .copied()
+            .sum();
+        let drop_ratio = (pending_tokens / active_tokens).clamp(0.0, 1.0);
+        let projected_input = (input_tokens * (1.0 - drop_ratio)).max(0.0);
+        Some(projected_input / context_limit * 100.0)
+    }
+
+    fn pending_drop(target_id: &str) -> PendingAgentDrop {
+        PendingAgentDrop {
+            id: 1,
+            target_id: target_id.to_string(),
+            queued_at_ms: 0,
+            command_id: None,
+            command_first_applied_at_ms: None,
+        }
+    }
+
+    fn frozen_drop(target_id: &str) -> mc_core::FrozenUnit {
+        mc_core::FrozenUnit {
+            key: format!("red:{target_id}"),
+            kind: "drop".to_string(),
+            frozen_payload: "[dropped]".to_string(),
+            durability_class: mc_core::DurabilityClass::Lineage,
+            reset_rule: String::new(),
+        }
+    }
+
+    #[test]
+    fn historian_trigger_token_reuse_matches_retokenized_production_shape() {
+        let messages = trigger_messages_fixture(1_400, 24);
+        let cases = [
+            ("empty", Vec::new(), Vec::new()),
+            ("pending", vec![pending_drop("m-100#0")], Vec::new()),
+            (
+                "frozen",
+                vec![pending_drop("m-100#0")],
+                vec![frozen_drop("m-100#0"), frozen_drop("retired#0")],
+            ),
+        ];
+        for (label, pending, frozen) in cases {
+            let reference_projection = projected_post_drop_percentage_retokenized_reference(
+                &messages, &pending, &frozen, 140_000.0, 200_000.0,
+            );
+            let optimized_projection =
+                projected_post_drop_percentage(&messages, &pending, &frozen, 140_000.0, 200_000.0);
+            assert_eq!(
+                optimized_projection, reference_projection,
+                "projection: {label}"
+            );
+
+            let context = TriggerContext {
+                boundary: BoundaryContext {
+                    context_limit: 200_000.0,
+                    execute_threshold_percentage: 65.0,
+                    usage_percentage: 70.0,
+                    usage_input_tokens: 140_000.0,
+                    last_compartment_end_ordinal: None,
+                    prior_boundary_ordinal: 0,
+                    migration_floor_active: false,
+                    emergency_tail_scale: None,
+                    trigger_budget: Some(4_000.0),
+                    fold_is_only_reclaim: false,
+                },
+                projected_post_drop_percentage: optimized_projection,
+                compartment_in_progress: false,
+                commit_cluster_trigger_enabled: true,
+                min_commit_clusters: 2,
+            };
+            let mut reference_context = context.clone();
+            reference_context.projected_post_drop_percentage = reference_projection;
+            assert_eq!(
+                boundary::check_compartment_trigger(&messages, &context),
+                boundary::check_compartment_trigger_retokenized_reference(
+                    &messages,
+                    &reference_context,
+                ),
+                "trigger decision and progress: {label}",
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "run manually to compare production-sized historian trigger cost"]
+    fn historian_trigger_token_reuse_benchmark() {
+        let template = trigger_messages_fixture(1_400, 2_048);
+        let context = TriggerContext {
+            boundary: BoundaryContext {
+                context_limit: 200_000.0,
+                execute_threshold_percentage: 65.0,
+                usage_percentage: 50.0,
+                usage_input_tokens: 100_000.0,
+                last_compartment_end_ordinal: None,
+                prior_boundary_ordinal: 0,
+                migration_floor_active: false,
+                emergency_tail_scale: None,
+                trigger_budget: None,
+                fold_is_only_reclaim: false,
+            },
+            projected_post_drop_percentage: Some(50.0),
+            compartment_in_progress: false,
+            commit_cluster_trigger_enabled: true,
+            min_commit_clusters: 2,
+        };
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for _ in 0..3 {
+            let started_at = Instant::now();
+            let reference_messages = template.clone();
+            let projected = projected_post_drop_percentage_retokenized_reference(
+                &reference_messages,
+                &[],
+                &[],
+                100_000.0,
+                200_000.0,
+            );
+            let mut reference_context = context.clone();
+            reference_context.projected_post_drop_percentage = projected;
+            std::hint::black_box(boundary::check_compartment_trigger_retokenized_reference(
+                std::hint::black_box(&reference_messages),
+                std::hint::black_box(&reference_context),
+            ));
+            before.push(started_at.elapsed().as_secs_f64() * 1_000.0);
+
+            let started_at = Instant::now();
+            let mut optimized_messages = template.clone();
+            for block in optimized_messages
+                .iter_mut()
+                .flat_map(|message| &mut message.blocks)
+            {
+                block.original_token_count = mc_tokenizer::estimate_tokens(&block.original);
+            }
+            let projected =
+                projected_post_drop_percentage(&optimized_messages, &[], &[], 100_000.0, 200_000.0);
+            let mut optimized_context = context.clone();
+            optimized_context.projected_post_drop_percentage = projected;
+            std::hint::black_box(boundary::check_compartment_trigger(
+                std::hint::black_box(&optimized_messages),
+                std::hint::black_box(&optimized_context),
+            ));
+            after.push(started_at.elapsed().as_secs_f64() * 1_000.0);
+        }
+        before.sort_by(f64::total_cmp);
+        after.sort_by(f64::total_cmp);
+        eprintln!(
+            "historian-trigger messages=1400 payload_bytes=2048 before_ms={:.1} after_ms={:.1}",
+            before[1], after[1],
+        );
+        assert!(after[1] < before[1], "before={before:?} after={after:?}");
+    }
+
     #[test]
     fn projected_post_drop_pressure_uses_pending_blocks_and_frozen_replacements() {
         let messages = vec![BoundaryMsg {
@@ -10196,6 +10468,7 @@ mod tests {
                 byte_size: 400,
                 arc_id: None,
                 original: "x".repeat(400),
+                original_token_count: mc_tokenizer::estimate_tokens(&"x".repeat(400)),
                 rendered: None,
                 ignored: false,
             }],
@@ -10230,6 +10503,7 @@ mod tests {
             byte_size: text.len(),
             arc_id: None,
             original: text.to_string(),
+            original_token_count: mc_tokenizer::estimate_tokens(text),
             rendered: None,
             ignored: false,
         };
@@ -11516,6 +11790,8 @@ mod tests {
         let response = call_transform_request(&handler, request(vec![ck("m1", 1, "hello")])).await;
 
         assert_eq!(response["status"], "ok");
+        assert!(response["timings"]["trigger_ms"].is_number());
+        assert_eq!(response["timings"]["trigger_tokenized_blocks"], 1);
         assert!(response["timings"]["post_attach"].is_number());
         assert_eq!(
             store.tag_number_query_count_for_test(),
