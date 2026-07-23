@@ -4073,6 +4073,18 @@ enum ClassificationTxnOutcome {
     AuthorityGenerationMismatch(u64),
 }
 
+enum VerificationTxnOutcome {
+    Applied(VerificationApplyResult),
+    AuthorityStateMismatch(String),
+    AuthorityGenerationMismatch(u64),
+}
+
+enum MappingTxnOutcome {
+    Applied(MappingApplyResult),
+    AuthorityStateMismatch(String),
+    AuthorityGenerationMismatch(u64),
+}
+
 enum CommitOutcome {
     Committed(u64),
     CasConflict(u64),
@@ -4797,6 +4809,68 @@ impl<'a> FacadeMutationTxn<'a> {
         )
         .map_err(|error| error.to_string())?;
         load_memory_full_tx(self.tx, target_id).map_err(|error| error.to_string())
+    }
+
+    pub fn set_memory_verification(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        authority_generation: u64,
+        rows: &[VerificationUpdate],
+        now_ms: i64,
+    ) -> Result<VerificationApplyResult, String> {
+        match set_memory_verification_tx(
+            self.tx,
+            context_store_uuid,
+            project,
+            authority_generation,
+            rows,
+            now_ms,
+        )
+        .map_err(|error| error.to_string())?
+        {
+            VerificationTxnOutcome::Applied(result) => Ok(result),
+            VerificationTxnOutcome::AuthorityStateMismatch(found) if found == "DRAINING" => {
+                Err("authority_draining".to_string())
+            }
+            VerificationTxnOutcome::AuthorityStateMismatch(found) => {
+                Err(format!("authority_state_mismatch:{found}"))
+            }
+            VerificationTxnOutcome::AuthorityGenerationMismatch(found) => Err(format!(
+                "authority_generation_mismatch:{authority_generation}:{found}"
+            )),
+        }
+    }
+
+    pub fn set_memory_mapping(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        authority_generation: u64,
+        rows: &[MappingUpdate],
+        now_ms: i64,
+    ) -> Result<MappingApplyResult, String> {
+        match set_memory_mapping_tx(
+            self.tx,
+            context_store_uuid,
+            project,
+            authority_generation,
+            rows,
+            now_ms,
+        )
+        .map_err(|error| error.to_string())?
+        {
+            MappingTxnOutcome::Applied(result) => Ok(result),
+            MappingTxnOutcome::AuthorityStateMismatch(found) if found == "DRAINING" => {
+                Err("authority_draining".to_string())
+            }
+            MappingTxnOutcome::AuthorityStateMismatch(found) => {
+                Err(format!("authority_state_mismatch:{found}"))
+            }
+            MappingTxnOutcome::AuthorityGenerationMismatch(found) => Err(format!(
+                "authority_generation_mismatch:{authority_generation}:{found}"
+            )),
+        }
     }
 
     pub fn insert_note(&self, input: NoteInput<'_>) -> Result<StoredNote, String> {
@@ -7198,9 +7272,8 @@ impl McStore {
     }
 
     /// Apply verification updates only when their authority generation and content hash still match
-    /// the values used for classification. Verification-only changes do not invalidate caches, but
-    /// content rewrites and archives must be added to the mutation log so consumers see them in the
-    /// next incremental update.
+    /// the values used for verification. The row change, mapping snapshot feed, and any memory
+    /// mutation commit together.
     pub fn set_memory_verification(
         &self,
         context_store_uuid: &str,
@@ -7209,73 +7282,35 @@ impl McStore {
         rows: &[VerificationUpdate],
         now_ms: i64,
     ) -> Result<VerificationApplyResult, McStoreError> {
-        let authority = self.authority_status(context_store_uuid, project, "memories")?;
-        let Some(authority) = authority else {
-            return Err(McStoreError::AuthorityStateMismatch {
-                expected: "MODULE".into(),
-                found: "missing".into(),
-            });
-        };
-        if authority.state != "MODULE" {
-            return Err(McStoreError::AuthorityStateMismatch {
-                expected: "MODULE".into(),
-                found: authority.state,
-            });
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            set_memory_verification_tx(
+                tx,
+                context_store_uuid,
+                project,
+                authority_generation,
+                rows,
+                now_ms,
+            )
+        })?;
+        match outcome {
+            VerificationTxnOutcome::Applied(result) => Ok(result),
+            VerificationTxnOutcome::AuthorityStateMismatch(found) => {
+                Err(McStoreError::AuthorityStateMismatch {
+                    expected: "MODULE".to_string(),
+                    found,
+                })
+            }
+            VerificationTxnOutcome::AuthorityGenerationMismatch(found) => {
+                Err(McStoreError::AuthorityGenerationMismatch {
+                    expected: authority_generation,
+                    found,
+                })
+            }
         }
-        if authority.generation != authority_generation {
-            return Err(McStoreError::AuthorityGenerationMismatch {
-                expected: authority_generation,
-                found: authority.generation,
-            });
-        }
-        self.inner.with_conn_fenced(|tx| {
-            let authority: (String, u64) = tx.query_row(
-                "SELECT state, generation FROM mc_authority WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
-                params![context_store_uuid, project], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            if authority.0 != "MODULE" {
-                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                    AuthorityTransitionError::State { expected: "MODULE".into(), found: authority.0 },
-                )));
-            }
-            if authority.1 != authority_generation {
-                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                    AuthorityTransitionError::Generation { expected: authority_generation, found: authority.1 },
-                )));
-            }
-            let mut accepted = Vec::new();
-            let mut rejected = Vec::new();
-            for update in rows {
-                let Some(memory) = load_memory_full_tx(tx, update.memory_id)? else {
-                    rejected.push(VerificationRejected { memory_id: update.memory_id, reason: "not_found".into() });
-                    continue;
-                };
-                if memory.project_path != project { rejected.push(VerificationRejected { memory_id: update.memory_id, reason: "not_owned".into() }); continue; }
-                if memory.normalized_hash != update.content_hash_at_prompt { rejected.push(VerificationRejected { memory_id: update.memory_id, reason: "stale".into() }); continue; }
-                match update.verification_status.as_str() {
-                    "verified" => { tx.execute("UPDATE mc_memories SET verification_status = 'verified', verified_at = ?1 WHERE id = ?2", params![now_ms, update.memory_id])?; }
-                    "update" => {
-                        let Some(content) = update.updated_content.as_deref().map(str::trim).filter(|v| !v.is_empty()) else { rejected.push(VerificationRejected { memory_id: update.memory_id, reason: "missing_updated_content".into() }); continue; };
-                        let hash = compute_normalized_memory_hash(content);
-                        tx.execute("UPDATE mc_memories SET content = ?1, normalized_hash = ?2, updated_at = ?3, shareable = 0, classified_at = NULL, verification_status = 'verified', verified_at = ?3 WHERE id = ?4", params![content, hash, now_ms, update.memory_id])?;
-                        tx.execute("DELETE FROM mc_memory_mappings WHERE memory_id = ?1", params![update.memory_id])?;
-                        append_memory_mutation_tx(tx, MemoryMutationAppend { project_path: project, mutation_type: "update", target_memory_id: update.memory_id, superseded_by_id: None, category: Some(&memory.category), new_content: Some(content), queued_at: now_ms })?;
-                    }
-                    "archive" => {
-                        let metadata = merge_archive_reason(memory.metadata_json.as_deref(), update.archive_reason.as_deref().unwrap_or("verified archive"));
-                        tx.execute("UPDATE mc_memories SET status = 'archived', metadata_json = ?1, updated_at = ?2 WHERE id = ?3", params![metadata, now_ms, update.memory_id])?;
-                        tx.execute("DELETE FROM mc_memory_mappings WHERE memory_id = ?1", params![update.memory_id])?;
-                        append_memory_mutation_tx(tx, MemoryMutationAppend { project_path: project, mutation_type: "archive", target_memory_id: update.memory_id, superseded_by_id: None, category: None, new_content: None, queued_at: now_ms })?;
-                    }
-                    _ => { rejected.push(VerificationRejected { memory_id: update.memory_id, reason: "invalid_status".into() }); continue; }
-                }
-                accepted.push(update.memory_id);
-            }
-            Ok(VerificationApplyResult { accepted, rejected })
-        }).map_err(Into::into)
     }
 
-    /// Store the complete file set reported by map-memories. Mapping is cache-neutral, but the
-    /// explicit feed row lets the context mirror converge without treating it as a memory rewrite.
+    /// Store the complete file set reported by map-memories and emit the resulting mapping and
+    /// verification snapshot for the context mirror in the same transaction.
     pub fn set_memory_mapping(
         &self,
         context_store_uuid: &str,
@@ -7284,55 +7319,31 @@ impl McStore {
         rows: &[MappingUpdate],
         now_ms: i64,
     ) -> Result<MappingApplyResult, McStoreError> {
-        let authority = self.authority_status(context_store_uuid, project, "memories")?;
-        let Some(authority) = authority else {
-            return Err(McStoreError::AuthorityStateMismatch {
-                expected: "MODULE".into(),
-                found: "missing".into(),
-            });
-        };
-        if authority.state != "MODULE" {
-            return Err(McStoreError::AuthorityStateMismatch {
-                expected: "MODULE".into(),
-                found: authority.state,
-            });
-        }
-        if authority.generation != authority_generation {
-            return Err(McStoreError::AuthorityGenerationMismatch {
-                expected: authority_generation,
-                found: authority.generation,
-            });
-        }
-        self.inner.with_conn_fenced(|tx| {
-            let authority: (String, u64) = tx.query_row(
-                "SELECT state, generation FROM mc_authority WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
-                params![context_store_uuid, project], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            if authority.0 != "MODULE" { return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(AuthorityTransitionError::State { expected: "MODULE".into(), found: authority.0 }))); }
-            if authority.1 != authority_generation { return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(AuthorityTransitionError::Generation { expected: authority_generation, found: authority.1 }))); }
-            tx.execute_batch("CREATE TABLE IF NOT EXISTS mc_memory_mappings (memory_id INTEGER PRIMARY KEY, project_path TEXT NOT NULL, mapped_files_json TEXT NOT NULL, updated_at INTEGER NOT NULL);")?;
-            let mut accepted = Vec::new();
-            let mut rejected = Vec::new();
-            for update in rows {
-                let Some(memory) = load_memory_full_tx(tx, update.memory_id)? else { rejected.push(MappingRejected { memory_id: update.memory_id, reason: "not_found".into() }); continue; };
-                if memory.project_path != project { rejected.push(MappingRejected { memory_id: update.memory_id, reason: "not_owned".into() }); continue; }
-                if memory.normalized_hash != update.content_hash_at_prompt { rejected.push(MappingRejected { memory_id: update.memory_id, reason: "stale".into() }); continue; }
-                let files = serde_json::to_string(&update.mapped_files).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-                tx.execute("INSERT INTO mc_memory_mappings(memory_id, project_path, mapped_files_json, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(memory_id) DO UPDATE SET project_path=excluded.project_path, mapped_files_json=excluded.mapped_files_json, updated_at=excluded.updated_at", params![update.memory_id, project, files, now_ms])?;
-                // Mapping is a feed-visible side effect, so it must carry the same complete
-                // row shape as the DML trigger. The mapping key is an overlay, not a replacement.
-                let snapshot = memory_feed_snapshot(&memory, update.mapped_files.as_deref());
-                tx.execute(
-                    "INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash) VALUES ('memories', 'update', ?1, ?2, ?3)",
-                    params![
-                        update.memory_id,
-                        serde_json::to_string(&snapshot).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
-                        update.content_hash_at_prompt,
-                    ],
-                )?;
-                accepted.push(update.memory_id);
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            set_memory_mapping_tx(
+                tx,
+                context_store_uuid,
+                project,
+                authority_generation,
+                rows,
+                now_ms,
+            )
+        })?;
+        match outcome {
+            MappingTxnOutcome::Applied(result) => Ok(result),
+            MappingTxnOutcome::AuthorityStateMismatch(found) => {
+                Err(McStoreError::AuthorityStateMismatch {
+                    expected: "MODULE".to_string(),
+                    found,
+                })
             }
-            Ok(MappingApplyResult { accepted, rejected })
-        }).map_err(Into::into)
+            MappingTxnOutcome::AuthorityGenerationMismatch(found) => {
+                Err(McStoreError::AuthorityGenerationMismatch {
+                    expected: authority_generation,
+                    found,
+                })
+            }
+        }
     }
 
     /// Record a terminal wrapup outcome only while the cache row still matches the
@@ -12643,25 +12654,28 @@ impl McStore {
             .map_err(|_| McStoreError::Serde("snapshot limit exceeds i64".to_string()))?;
         self.inner
             .with_conn(|conn| {
-                // The resnapshot consumer heals mirror rows from these snapshots, so they
-                // must carry the complete row like every other memories feed emission —
-                // a reduced projection here would null-clobber healed columns downstream.
+                // The resnapshot consumer heals mirror rows from these snapshots, so each row
+                // carries both the complete memory and its current mapping state.
                 let mut stmt = conn.prepare(&format!(
                     "{MEMORY_FULL_SELECT_COLUMNS} FROM mc_memories WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
                 ))?;
-                let rows = stmt
-                    .query_map(params![cursor, limit], |row| {
-                        let memory = stored_memory_full_from_row(row)?;
+                let memories = stmt
+                    .query_map(params![cursor, limit], stored_memory_full_from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let rows = memories
+                    .into_iter()
+                    .map(|memory| {
+                        let mapping = memory_mapping_feed_value(conn, memory.id)?;
                         Ok(ChangefeedRow {
                             feed_seq: 0,
                             domain: "memories".to_string(),
                             op: "insert".to_string(),
                             module_row_id: memory.id,
                             content_hash: Some(memory.normalized_hash.clone()),
-                            full_row_snapshot: memory_feed_snapshot(&memory, None),
+                            full_row_snapshot: memory_feed_snapshot(&memory, mapping),
                         })
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
+                    })
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()?;
                 let next_cursor = rows.last().map(|row| row.module_row_id).unwrap_or(cursor);
                 Ok(ChangefeedPage {
                     domain: "memories".to_string(),
@@ -13634,7 +13648,38 @@ fn load_memory_full_tx(
     .optional()
 }
 
-fn memory_feed_snapshot(memory: &StoredMemoryFull, mapping: Option<&[String]>) -> Value {
+fn memory_mapping_feed_value(
+    conn: &rusqlite::Connection,
+    memory_id: i64,
+) -> rusqlite::Result<Value> {
+    let stored = conn
+        .query_row(
+            "SELECT mapped_files_json FROM mc_memory_mappings WHERE memory_id = ?1",
+            params![memory_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(stored) = stored else {
+        return Ok(Value::Null);
+    };
+    let value = serde_json::from_str::<Value>(&stored).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    match value {
+        Value::Null => Ok(Value::Array(Vec::new())),
+        Value::Array(_) => Ok(value),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "memory mapping must be null or an array",
+            )),
+        )),
+    }
+}
+
+fn memory_feed_snapshot(memory: &StoredMemoryFull, mapping: Value) -> Value {
     serde_json::json!({
         "id": memory.id,
         "project_path": memory.project_path,
@@ -13665,6 +13710,271 @@ fn memory_feed_snapshot(memory: &StoredMemoryFull, mapping: Option<&[String]>) -
         "context_row_id": memory.context_row_id,
         "mapping": mapping,
     })
+}
+
+fn emit_verification_memory_snapshot_tx(
+    tx: &rusqlite::Transaction<'_>,
+    memory: &StoredMemoryFull,
+    feed_seq_before: i64,
+) -> rusqlite::Result<()> {
+    let mapping = memory_mapping_feed_value(tx, memory.id)?;
+    let snapshot = serde_json::to_string(&memory_feed_snapshot(memory, mapping))
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let enriched = tx.execute(
+        "UPDATE mc_changefeed
+            SET full_row_snapshot = ?1, content_hash = ?2
+          WHERE feed_seq = (
+                SELECT feed_seq FROM mc_changefeed
+                 WHERE domain = 'memories' AND op = 'update'
+                   AND module_row_id = ?3 AND feed_seq > ?4
+                 ORDER BY feed_seq DESC LIMIT 1
+          )",
+        params![snapshot, memory.normalized_hash, memory.id, feed_seq_before],
+    )?;
+    if enriched == 0 {
+        tx.execute(
+            "INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+             VALUES ('memories', 'update', ?1, ?2, ?3)",
+            params![memory.id, snapshot, memory.normalized_hash],
+        )?;
+    }
+    Ok(())
+}
+
+fn set_memory_verification_tx(
+    tx: &rusqlite::Transaction<'_>,
+    context_store_uuid: &str,
+    project: &str,
+    authority_generation: u64,
+    rows: &[VerificationUpdate],
+    now_ms: i64,
+) -> rusqlite::Result<VerificationTxnOutcome> {
+    let authority = tx
+        .query_row(
+            "SELECT state, generation FROM mc_authority
+              WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
+            params![context_store_uuid, project],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+        )
+        .optional()?;
+    let Some((state, generation)) = authority else {
+        return Ok(VerificationTxnOutcome::AuthorityStateMismatch(
+            "missing".to_string(),
+        ));
+    };
+    if state != "MODULE" {
+        return Ok(VerificationTxnOutcome::AuthorityStateMismatch(state));
+    }
+    if generation != authority_generation {
+        return Ok(VerificationTxnOutcome::AuthorityGenerationMismatch(
+            generation,
+        ));
+    }
+
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    for update in rows {
+        let Some(memory) = load_memory_full_tx(tx, update.memory_id)? else {
+            rejected.push(VerificationRejected {
+                memory_id: update.memory_id,
+                reason: "not_found".to_string(),
+            });
+            continue;
+        };
+        if memory.project_path != project {
+            rejected.push(VerificationRejected {
+                memory_id: update.memory_id,
+                reason: "not_owned".to_string(),
+            });
+            continue;
+        }
+        if memory.normalized_hash != update.content_hash_at_prompt {
+            rejected.push(VerificationRejected {
+                memory_id: update.memory_id,
+                reason: "stale".to_string(),
+            });
+            continue;
+        }
+        let feed_seq_before = tx.query_row(
+            "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        match update.verification_status.as_str() {
+            "verified" => {
+                tx.execute(
+                    "UPDATE mc_memories
+                        SET verification_status = 'verified', verified_at = ?1
+                      WHERE id = ?2",
+                    params![now_ms, update.memory_id],
+                )?;
+            }
+            "update" => {
+                let Some(content) = update
+                    .updated_content
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    rejected.push(VerificationRejected {
+                        memory_id: update.memory_id,
+                        reason: "missing_updated_content".to_string(),
+                    });
+                    continue;
+                };
+                let hash = compute_normalized_memory_hash(content);
+                tx.execute(
+                    "UPDATE mc_memories
+                        SET content = ?1, normalized_hash = ?2, updated_at = ?3,
+                            shareable = 0, classified_at = NULL,
+                            verification_status = 'verified', verified_at = ?3
+                      WHERE id = ?4",
+                    params![content, hash, now_ms, update.memory_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM mc_memory_mappings WHERE memory_id = ?1",
+                    params![update.memory_id],
+                )?;
+                append_memory_mutation_tx(
+                    tx,
+                    MemoryMutationAppend {
+                        project_path: project,
+                        mutation_type: "update",
+                        target_memory_id: update.memory_id,
+                        superseded_by_id: None,
+                        category: Some(&memory.category),
+                        new_content: Some(content),
+                        queued_at: now_ms,
+                    },
+                )?;
+            }
+            "archive" => {
+                let metadata = merge_archive_reason(
+                    memory.metadata_json.as_deref(),
+                    update
+                        .archive_reason
+                        .as_deref()
+                        .unwrap_or("verified archive"),
+                );
+                tx.execute(
+                    "UPDATE mc_memories
+                        SET status = 'archived', metadata_json = ?1, updated_at = ?2
+                      WHERE id = ?3",
+                    params![metadata, now_ms, update.memory_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM mc_memory_mappings WHERE memory_id = ?1",
+                    params![update.memory_id],
+                )?;
+                append_memory_mutation_tx(
+                    tx,
+                    MemoryMutationAppend {
+                        project_path: project,
+                        mutation_type: "archive",
+                        target_memory_id: update.memory_id,
+                        superseded_by_id: None,
+                        category: None,
+                        new_content: None,
+                        queued_at: now_ms,
+                    },
+                )?;
+            }
+            _ => {
+                rejected.push(VerificationRejected {
+                    memory_id: update.memory_id,
+                    reason: "invalid_status".to_string(),
+                });
+                continue;
+            }
+        }
+        let memory = load_memory_full_tx(tx, update.memory_id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        emit_verification_memory_snapshot_tx(tx, &memory, feed_seq_before)?;
+        accepted.push(update.memory_id);
+    }
+    Ok(VerificationTxnOutcome::Applied(VerificationApplyResult {
+        accepted,
+        rejected,
+    }))
+}
+
+fn set_memory_mapping_tx(
+    tx: &rusqlite::Transaction<'_>,
+    context_store_uuid: &str,
+    project: &str,
+    authority_generation: u64,
+    rows: &[MappingUpdate],
+    now_ms: i64,
+) -> rusqlite::Result<MappingTxnOutcome> {
+    let authority = tx
+        .query_row(
+            "SELECT state, generation FROM mc_authority
+              WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
+            params![context_store_uuid, project],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+        )
+        .optional()?;
+    let Some((state, generation)) = authority else {
+        return Ok(MappingTxnOutcome::AuthorityStateMismatch(
+            "missing".to_string(),
+        ));
+    };
+    if state != "MODULE" {
+        return Ok(MappingTxnOutcome::AuthorityStateMismatch(state));
+    }
+    if generation != authority_generation {
+        return Ok(MappingTxnOutcome::AuthorityGenerationMismatch(generation));
+    }
+
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    for update in rows {
+        let Some(memory) = load_memory_full_tx(tx, update.memory_id)? else {
+            rejected.push(MappingRejected {
+                memory_id: update.memory_id,
+                reason: "not_found".to_string(),
+            });
+            continue;
+        };
+        if memory.project_path != project {
+            rejected.push(MappingRejected {
+                memory_id: update.memory_id,
+                reason: "not_owned".to_string(),
+            });
+            continue;
+        }
+        if memory.normalized_hash != update.content_hash_at_prompt {
+            rejected.push(MappingRejected {
+                memory_id: update.memory_id,
+                reason: "stale".to_string(),
+            });
+            continue;
+        }
+        let files = serde_json::to_string(&update.mapped_files)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        tx.execute(
+            "INSERT INTO mc_memory_mappings(memory_id, project_path, mapped_files_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(memory_id) DO UPDATE SET
+                project_path = excluded.project_path,
+                mapped_files_json = excluded.mapped_files_json,
+                updated_at = excluded.updated_at",
+            params![update.memory_id, project, files, now_ms],
+        )?;
+        let mapping = memory_mapping_feed_value(tx, update.memory_id)?;
+        let snapshot = serde_json::to_string(&memory_feed_snapshot(&memory, mapping))
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        tx.execute(
+            "INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+             VALUES ('memories', 'update', ?1, ?2, ?3)",
+            params![update.memory_id, snapshot, memory.normalized_hash],
+        )?;
+        accepted.push(update.memory_id);
+    }
+    Ok(MappingTxnOutcome::Applied(MappingApplyResult {
+        accepted,
+        rejected,
+    }))
 }
 
 struct MemoryMutationAppend<'a> {
@@ -20522,6 +20832,19 @@ mod shadow_tests {
             )
             .unwrap();
         assert_eq!(classified.accepted, vec![1]);
+        store
+            .set_memory_mapping(
+                "context",
+                "git:applies",
+                authority.generation,
+                &[MappingUpdate {
+                    memory_id: 1,
+                    content_hash_at_prompt: hash(1),
+                    mapped_files: Some(vec!["src/old.rs".to_string()]),
+                }],
+                5,
+            )
+            .unwrap();
         let result = store
             .set_memory_verification(
                 "context",
@@ -20557,10 +20880,23 @@ mod shadow_tests {
                         archive_reason: None,
                     },
                 ],
-                0,
+                10,
             )
             .unwrap();
         assert_eq!(result.accepted, vec![1]);
+        let verified_feed = store
+            .pull_changefeed("memories", 0, 100)
+            .unwrap()
+            .rows
+            .into_iter()
+            .rev()
+            .find(|row| row.module_row_id == 1)
+            .unwrap();
+        assert_eq!(verified_feed.full_row_snapshot["verified_at"], 10);
+        assert_eq!(
+            verified_feed.full_row_snapshot["mapping"],
+            serde_json::json!(["src/old.rs"])
+        );
         assert_eq!(
             result
                 .rejected
@@ -20601,6 +20937,15 @@ mod shadow_tests {
             )
             .unwrap();
         assert_eq!(archived.accepted, vec![1]);
+        let archived_feed = store
+            .pull_changefeed("memories", 0, 100)
+            .unwrap()
+            .rows
+            .into_iter()
+            .rev()
+            .find(|row| row.module_row_id == 1)
+            .unwrap();
+        assert!(archived_feed.full_row_snapshot["mapping"].is_null());
         let mapping = store
             .set_memory_mapping(
                 "context",
@@ -20641,5 +20986,183 @@ mod shadow_tests {
             .rows
             .iter()
             .any(|row| row.full_row_snapshot["source_type"].as_str().is_some()));
+    }
+
+    #[test]
+    fn verification_command_crash_rolls_back_apply_ledger_and_feed_then_replays_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let prepared = store
+            .authority_begin_prepare("context", "git:command-atomic", "memories")
+            .unwrap();
+        let authority = store
+            .authority_finish_prepare(
+                "context",
+                "git:command-atomic",
+                "memories",
+                prepared.generation,
+                "digest",
+                "digest",
+                true,
+            )
+            .unwrap();
+        store
+            .seed_memory(1, "git:command-atomic", "CONSTRAINTS", "archive once", 1)
+            .unwrap();
+        let hash = store.get_memory_full(1).unwrap().unwrap().normalized_hash;
+        store
+            .set_memory_mapping(
+                "context",
+                "git:command-atomic",
+                authority.generation,
+                &[MappingUpdate {
+                    memory_id: 1,
+                    content_hash_at_prompt: hash.clone(),
+                    mapped_files: Some(vec!["src/lib.rs".to_string()]),
+                }],
+                2,
+            )
+            .unwrap();
+        let feed_head = store
+            .pull_changefeed("memories", 0, 100)
+            .unwrap()
+            .next_cursor;
+        let crashed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let crash_once = std::sync::Arc::clone(&crashed);
+        store.set_facade_mutation_abandon_hook(Box::new(move || {
+            if !crash_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                panic!("abandon verification command before commit");
+            }
+        }));
+        let update = VerificationUpdate {
+            memory_id: 1,
+            content_hash_at_prompt: hash,
+            verification_status: "archive".to_string(),
+            updated_content: None,
+            archive_reason: Some("obsolete".to_string()),
+        };
+        let abandoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.with_facade_command(
+                "/route/command-atomic",
+                "git:command-atomic",
+                "memories",
+                "session-command-atomic",
+                "memory",
+                "set_verification",
+                Some("verify-command"),
+                |tx| {
+                    tx.set_memory_verification(
+                        "context",
+                        "git:command-atomic",
+                        authority.generation,
+                        std::slice::from_ref(&update),
+                        3,
+                    )?;
+                    Ok(b"{\"ok\":true}".to_vec())
+                },
+            )
+        }));
+        assert!(abandoned.is_err());
+        assert_eq!(
+            store
+                .facade_mutation_ledger_count("session-command-atomic")
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.get_memory_full(1).unwrap().unwrap().status, "active");
+        assert_eq!(
+            store
+                .pull_changefeed("memories", 0, 100)
+                .unwrap()
+                .next_cursor,
+            feed_head
+        );
+        let mapping_count = |store: &McStore| {
+            store
+                .inner
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM mc_memory_mappings WHERE memory_id = 1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                })
+                .unwrap()
+        };
+        let mutation_count = |store: &McStore| {
+            store
+                .inner
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM mc_memory_mutation_log WHERE target_memory_id = 1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                })
+                .unwrap()
+        };
+        assert_eq!(mapping_count(&store), 1);
+        assert_eq!(mutation_count(&store), 0);
+
+        let applied = store
+            .with_facade_command(
+                "/route/command-atomic",
+                "git:command-atomic",
+                "memories",
+                "session-command-atomic",
+                "memory",
+                "set_verification",
+                Some("verify-command"),
+                |tx| {
+                    tx.set_memory_verification(
+                        "context",
+                        "git:command-atomic",
+                        authority.generation,
+                        std::slice::from_ref(&update),
+                        3,
+                    )?;
+                    Ok(b"{\"ok\":true}".to_vec())
+                },
+            )
+            .unwrap();
+        assert!(matches!(applied, FacadeMutationOutcome::Applied(_)));
+        assert_eq!(
+            store
+                .facade_mutation_ledger_count("session-command-atomic")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.get_memory_full(1).unwrap().unwrap().status,
+            "archived"
+        );
+        assert_eq!(mapping_count(&store), 0);
+        assert_eq!(mutation_count(&store), 1);
+        let applied_feed_head = store
+            .pull_changefeed("memories", 0, 100)
+            .unwrap()
+            .next_cursor;
+
+        let replay = store
+            .with_facade_command(
+                "/route/command-atomic",
+                "git:command-atomic",
+                "memories",
+                "session-command-atomic",
+                "memory",
+                "set_verification",
+                Some("verify-command"),
+                |_tx| panic!("replay must not enter the verification apply"),
+            )
+            .unwrap();
+        assert!(matches!(replay, FacadeMutationOutcome::Duplicate(_)));
+        assert_eq!(mutation_count(&store), 1);
+        assert_eq!(
+            store
+                .pull_changefeed("memories", 0, 100)
+                .unwrap()
+                .next_cursor,
+            applied_feed_head
+        );
     }
 }
