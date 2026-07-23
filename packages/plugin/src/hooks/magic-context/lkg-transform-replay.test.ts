@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
@@ -127,6 +127,30 @@ describe("LKG transform replay", () => {
             ]);
             expect(replay.messages[2]).toEqual(originalTail?.[0]);
             expect(new Set(replay.messages.map((message) => message.info.id)).size).toBe(4);
+        }
+    });
+
+    test("serializes the capture prefix once and stores that artifact", () => {
+        resetLkgSlotsForTest();
+        const input = [user("u0", 1)];
+        const stringifySpy = spyOn(JSON, "stringify");
+
+        try {
+            expect(
+                captureLkgSlot({
+                    sessionId: "single-serialization",
+                    input,
+                    output: structuredClone(input),
+                    modelKey: "test/model",
+                    providerKey: "test",
+                }),
+            ).toBe(true);
+            expect(stringifySpy).toHaveBeenCalledTimes(1);
+            expect(getSlot("single-serialization")?.jsonPrefix).toBe(
+                stringifySpy.mock.results[0]?.value,
+            );
+        } finally {
+            stringifySpy.mockRestore();
         }
     });
 

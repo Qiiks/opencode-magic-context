@@ -231,6 +231,11 @@ function outputMessageIsPostAnchor(
     return linkedIndex === undefined ? null : linkedIndex > anchorIndex;
 }
 
+/**
+ * Build the replay prefix and serialize it once. The returned `jsonPrefix` is
+ * the exact artifact stored in the last-known-good replay entry; callers must
+ * use it as-is rather than serialize the prefix again.
+ */
 export function buildLkgPrefix(
     input: LkgEntryProjection[] | MessageLike[],
     output: MessageLike[],
@@ -238,7 +243,7 @@ export function buildLkgPrefix(
     anchorIndex: number;
     anchorMessageId: string;
     inputIdSeq: string[];
-    prefix: MessageLike[];
+    jsonPrefix: string;
 } | null {
     const projected = asEntryProjection(input);
     const anchorIndex = findLkgAnchor(projected);
@@ -255,12 +260,10 @@ export function buildLkgPrefix(
         if (postAnchor === null) return null;
         if (!postAnchor) prefix.push(message);
     }
-    let json: string;
+    let jsonPrefix: string;
     try {
-        json = JSON.stringify(prefix);
-        if (typeof json !== "string") return null;
-        const parsed = JSON.parse(json);
-        if (!Array.isArray(parsed) || JSON.stringify(parsed) !== json) return null;
+        jsonPrefix = JSON.stringify(prefix);
+        if (typeof jsonPrefix !== "string") return null;
     } catch {
         return null;
     }
@@ -268,22 +271,15 @@ export function buildLkgPrefix(
         anchorIndex,
         anchorMessageId,
         inputIdSeq: validIds.slice(0, anchorIndex + 1),
-        prefix,
+        jsonPrefix,
     };
 }
 
 export function captureLkgSlot(args: LkgCaptureInput): boolean {
     const built = buildLkgPrefix(args.input, args.output);
     if (!built) return false;
-    let jsonPrefix: string;
-    try {
-        jsonPrefix = JSON.stringify(built.prefix);
-        if (typeof jsonPrefix !== "string") return false;
-    } catch {
-        return false;
-    }
     return captureSlot(args.sessionId, {
-        jsonPrefix,
+        jsonPrefix: built.jsonPrefix,
         inputIdSeq: built.inputIdSeq,
         lastInputMessageId: built.anchorMessageId,
         modelKey: args.modelKey,
