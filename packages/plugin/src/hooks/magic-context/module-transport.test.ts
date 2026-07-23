@@ -344,6 +344,24 @@ describe("SubcModuleTransport", () => {
         }
     });
 
+    it("bounds canonical-root entries with least-recently-used eviction", () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const internals = transport as unknown as {
+            canonicalRoot(root: string): string;
+            canonicalRootCache: Map<string, string>;
+        };
+        for (let index = 0; index < 256; index += 1) {
+            internals.canonicalRoot(`/missing-canonical-root-${index}`);
+        }
+        // A cache hit refreshes its recency before the next insert evicts an entry.
+        internals.canonicalRoot("/missing-canonical-root-0");
+        internals.canonicalRoot("/missing-canonical-root-256");
+
+        expect(internals.canonicalRootCache.size).toBe(256);
+        expect(internals.canonicalRootCache.has("/missing-canonical-root-0")).toBe(true);
+        expect(internals.canonicalRootCache.has("/missing-canonical-root-1")).toBe(false);
+    });
+
     it("does not reuse a route cached under an earlier connection generation", async () => {
         const transport = new SubcModuleTransport("unused-connection-file");
         const oldRoute = { channel: 7, epoch: 77 } as RouteHandle;

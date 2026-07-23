@@ -1781,6 +1781,9 @@ mod tests {
             request_observed_at_ms: None,
             channel2_nudge_state: String::new(),
             emergency_recovery_armed: false,
+            emergency_recovery_no_head_escape: false,
+            detected_context_limit: 0,
+            detected_context_limit_model_key: None,
             history_budget_tokens: None,
             declared_trim: None,
         }

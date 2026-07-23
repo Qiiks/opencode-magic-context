@@ -1254,13 +1254,25 @@ describe("emergency fail-closed decision", () => {
                 emergencyRecoveryOrigin: "provider_overflow",
                 foldMaterializedThisPass: false,
                 finalWireEstimate: { tokens: 14_000, trusted: true },
-                provenLimitTokens: 100_000,
+                providerProvenLimitTokens: 100_000,
             }),
         ).toEqual({
             shouldAbort: false,
             reason: "trusted-final-wire-disarm",
             disarm: { finalWireTokens: 14_000, provenLimitTokens: 100_000 },
         });
+    });
+
+    it("does not disarm from a catalog-only limit", () => {
+        expect(
+            evaluateEmergencyFailClosed({
+                usagePercentage: 95,
+                emergencyRecoveryArmed: true,
+                emergencyRecoveryOrigin: "provider_overflow",
+                foldMaterializedThisPass: false,
+                finalWireEstimate: { tokens: 14_000, trusted: true },
+            }),
+        ).toEqual({ shouldAbort: true, reason: "provider-overflow-abort" });
     });
 
     it("keeps provider-overflow blocking when the final-wire estimate is untrusted", () => {
@@ -1271,7 +1283,7 @@ describe("emergency fail-closed decision", () => {
                 emergencyRecoveryOrigin: "provider_overflow",
                 foldMaterializedThisPass: false,
                 finalWireEstimate: { tokens: 14_000, trusted: false },
-                provenLimitTokens: 100_000,
+                providerProvenLimitTokens: 100_000,
             }),
         ).toEqual({ shouldAbort: true, reason: "provider-overflow-abort" });
     });

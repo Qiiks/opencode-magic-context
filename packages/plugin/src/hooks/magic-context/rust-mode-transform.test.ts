@@ -14,7 +14,11 @@ import type { ContextDatabase } from "../../features/magic-context/storage";
 import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/magic-context/storage";
 import { initializeDatabase, openDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
-import { recordDetectedContextLimit } from "../../features/magic-context/storage-meta-persisted";
+import {
+    getOverflowState,
+    recordDetectedContextLimit,
+    recordOverflowDetected,
+} from "../../features/magic-context/storage-meta-persisted";
 import {
     scheduleOpenCodeTransformDecisionWrite,
     __test as transformDecisionTest,
@@ -372,6 +376,38 @@ describe("Rust mode authority adapter", () => {
         ).toBe(
             "rust pass: decision=HARD reason=first_render served_from=transform in=4 out=3 applied=true elapsed=12.3 ms module=8.8 ms stages=prefix_guard:0.0 ordinal_resolve:0.0 state_sync:0.0 clone:0.0 wire_build:0.0 transport:0.0 transport_pages:0 apply:0.0 lkg_snapshot:0.0 other:12.3",
         );
+    });
+
+    it("walks an armed low-usage Rust recovery through a forced fold and durable disarm", async () => {
+        const sessionId = `rust-overflow-recovery-${Date.now()}`;
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordOverflowDetected(db, sessionId, 100_000, "test/model");
+        const transformBodies: Record<string, unknown>[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                transformBodies.push(body);
+                return {
+                    native_messages: makeMessages(sessionId),
+                    decision: "HARD",
+                    materialize_reason: "overflow_recovery_fold",
+                };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.contextUsageMap.set(sessionId, {
+            usage: { inputTokens: 30_000, percentage: 30 },
+            updatedAt: Date.now(),
+        });
+        const runner = createRustModeTransform(deps, { moduleClient });
+        const messages = makeMessages(sessionId);
+
+        await runner.run(sessionId, messages, { messages }, makeMeta(db, sessionId));
+
+        expect(transformBodies).toHaveLength(1);
+        expect(transformBodies[0]?.emergency_recovery_armed).toBe(true);
+        expect(getOverflowState(db, sessionId).needsEmergencyRecovery).toBe(false);
     });
 
     it("binds every served Rust pass class to the provider assistant decision row", async () => {

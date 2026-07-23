@@ -20,12 +20,14 @@ import {
     getChannel2NudgeState,
     getOverflowState,
     isEmergencyRecoveryArmed,
+    loadProtectedTailMeta,
 } from "../../features/magic-context/storage-meta-persisted";
 import { writeRustTransformDecision } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
 import { resolveCtxReduceAvailability } from "./ctx-reduce-availability";
 import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
+import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     resolveExecuteThreshold,
@@ -880,6 +882,10 @@ function buildTransformBody(args: {
         request_observed_at_ms: args.requestObservedAtMs,
         channel2_nudge_state: args.channel2NudgeState,
         emergency_recovery_armed: args.emergencyRecoveryArmed,
+        emergency_recovery_no_head_escape:
+            args.passInputs.emergency_recovery_no_head_escape === true,
+        detected_context_limit: args.passInputs.detected_context_limit,
+        detected_context_limit_model_key: args.passInputs.detected_context_limit_model_key,
         model_key: args.modelKey,
         provider_id: args.providerId,
         tool_present: args.passInputs.tool_present === true,
@@ -999,7 +1005,6 @@ export function createRustModeTransform(
             modelKey: keys.modelKey,
             providerKey: keys.providerKey,
             entry,
-            skipSeamValidation: true,
         });
         if (!replay.ok) {
             sessionLog(sessionId, replay.reason);
@@ -1188,6 +1193,10 @@ export function createRustModeTransform(
             const midTurn = isMidTurn(deps, sessionId);
             const requestObservedAtMs = Date.now();
             const overflowState = getOverflowState(deps.db, sessionId, modelKey);
+            const recoveryNoHeadEscape =
+                overflowState.needsEmergencyRecovery &&
+                loadProtectedTailMeta(deps.db, sessionId).recoveryNoEligibleHeadCount >=
+                    RECOVERY_NO_HEAD_LIMIT;
             const passInputs: Record<string, unknown> = {
                 now_ms: requestObservedAtMs,
                 model_key: modelKey,
@@ -1210,6 +1219,9 @@ export function createRustModeTransform(
                 channel2_nudge_state: getChannel2NudgeState(deps.db, sessionId),
                 emergency_recovery_armed:
                     overflowState.needsEmergencyRecovery || isEmergencyRecoveryArmed(sessionId),
+                emergency_recovery_no_head_escape: recoveryNoHeadEscape,
+                detected_context_limit: overflowState.detectedContextLimit,
+                detected_context_limit_model_key: overflowState.detectedContextLimitModelKey,
             };
             const previousWireCache = wireCaches.get(sessionId);
             let wireDelta:

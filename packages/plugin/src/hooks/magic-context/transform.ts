@@ -2003,13 +2003,29 @@ export function createTransform(deps: TransformDeps) {
                 `transform: final-wire telemetry estimate=${finalWireEstimate.tokens} trusted=${finalWireEstimate.trusted} conversation=${finalWireEstimate.messageTokens.conversation} tools=${finalWireEstimate.messageTokens.toolCall} system=${finalWireEstimate.systemTokens} toolDefinitions=${finalWireEstimate.toolDefinitionTokens ?? "unknown"}`,
             );
         }
+        const currentModelKeyForRecovery = deps.getModelKey?.(sessionId);
+        const overflowStateForFinalWire = getOverflowState(
+            db,
+            sessionId,
+            currentModelKeyForRecovery,
+        );
+        // A catalog or user-configured limit is useful for budgeting, but it cannot
+        // prove that this provider accepts the recovered wire shape. Only the limit
+        // parsed from this model's own overflow response may disarm recovery.
+        const providerProvenLimitTokens =
+            typeof currentModelKeyForRecovery === "string" &&
+            currentModelKeyForRecovery.length > 0 &&
+            overflowStateForFinalWire.detectedContextLimit > 0 &&
+            overflowStateForFinalWire.detectedContextLimitModelKey === currentModelKeyForRecovery
+                ? overflowStateForFinalWire.detectedContextLimit
+                : undefined;
         const emergencyFailClosed = evaluateEmergencyFailClosed({
             usagePercentage: contextUsage.percentage,
             emergencyRecoveryArmed,
             emergencyRecoveryOrigin,
             foldMaterializedThisPass: postTransformResult.historianFoldMaterializedThisPass,
             finalWireEstimate,
-            provenLimitTokens: resolvedContextLimit,
+            providerProvenLimitTokens,
         });
         if (emergencyFailClosed.disarm) {
             clearEmergencyRecovery(db, sessionId);

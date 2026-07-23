@@ -258,6 +258,9 @@ pub struct SchedulerInputs {
     pub drain_latch: LatchState,
     /// Optional provider error text to scan for context overflow.
     pub overflow_error_text: Option<String>,
+    /// Durable provider-overflow recovery arm from the host. It upgrades a would-be
+    /// defer to the emergency path even when local usage is below the reported limit.
+    pub emergency_recovery_armed: bool,
 }
 
 /// Composed scheduler output returned to the caller.
@@ -616,6 +619,11 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
         Band::Force85 => PassDecision::Force85,
         Band::Normal => pass,
     };
+    // A provider already rejected this session's wire shape. A low local usage
+    // reading cannot safely defer recovery, so mirror the ≥95% emergency path.
+    if inputs.emergency_recovery_armed && pass == PassDecision::Defer {
+        pass = PassDecision::Emergency95;
+    }
 
     let (pass, deferred_execute) = apply_boundary_deferral(
         pass,
@@ -886,6 +894,7 @@ mod tests {
             boundary_bypass: BoundaryBypass::default(),
             drain_latch: LatchState::default(),
             overflow_error_text: None,
+            emergency_recovery_armed: false,
         }
     }
 
@@ -1046,6 +1055,19 @@ mod tests {
         assert_eq!(derive_band(85.0), Band::Force85);
         assert_eq!(derive_band(94.9), Band::Force85);
         assert_eq!(derive_band(95.0), Band::Emergency95);
+    }
+
+    #[test]
+    fn durable_overflow_arm_upgrades_only_a_would_be_defer_to_emergency() {
+        let mut inputs = base_inputs();
+        inputs.emergency_recovery_armed = true;
+        let forced = decide(&inputs);
+        assert_eq!(forced.pass, PassDecision::Emergency95);
+
+        inputs.usage.percentage = 70.0;
+        inputs.usage.input_tokens = 70_000.0;
+        let natural_execute = decide(&inputs);
+        assert_eq!(natural_execute.pass, PassDecision::Execute);
     }
 
     #[test]

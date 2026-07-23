@@ -550,6 +550,18 @@ pub struct TransformRequest {
     /// Durable provider-overflow recovery state. It controls historian discard-last healing.
     #[serde(default)]
     pub emergency_recovery_armed: bool,
+    /// The host exhausted recovery attempts because the remaining protected history tail has no
+    /// eligible earlier boundary that can be discarded or used for recovery. Until a new eligible
+    /// boundary appears, normal scheduling serves the prompt.
+    #[serde(default)]
+    pub emergency_recovery_no_head_escape: bool,
+    /// Context limit parsed from a provider overflow response. Zero means no provider proof.
+    #[serde(default)]
+    pub detected_context_limit: u64,
+    /// Model key associated with `detected_context_limit`; it must match `model_key` before the
+    /// emergency-recovery latch can be cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_context_limit_model_key: Option<String>,
     /// History budget resolved by the harness from the stable context limit, threshold,
     /// and history-budget percentage. Authority transforms carry it per pass because a
     /// route can outlive a config reload; absent values use the bind-time fallback.
@@ -634,6 +646,12 @@ struct TransformRequestWire {
     #[serde(default)]
     emergency_recovery_armed: bool,
     #[serde(default)]
+    emergency_recovery_no_head_escape: bool,
+    #[serde(default)]
+    detected_context_limit: u64,
+    #[serde(default)]
+    detected_context_limit_model_key: Option<String>,
+    #[serde(default)]
     history_budget_tokens: Option<f64>,
     #[serde(default)]
     declared_trim: Option<DeclaredTrim>,
@@ -679,6 +697,9 @@ impl<'de> Deserialize<'de> for TransformRequest {
             request_observed_at_ms: wire.request_observed_at_ms,
             channel2_nudge_state: wire.channel2_nudge_state,
             emergency_recovery_armed: wire.emergency_recovery_armed,
+            emergency_recovery_no_head_escape: wire.emergency_recovery_no_head_escape,
+            detected_context_limit: wire.detected_context_limit,
+            detected_context_limit_model_key: wire.detected_context_limit_model_key,
             history_budget_tokens: wire.history_budget_tokens,
             declared_trim: wire.declared_trim,
         })
@@ -1899,6 +1920,14 @@ fn apply_once(
     } else {
         0.0
     };
+    let emergency_no_head_escape =
+        req.emergency_recovery_armed && req.emergency_recovery_no_head_escape;
+    if emergency_no_head_escape {
+        eprintln!(
+            "mc-module: overflow recovery arm has no eligible history boundary; suppressing forced emergency pass for {}",
+            req.session_id
+        );
+    }
     let decide_scheduler_started_at = Instant::now();
     let mut scheduler_outcome = scheduler::decide(&SchedulerInputs {
         config: scheduler_config(ctx.execute_threshold_percentage),
@@ -1928,20 +1957,30 @@ fn apply_once(
         },
         drain_latch: latch_from_meta(&loaded.meta),
         overflow_error_text: req.provider_error.clone(),
+        emergency_recovery_armed: req.emergency_recovery_armed && !emergency_no_head_escape,
     });
     timings.decide += elapsed_ms(decide_scheduler_started_at);
     // A trusted final-wire measurement can only clear a latch that was already
-    // active before this pass. It never participates in the ≥95% arming path.
+    // active before this pass. The comparison limit must be parsed from a provider
+    // overflow response for this exact model; catalog and caller fallback limits do
+    // not prove that the recovered wire shape is safe.
+    let provider_proven_limit = req
+        .model_key
+        .as_deref()
+        .filter(|model_key| req.detected_context_limit_model_key.as_deref() == Some(*model_key))
+        .filter(|_| req.detected_context_limit > 0)
+        .map(|_| req.detected_context_limit);
     if loaded.meta.emergency_drain_active
         && effective_usage.final_wire_trusted
-        && effective_usage.final_wire_input_tokens.saturating_mul(100)
-            < effective_usage.context_limit_tokens.saturating_mul(80)
-        && effective_usage.context_limit_tokens > 0
+        && provider_proven_limit.is_some_and(|limit| {
+            effective_usage.final_wire_input_tokens.saturating_mul(100) < limit.saturating_mul(80)
+        })
     {
         scheduler_outcome.drain_latch.active_since_ms = None;
         eprintln!(
-            "emergency disarm: trusted final-wire {} under limit {}",
-            effective_usage.final_wire_input_tokens, effective_usage.context_limit_tokens
+            "emergency disarm: trusted final-wire {} under provider limit {}",
+            effective_usage.final_wire_input_tokens,
+            provider_proven_limit.unwrap_or_default()
         );
     }
     // A flush requests work on the next pass, not a new m0 fold. Promote only a normal
@@ -8455,6 +8494,9 @@ mod tests {
             request_observed_at_ms: None,
             channel2_nudge_state: String::new(),
             emergency_recovery_armed: false,
+            emergency_recovery_no_head_escape: false,
+            detected_context_limit: 0,
+            detected_context_limit_model_key: None,
             history_budget_tokens: None,
             declared_trim: None,
         }
@@ -9386,6 +9428,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         let session = "trusted-final-wire";
+        let model_key = "anthropic/claude-test";
         run(
             &s,
             &req(session, "cfg0", vec![item("m1", 1, "hello")]),
@@ -9399,8 +9442,11 @@ mod tests {
             s.commit(session, loaded.row_version, &loaded.core, &meta)
                 .unwrap();
         };
-        let request = |trusted: bool| {
+        let request = |trusted: bool, detected_limit: u64, detected_model_key: Option<&str>| {
             let mut request = req(session, "cfg0", vec![item("m1", 1, "hello")]);
+            request.model_key = Some(model_key.to_string());
+            request.detected_context_limit = detected_limit;
+            request.detected_context_limit_model_key = detected_model_key.map(str::to_string);
             request.usage = Some(ModuleUsage {
                 current_total_input_tokens: 95_000,
                 context_limit_tokens: 100_000,
@@ -9411,19 +9457,69 @@ mod tests {
         };
 
         set_latch(true);
-        run(&s, &request(true), &spine());
+        run(&s, &request(true, 100_000, Some(model_key)), &spine());
         assert!(!s.load(session).unwrap().meta.emergency_drain_active);
 
         set_latch(true);
-        run(&s, &request(false), &spine());
+        run(&s, &request(true, 0, None), &spine());
+        assert!(
+            s.load(session).unwrap().meta.emergency_drain_active,
+            "a catalog-only context limit must not disarm recovery"
+        );
+
+        set_latch(true);
+        run(
+            &s,
+            &request(true, 100_000, Some("anthropic/different-model")),
+            &spine(),
+        );
+        assert!(
+            s.load(session).unwrap().meta.emergency_drain_active,
+            "provider proof from a different model must not disarm recovery"
+        );
+
+        set_latch(true);
+        run(&s, &request(false, 100_000, Some(model_key)), &spine());
         assert!(s.load(session).unwrap().meta.emergency_drain_active);
 
         set_latch(false);
-        run(&s, &request(true), &spine());
+        run(&s, &request(true, 100_000, Some(model_key)), &spine());
         assert!(
             s.load(session).unwrap().meta.emergency_drain_active,
             "trusted estimates must not change the normal ≥95% arming path"
         );
+    }
+
+    #[test]
+    fn durable_overflow_arm_forces_emergency_and_no_head_escape_suppresses_the_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut armed = with_usage(
+            req("durable-overflow-arm", "cfg0", vec![item("m1", 1, "hello")]),
+            30_000,
+            100_000,
+        );
+        armed.emergency_recovery_armed = true;
+        let forced =
+            transform_with_projection(&s, &armed, &pctx("git:proj", "/nonexistent-docs", 0))
+                .unwrap();
+        assert_eq!(forced.scheduler_pass, scheduler::PassDecision::Emergency95);
+
+        let mut escaped = with_usage(
+            req(
+                "durable-overflow-no-head",
+                "cfg0",
+                vec![item("m1", 1, "hello")],
+            ),
+            30_000,
+            100_000,
+        );
+        escaped.emergency_recovery_armed = true;
+        escaped.emergency_recovery_no_head_escape = true;
+        let deferred =
+            transform_with_projection(&s, &escaped, &pctx("git:proj", "/nonexistent-docs", 0))
+                .unwrap();
+        assert_eq!(deferred.scheduler_pass, scheduler::PassDecision::Defer);
     }
 
     #[test]

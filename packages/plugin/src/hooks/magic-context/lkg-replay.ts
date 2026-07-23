@@ -107,7 +107,8 @@ export type LkgValidationFailure =
     | "lkg_model_mismatch"
     | "lkg_invalidated_reshape"
     | "lkg_unsafe_seam"
-    | "lkg_seam_invalid";
+    | "lkg_seam_invalid"
+    | "lkg_anthropic_reasoning_run_invalid";
 
 function recordValue(info: unknown, key: string): unknown {
     return info && typeof info === "object" ? (info as Record<string, unknown>)[key] : undefined;
@@ -333,6 +334,42 @@ function partIsReasoning(part: unknown): boolean {
     );
 }
 
+function partIsAnthropicThinking(part: unknown): boolean {
+    if (!part || typeof part !== "object") return false;
+    const type = (part as Record<string, unknown>).type;
+    return type === "thinking" || type === "reasoning" || type === "redacted_thinking";
+}
+
+/**
+ * The Anthropic adapter merges adjacent assistant messages before sending them.
+ * A merged run may contain only one leading thinking block; moving or retaining a
+ * later signed block would invalidate its provider signature, so recovery declines
+ * the entire replay instead of attempting a rewrite.
+ */
+export function validateAnthropicReasoningRuns(messages: MessageLike[]): boolean {
+    let index = 0;
+    while (index < messages.length) {
+        if (messageRole(messages[index]) !== "assistant") {
+            index += 1;
+            continue;
+        }
+        let thinkingBlocks = 0;
+        let sawOtherContent = false;
+        while (index < messages.length && messageRole(messages[index]) === "assistant") {
+            for (const part of messageParts(messages[index])) {
+                if (partIsAnthropicThinking(part)) {
+                    thinkingBlocks += 1;
+                    if (thinkingBlocks > 1 || sawOtherContent) return false;
+                } else {
+                    sawOtherContent = true;
+                }
+            }
+            index += 1;
+        }
+    }
+    return true;
+}
+
 export function validateLkgSeamBoundary(prefix: MessageLike[], tail: MessageLike[]): boolean {
     const last = prefix[prefix.length - 1];
     const first = tail[0];
@@ -449,7 +486,12 @@ export function replayLkg(args: {
             return { ok: false, reason: "lkg_seam_invalid" };
         }
     }
-    return { ok: true, messages: [...prefix, ...entry.pristineTail] };
+    const replayed = [...prefix, ...entry.pristineTail];
+    if (args.providerKey === "anthropic" && !validateAnthropicReasoningRuns(replayed)) {
+        dropSlot(args.sessionId, "lkg_anthropic_reasoning_run_invalid");
+        return { ok: false, reason: "lkg_anthropic_reasoning_run_invalid" };
+    }
+    return { ok: true, messages: replayed };
 }
 
 export function validateLkgEntry(slot: LkgSlot, entryIds: string[]): boolean {
