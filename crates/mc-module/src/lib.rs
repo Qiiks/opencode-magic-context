@@ -673,6 +673,7 @@ enum TransformPageStageAction {
         transform_id: String,
         generation: u64,
         final_digest: String,
+        inbound_bytes: usize,
     },
 }
 
@@ -781,6 +782,7 @@ impl TransformPageCoordinator {
                         transform_id,
                         generation,
                         final_digest: page_digest,
+                        inbound_bytes: page_bytes,
                     })
                 } else {
                     self.set_phase(
@@ -866,6 +868,7 @@ impl TransformPageCoordinator {
                         transform_id: active_id,
                         generation: active_generation,
                         final_digest: page_digest,
+                        inbound_bytes: bytes,
                     })
                 } else {
                     let next_index = pending.next_index;
@@ -5640,8 +5643,13 @@ impl McHandler {
         }))
     }
 
-    async fn handle_transform_value(&self, channel: u16, request: Value) -> HandlerOutcome {
-        self.handle_transform_unpaged_value(channel, request, false)
+    async fn handle_transform_value(
+        &self,
+        channel: u16,
+        request: Value,
+        inbound_bytes: Option<usize>,
+    ) -> HandlerOutcome {
+        self.handle_transform_unpaged_value(channel, request, false, inbound_bytes)
             .await
     }
 
@@ -5650,8 +5658,9 @@ impl McHandler {
         channel: u16,
         request: Value,
         from_page_apply: bool,
+        inbound_bytes: Option<usize>,
     ) -> HandlerOutcome {
-        let mut parsed: TransformRequest = match serde_json::from_value(request.clone()) {
+        let mut parsed: TransformRequest = match serde_json::from_value(request) {
             Ok(req) => req,
             Err(e) => {
                 return HandlerOutcome::Error {
@@ -6047,12 +6056,14 @@ impl McHandler {
         }
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
         self.record_response_observation(&parsed.session_id, now_ms());
-        // Management requests carry identity but not raw history. A successful full pass
-        // retains its decoded request together with the durable revert epoch it observed.
-        // Serialization accounts the payload bytes for the cross-session LRU bound.
-        let retained_bytes = serde_json::to_vec(parsed.as_ref())
-            .map(|bytes| bytes.len())
-            .unwrap_or(usize::MAX);
+        // The decoded request retains the same payload represented by its inbound JSON body, so
+        // charging the body's byte length conservatively bounds the parsed tree without a second
+        // O(B) serialization. Paged transforms pass the sum of their staged page bytes; the
+        // transport supplies the exact body length for unpaged transforms.
+        //
+        // Value-only test/replay callers cannot recover the original wire length. They use the
+        // transform frame cap as a conservative fallback; the transport path never takes it.
+        let retained_bytes = inbound_bytes.unwrap_or(MAX_TRANSFORM_FRAME_BYTES);
         self.transform_snapshots
             .lock()
             .expect("transform snapshots mutex")
@@ -6073,7 +6084,22 @@ impl McHandler {
 
     #[cfg(test)]
     async fn handle_transform_for_test(&self, channel: u16, request: Value) -> HandlerOutcome {
-        self.handle_transform_value(channel, request).await
+        let inbound_bytes = serde_json::to_vec(&request)
+            .map(|bytes| bytes.len())
+            .unwrap_or(MAX_TRANSFORM_FRAME_BYTES);
+        self.handle_transform_value(channel, request, Some(inbound_bytes))
+            .await
+    }
+
+    #[cfg(test)]
+    async fn handle_transform_for_test_with_body_size(
+        &self,
+        channel: u16,
+        request: Value,
+        inbound_bytes: usize,
+    ) -> HandlerOutcome {
+        self.handle_transform_value(channel, request, Some(inbound_bytes))
+            .await
     }
 
     fn handle_state_sync_value(&self, channel: u16, request: Value) -> HandlerOutcome {
@@ -6944,6 +6970,7 @@ impl McHandler {
                 transform_id,
                 generation,
                 final_digest,
+                inbound_bytes,
             } => {
                 let assembled = match assemble_transform_pages(pages) {
                     Ok(assembled) => assembled,
@@ -6953,7 +6980,7 @@ impl McHandler {
                     }
                 };
                 let outcome = self
-                    .handle_transform_unpaged_value(channel, assembled, true)
+                    .handle_transform_unpaged_value(channel, assembled, true, Some(inbound_bytes))
                     .await;
                 let completed_result = match &outcome {
                     HandlerOutcome::Response(bytes) => Some(bytes.clone()),
@@ -8563,8 +8590,12 @@ impl ModuleHandler for McHandler {
             return outcome;
         }
         let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-        self.dispatch_value(ctx.route_handle().channel, request)
-            .await
+        self.dispatch_value_with_inbound_bytes(
+            ctx.route_handle().channel,
+            request,
+            Some(body.len()),
+        )
+        .await
     }
 }
 
@@ -8572,7 +8603,18 @@ impl McHandler {
     /// Route a parsed request body to its handler. Split from `handle()` so the
     /// routing arms are unit-testable (`RequestCtx` cannot be constructed
     /// outside the transport).
+    #[cfg(test)]
     async fn dispatch_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+        self.dispatch_value_with_inbound_bytes(channel, request, None)
+            .await
+    }
+
+    async fn dispatch_value_with_inbound_bytes(
+        &self,
+        channel: u16,
+        request: Value,
+        inbound_bytes: Option<usize>,
+    ) -> HandlerOutcome {
         let method = request
             .get("method")
             .and_then(Value::as_str)
@@ -8606,7 +8648,8 @@ impl McHandler {
                         self.handle_transform_page_value(channel, request, TransformLane::Authority)
                             .await
                     } else {
-                        self.handle_transform_value(channel, request).await
+                        self.handle_transform_value(channel, request, inbound_bytes)
+                            .await
                     }
                 }
                 "state_sync" => self.handle_state_sync_value(channel, request),
@@ -9010,26 +9053,68 @@ fn state_sync_seed_content_digest(request: &Value) -> String {
     sha256_hex(canonical_value(&content).as_bytes())
 }
 
+fn canonical_object_fields(request: &Value, fields: &[&str]) -> String {
+    let mut entries = fields
+        .iter()
+        .filter_map(|field| request.get(*field).map(|value| (*field, value)))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(field, _)| *field);
+    let inner = entries
+        .into_iter()
+        .map(|(field, value)| {
+            format!(
+                "{}:{}",
+                serde_json::to_string(field).unwrap_or_default(),
+                canonical_value(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{inner}}}")
+}
+
 fn transform_page_content_digest(request: &Value) -> String {
-    let mut content = Map::new();
-    for field in TRANSFORM_PAGE_ARRAY_FIELDS {
-        if let Some(value) = request.get(field) {
-            content.insert(field.to_string(), value.clone());
-        }
+    // Keep the digest's canonical object shape while borrowing page arrays. The page is
+    // subsequently consumed by assembly, so cloning these values just to hash them would
+    // duplicate the largest allocation in the request.
+    sha256_hex(canonical_object_fields(request, &TRANSFORM_PAGE_ARRAY_FIELDS).as_bytes())
+}
+
+fn transform_continuation_chunk<'a>(
+    field: &str,
+    item_index: usize,
+    expected_chunk: usize,
+    chunk_total: usize,
+    chunk_value: &'a Value,
+) -> Result<&'a str, String> {
+    let Some(chunk_marker) = chunk_value
+        .get(ITEM_CONTINUATION_KEY)
+        .and_then(Value::as_object)
+    else {
+        return Err("transform continuation item was interrupted".to_string());
+    };
+    let same_item = chunk_marker.get("field").and_then(Value::as_str) == Some(field)
+        && chunk_marker.get("item_index").and_then(Value::as_u64) == Some(item_index as u64)
+        && chunk_marker.get("chunk_index").and_then(Value::as_u64) == Some(expected_chunk as u64)
+        && chunk_marker.get("chunk_total").and_then(Value::as_u64) == Some(chunk_total as u64);
+    if !same_item {
+        return Err("transform continuation chunks were reordered".to_string());
     }
-    sha256_hex(canonical_value(&Value::Object(content)).as_bytes())
+    chunk_value
+        .get("chunk")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "transform continuation marker is missing its chunk".to_string())
 }
 
 fn assemble_transform_page_field(field: &str, values: Vec<Value>) -> Result<Vec<Value>, String> {
     let mut assembled = Vec::new();
-    let mut index = 0usize;
-    while index < values.len() {
-        let Some(marker) = values[index]
+    let mut values = values.into_iter();
+    while let Some(first_value) = values.next() {
+        let Some(marker) = first_value
             .get(ITEM_CONTINUATION_KEY)
             .and_then(Value::as_object)
         else {
-            assembled.push(values[index].clone());
-            index += 1;
+            assembled.push(first_value);
             continue;
         };
         let marker_field = marker
@@ -9067,37 +9152,30 @@ fn assemble_transform_page_field(field: &str, values: Vec<Value>) -> Result<Vec<
 
         let mut serialized = String::new();
         for expected_chunk in 0..chunk_total {
-            let Some(chunk_value) = values.get(index + expected_chunk) else {
-                return Err(
-                    "transform continuation item ended before all chunks arrived".to_string(),
-                );
-            };
-            let Some(chunk_marker) = chunk_value
-                .get(ITEM_CONTINUATION_KEY)
-                .and_then(Value::as_object)
-            else {
-                return Err("transform continuation item was interrupted".to_string());
-            };
-            let same_item = chunk_marker.get("field").and_then(Value::as_str) == Some(field)
-                && chunk_marker.get("item_index").and_then(Value::as_u64)
-                    == Some(item_index as u64)
-                && chunk_marker.get("chunk_index").and_then(Value::as_u64)
-                    == Some(expected_chunk as u64)
-                && chunk_marker.get("chunk_total").and_then(Value::as_u64)
-                    == Some(chunk_total as u64);
-            if !same_item {
-                return Err("transform continuation chunks were reordered".to_string());
+            if expected_chunk == 0 {
+                serialized.push_str(transform_continuation_chunk(
+                    field,
+                    item_index,
+                    expected_chunk,
+                    chunk_total,
+                    &first_value,
+                )?);
+            } else {
+                let chunk_value = values.next().ok_or_else(|| {
+                    "transform continuation item ended before all chunks arrived".to_string()
+                })?;
+                serialized.push_str(transform_continuation_chunk(
+                    field,
+                    item_index,
+                    expected_chunk,
+                    chunk_total,
+                    &chunk_value,
+                )?);
             }
-            let chunk = chunk_value
-                .get("chunk")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "transform continuation marker is missing its chunk".to_string())?;
-            serialized.push_str(chunk);
         }
         let item = serde_json::from_str::<Value>(&serialized)
             .map_err(|error| format!("transform continuation item was not valid JSON: {error}"))?;
         assembled.push(item);
-        index += chunk_total;
     }
     Ok(assembled)
 }
@@ -9124,9 +9202,11 @@ fn assemble_transform_pages(mut pages: Vec<Value>) -> Result<Value, String> {
     for field in TRANSFORM_PAGE_ARRAY_FIELDS {
         let had_field = final_page.get(field).is_some();
         let mut values = Vec::new();
-        for page in pages.iter().chain(std::iter::once(&final_page)) {
-            if let Some(items) = page.get(field).and_then(Value::as_array) {
-                values.extend(items.iter().cloned());
+        for page in pages.iter_mut().chain(std::iter::once(&mut final_page)) {
+            if let Some(object) = page.as_object_mut() {
+                if let Some(Value::Array(mut items)) = object.remove(field) {
+                    values.append(&mut items);
+                }
             }
         }
         if had_field || !values.is_empty() {
@@ -18981,7 +19061,7 @@ mod tests {
             "render_config": "cfg0",
             "messages": messages.iter().map(|m| serde_json::to_value(m).unwrap()).collect::<Vec<_>>(),
         });
-        let out = handler.handle_transform_value(9, req).await;
+        let out = handler.handle_transform_value(9, req, None).await;
         let HandlerOutcome::Response(bytes) = out else {
             panic!("pass-through must be a response");
         };
@@ -19157,6 +19237,101 @@ mod tests {
         }
         page["transform_page_digest"] = json!(transform_page_content_digest(&page));
         page
+    }
+
+    #[test]
+    fn transform_page_assembly_matches_golden_fixture() {
+        let first_page = json!({
+            "method": "transform",
+            "session_id": "golden-session",
+            "messages": [
+                {"mid": "m0", "text": "first"},
+                {
+                    (ITEM_CONTINUATION_KEY): {
+                        "field": "messages",
+                        "item_index": 1,
+                        "chunk_index": 0,
+                        "chunk_total": 2
+                    },
+                    "chunk": "{\"mid\":\"m1\",\"text\":\"golden "
+                }
+            ],
+            "native_messages": [{"text": "native first"}],
+            "transform_page_id": "golden-page",
+            "transform_generation": 4,
+            "transform_page_index": 0,
+            "transform_page_total": 2,
+            "transform_page_complete": false,
+            "transform_page_digest": "ignored-first-digest"
+        });
+        let final_page = json!({
+            "method": "transform",
+            "session_id": "golden-session",
+            "messages": [
+                {
+                    (ITEM_CONTINUATION_KEY): {
+                        "field": "messages",
+                        "item_index": 1,
+                        "chunk_index": 1,
+                        "chunk_total": 2
+                    },
+                    "chunk": "fixture\"}"
+                },
+                {"mid": "m2", "text": "last"}
+            ],
+            "native_messages": [{"text": "native last"}],
+            "extra": "preserved",
+            "transform_page_id": "golden-page",
+            "transform_generation": 4,
+            "transform_page_index": 1,
+            "transform_page_total": 2,
+            "transform_page_complete": true,
+            "transform_page_digest": "ignored-final-digest"
+        });
+
+        let assembled = assemble_transform_pages(vec![first_page, final_page]).unwrap();
+        assert_eq!(
+            assembled,
+            json!({
+                "method": "transform",
+                "session_id": "golden-session",
+                "messages": [
+                    {"mid": "m0", "text": "first"},
+                    {"mid": "m1", "text": "golden fixture"},
+                    {"mid": "m2", "text": "last"}
+                ],
+                "native_messages": [
+                    {"text": "native first"},
+                    {"text": "native last"}
+                ],
+                "extra": "preserved"
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transform_snapshot_charge_uses_unpaged_body_length() {
+        let (handler, _store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let request = request(vec![ck("charge", 0, "body length")]);
+        let body_length = serde_json::to_vec(&request).unwrap().len();
+        let outcome = handler
+            .handle_transform_for_test_with_body_size(7, request, body_length)
+            .await;
+        assert!(
+            matches!(outcome, HandlerOutcome::Response(_)),
+            "{outcome:?}"
+        );
+
+        let snapshots = handler
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex");
+        let Some(TransformSnapshot::Ready { retained_bytes, .. }) = snapshots.entries.get("ses")
+        else {
+            panic!("expected retained transform snapshot");
+        };
+        assert_eq!(*retained_bytes, body_length);
     }
 
     #[allow(dead_code)]
@@ -19512,6 +19687,8 @@ mod tests {
         let mut final_page = final_page;
         final_page["native_messages"] = json!([{ "text": "b".repeat(280 * 1024) }]);
         final_page["transform_page_digest"] = json!(transform_page_content_digest(&final_page));
+        let expected_inbound_bytes = serde_json::to_vec(&first).unwrap().len()
+            + serde_json::to_vec(&final_page).unwrap().len();
 
         let first_ack = handler.dispatch_value(7, first).await;
         assert!(matches!(first_ack, HandlerOutcome::Response(_)));
@@ -19521,6 +19698,16 @@ mod tests {
         };
         let response: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(response["action"].is_string(), "{response}");
+
+        let snapshots = handler
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex");
+        let Some(TransformSnapshot::Ready { retained_bytes, .. }) = snapshots.entries.get("ses")
+        else {
+            panic!("expected retained transform snapshot");
+        };
+        assert_eq!(*retained_bytes, expected_inbound_bytes);
     }
 
     #[tokio::test]
