@@ -1646,12 +1646,13 @@ struct BoundaryTokenCacheSnapshot {
 }
 
 impl BoundaryTokenCacheSnapshot {
-    fn token_count(&mut self, block_id: &str, bytes: &str) -> usize {
+    fn token_count(&mut self, block_id: &str, bytes: &str, content_hash: &[u8; 32]) -> usize {
         // Block ids survive replay and same-length content edits are valid for live-tail blocks,
         // so length alone cannot prove that a cached token count still describes these bytes.
-        let content_hash: [u8; 32] = Sha256::digest(bytes.as_bytes()).into();
+        // The projection computes this digest once and retains it on the block, avoiding a second
+        // full payload hash when the token cache entry is still valid.
         if let Some(entry) = self.entries.get(block_id) {
-            if entry.byte_size == bytes.len() && entry.content_hash == content_hash {
+            if entry.byte_size == bytes.len() && entry.content_hash == *content_hash {
                 self.hits = self.hits.saturating_add(1);
                 return entry.token_count;
             }
@@ -1662,7 +1663,7 @@ impl BoundaryTokenCacheSnapshot {
             block_id.to_string(),
             BoundaryTokenCacheEntry {
                 byte_size: bytes.len(),
-                content_hash,
+                content_hash: *content_hash,
                 token_count,
             },
         );
@@ -10011,6 +10012,15 @@ fn cached_boundary_messages(
         .lock()
         .expect("boundary token cache mutex")
         .snapshot(&parsed.session_id);
+    // project_messages appends each message's blocks in one pass, so blocks for a message id are
+    // contiguous. A borrowed range map avoids rescanning the whole projection for every message.
+    let mut block_ranges = HashMap::<&str, std::ops::Range<usize>>::new();
+    for (index, block) in projection.blocks.iter().enumerate() {
+        block_ranges
+            .entry(block.mid.as_str())
+            .and_modify(|range| range.end = index + 1)
+            .or_insert(index..index + 1);
+    }
     let messages = parsed
         .messages
         .iter()
@@ -10021,9 +10031,10 @@ fn cached_boundary_messages(
             message_ordinal: message.ordinal,
             message_id: message.mid.clone(),
             role: Role::from_provider(&message.ck.role),
-            blocks: projection
-                .blocks
-                .iter()
+            blocks: block_ranges
+                .get(message.mid.as_str())
+                .into_iter()
+                .flat_map(|range| projection.blocks[range.clone()].iter())
                 .filter(|block| block.mid == message.mid && !block.synthetic)
                 .map(|block| BoundaryBlock {
                     id: block.id.clone(),
@@ -10032,8 +10043,12 @@ fn cached_boundary_messages(
                     provider_executed: block.provider_executed,
                     byte_size: block.bytes.len(),
                     arc_id: block.arc_id.clone(),
-                    original_token_count: cache_snapshot.token_count(&block.id, &block.bytes),
-                    original: block.bytes.clone(),
+                    original_token_count: cache_snapshot.token_count(
+                        &block.id,
+                        &block.bytes,
+                        &block.content_hash,
+                    ),
+                    original: Arc::clone(&block.bytes),
                     rendered: None,
                     ignored: false,
                 })
@@ -10436,7 +10451,10 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
 mod tests {
     use super::*;
     use std::collections::{HashMap, VecDeque};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     use crate::boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
     use crate::ck_wire::{
@@ -10521,7 +10539,7 @@ mod tests {
                         byte_size: original.len(),
                         arc_id: None,
                         original_token_count: mc_tokenizer::estimate_tokens(&original),
-                        original,
+                        original: Arc::from(original),
                         rendered: None,
                         ignored: false,
                     }],
@@ -10612,12 +10630,16 @@ mod tests {
     fn boundary_token_cache_hash_fences_same_length_edits_and_evicts_lru() {
         let mut cache = BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES);
         let mut cold = cache.snapshot("ses-a");
-        let cold_tokens = cold.token_count("m-1#0", "aaaaaaaa");
+        let cold_bytes = "aaaaaaaa";
+        let cold_hash: [u8; 32] = Sha256::digest(cold_bytes.as_bytes()).into();
+        let cold_tokens = cold.token_count("m-1#0", cold_bytes, &cold_hash);
         assert_eq!((cold.hits, cold.misses), (0, 1));
         cache.replace("ses-a", cold);
 
         let mut edited = cache.snapshot("ses-a");
-        let edited_tokens = edited.token_count("m-1#0", "a b c d ");
+        let edited_bytes = "a b c d ";
+        let edited_hash: [u8; 32] = Sha256::digest(edited_bytes.as_bytes()).into();
+        let edited_tokens = edited.token_count("m-1#0", edited_bytes, &edited_hash);
         assert_ne!(
             cold_tokens, edited_tokens,
             "fixture must change token count"
@@ -10631,7 +10653,7 @@ mod tests {
         cache.replace("ses-a", edited);
 
         let mut warm = cache.snapshot("ses-a");
-        warm.token_count("m-1#0", "a b c d ");
+        warm.token_count("m-1#0", edited_bytes, &edited_hash);
         assert_eq!((warm.hits, warm.misses), (1, 0));
         let one_session_bytes = warm.retained_bytes();
         let formatted = "[1] U:  a b c d";
@@ -10642,10 +10664,14 @@ mod tests {
 
         let mut bounded = BoundaryTokenCache::new(one_session_bytes);
         let mut first = bounded.snapshot("first");
-        first.token_count("m-1#0", "first");
+        let first_bytes = "first";
+        let first_hash: [u8; 32] = Sha256::digest(first_bytes.as_bytes()).into();
+        first.token_count("m-1#0", first_bytes, &first_hash);
         bounded.replace("first", first);
         let mut second = bounded.snapshot("second");
-        second.token_count("m-2#0", "other");
+        let second_bytes = "other";
+        let second_hash: [u8; 32] = Sha256::digest(second_bytes.as_bytes()).into();
+        second.token_count("m-2#0", second_bytes, &second_hash);
         bounded.replace("second", second);
         assert!(!bounded.sessions.contains_key("first"));
         assert!(bounded.sessions.contains_key("second"));
@@ -10870,7 +10896,7 @@ mod tests {
                 provider_executed: false,
                 byte_size: 400,
                 arc_id: None,
-                original: "x".repeat(400),
+                original: Arc::from("x".repeat(400)),
                 original_token_count: mc_tokenizer::estimate_tokens(&"x".repeat(400)),
                 rendered: None,
                 ignored: false,
@@ -10905,7 +10931,7 @@ mod tests {
             provider_executed: false,
             byte_size: text.len(),
             arc_id: None,
-            original: text.to_string(),
+            original: Arc::from(text),
             original_token_count: mc_tokenizer::estimate_tokens(text),
             rendered: None,
             ignored: false,

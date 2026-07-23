@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use mc_core::CkItem;
 use mc_store::BlockIdentity;
@@ -49,7 +50,10 @@ pub struct FlatBlock {
     pub provider_executed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arc_id: Option<String>,
-    pub bytes: String,
+    pub bytes: Arc<str>,
+    /// SHA-256 of the serialized block bytes, retained so consumers can verify that the block content has not changed.
+    #[serde(skip_serializing)]
+    pub content_hash: [u8; 32],
     pub synthetic: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -169,7 +173,7 @@ pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection,
             if !flat.synthetic {
                 identities.push(BlockIdentity {
                     kind_tag: flat.kind_tag.clone(),
-                    byte_fingerprint: fingerprint(&flat.bytes),
+                    byte_fingerprint: fingerprint_digest(&flat.content_hash),
                 });
             }
             blocks.push(flat);
@@ -273,6 +277,7 @@ fn flatten_block(
         block_index: index,
         kind: block.kind.tag().to_string(),
     })?;
+    let content_hash: [u8; 32] = Sha256::digest(bytes.as_bytes()).into();
     let (name, file_path, tool_input, provider_executed, tool_call_id, output_kind) =
         match &block.kind {
             CkKind::ToolCall {
@@ -316,7 +321,8 @@ fn flatten_block(
         tool_input,
         provider_executed,
         arc_id,
-        bytes,
+        bytes: Arc::from(bytes),
+        content_hash,
         synthetic: msg.ck.meta.synthetic,
         tool_call_id,
         output_kind,
@@ -380,13 +386,17 @@ fn extract_file_path(input: &Value) -> Option<String> {
         .find_map(|key| obj.get(*key).and_then(Value::as_str).map(str::to_string))
 }
 
-pub(crate) fn fingerprint(bytes: &str) -> String {
-    let digest = Sha256::digest(bytes.as_bytes());
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
+fn fingerprint_digest(content_hash: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(content_hash.len() * 2);
+    for byte in content_hash {
         let _ = write!(&mut out, "{byte:02x}");
     }
     out
+}
+
+pub(crate) fn fingerprint(bytes: &str) -> String {
+    let content_hash: [u8; 32] = Sha256::digest(bytes.as_bytes()).into();
+    fingerprint_digest(&content_hash)
 }
 
 pub fn duplicate_ids(blocks: &[FlatBlock]) -> Option<String> {

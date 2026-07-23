@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use mc_tokenizer::estimate_tokens;
 use regex::Regex;
@@ -105,12 +105,12 @@ pub struct BoundaryBlock {
     pub byte_size: usize,
     /// Tool arc id for calls/results/reasoning that belong to the same invocation.
     pub arc_id: Option<String>,
-    /// Original pre-reduction block bytes as UTF-8 text.
+    /// Original pre-reduction block bytes as UTF-8 text, shared with the flat projection.
     ///
     /// Boundary and trigger token measurement always uses this value, never a
-    /// rendered reduction placeholder. The raw session still contains these bytes,
-    /// and the historian would read these bytes if the trigger fired.
-    pub original: String,
+    /// rendered reduction placeholder. Sharing the projection's allocation keeps
+    /// trigger evaluation from cloning every raw block on every pass.
+    pub original: Arc<str>,
     /// Token count for `original`, computed once while constructing this pass's boundary input.
     /// Keeping it beside the source lets projected-drop and boundary walks share the same exact
     /// measurement instead of running byte-BPE repeatedly over an unchanged multi-megabyte tail.
@@ -2054,7 +2054,7 @@ mod tests {
                         provider_executed: block.provider_executed,
                         byte_size: block.byte_size,
                         arc_id: block.arc_id.clone(),
-                        original: block.original.clone(),
+                        original: Arc::from(block.original.clone()),
                         original_token_count: estimate_tokens(&block.original),
                         rendered: block.rendered.clone(),
                         ignored: block.ignored.unwrap_or(false),
@@ -2298,7 +2298,7 @@ mod tests {
                 provider_executed: false,
                 byte_size: text.len(),
                 arc_id: None,
-                original: text.to_string(),
+                original: Arc::from(text),
                 original_token_count: estimate_tokens(text),
                 rendered: None,
                 ignored: false,
@@ -2321,7 +2321,7 @@ mod tests {
                 provider_executed: false,
                 byte_size: 32,
                 arc_id: Some(arc_id.to_string()),
-                original: "{\"description\":\"run build\"}".to_string(),
+                original: Arc::from("{\"description\":\"run build\"}"),
                 original_token_count: estimate_tokens("{\"description\":\"run build\"}"),
                 rendered: None,
                 ignored: false,
@@ -2343,7 +2343,7 @@ mod tests {
                 provider_executed: false,
                 byte_size: text.len(),
                 arc_id: Some(arc_id.to_string()),
-                original: text.to_string(),
+                original: Arc::from(text),
                 original_token_count: estimate_tokens(text),
                 rendered: None,
                 ignored: false,
@@ -2503,7 +2503,7 @@ mod tests {
                     provider_executed: false,
                     byte_size: 16,
                     arc_id: Some((*arc).to_string()),
-                    original: "{}".to_string(),
+                    original: Arc::from("{}"),
                     original_token_count: estimate_tokens("{}"),
                     rendered: None,
                     ignored: false,
@@ -2525,7 +2525,7 @@ mod tests {
                     provider_executed: false,
                     byte_size: 21_000,
                     arc_id: Some((*arc).to_string()),
-                    original: "result ".repeat(3_000),
+                    original: Arc::from("result ".repeat(3_000)),
                     original_token_count: estimate_tokens(&"result ".repeat(3_000)),
                     rendered: None,
                     ignored: false,
