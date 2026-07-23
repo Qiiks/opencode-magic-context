@@ -1294,6 +1294,10 @@ pub enum TransformError {
     /// as an unbounded phantom HARD. Fail loud: it signals an empty or wrong-vocabulary
     /// compartment end_message_id (the anchor must be a flat block id, `<mid>#<index>`).
     BoundaryNotPresent(String),
+    /// The advertised flat boundary block exists, but its live message ordinal differs
+    /// from the tail compartment's claimed end. Trimming on that claim would discard a
+    /// different raw message than the anchor identifies.
+    BoundaryOrdinalMismatch(String),
 }
 
 impl std::fmt::Display for TransformError {
@@ -1328,6 +1332,9 @@ impl std::fmt::Display for TransformError {
             }
             TransformError::BoundaryNotPresent(m) => {
                 write!(f, "minted boundary not present: {m}")
+            }
+            TransformError::BoundaryOrdinalMismatch(m) => {
+                write!(f, "compartment boundary ordinal mismatch: {m}")
             }
         }
     }
@@ -2466,8 +2473,9 @@ fn apply_once(
                 // either, and the loud error repeats until the store is re-cut. A revert that
                 // clears the compartments entirely stays legitimate: coverage is then None
                 // and the fold mints the reserved empty anchor without entering this guard.
-                if comp.coverage_ordinal.is_some() {
+                if let Some(coverage_end) = comp.coverage_ordinal {
                     let minted = comp.boundary_id.as_str();
+                    validate_live_boundary_ordinal(minted, coverage_end, &live)?;
                     if minted.is_empty()
                         || !boundary_available(
                             minted,
@@ -2543,8 +2551,9 @@ fn apply_once(
                             )));
                             }
 
-                            if comp.coverage_ordinal.is_some() {
+                            if let Some(coverage_end) = comp.coverage_ordinal {
                                 let reminted = comp.boundary_id.as_str();
+                                validate_live_boundary_ordinal(reminted, coverage_end, &live)?;
                                 if reminted.is_empty()
                                     || !boundary_available(
                                         reminted,
@@ -2748,8 +2757,9 @@ fn apply_once(
                          )));
                     }
 
-                    if comp.coverage_ordinal.is_some() {
+                    if let Some(coverage_end) = comp.coverage_ordinal {
                         let minted = comp.boundary_id.as_str();
+                        validate_live_boundary_ordinal(minted, coverage_end, &live)?;
                         if minted.is_empty()
                             || !boundary_available(
                                 minted,
@@ -2863,7 +2873,8 @@ fn apply_once(
                     // SOFT can only reach here with reconcile clear (the classifier routes a
                     // pending reconcile to defer/HARD), so every advance is a fresh mint and the
                     // check is unconditional.
-                    if let Some(id) = &new_boundary_id {
+                    if let Some((id, coverage_end)) = m1.new_coverage.as_ref() {
+                        validate_live_boundary_ordinal(id, *coverage_end, &live)?;
                         if id.is_empty()
                             || !boundary_available(
                                 id,
@@ -4280,6 +4291,23 @@ fn first_uncovered_live_block<'a>(
         .min_by_key(|block| block.ordinal())
 }
 
+fn validate_live_boundary_ordinal(
+    boundary_id: &str,
+    expected_ordinal: u64,
+    live: &[&FlatBlock],
+) -> Result<(), TransformError> {
+    let Some(block) = live.iter().find(|block| block.id() == boundary_id) else {
+        return Ok(());
+    };
+    if block.ordinal() == expected_ordinal {
+        return Ok(());
+    }
+    Err(TransformError::BoundaryOrdinalMismatch(format!(
+        "anchor {boundary_id:?} lives at ordinal {}, but the tail compartment claims {expected_ordinal}",
+        block.ordinal(),
+    )))
+}
+
 fn boundary_available(
     id: &str,
     live: &[&FlatBlock],
@@ -4299,6 +4327,9 @@ fn resolve_boundary_state(
     live: &[&FlatBlock],
 ) -> Result<(BoundaryState, Option<TrimMismatch>), TransformError> {
     if !core.boundary_id.is_empty() && live.iter().any(|block| block.id() == core.boundary_id) {
+        if let Some(expected_ordinal) = meta.coverage_ordinal {
+            validate_live_boundary_ordinal(core.boundary_id.as_str(), expected_ordinal, live)?;
+        }
         return Ok((BoundaryState::LivePresent, None));
     }
 

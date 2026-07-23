@@ -430,6 +430,18 @@ fn state_sync_seq_mismatch_error(expected: u64, found: u64) -> HandlerOutcome {
     }
 }
 
+fn historian_compartment_sync_busy_error(phase: HistorianPhase) -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: "historian_compartment_sync_busy".to_string(),
+        message: json!({
+            "code": "historian_compartment_sync_busy",
+            "historian_phase": phase.as_str(),
+            "retryable": true,
+        })
+        .to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransformLane {
     Authority,
@@ -6714,6 +6726,24 @@ impl McHandler {
             .into_iter()
             .map(StoredCompartment::from)
             .collect::<Vec<_>>();
+        if !compartments.is_empty() {
+            let historian_phase = match store.load(&binding.session) {
+                Ok(loaded) => loaded.meta.historian.state,
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".to_string(),
+                        message: error.to_string(),
+                    }
+                }
+            };
+            if historian_phase != HistorianPhase::Idle {
+                // Do not stage or adopt compartment rows while a historian owns the
+                // snapshot. The TS sender treats this typed rejection as retry-later,
+                // retaining its acknowledged sequence and watermarks instead of forcing
+                // a full re-seed on every active historian pass.
+                return historian_compartment_sync_busy_error(historian_phase);
+            }
+        }
         let root_path = binding.project_root.to_string_lossy().to_string();
         let authority_project = match store.authority_project_for_route(&root_path, "memories") {
             Ok(project) => project,
@@ -13333,6 +13363,7 @@ mod tests {
                 producer_run_id: Some("run".to_string()),
                 fired_at_ms: Some(1),
                 expected_revert_epoch: 0,
+                compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
                 failure_backoff_at_ms: None,
                 last_failure: None,
                 last_no_fire: None,
@@ -13353,6 +13384,7 @@ mod tests {
                     producer_run_id: "run".to_string(),
                     chunk_fingerprint: "fp".to_string(),
                     selected_range_identities,
+                    compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
                 },
                 project_path: project.to_str().unwrap(),
                 compartments: &[stored_comp(1, 10, 12, "m12#0", "summary")],
@@ -16448,6 +16480,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn state_import_rejects_tail_anchor_at_a_different_live_ordinal() {
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let imported = call_dispatch_request(
+            &handler,
+            state_import_request(
+                "misbound-anchor",
+                0,
+                1,
+                vec![imported_compartment(1, 1, 10, "m1#0", "invalid summary")],
+            ),
+        )
+        .await;
+        assert_eq!(imported["imported"], json!(1));
+
+        let rejected = handler
+            .handle_transform_for_test(
+                7,
+                request(vec![ck("m1", 1, "actual anchor"), ck("m11", 11, "tail")]),
+            )
+            .await;
+        let (code, message) = error_frame(rejected);
+        assert_eq!(code, "transform_failed");
+        assert!(message.contains("boundary ordinal mismatch"), "{message}");
+        let after = store.load("ses").unwrap();
+        assert!(
+            after.row_version.is_none(),
+            "the invalid bootstrap must not commit"
+        );
+        assert!(after.core.boundary_id.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn state_import_two_batches_bootstrap_hard_folds_and_mints_tail_anchor() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -19112,6 +19177,7 @@ mod tests {
             producer_run_id: Some("run-reattach".to_string()),
             fired_at_ms: Some(1),
             expected_revert_epoch: 0,
+            compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
@@ -19143,6 +19209,7 @@ mod tests {
             producer_run_id: Some("run-stale".to_string()),
             fired_at_ms: Some(1),
             expected_revert_epoch: 0,
+            compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
@@ -19171,6 +19238,7 @@ mod tests {
             "seeded-fingerprint".to_string(),
             Vec::new(),
             0,
+            mc_store::CompartmentSetGeneration::default(),
             1,
         )
         .unwrap()
@@ -19460,6 +19528,7 @@ mod tests {
                     producer_run_id: "run-stale".to_string(),
                     chunk_fingerprint: "seeded-fingerprint".to_string(),
                     selected_range_identities: seeded_historian_identities(),
+                    compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
                 },
                 project_path: "git:proj",
                 compartments: &[stored_comp(1, 10, 20, "m20", "summary")],
@@ -19914,6 +19983,62 @@ mod tests {
             .lock()
             .expect("state sync seed mutex");
         (seeds.total_staged_bytes, seeds.pending_seed_count)
+    }
+
+    #[tokio::test]
+    async fn compartment_state_sync_retries_while_historian_is_firing() {
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        seed_historian_phase(&store, HistorianPhase::Firing);
+
+        let rejected = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "compartments": [state_sync_compartment(0, "must wait")],
+                }),
+            )
+            .await;
+        assert_eq!(error_code(rejected), "historian_compartment_sync_busy");
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+        assert_eq!(store.load("ses").unwrap().meta.shadow_seq, 0);
+
+        // Non-compartment state remains safe during the firing; the fence protects only
+        // the rows that could invalidate the producer's compartment snapshot.
+        let metadata_only = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "last_todo_state": "[]",
+                }),
+            )
+            .await;
+        assert!(matches!(metadata_only, HandlerOutcome::Response(_)));
+        assert_eq!(store.load("ses").unwrap().meta.shadow_seq, 1);
+
+        seed_idle(&store);
+        let retried = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 1,
+                    "compartments": [state_sync_compartment(0, "safe after idle")],
+                }),
+            )
+            .await;
+        assert!(matches!(retried, HandlerOutcome::Response(_)));
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
     }
 
     #[tokio::test]

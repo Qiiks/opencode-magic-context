@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
 use chrono::{Local, TimeZone};
-use mc_store::{BlockIdentity, HistorianSelectedMessageIdentity, McStore, StoredCompartment};
+use mc_store::{
+    BlockIdentity, CompartmentSetGeneration, HistorianSelectedMessageIdentity, McStore,
+    StoredCompartment,
+};
 use mc_tokenizer::estimate_tokens;
 use regex::Regex;
 use serde_json::Value;
@@ -453,6 +456,7 @@ pub struct AssembledHistorianFiring {
     pub chunk_fingerprint: String,
     pub selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
     pub expected_revert_epoch: u64,
+    pub compartment_set_generation: CompartmentSetGeneration,
     pub prior_compartments: Vec<StoredCompartmentRange>,
     pub validate_options: ValidateOptions,
     pub from_ordinal: u64,
@@ -487,6 +491,7 @@ impl AssembledHistorianFiring {
             chunk_fingerprint: &self.chunk_fingerprint,
             selected_range_identities: self.selected_range_identities.clone(),
             expected_revert_epoch: self.expected_revert_epoch,
+            compartment_set_generation: self.compartment_set_generation,
             observed_chunk_fingerprint: &self.chunk_fingerprint,
             validation_chunk: &self.chunk.chunk,
             chunk_transcript: &self.chunk.text,
@@ -523,6 +528,7 @@ pub fn assemble_historian_firing(
     let snapshot = store.load_historian_assembly_snapshot(&config.session_id)?;
     let compartments = snapshot.compartments;
     let expected_revert_epoch = snapshot.revert_epoch;
+    let compartment_set_generation = snapshot.compartment_set_generation;
     let eligible_end = config.boundary.eligible_head.end;
     let chunk_start =
         if let Some(last_end) = compartments.iter().map(|c| c.end_message as u64).max() {
@@ -651,6 +657,7 @@ pub fn assemble_historian_firing(
             chunk_fingerprint,
             selected_range_identities,
             expected_revert_epoch,
+            compartment_set_generation,
             prior_compartments,
             validate_options: ValidateOptions {
                 sequence_offset,

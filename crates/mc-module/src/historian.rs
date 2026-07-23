@@ -10,10 +10,11 @@ use std::fmt;
 use std::time::Duration;
 
 use mc_store::{
-    FactCandidate, HistorianChunkRange, HistorianDurableState, HistorianEventCandidate,
-    HistorianPhase, HistorianPrimerCandidate, HistorianPublishError, HistorianPublishPredicate,
-    HistorianPublishRequest, HistorianPublishResult, HistorianSelectedMessageIdentity,
-    HistorianUserMemoryCandidate, McStore, McStoreError, StoredCompartment,
+    CompartmentSetGeneration, FactCandidate, HistorianChunkRange, HistorianDurableState,
+    HistorianEventCandidate, HistorianPhase, HistorianPrimerCandidate, HistorianPublishError,
+    HistorianPublishPredicate, HistorianPublishRequest, HistorianPublishResult,
+    HistorianSelectedMessageIdentity, HistorianUserMemoryCandidate, McStore, McStoreError,
+    StoredCompartment,
 };
 
 use crate::historian_producer::{
@@ -244,6 +245,7 @@ impl From<HistorianPublishError> for HistorianStateError {
 
 /// Try to start a historian firing. Single-flight is enforced here: any
 /// non-idle phase returns `Busy` with the unchanged state.
+#[allow(clippy::too_many_arguments)] // The durable firing snapshot carries each fence explicitly.
 pub fn fire(
     current: &HistorianDurableState,
     from_ordinal: u64,
@@ -251,6 +253,7 @@ pub fn fire(
     chunk_fingerprint: String,
     selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
     expected_revert_epoch: u64,
+    compartment_set_generation: CompartmentSetGeneration,
     fired_at_ms: i64,
 ) -> Result<FireOutcome, HistorianStateError> {
     if from_ordinal > to_ordinal {
@@ -276,6 +279,7 @@ pub fn fire(
         producer_run_id: None,
         fired_at_ms: Some(fired_at_ms),
         expected_revert_epoch,
+        compartment_set_generation,
         failure_backoff_at_ms: current.failure_backoff_at_ms,
         last_failure: current.last_failure.clone(),
         // A fire resolves whatever skip reason preceded it.
@@ -389,6 +393,7 @@ pub fn publish_predicate(
         producer_run_id,
         chunk_fingerprint: state.chunk_fingerprint.clone(),
         selected_range_identities: state.selected_range_identities.clone(),
+        compartment_set_generation: state.compartment_set_generation,
     })
 }
 
@@ -554,6 +559,18 @@ pub fn publish_validated_chunk(
             Err(HistorianStateError::Publish(
                 HistorianPublishError::FenceRejected { reason },
             ))
+        }
+        Err(error @ HistorianPublishError::CompartmentOverlap { .. }) => {
+            // The storage backstop found an overlap after the optimistic fence. Treat it
+            // like every other stale local race: make the matching firing immediately
+            // idle so the caller never leaves a durable Publishing wedge behind.
+            abandon_matching_run_without_cooldown(
+                store,
+                request.session_id,
+                request.predicate,
+                Some(format!("publish rejected: {error}")),
+            )?;
+            Err(HistorianStateError::Publish(error))
         }
         Err(HistorianPublishError::CasConflict {
             expected,
@@ -888,6 +905,7 @@ pub struct HistorianFireRequest<'a> {
     pub chunk_fingerprint: &'a str,
     pub selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
     pub expected_revert_epoch: u64,
+    pub compartment_set_generation: CompartmentSetGeneration,
     pub observed_chunk_fingerprint: &'a str,
     pub validation_chunk: &'a HistorianChunk,
     pub chunk_transcript: &'a str,
@@ -1204,6 +1222,7 @@ where
             request.chunk_fingerprint.to_string(),
             request.selected_range_identities.clone(),
             request.expected_revert_epoch,
+            request.compartment_set_generation,
             request.now_ms,
         )? {
             FireOutcome::Busy(state) => return Ok(HistorianDriveOutcome::Busy(state)),
@@ -1588,21 +1607,19 @@ fn publish_output_from_awaiting(
     };
 
     let publishing = validation_ok(&validating)?;
-    persist_historian_state(store, session_id, publishing.clone())?;
+    let publishing_row_version = persist_historian_state(store, session_id, publishing.clone())?;
     let predicate = publish_predicate(&publishing)?;
-    // The commit-point fingerprint re-check lives INSIDE publish_validated_chunk, which
-    // abandons the matching firing (resetting the state to Idle+backoff) before returning
-    // the mismatch error. A separate pre-check here would compare the same fingerprints
-    // WITHOUT that abandon, so a mismatch would return early and strand the state in
-    // Publishing forever — a wedged historian that never refires. Rely on the internal
-    // guard as the single source of the check.
-    let loaded = store.load(session_id)?;
+    // Commit-point freshness checks live INSIDE publish_validated_chunk, which abandons
+    // the matching firing before returning a rejection. A separate pre-check could return
+    // early and strand the state in Publishing. Keep the row version written by the
+    // Publishing transition too: reloading here would adopt a racing sync's version and
+    // erase the CAS conflict that must retire this stale run.
     let published = publish_validated_chunk(
         store,
         ValidatedPublishRequest {
             session_id,
             project_path,
-            expected_row_version: loaded.row_version,
+            expected_row_version: Some(publishing_row_version),
             expected_revert_epoch: publishing.expected_revert_epoch,
             predicate: &predicate,
             observed_chunk_fingerprint,
@@ -2140,6 +2157,10 @@ mod tests {
         prior: &'a [StoredCompartmentRange],
     ) -> HistorianFireRequest<'a> {
         seed_test_selected_range_identities(store);
+        let compartment_set_generation = store
+            .load_historian_assembly_snapshot("ses")
+            .unwrap()
+            .compartment_set_generation;
         HistorianFireRequest {
             store,
             session_id: "ses",
@@ -2153,6 +2174,7 @@ mod tests {
             chunk_fingerprint: "fp",
             selected_range_identities: test_selected_range_identities(),
             expected_revert_epoch: 0,
+            compartment_set_generation,
             observed_chunk_fingerprint: "fp",
             validation_chunk: chunk,
             chunk_transcript: "U: transcript",
@@ -2203,6 +2225,7 @@ mod tests {
             producer_run_id: Some("run-3".into()),
             fired_at_ms: Some(10),
             expected_revert_epoch: 0,
+            compartment_set_generation: CompartmentSetGeneration::default(),
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
@@ -2758,6 +2781,10 @@ mod tests {
             "fp".into(),
             test_selected_range_identities(),
             0,
+            CompartmentSetGeneration {
+                max_sequence: 1,
+                count: 1,
+            },
             1,
         )
         .unwrap()
@@ -2809,6 +2836,10 @@ mod tests {
             "fp".into(),
             test_selected_range_identities(),
             0,
+            CompartmentSetGeneration {
+                max_sequence: 1,
+                count: 1,
+            },
             1,
         )
         .unwrap()
@@ -2880,6 +2911,10 @@ mod tests {
                 "fp".into(),
                 test_selected_range_identities(),
                 0,
+                CompartmentSetGeneration {
+                    max_sequence: 1,
+                    count: 1,
+                },
                 1,
             )
             .unwrap()
@@ -2984,6 +3019,10 @@ mod tests {
             "fp".into(),
             test_selected_range_identities(),
             0,
+            CompartmentSetGeneration {
+                max_sequence: 1,
+                count: 1,
+            },
             1,
         )
         .unwrap()
@@ -3030,6 +3069,7 @@ mod tests {
             "fp".into(),
             test_selected_range_identities(),
             0,
+            CompartmentSetGeneration::default(),
             1,
         )
         .unwrap()
@@ -3063,7 +3103,17 @@ mod tests {
         let state = store.load("ses").unwrap().meta.historian;
         assert_eq!(state.state, HistorianPhase::Idle);
         assert!(matches!(
-            fire(&state, 2, 4, "fp2".into(), Vec::new(), 0, 2).unwrap(),
+            fire(
+                &state,
+                2,
+                4,
+                "fp2".into(),
+                Vec::new(),
+                0,
+                CompartmentSetGeneration::default(),
+                2,
+            )
+            .unwrap(),
             FireOutcome::Fired(_)
         ));
     }
@@ -3321,7 +3371,17 @@ mod tests {
         assert_eq!(state.state, HistorianPhase::Idle);
         assert_eq!(state.failure_backoff_at_ms, Some(999));
         assert!(matches!(
-            fire(&state, 2, 4, "fp2".into(), Vec::new(), 0, 124).unwrap(),
+            fire(
+                &state,
+                2,
+                4,
+                "fp2".into(),
+                Vec::new(),
+                0,
+                CompartmentSetGeneration::default(),
+                124,
+            )
+            .unwrap(),
             FireOutcome::Fired(_)
         ));
     }
@@ -3344,6 +3404,10 @@ mod tests {
             "fp".into(),
             test_selected_range_identities(),
             0,
+            CompartmentSetGeneration {
+                max_sequence: 1,
+                count: 1,
+            },
             1,
         )
         .unwrap()
@@ -3688,6 +3752,10 @@ mod tests {
             producer_run_id: Some("run-1".into()),
             fired_at_ms: Some(1),
             expected_revert_epoch: 0,
+            compartment_set_generation: CompartmentSetGeneration {
+                max_sequence: 1,
+                count: 1,
+            },
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
@@ -3851,14 +3919,35 @@ mod tests {
     #[test]
     fn pure_state_machine_happy_path_and_single_flight() {
         let idle = HistorianDurableState::default();
-        let fired = match fire(&idle, 2, 5, "fp".into(), Vec::new(), 0, 100).unwrap() {
+        let fired = match fire(
+            &idle,
+            2,
+            5,
+            "fp".into(),
+            Vec::new(),
+            0,
+            CompartmentSetGeneration::default(),
+            100,
+        )
+        .unwrap()
+        {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => panic!("idle state must fire"),
         };
         assert_eq!(fired.state, HistorianPhase::Firing);
         assert_eq!(fired.firing_seq, 1);
         assert!(matches!(
-            fire(&fired, 6, 7, "other".into(), Vec::new(), 0, 101).unwrap(),
+            fire(
+                &fired,
+                6,
+                7,
+                "other".into(),
+                Vec::new(),
+                0,
+                CompartmentSetGeneration::default(),
+                101,
+            )
+            .unwrap(),
             FireOutcome::Busy(_)
         ));
 
@@ -3877,7 +3966,18 @@ mod tests {
             last_failure: Some("stale failure".into()),
             ..HistorianDurableState::default()
         };
-        let fired = match fire(&idle, 2, 5, "fp".into(), Vec::new(), 0, 100).unwrap() {
+        let fired = match fire(
+            &idle,
+            2,
+            5,
+            "fp".into(),
+            Vec::new(),
+            0,
+            CompartmentSetGeneration::default(),
+            100,
+        )
+        .unwrap()
+        {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => panic!("idle state must fire"),
         };
@@ -3937,7 +4037,17 @@ mod tests {
             "fingerprint cleanup must use the store's fenced abandon primitive"
         );
         assert!(matches!(
-            fire(&after, 6, 7, "new".into(), Vec::new(), 0, 1000).unwrap(),
+            fire(
+                &after,
+                6,
+                7,
+                "new".into(),
+                Vec::new(),
+                0,
+                CompartmentSetGeneration::default(),
+                1000,
+            )
+            .unwrap(),
             FireOutcome::Fired(_)
         ));
     }
@@ -3951,6 +4061,7 @@ mod tests {
             "fp".into(),
             Vec::new(),
             42,
+            CompartmentSetGeneration::default(),
             100,
         )
         .unwrap()
@@ -4013,6 +4124,88 @@ mod tests {
         assert!(store.load_compartments("ses").unwrap().is_empty());
     }
 
+    #[test]
+    fn compartment_generation_fence_releases_overlapped_publish_to_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .commit(
+                "ses",
+                None,
+                &CoreState::default(),
+                &test_meta_with_historian(publishing_state()),
+            )
+            .unwrap();
+        let predicate = publish_predicate(&store.load("ses").unwrap().meta.historian).unwrap();
+
+        // This models a state-sync commit that lands after the wrapup snapshot but before
+        // publication. Passing its fresh row version proves the compartment generation,
+        // not just the cache CAS, rejects the stale overlapping publish.
+        store
+            .append_compartments("ses", &[comp(1, 2, 4, "m4#0", "seeded summary")])
+            .unwrap();
+        let synced = store.load("ses").unwrap();
+        store
+            .commit("ses", synced.row_version, &synced.core, &synced.meta)
+            .unwrap();
+        let fresh = store.load("ses").unwrap();
+
+        let validated = ValidatedChunk {
+            compartments: vec![crate::historian_validate::ValidatedCompartment {
+                sequence: 1,
+                start_message: 2,
+                end_message: 4,
+                start_message_id: "m2#0".to_string(),
+                end_message_id: "m4#0".to_string(),
+                title: "stale summary".to_string(),
+                content: "stale summary".to_string(),
+                p1: Some("stale summary".to_string()),
+                p2: None,
+                p3: None,
+                p4: None,
+                importance: Some(50),
+                episode_type: None,
+            }],
+            unprocessed_from: 5,
+            ..Default::default()
+        };
+        let error = publish_validated_chunk(
+            &store,
+            ValidatedPublishRequest {
+                session_id: "ses",
+                project_path: "git:proj",
+                expected_row_version: fresh.row_version,
+                expected_revert_epoch: 0,
+                predicate: &predicate,
+                observed_chunk_fingerprint: "fp",
+                validated: &validated,
+                promote_facts: false,
+                collect_user_memory_candidates: false,
+                publication_floor_ordinal: 5,
+                chunk_transcript: "U: transcript",
+                boundary_dates: empty_boundary_dates(),
+                created_at_ms: 0,
+                failure_backoff_at_ms: 999,
+                publication_fence: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            HistorianStateError::Publish(HistorianPublishError::FenceRejected { .. })
+        ));
+        let after = store.load("ses").unwrap();
+        assert_eq!(after.meta.historian.state, HistorianPhase::Idle);
+        assert_eq!(after.meta.historian.failure_backoff_at_ms, None);
+        let compartments = store.load_compartments("ses").unwrap();
+        assert_eq!(
+            compartments.len(),
+            1,
+            "the stale publish must not append a second overlapping range"
+        );
+        assert!(crate::compartment_coverage::resolve_coverage(&compartments).is_ok());
+    }
+
     #[tokio::test]
     async fn reattach_carries_durable_revert_epoch_to_publish() {
         let dir = tempfile::tempdir().unwrap();
@@ -4027,6 +4220,7 @@ mod tests {
             "fp".into(),
             test_selected_range_identities(),
             7,
+            CompartmentSetGeneration::default(),
             1,
         )
         .unwrap()
@@ -4081,6 +4275,7 @@ mod tests {
                 "fp".into(),
                 test_selected_range_identities(),
                 0,
+                CompartmentSetGeneration::default(),
                 10,
             )
             .unwrap()
@@ -4172,6 +4367,11 @@ mod tests {
             block_identities: meta.block_identity_by_mid["t2"].clone(),
         }];
         let mut state = publishing_state();
+        let compartment_set_generation = store
+            .load_historian_assembly_snapshot("ses")
+            .unwrap()
+            .compartment_set_generation;
+        state.compartment_set_generation = compartment_set_generation;
         state.chunk_range = Some(HistorianChunkRange {
             from_ordinal: 2,
             to_ordinal: 2,
@@ -4193,6 +4393,7 @@ mod tests {
             producer_run_id: "run-3".into(),
             chunk_fingerprint: "tail-fp".into(),
             selected_range_identities,
+            compartment_set_generation,
         };
         store
             .publish_historian_chunk(HistorianPublishRequest {
