@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import { piModelRefToCanonical } from "../../../shared/harness-provider-map";
 import { log } from "../../../shared/logger";
 import { modelSupportsVision } from "../../../shared/models-dev-cache";
 import type { Database } from "../../../shared/sqlite";
@@ -131,12 +132,16 @@ export function ensureMuralRendered(
 }
 
 /** True only when the given model's cached provider metadata accepts images. A
- *  model key is `provider/model`; unknown capability means no image. */
+ *  model key is `provider/model`; unknown capability means no image.
+ *  Pi-native prefixes (`openai-codex/…`, `google-antigravity/…`) are translated
+ *  to the canonical OpenCode form before the models.dev lookup so both harnesses
+ *  share one vision gate. Missing cache entries fail closed (no image). */
 function modelKeyAcceptsImages(modelKey: string | undefined): boolean {
     if (!modelKey) return false;
-    const separator = modelKey.indexOf("/");
+    const canonical = piModelRefToCanonical(modelKey);
+    const separator = canonical.indexOf("/");
     if (separator <= 0) return false;
-    return modelSupportsVision(modelKey.slice(0, separator), modelKey.slice(separator + 1));
+    return modelSupportsVision(canonical.slice(0, separator), canonical.slice(separator + 1));
 }
 
 /**

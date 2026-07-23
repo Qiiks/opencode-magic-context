@@ -798,6 +798,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			injectDocs: cfg.dreamer?.inject_docs !== false,
 			injectionBudgetTokens: cfg.memory.injection_budget_tokens,
 			temporalAwareness: cfg.temporal_awareness === true,
+			muralEnabled: cfg.experimental?.mural?.enabled === true,
 		},
 		scheduler: {
 			executeThresholdPercentage: cfg.execute_threshold_percentage,

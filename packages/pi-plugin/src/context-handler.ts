@@ -845,6 +845,8 @@ export interface PiInjectionOptions {
 	injectDocs?: boolean;
 	injectionBudgetTokens: number;
 	temporalAwareness?: boolean;
+	/** experimental.mural.enabled — on-demand deterministic mural image on HARD folds. */
+	muralEnabled?: boolean;
 }
 
 /** Scheduler config — gates cache-busting stages on TTL + threshold. */
@@ -4946,6 +4948,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					injectionBudgetTokens: args.injection.injectionBudgetTokens,
 					historyBudgetTokens: args.injection.historyBudgetTokens,
 					hardSignals: piHardSignals,
+					muralEnabled: args.injection.muralEnabled === true,
 				},
 				args.db,
 				args.messages as Parameters<typeof injectM0M1Pi>[2],

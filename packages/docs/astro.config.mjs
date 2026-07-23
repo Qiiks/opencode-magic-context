@@ -46,6 +46,7 @@ export default defineConfig({
                         { slug: "concepts/overview" },
                         { slug: "concepts/historian" },
                         { slug: "concepts/memory" },
+                        { slug: "concepts/mural" },
                         { slug: "concepts/dreamer" },
                         { slug: "concepts/context-reduction" },
                         { slug: "concepts/cache-architecture" },
