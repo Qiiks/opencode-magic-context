@@ -51,6 +51,7 @@ import {
 import {
     beginSynapseBatchLedger,
     finishSynapseBatchLedger,
+    pruneSynapseBatchLedgerForProject,
 } from "./storage-embedding-measurements";
 
 const OFF_PROVIDER_IDENTITY = "embedding-provider:off";
@@ -953,6 +954,10 @@ export function registerProjectEmbedding(
         prior.runtimeFingerprint === runtimeFingerprint &&
         prior.providerIdentity === providerIdentity;
     recordActiveEmbeddingIdentity(db, projectIdentity, providerIdentity, chunkModelId, features);
+    // Synthetic ledger sessions (this project's primary and shadow batch keys)
+    // are never deleted through session teardown, so prune their expired rows
+    // on every (re)registration to keep the ledger bounded.
+    pruneSynapseBatchLedgerForProject(db, projectIdentity);
     // A trusted registration just landed — clear any prior untrusted-load latch
     // so GC can resume for this project.
     untrustedLoadProjects.delete(projectIdentity);

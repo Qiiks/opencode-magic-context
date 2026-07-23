@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDatabase, openDatabase } from "./storage";
 import {
+    MEASUREMENT_CORPUS_SESSION_ROW_CAP,
     listEmbeddingMeasurements,
     normalizedQueryHash,
     recordEmbeddingMeasurement,
@@ -52,5 +53,46 @@ describe("embedding measurement corpus", () => {
         expect(rows[0].query_text_hash).toBe(normalizedQueryHash(input.queryText));
         expect(JSON.parse(rows[0].primary_result_ids_json)).toHaveLength(10);
         expect(rows[0].query_text_hash).not.toContain(input.queryText);
+    });
+
+    it("bounds a session's corpus rows, keeping the newest when the cap is exceeded", () => {
+        const dir = mkdtempSync(join(tmpdir(), "embedding-measurements-cap-"));
+        dirs.push(dir);
+        process.env.XDG_DATA_HOME = dir;
+        const db = openDatabase();
+        const overflow = 5;
+        const total = MEASUREMENT_CORPUS_SESSION_ROW_CAP + overflow;
+        for (let i = 0; i < total; i++) {
+            recordEmbeddingMeasurement(db, {
+                sessionId: "ses-cap",
+                projectPath: "/repo",
+                // Unique query text per row: dedup is on (query hash, cohort), so
+                // distinct queries simulate the cohort-transition growth.
+                queryText: `query ${i}`,
+                cohortKey: "fp-a:0|fp-b:0",
+                primaryResultIds: [],
+                shadowResultIds: [],
+                primaryLatencyMs: 1,
+                shadowLatencyMs: 1,
+                primaryFailed: false,
+                shadowFailed: false,
+                primaryModelId: "local-id",
+                shadowModelId: "synapse-id",
+                primaryFingerprint: "",
+                shadowFingerprint: "fp-b",
+                primaryEpoch: 0,
+                shadowEpoch: 0,
+                corpusHash: `corpus-${i}`,
+                coverage: {},
+            });
+        }
+
+        const rows = listEmbeddingMeasurements(db, "ses-cap");
+        expect(rows).toHaveLength(MEASUREMENT_CORPUS_SESSION_ROW_CAP);
+        // The oldest `overflow` rows were pruned; the newest cap rows survive.
+        expect(rows[0].query_text_hash).toBe(normalizedQueryHash(`query ${overflow}`));
+        expect(rows[rows.length - 1].query_text_hash).toBe(
+            normalizedQueryHash(`query ${total - 1}`),
+        );
     });
 });
