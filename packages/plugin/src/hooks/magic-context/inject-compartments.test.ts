@@ -33,6 +33,7 @@ import {
     materializeWithRetry,
     mustMaterialize,
     prepareCompartmentInjection,
+    readCurrentM0SnapshotMarkers,
     renderCompartmentInjection,
     renderMemoryBlockV2,
     renderMemoryLineV2,
@@ -671,6 +672,53 @@ describe("m[0]/m[1] materialization", () => {
         expect(third.m1Text).toBe(second.m1Text);
     });
 
+    it("keeps mixed message bytes identical when the marker probe replays cached injection", () => {
+        db = makeDb();
+        const state = readStateFromMeta();
+        const fixture = [
+            userMessage("mixed-user", "[dropped §1§] user boundary"),
+            {
+                info: { id: "mixed-a", role: "assistant", sessionID: SESSION_ID },
+                parts: [
+                    { type: "reasoning", text: "signed reasoning", signature: "sig" },
+                    { type: "text", text: "<thinking>inline trace</thinking>answer" },
+                    { type: "file", mime: "image/png", url: "data:image/png;base64,AAAA" },
+                ],
+            },
+            {
+                info: { id: "mixed-b", role: "assistant", sessionID: SESSION_ID },
+                parts: [{ type: "text", text: "[dropped §2§]" }],
+            },
+        ] as unknown as MessageLike[];
+        const firstMessages = structuredClone(fixture) as MessageLike[];
+        const secondMessages = structuredClone(fixture) as MessageLike[];
+
+        const first = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: firstMessages,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory: "",
+            isCacheBustingPass: true,
+        });
+        const second = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: secondMessages,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory: "",
+            isCacheBustingPass: false,
+        });
+
+        expect(first.prependedMessageCount).toBe(2);
+        expect(second.prependedMessageCount).toBe(2);
+        expect(second.m0Bytes).toEqual(first.m0Bytes);
+        expect(second.m1Text).toBe(first.m1Text);
+        expect(JSON.stringify(secondMessages)).toBe(JSON.stringify(firstMessages));
+    });
+
     it("mustMaterialize returns true on first call", () => {
         db = makeDb();
         const decision = mustMaterialize({
@@ -704,6 +752,227 @@ describe("m[0]/m[1] materialization", () => {
         });
 
         expect(decision).toEqual({ value: false, reason: null });
+    });
+
+    it("invalidates cached marker reads after background writes for every observed marker", () => {
+        type MutableMarkerField =
+            | "projectMemoryEpoch"
+            | "workspaceFingerprint"
+            | "projectUserProfileVersion"
+            | "maxCompartmentSeq"
+            | "maxMemoryId"
+            | "maxMutationId"
+            | "maxMemoryMutationId"
+            | "sessionFactsVersion"
+            | "upgradeState";
+        const cases: Array<{
+            name: string;
+            field: MutableMarkerField;
+            mutate: (writer: Database) => void;
+            changes: boolean;
+        }> = [
+            {
+                name: "project memory epoch",
+                field: "projectMemoryEpoch",
+                mutate: (writer) => {
+                    setProjectState(writer, PROJECT_PATH, { projectMemoryEpoch: 1 });
+                },
+                changes: true,
+            },
+            {
+                name: "workspace membership",
+                field: "workspaceFingerprint",
+                mutate: (writer) => {
+                    const workspaceId = Number(
+                        (
+                            writer
+                                .prepare(
+                                    "INSERT INTO workspaces (name, created_at, updated_at) VALUES (?, ?, ?)",
+                                )
+                                .run("background-workspace", 1, 1) as { lastInsertRowid: number }
+                        ).lastInsertRowid,
+                    );
+                    const insertMember = writer.prepare(
+                        "INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at) VALUES (?, ?, ?, ?, ?)",
+                    );
+                    insertMember.run(workspaceId, PROJECT_PATH, "primary", PROJECT_PATH, 1);
+                    insertMember.run(
+                        workspaceId,
+                        "/tmp/background-member",
+                        "background",
+                        "/tmp/background-member",
+                        1,
+                    );
+                },
+                changes: true,
+            },
+            {
+                name: "global user profile version",
+                field: "projectUserProfileVersion",
+                mutate: (writer) => {
+                    setProjectState(writer, "__global__", { projectUserProfileVersion: 1 });
+                },
+                changes: true,
+            },
+            {
+                name: "historian compartment publish",
+                field: "maxCompartmentSeq",
+                mutate: (writer) => {
+                    appendCompartments(writer, SESSION_ID, [
+                        {
+                            sequence: 0,
+                            startMessage: 1,
+                            endMessage: 1,
+                            title: "background publish",
+                            content: "background summary",
+                        },
+                    ]);
+                },
+                changes: true,
+            },
+            {
+                name: "memory write",
+                field: "maxMemoryId",
+                mutate: (writer) => {
+                    insertMemory(writer, {
+                        projectPath: PROJECT_PATH,
+                        category: "PROJECT_RULES",
+                        content: "Background memory write must invalidate the probe.",
+                    });
+                },
+                changes: true,
+            },
+            {
+                name: "m0 mutation",
+                field: "maxMutationId",
+                mutate: (writer) => {
+                    queueM0Mutation(writer, {
+                        sessionId: SESSION_ID,
+                        mutationType: "compartment_merge",
+                        queuedAt: 1,
+                    });
+                },
+                changes: true,
+            },
+            {
+                name: "memory mutation",
+                field: "maxMemoryMutationId",
+                mutate: (writer) => {
+                    queueMemoryMutation(writer, {
+                        projectPath: PROJECT_PATH,
+                        mutationType: "update",
+                        targetMemoryId: 1,
+                        newContent: "updated in background",
+                        queuedAt: 1,
+                    });
+                },
+                changes: true,
+            },
+            {
+                name: "retired session facts version",
+                field: "sessionFactsVersion",
+                mutate: (writer) => {
+                    bumpSessionFactsVersion(writer, SESSION_ID);
+                },
+                changes: false,
+            },
+            {
+                name: "legacy upgrade state",
+                field: "upgradeState",
+                mutate: (writer) => {
+                    writer
+                        .prepare(
+                            `INSERT INTO compartments
+                                (session_id, sequence, start_message, end_message, title, content, legacy, created_at)
+                             VALUES (?, 0, 1, 1, 'legacy', 'legacy summary', 1, 1)`,
+                        )
+                        .run(SESSION_ID);
+                },
+                changes: true,
+            },
+        ];
+
+        for (const testCase of cases) {
+            const directory = makeProjectDir();
+            const reader = new Database(join(directory, `${testCase.field}.db`));
+            initializeDatabase(reader);
+            getOrCreateSessionMeta(reader, SESSION_ID);
+            const writer = new Database(join(directory, `${testCase.field}.db`));
+            initializeDatabase(writer);
+            try {
+                const before = readCurrentM0SnapshotMarkers({
+                    db: reader,
+                    sessionId: SESSION_ID,
+                    projectPath: PROJECT_PATH,
+                    projectDirectory: "",
+                });
+                testCase.mutate(writer);
+                const after = readCurrentM0SnapshotMarkers({
+                    db: reader,
+                    sessionId: SESSION_ID,
+                    projectPath: PROJECT_PATH,
+                    projectDirectory: "",
+                });
+
+                if (testCase.changes) {
+                    expect(after[testCase.field], testCase.name).not.toEqual(
+                        before[testCase.field],
+                    );
+                } else {
+                    expect(after[testCase.field], testCase.name).toEqual(before[testCase.field]);
+                }
+            } finally {
+                closeQuietly(writer);
+                closeQuietly(reader);
+            }
+        }
+    });
+
+    it("uses one cached statement execution for an unchanged marker decision", () => {
+        db = makeDb();
+        let prepares = 0;
+        let executions = 0;
+        const observedDb = new Proxy(db, {
+            get(target, property, receiver) {
+                if (property !== "prepare") return Reflect.get(target, property, receiver);
+                return (sql: string) => {
+                    prepares += 1;
+                    const statement = target.prepare(sql);
+                    if (!sql.includes("json_each(?)")) return statement;
+                    return {
+                        get: (...parameters: unknown[]) => {
+                            executions += 1;
+                            return statement.get(...parameters);
+                        },
+                    };
+                };
+            },
+        }) as Database;
+        const args = {
+            db: observedDb,
+            sessionId: SESSION_ID,
+            projectPath: PROJECT_PATH,
+            projectDirectory: "",
+        };
+
+        const before = readCurrentM0SnapshotMarkers(args);
+        prepares = 0;
+        executions = 0;
+        const after = readCurrentM0SnapshotMarkers(args);
+
+        expect(after).toMatchObject({
+            projectMemoryEpoch: before.projectMemoryEpoch,
+            workspaceFingerprint: before.workspaceFingerprint,
+            projectUserProfileVersion: before.projectUserProfileVersion,
+            maxCompartmentSeq: before.maxCompartmentSeq,
+            maxMemoryId: before.maxMemoryId,
+            maxMutationId: before.maxMutationId,
+            maxMemoryMutationId: before.maxMemoryMutationId,
+            sessionFactsVersion: before.sessionFactsVersion,
+            upgradeState: before.upgradeState,
+        });
+        expect(prepares).toBe(0);
+        expect(executions).toBe(1);
     });
 
     it("folds a legacy render epoch once, then replays m[0]/m[1] byte-identically", () => {

@@ -2528,4 +2528,57 @@ describe("final message representation", () => {
         });
         expect(JSON.stringify(nonAnthropicMessages)).toBe(nonAnthropicBefore);
     });
+
+    it("matches the former full cleared-reasoning walk on a mixed final fixture", () => {
+        const fixture = [
+            {
+                info: { role: "user", syntheticHead: true },
+                parts: [
+                    {
+                        type: "text",
+                        text: "<session-history>cached history</session-history>",
+                        synthetic: true,
+                    },
+                ],
+            },
+            {
+                info: { id: "synthetic-carrier", role: "assistant" },
+                parts: [
+                    { type: "reasoning", text: "[cleared]", signature: "new-head-signature" },
+                    { type: "tool", callID: "todo", state: { input: { todos: [] }, output: "ok" } },
+                ],
+            },
+            {
+                info: { id: "placeholder", role: "assistant" },
+                parts: [{ type: "text", text: "[dropped §3§]" }],
+            },
+            {
+                info: { id: "merged-a", role: "assistant" },
+                parts: [
+                    { type: "reasoning", text: "signed reasoning", signature: "keep-signature" },
+                    { type: "text", text: "<thinking>inline trace</thinking>answer" },
+                    { type: "file", mime: "image/png", url: "data:image/png;base64,AAAA" },
+                ],
+            },
+            {
+                info: { id: "merged-b", role: "assistant" },
+                parts: [
+                    { type: "thinking", thinking: "[cleared]", signature: "late-drop-signature" },
+                    { type: "text", text: "merged assistant tail" },
+                ],
+            },
+        ] as unknown as MessageLike[];
+        const fullWalk = cloneMessages(fixture);
+        const targeted = cloneMessages(fixture);
+        const targetedLateMutation = targeted.find((message) => message.info.id === "merged-b")!;
+
+        const oldResult = finalizeMessageRepresentation(fullWalk, "anthropic");
+        const targetedResult = finalizeMessageRepresentation(targeted, "anthropic", {
+            prependedMessageCount: 2,
+            reasoningMutatedMessages: [targetedLateMutation],
+        });
+
+        expect(targetedResult).toEqual(oldResult);
+        expect(JSON.stringify(targeted)).toBe(JSON.stringify(fullWalk));
+    });
 });

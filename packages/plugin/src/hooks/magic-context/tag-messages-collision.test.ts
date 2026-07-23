@@ -160,6 +160,63 @@ describe("tag-messages composite-key collision handling (v3.3.1 Layer C)", () =>
         expect(owners).toEqual(["m-asst-1", "m-asst-2"]);
     });
 
+    it("serializes each tool input once without changing tag metadata on a mixed fixture", () => {
+        useTempDataHome("single-input-serialization-");
+        const db = openDatabase();
+        const tagger = createTagger();
+        let toJSONCalls = 0;
+        const countedInput = {
+            toJSON() {
+                toJSONCalls += 1;
+                return { path: "src/index.ts", line: 42 };
+            },
+        };
+        const messages: MessageLike[] = [
+            {
+                info: { id: "user-placeholder", role: "user", sessionID: "ses-serialize" },
+                parts: [{ type: "text", text: "[dropped §1§]" }],
+            },
+            {
+                info: { id: "assistant-counted", role: "assistant", sessionID: "ses-serialize" },
+                parts: [
+                    { type: "reasoning", text: "signed reasoning", signature: "sig" },
+                    { type: "text", text: "<thinking>inline</thinking>answer" },
+                    {
+                        type: "tool",
+                        callID: "read:counted",
+                        tool: "read",
+                        state: { input: countedInput, output: "counted output" },
+                    },
+                    { type: "file", mime: "image/png", url: "data:image/png;base64,AAAA" },
+                ],
+            },
+            {
+                info: { id: "assistant-plain", role: "assistant", sessionID: "ses-serialize" },
+                parts: [
+                    {
+                        type: "tool",
+                        callID: "read:plain",
+                        tool: "read",
+                        state: {
+                            input: { path: "src/index.ts", line: 42 },
+                            output: "plain output",
+                        },
+                    },
+                ],
+            },
+        ];
+
+        tagMessages("ses-serialize", messages, tagger, db);
+
+        const toolTags = getTagsBySession(db, "ses-serialize")
+            .filter((tag) => tag.type === "tool")
+            .sort((left, right) => (left.messageId ?? "").localeCompare(right.messageId ?? ""));
+        expect(toJSONCalls).toBe(1);
+        expect(toolTags).toHaveLength(2);
+        expect(toolTags[0]?.inputByteSize).toBe(toolTags[1]?.inputByteSize);
+        expect(toolTags[0]?.inputTokenCount).toBe(toolTags[1]?.inputTokenCount);
+    });
+
     it("FIFO pairing: invocation+result sequences pair correctly across messages", () => {
         //#given — interleaved invocations and results: A1, A2, R1, R2.
         // This is the OpenCode-shape FIFO test from plan Test #14.

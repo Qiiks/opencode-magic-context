@@ -118,11 +118,17 @@ function isSyntheticHeadMessage(message: MessageLike): boolean {
 
 const TODO_HEAD_ANCHOR_ID = "__magic_context_todo_head__";
 
+interface SyntheticTodoInjectionResult {
+    injected: boolean;
+    messageId: string;
+    prependedMessageCount: number;
+}
+
 function injectSyntheticTodoAtHead(
     messages: MessageLike[],
     sessionId: string,
     part: SyntheticTodoPart,
-): string {
+): SyntheticTodoInjectionResult {
     let headEnd = 0;
     while (headEnd < messages.length && isSyntheticHeadMessage(messages[headEnd])) {
         headEnd += 1;
@@ -130,7 +136,11 @@ function injectSyntheticTodoAtHead(
     const existing = messages[headEnd];
     if (existing?.info.id === TODO_HEAD_ANCHOR_ID) {
         injectToolPartIntoAssistantById(messages, TODO_HEAD_ANCHOR_ID, part);
-        return TODO_HEAD_ANCHOR_ID;
+        return {
+            injected: true,
+            messageId: TODO_HEAD_ANCHOR_ID,
+            prependedMessageCount: 0,
+        };
     }
     messages.splice(headEnd, 0, {
         info: {
@@ -140,7 +150,11 @@ function injectSyntheticTodoAtHead(
         },
         parts: [part],
     });
-    return TODO_HEAD_ANCHOR_ID;
+    return {
+        injected: true,
+        messageId: TODO_HEAD_ANCHOR_ID,
+        prependedMessageCount: 1,
+    };
 }
 
 function injectPersistedTodoAnchor(
@@ -148,11 +162,14 @@ function injectPersistedTodoAnchor(
     sessionId: string,
     messageId: string,
     part: SyntheticTodoPart,
-): boolean {
-    if (injectToolPartIntoAssistantById(messages, messageId, part)) return true;
-    if (messageId !== TODO_HEAD_ANCHOR_ID) return false;
-    injectSyntheticTodoAtHead(messages, sessionId, part);
-    return true;
+): SyntheticTodoInjectionResult {
+    if (injectToolPartIntoAssistantById(messages, messageId, part)) {
+        return { injected: true, messageId, prependedMessageCount: 0 };
+    }
+    if (messageId !== TODO_HEAD_ANCHOR_ID) {
+        return { injected: false, messageId, prependedMessageCount: 0 };
+    }
+    return injectSyntheticTodoAtHead(messages, sessionId, part);
 }
 
 /**
@@ -483,7 +500,11 @@ export async function abortSessionFailClosed(
 
 export interface EmergencyFailClosedDecision {
     shouldAbort: boolean;
-    reason: "below-emergency-band" | "provider-overflow-abort" | "proceed" | "trusted-final-wire-disarm";
+    reason:
+        | "below-emergency-band"
+        | "provider-overflow-abort"
+        | "proceed"
+        | "trusted-final-wire-disarm";
     /** Trusted current-pass wire evidence that lets the caller clear its durable latch. */
     disarm?: { finalWireTokens: number; provenLimitTokens: number };
 }
@@ -532,10 +553,31 @@ export function evaluateEmergencyFailClosed(input: {
 export function finalizeMessageRepresentation(
     messages: MessageLike[],
     resolvedProviderID?: string,
+    options?: {
+        prependedMessageCount?: number;
+        reasoningMutatedMessages?: Iterable<MessageLike>;
+    },
 ): { clearedParts: number; mergedReasoningParts: number } {
-    const clearedParts = modelAcceptsEmptyContent(resolvedProviderID)
-        ? stripClearedReasoning(messages)
-        : 0;
+    let clearedParts = 0;
+    if (modelAcceptsEmptyContent(resolvedProviderID)) {
+        const prependedMessageCount = Math.min(
+            messages.length,
+            Math.max(0, options?.prependedMessageCount ?? 0),
+        );
+        const targetedMessages = options ? messages.slice(0, prependedMessageCount) : messages;
+        if (options?.reasoningMutatedMessages) {
+            const seen = new Set(targetedMessages);
+            for (const message of options.reasoningMutatedMessages) {
+                if (!seen.has(message)) {
+                    seen.add(message);
+                    targetedMessages.push(message);
+                }
+            }
+        }
+        if (targetedMessages.length > 0) {
+            clearedParts = stripClearedReasoning(targetedMessages);
+        }
+    }
     const mergedReasoningParts = stripReasoningFromMergedAssistants(messages, resolvedProviderID);
     return { clearedParts, mergedReasoningParts };
 }
@@ -769,6 +811,15 @@ export async function runPostTransformPhase(
     let m0RematerializedThisPass = false;
     let m0MaterializeReason: string | null = null;
     let m0M1InjectedThisPass = false;
+    let prependedMessageCount = 0;
+    const reasoningMutatedMessages = new Set<MessageLike>();
+    let reasoningMutationTargetUnknown = false;
+    if (args.didMutateFromFlushedStatuses) {
+        for (const target of args.targets.values()) {
+            if (target.message) reasoningMutatedMessages.add(target.message);
+            else reasoningMutationTargetUnknown = true;
+        }
+    }
     let autoReclaimDidMutateThisPass = false;
     try {
         if (shouldApplyPendingOps) {
@@ -803,6 +854,11 @@ export async function runPostTransformPhase(
             );
             if (pendingOpsDidMutate) {
                 droppedCount += pendingOps.length;
+                for (const pendingOp of pendingOps) {
+                    const message = args.targets.get(pendingOp.tagId)?.message;
+                    if (message) reasoningMutatedMessages.add(message);
+                    else reasoningMutationTargetUnknown = true;
+                }
             }
             logTransformTiming(args.sessionId, "applyPendingOperations", tApply);
         }
@@ -1011,6 +1067,11 @@ export async function runPostTransformPhase(
                 if (autoReclaimDidMutate) {
                     droppedCount += syntheticPendingOps.length;
                     autoReclaimDidMutateThisPass = true;
+                    for (const pendingOp of syntheticPendingOps) {
+                        const message = args.targets.get(pendingOp.tagId)?.message;
+                        if (message) reasoningMutatedMessages.add(message);
+                        else reasoningMutationTargetUnknown = true;
+                    }
                 }
             }
         }
@@ -1133,6 +1194,7 @@ export async function runPostTransformPhase(
             });
             if (result.injected) {
                 m0M1InjectedThisPass = true;
+                prependedMessageCount += result.prependedMessageCount;
                 m0RematerializedThisPass ||= result.m0RematerializedThisPass;
                 m0MaterializeReason = result.decision.reason ?? m0MaterializeReason;
                 sessionLog(
@@ -1157,11 +1219,12 @@ export async function runPostTransformPhase(
             // the next pass re-materializes the proper m[0]/m[1] layout.
             if (args.pendingCompartmentInjection) {
                 try {
-                    renderCompartmentInjection(
+                    const fallbackResult = renderCompartmentInjection(
                         args.sessionId,
                         args.messages,
                         args.pendingCompartmentInjection,
                     );
+                    prependedMessageCount += fallbackResult.prependedMessageCount;
                     sessionLog(
                         args.sessionId,
                         "transform: rendered legacy <session-history> fallback after m[0]/m[1] failure",
@@ -1203,6 +1266,7 @@ export async function runPostTransformPhase(
             args.pendingCompartmentInjection,
         );
         if (compartmentResult.injected) {
+            prependedMessageCount += compartmentResult.prependedMessageCount;
             if (compartmentResult.compartmentCount > 0) {
                 sessionLog(
                     args.sessionId,
@@ -1469,20 +1533,21 @@ export async function runPostTransformPhase(
         const persistedAnchor = getPersistedTodoSyntheticAnchor(args.db, args.sessionId);
         if (isCacheBustingPass) {
             const part = buildSyntheticTodoPart(args.sessionMeta.lastTodoState);
+            const persistedInjection =
+                part !== null && persistedAnchor && persistedAnchor.callId === part.callID
+                    ? injectPersistedTodoAnchor(
+                          args.messages,
+                          args.sessionId,
+                          persistedAnchor.messageId,
+                          part,
+                      )
+                    : null;
             if (part === null) {
                 if (persistedAnchor) {
                     clearPersistedTodoSyntheticAnchor(args.db, args.sessionId);
                 }
-            } else if (
-                persistedAnchor &&
-                persistedAnchor.callId === part.callID &&
-                injectPersistedTodoAnchor(
-                    args.messages,
-                    args.sessionId,
-                    persistedAnchor.messageId,
-                    part,
-                )
-            ) {
+            } else if (persistedAnchor && persistedInjection?.injected) {
+                prependedMessageCount += persistedInjection.prependedMessageCount;
                 // Snapshot unchanged AND persisted anchor message still
                 // present — idempotent re-inject leaves DB and messages
                 // byte-identical.
@@ -1511,14 +1576,21 @@ export async function runPostTransformPhase(
                     );
                 }
             } else {
-                const anchoredMessageId =
-                    injectToolPartIntoLatestAssistant(args.messages, part) ??
-                    injectSyntheticTodoAtHead(args.messages, args.sessionId, part);
+                const existingAssistantId = injectToolPartIntoLatestAssistant(args.messages, part);
+                const injection =
+                    existingAssistantId === null
+                        ? injectSyntheticTodoAtHead(args.messages, args.sessionId, part)
+                        : {
+                              injected: true,
+                              messageId: existingAssistantId,
+                              prependedMessageCount: 0,
+                          };
+                prependedMessageCount += injection.prependedMessageCount;
                 setPersistedTodoSyntheticAnchor(
                     args.db,
                     args.sessionId,
                     part.callID,
-                    anchoredMessageId,
+                    injection.messageId,
                     // Persist the SNAPSHOT we injected, not just the callID.
                     // Defer-pass replay rebuilds from THIS state so prefix bytes
                     // stay identical even if a real todowrite mutates
@@ -1543,12 +1615,13 @@ export async function runPostTransformPhase(
             // matching legacy behavior.
             const part = buildSyntheticTodoPart(persistedAnchor.stateJson);
             if (part !== null && part.callID === persistedAnchor.callId) {
-                injectPersistedTodoAnchor(
+                const injection = injectPersistedTodoAnchor(
                     args.messages,
                     args.sessionId,
                     persistedAnchor.messageId,
                     part,
                 );
+                prependedMessageCount += injection.prependedMessageCount;
             }
         }
     }
@@ -1697,10 +1770,37 @@ export async function runPostTransformPhase(
     // Final representation strips run once, after all topology mutations; execute
     // and defer must serialize identical prefixes. Do not add message, tool-target,
     // or role-topology mutations below this phase.
+    //
+    if (reasoningMutationTargetUnknown) {
+        const reasoningCandidates =
+            args.reasoningByMessage.size > 0 ? args.reasoningByMessage.keys() : args.messages;
+        for (const message of reasoningCandidates) {
+            const hasClearedReasoning = message.parts.some((part) => {
+                if (part === null || typeof part !== "object") return false;
+                const candidate = part as { type?: unknown; thinking?: unknown; text?: unknown };
+                if (candidate.type !== "reasoning" && candidate.type !== "thinking") return false;
+                return candidate.thinking === "[cleared]" || candidate.text === "[cleared]";
+            });
+            if (hasClearedReasoning) reasoningMutatedMessages.add(message);
+        }
+    }
+
+    // The original corpus was already cleared in transform.ts. After that point,
+    // only explicit injection results add messages, while flushed/pending tool or
+    // text drops can rewrite an owning assistant's reasoning to `[cleared]`. Todo synthesis,
+    // notes, marker reconciliation, and auto-search add only tool/text parts, so
+    // they cannot create a cleared reasoning shell. Keeping the exact injected
+    // head count plus owning mutation targets preserves the old full-array result
+    // without repeating its O(session) walk. A legacy/custom target that omits its
+    // owner pays one mutation-pass discovery scan above; steady defer never does.
     const tFinalRepresentation = performance.now();
     const finalRepresentation = finalizeMessageRepresentation(
         args.messages,
         args.resolvedProviderID,
+        {
+            prependedMessageCount,
+            reasoningMutatedMessages,
+        },
     );
     sessionLog(
         args.sessionId,

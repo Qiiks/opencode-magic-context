@@ -134,6 +134,7 @@ export function getVisibleMemoryIds(db: Database, sessionId: string): Set<number
 
 export interface CompartmentInjectionResult {
     injected: boolean;
+    prependedMessageCount: number;
     compartmentEndMessage: number;
     compartmentCount: number;
     skippedVisibleMessages: number;
@@ -508,7 +509,9 @@ export function renderCompartmentInjection(
     const historyBlock = `<session-history>\n${prepared.block}\n</session-history>`;
     const firstMessage = messages[0];
     const textPart = firstMessage ? findFirstTextPart(firstMessage.parts) : null;
+    let prependedMessageCount = 0;
     if (!firstMessage || !textPart || isDroppedPlaceholder(textPart.text)) {
+        prependedMessageCount = 1;
         // synthetic: true — injected context, not a real user turn. Keeps it out
         // of OpenCode's auto-title gate (issue #129) while still reaching the
         // model (toModelMessagesEffect filters `ignored`, not `synthetic`).
@@ -535,6 +538,7 @@ export function renderCompartmentInjection(
 
     return {
         injected: true,
+        prependedMessageCount,
         compartmentEndMessage: prepared.compartmentEndMessage,
         compartmentCount: prepared.compartmentCount,
         skippedVisibleMessages: prepared.skippedVisibleMessages,
@@ -677,6 +681,7 @@ export interface MaterializeM0Result {
 
 export interface InjectM0M1Result {
     injected: boolean;
+    prependedMessageCount: number;
     m0RematerializedThisPass: boolean;
     materializationContentionRetryExhausted: boolean;
     decision: MaterializeDecision;
@@ -853,6 +858,8 @@ function memoryRenderOrder(left: Memory, right: Memory): number {
 const maxCompartmentSeqStatements = new WeakMap<Database, PreparedStatement>();
 const maxMemoryIdStatements = new WeakMap<Database, PreparedStatement>();
 const legacyCompartmentCountStatements = new WeakMap<Database, PreparedStatement>();
+const markerChangeProbeStatements = new WeakMap<Database, PreparedStatement>();
+const markerReadCaches = new WeakMap<Database, BoundedSessionMap<MarkerReadCacheEntry>>();
 const m0CompartmentStatements = new WeakMap<Database, PreparedStatement>();
 const newCompartmentStatements = new WeakMap<Database, PreparedStatement>();
 
@@ -928,7 +935,7 @@ function getGlobalUserProfileVersion(db: Database): number {
     return getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH)?.projectUserProfileVersion ?? 0;
 }
 
-export function readCurrentM0SnapshotMarkers(args: {
+interface M0SnapshotMarkerReadArgs {
     db: Database;
     sessionId: string;
     projectPath?: string;
@@ -936,7 +943,199 @@ export function readCurrentM0SnapshotMarkers(args: {
     injectDocs?: boolean;
     hardSignals?: M0HardSignals;
     workspaceIdentitySet?: WorkspaceIdentitySet;
-}): M0SnapshotMarkers {
+}
+
+interface MarkerChangeProbe {
+    projectMemoryEpoch: number;
+    projectUserProfileVersion: number;
+    maxCompartmentSeq: number;
+    legacyCompartmentCount: number;
+    maxMemoryId: number;
+    maxMutationId: number;
+    maxMemoryMutationId: number;
+    workspaceSignature: string;
+    workspaceEpochSignature: string;
+    aliasSignature: string;
+}
+
+interface MarkerReadCacheEntry {
+    markers: M0SnapshotMarkers;
+    probe: MarkerChangeProbe;
+    workspace: WorkspaceRenderContext;
+    workspaceIdentity: string;
+}
+
+interface MarkerChangeProbeRow {
+    project_memory_epoch: number;
+    project_user_profile_version: number;
+    max_compartment_seq: number;
+    legacy_compartment_count: number;
+    max_memory_id: number;
+    max_mutation_id: number;
+    max_memory_mutation_id: number;
+    workspace_signature: string;
+    workspace_epoch_signature: string;
+    alias_signature: string;
+}
+
+const MARKER_CHANGE_PROBE_SQL = `
+    WITH
+      expanded(project_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?)),
+      own(project_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?)),
+      shared(category) AS (SELECT CAST(value AS TEXT) FROM json_each(?)),
+      canonical(project_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?))
+    SELECT
+      COALESCE((
+        SELECT project_memory_epoch FROM project_state WHERE project_path = ?
+      ), 0) AS project_memory_epoch,
+      COALESCE((
+        SELECT project_user_profile_version FROM project_state WHERE project_path = ?
+      ), 0) AS project_user_profile_version,
+      COALESCE((
+        SELECT MAX(sequence) FROM compartments WHERE session_id = ?
+      ), -1) AS max_compartment_seq,
+      (
+        SELECT COUNT(*) FROM compartments WHERE session_id = ? AND legacy = 1
+      ) AS legacy_compartment_count,
+      COALESCE((
+        SELECT MAX(memory.id)
+          FROM memories AS memory
+         WHERE memory.project_path IN (SELECT project_path FROM expanded)
+           AND (
+             memory.project_path IN (SELECT project_path FROM own)
+             OR (
+               memory.shareable = 1
+               AND memory.scope IN ('project', 'ecosystem', 'universe')
+               AND memory.category IN (SELECT category FROM shared)
+             )
+           )
+      ), 0) AS max_memory_id,
+      COALESCE((
+        SELECT MAX(id) FROM m0_mutation_log WHERE session_id = ?
+      ), 0) AS max_mutation_id,
+      COALESCE((
+        SELECT MAX(id)
+          FROM memory_mutation_log
+         WHERE project_path IN (SELECT project_path FROM expanded)
+      ), 0) AS max_memory_mutation_id,
+      COALESCE((
+        SELECT GROUP_CONCAT(signature, char(30))
+          FROM (
+            SELECT member.workspace_id || char(31) || member.project_path || char(31) ||
+                   member.display_name || char(31) || member.display_path || char(31) ||
+                   workspace.share_categories AS signature
+              FROM workspace_members AS anchor
+              JOIN workspace_members AS member ON member.workspace_id = anchor.workspace_id
+              JOIN workspaces AS workspace ON workspace.id = member.workspace_id
+             WHERE anchor.project_path = ?
+             ORDER BY member.workspace_id, member.project_path
+          )
+      ), '') AS workspace_signature,
+      COALESCE((
+        SELECT GROUP_CONCAT(signature, char(30))
+          FROM (
+            SELECT canonical.project_path || char(31) ||
+                   COALESCE(state.project_memory_epoch, 0) AS signature
+              FROM canonical
+              LEFT JOIN project_state AS state ON state.project_path = canonical.project_path
+             ORDER BY canonical.project_path
+          )
+      ), '') AS workspace_epoch_signature,
+      COALESCE((
+        SELECT GROUP_CONCAT(signature, char(30))
+          FROM (
+            SELECT alias.old_project_path || char(31) || alias.new_project_path AS signature
+              FROM v22_identity_rekey_map AS alias
+             WHERE alias.new_project_path IN (SELECT project_path FROM canonical)
+             ORDER BY alias.old_project_path, alias.new_project_path
+          )
+      ), '') AS alias_signature`;
+
+function workspaceIdentity(workspace: WorkspaceRenderContext): string {
+    return JSON.stringify({
+        identities: workspace.identities,
+        expandedIdentities: workspace.expandedIdentities,
+        ownIdentities: workspace.ownIdentities,
+        shareCategories: workspace.shareCategories,
+        names: [...workspace.namesByIdentity].sort(([left], [right]) => left.localeCompare(right)),
+    });
+}
+
+function markerReadCacheKey(args: M0SnapshotMarkerReadArgs): string {
+    const suppliedWorkspace = args.workspaceIdentitySet
+        ? JSON.stringify({
+              identities: args.workspaceIdentitySet.identities,
+              names: [...args.workspaceIdentitySet.namesByIdentity].sort(([left], [right]) =>
+                  left.localeCompare(right),
+              ),
+          })
+        : "auto";
+    return `${args.sessionId}\u0000${args.projectPath ?? ""}\u0000${suppliedWorkspace}`;
+}
+
+function getMarkerReadCache(db: Database): BoundedSessionMap<MarkerReadCacheEntry> {
+    let cache = markerReadCaches.get(db);
+    if (!cache) {
+        cache = new BoundedSessionMap<MarkerReadCacheEntry>(100);
+        markerReadCaches.set(db, cache);
+    }
+    return cache;
+}
+
+function readMarkerChangeProbe(
+    args: M0SnapshotMarkerReadArgs,
+    workspace: WorkspaceRenderContext,
+): MarkerChangeProbe {
+    const statement = cachedStatement(
+        markerChangeProbeStatements,
+        args.db,
+        MARKER_CHANGE_PROBE_SQL,
+    );
+    const row = statement.get(
+        JSON.stringify(workspace.expandedIdentities),
+        JSON.stringify(workspace.ownIdentities),
+        JSON.stringify(workspace.shareCategories ?? []),
+        JSON.stringify(workspace.identities),
+        args.projectPath ?? "",
+        GLOBAL_USER_PROFILE_PROJECT_PATH,
+        args.sessionId,
+        args.sessionId,
+        args.sessionId,
+        args.projectPath ?? "",
+    ) as MarkerChangeProbeRow;
+    return {
+        projectMemoryEpoch: row.project_memory_epoch,
+        projectUserProfileVersion: row.project_user_profile_version,
+        maxCompartmentSeq: row.max_compartment_seq,
+        legacyCompartmentCount: row.legacy_compartment_count,
+        maxMemoryId: row.max_memory_id,
+        maxMutationId: row.max_mutation_id,
+        maxMemoryMutationId: row.max_memory_mutation_id,
+        workspaceSignature: row.workspace_signature,
+        workspaceEpochSignature: row.workspace_epoch_signature,
+        aliasSignature: row.alias_signature,
+    };
+}
+
+function markerChangeProbeEquals(left: MarkerChangeProbe, right: MarkerChangeProbe): boolean {
+    return (
+        left.projectMemoryEpoch === right.projectMemoryEpoch &&
+        left.projectUserProfileVersion === right.projectUserProfileVersion &&
+        left.maxCompartmentSeq === right.maxCompartmentSeq &&
+        left.legacyCompartmentCount === right.legacyCompartmentCount &&
+        left.maxMemoryId === right.maxMemoryId &&
+        left.maxMutationId === right.maxMutationId &&
+        left.maxMemoryMutationId === right.maxMemoryMutationId &&
+        left.workspaceSignature === right.workspaceSignature &&
+        left.workspaceEpochSignature === right.workspaceEpochSignature &&
+        left.aliasSignature === right.aliasSignature
+    );
+}
+
+function readCurrentM0SnapshotMarkersUncached(args: M0SnapshotMarkerReadArgs): {
+    markers: M0SnapshotMarkers;
+    workspace: WorkspaceRenderContext;
+} {
     const projectDirectory = args.projectDirectory ?? args.projectPath ?? "";
     const hard = args.hardSignals ?? EMPTY_HARD_SIGNALS;
     const workspace = resolveWorkspaceRenderContext({
@@ -945,38 +1144,109 @@ export function readCurrentM0SnapshotMarkers(args: {
         workspaceIdentitySet: args.workspaceIdentitySet,
     });
     return {
-        projectMemoryEpoch: getProjectMemoryEpoch(args.db, args.projectPath),
-        workspaceFingerprint: workspace.isWorkspaced
-            ? computeWorkspaceEpochFingerprint(args.db, workspace.identities)
-            : null,
-        projectUserProfileVersion: getGlobalUserProfileVersion(args.db),
-        maxCompartmentSeq: getMaxCompartmentSeq(args.db, args.sessionId),
-        maxMemoryId: workspace.isWorkspaced
-            ? getMaxMemoryIdForProjects(
-                  args.db,
-                  workspace.expandedIdentities,
-                  workspace.ownIdentities,
-                  workspace.shareCategories,
-              )
-            : getMaxMemoryId(args.db, args.projectPath),
-        maxMutationId: getMaxM0MutationId(args.db, args.sessionId) ?? 0,
-        maxMemoryMutationId: workspace.isWorkspaced
-            ? (getMaxMemoryMutationIdForProjects(args.db, workspace.expandedIdentities) ?? 0)
-            : args.projectPath
-              ? (getMaxMemoryMutationId(args.db, args.projectPath) ?? 0)
-              : 0,
+        workspace,
+        markers: {
+            projectMemoryEpoch: getProjectMemoryEpoch(args.db, args.projectPath),
+            workspaceFingerprint: workspace.isWorkspaced
+                ? computeWorkspaceEpochFingerprint(args.db, workspace.identities)
+                : null,
+            projectUserProfileVersion: getGlobalUserProfileVersion(args.db),
+            maxCompartmentSeq: getMaxCompartmentSeq(args.db, args.sessionId),
+            maxMemoryId: workspace.isWorkspaced
+                ? getMaxMemoryIdForProjects(
+                      args.db,
+                      workspace.expandedIdentities,
+                      workspace.ownIdentities,
+                      workspace.shareCategories,
+                  )
+                : getMaxMemoryId(args.db, args.projectPath),
+            maxMutationId: getMaxM0MutationId(args.db, args.sessionId) ?? 0,
+            maxMemoryMutationId: workspace.isWorkspaced
+                ? (getMaxMemoryMutationIdForProjects(args.db, workspace.expandedIdentities) ?? 0)
+                : args.projectPath
+                  ? (getMaxMemoryMutationId(args.db, args.projectPath) ?? 0)
+                  : 0,
+            projectDocsHash:
+                projectDirectory && args.injectDocs !== false
+                    ? computeProjectDocsHash(projectDirectory)
+                    : "",
+            materializedAt: Date.now(),
+            sessionFactsVersion: getSessionFactsVersion(args.db, args.sessionId),
+            upgradeState: getUpgradeState(args.db, args.sessionId),
+            compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
+            systemHash: hard.systemHash,
+            modelKey: hard.modelKey,
+            projectIdentity: args.projectPath ?? null,
+        },
+    };
+}
+
+function refreshVolatileMarkerInputs(
+    markers: M0SnapshotMarkers,
+    args: M0SnapshotMarkerReadArgs,
+): M0SnapshotMarkers {
+    const projectDirectory = args.projectDirectory ?? args.projectPath ?? "";
+    const hard = args.hardSignals ?? EMPTY_HARD_SIGNALS;
+    return {
+        ...markers,
         projectDocsHash:
             projectDirectory && args.injectDocs !== false
                 ? computeProjectDocsHash(projectDirectory)
                 : "",
         materializedAt: Date.now(),
-        sessionFactsVersion: getSessionFactsVersion(args.db, args.sessionId),
-        upgradeState: getUpgradeState(args.db, args.sessionId),
-        compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
         systemHash: hard.systemHash,
         modelKey: hard.modelKey,
         projectIdentity: args.projectPath ?? null,
     };
+}
+
+/**
+ * Read the current marker set while keeping the steady-state decision to one query.
+ *
+ * Completeness is based on the values the full read observes, not writer heuristics:
+ * the probe reads project/global state, compartment sequence and legacy count,
+ * filtered memory and memory-mutation maxima, and the session m0-mutation maximum.
+ * Its workspace signatures include current membership, names, sharing policy,
+ * aliases, and every member epoch. Therefore historian publishes, all memory
+ * additions/mutations/classification changes, m0 mutations, epoch/profile bumps,
+ * membership transitions, alias writes, and legacy upgrades change at least one
+ * probe field. `sessionFactsVersion` is intentionally absent because its getter is
+ * pinned to zero and no longer renders; project docs retain their filesystem probe.
+ * A changed field falls through to the authoritative multi-read implementation.
+ */
+export function readCurrentM0SnapshotMarkers(args: M0SnapshotMarkerReadArgs): M0SnapshotMarkers {
+    const cache = getMarkerReadCache(args.db);
+    const cacheKey = markerReadCacheKey(args);
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        const probe = readMarkerChangeProbe(args, cached.workspace);
+        if (markerChangeProbeEquals(probe, cached.probe)) {
+            return refreshVolatileMarkerInputs(cached.markers, args);
+        }
+
+        const fresh = readCurrentM0SnapshotMarkersUncached(args);
+        const freshWorkspaceIdentity = workspaceIdentity(fresh.workspace);
+        const freshProbe =
+            freshWorkspaceIdentity === cached.workspaceIdentity
+                ? probe
+                : readMarkerChangeProbe(args, fresh.workspace);
+        cache.set(cacheKey, {
+            markers: fresh.markers,
+            probe: freshProbe,
+            workspace: fresh.workspace,
+            workspaceIdentity: freshWorkspaceIdentity,
+        });
+        return fresh.markers;
+    }
+
+    const fresh = readCurrentM0SnapshotMarkersUncached(args);
+    cache.set(cacheKey, {
+        markers: fresh.markers,
+        probe: readMarkerChangeProbe(args, fresh.workspace),
+        workspace: fresh.workspace,
+        workspaceIdentity: workspaceIdentity(fresh.workspace),
+    });
+    return fresh.markers;
 }
 
 function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null {
@@ -2312,7 +2582,7 @@ function prependM0M1Messages(
     m0Text: string,
     m1Text: string,
     mural?: { enabled: boolean; supportsVision: boolean; dataUrl?: string },
-): void {
+): number {
     // `syntheticHead` identifies the injected m0 and m1 message positions for
     // marker placement; `synthetic: true` marks their parts as injected context,
     // not real user turns.
@@ -2346,6 +2616,7 @@ function prependM0M1Messages(
             parts: [{ type: "text", text: m1Text, synthetic: true }],
         },
     );
+    return 2;
 }
 
 /**
@@ -2505,6 +2776,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
     }
     const skipped: InjectM0M1Result = {
         injected: false,
+        prependedMessageCount: 0,
         m0RematerializedThisPass: false,
         materializationContentionRetryExhausted: false,
         decision: { value: false, reason: "skipped" },
@@ -2675,6 +2947,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
         }
     }
 
+    let prependedMessageCount = 0;
     if (options.messages) {
         const muralForWire = options.state.cachedM0MuralDataUrl
             ? {
@@ -2684,11 +2957,18 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
                   contentHash: options.state.cachedM0MuralHash ?? undefined,
               }
             : undefined;
-        prependM0M1Messages(options.sessionId, options.messages, m0Text, m1Text, muralForWire);
+        prependedMessageCount = prependM0M1Messages(
+            options.sessionId,
+            options.messages,
+            m0Text,
+            m1Text,
+            muralForWire,
+        );
     }
 
     return {
         injected: true,
+        prependedMessageCount,
         m0RematerializedThisPass: rematerialized,
         materializationContentionRetryExhausted: contentionExhausted,
         decision,
