@@ -13,6 +13,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -25,6 +26,7 @@
         },
         "provider_executed": false,
         "byte_size": 100,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -38,6 +40,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -50,6 +53,7 @@
         },
         "provider_executed": false,
         "byte_size": 100,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -63,6 +67,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c3#0"
       },
       {
@@ -75,6 +80,7 @@
         },
         "provider_executed": false,
         "byte_size": 100,
+        "token_count": null,
         "arc_id": "c3#0"
       }
     ],
@@ -84,6 +90,7 @@
       "ceiling_tokens": 0,
       "protected_cutoff_ordinal": 0,
       "last_execute_ordinal": 0,
+      "scheduler_pressure_execute": true,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -109,6 +116,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -121,6 +129,7 @@
         },
         "provider_executed": false,
         "byte_size": 40,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -134,6 +143,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -146,6 +156,7 @@
         },
         "provider_executed": false,
         "byte_size": 40,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -159,6 +170,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c3#0"
       },
       {
@@ -171,6 +183,7 @@
         },
         "provider_executed": false,
         "byte_size": 40,
+        "token_count": null,
         "arc_id": "c3#0"
       },
       {
@@ -184,6 +197,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c4#0"
       },
       {
@@ -196,6 +210,7 @@
         },
         "provider_executed": false,
         "byte_size": 40,
+        "token_count": null,
         "arc_id": "c4#0"
       },
       {
@@ -209,6 +224,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c5#0"
       },
       {
@@ -221,6 +237,7 @@
         },
         "provider_executed": false,
         "byte_size": 40,
+        "token_count": null,
         "arc_id": "c5#0"
       },
       {
@@ -234,6 +251,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c6#0"
       },
       {
@@ -246,6 +264,7 @@
         },
         "provider_executed": false,
         "byte_size": 40,
+        "token_count": null,
         "arc_id": "c6#0"
       },
       {
@@ -259,6 +278,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c7#0"
       },
       {
@@ -271,6 +291,7 @@
         },
         "provider_executed": false,
         "byte_size": 40,
+        "token_count": null,
         "arc_id": "c7#0"
       }
     ],
@@ -280,6 +301,7 @@
       "ceiling_tokens": 0,
       "protected_cutoff_ordinal": 0,
       "last_execute_ordinal": 0,
+      "scheduler_pressure_execute": true,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -305,6 +327,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -317,6 +340,7 @@
         },
         "provider_executed": false,
         "byte_size": 30,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -330,6 +354,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -342,6 +367,7 @@
         },
         "provider_executed": false,
         "byte_size": 30,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -355,6 +381,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c3#0"
       },
       {
@@ -367,6 +394,7 @@
         },
         "provider_executed": false,
         "byte_size": 30,
+        "token_count": null,
         "arc_id": "c3#0"
       }
     ],
@@ -376,6 +404,7 @@
       "ceiling_tokens": 0,
       "protected_cutoff_ordinal": 0,
       "last_execute_ordinal": 0,
+      "scheduler_pressure_execute": true,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -403,6 +432,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -415,6 +445,7 @@
         },
         "provider_executed": false,
         "byte_size": 50,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -430,6 +461,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -442,6 +474,7 @@
         },
         "provider_executed": false,
         "byte_size": 50,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -458,6 +491,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c3#0"
       },
       {
@@ -470,6 +504,7 @@
         },
         "provider_executed": false,
         "byte_size": 50,
+        "token_count": null,
         "arc_id": "c3#0"
       }
     ],
@@ -479,6 +514,7 @@
       "ceiling_tokens": 0,
       "protected_cutoff_ordinal": 0,
       "last_execute_ordinal": 0,
+      "scheduler_pressure_execute": true,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -508,6 +544,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -520,6 +557,7 @@
         },
         "provider_executed": false,
         "byte_size": 500,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -537,6 +575,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -549,6 +588,7 @@
         },
         "provider_executed": false,
         "byte_size": 500,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -565,6 +605,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c3#0"
       },
       {
@@ -577,6 +618,7 @@
         },
         "provider_executed": false,
         "byte_size": 500,
+        "token_count": null,
         "arc_id": "c3#0"
       }
     ],
@@ -586,6 +628,7 @@
       "ceiling_tokens": 0,
       "protected_cutoff_ordinal": 0,
       "last_execute_ordinal": 0,
+      "scheduler_pressure_execute": true,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -613,6 +656,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -625,6 +669,7 @@
         },
         "provider_executed": false,
         "byte_size": 500,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -641,6 +686,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -653,6 +699,7 @@
         },
         "provider_executed": false,
         "byte_size": 500,
+        "token_count": null,
         "arc_id": "c2#0"
       }
     ],
@@ -662,6 +709,7 @@
       "ceiling_tokens": 0,
       "protected_cutoff_ordinal": 0,
       "last_execute_ordinal": 0,
+      "scheduler_pressure_execute": true,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -684,6 +732,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -696,6 +745,7 @@
         },
         "provider_executed": false,
         "byte_size": 200,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -709,6 +759,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -721,6 +772,7 @@
         },
         "provider_executed": false,
         "byte_size": 200,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -734,6 +786,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c3#0"
       },
       {
@@ -746,6 +799,7 @@
         },
         "provider_executed": false,
         "byte_size": 200,
+        "token_count": null,
         "arc_id": "c3#0"
       },
       {
@@ -759,6 +813,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c4#0"
       },
       {
@@ -771,6 +826,7 @@
         },
         "provider_executed": false,
         "byte_size": 200,
+        "token_count": null,
         "arc_id": "c4#0"
       },
       {
@@ -784,6 +840,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c5#0"
       },
       {
@@ -796,6 +853,7 @@
         },
         "provider_executed": false,
         "byte_size": 200,
+        "token_count": null,
         "arc_id": "c5#0"
       }
     ],
@@ -805,6 +863,7 @@
       "ceiling_tokens": 0,
       "protected_cutoff_ordinal": 0,
       "last_execute_ordinal": 3,
+      "scheduler_pressure_execute": true,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -815,6 +874,156 @@
       "c1#0": "drop",
       "c2#0": "drop",
       "c3#0": "drop"
+    }
+  },
+  {
+    "label": "two_pass: skip sub-floor arcs",
+    "items": [
+      {
+        "id": "c1#0",
+        "ordinal": 1,
+        "kind": {
+          "ToolCall": {
+            "name": "bash",
+            "input": {}
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 0,
+        "token_count": null,
+        "arc_id": "c1#0"
+      },
+      {
+        "id": "c1#1",
+        "ordinal": 1,
+        "kind": {
+          "ToolResult": {
+            "tool_name": "bash"
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 2000,
+        "token_count": 249,
+        "arc_id": "c1#0"
+      },
+      {
+        "id": "c2#0",
+        "ordinal": 2,
+        "kind": {
+          "ToolCall": {
+            "name": "read",
+            "input": {}
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 0,
+        "token_count": null,
+        "arc_id": "c2#0"
+      },
+      {
+        "id": "c2#1",
+        "ordinal": 2,
+        "kind": {
+          "ToolResult": {
+            "tool_name": "read"
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 2000,
+        "token_count": 250,
+        "arc_id": "c2#0"
+      }
+    ],
+    "ctx": {
+      "pass_class": "Execute",
+      "current_total_input_tokens": 0,
+      "ceiling_tokens": 0,
+      "protected_cutoff_ordinal": 0,
+      "last_execute_ordinal": 2,
+      "scheduler_pressure_execute": true,
+      "prior_input_sample": 0,
+      "has_prior_drop": false,
+      "agent_drop_ids": []
+    },
+    "smart_drops": false,
+    "frozen": [],
+    "expected": {
+      "c2#0": "drop"
+    }
+  },
+  {
+    "label": "two_pass: keep newest todowrite",
+    "items": [
+      {
+        "id": "c1#0",
+        "ordinal": 1,
+        "kind": {
+          "ToolCall": {
+            "name": "todowrite",
+            "input": {}
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 0,
+        "token_count": null,
+        "arc_id": "c1#0"
+      },
+      {
+        "id": "c1#1",
+        "ordinal": 1,
+        "kind": {
+          "ToolResult": {
+            "tool_name": "todowrite"
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 2000,
+        "token_count": 300,
+        "arc_id": "c1#0"
+      },
+      {
+        "id": "c2#0",
+        "ordinal": 2,
+        "kind": {
+          "ToolCall": {
+            "name": "todowrite",
+            "input": {}
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 0,
+        "token_count": null,
+        "arc_id": "c2#0"
+      },
+      {
+        "id": "c2#1",
+        "ordinal": 2,
+        "kind": {
+          "ToolResult": {
+            "tool_name": "todowrite"
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 2000,
+        "token_count": 300,
+        "arc_id": "c2#0"
+      }
+    ],
+    "ctx": {
+      "pass_class": "Execute",
+      "current_total_input_tokens": 0,
+      "ceiling_tokens": 0,
+      "protected_cutoff_ordinal": 0,
+      "last_execute_ordinal": 2,
+      "scheduler_pressure_execute": true,
+      "prior_input_sample": 0,
+      "has_prior_drop": false,
+      "agent_drop_ids": []
+    },
+    "smart_drops": false,
+    "frozen": [],
+    "expected": {
+      "c1#0": "drop"
     }
   },
   {
@@ -831,6 +1040,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -843,6 +1053,7 @@
         },
         "provider_executed": false,
         "byte_size": 40000,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -856,6 +1067,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -868,6 +1080,7 @@
         },
         "provider_executed": false,
         "byte_size": 40000,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -881,6 +1094,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c3#0"
       },
       {
@@ -893,6 +1107,7 @@
         },
         "provider_executed": false,
         "byte_size": 40000,
+        "token_count": null,
         "arc_id": "c3#0"
       },
       {
@@ -906,6 +1121,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c4#0"
       },
       {
@@ -918,6 +1134,7 @@
         },
         "provider_executed": false,
         "byte_size": 40000,
+        "token_count": null,
         "arc_id": "c4#0"
       }
     ],
@@ -927,6 +1144,7 @@
       "ceiling_tokens": 160000,
       "protected_cutoff_ordinal": 4,
       "last_execute_ordinal": 0,
+      "scheduler_pressure_execute": false,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -952,6 +1170,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -964,6 +1183,7 @@
         },
         "provider_executed": false,
         "byte_size": 80000,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -977,6 +1197,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -989,6 +1210,7 @@
         },
         "provider_executed": false,
         "byte_size": 80000,
+        "token_count": null,
         "arc_id": "c2#0"
       },
       {
@@ -1002,6 +1224,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c3#0"
       },
       {
@@ -1014,6 +1237,7 @@
         },
         "provider_executed": false,
         "byte_size": 80000,
+        "token_count": null,
         "arc_id": "c3#0"
       },
       {
@@ -1027,6 +1251,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c4#0"
       },
       {
@@ -1039,6 +1264,7 @@
         },
         "provider_executed": false,
         "byte_size": 80000,
+        "token_count": null,
         "arc_id": "c4#0"
       }
     ],
@@ -1048,6 +1274,7 @@
       "ceiling_tokens": 160000,
       "protected_cutoff_ordinal": 2,
       "last_execute_ordinal": 0,
+      "scheduler_pressure_execute": false,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -1073,6 +1300,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -1085,6 +1313,7 @@
         },
         "provider_executed": false,
         "byte_size": 80000,
+        "token_count": null,
         "arc_id": "c1#0"
       }
     ],
@@ -1094,6 +1323,7 @@
       "ceiling_tokens": 160000,
       "protected_cutoff_ordinal": 1,
       "last_execute_ordinal": 0,
+      "scheduler_pressure_execute": false,
       "prior_input_sample": 200000,
       "has_prior_drop": true,
       "agent_drop_ids": []
@@ -1116,6 +1346,7 @@
         },
         "provider_executed": false,
         "byte_size": 0,
+        "token_count": null,
         "arc_id": "c1#0"
       },
       {
@@ -1128,6 +1359,7 @@
         },
         "provider_executed": false,
         "byte_size": 8000,
+        "token_count": null,
         "arc_id": "c1#0"
       }
     ],
@@ -1137,6 +1369,7 @@
       "ceiling_tokens": 160000,
       "protected_cutoff_ordinal": 1,
       "last_execute_ordinal": 0,
+      "scheduler_pressure_execute": false,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
