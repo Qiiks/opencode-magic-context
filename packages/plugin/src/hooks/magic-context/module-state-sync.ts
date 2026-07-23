@@ -1489,6 +1489,17 @@ function responseMemoriesSkipped(response: unknown): boolean {
     return isRecord(value) && value.memories_skipped === true;
 }
 
+function isHistorianCompartmentSyncBusy(error: unknown): boolean {
+    let current = error;
+    const seen = new Set<unknown>();
+    while (isRecord(current) && !seen.has(current)) {
+        seen.add(current);
+        if (current.code === "historian_compartment_sync_busy") return true;
+        current = current.cause;
+    }
+    return false;
+}
+
 function readAuthoritySeqMismatch(error: unknown): number | null {
     let current = error;
     const seen = new Set<unknown>();
@@ -1593,6 +1604,12 @@ export async function syncModuleState(args: {
                 }
             }
         } catch (error) {
+            if (isHistorianCompartmentSyncBusy(error)) {
+                // The module rejected only compartment rows while its historian owns a
+                // firing snapshot. Leave sender state untouched so the next pass retries
+                // this same delta after the run reaches Idle; never promote it into a full seed.
+                return null;
+            }
             const durableSeq = args.options?.authority ? readAuthoritySeqMismatch(error) : null;
             if (durableSeq === null || adoption.used) throw error;
             adoption.used = true;

@@ -271,6 +271,33 @@ describe("module strip-state cold-start seed", () => {
     });
 });
 
+describe("historian compartment sync fence", () => {
+    it("keeps the same delta pending when the module asks for a retry", async () => {
+        const db = createContextDb();
+        const state = syncState();
+        let calls = 0;
+        const result = await syncModuleState({
+            client: {
+                async call() {
+                    calls += 1;
+                    throw Object.assign(new Error("historian owns the compartment snapshot"), {
+                        code: "historian_compartment_sync_busy",
+                    });
+                },
+            },
+            state,
+            pass: { db, sessionId: "sync-busy", nowMs: 1 },
+            projectRoot: "/tmp/project",
+            force: true,
+        });
+
+        expect(result).toBeNull();
+        expect(calls).toBe(1);
+        expect(state.lastAckedSeq).toBe(0);
+        expect(state.lastAckedWatermarks).toBeNull();
+    });
+});
+
 describe("module state external epochs", () => {
     it("carries dashboard project and profile epochs on the completed sync page", async () => {
         const db = createContextDb();

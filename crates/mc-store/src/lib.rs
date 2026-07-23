@@ -2323,6 +2323,11 @@ pub struct HistorianDurableState {
     /// same epoch it originally saw, not the session's current epoch.
     #[serde(default)]
     pub expected_revert_epoch: u64,
+    /// The compartment-set generation observed with the firing snapshot. Publication
+    /// rechecks it inside its transaction so an overlapping external sync cannot slip
+    /// between the producer's snapshot and the append.
+    #[serde(default)]
+    pub compartment_set_generation: CompartmentSetGeneration,
     #[serde(default)]
     pub failure_backoff_at_ms: Option<i64>,
     /// Human-readable detail of the most recent failed firing. The producer runs in a
@@ -2355,6 +2360,7 @@ impl Default for HistorianDurableState {
             producer_run_id: None,
             fired_at_ms: None,
             expected_revert_epoch: 0,
+            compartment_set_generation: CompartmentSetGeneration::default(),
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
@@ -2446,6 +2452,10 @@ pub struct HistorianPublishPredicate {
     pub producer_run_id: String,
     pub chunk_fingerprint: String,
     pub selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
+    /// Cheap generation of the complete compartment set captured when this firing
+    /// assembled its raw chunk. Count closes the sequence-reuse case that max alone
+    /// cannot distinguish.
+    pub compartment_set_generation: CompartmentSetGeneration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2467,12 +2477,20 @@ pub struct HistorianSideChannelStatus {
     pub last_failure: Option<String>,
 }
 
-/// Session data read atomically for historian assembly. The epoch must be snapped
-/// with the compartment set that determines the chunk.
+/// A cheap, snapshot-consistent identifier for the complete compartment set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompartmentSetGeneration {
+    pub max_sequence: i64,
+    pub count: i64,
+}
+
+/// Session data read atomically for historian assembly. The epoch and compartment
+/// generation must be snapped with the set that determines the chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistorianAssemblySnapshot {
     pub compartments: Vec<StoredCompartment>,
     pub revert_epoch: u64,
+    pub compartment_set_generation: CompartmentSetGeneration,
 }
 
 /// Result of a deterministic revert re-cut. The caller must use the returned
@@ -2518,6 +2536,14 @@ pub enum HistorianPublishError {
     FenceRejected {
         reason: String,
     },
+    /// An appended historian compartment intersects an already durable range. This
+    /// is a publish rejection rather than a SQLite failure so callers can abandon the
+    /// stale firing and leave the session immediately reusable.
+    CompartmentOverlap {
+        existing_sequence: i64,
+        incoming_start_message: i64,
+        incoming_end_message: i64,
+    },
     StateMismatch {
         expected: Box<HistorianPublishPredicate>,
         found: Box<HistorianDurableState>,
@@ -2535,6 +2561,14 @@ impl std::fmt::Display for HistorianPublishError {
             HistorianPublishError::FenceRejected { reason } => {
                 write!(f, "publication fence rejected: {reason}")
             }
+            HistorianPublishError::CompartmentOverlap {
+                existing_sequence,
+                incoming_start_message,
+                incoming_end_message,
+            } => write!(
+                f,
+                "historian compartment {incoming_start_message}..={incoming_end_message} overlaps existing sequence {existing_sequence}"
+            ),
             HistorianPublishError::CasConflict {
                 expected,
                 found,
@@ -3853,6 +3887,12 @@ pub enum McStoreError {
         id: i64,
         project: String,
     },
+    /// An append would overlap a durable compartment range for the same session.
+    CompartmentRangeOverlap {
+        existing_sequence: i64,
+        incoming_start_message: i64,
+        incoming_end_message: i64,
+    },
     /// A facade route bound to an authority-managed identity attempted to write
     /// using filesystem-path transport vocabulary instead of the domain identity.
     FacadeProjectVocabularyMismatch {
@@ -3903,6 +3943,14 @@ impl std::fmt::Display for McStoreError {
             McStoreError::NoteOwnershipMismatch { id, project } => {
                 write!(f, "note {id} is not owned by project {project}")
             }
+            McStoreError::CompartmentRangeOverlap {
+                existing_sequence,
+                incoming_start_message,
+                incoming_end_message,
+            } => write!(
+                f,
+                "compartment {incoming_start_message}..={incoming_end_message} overlaps existing sequence {existing_sequence}"
+            ),
             McStoreError::FacadeProjectVocabularyMismatch {
                 route_project_root,
                 authority_project,
@@ -4037,11 +4085,28 @@ enum AuthorityFinishDrainOutcome {
 
 enum PublishTxnOutcome {
     Committed(HistorianPublishResult),
-    CasConflict { found: u64, reason: Option<String> },
+    CasConflict {
+        found: u64,
+        reason: Option<String>,
+    },
     FenceRejected(String),
-    StateMismatch(HistorianDurableState),
+    CompartmentOverlap {
+        existing_sequence: i64,
+        incoming_start_message: i64,
+        incoming_end_message: i64,
+    },
+    StateMismatch(Box<HistorianDurableState>),
     InvalidState(String),
     Serde(String),
+}
+
+enum AppendCompartmentsTxnOutcome {
+    Appended,
+    Overlap {
+        existing_sequence: i64,
+        incoming_start_message: i64,
+        incoming_end_message: i64,
+    },
 }
 
 const HISTORIAN_SIDE_CHANNEL_KINDS: [&str; 3] = ["event", "primer", "user_observation"];
@@ -8265,25 +8330,37 @@ impl McStore {
         &self,
         session_id: &str,
     ) -> Result<HistorianAssemblySnapshot, McStoreError> {
-        let (meta_json, compartments) = self.inner.with_conn(|conn| {
-            let meta_json = conn
-                .query_row(
-                    "SELECT meta FROM mc_cache_state WHERE session_id = ?1",
-                    params![session_id],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()?;
-            let mut stmt = conn.prepare(
-                "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
+        let (meta_json, compartments, compartment_set_generation) =
+            self.inner.with_conn(|conn| {
+                let meta_json = conn
+                    .query_row(
+                        "SELECT meta FROM mc_cache_state WHERE session_id = ?1",
+                        params![session_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let mut stmt = conn.prepare(
+                    "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
                         start_date, end_date, title, content, p1, p2, p3, p4, importance,
                         episode_type, legacy, created_at
                  FROM mc_compartments WHERE session_id = ?1 ORDER BY sequence ASC",
-            )?;
-            let compartments = stmt
-                .query_map(params![session_id], Self::stored_compartment_from_row)?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((meta_json, compartments))
-        })?;
+                )?;
+                let compartments = stmt
+                    .query_map(params![session_id], Self::stored_compartment_from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let compartment_set_generation = conn.query_row(
+                    "SELECT COALESCE(MAX(sequence), 0), COUNT(*)
+                 FROM mc_compartments WHERE session_id = ?1",
+                    params![session_id],
+                    |row| {
+                        Ok(CompartmentSetGeneration {
+                            max_sequence: row.get(0)?,
+                            count: row.get(1)?,
+                        })
+                    },
+                )?;
+                Ok((meta_json, compartments, compartment_set_generation))
+            })?;
         let revert_epoch = match meta_json {
             Some(json) => {
                 serde_json::from_str::<ModuleMeta>(&json)
@@ -8295,6 +8372,7 @@ impl McStore {
         Ok(HistorianAssemblySnapshot {
             compartments,
             revert_epoch,
+            compartment_set_generation,
         })
     }
 
@@ -8709,11 +8787,21 @@ impl McStore {
         session_id: &str,
         compartments: &[StoredCompartment],
     ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|tx| {
-            append_compartments_tx(tx, session_id, compartments)?;
-            Ok(())
-        })?;
-        Ok(())
+        let outcome = self
+            .inner
+            .with_conn_fenced(|tx| append_compartments_tx(tx, session_id, compartments))?;
+        match outcome {
+            AppendCompartmentsTxnOutcome::Appended => Ok(()),
+            AppendCompartmentsTxnOutcome::Overlap {
+                existing_sequence,
+                incoming_start_message,
+                incoming_end_message,
+            } => Err(McStoreError::CompartmentRangeOverlap {
+                existing_sequence,
+                incoming_start_message,
+                incoming_end_message,
+            }),
+        }
     }
 
     /// Promote validated historian facts into project memories using exact-content
@@ -9213,7 +9301,8 @@ impl McStore {
             let predicate_matches = historian.firing_seq == predicate.firing_seq
                 && historian.producer_run_id.as_deref() == Some(predicate.producer_run_id.as_str())
                 && historian.chunk_fingerprint == predicate.chunk_fingerprint
-                && historian.selected_range_identities == predicate.selected_range_identities;
+                && historian.selected_range_identities == predicate.selected_range_identities
+                && historian.compartment_set_generation == predicate.compartment_set_generation;
             if !predicate_matches || historian.state == HistorianPhase::Idle {
                 return Ok(AbandonHistorianTxnOutcome::Unchanged);
             }
@@ -9290,7 +9379,8 @@ impl McStore {
             let predicate_matches = historian.firing_seq == predicate.firing_seq
                 && historian.producer_run_id.as_deref() == Some(predicate.producer_run_id.as_str())
                 && historian.chunk_fingerprint == predicate.chunk_fingerprint
-                && historian.selected_range_identities == predicate.selected_range_identities;
+                && historian.selected_range_identities == predicate.selected_range_identities
+                && historian.compartment_set_generation == predicate.compartment_set_generation;
             if !predicate_matches {
                 return Ok(AbandonHistorianTxnOutcome::Unchanged);
             }
@@ -9373,9 +9463,11 @@ impl McStore {
                 && meta.historian.producer_run_id.as_deref()
                     == Some(predicate.producer_run_id.as_str())
                 && meta.historian.chunk_fingerprint == predicate.chunk_fingerprint
-                && meta.historian.selected_range_identities == predicate.selected_range_identities;
+                && meta.historian.selected_range_identities == predicate.selected_range_identities
+                && meta.historian.compartment_set_generation
+                    == predicate.compartment_set_generation;
             if !predicate_matches {
-                return Ok(PublishTxnOutcome::StateMismatch(meta.historian));
+                return Ok(PublishTxnOutcome::StateMismatch(Box::new(meta.historian)));
             }
 
             // `chunk_fingerprint` remains a readable structural diagnostic; exact
@@ -9405,8 +9497,42 @@ impl McStore {
                 });
             }
 
+            let current_compartment_set_generation = tx.query_row(
+                "SELECT COALESCE(MAX(sequence), 0), COUNT(*)
+                 FROM mc_compartments WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(CompartmentSetGeneration {
+                        max_sequence: row.get(0)?,
+                        count: row.get(1)?,
+                    })
+                },
+            )?;
+            if current_compartment_set_generation != predicate.compartment_set_generation {
+                return Ok(PublishTxnOutcome::FenceRejected(format!(
+                    "compartment set changed after firing (expected max sequence {} with {} rows, found {} with {} rows)",
+                    predicate.compartment_set_generation.max_sequence,
+                    predicate.compartment_set_generation.count,
+                    current_compartment_set_generation.max_sequence,
+                    current_compartment_set_generation.count,
+                )));
+            }
+
             let first_appended_sequence = next_compartment_sequence_tx(tx, session_id)?;
-            append_compartments_tx(tx, session_id, request.compartments)?;
+            match append_compartments_tx(tx, session_id, request.compartments)? {
+                AppendCompartmentsTxnOutcome::Appended => {}
+                AppendCompartmentsTxnOutcome::Overlap {
+                    existing_sequence,
+                    incoming_start_message,
+                    incoming_end_message,
+                } => {
+                    return Ok(PublishTxnOutcome::CompartmentOverlap {
+                        existing_sequence,
+                        incoming_start_message,
+                        incoming_end_message,
+                    });
+                }
+            }
             if let Some(transcript) = request.chunk_transcript {
                 insert_chunk_transcripts_tx(
                     tx,
@@ -9468,9 +9594,18 @@ impl McStore {
             PublishTxnOutcome::FenceRejected(reason) => {
                 Err(HistorianPublishError::FenceRejected { reason })
             }
+            PublishTxnOutcome::CompartmentOverlap {
+                existing_sequence,
+                incoming_start_message,
+                incoming_end_message,
+            } => Err(HistorianPublishError::CompartmentOverlap {
+                existing_sequence,
+                incoming_start_message,
+                incoming_end_message,
+            }),
             PublishTxnOutcome::StateMismatch(found) => Err(HistorianPublishError::StateMismatch {
                 expected: Box::new(predicate.clone()),
-                found: Box::new(found),
+                found,
             }),
             PublishTxnOutcome::InvalidState(state) => {
                 Err(HistorianPublishError::InvalidState { state })
@@ -13135,15 +13270,51 @@ fn append_compartments_tx(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
     compartments: &[StoredCompartment],
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<AppendCompartmentsTxnOutcome> {
     if compartments.is_empty() {
-        return Ok(());
+        return Ok(AppendCompartmentsTxnOutcome::Appended);
     }
-    let tail = next_compartment_sequence_tx(tx, session_id)? - 1;
-    for (idx, compartment) in compartments.iter().enumerate() {
-        insert_compartment_tx(tx, session_id, tail + idx as i64 + 1, compartment)?;
+
+    let next_sequence = next_compartment_sequence_tx(tx, session_id)?;
+    let mut statement = tx.prepare(
+        "SELECT sequence, start_message, end_message
+         FROM mc_compartments WHERE session_id = ?1",
+    )?;
+    let mut ranges = statement
+        .query_map(params![session_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    // Validate the whole append before writing its first row. This keeps a rejected
+    // batch atomic and makes ordinal-overlap corruption impossible even if a caller
+    // bypassed the historian's optimistic publish fence.
+    for (index, compartment) in compartments.iter().enumerate() {
+        if let Some((existing_sequence, _, _)) = ranges.iter().find(|(_, start, end)| {
+            compartment.start_message <= *end && *start <= compartment.end_message
+        }) {
+            return Ok(AppendCompartmentsTxnOutcome::Overlap {
+                existing_sequence: *existing_sequence,
+                incoming_start_message: compartment.start_message,
+                incoming_end_message: compartment.end_message,
+            });
+        }
+        ranges.push((
+            next_sequence + index as i64,
+            compartment.start_message,
+            compartment.end_message,
+        ));
     }
-    Ok(())
+
+    for (index, compartment) in compartments.iter().enumerate() {
+        insert_compartment_tx(tx, session_id, next_sequence + index as i64, compartment)?;
+    }
+    Ok(AppendCompartmentsTxnOutcome::Appended)
 }
 
 fn next_compartment_sequence_tx(
@@ -16810,6 +16981,49 @@ mod tests {
     }
 
     #[test]
+    fn append_compartments_rejects_overlapping_ranges_without_partial_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let compartment = |sequence: i64,
+                           start_message: i64,
+                           end_message: i64,
+                           end_message_id: &str| StoredCompartment {
+            sequence,
+            start_message,
+            end_message,
+            end_message_id: end_message_id.to_string(),
+            title: "summary".to_string(),
+            content: "summary".to_string(),
+            ..Default::default()
+        };
+        store
+            .replace_compartments("ses", &[compartment(1, 1, 5, "m5")])
+            .unwrap();
+
+        let error = store
+            .append_compartments("ses", &[compartment(99, 5, 8, "m8")])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            McStoreError::CompartmentRangeOverlap {
+                existing_sequence: 1,
+                incoming_start_message: 5,
+                incoming_end_message: 8,
+            }
+        ));
+        let rows = store.load_compartments("ses").unwrap();
+        assert_eq!(rows.len(), 1, "a rejected append must stay atomic");
+        assert_eq!(rows[0].sequence, 1);
+
+        store
+            .append_compartments("ses", &[compartment(99, 6, 8, "m8")])
+            .unwrap();
+        let rows = store.load_compartments("ses").unwrap();
+        assert_eq!(rows.len(), 2, "a disjoint append must remain legal");
+        assert_eq!(rows[1].sequence, 2, "append still owns durable numbering");
+    }
+
+    #[test]
     fn promote_facts_exact_dedup_skips_duplicates_and_advances_watermark() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
@@ -16883,6 +17097,7 @@ mod tests {
                 producer_run_id: Some("run-1".into()),
                 fired_at_ms: Some(123),
                 expected_revert_epoch: 0,
+                compartment_set_generation: CompartmentSetGeneration::default(),
                 failure_backoff_at_ms: Some(456),
                 last_failure: None,
                 last_no_fire: None,
@@ -16940,6 +17155,7 @@ mod tests {
             producer_run_id: "run-1".into(),
             chunk_fingerprint: "fp".into(),
             selected_range_identities: selected_range_identities(),
+            compartment_set_generation: CompartmentSetGeneration::default(),
         }
     }
 
@@ -17107,6 +17323,55 @@ mod tests {
         assert_eq!(loaded.meta.historian.firing_seq, 7);
         assert_eq!(loaded.meta.publication_floor_ordinal, Some(21));
         assert_eq!(store.max_memory_id(&["git:proj".to_string()]).unwrap(), 1);
+    }
+
+    #[test]
+    fn publish_historian_chunk_rejects_overlapping_compartment_as_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let mut existing = publish_compartment();
+        existing.sequence = 1;
+        store.replace_compartments("ses", &[existing]).unwrap();
+        let mut meta = publishing_meta();
+        meta.historian.compartment_set_generation = CompartmentSetGeneration {
+            max_sequence: 1,
+            count: 1,
+        };
+        store
+            .commit("ses", None, &CoreState::default(), &meta)
+            .unwrap();
+        let expected = store.load("ses").unwrap().row_version;
+        let predicate = HistorianPublishPredicate {
+            compartment_set_generation: meta.historian.compartment_set_generation,
+            ..publish_predicate()
+        };
+
+        let error = store
+            .publish_historian_chunk(HistorianPublishRequest {
+                session_id: "ses",
+                expected_row_version: expected,
+                expected_revert_epoch: 0,
+                predicate: &predicate,
+                project_path: "git:proj",
+                compartments: &[publish_compartment()],
+                facts: &[],
+                promote_facts: false,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
+                publication_floor_ordinal: 21,
+                chunk_transcript: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HistorianPublishError::CompartmentOverlap {
+                existing_sequence: 1,
+                incoming_start_message: 10,
+                incoming_end_message: 20,
+            }
+        ));
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
     }
 
     #[test]
@@ -17439,16 +17704,25 @@ mod tests {
             compress_transcript(&oversized).unwrap().len() < MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES
         );
         let loaded = store.load("ses").unwrap();
+        let mut replay_meta = publishing_meta();
+        replay_meta.historian.compartment_set_generation = CompartmentSetGeneration {
+            max_sequence: 8,
+            count: 8,
+        };
         store
-            .commit("ses", loaded.row_version, &loaded.core, &publishing_meta())
+            .commit("ses", loaded.row_version, &loaded.core, &replay_meta)
             .unwrap();
         let expected = store.load("ses").unwrap().row_version;
+        let replay_predicate = HistorianPublishPredicate {
+            compartment_set_generation: replay_meta.historian.compartment_set_generation,
+            ..publish_predicate()
+        };
         store
             .publish_historian_chunk(HistorianPublishRequest {
                 session_id: "ses",
                 expected_row_version: expected,
                 expected_revert_epoch: 0,
-                predicate: &publish_predicate(),
+                predicate: &replay_predicate,
                 project_path: "git:proj",
                 compartments: &[StoredCompartment {
                     start_message: 100,
