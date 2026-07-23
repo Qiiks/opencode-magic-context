@@ -282,6 +282,7 @@ const MAX_ACTIVE_SNAPSHOT_LEASES: usize = 8;
 /// failing sessions would otherwise accumulate for the process lifetime.
 const MAX_IN_FLIGHT_SNAPSHOT_ENTRIES: usize = 4_096;
 const WRAPUP_REQUEST_MARGIN: Duration = Duration::from_secs(5);
+const HISTORIAN_SIDE_CHANNEL_DRAIN_PER_KIND: usize = 32;
 
 #[derive(Debug, Deserialize)]
 struct ModuleStateSyncWire {
@@ -5350,13 +5351,34 @@ impl McHandler {
                 }
             }
         };
+        let side_channel_status = match store.historian_side_channel_status(session_id) {
+            Ok(status) => status,
+            Err(e) => {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: e.to_string(),
+                }
+            }
+        };
+        let mut historian = json!(&loaded.meta.historian);
+        let historian_fields = historian
+            .as_object_mut()
+            .expect("historian status serializes as an object");
+        historian_fields.insert(
+            "side_channel_pending_count".to_string(),
+            json!(side_channel_status.pending_count),
+        );
+        historian_fields.insert(
+            "side_channel_last_failure".to_string(),
+            json!(side_channel_status.last_failure),
+        );
         respond(json!({
             "ok": true,
             "store_open": true,
             "session_id": session_id,
             "initialized": loaded.meta.initialized,
             "row_version": loaded.row_version,
-            "historian": loaded.meta.historian,
+            "historian": historian,
             "publication_floor_ordinal": loaded.meta.publication_floor_ordinal,
             "tail_identity_re_adopt_count": loaded.meta.tail_identity_re_adopt_count,
             "pass_trace": pass_trace,
@@ -5521,6 +5543,13 @@ impl McHandler {
                 }
             };
         let pass_now = now_ms();
+        // A previous publish may have committed while one independent side channel failed.
+        // Retry on normal traffic rather than creating another background timer.
+        let _ = store.drain_historian_side_channels(
+            &parsed.session_id,
+            pass_now,
+            HISTORIAN_SIDE_CHANNEL_DRAIN_PER_KIND,
+        );
         // This trace is intentionally outside the fenced cache-state commit: a rejected
         // pass must still leave a durable breadcrumb, and a trace failure must never
         // change the transform result.
@@ -17856,6 +17885,63 @@ mod tests {
                 .failure_backoff_at_ms
                 .is_some_and(|backoff_at_ms| backoff_at_ms > now_ms()),
             "the cooldown remains active until the backoff boundary"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_diagnostics_surface_pending_historian_side_channel_failure() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        seed_historian_phase(&store, HistorianPhase::Publishing);
+        store.fail_next_historian_side_channel_for_test("event");
+        let loaded = store.load("ses").unwrap();
+        let event = mc_store::HistorianEventCandidate {
+            kind: "trajectory_correction".to_string(),
+            fields_json: "{}".to_string(),
+            ..Default::default()
+        };
+        store
+            .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                session_id: "ses",
+                expected_row_version: loaded.row_version,
+                expected_revert_epoch: 0,
+                predicate: &mc_store::HistorianPublishPredicate {
+                    firing_seq: 1,
+                    producer_run_id: "run-stale".to_string(),
+                    chunk_fingerprint: "seeded-fingerprint".to_string(),
+                },
+                project_path: "git:proj",
+                compartments: &[stored_comp(1, 10, 20, "m20", "summary")],
+                facts: &[],
+                promote_facts: false,
+                events: std::slice::from_ref(&event),
+                primer_candidates: &[],
+                user_memory_candidates: &[],
+                publication_floor_ordinal: 21,
+                chunk_transcript: None,
+            })
+            .unwrap();
+
+        let status =
+            call_dispatch_request(&handler, json!({ "kind": "status", "session_id": "ses" })).await;
+        assert_eq!(status["historian"]["side_channel_pending_count"], 1);
+        assert!(status["historian"]["side_channel_last_failure"]
+            .as_str()
+            .is_some_and(|error| error.contains("event")));
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let _ = call_transform(
+            &handler,
+            vec![ck("m21", 21, "follow up"), ck("m22", 22, "small reply")],
+        )
+        .await;
+        assert_eq!(store.load_compartment_events("ses").unwrap().len(), 1);
+        let recovered =
+            call_dispatch_request(&handler, json!({ "kind": "status", "session_id": "ses" })).await;
+        assert_eq!(recovered["historian"]["side_channel_pending_count"], 0);
+        assert_eq!(
+            recovered["historian"]["side_channel_last_failure"],
+            Value::Null
         );
     }
 
