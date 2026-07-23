@@ -13,11 +13,11 @@
 //!    defer replays the frozen m1 verbatim; re-composing from the now-possibly-mutated store
 //!    on a defer would change bytes on a defer, violating the deferred-work invariant).
 
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
-use mc_store::{McStore, McStoreError, ModuleMeta, NoteDelivery, StoredNote};
+use mc_store::{McStore, McStoreError, ModuleMeta, NoteDelivery, StoredMemory, StoredNote};
 
 use crate::compartment_coverage::{partition_by_folded_seq, resolve_coverage, CoverageGap};
 use crate::decay_render::DecayRenderCompartment;
@@ -26,6 +26,8 @@ use crate::memory_render::{
     assemble_m1, render_memory_block, render_memory_updates, render_new_compartments,
     render_user_profile_block, workspace_source_names, M1_PLACEHOLDER,
 };
+
+const MAX_MERGE_REPLACEMENTS_PER_DELTA: usize = 10;
 
 /// Why composing the SOFT m1 from the store failed.
 #[derive(Debug)]
@@ -330,30 +332,64 @@ pub fn compose_m1_from_store(
         meta.memory_mutation_cursor,
         &meta.rendered_memory_ids,
     )?;
-    let rendered_ids: std::collections::HashSet<i64> =
-        meta.rendered_memory_ids.iter().copied().collect();
-    let memory_updates_block = render_memory_updates(&mutations, &rendered_ids);
+    let baseline_ids: HashSet<i64> = meta.rendered_memory_ids.iter().copied().collect();
 
-    // --- new-memories (id past the folded max) ---
-    let new_memories = load_new_memories(
-        store,
-        membership.as_ref(),
-        &paths,
-        meta.max_memory_id,
-        now_ms,
-    )?;
+    // Read the render-eligible pool through the exact same project/workspace visibility,
+    // lifecycle, and frozen-expiry predicate as m0. A merge replacement may predate the
+    // folded max-memory watermark, so the ordinary new-memory lane cannot discover it.
+    let eligible_memories =
+        load_render_eligible_memories(store, membership.as_ref(), project_path, now_ms)?;
+    let eligible_ids: HashSet<i64> = eligible_memories.iter().map(|memory| memory.id).collect();
+    let mut replacement_ids = mutations
+        .iter()
+        .filter(|mutation| mutation.mutation_type == "superseded")
+        .filter_map(|mutation| mutation.superseded_by_id)
+        .filter(|id| !baseline_ids.contains(id) && eligible_ids.contains(id))
+        .collect::<Vec<_>>();
+    replacement_ids.sort_unstable();
+    replacement_ids.dedup();
+    if replacement_ids.len() > MAX_MERGE_REPLACEMENTS_PER_DELTA {
+        eprintln!(
+            "mc-module: m1 merge replacement cap exceeded session={} replacements={} cap={}",
+            session_id,
+            replacement_ids.len(),
+            MAX_MERGE_REPLACEMENTS_PER_DELTA
+        );
+        replacement_ids.truncate(MAX_MERGE_REPLACEMENTS_PER_DELTA);
+    }
+    let replacement_ids: HashSet<i64> = replacement_ids.into_iter().collect();
+
+    // Additive memories keep the 25% sub-budget. Merge replacements are corrections to
+    // baseline facts and ride outside that trim, so a rendered source cannot become a
+    // removal-only delta merely because its existing target was budget-trimmed from m0.
+    let additive_candidates = eligible_memories
+        .iter()
+        .filter(|memory| memory.id > meta.max_memory_id)
+        .filter(|memory| !replacement_ids.contains(&memory.id))
+        .cloned()
+        .collect();
     let source_name_by_id = membership
         .as_ref()
-        .map(|workspace| workspace_source_names(&new_memories, workspace))
+        .map(|workspace| workspace_source_names(&eligible_memories, workspace))
         .unwrap_or_default();
-    let new_memories = trim_memories_to_budget(
-        new_memories,
+    let mut delta_memories = trim_memories_to_budget(
+        additive_candidates,
         None,
         &source_name_by_id,
         (memory_budget_tokens.max(1.0) * 0.25).floor().max(1.0),
         estimate_tokens,
     );
-    let new_memories_block = render_memory_block(&new_memories, "new-memories", &source_name_by_id);
+    delta_memories.extend(
+        eligible_memories
+            .into_iter()
+            .filter(|memory| replacement_ids.contains(&memory.id)),
+    );
+
+    let mut resolvable_ids = baseline_ids;
+    resolvable_ids.extend(delta_memories.iter().map(|memory| memory.id));
+    let memory_updates_block = render_memory_updates(&mutations, &resolvable_ids);
+    let new_memories_block =
+        render_memory_block(&delta_memories, "new-memories", &source_name_by_id);
 
     // Profile rows and their version arrive together through state sync. Render the block only
     // after a version change, and leave the applied version behind when trimming leaves no body
@@ -409,28 +445,19 @@ pub fn compose_m1_from_store(
     })
 }
 
-/// Active memories with `id > after_id` for the calling project (or the workspace union
-/// when `membership` is Some). This loader sorts by importance then id; the compact
-/// `<new-memories>` renderer canonicalizes the final category-grouped wire order.
-/// Filters the active pool in memory — the new set is a small tail and this runs
-/// only on a bust. `membership` is the ALREADY-RESOLVED membership for the CALLING project
-/// (so own-vs-foreign visibility keys off the right own_identity); `paths[0]` is the
-/// single project when there is no membership.
-fn load_new_memories(
+/// Load the full render-eligible memory pool through m0's established predicates. The caller
+/// partitions this one snapshot into additive memories and merge-replacement corrections.
+/// `membership` is resolved from the calling project, so own-vs-foreign visibility cannot drift
+/// to whichever workspace member happens to sort first.
+fn load_render_eligible_memories(
     store: &McStore,
     membership: Option<&mc_store::WorkspaceMembership>,
-    paths: &[String],
-    after_id: i64,
+    project_path: &str,
     now_ms: i64,
-) -> Result<Vec<mc_store::StoredMemory>, McStoreError> {
-    let all = match membership {
-        // union: own (full visibility) + foreign (shared categories only), keyed off the
-        // membership's own_identity = the calling project. A new own memory in a non-shared
-        // category is still visible (it's own); a new foreign one follows the share policy.
-        Some(m) => store.load_workspace_union_memories(m, now_ms)?,
-        None => store.load_active_memories(&paths[0], now_ms)?,
-    };
-    Ok(all.into_iter().filter(|m| m.id > after_id).collect())
+) -> Result<Vec<StoredMemory>, McStoreError> {
+    Ok(store
+        .load_memory_render_snapshot(project_path, membership, now_ms)?
+        .memories)
 }
 
 #[cfg(test)]
@@ -689,6 +716,186 @@ mod tests {
                 "memory-only mutations do not extend coverage"
             );
         }
+    }
+
+    #[test]
+    fn merge_replacement_omitted_from_m0_renders_with_lineage_and_one_revision_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:proj";
+        store
+            .replace_compartments("ses", &[comp(1, 1, 10, "m10")])
+            .unwrap();
+        let source = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "source fact", 1))
+            .unwrap();
+        let target = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "trimmed target", 1))
+            .unwrap();
+        let folded_max = store.max_memory_id(&[project.to_string()]).unwrap();
+        let folded_cursor = store
+            .max_memory_mutation_id(&[project.to_string()])
+            .unwrap();
+        let before = m1_revision_signal(&store, project, "ses").unwrap();
+
+        store
+            .merge_memories(project, target, &[source], "merged correction", 2)
+            .unwrap();
+
+        let after = m1_revision_signal(&store, project, "ses").unwrap();
+        assert_ne!(before, after, "the atomic merge must move the m1 revision");
+        assert_eq!(
+            after,
+            m1_revision_signal(&store, project, "ses").unwrap(),
+            "the merge moves the revision once rather than creating a live render input"
+        );
+        let meta = meta_after_hard(1, Some(10), folded_max, folded_cursor, vec![source]);
+        let first = compose_m1_from_store(
+            &store,
+            project,
+            project,
+            "ses",
+            &meta,
+            0,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+        let replay = compose_m1_from_store(
+            &store,
+            project,
+            project,
+            "ses",
+            &meta,
+            0,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+
+        assert!(
+            first
+                .body
+                .contains(&format!("<superseded id=\"{source}\" by=\"{target}\"/>")),
+            "{}",
+            first.body
+        );
+        assert!(first.body.contains("merged correction"), "{}", first.body);
+        assert!(
+            !first.body.contains(&format!("<removed id=\"{source}\"/>")),
+            "{}",
+            first.body
+        );
+        assert_eq!(
+            first.body, replay.body,
+            "the frozen-cutoff compose is deterministic"
+        );
+    }
+
+    #[test]
+    fn merge_replacement_newer_than_folded_max_is_deduplicated_from_additions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:proj";
+        let source = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "source fact", 1))
+            .unwrap();
+        let folded_cursor = store
+            .max_memory_mutation_id(&[project.to_string()])
+            .unwrap();
+        let target = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "new target", 2))
+            .unwrap();
+        store
+            .merge_memories(project, target, &[source], "deduplicated correction", 3)
+            .unwrap();
+
+        let meta = meta_after_hard(0, None, source, folded_cursor, vec![source]);
+        let m1 = compose_m1_from_store(
+            &store,
+            project,
+            project,
+            "ses",
+            &meta,
+            0,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+        assert_eq!(
+            m1.body.matches("deduplicated correction").count(),
+            1,
+            "a replacement that is also newer than the watermark must render once: {}",
+            m1.body
+        );
+        assert!(
+            m1.body
+                .contains(&format!("<superseded id=\"{source}\" by=\"{target}\"/>")),
+            "{}",
+            m1.body
+        );
+    }
+
+    #[test]
+    fn workspace_merge_replacement_uses_calling_projects_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let foreign = "git:aaa-foreign";
+        let own = "git:zzz-own";
+        store
+            .seed_workspace_member("ws", foreign, "[\"CONSTRAINTS\"]")
+            .unwrap();
+        store
+            .seed_workspace_member("ws", own, "[\"CONSTRAINTS\"]")
+            .unwrap();
+        store
+            .replace_compartments("ses", &[comp(1, 1, 10, "m10")])
+            .unwrap();
+        let source = store
+            .insert_memory(insert_input(own, "ARCHITECTURE", "own source", 1))
+            .unwrap();
+        let target = store
+            .insert_memory(insert_input(own, "ARCHITECTURE", "own trimmed target", 1))
+            .unwrap();
+        let paths = vec![foreign.to_string(), own.to_string()];
+        let folded_max = store.max_memory_id(&paths).unwrap();
+        let folded_cursor = store.max_memory_mutation_id(&paths).unwrap();
+
+        store
+            .merge_memories(own, target, &[source], "own workspace correction", 2)
+            .unwrap();
+
+        let meta = meta_after_hard(1, Some(10), folded_max, folded_cursor, vec![source]);
+        let m1 = compose_m1_from_store(
+            &store,
+            own,
+            own,
+            "ses",
+            &meta,
+            0,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+        assert!(m1.body.contains("own workspace correction"), "{}", m1.body);
+        assert!(
+            m1.body
+                .contains(&format!("<superseded id=\"{source}\" by=\"{target}\"/>")),
+            "{}",
+            m1.body
+        );
     }
 
     #[test]

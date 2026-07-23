@@ -13989,6 +13989,74 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn facade_merge_renders_a_budget_trimmed_target_then_defer_replays_bytes() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let project = project.to_str().unwrap();
+        store
+            .replace_compartments("ses", &[stored_comp(1, 0, 0, "m0", "initial summary")])
+            .unwrap();
+        let source = insert_memory(&store, project, "CONSTRAINTS", "source fact", 1);
+        let target = insert_memory(
+            &store,
+            project,
+            "CONSTRAINTS",
+            &format!("trimmed target {}", "large ".repeat(20_000)),
+            1,
+        );
+        let request = request(vec![ck("m0", 0, "live input")]);
+        let initial = call_transform_request(&handler, request.clone()).await;
+        assert_eq!(initial["action"], "HARD");
+        assert_eq!(
+            store.load("ses").unwrap().meta.rendered_memory_ids,
+            vec![source]
+        );
+        let revision_before =
+            crate::m1_compose::m1_revision_signal(&store, project, "ses").unwrap();
+
+        let merge = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({"action": "merge", "ids": [target, source], "content": "merged correction"}),
+        )
+        .await;
+        assert!(!tool_is_error(merge));
+        let revision_after = crate::m1_compose::m1_revision_signal(&store, project, "ses").unwrap();
+        assert_ne!(revision_before, revision_after);
+        assert_eq!(
+            revision_after,
+            crate::m1_compose::m1_revision_signal(&store, project, "ses").unwrap(),
+            "the merge's atomic mutation rows move the existing revision input once"
+        );
+
+        let transition = call_transform_request(&handler, request.clone()).await;
+        assert_eq!(transition["action"], "SOFT");
+        let transition_m1 = transition["ck_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["meta"]["synthetic"] == json!(true))
+            .nth(1)
+            .and_then(|message| message["content"][0]["kind"]["text"].as_str())
+            .unwrap();
+        assert!(
+            transition_m1.contains("merged correction"),
+            "{transition_m1}"
+        );
+        assert!(
+            transition_m1.contains(&format!("<superseded id=\"{source}\" by=\"{target}\"/>")),
+            "{transition_m1}"
+        );
+        let stable = call_transform_request(&handler, request).await;
+        assert_eq!(stable["action"], "SOFT+");
+        assert_eq!(transition["ck_messages"], stable["ck_messages"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn authority_activation_moves_render_reads_once_through_the_m1_revision() {
         let (handler, store, _dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
