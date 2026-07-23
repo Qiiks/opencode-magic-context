@@ -82,6 +82,7 @@ import {
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
+import { getSourceContents } from "@magic-context/core/features/magic-context/storage-source";
 import {
 	clearDeferredExecutePendingIfMatches,
 	clearDetectedContextLimit,
@@ -154,10 +155,14 @@ import {
 	advanceToolReclaimWatermarkToCurrentMax,
 	buildSyntheticToolReclaimOps,
 } from "@magic-context/core/hooks/magic-context/tool-reclaim";
+import { stripTagPrefix } from "@magic-context/core/hooks/magic-context/tag-content-primitives";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
-import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
+import {
+	tagTranscript,
+	TEXT_TAG_IDENTITY_MARKER,
+} from "@magic-context/core/shared/tag-transcript";
 import {
 	clearAutoSearchForPiSession,
 	runAutoSearchHintForPi,
@@ -284,6 +289,7 @@ export const __test = {
 		return new Set(taggedStableMessageIdsBySession.get(sessionId));
 	},
 	recordSuccessfulTaggedMessageIds,
+	buildPiTextIdentityPlan,
 	setInFlightHistorianForTests(
 		sessionId: string,
 		promise: Promise<unknown>,
@@ -436,6 +442,95 @@ const piTagToolTokenCacheBySession = new Map<
 	string,
 	Map<string, { text: string; tokenCount: number }>
 >();
+const piTextIdentitySourceCacheBySession = new Map<string, Map<number, string>>();
+
+interface PiTextIdentityPlan {
+	driftedMessageIds: Set<string>;
+	reusableMessageIds: Set<string>;
+	sourceCache: Map<number, string>;
+}
+
+function buildPiTextIdentityPlan(
+	db: ContextDatabase,
+	sessionId: string,
+	tagger: Tagger,
+	transcript: ReturnType<typeof createPiTranscript>,
+	reuseCandidates: ReadonlySet<string> = new Set(),
+): PiTextIdentityPlan {
+	const currentSourcesByMessageId = new Map<string, string[]>();
+	for (const message of transcript.messages) {
+		const messageId = message.info.id;
+		if (messageId === undefined) continue;
+		currentSourcesByMessageId.set(
+			messageId,
+			message.parts
+				.filter((part) => part.kind === "text")
+				.map((part) => stripTagPrefix(part.getText() ?? "")),
+		);
+	}
+
+	const legacyRowsByMessageId = new Map<
+		string,
+		Array<{ ordinal: number; tagId: number }>
+	>();
+	const versionedMessageIds = new Set<string>();
+	for (const [contentId, tagId] of tagger.getAssignments(sessionId)) {
+		const markerIndex = contentId.lastIndexOf(TEXT_TAG_IDENTITY_MARKER);
+		if (markerIndex >= 0) {
+			const ownerId = contentId.slice(0, markerIndex);
+			if (currentSourcesByMessageId.has(ownerId)) versionedMessageIds.add(ownerId);
+			continue;
+		}
+
+		const ordinalMatch = /:p(\d+)$/.exec(contentId);
+		if (!ordinalMatch) continue;
+		const ownerId = contentId.slice(0, ordinalMatch.index);
+		if (!currentSourcesByMessageId.has(ownerId)) continue;
+		const ordinal = Number.parseInt(ordinalMatch[1] ?? "", 10);
+		if (!Number.isSafeInteger(ordinal)) continue;
+		const rows = legacyRowsByMessageId.get(ownerId) ?? [];
+		rows.push({ ordinal, tagId });
+		legacyRowsByMessageId.set(ownerId, rows);
+	}
+
+	let sourceCache = piTextIdentitySourceCacheBySession.get(sessionId);
+	if (!sourceCache) {
+		sourceCache = new Map();
+		piTextIdentitySourceCacheBySession.set(sessionId, sourceCache);
+	}
+	const missingTagIds = Array.from(legacyRowsByMessageId.values())
+		.flat()
+		.map((row) => row.tagId)
+		.filter((tagId) => !sourceCache.has(tagId));
+	for (let offset = 0; offset < missingTagIds.length; offset += 500) {
+		const loaded = getSourceContents(db, sessionId, missingTagIds.slice(offset, offset + 500));
+		for (const [tagId, source] of loaded) sourceCache.set(tagId, source);
+	}
+
+	const driftedMessageIds = new Set<string>();
+	for (const [messageId, currentSources] of currentSourcesByMessageId) {
+		const legacyRows = legacyRowsByMessageId.get(messageId) ?? [];
+		if (versionedMessageIds.has(messageId)) {
+			driftedMessageIds.add(messageId);
+			continue;
+		}
+		if (legacyRows.length === 0) continue;
+		legacyRows.sort((left, right) => left.ordinal - right.ordinal);
+		const vectorMatches =
+			legacyRows.length === currentSources.length &&
+			legacyRows.every(
+				(row, index) =>
+					row.ordinal === index && sourceCache.get(row.tagId) === currentSources[index],
+			);
+		if (!vectorMatches) driftedMessageIds.add(messageId);
+	}
+
+	const reusableMessageIds = new Set<string>();
+	for (const messageId of reuseCandidates) {
+		if (!driftedMessageIds.has(messageId)) reusableMessageIds.add(messageId);
+	}
+	return { driftedMessageIds, reusableMessageIds, sourceCache };
+}
 
 interface PiBranchEntryLookup {
 	entryIdByMessageRef: Map<object, string>;
@@ -4234,6 +4329,13 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		tFallbackIdentity,
 	);
 	afterFallbackAdoptionForTests?.(args.stableIdSchemeCutover === true);
+	const textIdentityPlan = buildPiTextIdentityPlan(
+		args.db,
+		args.sessionId,
+		args.tagger,
+		transcript,
+		args.reusableMessageIds,
+	);
 	const tTag = performance.now();
 	let tagTextTokenCache = piTagTextTokenCacheBySession.get(args.sessionId);
 	if (!tagTextTokenCache) {
@@ -4253,7 +4355,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		{
 			skipPrefixInjection: !ctxReduceCallable,
 			entryFingerprintByMessageId,
-			reuseMessageIds: args.reusableMessageIds,
+			reuseMessageIds: textIdentityPlan.reusableMessageIds,
+			textIdentityDriftMessageIds: textIdentityPlan.driftedMessageIds,
+			textIdentitySourceCache: textIdentityPlan.sourceCache,
 			textTokenCache: tagTextTokenCache,
 			toolTokenCache: tagToolTokenCache,
 			onTiming: hasPiTransformTimingObserver()
@@ -5650,6 +5754,7 @@ export function clearContextHandlerSession(sessionId: string): void {
 	piMessageTokenCacheBySession.delete(sessionId);
 	piTagTextTokenCacheBySession.delete(sessionId);
 	piTagToolTokenCacheBySession.delete(sessionId);
+	piTextIdentitySourceCacheBySession.delete(sessionId);
 	piBranchProjectionBySession.delete(sessionId);
 	clearPiInjectionTokenCountCache(sessionId);
 	clearPiChannel1State(sessionId);

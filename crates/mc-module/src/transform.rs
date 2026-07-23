@@ -7677,12 +7677,15 @@ fn build_output_with_tags_inner(
                             );
                         }
                     }
-                } else if !req.is_subagent
+                }
+                if !req.is_subagent
                     && req.caveman_enabled
                     && matches!(msg.ck.role.as_str(), "user" | "assistant")
                 {
                     for block in blocks {
-                        if is_reasoning_block(&block.wire) {
+                        if reduced.contains_key(&block.block_index)
+                            || is_reasoning_block(&block.wire)
+                        {
                             continue;
                         }
                         let unit_key = format!("{CAV_KEY_PREFIX}{}", block.id);
@@ -17537,6 +17540,136 @@ mod tests {
             other => panic!("unexpected replay block: {other:?}"),
         };
         assert_eq!(replayed, &core.frozen_units[2].frozen_payload);
+    }
+
+    #[test]
+    fn block_source_selection_preserves_single_source_rendering() {
+        let first = caveman_test_source("first");
+        let second = caveman_test_source("second");
+        let mut request = req(
+            "block-source-shapes",
+            "cfg",
+            vec![two_block_item("m1", 1, &first, &second)],
+        );
+        request.caveman_enabled = true;
+        let projection = project_messages(&request.messages).unwrap();
+
+        let render = |units: Vec<FrozenUnit>| {
+            let mut core = CoreState {
+                frozen_units: vec![
+                    synth_region("m0", "m0".to_string()),
+                    render_m1_placeholder(),
+                ],
+                ..CoreState::default()
+            };
+            core.frozen_units.extend(units);
+            let output = build_output(
+                &core,
+                &ModuleMeta::default(),
+                &projection,
+                &request,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            output
+                .last()
+                .unwrap()
+                .content
+                .iter()
+                .map(|block| first_block_text(block).unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let caveman = "caveman-first";
+        let reduced = "[dropped first]";
+        assert_eq!(render(vec![]), vec![first.clone(), second.clone()]);
+        assert_eq!(
+            render(vec![caveman_unit("m1#0", 3, caveman)]),
+            vec![caveman.to_string(), second.clone()]
+        );
+        assert_eq!(
+            render(vec![red_unit("m1#0", "drop", reduced)]),
+            vec![reduced.to_string(), second.clone()]
+        );
+        assert_eq!(
+            render(vec![
+                caveman_unit("m1#0", 3, caveman),
+                red_unit("m1#0", "drop", reduced),
+            ]),
+            vec![reduced.to_string(), second]
+        );
+    }
+
+    #[test]
+    fn reduction_on_one_block_keeps_sibling_caveman_payload_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "caveman-reduction-siblings";
+        let first = caveman_test_source("target-first");
+        let second = caveman_test_source("target-second");
+        let mut messages = vec![item("anchor", 1, "covered")];
+        messages.push(two_block_item("target", 2, &first, &second));
+        messages.extend((3..=10u64).map(|ordinal| {
+            item(
+                &format!("later-{ordinal}"),
+                ordinal,
+                &caveman_test_source(&format!("later-{ordinal}")),
+            )
+        }));
+        let mut request = req(session, "cfg", messages);
+
+        let db = store(dir.path());
+        db.replace_compartments(session, &[comp(1, 1, 1, "anchor", "covered")])
+            .unwrap();
+        assert_eq!(run(&db, &request, &spine()).action, "HARD");
+        request.caveman_enabled = true;
+        request.caveman_min_chars = 1;
+        request.protected_tags = 0;
+        assert_eq!(run(&db, &request, &spine()).action, "SOFT+");
+        db.arm_soft_refresh(session).unwrap();
+        assert_eq!(run(&db, &request, &spine()).action, "SOFT");
+
+        let target_caveman = stored_caveman_units(&db, session)
+            .into_iter()
+            .filter(|unit| unit.key == "cav:target#0" || unit.key == "cav:target#1")
+            .collect::<Vec<_>>();
+        assert_eq!(target_caveman.len(), 2);
+        let sibling_payload = target_caveman
+            .iter()
+            .find(|unit| unit.key == "cav:target#1")
+            .unwrap()
+            .frozen_payload
+            .clone();
+
+        let reductions =
+            with_reductions(vec![reduce("target#0", "drop", "[dropped target-first]")]);
+        let reduced = run(&db, &request, &reductions);
+        assert_eq!(reduced.action, "SOFT");
+        let target = reduced
+            .messages()
+            .iter()
+            .find(|message| !message.meta.synthetic)
+            .unwrap();
+        assert_eq!(
+            first_block_text(&target.content[0]),
+            Some("[dropped target-first]")
+        );
+        assert_eq!(
+            first_block_text(&target.content[1]),
+            Some(sibling_payload.as_str())
+        );
+        let reduced_bytes = serde_json::to_vec(reduced.messages()).unwrap();
+        drop(db);
+
+        let restarted = store(dir.path());
+        let replay = run(&restarted, &request, &reductions);
+        assert_eq!(replay.action, "SOFT+");
+        assert!(!replay.committed);
+        assert_eq!(
+            serde_json::to_vec(replay.messages()).unwrap(),
+            reduced_bytes
+        );
     }
 
     #[test]
