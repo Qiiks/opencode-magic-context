@@ -33,15 +33,40 @@ function getDefaultConnectionFile(): string {
     return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
 }
 
-function connectionFailureCode(error: unknown): string | null {
+function errorChainSome(
+    error: unknown,
+    predicate: (value: Record<string, unknown>) => boolean,
+): boolean {
     let current = error;
     const seen = new Set<unknown>();
     while (isRecord(current) && !seen.has(current)) {
         seen.add(current);
-        if (typeof current.code === "string") return current.code;
+        if (predicate(current)) return true;
         current = current.cause;
     }
-    return null;
+    return false;
+}
+
+/** Route errors must be recognized by wire-visible shape because plugin bundles can carry a
+ *  different copy of subc-client from the client that originated the error. */
+function isStaleOrDeadRouteFailure(error: unknown): boolean {
+    return errorChainSome(error, (current) => {
+        const code = typeof current.code === "string" ? current.code : "";
+        const name = typeof current.name === "string" ? current.name : "";
+        const message = typeof current.message === "string" ? current.message : "";
+        return (
+            [
+                "stale_route_handle",
+                "route_closed",
+                "unknown_channel",
+                "unrecognized_channel",
+                "route_gone",
+            ].includes(code) ||
+            name === "StaleRouteHandleError" ||
+            /route handle \(\d+,\s*\d+\) is not live on the current connection/i.test(message) ||
+            /\b(?:unknown|unrecognized) channel\b/i.test(message)
+        );
+    });
 }
 
 function isConnectionFailure(error: unknown): boolean {
@@ -49,20 +74,34 @@ function isConnectionFailure(error: unknown): boolean {
         error instanceof SocketClosedError ||
         error instanceof SocketTimeoutError ||
         error instanceof StaleRouteHandleError ||
-        isConsumerReconnectTransient(error)
+        isConsumerReconnectTransient(error) ||
+        isStaleOrDeadRouteFailure(error)
     ) {
         return true;
     }
-    return [
-        "ENOENT",
-        "ECONNREFUSED",
-        "ECONNRESET",
-        "EPIPE",
-        "ETIMEDOUT",
-        "request_deadline",
-        "route_closed",
-        "SUBC_CONNECTION_BACKOFF",
-    ].includes(connectionFailureCode(error) ?? "");
+    return errorChainSome(error, (current) =>
+        [
+            "ENOENT",
+            "ECONNREFUSED",
+            "ECONNRESET",
+            "EPIPE",
+            "ETIMEDOUT",
+            "request_deadline",
+            "SUBC_CONNECTION_BACKOFF",
+        ].includes(typeof current.code === "string" ? current.code : ""),
+    );
+}
+
+interface CachedRoute {
+    route: RouteHandle;
+    generation: number;
+}
+
+interface EnsuredRoute {
+    client: SubcClient;
+    route: RouteHandle;
+    routeKey: string;
+    generation: number;
 }
 
 interface SerialLaneWaiter {
@@ -82,7 +121,7 @@ export class SubcModuleTransport {
     private readonly requestTimeoutMs: number;
     private readonly routeSessionPrefix: string;
     private client: SubcClient | null = null;
-    private routes = new Map<string, RouteHandle>();
+    private routes = new Map<string, CachedRoute>();
     private canonicalRootCache = new Map<string, string>();
     private activeSession: string | null = null;
     private nextProbeMs = 0;
@@ -246,26 +285,45 @@ export class SubcModuleTransport {
         const onAbort = () => this.invalidateConnection();
         args.signal?.addEventListener("abort", onAbort, { once: true });
         try {
-            if (args.signal?.aborted) {
-                throw args.signal.reason ?? new Error("module transport call aborted");
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+                let ensuredRoute: EnsuredRoute | null = null;
+                try {
+                    if (args.signal?.aborted) {
+                        throw args.signal.reason ?? new Error("module transport call aborted");
+                    }
+                    // Queue residence consumes the same deadline as the request. Starting work with
+                    // only scheduler noise left would let an earlier facade call overrun a transform's
+                    // caller budget, so reject before opening or reusing a route.
+                    const remainingMs = deadlineMs - Date.now();
+                    if (remainingMs < SERIAL_LANE_MIN_REMAINING_MS) throw this.laneTimeoutError();
+                    ensuredRoute = await this.ensureRoute(args.sessionId, args.projectRoot);
+                    if (args.signal?.aborted) {
+                        throw args.signal.reason ?? new Error("module transport call aborted");
+                    }
+                    return await ensuredRoute.client.request(ensuredRoute.route, args.body, {
+                        priority: Priority.Background,
+                        admissionClass: AdmissionClass.Normal,
+                        timeoutMs: Math.max(1, deadlineMs - Date.now()),
+                    });
+                } catch (error) {
+                    const staleOrDeadRoute = isStaleOrDeadRouteFailure(error);
+                    if (staleOrDeadRoute) {
+                        if (ensuredRoute) {
+                            this.dropRoute(ensuredRoute.routeKey, ensuredRoute.route);
+                            this.invalidateConnection(ensuredRoute.client);
+                        } else {
+                            this.invalidateConnection();
+                        }
+                        // Stale handles and dead route channels fail before module dispatch, so one
+                        // retry may safely reconnect and bind a fresh route without replaying work.
+                        if (attempt === 0 && !args.signal?.aborted) continue;
+                    } else if (isConnectionFailure(error)) {
+                        this.invalidateConnection(ensuredRoute?.client);
+                    }
+                    throw error;
+                }
             }
-            // Queue residence consumes the same deadline as the request. Starting work with
-            // only scheduler noise left would let an earlier facade call overrun a transform's
-            // caller budget, so reject before opening or reusing a route.
-            const remainingMs = deadlineMs - Date.now();
-            if (remainingMs < SERIAL_LANE_MIN_REMAINING_MS) throw this.laneTimeoutError();
-            const { client, route } = await this.ensureRoute(args.sessionId, args.projectRoot);
-            if (args.signal?.aborted) {
-                throw args.signal.reason ?? new Error("module transport call aborted");
-            }
-            return await client.request(route, args.body, {
-                priority: Priority.Background,
-                admissionClass: AdmissionClass.Normal,
-                timeoutMs: Math.max(1, deadlineMs - Date.now()),
-            });
-        } catch (error) {
-            if (isConnectionFailure(error)) this.invalidateConnection();
-            throw error;
+            throw new Error("module transport route retry exhausted");
         } finally {
             args.signal?.removeEventListener("abort", onAbort);
             releaseLane();
@@ -407,10 +465,10 @@ export class SubcModuleTransport {
         const client = this.client;
         const prefix = `${sessionId}\0`;
         const routes = [...this.routes.entries()].filter(([key]) => key.startsWith(prefix));
-        for (const [key, route] of routes) {
+        for (const [key, cachedRoute] of routes) {
             this.routes.delete(key);
             if (client) {
-                void client.closeRoute(route).catch((error: unknown) => {
+                void client.closeRoute(cachedRoute.route).catch((error: unknown) => {
                     if (this.client === client && isConnectionFailure(error)) {
                         this.invalidateConnection(client);
                     }
@@ -422,10 +480,7 @@ export class SubcModuleTransport {
         }
     }
 
-    private async ensureRoute(
-        sessionId: string,
-        rawProjectRoot: string,
-    ): Promise<{ client: SubcClient; route: RouteHandle }> {
+    private async ensureRoute(sessionId: string, rawProjectRoot: string): Promise<EnsuredRoute> {
         // The transform and tool lanes can observe the same directory under different
         // spellings when the project is reached through a symlink (OpenCode reports the
         // launch spelling on one lane and the resolved target on the other). The module
@@ -436,14 +491,15 @@ export class SubcModuleTransport {
         // One identity may legitimately have multiple filesystem routes (for example,
         // worktrees). Reusing a route across roots would bind authority to the wrong tree.
         const routeKey = `${sessionId}\0${projectRoot}`;
-        // Read the cached route only AFTER the connection is settled: ensureConnected
-        // may dial a fresh connection (clearing this.routes), and a route handle
-        // captured before that dial belongs to the dead connection. Returning it
-        // produced StaleRouteHandleError on the first pass after every reconnect —
-        // and one such error pass served a 965K-token raw array to a live session.
+        // Read the cached route only after the connection is settled. The generation check
+        // makes a route from any earlier connection invisible even if a cache clear is missed.
         const client = await this.ensureConnected();
+        const generation = this.connectionGeneration;
         const existing = this.routes.get(routeKey);
-        if (existing) return { client, route: existing };
+        if (existing?.generation === generation) {
+            return { client, route: existing.route, routeKey, generation };
+        }
+        if (existing) this.routes.delete(routeKey);
 
         const target: RouteTarget = { kind: "tool_provider", module_id: this.moduleId };
         const identity: BindIdentity = {
@@ -452,7 +508,7 @@ export class SubcModuleTransport {
             session: `${this.routeSessionPrefix}${sessionId}`,
         };
         const route = await client.routeOpen(target, identity);
-        if (this.client !== client) {
+        if (this.client !== client || generation !== this.connectionGeneration) {
             await client.closeRoute(route).catch(() => undefined);
             const error = new Error(
                 "subc connection changed while opening module route",
@@ -462,8 +518,14 @@ export class SubcModuleTransport {
             error.code = "ECONNRESET";
             throw error;
         }
-        this.routes.set(routeKey, route);
-        return { client, route };
+        this.routes.set(routeKey, { route, generation });
+        return { client, route, routeKey, generation };
+    }
+
+    private dropRoute(routeKey: string, route?: RouteHandle): void {
+        const existing = this.routes.get(routeKey);
+        if (!existing || (route && existing.route !== route)) return;
+        this.routes.delete(routeKey);
     }
 
     /** Resolve symlinks with per-instance memoization; keep the input spelling when the
@@ -531,3 +593,5 @@ export class SubcModuleTransport {
         client?.close();
     }
 }
+
+export const __moduleTransportTest = { isConnectionFailure, isStaleOrDeadRouteFailure };
