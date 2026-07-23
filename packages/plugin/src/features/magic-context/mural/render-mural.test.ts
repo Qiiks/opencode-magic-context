@@ -75,29 +75,55 @@ describe("deterministic mural renderer", () => {
         expect(muralImageTokenEstimateForDimensions(364, 700)).toBe(13 * 25);
     });
 
-    test("sizes sparse pools to their content and keeps a full pool at the cap", () => {
-        for (const count of [7, 50, 200]) {
+    test("fits the 7/50/200 size matrix while keeping full pools at the cap", () => {
+        const expected = {
+            // 40 chars × 5px = 200px → 224px = 8 tiles; 14 lines × 9px =
+            // 126px → 140px = 5 tiles, for 8 × 5 = 40 image tiles.
+            7: [224, 140, 40],
+            // Three balanced columns make (3 × 40 + 2 gap chars) × 5px =
+            // 610px → 616px = 22 tiles; 34 lines × 9px = 306px → 308px =
+            // 11 tiles, for 22 × 11 = 242 image tiles.
+            50: [616, 308, 242],
+            // The capped three-column layout leaves 120 usable rows per column
+            // after the never-orphan-header rule: 120 × 9px = 1080px → 1092px
+            // = 39 tiles; 22 × 39 = 858 image tiles.
+            200: [616, 1092, 858],
+        } as const;
+
+        for (const count of [7, 50, 200] as const) {
             const result = renderMural(syntheticEntries(count));
             expect(result.width % MURAL_VISION_TILE).toBe(0);
             expect(result.height % MURAL_VISION_TILE).toBe(0);
-            if (count === 7) {
-                // The generated Spleen atlas has a 5px advance, so the derived
-                // 72-character room is 360px and snaps to 364px at 28px tiles.
-                const roomPixels = MURAL_ROOM_WIDTH * MURAL_CELL_WIDTH;
-                const expectedWidth =
-                    Math.ceil(roomPixels / MURAL_VISION_TILE) * MURAL_VISION_TILE;
-                expect(result.width).toBe(expectedWidth);
-                expect(result.width).toBeLessThan(MURAL_WIDTH / 2);
-                expect(
-                    muralImageTokenEstimateForDimensions(result.width, result.height),
-                ).toBeLessThan(300);
-            } else if (count === 50) {
+            expect([
+                result.width,
+                result.height,
+                muralImageTokenEstimateForDimensions(result.width, result.height),
+            ]).toEqual(expected[count]);
+            if (count === 7 || count === 50) {
                 expect(result.width).toBeLessThan(MURAL_WIDTH);
                 expect(result.height).toBeLessThan(MURAL_HEIGHT);
             } else {
-                expect([result.width, result.height]).toEqual([MURAL_WIDTH, MURAL_HEIGHT]);
+                // The full pool still reaches the 1092px height cap; fitted columns
+                // leave its width at 616px rather than paying for blank side tiles.
+                expect(result.height).toBe(MURAL_HEIGHT);
             }
         }
+    });
+
+    test("never costs more tiles than the legacy 72-character single-column fixture", () => {
+        const entries = syntheticEntries(50);
+        const result = renderMural(entries);
+        // Alternating categories produce 50 banners + 50 body lines. The old
+        // single-column layout was 72 chars × 5px = 360px → 364px = 13 tiles
+        // wide and 100 × 9px = 900px → 924px = 33 tiles tall: 13 × 33 = 429.
+        const legacyTiles = muralImageTokenEstimateForDimensions(
+            Math.ceil((MURAL_ROOM_WIDTH * MURAL_CELL_WIDTH) / MURAL_VISION_TILE) *
+                MURAL_VISION_TILE,
+            Math.ceil((entries.length * 2 * MURAL_LINE_PITCH) / MURAL_VISION_TILE) *
+                MURAL_VISION_TILE,
+        );
+        const newTiles = muralImageTokenEstimateForDimensions(result.width, result.height);
+        expect(newTiles).toBeLessThanOrEqual(legacyTiles);
     });
 
     test("fills all three columns on a 300-cue fixture (>80% line occupancy)", () => {
@@ -126,7 +152,8 @@ describe("deterministic mural renderer", () => {
         const result = renderMural([
             { id: 1, category: "PROJECT_RULES", importance: 90, cue: longCue },
         ]);
-        // No rendered line exceeds the column width in codepoints.
+        // No rendered line exceeds three legacy-width columns; the selected
+        // content width is narrower and continuation lines use two spaces.
         expect(longestLine(result.muralText)).toBeLessThanOrEqual(
             MURAL_ROOM_WIDTH * 3 + 2, // three padded columns + 2 single-space gaps
         );

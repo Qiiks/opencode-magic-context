@@ -21,12 +21,10 @@ export const MURAL_CELL_HEIGHT = MURAL_FONT_CELL_HEIGHT;
 export const MURAL_LINE_PITCH = MURAL_FONT_LINE_PITCH;
 export const MURAL_COLUMNS = 3;
 export const MURAL_COLUMN_GAP = 1;
-/** Keep the legacy 72-character room width in pixels as the font metrics evolve. */
-const LEGACY_ROOM_WIDTH_PIXELS = 72 * 5;
-export const MURAL_ROOM_WIDTH = Math.max(
-    1,
-    Math.floor(LEGACY_ROOM_WIDTH_PIXELS / MURAL_CELL_WIDTH),
-);
+/** Width bounds keep sparse murals compact without making their columns unreadably narrow. */
+const MURAL_MIN_ROOM_WIDTH = 40;
+/** Keep the historical 72-character maximum so murals remain compatible with the prior single-column layout and its line-width limit. */
+export const MURAL_ROOM_WIDTH = 72;
 export const MURAL_ROWS = Math.floor(MURAL_HEIGHT / MURAL_LINE_PITCH);
 export const MURAL_LINE_CAPACITY = MURAL_COLUMNS * MURAL_ROWS;
 
@@ -69,8 +67,6 @@ export interface MuralRenderResult {
     height: number;
 }
 
-type Cursor = { column: number; row: number };
-
 const CATEGORY_COLORS: Record<string, readonly [number, number, number]> = {
     PROJECT_RULES: [24, 58, 112],
     ARCHITECTURE: [0, 88, 92],
@@ -92,15 +88,15 @@ function escapeText(value: string): string {
         .trim();
 }
 
-function banner(category: MuralCategory): string {
+function banner(category: MuralCategory, roomWidth: number): string {
     const label = ` <${category}> `;
-    if (codepoints(label) > MURAL_ROOM_WIDTH) {
+    if (codepoints(label) > roomWidth) {
         // A category name longer than a column is degenerate; hard-truncate the
         // banner rather than throw — the deterministic renderer must never fail
         // the m0 injection over a label width.
-        return label.slice(0, MURAL_ROOM_WIDTH);
+        return [...label].slice(0, roomWidth).join("");
     }
-    const remaining = MURAL_ROOM_WIDTH - codepoints(label);
+    const remaining = roomWidth - codepoints(label);
     return `${"─".repeat(Math.floor(remaining / 2))}${label}${"─".repeat(Math.ceil(remaining / 2))}`;
 }
 
@@ -118,28 +114,28 @@ function breakLongToken(token: string, width: number): string[] {
 }
 
 /**
- * Word-wrap one cue into bullet lines that fit the column width. The first line
- * is bulleted (`•`), continuations are indented one space. Shape adapted from
- * the visual-memory experiment's appendEntry, hardened to hard-break an
- * over-wide single token instead of throwing.
+ * Word-wrap one cue into bullet lines that fit the selected column width. The
+ * first line is bulleted; continuations are indented two spaces so wrapped
+ * cues remain visually distinct from the category bars.
  */
 function wrapCue(cue: string, width: number): string[] {
+    const continuationIndent = "  ";
     const words = escapeText(cue)
         .split(/\s+/)
         .filter(Boolean)
-        .flatMap((word) => breakLongToken(word, width - 1));
+        .flatMap((word) => breakLongToken(word, Math.max(1, width - continuationIndent.length)));
     if (words.length === 0) return ["•"];
     const lines: string[] = [];
     let line = "•";
     for (const word of words) {
-        const separator = line === "•" || line === " " ? "" : " ";
+        const separator = line === "•" ? "" : " ";
         const candidate = `${line}${separator}${word}`;
         if (codepoints(candidate) <= width) {
             line = candidate;
             continue;
         }
         lines.push(line);
-        line = ` ${word}`;
+        line = `${continuationIndent}${word}`;
     }
     lines.push(line);
     return lines;
@@ -153,25 +149,72 @@ interface PlannedLine {
     category: MuralCategory;
 }
 
+function canShareCues(cue: string, nextCue: string, roomWidth: number): boolean {
+    const shortEntryLimit = Math.floor((roomWidth - 4) / 2);
+    const shared = `•${cue} • ${nextCue}`;
+    return (
+        !cue.includes("⊘") &&
+        !nextCue.includes("⊘") &&
+        codepoints(cue) <= shortEntryLimit &&
+        codepoints(nextCue) <= shortEntryLimit &&
+        codepoints(shared) <= roomWidth
+    );
+}
+
+/**
+ * Measure the unwrapped lines for a possible width. Category labels participate
+ * in the measurement, while their decorative bars are sized to that width.
+ */
+function naturalLineLengths(entries: readonly MuralRenderEntry[], roomWidth: number): number[] {
+    const lengths: number[] = [];
+    let currentCategory: string | null = null;
+    for (let index = 0; index < entries.length; index++) {
+        const entry = entries[index]!;
+        if (entry.category !== currentCategory) {
+            currentCategory = entry.category;
+            lengths.push(codepoints(` <${entry.category}> `));
+        }
+
+        const cue = escapeText(entry.cue);
+        const next = entries[index + 1];
+        const sameCategoryNext = next && next.category === entry.category;
+        const nextCue = sameCategoryNext ? escapeText(next.cue) : "";
+        if (sameCategoryNext && canShareCues(cue, nextCue, roomWidth)) {
+            lengths.push(codepoints(`•${cue} • ${nextCue}`));
+            index++;
+        } else {
+            lengths.push(1 + codepoints(cue));
+        }
+    }
+    return lengths;
+}
+
+/** Choose the smallest bounded width that leaves only the longest ~5% wrapped. */
+function chooseRoomWidth(entries: readonly MuralRenderEntry[]): number {
+    for (let width = MURAL_MIN_ROOM_WIDTH; width <= MURAL_ROOM_WIDTH; width++) {
+        const lengths = naturalLineLengths(entries, width);
+        const allowedWrappedLines = Math.ceil(lengths.length * 0.05);
+        const wrappedLines = lengths.filter((length) => length > width).length;
+        if (wrappedLines <= allowedWrappedLines) return width;
+    }
+    return MURAL_ROOM_WIDTH;
+}
+
 /**
  * Build the flat line plan for the pre-ordered entries: a category banner at
  * each band boundary, then the entries' cue lines with shared-pair packing (two
  * short non-prohibition cues on one line — a density win) and word-wrap for the
  * rest.
  */
-function planLines(entries: readonly MuralRenderEntry[]): PlannedLine[] {
+function planLines(entries: readonly MuralRenderEntry[], roomWidth: number): PlannedLine[] {
     const lines: PlannedLine[] = [];
-    // Two short cues share a line as `•a • b`; each half gets at most half the
-    // column minus the bullets/separator overhead.
-    const shortEntryLimit = Math.floor((MURAL_ROOM_WIDTH - 4) / 2);
-
     let currentCategory: string | null = null;
     for (let index = 0; index < entries.length; index++) {
         const entry = entries[index]!;
         if (entry.category !== currentCategory) {
             currentCategory = entry.category;
             lines.push({
-                text: banner(entry.category),
+                text: banner(entry.category, roomWidth),
                 entryIds: [],
                 isBanner: true,
                 category: entry.category,
@@ -182,26 +225,18 @@ function planLines(entries: readonly MuralRenderEntry[]): PlannedLine[] {
         const next = entries[index + 1];
         const sameCategoryNext = next && next.category === entry.category;
         const nextCue = sameCategoryNext ? escapeText(next.cue) : "";
-        const shared = `•${cue} • ${nextCue}`;
-        if (
-            sameCategoryNext &&
-            !cue.includes("⊘") &&
-            !nextCue.includes("⊘") &&
-            codepoints(cue) <= shortEntryLimit &&
-            codepoints(nextCue) <= shortEntryLimit &&
-            codepoints(shared) <= MURAL_ROOM_WIDTH
-        ) {
+        if (sameCategoryNext && canShareCues(cue, nextCue, roomWidth)) {
             lines.push({
-                text: shared,
+                text: `•${cue} • ${nextCue}`,
                 entryIds: [entry.id, next.id],
                 isBanner: false,
                 category: entry.category,
             });
-            index++; // consumed the pair
+            index++;
             continue;
         }
 
-        const wrapped = wrapCue(cue, MURAL_ROOM_WIDTH);
+        const wrapped = wrapCue(cue, roomWidth);
         wrapped.forEach((text, wrappedIndex) => {
             lines.push({
                 text,
@@ -215,13 +250,32 @@ function planLines(entries: readonly MuralRenderEntry[]): PlannedLine[] {
     return lines;
 }
 
-function advance(cursor: Cursor): Cursor {
-    if (cursor.row + 1 < MURAL_ROWS) return { column: cursor.column, row: cursor.row + 1 };
-    return { column: cursor.column + 1, row: 0 };
-}
+function splitPlan(plan: readonly PlannedLine[], columnCount: number): PlannedLine[][] {
+    const columns: PlannedLine[][] = Array.from({ length: columnCount }, () => []);
+    let offset = 0;
+    for (let column = 0; column < columnCount && offset < plan.length; column++) {
+        const remainingLines = plan.length - offset;
+        const remainingColumns = columnCount - column;
+        let take = Math.min(MURAL_ROWS, Math.ceil(remainingLines / remainingColumns));
 
-function atEnd(cursor: Cursor): boolean {
-    return cursor.column >= MURAL_COLUMNS;
+        // Keep a category banner with at least one following body line when a
+        // balanced split would otherwise leave the banner at the bottom.
+        while (
+            offset + take < plan.length &&
+            take < MURAL_ROWS &&
+            plan[offset + take - 1]?.isBanner
+        ) {
+            take++;
+        }
+        // If the cap itself lands on a banner, preserve the old behavior: leave
+        // that final row blank instead of rendering an orphaned category header.
+        if (take === MURAL_ROWS && plan[offset + take - 1]?.isBanner) take--;
+        if (take <= 0) break;
+
+        columns[column] = plan.slice(offset, offset + take);
+        offset += take;
+    }
+    return columns;
 }
 
 interface LayoutResult {
@@ -237,9 +291,13 @@ interface LayoutResult {
     rowCount: number;
 }
 
-function renderLayout(entries: readonly MuralRenderEntry[]): LayoutResult {
-    const plan = planLines(entries);
-    const grid = Array.from({ length: MURAL_COLUMNS }, () =>
+function renderLayout(
+    entries: readonly MuralRenderEntry[],
+    plan: readonly PlannedLine[],
+    roomWidth: number,
+    columnCount: number,
+): LayoutResult {
+    const grid = Array.from({ length: columnCount }, () =>
         Array.from({ length: MURAL_ROWS }, () => ""),
     );
     const placements: MuralRenderResult["placements"] = new Map();
@@ -247,68 +305,58 @@ function renderLayout(entries: readonly MuralRenderEntry[]): LayoutResult {
     const renderedIds: number[] = [];
     const placedIds = new Set<number>();
     const usage: Record<string, number> = {};
-    let cursor: Cursor = { column: 0, row: 0 };
     let filledLineCount = 0;
 
-    for (const line of plan) {
-        if (atEnd(cursor)) break;
-        // Never strand a category banner on the last row of a column — push it to
-        // the next column so its band isn't orphaned (mirrors the old room-header
-        // rule). A body line may take the last row.
-        if (line.isBanner && cursor.row === MURAL_ROWS - 1) {
-            cursor = advance(cursor);
-            if (atEnd(cursor)) break;
-        }
-
-        grid[cursor.column]![cursor.row] = line.text;
-        filledLineCount += 1;
-        usage[line.category] = (usage[line.category] ?? 0) + 1;
-        const placementLine = cursor.row + 1;
-        const placementColumn = cursor.column;
-        if (line.isBanner) {
-            layoutItems.push({
-                kind: "category",
-                category: line.category,
-                column: placementColumn,
-                startLine: placementLine,
-                endLine: placementLine,
-            });
-        }
-        for (const id of line.entryIds) {
-            placements.set(id, {
-                category: line.category,
-                column: placementColumn,
-                line: placementLine,
-            });
-            if (!placedIds.has(id)) {
-                placedIds.add(id);
-                renderedIds.push(id);
+    for (const [column, columnPlan] of splitPlan(plan, columnCount).entries()) {
+        for (const [row, line] of columnPlan.entries()) {
+            grid[column]![row] = line.text;
+            filledLineCount += 1;
+            usage[line.category] = (usage[line.category] ?? 0) + 1;
+            const placementLine = row + 1;
+            if (line.isBanner) {
+                layoutItems.push({
+                    kind: "category",
+                    category: line.category,
+                    column,
+                    startLine: placementLine,
+                    endLine: placementLine,
+                });
             }
-            layoutItems.push({
-                kind: "entry",
-                category: line.category,
-                column: placementColumn,
-                startLine: placementLine,
-                endLine: placementLine,
-            });
+            for (const id of line.entryIds) {
+                placements.set(id, {
+                    category: line.category,
+                    column,
+                    line: placementLine,
+                });
+                if (!placedIds.has(id)) {
+                    placedIds.add(id);
+                    renderedIds.push(id);
+                }
+                layoutItems.push({
+                    kind: "entry",
+                    category: line.category,
+                    column,
+                    startLine: placementLine,
+                    endLine: placementLine,
+                });
+            }
         }
-        cursor = advance(cursor);
     }
 
     const droppedIds = entries.filter((entry) => !placedIds.has(entry.id)).map((entry) => entry.id);
-
-    let columnCount = 0;
-    let rowCount = 0;
-    for (let column = 0; column < MURAL_COLUMNS; column++) {
-        for (let row = 0; row < MURAL_ROWS; row++) {
-            if (!grid[column]?.[row]) continue;
-            columnCount = Math.max(columnCount, column + 1);
-            rowCount = Math.max(rowCount, row + 1);
+    const usedColumnCount = grid.reduce(
+        (last, column, index) => (column.some(Boolean) ? index + 1 : last),
+        0,
+    );
+    const rowCount = grid.reduce((last, column) => {
+        for (let row = column.length - 1; row >= 0; row--) {
+            if (column[row]) return Math.max(last, row + 1);
         }
-    }
+        return last;
+    }, 0);
     const textLines = Array.from({ length: rowCount }, (_, row) =>
-        Array.from({ length: columnCount }, (_, column) =>
-            (grid[column]?.[row] ?? "").padEnd(MURAL_ROOM_WIDTH),
+        Array.from({ length: usedColumnCount }, (_, column) =>
+            (grid[column]?.[row] ?? "").padEnd(roomWidth),
         ).join(" "),
     );
     return {
@@ -320,7 +368,7 @@ function renderLayout(entries: readonly MuralRenderEntry[]): LayoutResult {
         droppedIds,
         usage,
         filledLineCount,
-        columnCount,
+        columnCount: usedColumnCount,
         rowCount,
     };
 }
@@ -460,20 +508,62 @@ function snapDimensionToVisionTile(contentPixels: number, maximum: number): numb
 /**
  * Render the deterministic mural from a pre-ordered flat entry list. Zero LLM,
  * pure function of its input — callable any time. Category bands, bullet lines,
- * shared-pair packing, word-wrap at the column width, and prohibition ink are
- * all preserved from the author-era renderer; rooms and merges are gone.
+ * shared-pair packing, fitted word-wrap, balanced columns, and prohibition ink
+ * are all preserved from the author-era renderer; rooms and merges are gone.
  */
 export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderResult {
-    const layout = renderLayout(entries);
+    const roomWidth = chooseRoomWidth(entries);
+    const plan = planLines(entries, roomWidth);
+    const candidates = Array.from({ length: MURAL_COLUMNS }, (_, index) => {
+        const requestedColumnCount = index + 1;
+        const layout = renderLayout(entries, plan, roomWidth, requestedColumnCount);
+        const contentWidth =
+            layout.columnCount === 0
+                ? 0
+                : layout.columnCount * roomWidth * MURAL_CELL_WIDTH +
+                  MURAL_COLUMN_GAP * (layout.columnCount - 1) * MURAL_CELL_WIDTH;
+        const contentHeight = layout.rowCount * MURAL_LINE_PITCH;
+        const width = snapDimensionToVisionTile(contentWidth, MURAL_WIDTH);
+        const height = snapDimensionToVisionTile(contentHeight, MURAL_HEIGHT);
+        return {
+            requestedColumnCount,
+            layout,
+            width,
+            height,
+            tileArea: muralImageTokenEstimateForDimensions(width, height),
+        };
+    });
+
+    // A smaller canvas must not win by silently dropping entries. When no layout
+    // can fit the full plan under the hard cap, keep as many entries as possible
+    // and then apply the same tile-area optimization.
+    const fittingCandidates = candidates.filter(
+        (candidate) => candidate.layout.droppedIds.length === 0,
+    );
+    const candidatesToCompare = fittingCandidates.length > 0 ? fittingCandidates : candidates;
+    const selected = candidatesToCompare.reduce((best, candidate) => {
+        if (!best) return candidate;
+        if (
+            fittingCandidates.length === 0 &&
+            candidate.layout.renderedIds.length !== best.layout.renderedIds.length
+        ) {
+            return candidate.layout.renderedIds.length > best.layout.renderedIds.length
+                ? candidate
+                : best;
+        }
+        if (candidate.tileArea !== best.tileArea) {
+            return candidate.tileArea < best.tileArea ? candidate : best;
+        }
+        return candidate.requestedColumnCount < best.requestedColumnCount ? candidate : best;
+    }, candidatesToCompare[0]!);
+
+    const { layout, width, height } = selected;
+    const pixels = new Uint8Array(width * height * 3).fill(255);
     const contentWidth =
         layout.columnCount === 0
             ? 0
-            : layout.columnCount * MURAL_ROOM_WIDTH * MURAL_CELL_WIDTH +
+            : layout.columnCount * roomWidth * MURAL_CELL_WIDTH +
               MURAL_COLUMN_GAP * (layout.columnCount - 1) * MURAL_CELL_WIDTH;
-    const contentHeight = layout.rowCount * MURAL_LINE_PITCH;
-    const width = snapDimensionToVisionTile(contentWidth, MURAL_WIDTH);
-    const height = snapDimensionToVisionTile(contentHeight, MURAL_HEIGHT);
-    const pixels = new Uint8Array(width * height * 3).fill(255);
     const left = Math.floor((width - contentWidth) / 2);
     for (let column = 0; column < layout.columnCount; column++) {
         for (let row = 0; row < layout.rowCount; row++) {
@@ -485,9 +575,9 @@ export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderRe
                     pixels,
                     width,
                     height,
-                    left + column * (MURAL_ROOM_WIDTH + MURAL_COLUMN_GAP) * MURAL_CELL_WIDTH,
+                    left + column * (roomWidth + MURAL_COLUMN_GAP) * MURAL_CELL_WIDTH,
                     row * MURAL_LINE_PITCH,
-                    MURAL_ROOM_WIDTH * MURAL_CELL_WIDTH,
+                    roomWidth * MURAL_CELL_WIDTH,
                     MURAL_CELL_HEIGHT,
                     CATEGORY_COLORS[category ?? ""] ?? [72, 78, 86],
                 );
@@ -500,7 +590,7 @@ export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderRe
                 pixels,
                 width,
                 height,
-                left + column * (MURAL_ROOM_WIDTH + MURAL_COLUMN_GAP) * MURAL_CELL_WIDTH,
+                left + column * (roomWidth + MURAL_COLUMN_GAP) * MURAL_CELL_WIDTH,
                 row * MURAL_LINE_PITCH,
                 text,
                 ink,
