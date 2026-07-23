@@ -814,6 +814,8 @@ pub struct TransformTimings {
     #[serde(default)]
     pub store_commit: f64,
     #[serde(default)]
+    pub post_attach: f64,
+    #[serde(default)]
     pub response_encode: f64,
     #[serde(default)]
     pub frozen_units: usize,
@@ -866,7 +868,7 @@ pub fn format_pass_timing_line(
          blocks_by_mid={:.1} build_frozen_unit_index={:.1} full_drop_tool_ids={:.1} \
          build_output={:.1} build_identity={:.1} build_identity_max={:.1} build_frozen_unit_scan={:.1} \
          build_cache_lookup={:.1} build_serialize_misses={:.1} build_tail_loop={:.1} \
-         divergence={:.1} store_commit={:.1} response_encode={response_encode_ms:.1} \
+         divergence={:.1} store_commit={:.1} post_attach_ms={:.1} response_encode={response_encode_ms:.1} \
          frozen_units={} tail_units_matched={} projection_blocks={} tail_messages_emitted={} \
          build_identity_messages={} cache_hits={} cache_misses={} cache_dirty_skips={}",
         timings.total,
@@ -903,6 +905,7 @@ pub fn format_pass_timing_line(
         timings.build_tail_loop,
         timings.divergence,
         timings.store_commit,
+        timings.post_attach,
         timings.frozen_units,
         timings.tail_units_matched,
         timings.projection_blocks,
@@ -1068,6 +1071,8 @@ pub struct TransformWithProjection {
     pub scheduler_pass: scheduler::PassDecision,
     pub boundary_state: BoundaryState,
     pub trim_mismatch: Option<TrimMismatch>,
+    pub revert_epoch: u64,
+    pub reasoning_watermark: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1699,6 +1704,10 @@ fn apply_once(
                 projection,
                 req,
                 row_version,
+                revert_epoch: next_meta.revert_epoch,
+                reasoning_watermark: next_meta
+                    .reasoning_cleared_through_tag
+                    .max(next_meta.reasoning_cleared_through_ordinal),
                 committed: fingerprint_changed,
                 trim_mismatch,
                 messages: passthrough_messages,
@@ -1777,6 +1786,10 @@ fn apply_once(
             projection,
             req,
             row_version,
+            revert_epoch: meta.revert_epoch,
+            reasoning_watermark: meta
+                .reasoning_cleared_through_tag
+                .max(meta.reasoning_cleared_through_ordinal),
             committed: true,
             trim_mismatch,
             messages: passthrough_messages,
@@ -3085,6 +3098,10 @@ fn apply_once(
         scheduler_pass: scheduler_outcome.pass,
         boundary_state,
         trim_mismatch,
+        revert_epoch: meta.revert_epoch,
+        reasoning_watermark: meta
+            .reasoning_cleared_through_tag
+            .max(meta.reasoning_cleared_through_ordinal),
         response: TransformResponse {
             status: TransformStatus::Ok,
             served_from: ServedFrom::Transform,
@@ -4319,6 +4336,8 @@ struct PendingPassthroughArgs<'a> {
     projection: FlatProjection,
     req: &'a TransformRequest,
     row_version: u64,
+    revert_epoch: u64,
+    reasoning_watermark: u64,
     committed: bool,
     trim_mismatch: Option<TrimMismatch>,
     messages: Vec<ServedMessage>,
@@ -4364,6 +4383,8 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         projection,
         req,
         row_version,
+        revert_epoch,
+        reasoning_watermark,
         committed,
         trim_mismatch,
         messages,
@@ -4388,6 +4409,8 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         scheduler_pass: scheduler::PassDecision::Defer,
         boundary_state: BoundaryState::Absent,
         trim_mismatch,
+        revert_epoch,
+        reasoning_watermark,
         response,
     }
 }
@@ -7769,6 +7792,7 @@ mod tests {
         assert!(timings.todo >= 0.0);
         assert!(timings.build_output >= 0.0);
         assert!(timings.store_commit >= 0.0);
+        assert!(timings.post_attach >= 0.0);
         assert_eq!(response.decision, "HARD");
         assert_eq!(response.materialize_reason.as_deref(), Some("first_render"));
 
@@ -7813,6 +7837,7 @@ mod tests {
             "build_tail_loop",
             "divergence",
             "store_commit",
+            "post_attach_ms",
             "response_encode",
         ] {
             assert_eq!(fields[key], "0.0", "{key} renders one decimal place");

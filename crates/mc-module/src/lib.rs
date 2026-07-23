@@ -62,8 +62,8 @@ use mc_store::{
     NoteEvaluationInput, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop,
     PendingAgentDropSeedRow, PendingCompactionMarkerState, RecordWrapupCommandOutcome,
     StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
-    StoredCompartment, StoredMemoryMutation, StoredNote, TodoStateSetOutcome, UserHintSeedRow,
-    VerificationUpdate, WrapupCommandRecord,
+    StoredCompartment, StoredMemoryMutation, StoredNote, TagNumberRow, TodoStateSetOutcome,
+    UserHintSeedRow, VerificationUpdate, WrapupCommandRecord,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -5738,6 +5738,9 @@ impl McHandler {
                 };
             }
         }
+        let post_attach_started_at = Instant::now();
+        let revert_epoch = result.revert_epoch;
+        let reasoning_watermark = result.reasoning_watermark;
         let mut response = result.response;
         if response.committed {
             self.guidance_dates
@@ -5746,37 +5749,18 @@ impl McHandler {
                 .remove(&parsed.session_id);
         }
         response.historian = Some(diagnostics);
-        let reasoning_watermark = store
-            .load(&parsed.session_id)
-            .map(|state| {
-                state
-                    .meta
-                    .reasoning_cleared_through_tag
-                    .max(state.meta.reasoning_cleared_through_ordinal)
-            })
-            .unwrap_or(0);
-        let tag_numbers = store
-            .load_transform_snapshot(&parsed.session_id)
-            .map(|snapshot| {
-                let mut by_message = std::collections::BTreeMap::new();
-                for tag in snapshot.tags {
-                    let message_id = tag
-                        .block_id
-                        .split_once('#')
-                        .map(|(message_id, _)| message_id)
-                        .unwrap_or(tag.block_id.as_str())
-                        .to_string();
-                    by_message
-                        .entry(message_id)
-                        .and_modify(|number: &mut u64| {
-                            *number = (*number).max(tag.tag_number as u64)
-                        })
-                        .or_insert(tag.tag_number as u64);
-                }
-                by_message
-            })
-            .unwrap_or_default();
-        attach_native_messages_with_tags(&mut response, &parsed, reasoning_watermark, &tag_numbers);
+        if parsed.serve_native {
+            let tag_numbers = store
+                .load_tag_numbers_for_session(&parsed.session_id)
+                .map(message_tag_numbers)
+                .unwrap_or_default();
+            attach_native_messages_with_tags(
+                &mut response,
+                &parsed,
+                reasoning_watermark,
+                &tag_numbers,
+            );
+        }
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
         self.record_response_observation(&parsed.session_id, now_ms());
         // Management requests carry identity but not raw history. A successful full pass
@@ -5785,17 +5769,18 @@ impl McHandler {
         let retained_bytes = serde_json::to_vec(parsed.as_ref())
             .map(|bytes| bytes.len())
             .unwrap_or(usize::MAX);
-        if let Ok(loaded) = store.load(&parsed.session_id) {
-            self.transform_snapshots
-                .lock()
-                .expect("transform snapshots mutex")
-                .finish_ready(
-                    &parsed.session_id,
-                    snapshot_generation,
-                    Arc::clone(&parsed),
-                    loaded.meta.revert_epoch,
-                    retained_bytes,
-                );
+        self.transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .finish_ready(
+                &parsed.session_id,
+                snapshot_generation,
+                Arc::clone(&parsed),
+                revert_epoch,
+                retained_bytes,
+            );
+        if let Some(timings) = response.timings.as_mut() {
+            timings.post_attach = post_attach_started_at.elapsed().as_secs_f64() * 1_000.0;
         }
         respond_transform(&parsed.session_id, response)
     }
@@ -8441,6 +8426,24 @@ fn attach_native_messages(
         reasoning_watermark,
         &std::collections::BTreeMap::new(),
     );
+}
+
+fn message_tag_numbers(rows: Vec<TagNumberRow>) -> std::collections::BTreeMap<String, u64> {
+    let mut by_message = std::collections::BTreeMap::new();
+    for row in rows {
+        let message_id = row
+            .block_id
+            .split_once('#')
+            .map(|(message_id, _)| message_id)
+            .unwrap_or(row.block_id.as_str())
+            .to_string();
+        let tag_number = row.tag_number as u64;
+        by_message
+            .entry(message_id)
+            .and_modify(|number: &mut u64| *number = (*number).max(tag_number))
+            .or_insert(tag_number);
+    }
+    by_message
 }
 
 fn attach_native_messages_with_tags(
@@ -11467,6 +11470,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn non_native_transform_skips_post_transform_tag_query() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        assert_eq!(store.tag_number_query_count_for_test(), 0);
+
+        let response = call_transform_request(&handler, request(vec![ck("m1", 1, "hello")])).await;
+
+        assert_eq!(response["status"], "ok");
+        assert!(response["timings"]["post_attach"].is_number());
+        assert_eq!(
+            store.tag_number_query_count_for_test(),
+            0,
+            "non-native attachment must not touch the tag table"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn serve_native_rejects_non_opencode_profiles() {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -11519,6 +11539,102 @@ mod tests {
                 .unwrap()["info"]["customInfo"],
             "preserve-me"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lightweight_tag_lookup_preserves_native_attachment_bytes() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let seeded_tags = (0..55)
+            .map(|index| TagMintInput {
+                block_id: if index == 0 {
+                    "assistant-old#0".to_string()
+                } else {
+                    format!("history-{index}#0")
+                },
+                kind: "message".to_string(),
+                token_count: 1,
+                source_bytes: format!("source-{index}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        store.seed_tags_for_test("ses", &seeded_tags, 1).unwrap();
+
+        let mut request = request(vec![
+            ck_reasoning("assistant-old", 1, "signed historical thinking"),
+            ck("user-new", 100, "new prompt"),
+        ]);
+        request["serializer_profile"] = json!("opencode-aisdk");
+        request["serve_native"] = json!(true);
+        request["tool_present"] = json!(true);
+        request["provider_id"] = json!("anthropic");
+        request["native_messages"] = json!([
+            {
+                "info": {
+                    "id": "assistant-old",
+                    "role": "assistant",
+                    "providerID": "anthropic",
+                    "modelID": "claude-opus-4-8"
+                },
+                "parts": [{
+                    "type": "reasoning",
+                    "text": "signed historical thinking",
+                    "time": { "start": 1, "end": 2 },
+                    "metadata": { "anthropic": { "signature": "signature-assistant-old" } }
+                }]
+            },
+            {
+                "info": {
+                    "id": "user-new",
+                    "role": "user",
+                    "model": { "providerID": "anthropic", "modelID": "claude-opus-4-8" }
+                },
+                "parts": [{ "type": "text", "text": "new prompt" }]
+            }
+        ]);
+        let parsed: TransformRequest = serde_json::from_value(request.clone()).unwrap();
+        let actual = call_transform_request(&handler, request).await;
+        assert_eq!(actual["status"], "ok");
+        let actual_native = actual["native_messages"].as_array().unwrap().clone();
+        let cleared_reasoning = actual_native
+            .iter()
+            .find(|message| message["info"]["id"] == json!("assistant-old"))
+            .expect("tagged historical reasoning remains addressable");
+        assert_eq!(
+            cleared_reasoning["parts"][0],
+            json!({ "type": "reasoning", "text": "" })
+        );
+
+        let mut old_tag_numbers = std::collections::BTreeMap::new();
+        for tag in store.load_transform_snapshot("ses").unwrap().tags {
+            let message_id = tag
+                .block_id
+                .split_once('#')
+                .map(|(message_id, _)| message_id)
+                .unwrap_or(tag.block_id.as_str())
+                .to_string();
+            old_tag_numbers
+                .entry(message_id)
+                .and_modify(|number: &mut u64| *number = (*number).max(tag.tag_number as u64))
+                .or_insert(tag.tag_number as u64);
+        }
+        let new_tag_numbers =
+            message_tag_numbers(store.load_tag_numbers_for_session("ses").unwrap());
+        assert_eq!(new_tag_numbers, old_tag_numbers);
+
+        let loaded = store.load("ses").unwrap();
+        let reasoning_watermark = loaded
+            .meta
+            .reasoning_cleared_through_tag
+            .max(loaded.meta.reasoning_cleared_through_ordinal);
+        let mut replay: transform::TransformResponse = serde_json::from_value(actual).unwrap();
+        replay.native_messages = None;
+        attach_native_messages_with_tags(
+            &mut replay,
+            &parsed,
+            reasoning_watermark,
+            &old_tag_numbers,
+        );
+        assert_eq!(replay.native_messages, Some(actual_native));
     }
 
     #[tokio::test(flavor = "current_thread")]
