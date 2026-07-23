@@ -11,6 +11,7 @@ import {
     addStaleReduceStrippedIds,
     applyStrippedPlaceholderDelta,
     getCompartments,
+    updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { setProjectState } from "../../features/magic-context/storage-project-state";
@@ -21,8 +22,18 @@ import {
 } from "../../features/magic-context/storage-tags";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { mirrorModuleCompartments, syncModuleState } from "./module-state-sync";
-import { resolveOrdinalsForModule } from "./module-wire";
+import {
+    buildModuleStateSyncPayload,
+    buildPagedModuleStateSyncPayloads,
+    loadModuleWatermarks,
+    mirrorModuleCompartments,
+    syncModuleState,
+} from "./module-state-sync";
+import {
+    MODULE_PAGE_MAX_BYTES,
+    moduleWireBodyBytes,
+    resolveOrdinalsForModule,
+} from "./module-wire";
 import { closeReadOnlySessionDb } from "./read-session-db";
 
 const databases: Database[] = [];
@@ -522,6 +533,105 @@ describe("module compartment ordinal serialization", () => {
                 messageRole: "assistant",
             }),
         );
+    });
+});
+
+describe("module incremental and paged assembly", () => {
+    it("packs pages linearly and preserves item order under the wire cap", () => {
+        createContextDb();
+        const watermarks = {
+            compartment_sequence: 0,
+            memory_id: 0,
+            m0_mutation_id: 0,
+            memory_mutation_id: 0,
+            last_todo_state_hash: "",
+            project_memory_epoch: 0,
+            project_user_profile_version: 0,
+            reasoning_cleared_through_tag: 0,
+        };
+        const items = Array.from({ length: 900 }, (_, index) => ({
+            id: index,
+            content: "x".repeat(1200),
+        }));
+        const originalStringify = JSON.stringify;
+        let serializedBytes = 0;
+        JSON.stringify = ((...args: Parameters<typeof JSON.stringify>) => {
+            const result = originalStringify(...args);
+            if (typeof result === "string") serializedBytes += Buffer.byteLength(result);
+            return result;
+        }) as typeof JSON.stringify;
+        let pages: ReturnType<typeof buildPagedModuleStateSyncPayloads> = [];
+        try {
+            pages = buildPagedModuleStateSyncPayloads({
+                moduleGeneration: 1,
+                expectedShadowSeq: 0,
+                seedId: "seed",
+                seedBoundaryId: null,
+                compartments: items,
+                memories: [],
+                memoryMutations: [],
+                userProfile: [],
+                workspace: null,
+                lastTodoState: "",
+                watermarks,
+            });
+        } finally {
+            JSON.stringify = originalStringify;
+        }
+
+        expect(pages.length).toBeGreaterThan(1);
+        expect(pages.flatMap((page) => page.params.compartments)).toEqual(items);
+        expect(serializedBytes).toBeLessThan(10_000_000);
+        for (const page of pages) {
+            expect(
+                moduleWireBodyBytes({
+                    method: "state_sync",
+                    params: page.params,
+                }),
+            ).toBeLessThanOrEqual(MODULE_PAGE_MAX_BYTES);
+        }
+    });
+
+    it("does not read memory pools for a todo-only watermark change", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-todo-only-sync";
+        const baseline = loadModuleWatermarks({ db, sessionId, projectPath: "/tmp/project" });
+        updateSessionMeta(db, sessionId, { lastTodoState: '[{"content":"todo"}]' });
+        const originalPrepare = db.prepare.bind(db);
+        let memoryPoolReads = 0;
+        db.prepare = ((sql: string) => {
+            if (/FROM memories/i.test(sql) && !/MAX\(/i.test(sql)) memoryPoolReads += 1;
+            return originalPrepare(sql);
+        }) as typeof db.prepare;
+
+        const payload = await buildModuleStateSyncPayload({
+            state: { ...syncState(), lastAckedWatermarks: baseline, seedPassPending: false },
+            pass: { db, sessionId, projectPath: "/tmp/project", nowMs: 1 },
+            force: false,
+        });
+
+        expect(payload).not.toBeNull();
+        expect(memoryPoolReads).toBe(0);
+    });
+
+    it("does not issue a full tag-table read during a force seed", async () => {
+        const db = createContextDb();
+        const originalPrepare = db.prepare.bind(db);
+        let fullTagReads = 0;
+        db.prepare = ((sql: string) => {
+            if (/FROM tags WHERE session_id = \? ORDER BY tag_number/i.test(sql)) {
+                fullTagReads += 1;
+            }
+            return originalPrepare(sql);
+        }) as typeof db.prepare;
+
+        await buildModuleStateSyncPayload({
+            state: syncState(),
+            pass: { db, sessionId: "ses-force-tags", nowMs: 1 },
+            force: true,
+        });
+
+        expect(fullTagReads).toBeLessThanOrEqual(1);
     });
 });
 

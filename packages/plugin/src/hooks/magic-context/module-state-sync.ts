@@ -1,9 +1,12 @@
 import { createHmac, randomUUID } from "node:crypto";
 
+import type { Compartment } from "../../features/magic-context/compartment-storage";
 import {
+    buildWorkspaceMemorySqlFilter,
     getMaxMemoryIdForProjects,
     getMemoriesByProject,
     getMemoriesByProjects,
+    readNewMemoriesForM1Union,
 } from "../../features/magic-context/memory/storage-memory";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
@@ -31,7 +34,10 @@ import {
     GLOBAL_USER_PROFILE_PROJECT_PATH,
     getProjectState,
 } from "../../features/magic-context/storage-project-state";
-import { getTagsBySession } from "../../features/magic-context/storage-tags";
+import {
+    getDroppedTagsBySession,
+    getTagsByNumbers,
+} from "../../features/magic-context/storage-tags";
 import type { TagEntry } from "../../features/magic-context/types";
 import { getActiveUserMemories } from "../../features/magic-context/user-memory/storage-user-memory";
 import {
@@ -358,8 +364,10 @@ export function loadModuleWatermarks(args: {
     db: ContextDatabase;
     sessionId: string;
     projectPath?: string;
+    /** Reuse the workspace resolved by the enclosing payload build. */
+    workspace?: ModuleWorkspaceContext;
 }): ModuleWatermarks {
-    const workspace = resolveModuleWorkspaceContext(args.db, args.projectPath);
+    const workspace = args.workspace ?? resolveModuleWorkspaceContext(args.db, args.projectPath);
     const sessionMeta = getOrCreateSessionMeta(args.db, args.sessionId);
     const compartmentRow = args.db
         .prepare(
@@ -603,7 +611,7 @@ function buildDropSeeds(args: {
 }): { seeds: ModuleDropSeed[]; skipped: number } {
     const byBlock = new Map<string, ModuleDropSeed>();
     let skipped = 0;
-    for (const tag of getTagsBySession(args.db, args.sessionId)) {
+    for (const tag of getDroppedTagsBySession(args.db, args.sessionId)) {
         if (tag.status !== "dropped") continue;
         const result = dropSeedForTag({ tag, readRawById: args.readRawById });
         if (!("seed" in result)) {
@@ -632,12 +640,17 @@ function buildPendingDropSeeds(args: {
     sessionId: string;
     readRawById: (messageId: string) => RawMessageParts | null;
 }): { seeds: ModulePendingDropSeed[]; skipped: number } {
+    const pendingOps = getPendingOps(args.db, args.sessionId);
     const tagsByNumber = new Map(
-        getTagsBySession(args.db, args.sessionId).map((tag) => [tag.tagNumber, tag] as const),
+        getTagsByNumbers(
+            args.db,
+            args.sessionId,
+            pendingOps.map((op) => op.tagId),
+        ).map((tag) => [tag.tagNumber, tag] as const),
     );
     const byBlock = new Map<string, ModulePendingDropSeed>();
     let skipped = 0;
-    for (const op of getPendingOps(args.db, args.sessionId)) {
+    for (const op of pendingOps) {
         const tag = tagsByNumber.get(op.tagId);
         if (!tag) {
             skipped += 1;
@@ -740,6 +753,93 @@ type SeedItem =
     | { kind: "strip_seed"; value: ModuleStripSeed }
     | { kind: "user_profile"; value: string };
 
+function readCompartmentsAfterSequence(
+    db: ContextDatabase,
+    sessionId: string,
+    afterSequence: number,
+): Compartment[] {
+    const rows = db
+        .prepare(
+            `SELECT id, session_id, sequence, start_message, end_message,
+                    start_message_id, end_message_id, title, content,
+                    p1, p2, p3, p4, importance, episode_type, legacy, created_at
+               FROM compartments
+              WHERE session_id = ? AND sequence > ?
+              ORDER BY sequence ASC`,
+        )
+        .all(sessionId, afterSequence) as Array<Record<string, unknown>>;
+    return rows
+        .filter(
+            (row) =>
+                typeof row.id === "number" &&
+                typeof row.session_id === "string" &&
+                typeof row.sequence === "number" &&
+                typeof row.start_message === "number" &&
+                typeof row.end_message === "number" &&
+                typeof row.start_message_id === "string" &&
+                typeof row.end_message_id === "string" &&
+                typeof row.title === "string" &&
+                typeof row.content === "string" &&
+                typeof row.created_at === "number",
+        )
+        .map((row) => ({
+            id: row.id as number,
+            sessionId: row.session_id as string,
+            sequence: row.sequence as number,
+            startMessage: row.start_message as number,
+            endMessage: row.end_message as number,
+            startMessageId: row.start_message_id as string,
+            endMessageId: row.end_message_id as string,
+            title: row.title as string,
+            content: row.content as string,
+            p1: typeof row.p1 === "string" ? row.p1 : null,
+            p2: typeof row.p2 === "string" ? row.p2 : null,
+            p3: typeof row.p3 === "string" ? row.p3 : null,
+            p4: typeof row.p4 === "string" ? row.p4 : null,
+            importance: typeof row.importance === "number" ? row.importance : 50,
+            episodeType: typeof row.episode_type === "string" ? row.episode_type : null,
+            legacy: typeof row.legacy === "number" ? row.legacy : 0,
+            createdAt: row.created_at as number,
+        }));
+}
+
+function readRenderedMemoryIds(args: {
+    db: ContextDatabase;
+    projectPath?: string;
+    workspace: ModuleWorkspaceContext;
+    nowMs: number;
+}): number[] {
+    if (!args.projectPath) return [];
+    const identities =
+        args.workspace.expandedIdentities.length > 0
+            ? args.workspace.expandedIdentities
+            : [args.projectPath];
+    const filter = buildWorkspaceMemorySqlFilter({
+        identities,
+        ownIdentities: args.workspace.ownIdentities,
+        shareCategories: args.workspace.shareCategories,
+        tableName: "m",
+    });
+    const placeholders = identities.map(() => "?").join(", ");
+    const rows = args.db
+        .prepare(
+            `SELECT m.id
+               FROM memories AS m
+              WHERE m.project_path IN (${placeholders})
+                AND m.status IN ('active', 'permanent')
+                AND (m.expires_at IS NULL OR m.expires_at > ?)
+                ${filter.clause}
+              ORDER BY m.id ASC`,
+        )
+        .all(...identities, args.nowMs, ...filter.params) as Array<{ id?: unknown }>;
+    return rows.flatMap((row) => (typeof row.id === "number" ? [row.id] : []));
+}
+
+function encodedSeedItemBytes(item: SeedItem): number {
+    const encoded = JSON.stringify(item.value);
+    return Buffer.byteLength(encoded === undefined ? "null" : encoded);
+}
+
 export function buildPagedModuleStateSyncPayloads(args: {
     moduleGeneration: number;
     expectedShadowSeq: number;
@@ -790,6 +890,43 @@ export function buildPagedModuleStateSyncPayloads(args: {
         ...(args.stripSeeds ?? []).map((value) => ({ kind: "strip_seed", value }) as const),
         ...args.userProfile.map((value) => ({ kind: "user_profile", value }) as const),
     ];
+
+    type SeedBatch = {
+        compartments: unknown[];
+        memories: unknown[];
+        memoryMutations: unknown[];
+        dropSeeds: ModuleDropSeed[];
+        pendingAgentDrops: ModulePendingDropSeed[];
+        noteNudgeAnchors: ModuleNoteNudgeAnchorSeed[];
+        autoSearchHintDecisions: ModuleAutoSearchHintSeed[];
+        stripSeeds: ModuleStripSeed[];
+        userProfile: string[];
+    };
+
+    const emptyBatch = (): SeedBatch => ({
+        compartments: [],
+        memories: [],
+        memoryMutations: [],
+        dropSeeds: [],
+        pendingAgentDrops: [],
+        noteNudgeAnchors: [],
+        autoSearchHintDecisions: [],
+        stripSeeds: [],
+        userProfile: [],
+    });
+
+    const appendItem = (batch: SeedBatch, item: SeedItem): void => {
+        if (item.kind === "compartment") batch.compartments.push(item.value);
+        else if (item.kind === "memory") batch.memories.push(item.value);
+        else if (item.kind === "memory_mutation") batch.memoryMutations.push(item.value);
+        else if (item.kind === "drop_seed") batch.dropSeeds.push(item.value);
+        else if (item.kind === "pending_agent_drop") batch.pendingAgentDrops.push(item.value);
+        else if (item.kind === "note_nudge_anchor") batch.noteNudgeAnchors.push(item.value);
+        else if (item.kind === "auto_search_hint") batch.autoSearchHintDecisions.push(item.value);
+        else if (item.kind === "strip_seed") batch.stripSeeds.push(item.value);
+        else batch.userProfile.push(item.value);
+    };
+
     const makePayload = (input: {
         index: number;
         total: number;
@@ -884,167 +1021,78 @@ export function buildPagedModuleStateSyncPayloads(args: {
         },
         watermarks: args.watermarks,
     });
-    const appendItem = (
-        batch: {
-            compartments: unknown[];
-            memories: unknown[];
-            memoryMutations: unknown[];
-            dropSeeds: ModuleDropSeed[];
-            pendingAgentDrops: ModulePendingDropSeed[];
-            noteNudgeAnchors: ModuleNoteNudgeAnchorSeed[];
-            autoSearchHintDecisions: ModuleAutoSearchHintSeed[];
-            stripSeeds: ModuleStripSeed[];
-            userProfile: string[];
-        },
-        item: SeedItem,
-    ): void => {
-        if (item.kind === "compartment") batch.compartments.push(item.value);
-        else if (item.kind === "memory") batch.memories.push(item.value);
-        else if (item.kind === "memory_mutation") batch.memoryMutations.push(item.value);
-        else if (item.kind === "drop_seed") batch.dropSeeds.push(item.value);
-        else if (item.kind === "pending_agent_drop") batch.pendingAgentDrops.push(item.value);
-        else if (item.kind === "note_nudge_anchor") batch.noteNudgeAnchors.push(item.value);
-        else if (item.kind === "auto_search_hint") batch.autoSearchHintDecisions.push(item.value);
-        else if (item.kind === "strip_seed") batch.stripSeeds.push(item.value);
-        else batch.userProfile.push(item.value);
-    };
 
-    let assumedTotal = 1;
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-        const batches: ModuleStateSyncPayload[] = [];
-        let current = {
-            compartments: [],
-            memories: [],
-            memoryMutations: [],
-            dropSeeds: [],
-            pendingAgentDrops: [],
-            noteNudgeAnchors: [],
-            autoSearchHintDecisions: [],
-            stripSeeds: [],
-            userProfile: [],
-        } as {
-            compartments: unknown[];
-            memories: unknown[];
-            memoryMutations: unknown[];
-            dropSeeds: ModuleDropSeed[];
-            pendingAgentDrops: ModulePendingDropSeed[];
-            noteNudgeAnchors: ModuleNoteNudgeAnchorSeed[];
-            autoSearchHintDecisions: ModuleAutoSearchHintSeed[];
-            stripSeeds: ModuleStripSeed[];
-            userProfile: string[];
-        };
-        for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
-            const candidate = {
-                compartments: [...current.compartments],
-                memories: [...current.memories],
-                memoryMutations: [...current.memoryMutations],
-                dropSeeds: [...current.dropSeeds],
-                pendingAgentDrops: [...current.pendingAgentDrops],
-                noteNudgeAnchors: [...current.noteNudgeAnchors],
-                autoSearchHintDecisions: [...current.autoSearchHintDecisions],
-                stripSeeds: [...current.stripSeeds],
-                userProfile: [...current.userProfile],
-            };
-            appendItem(candidate, items[itemIndex]);
-            const complete = itemIndex + 1 === items.length;
-            const candidatePayload = makePayload({
-                index: batches.length,
-                total: assumedTotal,
-                complete,
-                dropSeedSkipped: args.dropSeedSkipped,
-                ...candidate,
-            });
-            if (
-                moduleWireBodyBytes({ method: "state_sync", params: candidatePayload.params }) <=
-                MODULE_PAGE_MAX_BYTES
-            ) {
-                current = candidate;
-                continue;
-            }
-            const currentHasItems = Object.values(current).some((values) => values.length > 0);
-            if (currentHasItems) {
-                batches.push(
-                    makePayload({
-                        index: batches.length,
-                        total: assumedTotal,
-                        complete: false,
-                        dropSeedSkipped: args.dropSeedSkipped,
-                        ...current,
-                    }),
-                );
-            }
-            current = {
-                compartments: [],
-                memories: [],
-                memoryMutations: [],
-                dropSeeds: [],
-                pendingAgentDrops: [],
-                noteNudgeAnchors: [],
-                autoSearchHintDecisions: [],
-                stripSeeds: [],
-                userProfile: [],
-            };
-            appendItem(current, items[itemIndex]);
-            const itemOnlyPayload = makePayload({
-                index: batches.length,
-                total: assumedTotal,
-                complete: false,
-                dropSeedSkipped: args.dropSeedSkipped,
-                ...current,
-            });
-            if (
-                moduleWireBodyBytes({ method: "state_sync", params: itemOnlyPayload.params }) >
-                MODULE_PAGE_MAX_BYTES
-            ) {
-                throw new Error("module seed item exceeds the 512 KiB batch limit");
-            }
-            if (complete) {
-                const itemWithTailPayload = makePayload({
-                    index: batches.length,
-                    total: assumedTotal,
-                    complete: true,
-                    dropSeedSkipped: args.dropSeedSkipped,
-                    ...current,
-                });
-                if (
-                    moduleWireBodyBytes({
-                        method: "state_sync",
-                        params: itemWithTailPayload.params,
-                    }) > MODULE_PAGE_MAX_BYTES
-                ) {
-                    batches.push(itemOnlyPayload);
-                    current = {
-                        compartments: [],
-                        memories: [],
-                        memoryMutations: [],
-                        dropSeeds: [],
-                        pendingAgentDrops: [],
-                        noteNudgeAnchors: [],
-                        autoSearchHintDecisions: [],
-                        stripSeeds: [],
-                        userProfile: [],
-                    };
-                }
-            }
+    // The envelope is fixed for all pages; use the largest safe sequence numbers so
+    // page estimates cannot undercount metadata. Empty arrays are intentionally left
+    // in this margin, making the estimate conservative by a few bytes per field.
+    const sizingEnvelope = makePayload({
+        index: Number.MAX_SAFE_INTEGER,
+        total: Number.MAX_SAFE_INTEGER,
+        complete: true,
+        ...emptyBatch(),
+        dropSeedSkipped: args.dropSeedSkipped,
+        pendingDropSkipped: args.pendingDropSkipped,
+        autoSearchHintSkipped: args.autoSearchHintSkipped,
+        pendingCompactionMarker: args.pendingCompactionMarker,
+        deferredExecuteState: args.deferredExecuteState,
+        channel2NudgeState: args.channel2NudgeState,
+    });
+    const envelopeMarginBytes = moduleWireBodyBytes({
+        method: "state_sync",
+        params: sizingEnvelope.params,
+    });
+
+    const pageBatches: SeedBatch[] = [];
+    let current = emptyBatch();
+    let currentEncodedBytes = 0;
+    let currentItemCount = 0;
+    for (const item of items) {
+        // Encode each item once for the linear packing estimate. The final page
+        // serialization below remains the sole exact wire-size assertion.
+        const itemBytes = encodedSeedItemBytes(item);
+        const itemContribution = itemBytes + 1; // value bytes plus a conservative comma.
+        const candidateBytes = envelopeMarginBytes + currentEncodedBytes + itemContribution;
+        if (currentItemCount > 0 && candidateBytes > MODULE_PAGE_MAX_BYTES) {
+            pageBatches.push(current);
+            current = emptyBatch();
+            currentEncodedBytes = 0;
+            currentItemCount = 0;
         }
-        const finalPayload = makePayload({
-            index: batches.length,
-            total: assumedTotal,
-            complete: true,
+        if (envelopeMarginBytes + itemContribution > MODULE_PAGE_MAX_BYTES) {
+            throw new Error("module seed item exceeds the 512 KiB batch limit");
+        }
+        appendItem(current, item);
+        currentEncodedBytes += itemContribution;
+        currentItemCount += 1;
+    }
+    if (currentItemCount > 0 || pageBatches.length === 0) pageBatches.push(current);
+
+    const total = pageBatches.length;
+    const batches = pageBatches.map((batch, index) => {
+        const payload = makePayload({
+            index,
+            total,
+            complete: index + 1 === total,
             dropSeedSkipped: args.dropSeedSkipped,
-            ...current,
+            pendingDropSkipped: args.pendingDropSkipped,
+            autoSearchHintSkipped: args.autoSearchHintSkipped,
+            pendingCompactionMarker: args.pendingCompactionMarker,
+            deferredExecuteState: args.deferredExecuteState,
+            channel2NudgeState: args.channel2NudgeState,
+            ...batch,
         });
+        // An estimate may choose a different split point than an exact wire-size
+        // check. This is safe because the module reassembler concatenates pages in
+        // order, preserving every item.
         if (
-            moduleWireBodyBytes({ method: "state_sync", params: finalPayload.params }) >
+            moduleWireBodyBytes({ method: "state_sync", params: payload.params }) >
             MODULE_PAGE_MAX_BYTES
         ) {
-            throw new Error("module seed scalar tail exceeds the 512 KiB batch limit");
+            throw new Error("module seed batch exceeds the 512 KiB batch limit");
         }
-        batches.push(finalPayload);
-        if (batches.length === assumedTotal) return batches;
-        assumedTotal = batches.length;
-    }
-    throw new Error("module seed batch count did not stabilize");
+        return payload;
+    });
+    return batches;
 }
 
 export async function buildModuleStateSyncPayload(args: {
@@ -1064,6 +1112,7 @@ export async function buildModuleStateSyncPayload(args: {
         db: args.pass.db,
         sessionId: args.pass.sessionId,
         projectPath: args.pass.projectPath,
+        workspace,
     });
     if (
         !args.force &&
@@ -1103,10 +1152,32 @@ export async function buildModuleStateSyncPayload(args: {
         }
         return rawById.get(messageId) ?? null;
     };
+    const compartmentsChanged =
+        args.force || currentWatermarks.compartment_sequence > acked.compartment_sequence;
+    const memoryChanged =
+        !omitAuthorityMemorySections &&
+        (args.force ||
+            currentWatermarks.memory_id > acked.memory_id ||
+            currentWatermarks.project_memory_epoch !== acked.project_memory_epoch);
+    const memoryMutationsChanged =
+        !omitAuthorityMemorySections &&
+        (args.force || currentWatermarks.memory_mutation_id > acked.memory_mutation_id);
+    const profileChanged =
+        args.force ||
+        currentWatermarks.project_user_profile_version > acked.project_user_profile_version;
+
     const compartments: unknown[] = [];
     let serializedCount = 0;
-    for (const compartment of getCompartments(args.pass.db, args.pass.sessionId)) {
-        if (compartment.sequence <= acked.compartment_sequence) continue;
+    const compartmentsToSerialize = compartmentsChanged
+        ? args.force
+            ? getCompartments(args.pass.db, args.pass.sessionId)
+            : readCompartmentsAfterSequence(
+                  args.pass.db,
+                  args.pass.sessionId,
+                  acked.compartment_sequence,
+              )
+        : [];
+    for (const compartment of compartmentsToSerialize) {
         args.options?.beforeSerializeCompartment?.();
         if (args.options?.shouldAbortSeed?.()) return "seed_budget";
         const serialized = serializeCompartment({
@@ -1127,7 +1198,7 @@ export async function buildModuleStateSyncPayload(args: {
     }
 
     const allMemories =
-        !omitAuthorityMemorySections && args.pass.projectPath
+        args.force && !omitAuthorityMemorySections && args.pass.projectPath
             ? workspace.workspace
                 ? getMemoriesByProjects(
                       args.pass.db,
@@ -1144,38 +1215,59 @@ export async function buildModuleStateSyncPayload(args: {
                       args.pass.nowMs,
                   )
             : [];
-    const memories = allMemories
-        .filter((memory) => memory.id > acked.memory_id)
-        .map((memory) => ({
-            id: memory.id,
-            project_path: memory.projectPath,
-            category: memory.category,
-            content: memory.content,
-            normalized_hash: memory.normalizedHash,
-            importance: memory.importance,
-            scope: memory.scope,
-            shareable: memory.shareable,
-            source_session_id: memory.sourceSessionId,
-            source_type: memory.sourceType,
-            seen_count: memory.seenCount,
-            retrieval_count: memory.retrievalCount,
-            first_seen_at: memory.firstSeenAt,
-            created_at: memory.createdAt,
-            updated_at: memory.updatedAt,
-            last_seen_at: memory.lastSeenAt,
-            last_retrieved_at: memory.lastRetrievedAt,
-            status: memory.status,
-            expires_at: memory.expiresAt,
-            verification_status: memory.verificationStatus,
-            verified_at: memory.verifiedAt,
-            superseded_by_memory_id: memory.supersededByMemoryId,
-            merged_from: memory.mergedFrom,
-            metadata_json: memory.metadataJson,
-        }));
-    const renderedMemoryIds = allMemories.map((memory) => memory.id);
-    const userProfile = getActiveUserMemories(args.pass.db).map((memory) => memory.content);
+    const incrementalMemories =
+        memoryChanged && !args.force && args.pass.projectPath
+            ? readNewMemoriesForM1Union(
+                  args.pass.db,
+                  workspace.expandedIdentities,
+                  acked.memory_id,
+                  args.pass.nowMs,
+                  workspace.ownIdentities,
+                  workspace.shareCategories,
+              )
+            : [];
+    const memoryRows = args.force ? allMemories : incrementalMemories;
+    const memories = memoryRows.map((memory) => ({
+        id: memory.id,
+        project_path: memory.projectPath,
+        category: memory.category,
+        content: memory.content,
+        normalized_hash: memory.normalizedHash,
+        importance: memory.importance,
+        scope: memory.scope,
+        shareable: memory.shareable,
+        source_session_id: memory.sourceSessionId,
+        source_type: memory.sourceType,
+        seen_count: memory.seenCount,
+        retrieval_count: memory.retrievalCount,
+        first_seen_at: memory.firstSeenAt,
+        created_at: memory.createdAt,
+        updated_at: memory.updatedAt,
+        last_seen_at: memory.lastSeenAt,
+        last_retrieved_at: memory.lastRetrievedAt,
+        status: memory.status,
+        expires_at: memory.expiresAt,
+        verification_status: memory.verificationStatus,
+        verified_at: memory.verifiedAt,
+        superseded_by_memory_id: memory.supersededByMemoryId,
+        merged_from: memory.mergedFrom,
+        metadata_json: memory.metadataJson,
+    }));
+    const renderedMemoryIds = memoryMutationsChanged
+        ? args.force
+            ? allMemories.map((memory) => memory.id)
+            : readRenderedMemoryIds({
+                  db: args.pass.db,
+                  projectPath: args.pass.projectPath,
+                  workspace,
+                  nowMs: args.pass.nowMs,
+              })
+        : [];
+    const userProfile = profileChanged
+        ? getActiveUserMemories(args.pass.db).map((memory) => memory.content)
+        : [];
     const memoryMutations =
-        !omitAuthorityMemorySections && args.pass.projectPath
+        memoryMutationsChanged && args.pass.projectPath
             ? getMemoryMutationsForRenderByProjects(
                   args.pass.db,
                   workspace.expandedIdentities,
