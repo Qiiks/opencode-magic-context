@@ -1,20 +1,32 @@
 import { deflateSync } from "node:zlib";
 
+import {
+    MURAL_FONT_CELL_HEIGHT,
+    MURAL_FONT_CELL_WIDTH,
+    MURAL_FONT_GLYPHS,
+    MURAL_FONT_LINE_PITCH,
+    MURAL_FONT_REPLACEMENT_GLYPH,
+    type MuralFontGlyph,
+} from "./mural-font.generated";
+
 /** Maximum canvas extent; sparse renders use only the needed snapped extent. */
 export const MURAL_WIDTH = 1_092;
 export const MURAL_HEIGHT = 1_092;
 /** Anthropic vision image-token tiles are 28 pixels on each side. */
 export const MURAL_VISION_TILE = 28;
 export const MURAL_FONT = "spleen-5x8";
-export const MURAL_CELL_WIDTH = 5;
-export const MURAL_CELL_HEIGHT = 8;
-export const MURAL_LINE_PITCH = 9;
+/** Spleen's 5px cell includes its own blank right-side column for letter spacing. */
+export const MURAL_CELL_WIDTH = MURAL_FONT_CELL_WIDTH;
+export const MURAL_CELL_HEIGHT = MURAL_FONT_CELL_HEIGHT;
+export const MURAL_LINE_PITCH = MURAL_FONT_LINE_PITCH;
 export const MURAL_COLUMNS = 3;
 export const MURAL_COLUMN_GAP = 1;
-/** Character width of one column. High-importance cues can be up to 90 chars, so
- *  a cue wider than this wraps across lines (word-wrap) rather than truncating —
- *  this restores the true three-column fill the single-column port lost. */
-export const MURAL_ROOM_WIDTH = 72;
+/** Keep the legacy 72-character room width in pixels as the font metrics evolve. */
+const LEGACY_ROOM_WIDTH_PIXELS = 72 * 5;
+export const MURAL_ROOM_WIDTH = Math.max(
+    1,
+    Math.floor(LEGACY_ROOM_WIDTH_PIXELS / MURAL_CELL_WIDTH),
+);
 export const MURAL_ROWS = Math.floor(MURAL_HEIGHT / MURAL_LINE_PITCH);
 export const MURAL_LINE_CAPACITY = MURAL_COLUMNS * MURAL_ROWS;
 
@@ -363,81 +375,10 @@ function encodeRgbPng(pixels: Uint8Array, width: number, height: number): Uint8A
     return output;
 }
 
-// Spleen's 5x8 grid is intentionally represented as a stable, tiny atlas. The
-// fallback glyph keeps punctuation and non-ASCII relation marks visible rather
-// than silently changing the layout when a cue uses a new symbol.
-const GLYPHS: Record<string, readonly string[]> = {
-    " ": ["     ", "     ", "     ", "     ", "     ", "     ", "     ", "     "],
-    "-": ["     ", "     ", "     ", "     ", "     ", "     ", "     ", "█████"],
-    ".": ["     ", "     ", "     ", "     ", "     ", "     ", " ██  ", " ██  "],
-    ":": ["     ", " ██  ", " ██  ", "     ", "     ", " ██  ", " ██  ", "     "],
-    "/": ["    █", "   █ ", "   █ ", "  █  ", " █   ", " █   ", "█    ", "     "],
-    "<": ["     ", "  █  ", " █   ", "█    ", " █   ", "  █  ", "     ", "     "],
-    ">": ["     ", "  █  ", "   █ ", "    █", "   █ ", "  █  ", "     ", "     "],
-    "→": ["     ", "     ", "  █  ", " ████", "█████", " ████", "  █  ", "     "],
-    "←": ["     ", "     ", "  █  ", "█████", " ████", "█████", "  █  ", "     "],
-    "⊘": [" ███ ", "█   █", "█ █ █", "██ ██", "██ ██", "█ █ █", "█   █", " ███ "],
-    "•": ["     ", "     ", " ██  ", "████ ", "████ ", " ██  ", "     ", "     "],
-    "▰": ["█████", "█████", "█████", "█████", "█████", "█████", "█████", "█████"],
-    "─": ["     ", "     ", "     ", "     ", "     ", "     ", "     ", "█████"],
-    "—": ["     ", "     ", "     ", "     ", "     ", "     ", "█████", "     "],
-};
-
-const LETTERS = [
-    ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
-    ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
-    ["01111", "10000", "10000", "10000", "10000", "10000", "01111"],
-    ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
-    ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
-    ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
-    ["01111", "10000", "10000", "10111", "10001", "10001", "01111"],
-    ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
-    ["11111", "00100", "00100", "00100", "00100", "00100", "11111"],
-    ["00111", "00010", "00010", "00010", "10010", "10010", "01100"],
-    ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
-    ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
-    ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
-    ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
-    ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
-    ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
-    ["01110", "10001", "10001", "10001", "10101", "10010", "01101"],
-    ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
-    ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
-    ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
-    ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
-    ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
-    ["10001", "10001", "10001", "10101", "10101", "11011", "10001"],
-    ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
-    ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
-    ["11111", "00001", "00010", "00100", "01000", "10000", "11111"],
-] as const;
-const DIGITS = ["01110", "10001", "10011", "10101", "11001", "10001", "01110"];
-
-function glyph(character: string): readonly string[] {
-    const direct = GLYPHS[character];
-    if (direct) return direct;
-    const upper = character.toUpperCase();
-    const letterIndex = upper.charCodeAt(0) - 65;
-    if (letterIndex >= 0 && letterIndex < 26) {
-        const rows = LETTERS[letterIndex]!;
-        return [...rows, "     "];
-    }
-    const digit = character.charCodeAt(0) - 48;
-    if (digit >= 0 && digit <= 9) {
-        if (digit === 0)
-            return ["01110", "10001", "10011", "10101", "11001", "10001", "01110", "     "];
-        const pattern = DIGITS;
-        return [
-            ...pattern.map((row, index) => (index === 0 ? (digit === 1 ? "00100" : row) : row)),
-            "     ",
-        ];
-    }
-    const seed = character.codePointAt(0) ?? 0;
-    return Array.from({ length: 8 }, (_, row) =>
-        Array.from({ length: 5 }, (_, column) =>
-            (seed + row * 11 + column * 7) % 5 === 0 ? "█" : " ",
-        ).join(""),
-    );
+/** The generated atlas provides real Spleen pixels; unknown characters use a
+ * visible, deterministic replacement glyph rather than random-looking noise. */
+function glyph(character: string): MuralFontGlyph {
+    return MURAL_FONT_GLYPHS[character] ?? MURAL_FONT_REPLACEMENT_GLYPH;
 }
 
 function drawGlyph(
@@ -449,11 +390,11 @@ function drawGlyph(
     character: string,
     color: readonly [number, number, number],
 ): void {
-    const rows = glyph(character);
-    for (let row = 0; row < 8; row++) {
-        const pattern = rows[row] ?? "     ";
-        for (let column = 0; column < 5; column++) {
-            if (pattern[column] !== "█" && pattern[column] !== "1") continue;
+    const glyphData = glyph(character);
+    for (let row = 0; row < MURAL_CELL_HEIGHT; row++) {
+        const pattern = glyphData.rows[row] ?? 0;
+        for (let column = 0; column < glyphData.width; column++) {
+            if ((pattern & (1 << (glyphData.width - column - 1))) === 0) continue;
             const px = x + column;
             const py = y + row;
             if (px < 0 || py < 0 || px >= width || py >= height) continue;
@@ -474,9 +415,11 @@ function drawText(
     text: string,
     color: readonly [number, number, number],
 ): void {
-    [...text].forEach((character, index) => {
-        drawGlyph(pixels, width, height, x + index * MURAL_CELL_WIDTH, y, character, color);
-    });
+    let offset = 0;
+    for (const character of [...text]) {
+        drawGlyph(pixels, width, height, x + offset, y, character, color);
+        offset += glyph(character).advance;
+    }
 }
 
 function fillRect(
@@ -582,8 +525,9 @@ export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderRe
     };
 }
 
+/** Anthropic charges one visual token per 28x28 image patch. */
 export function muralImageTokenEstimateForDimensions(width: number, height: number): number {
-    return Math.ceil((width * height) / 750);
+    return Math.ceil(width / MURAL_VISION_TILE) * Math.ceil(height / MURAL_VISION_TILE);
 }
 
 export const muralImageTokenEstimate = muralImageTokenEstimateForDimensions(

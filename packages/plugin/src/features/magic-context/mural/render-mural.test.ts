@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+    MURAL_CELL_WIDTH,
     MURAL_HEIGHT,
+    MURAL_LINE_PITCH,
     MURAL_ROOM_WIDTH,
     MURAL_VISION_TILE,
     MURAL_WIDTH,
@@ -9,6 +11,7 @@ import {
     muralImageTokenEstimateForDimensions,
     renderMural,
 } from "./render-mural";
+import { MURAL_FONT_GLYPHS } from "./mural-font.generated";
 
 const CATEGORIES = ["PROJECT_RULES", "ARCHITECTURE", "CONSTRAINTS", "CONFIG_VALUES", "NAMING"];
 
@@ -26,6 +29,31 @@ function syntheticEntries(count: number): MuralRenderEntry[] {
 }
 
 describe("deterministic mural renderer", () => {
+    test("includes every printable ASCII glyph in the generated atlas", () => {
+        for (let codepoint = 0x20; codepoint <= 0x7e; codepoint++) {
+            const character = String.fromCodePoint(codepoint);
+            expect(MURAL_FONT_GLYPHS[character]).toBeDefined();
+        }
+    });
+
+    test("preserves case and leaves a blank column between consecutive M glyphs", () => {
+        const upper = MURAL_FONT_GLYPHS["M"]!;
+        const lower = MURAL_FONT_GLYPHS["a"]!;
+        expect(lower.rows).not.toEqual(upper.rows);
+
+        const pairColumns = Array.from({ length: upper.advance * 2 }, (_, column) =>
+            upper.rows.some((row) => {
+                const localColumn = column % upper.advance;
+                return (
+                    localColumn < upper.width &&
+                    (row & (1 << (upper.width - localColumn - 1))) !== 0
+                );
+            }),
+        );
+        expect(pairColumns[upper.advance - 1]).toBe(false);
+        expect(pairColumns[upper.advance]).toBe(true);
+    });
+
     test("renders identical bytes for identical input (pure function)", () => {
         const entries: MuralRenderEntry[] = Array.from({ length: 40 }, (_, index) => ({
             id: index + 1,
@@ -41,15 +69,24 @@ describe("deterministic mural renderer", () => {
         expect([MURAL_WIDTH, MURAL_HEIGHT]).toEqual([1092, 1092]);
     });
 
+    test("uses Anthropic's exact 28px tile token formula", () => {
+        // 1092x1092 is 39x39 patches; a 364x700 image is 13x25 patches.
+        expect(muralImageTokenEstimateForDimensions(1092, 1092)).toBe(39 * 39);
+        expect(muralImageTokenEstimateForDimensions(364, 700)).toBe(13 * 25);
+    });
+
     test("sizes sparse pools to their content and keeps a full pool at the cap", () => {
         for (const count of [7, 50, 200]) {
             const result = renderMural(syntheticEntries(count));
             expect(result.width % MURAL_VISION_TILE).toBe(0);
             expect(result.height % MURAL_VISION_TILE).toBe(0);
             if (count === 7) {
-                // One 72-character column is 360 pixels; the snapped canvas has
-                // no reason to reserve the old three-column width.
-                expect(result.width).toBe(364);
+                // The generated Spleen atlas has a 5px advance, so the derived
+                // 72-character room is 360px and snaps to 364px at 28px tiles.
+                const roomPixels = MURAL_ROOM_WIDTH * MURAL_CELL_WIDTH;
+                const expectedWidth =
+                    Math.ceil(roomPixels / MURAL_VISION_TILE) * MURAL_VISION_TILE;
+                expect(result.width).toBe(expectedWidth);
                 expect(result.width).toBeLessThan(MURAL_WIDTH / 2);
                 expect(
                     muralImageTokenEstimateForDimensions(result.width, result.height),
@@ -78,7 +115,7 @@ describe("deterministic mural renderer", () => {
         expect(result.layoutItems.some((item) => item.column === 1)).toBe(true);
         expect(result.layoutItems.some((item) => item.column === 2)).toBe(true);
         // Occupancy: filled content lines vs. total grid capacity > 80%.
-        const rows = Math.floor(MURAL_HEIGHT / 9);
+        const rows = Math.floor(MURAL_HEIGHT / MURAL_LINE_PITCH);
         const capacity = 3 * rows;
         expect(result.filledLineCount / capacity).toBeGreaterThan(0.8);
     });
