@@ -1977,6 +1977,25 @@ const MIGRATIONS: &[Migration] = &[
             );
     ",
     },
+    Migration {
+        version: 41,
+        // Facade tool calls use the host tool-call id as a durable command key. The complete
+        // response is retained with the mutation so a lost response can be retried without
+        // touching memory/note rows, revisions, or the changefeed again.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_facade_mutation_ledger (
+            identity_scope TEXT NOT NULL,
+            tool           TEXT NOT NULL,
+            action         TEXT NOT NULL,
+            command_id     TEXT NOT NULL,
+            response_json  BLOB NOT NULL,
+            created_at_ms  INTEGER NOT NULL,
+            PRIMARY KEY (identity_scope, tool, action, command_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mc_facade_mutation_ledger_scope_newest
+            ON mc_facade_mutation_ledger(identity_scope, created_at_ms DESC, tool, action, command_id);
+    ",
+    },
 ];
 
 /// Apply the route-to-identity vocabulary law inside the caller's fenced transaction.
@@ -4200,6 +4219,549 @@ impl Drop for FacadeMutationScopeGuard<'_> {
     }
 }
 
+struct FacadeNoteScopeGuard<'a> {
+    scope: &'a Mutex<Option<String>>,
+    previous: Option<String>,
+}
+
+impl Drop for FacadeNoteScopeGuard<'_> {
+    fn drop(&mut self) {
+        *self
+            .scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.previous.take();
+    }
+}
+
+/// The result of one command-aware facade mutation. `Duplicate` contains the exact response bytes
+/// committed by the original command; it is returned without entering the mutation operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FacadeMutationOutcome {
+    Applied(Vec<u8>),
+    Duplicate(Vec<u8>),
+}
+
+/// Transaction-scoped ports used by the module facade. Every method operates on the transaction
+/// owned by `with_facade_command`, so the mutation and its response ledger row commit together.
+pub struct FacadeMutationTxn<'a> {
+    tx: &'a rusqlite::Transaction<'a>,
+}
+
+impl<'a> FacadeMutationTxn<'a> {
+    pub fn insert_memory(&self, input: InsertMemoryInput<'_>) -> Result<i64, String> {
+        let normalized_hash = compute_normalized_memory_hash(input.content);
+        let existing: Option<i64> = self
+            .tx
+            .query_row(
+                "SELECT id FROM mc_memories
+                  WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3",
+                params![input.project_path, input.category, normalized_hash],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(id) = existing {
+            self.tx
+                .execute(
+                    "UPDATE mc_memories
+                        SET seen_count = COALESCE(seen_count, 0) + 1,
+                            last_seen_at = ?1,
+                            updated_at = ?1
+                      WHERE id = ?2",
+                    params![input.now_ms, id],
+                )
+                .map_err(|error| error.to_string())?;
+            return Ok(id);
+        }
+        self.tx
+            .execute(
+                "INSERT INTO mc_memories
+                   (project_path, category, content, normalized_hash, importance,
+                    source_session_id, source_type, seen_count, retrieval_count,
+                    first_seen_at, created_at, updated_at, last_seen_at, status,
+                    expires_at, verification_status, metadata_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0, ?8, ?8, ?8, ?8,
+                         'active', ?9, 'unverified', ?10)",
+                params![
+                    input.project_path,
+                    input.category,
+                    input.content,
+                    normalized_hash,
+                    input.importance.map(i64::from),
+                    input.source_session_id,
+                    input.source_type.unwrap_or("historian"),
+                    input.now_ms,
+                    input.expires_at,
+                    input.metadata_json,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(self.tx.last_insert_rowid())
+    }
+
+    pub fn update_memory_content(
+        &self,
+        project_path: &str,
+        id: i64,
+        content: &str,
+        now_ms: i64,
+    ) -> Result<Option<StoredMemoryFull>, String> {
+        let Some(memory) = load_memory_full_tx(self.tx, id).map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        if memory.project_path != project_path
+            || memory.superseded_by_memory_id.is_some()
+            || !matches!(memory.status.as_str(), "active" | "permanent")
+        {
+            return Ok(None);
+        }
+        let normalized_hash = compute_normalized_memory_hash(content);
+        let duplicate_id = self
+            .tx
+            .query_row(
+                "SELECT id FROM mc_memories
+                  WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
+                  LIMIT 1",
+                params![project_path, memory.category, normalized_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(duplicate_id) = duplicate_id.filter(|duplicate_id| *duplicate_id != id) {
+            return Err(format!(
+                "memory content already exists as ID {duplicate_id}"
+            ));
+        }
+        self.tx
+            .execute(
+                "UPDATE mc_memories
+                    SET content = ?1,
+                        normalized_hash = ?2,
+                        updated_at = ?3,
+                        shareable = 0,
+                        classified_at = NULL
+                  WHERE id = ?4",
+                params![content, normalized_hash, now_ms, id],
+            )
+            .map_err(|error| error.to_string())?;
+        append_memory_mutation_tx(
+            self.tx,
+            MemoryMutationAppend {
+                project_path: &memory.project_path,
+                mutation_type: "update",
+                target_memory_id: id,
+                superseded_by_id: None,
+                category: Some(&memory.category),
+                new_content: Some(content),
+                queued_at: now_ms,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        load_memory_full_tx(self.tx, id).map_err(|error| error.to_string())
+    }
+
+    pub fn archive_memories(
+        &self,
+        project_path: &str,
+        ids: &[i64],
+        reason: Option<&str>,
+        now_ms: i64,
+    ) -> Result<Option<Vec<i64>>, String> {
+        let mut memories = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(memory) =
+                load_memory_full_tx(self.tx, *id).map_err(|error| error.to_string())?
+            else {
+                return Ok(None);
+            };
+            if memory.project_path != project_path
+                || memory.superseded_by_memory_id.is_some()
+                || !matches!(memory.status.as_str(), "active" | "permanent" | "archived")
+            {
+                return Ok(None);
+            }
+            memories.push(memory);
+        }
+        let trimmed_reason = reason.map(str::trim).filter(|value| !value.is_empty());
+        let mut archived = Vec::new();
+        for memory in memories {
+            if memory.status == "archived" {
+                continue;
+            }
+            if let Some(reason) = trimmed_reason {
+                let metadata_json = merge_archive_reason(memory.metadata_json.as_deref(), reason);
+                self.tx
+                    .execute(
+                        "UPDATE mc_memories
+                            SET status = 'archived', metadata_json = ?1, updated_at = ?2
+                          WHERE id = ?3",
+                        params![metadata_json, now_ms, memory.id],
+                    )
+                    .map_err(|error| error.to_string())?;
+            } else {
+                self.tx
+                    .execute(
+                        "UPDATE mc_memories SET status = 'archived', updated_at = ?1 WHERE id = ?2",
+                        params![now_ms, memory.id],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            append_memory_mutation_tx(
+                self.tx,
+                MemoryMutationAppend {
+                    project_path: &memory.project_path,
+                    mutation_type: "archive",
+                    target_memory_id: memory.id,
+                    superseded_by_id: None,
+                    category: None,
+                    new_content: None,
+                    queued_at: now_ms,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            archived.push(memory.id);
+        }
+        Ok(Some(archived))
+    }
+
+    pub fn merge_memories(
+        &self,
+        project_path: &str,
+        target_id: i64,
+        source_ids: &[i64],
+        merged_content: &str,
+        now_ms: i64,
+    ) -> Result<Option<StoredMemoryFull>, String> {
+        let Some(target) =
+            load_memory_full_tx(self.tx, target_id).map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        if target.project_path != project_path
+            || target.superseded_by_memory_id.is_some()
+            || !matches!(target.status.as_str(), "active" | "permanent")
+        {
+            return Ok(None);
+        }
+        let mut unique_sources = source_ids.to_vec();
+        unique_sources.sort_unstable();
+        unique_sources.dedup();
+        if unique_sources.is_empty()
+            || unique_sources.len() != source_ids.len()
+            || unique_sources.binary_search(&target_id).is_ok()
+        {
+            return Ok(None);
+        }
+        let mut source_rows = Vec::with_capacity(unique_sources.len());
+        for source_id in unique_sources {
+            let Some(source) =
+                load_memory_full_tx(self.tx, source_id).map_err(|error| error.to_string())?
+            else {
+                return Ok(None);
+            };
+            if source.project_path != project_path
+                || source.category != target.category
+                || source.superseded_by_memory_id.is_some()
+                || !matches!(source.status.as_str(), "active" | "permanent")
+            {
+                return Ok(None);
+            }
+            source_rows.push(source);
+        }
+        let normalized_hash = compute_normalized_memory_hash(merged_content);
+        let duplicate_id = self
+            .tx
+            .query_row(
+                "SELECT id FROM mc_memories
+                  WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
+                  LIMIT 1",
+                params![project_path, target.category, normalized_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(duplicate_id) = duplicate_id.filter(|duplicate_id| *duplicate_id != target_id) {
+            return Err(format!(
+                "memory content already exists as ID {duplicate_id}"
+            ));
+        }
+        let mut affected = Vec::with_capacity(source_rows.len() + 1);
+        affected.push(target.clone());
+        affected.extend(source_rows.iter().cloned());
+        let merged_from = merged_from_json(&affected);
+        let seen_count: i64 = affected.iter().map(|memory| memory.seen_count.max(0)).sum();
+        let retrieval_count: i64 = affected
+            .iter()
+            .map(|memory| memory.retrieval_count.max(0))
+            .sum();
+        let merged_status = if affected.iter().any(|memory| memory.status == "permanent") {
+            "permanent"
+        } else {
+            "active"
+        };
+        for source in &source_rows {
+            self.tx
+                .execute(
+                    "UPDATE mc_memories
+                        SET status = 'archived',
+                            superseded_by_memory_id = ?1,
+                            updated_at = ?2
+                      WHERE id = ?3",
+                    params![target_id, now_ms, source.id],
+                )
+                .map_err(|error| error.to_string())?;
+            append_memory_mutation_tx(
+                self.tx,
+                MemoryMutationAppend {
+                    project_path: &source.project_path,
+                    mutation_type: "superseded",
+                    target_memory_id: source.id,
+                    superseded_by_id: Some(target_id),
+                    category: None,
+                    new_content: None,
+                    queued_at: now_ms,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        self.tx
+            .execute(
+                "UPDATE mc_memories
+                    SET content = ?1,
+                        normalized_hash = ?2,
+                        seen_count = ?3,
+                        retrieval_count = ?4,
+                        merged_from = ?5,
+                        status = ?6,
+                        updated_at = ?7,
+                        shareable = 0,
+                        classified_at = NULL
+                  WHERE id = ?8",
+                params![
+                    merged_content,
+                    normalized_hash,
+                    seen_count,
+                    retrieval_count,
+                    merged_from,
+                    merged_status,
+                    now_ms,
+                    target_id,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        append_memory_mutation_tx(
+            self.tx,
+            MemoryMutationAppend {
+                project_path: &target.project_path,
+                mutation_type: "update",
+                target_memory_id: target_id,
+                superseded_by_id: None,
+                category: Some(&target.category),
+                new_content: Some(merged_content),
+                queued_at: now_ms,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        load_memory_full_tx(self.tx, target_id).map_err(|error| error.to_string())
+    }
+
+    pub fn insert_note(&self, input: NoteInput<'_>) -> Result<StoredNote, String> {
+        let content = input.content.trim();
+        if content.is_empty() {
+            return Err("note content must not be empty".to_string());
+        }
+        self.tx
+            .execute(
+                "INSERT INTO mc_notes
+                 (type, project_path, session_id, content, status, surface_condition,
+                  anchor_block_id, harness, created_at_ms, updated_at_ms)
+                 VALUES ('session', ?1, ?2, ?3, 'active', ?4, ?5, 'module', ?6, ?6)",
+                params![
+                    input.project_path,
+                    input.session_id,
+                    content,
+                    input.surface_condition,
+                    input.anchor_block_id,
+                    input.now_ms,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        load_note_tx(self.tx, self.tx.last_insert_rowid()).map_err(|error| error.to_string())
+    }
+
+    pub fn insert_project_note(&self, input: NoteWriteInput<'_>) -> Result<StoredNote, String> {
+        let content = input.content.trim();
+        if content.is_empty() {
+            return Err("note content must not be empty".to_string());
+        }
+        let status = if input
+            .surface_condition
+            .is_some_and(|condition| !condition.trim().is_empty())
+        {
+            "pending"
+        } else {
+            "active"
+        };
+        self.tx
+            .execute(
+                "INSERT INTO mc_notes
+                 (type, project_path, session_id, content, status, surface_condition,
+                  anchor_block_id, anchor_ordinal, harness, created_at_ms, updated_at_ms)
+                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?8)",
+                params![
+                    input.project_path,
+                    input.session_id,
+                    content,
+                    status,
+                    input
+                        .surface_condition
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty()),
+                    input.anchor_block_id,
+                    input.anchor_ordinal,
+                    input.now_ms,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        load_note_tx(self.tx, self.tx.last_insert_rowid()).map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_note_cas(
+        &self,
+        project_path: &str,
+        note_id: i64,
+        expected_status: &str,
+        expected_version: i64,
+        content: Option<&str>,
+        surface_condition: Option<Option<&str>>,
+        now_ms: i64,
+    ) -> Result<NoteCasOutcome, String> {
+        let current = load_note_tx(self.tx, note_id)
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(current) = current else {
+            return Ok(NoteCasOutcome::Conflict { current: None });
+        };
+        if current.project_path != project_path
+            || current.status != expected_status
+            || current.status_version != expected_version
+        {
+            return Ok(NoteCasOutcome::Conflict {
+                current: Some(current),
+            });
+        }
+        let next_content = content.map(str::trim).unwrap_or(&current.content);
+        if next_content.is_empty() {
+            return Ok(NoteCasOutcome::Conflict {
+                current: Some(current),
+            });
+        }
+        let condition_changed = surface_condition.is_some();
+        let next_condition = surface_condition
+            .flatten()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let next_status = if condition_changed && next_condition.is_some() {
+            "pending"
+        } else {
+            current.status.as_str()
+        };
+        let changed = self
+            .tx
+            .execute(
+                "UPDATE mc_notes SET content = ?1, surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
+                    status = ?4, status_version = status_version + 1, updated_at_ms = ?5,
+                    last_checked_at = CASE WHEN ?2 THEN NULL ELSE last_checked_at END,
+                    ready_at = CASE WHEN ?2 THEN NULL ELSE ready_at END,
+                    ready_reason = CASE WHEN ?2 THEN NULL ELSE ready_reason END,
+                    compiled_check = CASE WHEN ?2 THEN NULL ELSE compiled_check END,
+                    manifest_json = CASE WHEN ?2 THEN NULL ELSE manifest_json END,
+                    check_hash = CASE WHEN ?2 THEN NULL ELSE check_hash END,
+                    check_status = CASE WHEN ?2 THEN 'uncompiled' ELSE check_status END
+                  WHERE id = ?6 AND project_path = ?7 AND status = ?8 AND status_version = ?9",
+                params![
+                    next_content,
+                    condition_changed,
+                    next_condition,
+                    next_status,
+                    now_ms,
+                    note_id,
+                    project_path,
+                    expected_status,
+                    expected_version,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Ok(NoteCasOutcome::Conflict {
+                current: load_note_tx(self.tx, note_id)
+                    .optional()
+                    .map_err(|error| error.to_string())?,
+            });
+        }
+        Ok(NoteCasOutcome::Applied(
+            load_note_tx(self.tx, note_id).map_err(|error| error.to_string())?,
+        ))
+    }
+
+    pub fn dismiss_note(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        note_id: i64,
+        resolution: Option<&str>,
+        now_ms: i64,
+    ) -> Result<Option<StoredNote>, String> {
+        let Some(current) = load_note_tx(self.tx, note_id)
+            .optional()
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        if current.project_path != project_path
+            || current.session_id != session_id
+            || !matches!(
+                current.status.as_str(),
+                "active" | "pending" | "ready" | "surfacing" | "surfaced"
+            )
+        {
+            return Ok(None);
+        }
+        let resolution = resolution.map(str::trim).filter(|value| !value.is_empty());
+        let content = resolution
+            .map(|value| format!("{}\n\nResolution: {value}", current.content))
+            .unwrap_or_else(|| current.content.clone());
+        let changed = self
+            .tx
+            .execute(
+                "UPDATE mc_notes
+                    SET status = 'dismissed', content = ?1,
+                        status_version = status_version + 1, updated_at_ms = ?2,
+                        dismissed_at = ?2, dismissal_resolution = ?3
+                  WHERE id = ?4 AND project_path = ?5
+                    AND status = ?6 AND status_version = ?7",
+                params![
+                    content,
+                    now_ms,
+                    resolution,
+                    note_id,
+                    project_path,
+                    current.status,
+                    current.status_version,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(Some(
+            load_note_tx(self.tx, note_id).map_err(|error| error.to_string())?,
+        ))
+    }
+}
+
 pub struct McStore {
     inner: SqliteStore,
     /// The connection-local caller identity used by note ownership triggers. It is
@@ -4212,6 +4774,8 @@ pub struct McStore {
     facade_mutation_lock: Mutex<()>,
     #[cfg(any(test, feature = "test-support"))]
     abandon_historian_hook: AbandonHistorianHook,
+    #[cfg(any(test, feature = "test-support"))]
+    facade_mutation_abandon_hook: AbandonHistorianHook,
     #[cfg(any(test, feature = "test-support"))]
     authority_project_resolution_fail_once: std::sync::atomic::AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
@@ -4459,6 +5023,8 @@ impl McStore {
             #[cfg(any(test, feature = "test-support"))]
             abandon_historian_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
+            facade_mutation_abandon_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-support"))]
             authority_project_resolution_fail_once: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
             tag_number_query_count: std::sync::atomic::AtomicUsize::new(0),
@@ -4524,6 +5090,119 @@ impl McStore {
                     }
                 }
                 Ok(false)
+            })
+            .map_err(Into::into)
+    }
+
+    /// Execute a command-aware facade mutation in one fenced transaction. The operation callback
+    /// must return the exact response bytes that the caller would receive; those bytes are stored
+    /// before the transaction commits. A duplicate command returns the stored bytes without
+    /// invoking the callback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_facade_command(
+        &self,
+        route_project_root: &str,
+        caller_project: &str,
+        domain: &str,
+        identity_scope: &str,
+        tool: &str,
+        action: &str,
+        command_id: Option<&str>,
+        mutation: impl FnOnce(&FacadeMutationTxn<'_>) -> Result<Vec<u8>, String>,
+    ) -> Result<FacadeMutationOutcome, McStoreError> {
+        let _mutation_guard = self
+            .facade_mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_note_scope = self
+            .note_caller_project
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(caller_project.to_string());
+        let _note_scope_guard = FacadeNoteScopeGuard {
+            scope: &self.note_caller_project,
+            previous: previous_note_scope,
+        };
+        {
+            let mut scope = self
+                .facade_authority_scope
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *scope = Some(FacadeAuthorityScope {
+                owner: std::thread::current().id(),
+                route_project_root: route_project_root.to_string(),
+                domain: domain.to_string(),
+            });
+        }
+        let _scope_guard = FacadeMutationScopeGuard {
+            scope: &self.facade_authority_scope,
+        };
+        self.inner
+            .with_conn_fenced(|tx| {
+                if let Some(command_id) = command_id {
+                    let stored = tx
+                        .query_row(
+                            "SELECT response_json
+                               FROM mc_facade_mutation_ledger
+                              WHERE identity_scope = ?1 AND tool = ?2
+                                AND action = ?3 AND command_id = ?4",
+                            params![identity_scope, tool, action, command_id],
+                            |row| row.get::<_, Vec<u8>>(0),
+                        )
+                        .optional()?;
+                    if let Some(response) = stored {
+                        return Ok(FacadeMutationOutcome::Duplicate(response));
+                    }
+                }
+
+                let response = mutation(&FacadeMutationTxn { tx }).map_err(|error| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                        error,
+                    )))
+                })?;
+                if let Some(command_id) = command_id {
+                    let created_at_ms = current_time_ms();
+                    tx.execute(
+                        "INSERT INTO mc_facade_mutation_ledger
+                             (identity_scope, tool, action, command_id, response_json, created_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            identity_scope,
+                            tool,
+                            action,
+                            command_id,
+                            response,
+                            created_at_ms
+                        ],
+                    )?;
+                    // Keep only the newest 512 commands for each session identity. The command
+                    // key remains unique while it is retained; old outcomes are intentionally
+                    // forgettable because the host session has a bounded replay horizon.
+                    tx.execute(
+                        "DELETE FROM mc_facade_mutation_ledger
+                          WHERE identity_scope = ?1
+                            AND (created_at_ms, tool, action, command_id) IN (
+                                SELECT created_at_ms, tool, action, command_id
+                                  FROM mc_facade_mutation_ledger
+                                 WHERE identity_scope = ?1
+                                 ORDER BY created_at_ms DESC, tool DESC, action DESC, command_id DESC
+                                 LIMIT -1 OFFSET 512
+                            )",
+                        params![identity_scope],
+                    )?;
+                    #[cfg(any(test, feature = "test-support"))]
+                    if let Some(hook) = self
+                        .facade_mutation_abandon_hook
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .as_mut()
+                    {
+                        // This callback runs after both writes and before commit, allowing tests
+                        // to simulate a process abandoning the transaction at the crash window.
+                        hook();
+                    }
+                }
+                Ok(FacadeMutationOutcome::Applied(response))
             })
             .map_err(Into::into)
     }
@@ -4785,6 +5464,60 @@ impl McStore {
             .abandon_historian_hook
             .lock()
             .expect("abandon historian hook mutex") = Some(hook);
+    }
+
+    /// Install a test callback that runs after a facade mutation and its ledger row have both
+    /// been written, but before the enclosing fenced transaction commits. Panicking from the
+    /// callback exercises the crash window without allowing either half to persist.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_facade_mutation_abandon_hook(&self, hook: Box<dyn FnMut() + Send>) {
+        *self
+            .facade_mutation_abandon_hook
+            .lock()
+            .expect("facade mutation abandon hook mutex") = Some(hook);
+    }
+
+    /// Count retained command outcomes for one identity scope. This is intentionally a read-only
+    /// inspection API so retention tests do not need to reach through the store's connection.
+    pub fn facade_mutation_ledger_count(
+        &self,
+        identity_scope: &str,
+    ) -> Result<usize, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_facade_mutation_ledger WHERE identity_scope = ?1",
+                    params![identity_scope],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .map_err(Into::into)
+            .and_then(|count| {
+                usize::try_from(count)
+                    .map_err(|_| McStoreError::Serde("ledger count exceeds usize".to_string()))
+            })
+    }
+
+    pub fn facade_mutation_ledger_response(
+        &self,
+        identity_scope: &str,
+        tool: &str,
+        action: &str,
+        command_id: &str,
+    ) -> Result<Option<Vec<u8>>, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT response_json
+                       FROM mc_facade_mutation_ledger
+                      WHERE identity_scope = ?1 AND tool = ?2
+                        AND action = ?3 AND command_id = ?4",
+                    params![identity_scope, tool, action, command_id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+            })
+            .map_err(Into::into)
     }
 
     fn with_note_conn_fenced<T>(
@@ -13559,6 +14292,215 @@ mod tests {
     }
 
     #[test]
+    fn facade_mutation_command_replays_stored_response_without_reapplying() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:facade-replay";
+        let response =
+            b"{\"content\":[{\"type\":\"text\",\"text\":\"saved\"}],\"isError\":false}".to_vec();
+        let first = store
+            .with_facade_command(
+                "/route/facade-replay",
+                project,
+                "memories",
+                "session-facade-replay",
+                "ctx_memory",
+                "write",
+                Some("tool-use-1"),
+                |tx| {
+                    tx.insert_memory(insert_input(project, "CONSTRAINTS", "durable fact", 1))
+                        .map_err(|error| error.to_string())?;
+                    Ok(response.clone())
+                },
+            )
+            .unwrap();
+        assert_eq!(first, FacadeMutationOutcome::Applied(response.clone()));
+        let memory_count = |store: &McStore| {
+            store
+                .inner
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM mc_memories WHERE project_path = ?1",
+                        params![project],
+                        |row| row.get::<_, i64>(0),
+                    )
+                })
+                .unwrap()
+        };
+        let changefeed_count = |store: &McStore| {
+            store
+                .inner
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM mc_changefeed WHERE domain = 'memories'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                })
+                .unwrap()
+        };
+        assert_eq!(memory_count(&store), 1);
+        assert_eq!(changefeed_count(&store), 1);
+        let replay = store
+            .with_facade_command(
+                "/route/facade-replay",
+                project,
+                "memories",
+                "session-facade-replay",
+                "ctx_memory",
+                "write",
+                Some("tool-use-1"),
+                |_tx| panic!("duplicate must not enter the mutation callback"),
+            )
+            .unwrap();
+        assert_eq!(replay, FacadeMutationOutcome::Duplicate(response.clone()));
+        assert_eq!(memory_count(&store), 1);
+        assert_eq!(changefeed_count(&store), 1);
+        assert_eq!(
+            store
+                .facade_mutation_ledger_response(
+                    "session-facade-replay",
+                    "ctx_memory",
+                    "write",
+                    "tool-use-1",
+                )
+                .unwrap(),
+            Some(response)
+        );
+    }
+
+    #[test]
+    fn facade_mutation_command_accepts_missing_id_without_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:facade-legacy";
+        let outcome = store
+            .with_facade_command(
+                "/route/facade-legacy",
+                project,
+                "memories",
+                "session-facade-legacy",
+                "ctx_memory",
+                "write",
+                None,
+                |tx| {
+                    tx.insert_memory(insert_input(project, "CONSTRAINTS", "legacy caller", 1))
+                        .map_err(|error| error.to_string())?;
+                    Ok(b"{\"ok\":true}".to_vec())
+                },
+            )
+            .unwrap();
+        assert!(matches!(outcome, FacadeMutationOutcome::Applied(_)));
+        assert_eq!(
+            store
+                .facade_mutation_ledger_count("session-facade-legacy")
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.max_memory_id(&[project.to_string()]).unwrap(), 1);
+    }
+
+    #[test]
+    fn facade_mutation_command_rolls_back_mutation_and_ledger_at_crash_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:facade-crash";
+        store.set_facade_mutation_abandon_hook(Box::new(|| {
+            panic!("abandon facade mutation before commit");
+        }));
+        let abandoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.with_facade_command(
+                "/route/facade-crash",
+                project,
+                "memories",
+                "session-facade-crash",
+                "ctx_memory",
+                "write",
+                Some("crash-command"),
+                |tx| {
+                    tx.insert_memory(insert_input(project, "CONSTRAINTS", "must roll back", 1))
+                        .map_err(|error| error.to_string())?;
+                    Ok(b"{\"ok\":true}".to_vec())
+                },
+            )
+        }));
+        assert!(abandoned.is_err());
+        assert_eq!(
+            store
+                .facade_mutation_ledger_count("session-facade-crash")
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.max_memory_id(&[project.to_string()]).unwrap(), 0);
+        let memory_count: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_memories WHERE project_path = ?1",
+                    params![project],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(memory_count, 0);
+    }
+
+    #[test]
+    fn facade_mutation_ledger_retains_newest_512_per_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:facade-retention";
+        for index in 0..513 {
+            let command_id = format!("command-{index:03}");
+            store
+                .with_facade_command(
+                    "/route/facade-retention",
+                    project,
+                    "memories",
+                    "session-facade-retention",
+                    "ctx_memory",
+                    "write",
+                    Some(&command_id),
+                    |tx| {
+                        tx.insert_memory(insert_input(
+                            project,
+                            "CONSTRAINTS",
+                            &format!("fact {index}"),
+                            index,
+                        ))
+                        .map_err(|error| error.to_string())?;
+                        Ok(format!("{{\"index\":{index}}}").into_bytes())
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .facade_mutation_ledger_count("session-facade-retention")
+                .unwrap(),
+            512
+        );
+        assert!(store
+            .facade_mutation_ledger_response(
+                "session-facade-retention",
+                "ctx_memory",
+                "write",
+                "command-000",
+            )
+            .unwrap()
+            .is_none());
+        assert!(store
+            .facade_mutation_ledger_response(
+                "session-facade-retention",
+                "ctx_memory",
+                "write",
+                "command-512",
+            )
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
     fn zero_target_append_records_ledger_row_with_no_targets_disposition() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
@@ -14073,7 +15015,7 @@ mod tests {
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=40).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=41).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -16863,7 +17805,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=40).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=41).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)

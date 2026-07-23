@@ -41,7 +41,10 @@ import {
     resolveWorkspaceShareCategories,
     storedPathBelongsToWorkspace,
 } from "../../features/magic-context/workspaces";
-import { isRustAuthorityDrainingError } from "../../plugin/rust-tool-backends";
+import {
+    isRustAuthorityDrainingError,
+    toolCallIdFromContext,
+} from "../../plugin/rust-tool-backends";
 import { sessionLog } from "../../shared/logger";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_MEMORY_DESCRIPTION, CTX_MEMORY_TOOL_NAME, DEFAULT_SEARCH_LIMIT } from "./constants";
@@ -426,8 +429,10 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         return "Error: Rust memory authority is active, but this module transport does not support ctx_memory.";
                     }
                     try {
+                        const commandId = toolCallIdFromContext(toolContext);
                         const text = moduleMemoryText(
                             await memoryBackend({
+                                ...(commandId ? { commandId } : {}),
                                 sessionId: toolContext.sessionID,
                                 projectRoot: toolContext.directory,
                                 projectPath,
