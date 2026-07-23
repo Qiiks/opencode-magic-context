@@ -1559,6 +1559,7 @@ export function getTagsBySession(db: Database, sessionId: string): TagEntry[] {
 // apply-operations, heuristic-cleanup, nudger) should switch to these.
 
 const getActiveTagsBySessionStatements = new WeakMap<Database, PreparedStatement>();
+const getDroppedTagsBySessionStatements = new WeakMap<Database, PreparedStatement>();
 const getMaxDroppedTagNumberStatements = new WeakMap<Database, PreparedStatement>();
 
 function getActiveTagsBySessionStatement(db: Database): PreparedStatement {
@@ -1568,6 +1569,17 @@ function getActiveTagsBySessionStatement(db: Database): PreparedStatement {
             `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND status = 'active' ORDER BY tag_number ASC, id ASC`,
         );
         getActiveTagsBySessionStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function getDroppedTagsBySessionStatement(db: Database): PreparedStatement {
+    let stmt = getDroppedTagsBySessionStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND status = 'dropped' ORDER BY tag_number ASC, id ASC`,
+        );
+        getDroppedTagsBySessionStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -1598,6 +1610,15 @@ function getMaxDroppedTagNumberStatement(db: Database): PreparedStatement {
  */
 export function getActiveTagsBySession(db: Database, sessionId: string): TagEntry[] {
     const rows = getActiveTagsBySessionStatement(db).all(sessionId).filter(isTagRow);
+    return rows.map(toTagEntry);
+}
+
+/**
+ * Return only dropped tags for a session. The partial dropped-tag index avoids
+ * loading active and compacted history when a force seed only needs drop state.
+ */
+export function getDroppedTagsBySession(db: Database, sessionId: string): TagEntry[] {
+    const rows = getDroppedTagsBySessionStatement(db).all(sessionId).filter(isTagRow);
     return rows.map(toTagEntry);
 }
 
