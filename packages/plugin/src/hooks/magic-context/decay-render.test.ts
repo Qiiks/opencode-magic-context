@@ -1,9 +1,11 @@
 import { describe, expect, it } from "bun:test";
+import { computeBudgetPressure, renderedTier } from "./decay-curve";
 import {
     type DecayRenderCompartment,
     renderCompartmentAtTier,
     renderDecayedCompartments,
 } from "./decay-render";
+import { estimateTokens } from "./read-session-formatting";
 
 function legacyCompartment(i: number): DecayRenderCompartment {
     return {
@@ -13,6 +15,64 @@ function legacyCompartment(i: number): DecayRenderCompartment {
         content: "legacy summary",
         legacy: 1,
     };
+}
+
+function productionShapeCompartments(): DecayRenderCompartment[] {
+    const filler = "summary code decision result ";
+    return Array.from({ length: 52 }, (_, i) => ({
+        startMessage: i * 27 + 1,
+        endMessage: (i + 1) * 27,
+        title: `Work arc ${i}`,
+        content: "",
+        p1: `P1_ROW_${i} ${filler.repeat(80)}`,
+        p2: `P2_ROW_${i} ${filler.repeat(40)}`,
+        p3: `P3_ROW_${i} ${filler.repeat(20)}`,
+        p4: `P4_ROW_${i} ${filler.repeat(6)}`,
+        importance: 30 + (i % 70),
+        legacy: 0,
+    }));
+}
+
+function renderWithPreviousBudgetGuard(
+    compartments: DecayRenderCompartment[],
+    historyBudgetTokens: number,
+): { body: string; tiers: number[] } {
+    const total = compartments.length;
+    const pressure = computeBudgetPressure(
+        compartments.map((compartment, index) => ({
+            index: total - index,
+            importance: Math.max(1, Math.min(100, compartment.importance ?? 50)),
+        })),
+        historyBudgetTokens,
+    );
+    const tiers = compartments.map((compartment, index) =>
+        renderedTier(total - index, compartment.importance ?? 50, pressure, 0),
+    );
+    const render = (): string =>
+        compartments
+            .map((compartment, index) => renderCompartmentAtTier(compartment, tiers[index]))
+            .filter((part) => part.length > 0)
+            .join("\n\n");
+
+    let body = render();
+    let guard = compartments.length * 5;
+    while (historyBudgetTokens > 0 && estimateTokens(body) > historyBudgetTokens && guard > 0) {
+        const index = tiers.findIndex((tier) => tier < 5);
+        if (index < 0) break;
+        tiers[index] += 1;
+        body = render();
+        guard -= 1;
+    }
+    return { body, tiers };
+}
+
+function tiersFromRenderedBody(body: string, compartmentCount: number): number[] {
+    return Array.from({ length: compartmentCount }, (_, index) => {
+        for (let tier = 1; tier <= 4; tier += 1) {
+            if (body.includes(`P${tier}_ROW_${index} `)) return tier;
+        }
+        return 5;
+    });
 }
 
 describe("decay-render", () => {
@@ -209,5 +269,32 @@ describe("decay-render", () => {
         });
 
         expect(rendered.split("\n")).toContain("## 29-29 · v2 28");
+    });
+
+    it("matches the previous guard's tiers and bytes across production-shape budgets", () => {
+        const compartments = productionShapeCompartments();
+        const budgets = [
+            { name: "zero", tokens: 0 },
+            { name: "tight", tokens: 5_000 },
+            { name: "exact-fit", tokens: 4_931 },
+            { name: "loose", tokens: 60_000 },
+        ];
+
+        for (const budget of budgets) {
+            const previous = renderWithPreviousBudgetGuard(compartments, budget.tokens);
+            const rendered = renderDecayedCompartments({
+                compartments,
+                historyBudgetTokens: budget.tokens,
+            });
+
+            expect(rendered, `${budget.name} body`).toBe(previous.body);
+            expect(
+                tiersFromRenderedBody(rendered, compartments.length),
+                `${budget.name} tiers`,
+            ).toEqual(previous.tiers);
+            if (budget.name === "exact-fit") {
+                expect(estimateTokens(rendered)).toBe(budget.tokens);
+            }
+        }
     });
 });

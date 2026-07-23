@@ -192,36 +192,71 @@ export function renderDecayedCompartments(args: {
     if (compartments.length === 0) return "";
 
     const tiers = computeTiers(compartments, historyBudgetTokens);
+    const renderedByTier = compartments.map(() => new Array<string | undefined>(6));
+    const tokensByTier = compartments.map(() => new Array<number | undefined>(6));
 
+    const renderedAt = (index: number, tier: number): string => {
+        const cached = renderedByTier[index][tier];
+        if (cached !== undefined) return cached;
+        const rendered = renderOneCompartment(compartments[index], tier);
+        renderedByTier[index][tier] = rendered;
+        return rendered;
+    };
+    const tokensAt = (index: number, tier: number): number => {
+        const cached = tokensByTier[index][tier];
+        if (cached !== undefined) return cached;
+        const rendered = renderedAt(index, tier);
+        const tokens = rendered.length === 0 ? 0 : estimateTokens(rendered);
+        tokensByTier[index][tier] = tokens;
+        return tokens;
+    };
     const render = (): string => {
         const parts: string[] = [];
         for (let i = 0; i < compartments.length; i++) {
-            const rendered = renderOneCompartment(compartments[i], tiers[i]);
+            const rendered = renderedAt(i, tiers[i]);
             if (rendered.length > 0) parts.push(rendered);
         }
         return parts.join("\n\n");
     };
 
     let body = render();
-    // Budget guard: the curve already targets the budget, but estimate drift or
-    // a very tight budget can overshoot. Demote oldest-first until it fits.
-    // Uses the real Claude tokenizer (estimateTokens) — the SAME estimator as
-    // the materialize tightening loop and trim helpers — so a single budget is
-    // never measured by two different token counts (a char/N proxy here
-    // over-archived CJK/code content the tightening loop measured correctly).
+    if (historyBudgetTokens <= 0) return body;
+
+    // Sum memoized compartment counts while selecting tiers. A final joined-body
+    // check below accounts for separators and tokenizer effects at boundaries.
+    let runningTokens = 0;
+    for (let i = 0; i < tiers.length; i++) {
+        runningTokens += tokensAt(i, tiers[i]);
+    }
+
     let guard = compartments.length * 5;
-    while (historyBudgetTokens > 0 && estimateTokens(body) > historyBudgetTokens && guard > 0) {
-        let demoted = false;
-        for (let i = 0; i < tiers.length; i++) {
-            if (tiers[i] < 5) {
-                tiers[i] += 1;
-                demoted = true;
-                break;
-            }
+    let oldestDemotableIndex = 0;
+    const demoteOldest = (): boolean => {
+        while (oldestDemotableIndex < tiers.length && tiers[oldestDemotableIndex] >= 5) {
+            oldestDemotableIndex += 1;
         }
-        if (!demoted) break;
-        body = render();
+        if (oldestDemotableIndex >= tiers.length) return false;
+
+        const index = oldestDemotableIndex;
+        const previousTier = tiers[index];
+        const nextTier = previousTier + 1;
+        runningTokens += tokensAt(index, nextTier) - tokensAt(index, previousTier);
+        tiers[index] = nextTier;
+        return true;
+    };
+
+    while (runningTokens > historyBudgetTokens && guard > 0) {
+        if (!demoteOldest()) break;
         guard -= 1;
+    }
+
+    body = render();
+    let exactTokens = estimateTokens(body);
+    while (exactTokens > historyBudgetTokens && guard > 0) {
+        if (!demoteOldest()) break;
+        guard -= 1;
+        body = render();
+        exactTokens = estimateTokens(body);
     }
     return body;
 }
