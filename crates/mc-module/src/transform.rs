@@ -814,6 +814,10 @@ pub struct TransformTimings {
     #[serde(default)]
     pub store_commit: f64,
     #[serde(default)]
+    pub trigger_ms: f64,
+    #[serde(default)]
+    pub trigger_tokenized_blocks: usize,
+    #[serde(default)]
     pub post_attach: f64,
     #[serde(default)]
     pub response_encode: f64,
@@ -868,8 +872,9 @@ pub fn format_pass_timing_line(
          blocks_by_mid={:.1} build_frozen_unit_index={:.1} full_drop_tool_ids={:.1} \
          build_output={:.1} build_identity={:.1} build_identity_max={:.1} build_frozen_unit_scan={:.1} \
          build_cache_lookup={:.1} build_serialize_misses={:.1} build_tail_loop={:.1} \
-         divergence={:.1} store_commit={:.1} post_attach_ms={:.1} response_encode={response_encode_ms:.1} \
-         frozen_units={} tail_units_matched={} projection_blocks={} tail_messages_emitted={} \
+          divergence={:.1} store_commit={:.1} trigger_ms={:.1} trigger_tokenized_blocks={} \
+          post_attach_ms={:.1} response_encode={response_encode_ms:.1} frozen_units={} \
+          tail_units_matched={} projection_blocks={} tail_messages_emitted={} \
          build_identity_messages={} cache_hits={} cache_misses={} cache_dirty_skips={}",
         timings.total,
         timings.projection,
@@ -905,6 +910,8 @@ pub fn format_pass_timing_line(
         timings.build_tail_loop,
         timings.divergence,
         timings.store_commit,
+        timings.trigger_ms,
+        timings.trigger_tokenized_blocks,
         timings.post_attach,
         timings.frozen_units,
         timings.tail_units_matched,
@@ -7818,6 +7825,8 @@ mod tests {
         assert!(timings.todo >= 0.0);
         assert!(timings.build_output >= 0.0);
         assert!(timings.store_commit >= 0.0);
+        assert!(timings.trigger_ms >= 0.0);
+        assert_eq!(timings.trigger_tokenized_blocks, 0);
         assert!(timings.post_attach >= 0.0);
         assert_eq!(response.decision, "HARD");
         assert_eq!(response.materialize_reason.as_deref(), Some("first_render"));
@@ -7863,6 +7872,7 @@ mod tests {
             "build_tail_loop",
             "divergence",
             "store_commit",
+            "trigger_ms",
             "post_attach_ms",
             "response_encode",
         ] {
@@ -7872,6 +7882,7 @@ mod tests {
             "tag_mint_candidates",
             "tag_mint_new",
             "tag_mint_tokenized_bytes",
+            "trigger_tokenized_blocks",
             "frozen_units",
             "tail_units_matched",
             "projection_blocks",
