@@ -208,50 +208,78 @@ const SNAPSHOT_BOOLEAN = Symbol("boolean");
 const SNAPSHOT_NULL = Symbol("null");
 const SNAPSHOT_UNDEFINED = Symbol("undefined");
 
-function appendMessageContentFields(value: unknown, fields: MessageContentField[]): void {
-    if (value === null) {
-        fields.push(SNAPSHOT_NULL);
-        return;
-    }
+interface MessageContentFieldVisitor {
+    field(value: MessageContentField): boolean;
+    beginObject(): number | undefined;
+    endObject(token: number, entryCount: number): boolean;
+}
+
+function isSnapshotObjectChild(value: unknown): boolean {
+    return value !== undefined && typeof value !== "function" && typeof value !== "symbol";
+}
+
+function visitMessageContentFields(value: unknown, visitor: MessageContentFieldVisitor): boolean {
+    if (value === null) return visitor.field(SNAPSHOT_NULL);
     if (typeof value === "string") {
-        fields.push(SNAPSHOT_STRING, value);
-        return;
+        return visitor.field(SNAPSHOT_STRING) && visitor.field(value);
     }
     if (typeof value === "number") {
-        fields.push(SNAPSHOT_NUMBER, value);
-        return;
+        return visitor.field(SNAPSHOT_NUMBER) && visitor.field(value);
     }
     if (typeof value === "boolean") {
-        fields.push(SNAPSHOT_BOOLEAN, value);
-        return;
+        return visitor.field(SNAPSHOT_BOOLEAN) && visitor.field(value);
     }
     if (value === undefined || typeof value === "function" || typeof value === "symbol") {
-        fields.push(SNAPSHOT_UNDEFINED);
-        return;
+        return visitor.field(SNAPSHOT_UNDEFINED);
     }
     if (Array.isArray(value)) {
-        fields.push(SNAPSHOT_ARRAY, value.length);
-        for (const item of value) appendMessageContentFields(item, fields);
-        return;
+        if (!visitor.field(SNAPSHOT_ARRAY) || !visitor.field(value.length)) return false;
+        for (const item of value) {
+            if (!visitMessageContentFields(item, visitor)) return false;
+        }
+        return true;
     }
     if (typeof value === "object") {
-        const entries = Object.entries(value).filter(
-            ([, child]) =>
-                child !== undefined && typeof child !== "function" && typeof child !== "symbol",
-        );
-        fields.push(SNAPSHOT_OBJECT, entries.length);
-        for (const [key, child] of entries) {
-            fields.push(SNAPSHOT_KEY, key);
-            appendMessageContentFields(child, fields);
+        if (!visitor.field(SNAPSHOT_OBJECT)) return false;
+        const objectToken = visitor.beginObject();
+        if (objectToken === undefined) return false;
+        let entryCount = 0;
+        for (const key in value) {
+            if (!Object.hasOwn(value, key)) continue;
+            const child = (value as Record<string, unknown>)[key];
+            if (!isSnapshotObjectChild(child)) continue;
+            entryCount += 1;
+            if (
+                !visitor.field(SNAPSHOT_KEY) ||
+                !visitor.field(key) ||
+                !visitMessageContentFields(child, visitor)
+            ) {
+                return false;
+            }
         }
-        return;
+        return visitor.endObject(objectToken, entryCount);
     }
-    fields.push(SNAPSHOT_UNDEFINED);
+    return visitor.field(SNAPSHOT_UNDEFINED);
 }
 
 function messageContentFields(message: MessageLike): MessageContentField[] {
     const fields: MessageContentField[] = [];
-    appendMessageContentFields(message, fields);
+    const complete = visitMessageContentFields(message, {
+        field(value) {
+            fields.push(value);
+            return true;
+        },
+        beginObject() {
+            const countIndex = fields.length;
+            fields.push(0);
+            return countIndex;
+        },
+        endObject(countIndex, entryCount) {
+            fields[countIndex] = entryCount;
+            return true;
+        },
+    });
+    if (!complete) throw new Error("message content snapshot traversal stopped unexpectedly");
     return fields;
 }
 
@@ -280,11 +308,24 @@ function messageMatchesContentSnapshot(
     message: MessageLike,
     snapshot: MessageContentSnapshot,
 ): boolean {
-    const fields = messageContentFields(message);
-    return (
-        fields.length === snapshot.fields.length &&
-        fields.every((field, index) => Object.is(field, snapshot.fields[index]))
-    );
+    let fieldIndex = 0;
+    const matched = visitMessageContentFields(message, {
+        field(value) {
+            if (!Object.is(value, snapshot.fields[fieldIndex])) return false;
+            fieldIndex += 1;
+            return true;
+        },
+        beginObject() {
+            const expectedCount = snapshot.fields[fieldIndex];
+            if (typeof expectedCount !== "number") return undefined;
+            fieldIndex += 1;
+            return expectedCount;
+        },
+        endObject(expectedCount, entryCount) {
+            return expectedCount === entryCount;
+        },
+    });
+    return matched && fieldIndex === snapshot.fields.length;
 }
 
 function prefixContentSnapshotsMatch(
@@ -337,6 +378,7 @@ function newestUserMessage(messages: MessageLike[]): MessageLike | undefined {
 }
 
 interface RustPassTimings {
+    prefixGuard: number;
     ordinalResolve: number;
     stateSync: number;
     clone: number;
@@ -349,6 +391,7 @@ interface RustPassTimings {
 
 function emptyRustPassTimings(): RustPassTimings {
     return {
+        prefixGuard: 0,
         ordinalResolve: 0,
         stateSync: 0,
         clone: 0,
@@ -373,6 +416,7 @@ function formatRustPassLog(args: {
 }): string {
     const timings = args.timings ?? emptyRustPassTimings();
     const measured =
+        timings.prefixGuard +
         timings.ordinalResolve +
         timings.stateSync +
         timings.clone +
@@ -381,7 +425,7 @@ function formatRustPassLog(args: {
         timings.apply +
         timings.lkgSnapshot;
     const unattributed = Math.max(0, args.elapsedMs - measured);
-    return `rust pass: decision=${args.decision} reason=${args.reason} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} other:${unattributed.toFixed(1)}`;
+    return `rust pass: decision=${args.decision} reason=${args.reason} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} other:${unattributed.toFixed(1)}`;
 }
 
 function isSyntheticUserMessage(message: MessageLike | undefined): boolean {
@@ -1188,11 +1232,13 @@ export function createRustModeTransform(
                 // cover the tail; this covers in-place mutation of an older message (an
                 // ephemeral reminder wrapper, a late tool completion) which must force a
                 // full send instead of riding a stale-prefix delta.
+                const prefixGuardStartedAt = performance.now();
                 const prefixIntact = prefixContentSnapshotsMatch(
                     messages,
                     previousWireCache,
                     Math.max(0, previousWireCache.rawCount - 1),
                 );
+                logStage(sessionId, "prefixGuard", prefixGuardStartedAt, timings);
                 const lastChanged =
                     !appending && lastMessage !== undefined
                         ? messageCacheSignature(lastMessage) !== previousWireCache.rawLastSignature
@@ -1885,6 +1931,16 @@ export async function runRustModeTransform(
 export const __rustModeTransformTest = {
     applyNativeMessagesVerbatim,
     contentSnapshotsFor,
+    snapshotTags: {
+        array: SNAPSHOT_ARRAY,
+        object: SNAPSHOT_OBJECT,
+        key: SNAPSHOT_KEY,
+        string: SNAPSHOT_STRING,
+        number: SNAPSHOT_NUMBER,
+        boolean: SNAPSHOT_BOOLEAN,
+        null: SNAPSHOT_NULL,
+        undefined: SNAPSHOT_UNDEFINED,
+    },
     messageContentSnapshot,
     messageMatchesContentSnapshot,
     buildTransformBody,
