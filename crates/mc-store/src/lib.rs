@@ -2774,6 +2774,12 @@ pub struct McTagRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagNumberRow {
+    pub block_id: String,
+    pub tag_number: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Channel1AppendRow {
     pub block_id: String,
     pub reminder_text: String,
@@ -4098,6 +4104,8 @@ pub struct McStore {
     abandon_historian_hook: AbandonHistorianHook,
     #[cfg(any(test, feature = "test-support"))]
     authority_project_resolution_fail_once: std::sync::atomic::AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
+    tag_number_query_count: std::sync::atomic::AtomicUsize,
 }
 
 fn valid_drop_seed_block_id(block_id: &str) -> bool {
@@ -4336,6 +4344,8 @@ impl McStore {
             abandon_historian_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
             authority_project_resolution_fail_once: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
+            tag_number_query_count: std::sync::atomic::AtomicUsize::new(0),
         };
         store.repair_migration_30_authority_routes()?;
         store.prune_transform_session_roots()?;
@@ -5306,6 +5316,35 @@ impl McStore {
             }
             Ok(out)
         })?)
+    }
+
+    /// Load only the fields used to decide whether native reasoning is old enough to clear.
+    pub fn load_tag_numbers_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<TagNumberRow>, McStoreError> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.tag_number_query_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT block_id, tag_number FROM mc_tags
+                 WHERE session_id = ?1 ORDER BY tag_number ASC",
+            )?;
+            let rows = stmt.query_map(params![session_id], |row| {
+                Ok(TagNumberRow {
+                    block_id: row.get(0)?,
+                    tag_number: row.get(1)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn tag_number_query_count_for_test(&self) -> usize {
+        self.tag_number_query_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Sum stored token counts for a caller-selected block-id set.
@@ -12740,6 +12779,25 @@ mod tests {
         );
         let all = store.load_tags_for_session("ses").unwrap();
         assert_eq!(all.len(), 3);
+        assert_eq!(store.tag_number_query_count_for_test(), 0);
+        assert_eq!(
+            store.load_tag_numbers_for_session("ses").unwrap(),
+            vec![
+                TagNumberRow {
+                    block_id: "m1#0".to_string(),
+                    tag_number: 1,
+                },
+                TagNumberRow {
+                    block_id: "m2#0".to_string(),
+                    tag_number: 2,
+                },
+                TagNumberRow {
+                    block_id: "m3#0".to_string(),
+                    tag_number: 3,
+                },
+            ]
+        );
+        assert_eq!(store.tag_number_query_count_for_test(), 1);
         assert_eq!(
             all[0].token_count, 11,
             "token count is computed once at mint"
