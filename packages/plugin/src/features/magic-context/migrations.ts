@@ -2486,6 +2486,59 @@ const MIGRATIONS: Migration[] = [
             );
         },
     },
+    {
+        version: 67,
+        description: "converge message FTS deletions and same-ID source revisions",
+        up(db: Database): void {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS message_history_source (
+                    session_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    message_ordinal INTEGER NOT NULL,
+                    source_version TEXT NOT NULL,
+                    normalized_content_hash TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    harness TEXT NOT NULL DEFAULT 'opencode',
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(session_id, message_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_message_history_source_session_ordinal
+                    ON message_history_source(session_id, message_ordinal);
+
+                CREATE TABLE IF NOT EXISTS pending_session_cleanup (
+                    session_id TEXT PRIMARY KEY,
+                    harness TEXT NOT NULL DEFAULT 'opencode',
+                    requested_at INTEGER NOT NULL,
+                    last_attempt_at INTEGER
+                );
+
+                CREATE TABLE IF NOT EXISTS message_history_orphan_sweep (
+                    harness TEXT PRIMARY KEY,
+                    cursor_session_id TEXT NOT NULL DEFAULT '',
+                    last_swept_at INTEGER
+                );
+            `);
+            if (tableExists(db, "message_history_index")) {
+                const columns = new Set(
+                    (
+                        db.prepare("PRAGMA table_info(message_history_index)").all() as Array<{
+                            name: string;
+                        }>
+                    ).map((column) => column.name),
+                );
+                if (
+                    columns.has("session_id") &&
+                    columns.has("harness") &&
+                    columns.has("updated_at")
+                ) {
+                    db.exec(`
+                        CREATE INDEX IF NOT EXISTS idx_message_history_index_orphan_sweep
+                            ON message_history_index(harness, session_id, updated_at);
+                    `);
+                }
+            }
+        },
+    },
 ];
 
 /**

@@ -100,6 +100,9 @@ export {
     advanceToolReclaimWatermark,
     clearSession,
     getOrCreateSessionMeta,
+    markSessionCleanupPending,
+    type PendingSessionCleanupRetryResult,
+    retryPendingSessionCleanups,
     updateSessionMeta,
 } from "./storage-meta-session";
 export {

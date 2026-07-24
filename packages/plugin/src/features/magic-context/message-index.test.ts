@@ -53,6 +53,42 @@ describe("message-index", () => {
         expect(indexedRows(db, "ses-1")).toEqual([{ message_id: "m-1" }]);
     });
 
+    it("preserves an unrelated later dirty floor across a same-ID replacement", () => {
+        const original: RawMessage = {
+            ordinal: 1,
+            id: "m-edit-with-gap",
+            role: "user",
+            parts: [{ type: "text", text: "before edit" }],
+            version: 1,
+        };
+        const second: RawMessage = {
+            ordinal: 2,
+            id: "m-second",
+            role: "user",
+            parts: [{ type: "text", text: "second" }],
+            version: 1,
+        };
+        indexMessagesAfterOrdinal(db, "ses-edit-with-gap", [original, second], 0, 2);
+        markMessageIndexDirty(db, "ses-edit-with-gap", 3);
+
+        expect(
+            indexSingleMessage(db, "ses-edit-with-gap", {
+                ...original,
+                parts: [{ type: "text", text: "after edit" }],
+                version: 2,
+            }),
+        ).toBe(true);
+
+        expect(getDirtyIndexFloor(db, "ses-edit-with-gap")).toBe(3);
+        expect(
+            db
+                .prepare(
+                    "SELECT content FROM message_history_fts WHERE session_id = ? AND message_id = ?",
+                )
+                .get("ses-edit-with-gap", original.id),
+        ).toEqual({ content: "after edit" });
+    });
+
     it("preserves a dirty floor beyond a stale snapshot and fills it on the next pass", () => {
         const directory = mkdtempSync(join(tmpdir(), "message-index-gap-"));
         const dbPath = join(directory, "context.db");

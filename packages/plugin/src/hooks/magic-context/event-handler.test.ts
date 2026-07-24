@@ -19,6 +19,7 @@ import {
     incrementHistorianFailure,
     insertTag,
     openDatabase,
+    retryPendingSessionCleanups,
     setStrippedPlaceholderIds,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
@@ -859,6 +860,65 @@ describe("createEventHandler", () => {
         expect(getTagsBySession(openDatabase(), "ses-clean")).toHaveLength(0);
         expect(getMaxCompressionDepth(openDatabase(), "ses-clean")).toBe(0);
         expect(getOrCreateSessionMeta(openDatabase(), "ses-clean").isSubagent).toBe(false);
+    });
+
+    it("retries a failed deleted-session cleanup from its durable marker", async () => {
+        useTempDataHome("context-event-delete-retry-");
+        const deps = createDeps(new Map());
+        const handler = createEventHandler(deps);
+        insertTag(deps.db, "ses-delete-retry", "m-1", "message", 100, 1);
+        deps.db
+            .prepare(
+                "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, 1, 'm-1', 'user', 'private bytes')",
+            )
+            .run("ses-delete-retry");
+        deps.db
+            .prepare(
+                "INSERT INTO message_history_index (session_id, last_indexed_ordinal, updated_at) VALUES (?, 1, ?)",
+            )
+            .run("ses-delete-retry", Date.now());
+
+        const originalPrepare = deps.db.prepare.bind(deps.db);
+        let failCleanup = true;
+        (deps.db as unknown as { prepare: typeof deps.db.prepare }).prepare = ((sql: string) => {
+            if (failCleanup && sql === "DELETE FROM source_contents WHERE session_id = ?") {
+                failCleanup = false;
+                throw new Error("synthetic session cleanup failure");
+            }
+            return originalPrepare(sql);
+        }) as typeof deps.db.prepare;
+
+        await handler({
+            event: {
+                type: "session.deleted",
+                properties: { info: { id: "ses-delete-retry" } },
+            },
+        });
+
+        expect(
+            deps.db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM pending_session_cleanup WHERE session_id = ?",
+                )
+                .get("ses-delete-retry"),
+        ).toEqual({ count: 1 });
+        expect(countIndexedMessages("ses-delete-retry", "m-1")).toBe(1);
+
+        (deps.db as unknown as { prepare: typeof deps.db.prepare }).prepare = originalPrepare;
+        expect(retryPendingSessionCleanups(deps.db)).toEqual({
+            attempted: 1,
+            cleared: 1,
+            failedSessionIds: [],
+        });
+        expect(countIndexedMessages("ses-delete-retry", "m-1")).toBe(0);
+        expect(getTagsBySession(deps.db, "ses-delete-retry")).toHaveLength(0);
+        expect(
+            deps.db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM pending_session_cleanup WHERE session_id = ?",
+                )
+                .get("ses-delete-retry"),
+        ).toEqual({ count: 0 });
     });
 
     it("cleans up removed-message tags and indexed content", async () => {

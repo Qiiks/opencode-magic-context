@@ -22,12 +22,18 @@ function createTestDb(): Database {
     return db;
 }
 
-function message(id: string, ordinal: number, text: string): RawMessage {
+function message(
+    id: string,
+    ordinal: number,
+    text: string,
+    version: string | number | null = null,
+): RawMessage {
     return {
         id,
         ordinal,
         role: "user",
-        parts: [{ type: "text", text }],
+        parts: text.length > 0 ? [{ type: "text", text }] : [],
+        version,
     };
 }
 
@@ -140,20 +146,84 @@ describe("message-index-async", () => {
         expect(countMessageRows(db, "ses-overlap", "m-1")).toBe(1);
     });
 
-    it("does not reschedule a completed message and accepts an already-converted entry", async () => {
-        const converted = message("m-direct", 1, "direct source");
-        let fallbackReads = 0;
+    it("replays the same source revision without replacing its FTS row", async () => {
+        const converted = message("m-direct", 1, "direct source", 1);
         scheduleIncrementalIndex(db, "ses-watermark", converted.id, converted);
         await wait(140);
+        const before = db
+            .prepare(
+                "SELECT rowid FROM message_history_fts WHERE session_id = ? AND message_id = ?",
+            )
+            .get("ses-watermark", converted.id) as { rowid: number };
 
-        scheduleIncrementalIndex(db, "ses-watermark", converted.id, () => {
-            fallbackReads++;
-            return converted;
-        });
+        scheduleIncrementalIndex(db, "ses-watermark", converted.id, () => converted);
         await wait(140);
 
-        expect(fallbackReads).toBe(0);
+        const after = db
+            .prepare(
+                "SELECT rowid FROM message_history_fts WHERE session_id = ? AND message_id = ?",
+            )
+            .get("ses-watermark", converted.id) as { rowid: number };
+        expect(after.rowid).toBe(before.rowid);
         expect(countMessageRows(db, "ses-watermark", converted.id)).toBe(1);
+    });
+
+    it("re-indexes a terminal same-ID edit", async () => {
+        const original = message("m-edit", 1, "original searchable bytes", 1);
+        scheduleReconciliation(db, "ses-edit", () => [original]);
+        await wait(20);
+
+        const edited = message("m-edit", 1, "replacement searchable bytes", 2);
+        scheduleIncrementalIndex(db, "ses-edit", edited.id, edited);
+        await wait(140);
+
+        expect(searchMessageIds(db, "ses-edit", "original")).toEqual([]);
+        expect(searchMessageIds(db, "ses-edit", "replacement")).toEqual(["m-edit"]);
+        expect(countMessageRows(db, "ses-edit", "m-edit")).toBe(1);
+    });
+
+    it("deletes the indexed row when a same-ID message is redacted to empty", async () => {
+        const original = message("m-redact", 1, "secret redaction target", 1);
+        scheduleReconciliation(db, "ses-redact", () => [original]);
+        await wait(20);
+
+        const redacted = message("m-redact", 1, "", 2);
+        scheduleIncrementalIndex(db, "ses-redact", redacted.id, redacted);
+        await wait(140);
+
+        expect(searchMessageIds(db, "ses-redact", "secret")).toEqual([]);
+        expect(countMessageRows(db, "ses-redact", "m-redact")).toBe(0);
+    });
+
+    it("reconciles a same-ID replacement after its transaction fails", async () => {
+        const original = message("m-retry-edit", 1, "stale before retry", 1);
+        const edited = message("m-retry-edit", 1, "fresh after retry", 2);
+        scheduleReconciliation(db, "ses-retry-edit", () => [original]);
+        await wait(20);
+
+        const originalExec = db.exec.bind(db);
+        let failCommit = true;
+        (db as unknown as { exec: typeof db.exec }).exec = ((sql: string) => {
+            if (failCommit && sql === "COMMIT") {
+                failCommit = false;
+                throw new Error("synthetic replace commit failure");
+            }
+            return originalExec(sql);
+        }) as typeof db.exec;
+
+        scheduleIncrementalIndex(db, "ses-retry-edit", edited.id, edited);
+        await wait(140);
+        expect(getDirtyIndexFloor(db, "ses-retry-edit")).toBe(1);
+        expect(searchMessageIds(db, "ses-retry-edit", "stale")).toEqual(["m-retry-edit"]);
+        expect(searchMessageIds(db, "ses-retry-edit", "fresh")).toEqual([]);
+
+        (db as unknown as { exec: typeof db.exec }).exec = originalExec;
+        scheduleReconciliation(db, "ses-retry-edit", () => [edited]);
+        await wait(20);
+
+        expect(getDirtyIndexFloor(db, "ses-retry-edit")).toBeNull();
+        expect(searchMessageIds(db, "ses-retry-edit", "stale")).toEqual([]);
+        expect(searchMessageIds(db, "ses-retry-edit", "fresh")).toEqual(["m-retry-edit"]);
     });
 
     it("reconciles a failed incremental hole even after a later incremental success advanced the watermark", async () => {

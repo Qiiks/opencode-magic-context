@@ -39,7 +39,7 @@ describe("migration v53: Synapse embedding storage", () => {
                 DROP TABLE embedding_measurement_corpus;
                 DROP TABLE shadow_embedding_registrations;
                 DROP TABLE synapse_batch_ledger;
-                DELETE FROM schema_migrations WHERE version IN (53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66);
+                DELETE FROM schema_migrations WHERE version IN (53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67);
             `);
             runMigrations(db);
             db.prepare(
