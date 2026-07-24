@@ -2105,6 +2105,9 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         );
         m1Text = m1Render.text;
         m1Bytes = Buffer.from(m1Text, "utf8");
+        const visibleMemoryIds = [
+            ...new Set([...renderedMemoryIds, ...m1Render.renderedMemoryIds]),
+        ];
 
         persistCachedM0(options.db, options.sessionId, {
             m0Bytes,
@@ -2141,7 +2144,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             .prepare(
                 "UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ? WHERE session_id = ?",
             )
-            .run(renderedMemoryIds.length, JSON.stringify(renderedMemoryIds), options.sessionId);
+            .run(visibleMemoryIds.length, JSON.stringify(visibleMemoryIds), options.sessionId);
 
         // Persist the boundary the freshly-rendered m[0]+m[1] cover (the latest
         // compartment's end message id). A cold post-restart pass reads this to
@@ -2245,6 +2248,7 @@ function renderMemoryUpdatesBlock(args: {
 interface RenderM1Result {
     text: string;
     memoryUpdateCount: number;
+    renderedMemoryIds: number[];
 }
 
 function renderM1WithMetadata(
@@ -2349,12 +2353,20 @@ function renderM1WithMetadata(
     // facts reach the agent as promoted memories via the new-memories block
     // above (maxMemoryId watermark), not via a <session_facts> delta here.
 
+    const renderedNewMemoryIds = newMemoriesBlock
+        ? trimmedNewMemories.map((memory) => memory.id)
+        : [];
     if (blocks.length === 0) {
-        return { text: M1_EMPTY_PLACEHOLDER, memoryUpdateCount: memoryUpdates.count };
+        return {
+            text: M1_EMPTY_PLACEHOLDER,
+            memoryUpdateCount: memoryUpdates.count,
+            renderedMemoryIds: renderedNewMemoryIds,
+        };
     }
     return {
         text: `<session-history-since>\n${blocks.join("\n")}\n</session-history-since>`,
         memoryUpdateCount: memoryUpdates.count,
+        renderedMemoryIds: renderedNewMemoryIds,
     };
 }
 
@@ -2544,13 +2556,21 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
             const sibling = readCachedM0M1Row(options.db, options.sessionId);
             if (!sibling) throw new RenderM1InvalidMarkersError(options.sessionId);
             applyCachedRowToState(options.state, sibling);
-            return { text: replayCachedM1(options.state), memoryUpdateCount: 0 };
+            return {
+                text: replayCachedM1(options.state),
+                memoryUpdateCount: 0,
+                renderedMemoryIds: [],
+            };
         }
 
         const markers = markersFromCachedRow(row);
         if (!markers) throw new RenderM1InvalidMarkersError(options.sessionId);
-        const renderedMemoryIds = parseMemoryBlockIds(row.memory_block_ids);
-        const rendered = renderM1WithMetadata({ ...options }, markers, renderedMemoryIds);
+        const persistedVisibleIds = parseMemoryBlockIds(row.memory_block_ids);
+        // The snapshot watermark separates m[0] ids from post-snapshot m[1] ids,
+        // allowing each soft refresh to replace (rather than accumulate) m[1].
+        const renderedM0Ids = persistedVisibleIds.filter((id) => id <= markers.maxMemoryId);
+        const rendered = renderM1WithMetadata({ ...options }, markers, renderedM0Ids);
+        const visibleMemoryIds = [...new Set([...renderedM0Ids, ...rendered.renderedMemoryIds])];
         const m1Bytes = Buffer.from(rendered.text, "utf8");
         // Advance the persisted baseline boundary too: soft-refresh re-renders
         // m[1] to cover every compartment up to the latest, so the boundary the
@@ -2559,9 +2579,20 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
         const baselineEndMessageId = getLastCompartmentEndMessageId(options.db, options.sessionId);
         options.db
             .prepare(
-                "UPDATE session_meta SET cached_m1_bytes = ?, cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?",
+                `UPDATE session_meta
+                    SET cached_m1_bytes = ?,
+                        cached_m0_last_baseline_end_message_id = ?,
+                        memory_block_count = ?,
+                        memory_block_ids = ?
+                  WHERE session_id = ?`,
             )
-            .run(m1Bytes, baselineEndMessageId, options.sessionId);
+            .run(
+                m1Bytes,
+                baselineEndMessageId,
+                visibleMemoryIds.length,
+                JSON.stringify(visibleMemoryIds),
+                options.sessionId,
+            );
         options.db.exec("COMMIT");
         options.state.cachedM1Bytes = m1Bytes;
         options.state.snapshotMarkers = markers;
@@ -2809,7 +2840,11 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
                 materialized.snapshotMarkers,
                 materialized.m1Bytes,
             );
-            m1Render = { text: materialized.m1Text, memoryUpdateCount: 0 };
+            m1Render = {
+                text: materialized.m1Text,
+                memoryUpdateCount: 0,
+                renderedMemoryIds: [],
+            };
             rematerialized = true;
         } catch (error) {
             if (!(error instanceof MaterializeContentionError)) throw error;

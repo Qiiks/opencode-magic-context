@@ -3,6 +3,7 @@ import { estimateTokens } from "../../hooks/magic-context/read-session-formattin
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
+    _resetCompartmentChunkSearchCacheForTests,
     buildCanonicalChunkTextFromFts,
     CHUNK_WINDOW_SAFETY_RATIO,
     canonicalizeInMemoryChunkTextForEmbedding,
@@ -269,6 +270,67 @@ describe("compartment chunk embedding core", () => {
                 ),
             ).toHaveLength(0);
         } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("reuses decoded search vectors until the pool probe changes", () => {
+        const db = createDb();
+        try {
+            appendCompartments(db, "ses-cache", [
+                {
+                    sequence: 0,
+                    startMessage: 1,
+                    endMessage: 2,
+                    startMessageId: "u1",
+                    endMessageId: "a2",
+                    title: "Cached chunks",
+                    content: "P1 content",
+                    p1: "P1 content",
+                },
+            ]);
+            const compartment = getCompartments(db, "ses-cache")[0];
+            const [window] = chunkCanonicalText("[1] U: hello\n[2] A: world", 1, 2, 10_000);
+            const writeVector = (vector: Float32Array) =>
+                replaceCompartmentChunkEmbeddings(db, [
+                    {
+                        compartmentId: compartment.id,
+                        sessionId: "ses-cache",
+                        projectPath: "/repo/cache",
+                        window,
+                        modelId: "mock:model",
+                        vector,
+                    },
+                ]);
+
+            writeVector(new Float32Array([1, 0]));
+            const first = loadCompartmentChunkEmbeddingsForSearch(
+                db,
+                "ses-cache",
+                "/repo/cache",
+                "mock:model",
+            );
+            const cached = loadCompartmentChunkEmbeddingsForSearch(
+                db,
+                "ses-cache",
+                "/repo/cache",
+                "mock:model",
+            );
+            expect(cached).toBe(first);
+
+            // Replacement preserves the row count but advances the maximum id,
+            // so the cheap probe must invalidate the decoded pool.
+            writeVector(new Float32Array([0, 1]));
+            const replaced = loadCompartmentChunkEmbeddingsForSearch(
+                db,
+                "ses-cache",
+                "/repo/cache",
+                "mock:model",
+            );
+            expect(replaced).not.toBe(first);
+            expect([...replaced[0].vector]).toEqual([0, 1]);
+        } finally {
+            _resetCompartmentChunkSearchCacheForTests();
             closeQuietly(db);
         }
     });

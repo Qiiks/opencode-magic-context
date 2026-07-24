@@ -49,6 +49,20 @@ interface SearchChunkRow {
     vector: Uint8Array | ArrayBuffer;
 }
 
+interface SearchPoolProbeRow {
+    rowCount: number;
+    maxRowId: number | null;
+}
+
+interface DecodedSearchPoolEntry {
+    pool: Map<string, DecodedSearchPoolEntry>;
+    key: string;
+    rowCount: number;
+    maxRowId: number;
+    rows: StoredCompartmentChunkEmbedding[];
+    byteSize: number;
+}
+
 interface BackfillCandidateRow {
     id: number;
     sessionId: string;
@@ -108,7 +122,13 @@ const clearProjectStatements = new WeakMap<Database, PreparedStatement>();
 const clearProjectModelStatements = new WeakMap<Database, PreparedStatement>();
 const searchRowsStatements = new WeakMap<Database, PreparedStatement>();
 const searchRowsByModelStatements = new WeakMap<Database, PreparedStatement>();
+const searchPoolProbeStatements = new WeakMap<Database, PreparedStatement>();
 const backfillCandidateStatements = new WeakMap<Database, PreparedStatement>();
+
+const DECODED_SEARCH_POOL_CACHE_MAX_BYTES = 256 * 1024 * 1024;
+const decodedSearchPools = new WeakMap<Database, Map<string, DecodedSearchPoolEntry>>();
+const decodedSearchPoolLru = new Map<DecodedSearchPoolEntry, true>();
+let decodedSearchPoolBytes = 0;
 
 function getLoadFtsRowsStatement(db: Database): PreparedStatement {
     let stmt = loadFtsRowsStatements.get(db);
@@ -202,6 +222,22 @@ function getClearProjectModelStatement(db: Database): PreparedStatement {
     return stmt;
 }
 
+function getSearchPoolProbeStatement(db: Database): PreparedStatement {
+    let stmt = searchPoolProbeStatements.get(db);
+    if (!stmt) {
+        // idx_cce_project_model bounds this to one project/model pool, with the
+        // session predicate applied before aggregation. Excluding vector keeps
+        // steady-state searches from reading or decoding blobs.
+        stmt = db.prepare(
+            `SELECT COUNT(*) AS rowCount, MAX(id) AS maxRowId
+             FROM compartment_chunk_embeddings
+             WHERE session_id = ? AND project_path = ? AND model_id = ?`,
+        );
+        searchPoolProbeStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
 function getSearchRowsStatement(db: Database, withModel: boolean): PreparedStatement {
     const map = withModel ? searchRowsByModelStatements : searchRowsStatements;
     let stmt = map.get(db);
@@ -260,6 +296,102 @@ function getBackfillCandidateStatement(db: Database): PreparedStatement {
         backfillCandidateStatements.set(db, stmt);
     }
     return stmt;
+}
+
+function searchPoolKey(sessionId: string, projectPath: string, modelId: string): string {
+    return JSON.stringify([sessionId, projectPath, modelId]);
+}
+
+function getDecodedSearchPool(db: Database): Map<string, DecodedSearchPoolEntry> {
+    let pool = decodedSearchPools.get(db);
+    if (!pool) {
+        pool = new Map();
+        decodedSearchPools.set(db, pool);
+    }
+    return pool;
+}
+
+function removeDecodedSearchPoolEntry(entry: DecodedSearchPoolEntry): void {
+    if (entry.pool.get(entry.key) === entry) {
+        entry.pool.delete(entry.key);
+    }
+    if (decodedSearchPoolLru.delete(entry)) {
+        decodedSearchPoolBytes -= entry.byteSize;
+    }
+}
+
+function touchDecodedSearchPoolEntry(entry: DecodedSearchPoolEntry): void {
+    decodedSearchPoolLru.delete(entry);
+    decodedSearchPoolLru.set(entry, true);
+}
+
+function estimateDecodedSearchPoolBytes(rows: readonly StoredCompartmentChunkEmbedding[]): number {
+    let bytes = 0;
+    for (const row of rows) {
+        // Vectors dominate, but include a conservative allowance for the row
+        // object and UTF-16 metadata so the process-wide budget remains real.
+        bytes +=
+            row.vector.byteLength +
+            256 +
+            2 *
+                (row.sessionId.length +
+                    row.title.length +
+                    row.chunkHash.length +
+                    row.modelId.length);
+    }
+    return bytes;
+}
+
+function cacheDecodedSearchPool(
+    pool: Map<string, DecodedSearchPoolEntry>,
+    key: string,
+    rowCount: number,
+    maxRowId: number,
+    rows: StoredCompartmentChunkEmbedding[],
+): void {
+    const existing = pool.get(key);
+    if (existing) removeDecodedSearchPoolEntry(existing);
+
+    const entry: DecodedSearchPoolEntry = {
+        pool,
+        key,
+        rowCount,
+        maxRowId,
+        rows,
+        byteSize: estimateDecodedSearchPoolBytes(rows),
+    };
+    pool.set(key, entry);
+    decodedSearchPoolLru.set(entry, true);
+    decodedSearchPoolBytes += entry.byteSize;
+
+    while (decodedSearchPoolBytes > DECODED_SEARCH_POOL_CACHE_MAX_BYTES) {
+        const oldest = decodedSearchPoolLru.keys().next().value as
+            | DecodedSearchPoolEntry
+            | undefined;
+        if (!oldest) break;
+        removeDecodedSearchPoolEntry(oldest);
+    }
+}
+
+function invalidateDecodedSearchPools(
+    db: Database,
+    predicate: (keyParts: readonly [string, string, string]) => boolean,
+): void {
+    const pool = decodedSearchPools.get(db);
+    if (!pool) return;
+    for (const [key, entry] of [...pool.entries()]) {
+        const parsed = JSON.parse(key) as [string, string, string];
+        if (predicate(parsed)) removeDecodedSearchPoolEntry(entry);
+    }
+}
+
+/** Clear process-level decoded vectors between isolated test cases. */
+export function _resetCompartmentChunkSearchCacheForTests(): void {
+    for (const entry of [...decodedSearchPoolLru.keys()]) {
+        removeDecodedSearchPoolEntry(entry);
+    }
+    decodedSearchPoolLru.clear();
+    decodedSearchPoolBytes = 0;
 }
 
 function isFinitePositiveInteger(value: unknown): value is number {
@@ -701,6 +833,13 @@ export function replaceCompartmentChunkEmbeddings(
             );
         }
     })();
+    invalidateDecodedSearchPools(
+        db,
+        ([sessionId, projectPath, cachedModelId]) =>
+            sessionId === rows[0].sessionId &&
+            projectPath === rows[0].projectPath &&
+            cachedModelId === modelId,
+    );
 }
 
 export function getDistinctChunkEmbeddingModelIds(
@@ -716,10 +855,15 @@ export function clearChunkEmbeddingsForProject(
     projectPath: string,
     modelId?: string,
 ): number {
-    if (modelId) {
-        return getClearProjectModelStatement(db).run(projectPath, modelId).changes;
-    }
-    return getClearProjectStatement(db).run(projectPath).changes;
+    const changes = modelId
+        ? getClearProjectModelStatement(db).run(projectPath, modelId).changes
+        : getClearProjectStatement(db).run(projectPath).changes;
+    invalidateDecodedSearchPools(
+        db,
+        ([, cachedProjectPath, cachedModelId]) =>
+            cachedProjectPath === projectPath && (!modelId || cachedModelId === modelId),
+    );
+    return changes;
 }
 
 export function loadCompartmentChunkEmbeddingsForSearch(
@@ -731,12 +875,26 @@ export function loadCompartmentChunkEmbeddingsForSearch(
     if (!modelId) {
         throw new Error("loadCompartmentChunkEmbeddingsForSearch requires a current model id");
     }
+    const key = searchPoolKey(sessionId, projectPath, modelId);
+    const pool = getDecodedSearchPool(db);
+    const probe = getSearchPoolProbeStatement(db).get(sessionId, projectPath, modelId) as
+        | SearchPoolProbeRow
+        | undefined;
+    const rowCount = typeof probe?.rowCount === "number" ? probe.rowCount : 0;
+    const maxRowId = typeof probe?.maxRowId === "number" ? probe.maxRowId : 0;
+    const cached = pool.get(key);
+    if (cached && cached.rowCount === rowCount && cached.maxRowId === maxRowId) {
+        touchDecodedSearchPoolEntry(cached);
+        return cached.rows;
+    }
+    if (cached) removeDecodedSearchPoolEntry(cached);
+
     const rows = getSearchRowsStatement(db, true).all(
         sessionId,
         projectPath,
         modelId,
     ) as SearchChunkRow[];
-    return rows
+    const decodedRows = rows
         .filter(
             (row) =>
                 typeof row.compartmentId === "number" &&
@@ -766,6 +924,8 @@ export function loadCompartmentChunkEmbeddingsForSearch(
             dims: row.dims,
             vector: toFloat32Array(row.vector),
         }));
+    cacheDecodedSearchPool(pool, key, rowCount, maxRowId, decodedRows);
+    return decodedRows;
 }
 
 export function loadUnembeddedCompartmentChunkCandidates(
