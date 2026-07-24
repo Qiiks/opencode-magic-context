@@ -9133,10 +9133,95 @@ fn replay_dream_task_response(response_json: &str) -> HandlerOutcome {
     respond(response)
 }
 
+// SAFETY: Deliberate fault injection for the joint CC rig drive — see the `drive-fault`
+// feature note in Cargo.toml for why this ships in the binary at all.
+//
+// Why it exists: the claude-code-anthropic ("CC") transform leg carries no organic
+// traffic, so its mismatch / "raw-only fence" error paths — the consumer's reaction to a
+// response whose echoed fingerprint or message array does not match what it submitted —
+// can only be exercised by a rig drive. To induce those paths the drive needs OUR
+// transform response to be deliberately malformed; the CC-leg peer correctly refuses to
+// carry fault scaffolding on its own side, so the corruption lives here.
+//
+// Why it is safe: this whole block is compiled ONLY under `--features drive-fault`. A
+// default deploy build has no corruption path at all — that structural absence is the
+// dormancy proof, so there is no runtime-reachable arm a stray env var could trigger.
+// Even under the feature the arm is inert unless MC_DRIVE_FAULT selects it, and it is
+// scoped to transform responses only: respond_transform is the sole transform-response
+// serializer, and facade tools and status/wrapup ops never route through it.
+//
+// Maintenance rule: never add another fault arm without the same absence-proof note in
+// Cargo.toml and the fault-shape tests that pin the existing arms.
+#[cfg(feature = "drive-fault")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriveFault {
+    FingerprintSkew,
+    OmitCkMessages,
+}
+
+/// Map the raw MC_DRIVE_FAULT value to a fault arm. Pure (no env access) so the
+/// selection logic is unit-testable without mutating process-global env or the
+/// process-wide OnceLock below. Any unrecognized value — or no value — maps to None,
+/// which leaves the response untouched.
+#[cfg(feature = "drive-fault")]
+fn parse_drive_fault(raw: Option<&str>) -> Option<DriveFault> {
+    match raw {
+        Some("fingerprint_skew") => Some(DriveFault::FingerprintSkew),
+        Some("omit_ck_messages") => Some(DriveFault::OmitCkMessages),
+        _ => None,
+    }
+}
+
+/// The active fault arm, read from MC_DRIVE_FAULT once per process (first call wins via
+/// OnceLock — no per-request getenv on the transform hot path).
+#[cfg(feature = "drive-fault")]
+fn drive_fault() -> Option<DriveFault> {
+    use std::sync::OnceLock;
+    static FAULT: OnceLock<Option<DriveFault>> = OnceLock::new();
+    *FAULT.get_or_init(|| parse_drive_fault(std::env::var("MC_DRIVE_FAULT").ok().as_deref()))
+}
+
+/// Corrupt a transform response per the selected fault arm and log one loud WARN per
+/// fired fault so a forgotten MC_DRIVE_FAULT is impossible to miss in rig logs.
+#[cfg(feature = "drive-fault")]
+fn apply_drive_fault(response: &mut transform::TransformResponse, fault: DriveFault) {
+    match fault {
+        DriveFault::FingerprintSkew => {
+            // Echo a perturbed fingerprint so it fails any equality check against the
+            // submitted value. A response with no fingerprint still gets a non-empty
+            // sentinel so the echo cannot match a submitted empty/absent value.
+            let perturbed = match response.full_array_fingerprint.take() {
+                Some(fingerprint) => format!("{fingerprint}_skew"),
+                None => "_skew".to_string(),
+            };
+            response.full_array_fingerprint = Some(perturbed);
+            eprintln!(
+                "mc-module: WARN MC_DRIVE_FAULT=fingerprint_skew active — response deliberately corrupted for drive"
+            );
+        }
+        DriveFault::OmitCkMessages => {
+            // Drop ck_messages so it serializes ABSENT (the same skip_serializing_if arm
+            // need_full_sync uses) while keeping the ok status: a success-shaped response
+            // with the array field missing.
+            response.ck_messages = None;
+            eprintln!(
+                "mc-module: WARN MC_DRIVE_FAULT=omit_ck_messages active — response deliberately corrupted for drive"
+            );
+        }
+    }
+}
+
 fn respond_transform(
     session_id: &str,
     mut response: transform::TransformResponse,
 ) -> HandlerOutcome {
+    // drive-fault: corrupt the response before it is serialized (see the SAFETY note
+    // above the fault helpers). No-op unless the feature is compiled in AND MC_DRIVE_FAULT
+    // selects an arm; must run before ck_messages is taken for the streaming placeholder.
+    #[cfg(feature = "drive-fault")]
+    if let Some(fault) = drive_fault() {
+        apply_drive_fault(&mut response, fault);
+    }
     let response_encode_started_at = Instant::now();
     let pass_timings = response.timings.clone();
     let messages = response.ck_messages.take();
@@ -12660,6 +12745,72 @@ mod tests {
             panic!("cached transform response failed to encode");
         };
         assert_eq!(actual, expected);
+    }
+
+    // drive-fault fault-shape tests. These only exist under `--features drive-fault`
+    // (the same gate as the corruption path itself); a default build has neither the arm
+    // nor these tests. They exercise `apply_drive_fault`/`parse_drive_fault` directly
+    // rather than setting MC_DRIVE_FAULT, so they never touch process-global env or the
+    // process-wide OnceLock and stay deterministic alongside the rest of the suite.
+    #[test]
+    #[cfg(feature = "drive-fault")]
+    fn drive_fault_parse_maps_arms_and_ignores_unknown() {
+        assert_eq!(
+            parse_drive_fault(Some("fingerprint_skew")),
+            Some(DriveFault::FingerprintSkew)
+        );
+        assert_eq!(
+            parse_drive_fault(Some("omit_ck_messages")),
+            Some(DriveFault::OmitCkMessages)
+        );
+        // Unset, empty, and unrecognized values all leave the response untouched.
+        assert_eq!(parse_drive_fault(None), None);
+        assert_eq!(parse_drive_fault(Some("")), None);
+        assert_eq!(parse_drive_fault(Some("anything_else")), None);
+    }
+
+    #[test]
+    #[cfg(feature = "drive-fault")]
+    fn drive_fault_fingerprint_skew_perturbs_echoed_fingerprint() {
+        let submitted = "abc123".to_string();
+        let mut response = transform::TransformResponse::passthrough(
+            vec![ck("fp-skew", 1, "hello").ck],
+            Some(submitted.clone()),
+        );
+        apply_drive_fault(&mut response, DriveFault::FingerprintSkew);
+        // The echoed fingerprint must fail an equality check against the submitted value,
+        // while the response otherwise stays success-shaped (ok status, array present).
+        let echoed = response
+            .full_array_fingerprint
+            .clone()
+            .expect("fingerprint still echoed after skew");
+        assert_ne!(echoed, submitted);
+        assert_eq!(response.status, transform::TransformStatus::Ok);
+        assert!(response.ck_messages.is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "drive-fault")]
+    fn drive_fault_omit_ck_messages_absents_field_on_ok_status() {
+        let mut response = transform::TransformResponse::passthrough(
+            vec![ck("omit-ck", 1, "hello").ck],
+            Some("fingerprint".to_string()),
+        );
+        assert!(
+            response.ck_messages.is_some(),
+            "passthrough response carries ck_messages before the fault"
+        );
+        apply_drive_fault(&mut response, DriveFault::OmitCkMessages);
+        // Success-shaped (ok status retained) but with the ck_messages field ABSENT on the
+        // wire — the same skip_serializing_if arm need_full_sync uses.
+        assert_eq!(response.status, transform::TransformStatus::Ok);
+        assert!(response.ck_messages.is_none());
+        let value = serde_json::to_value(&response).unwrap();
+        assert!(
+            value.get("ck_messages").is_none(),
+            "ck_messages must be absent from the serialized response"
+        );
+        assert_eq!(value["status"], json!("ok"));
     }
 
     #[tokio::test(flavor = "current_thread")]
