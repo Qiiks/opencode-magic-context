@@ -286,7 +286,13 @@ export function applyCues(
                 );
                 continue;
             }
-            setMuralCue(args.db, entry.id, entry.cue.trim(), candidate.contentHash);
+            setMuralCue(
+                args.db,
+                args.projectIdentity,
+                entry.id,
+                entry.cue.trim(),
+                candidate.contentHash,
+            );
             compressed += 1;
         }
     });

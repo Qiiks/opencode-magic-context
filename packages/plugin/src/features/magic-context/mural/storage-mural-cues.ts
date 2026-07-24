@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import type { Database } from "../../../shared/sqlite";
+import { type Database, withPrivilegedWriter } from "../../../shared/sqlite";
 
 /**
  * Per-memory mural cue storage (v65). The compress-cues dreamer task writes one
@@ -9,9 +9,9 @@ import type { Database } from "../../../shared/sqlite";
  * hash-current ones and packs them deterministically at inject time.
  *
  * These are a LOCAL render cache derived from memory content — not a
- * module-mirrored authority column (the mural is TS-side; rust-mode m0 mural
- * injection is a later slice). Writes are therefore plain column updates, not
- * routed through the memory-authority guard.
+ * module-mirrored authority column. Authority triggers still guard every update
+ * to a managed memory row, so the narrow cache writer below uses an explicit
+ * privilege bracket without granting callers access to authoritative content.
  */
 
 /**
@@ -91,9 +91,25 @@ export function memoryNeedsCue(state: MuralCueState | undefined, currentContent:
  * next run. Cache-neutral: the mural is rendered on demand from these columns,
  * not injected as part of the m[0] baseline bytes.
  */
-export function setMuralCue(db: Database, id: number, cue: string, contentHash: string): void {
+export function setMuralCue(
+    db: Database,
+    projectPath: string,
+    id: number,
+    cue: string,
+    contentHash: string,
+): void {
     if (!hasMuralCueColumns(db)) return;
-    db.prepare(
-        "UPDATE memories SET mural_cue = ?, mural_cue_hash = ?, mural_cue_at = ? WHERE id = ?",
-    ).run(cue, contentHash, Date.now(), id);
+    withPrivilegedWriter(db, () => {
+        const owned = db
+            .prepare("SELECT 1 FROM memories WHERE id = ? AND project_path = ?")
+            .get(id, projectPath);
+        if (!owned) {
+            throw new Error(`Memory ${id} does not belong to project ${projectPath}`);
+        }
+        // Privilege is safe here because only derived cache columns are changed;
+        // authoritative memory content and identity fields are never writable here.
+        db.prepare(
+            "UPDATE memories SET mural_cue = ?, mural_cue_hash = ?, mural_cue_at = ? WHERE id = ? AND project_path = ?",
+        ).run(cue, contentHash, Date.now(), id, projectPath);
+    });
 }

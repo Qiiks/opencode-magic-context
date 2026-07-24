@@ -202,6 +202,35 @@ describe("authority-managed context.db schema", () => {
                 .run("/project", "CONSTRAINTS", "after", "hash"),
         ).toThrow(/managed by the Rust module/i);
     });
+
+    it("reinstalls the latest authority triggers after replaying a legacy batch", () => {
+        const db = freshDatabase();
+        const uuid = ensureContextStoreUuid(db);
+        installAuthorityManagedMarker(db, "/project", uuid);
+        db.prepare(
+            "INSERT INTO session_projects(session_id, harness, project_path, updated_at) VALUES (?, 'opencode', ?, 0)",
+        ).run("session", "/project");
+        db.exec(`
+            DROP TRIGGER notes_authority_guard_insert;
+            CREATE TRIGGER notes_authority_guard_insert
+            BEFORE INSERT ON notes
+            WHEN NEW.type = 'smart' AND NEW.project_path IS NOT NULL
+              AND EXISTS (SELECT 1 FROM authority_managed WHERE project_path = NEW.project_path)
+              AND COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0
+            BEGIN SELECT RAISE(ABORT, 'old smart-note-only guard'); END;
+            DELETE FROM schema_migrations WHERE version >= 61;
+        `);
+
+        runMigrations(db);
+
+        expect(() =>
+            db
+                .prepare(
+                    "INSERT INTO notes (type, status, content, session_id, created_at, updated_at) VALUES ('session', 'active', 'blocked after replay', ?, 0, 0)",
+                )
+                .run("session"),
+        ).toThrow(/managed by the Rust module/i);
+    });
 });
 
 describe("module changefeed mirror", () => {

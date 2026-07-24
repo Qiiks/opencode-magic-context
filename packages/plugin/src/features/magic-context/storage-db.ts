@@ -46,7 +46,7 @@ export function getSchemaFenceRejection(): {
     return lastSchemaFenceRejection;
 }
 
-export const LATEST_SUPPORTED_VERSION = 68;
+export const LATEST_SUPPORTED_VERSION = 69;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -645,12 +645,12 @@ export function initializeDatabase(db: Database): void {
       verification_status TEXT DEFAULT 'unverified',
       verified_at INTEGER,
       classified_at INTEGER,
-      mural_cue TEXT,
-      mural_cue_hash TEXT,
-      mural_cue_at INTEGER,
       superseded_by_memory_id INTEGER,
       merged_from TEXT,
       metadata_json TEXT,
+      mural_cue TEXT,
+      mural_cue_hash TEXT,
+      mural_cue_at INTEGER,
       UNIQUE(project_path, category, normalized_hash)
     );
 
@@ -765,6 +765,10 @@ export function initializeDatabase(db: Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_memory_mutation_log_project
       ON memory_mutation_log(project_path, id);
+    CREATE INDEX IF NOT EXISTS idx_memory_mutation_log_visibility
+      ON memory_mutation_log(project_path, category, id, target_memory_id);
+    CREATE INDEX IF NOT EXISTS idx_memory_mutation_log_target
+      ON memory_mutation_log(project_path, target_memory_id, id);
 
     CREATE TABLE IF NOT EXISTS dream_state (
       key TEXT PRIMARY KEY,
@@ -1026,8 +1030,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       -- pending_compaction_marker_state: intentionally NULLABLE without a
       -- default. Absence of a deferred marker is SQL NULL; presence is a
       -- valid JSON blob written via setPendingCompactionMarkerState.
-      -- Excluded from healNullTextColumns. Readers filter IS NOT NULL AND
-      -- != empty-string defensively. Plan v6 section 3.
+      -- Excluded from the healAllNullColumns fallback list. Readers filter
+      -- IS NOT NULL AND != empty-string defensively. Plan v6 section 3.
       pending_compaction_marker_state TEXT,
       -- Target OpenCode message id used to inject the current compaction marker.
       -- Nullable for legacy persisted markers; repaired on the next marker move.
@@ -1035,17 +1039,16 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       -- pending_pi_compaction_marker_state: intentionally NULLABLE without a
       -- default. Absence of a deferred Pi-native marker is SQL NULL; presence
       -- is a valid JSON blob written via setPendingPiCompactionMarkerState.
-      -- Excluded from healNullTextColumns.
+      -- Excluded from the healAllNullColumns fallback list.
       pending_pi_compaction_marker_state TEXT,
       new_work_tokens INTEGER NOT NULL DEFAULT 0,
       total_input_tokens INTEGER NOT NULL DEFAULT 0,
       -- deferred_execute_state: intentionally NULLABLE without a default.
       -- Absence is SQL NULL; presence is a JSON blob written via
-      -- setDeferredExecutePendingIfAbsent. Excluded from healNullTextColumns.
+      -- setDeferredExecutePendingIfAbsent. Excluded from the
+      -- healAllNullColumns fallback list.
       deferred_execute_state TEXT,
       cached_m0_bytes BLOB,
-      cached_m0_mural_data_url TEXT,
-      cached_m0_mural_hash TEXT,
       cached_m0_project_memory_epoch INTEGER,
       cached_m0_workspace_fingerprint TEXT,
       cached_m0_project_user_profile_version INTEGER,
@@ -1076,8 +1079,6 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       cached_m0_project_identity TEXT,
       cached_m0_last_baseline_end_message_id TEXT,
        upgrade_reminded_at INTEGER,
-       upgrade_reminder_last_sent_at INTEGER,
-       upgrade_reminder_count INTEGER NOT NULL DEFAULT 0,
        pi_stable_id_scheme INTEGER
     );
 
@@ -1398,18 +1399,18 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "emergency_recovery_origin", "TEXT DEFAULT ''");
     // Deferred compaction-marker drain (plan v6). Intentionally NO DEFAULT
     // clause — absence is SQL NULL, presence is a JSON blob. Reader must
-    // filter `IS NOT NULL AND != ''`. This column MUST NOT be added to
-    // `healNullTextColumns` (NULL is the load-bearing absence sentinel).
+    // filter `IS NOT NULL AND != ''`. This column MUST NOT be added to the
+    // healAllNullColumns fallback list (NULL is the load-bearing absence sentinel).
     ensureColumn(db, "session_meta", "pending_compaction_marker_state", "TEXT");
     // Pi-native deferred compaction marker queue. Intentionally NO DEFAULT;
     // NULL is the load-bearing absence sentinel and this column MUST NOT be
-    // added to healNullTextColumns.
+    // added to the healAllNullColumns fallback list.
     ensureColumn(db, "session_meta", "pending_pi_compaction_marker_state", "TEXT");
     ensureColumn(db, "session_meta", "new_work_tokens", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "total_input_tokens", "INTEGER NOT NULL DEFAULT 0");
     // Boundary-execution deferred intent (plan v8). Intentionally NO DEFAULT
     // clause — absence is SQL NULL, presence is a JSON blob. This column MUST
-    // NOT be added to `healNullTextColumns`.
+    // NOT be added to the healAllNullColumns fallback list.
     ensureColumn(db, "session_meta", "deferred_execute_state", "TEXT");
 
     ensureColumn(db, "compartments", "p1", "TEXT");
@@ -1436,8 +1437,6 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "memories", "mural_cue_at", "INTEGER");
     ensureColumn(db, "memory_verifications", "mapped_at", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "cached_m0_bytes", "BLOB");
-    ensureColumn(db, "session_meta", "cached_m0_mural_data_url", "TEXT");
-    ensureColumn(db, "session_meta", "cached_m0_mural_hash", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_project_memory_epoch", "INTEGER");
     ensureColumn(db, "session_meta", "cached_m0_workspace_fingerprint", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_project_user_profile_version", "INTEGER");
@@ -1488,8 +1487,11 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // ALTER in the Pi plugin.
     ensureColumn(db, "session_meta", "cached_m0_last_baseline_end_message_id", "TEXT");
     ensureColumn(db, "session_meta", "upgrade_reminded_at", "INTEGER");
+    // Keep migration order canonical: v66 reminder fields precede v67 mural cache fields.
     ensureColumn(db, "session_meta", "upgrade_reminder_last_sent_at", "INTEGER");
     ensureColumn(db, "session_meta", "upgrade_reminder_count", "INTEGER NOT NULL DEFAULT 0");
+    ensureColumn(db, "session_meta", "cached_m0_mural_data_url", "TEXT");
+    ensureColumn(db, "session_meta", "cached_m0_mural_hash", "TEXT");
 
     db.exec(`
       CREATE TABLE IF NOT EXISTS project_state (

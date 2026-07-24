@@ -35,7 +35,13 @@ function seedCuedMemory(
         sourceSessionId: "s",
     });
     setMemoryClassification(db, memory.id, { importance });
-    setMuralCue(db, memory.id, `cue-${memory.id}`, computeCueContentHash(content));
+    setMuralCue(
+        db,
+        memory.projectPath,
+        memory.id,
+        `cue-${memory.id}`,
+        computeCueContentHash(content),
+    );
     return memory;
 }
 
@@ -88,7 +94,13 @@ describe("resolveMural", () => {
                 sourceSessionId: "s",
             });
             setMemoryClassification(db, stale.id, { importance: 50 });
-            setMuralCue(db, stale.id, "stale cue", computeCueContentHash("OLD content"));
+            setMuralCue(
+                db,
+                stale.projectPath,
+                stale.id,
+                "stale cue",
+                computeCueContentHash("OLD content"),
+            );
 
             const entries = resolveMural(db, project, 1);
             const idsOut = entries.map((entry) => entry.id);

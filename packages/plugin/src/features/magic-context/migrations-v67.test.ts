@@ -5,10 +5,7 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
 import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
-import {
-    clearCachedM0M1,
-    persistCachedM0,
-} from "./storage-meta-shared";
+import { clearCachedM0M1, persistCachedM0 } from "./storage-meta-shared";
 import { clearSession, getOrCreateSessionMeta } from "./storage-meta-session";
 
 function columnNames(db: Database, table: string): Set<string> {
@@ -45,7 +42,6 @@ describe("migration v67: cached m0 mural payload", () => {
             runMigrations(db);
 
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
-            expect(LATEST_MIGRATION_VERSION).toBe(67);
             const columns = columnNames(db, "session_meta");
             expect(columns.has("cached_m0_mural_data_url")).toBe(true);
             expect(columns.has("cached_m0_mural_hash")).toBe(true);
@@ -89,7 +85,9 @@ describe("migration v67: cached m0 mural payload", () => {
 
             clearSession(db, sessionId);
             expect(
-                db.prepare("SELECT session_id FROM session_meta WHERE session_id = ?").get(sessionId),
+                db
+                    .prepare("SELECT session_id FROM session_meta WHERE session_id = ?")
+                    .get(sessionId),
             ).toBeNull();
         } finally {
             closeQuietly(db);

@@ -35,8 +35,7 @@ describe("migration v68: convergent message history", () => {
             initializeDatabase(db);
             runMigrations(db);
 
-            expect(LATEST_SUPPORTED_VERSION).toBe(68);
-            expect(LATEST_MIGRATION_VERSION).toBe(68);
+            expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
             expect(columnNames(db, "message_history_source")).toEqual([
                 "session_id",
                 "message_id",

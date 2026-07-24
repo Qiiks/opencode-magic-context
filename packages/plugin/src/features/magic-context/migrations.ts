@@ -66,6 +66,86 @@ function assertForeignKeyIntegrity(db: Database, table?: string): void {
     }
 }
 
+function authorityPrivilegeCheck(db: Database): string {
+    const native = db as unknown as {
+        function?: unknown;
+        createFunction?: unknown;
+    };
+    return typeof native.function === "function" || typeof native.createFunction === "function"
+        ? "mc_privileged_writer() = 0"
+        : "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0";
+}
+
+function managedAuthorityNoteRow(row: "OLD" | "NEW"): string {
+    return `(
+        EXISTS (SELECT 1 FROM authority_managed WHERE project_path = ${row}.project_path)
+        OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = ${row}.project_path)
+        OR EXISTS (
+            SELECT 1 FROM session_projects sp
+            JOIN authority_managed am ON am.project_path = sp.project_path
+            WHERE sp.session_id = ${row}.session_id
+        )
+        OR EXISTS (
+            SELECT 1 FROM session_projects sp
+            JOIN authority_repair_pending arp ON arp.project_path = sp.project_path
+            WHERE sp.session_id = ${row}.session_id
+        )
+    )`;
+}
+
+/** Install the latest authority fences after historical/recovery migration batches. */
+function installLatestAuthorityTriggers(db: Database): void {
+    const privilegeCheck = authorityPrivilegeCheck(db);
+    if (tableExists(db, "memories")) {
+        db.exec(`
+            DROP TRIGGER IF EXISTS memories_authority_guard_insert;
+            DROP TRIGGER IF EXISTS memories_authority_guard_update;
+            DROP TRIGGER IF EXISTS memories_authority_guard_delete;
+            CREATE TRIGGER memories_authority_guard_insert
+            BEFORE INSERT ON memories
+            WHEN (EXISTS (SELECT 1 FROM authority_managed WHERE project_path = NEW.project_path)
+               OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = NEW.project_path))
+              AND ${privilegeCheck}
+            BEGIN SELECT RAISE(ABORT, 'context.db memory writes are managed by the Rust module'); END;
+            CREATE TRIGGER memories_authority_guard_update
+            BEFORE UPDATE ON memories
+            WHEN (EXISTS (SELECT 1 FROM authority_managed WHERE project_path = OLD.project_path)
+               OR EXISTS (SELECT 1 FROM authority_managed WHERE project_path = NEW.project_path)
+               OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = OLD.project_path)
+               OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = NEW.project_path))
+              AND ${privilegeCheck}
+            BEGIN SELECT RAISE(ABORT, 'context.db memory writes are managed by the Rust module'); END;
+            CREATE TRIGGER memories_authority_guard_delete
+            BEFORE DELETE ON memories
+            WHEN (EXISTS (SELECT 1 FROM authority_managed WHERE project_path = OLD.project_path)
+               OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = OLD.project_path))
+              AND ${privilegeCheck}
+            BEGIN SELECT RAISE(ABORT, 'context.db memory writes are managed by the Rust module'); END;
+        `);
+    }
+    if (tableExists(db, "notes")) {
+        const managedOld = managedAuthorityNoteRow("OLD");
+        const managedNew = managedAuthorityNoteRow("NEW");
+        db.exec(`
+            DROP TRIGGER IF EXISTS notes_authority_guard_insert;
+            DROP TRIGGER IF EXISTS notes_authority_guard_update;
+            DROP TRIGGER IF EXISTS notes_authority_guard_delete;
+            CREATE TRIGGER notes_authority_guard_insert
+            BEFORE INSERT ON notes
+            WHEN ${managedNew} AND ${privilegeCheck}
+            BEGIN SELECT RAISE(ABORT, 'context.db note writes are managed by the Rust module'); END;
+            CREATE TRIGGER notes_authority_guard_update
+            BEFORE UPDATE ON notes
+            WHEN (${managedOld} OR ${managedNew}) AND ${privilegeCheck}
+            BEGIN SELECT RAISE(ABORT, 'context.db note writes are managed by the Rust module'); END;
+            CREATE TRIGGER notes_authority_guard_delete
+            BEFORE DELETE ON notes
+            WHEN ${managedOld} AND ${privilegeCheck}
+            BEGIN SELECT RAISE(ABORT, 'context.db note writes are managed by the Rust module'); END;
+        `);
+    }
+}
+
 const MIGRATIONS: Migration[] = [
     {
         version: 1,
@@ -551,8 +631,9 @@ const MIGRATIONS: Migration[] = [
             // background publish (compartment-runner-incremental) and the
             // next consuming pass (transform-postprocess-phase). Intentionally
             // declared WITHOUT `DEFAULT ''` so absence is signalled as SQL
-            // NULL — see `getSessionsWithPendingMarker` / `healNullTextColumns`
-            // contracts in storage-db.ts. Plan v6 §3.
+            // NULL — see `getSessionsWithPendingMarker` and the healAllNullColumns
+            // exclusion contract in storage-db.ts. NULL represents an absent marker,
+            // so the fallback healer must not populate this column.
             if (!cols.some((c) => c.name === "pending_compaction_marker_state")) {
                 db.exec("ALTER TABLE session_meta ADD COLUMN pending_compaction_marker_state TEXT");
             }
@@ -677,8 +758,8 @@ const MIGRATIONS: Migration[] = [
             }>;
             // Pi-native compaction marker queue. Intentionally declared
             // WITHOUT a DEFAULT so SQL NULL remains the absence sentinel,
-            // matching pending_compaction_marker_state and excluded from
-            // healNullTextColumns.
+            // matching pending_compaction_marker_state and excluded from the
+            // healAllNullColumns fallback list.
             if (!cols.some((c) => c.name === "pending_pi_compaction_marker_state")) {
                 db.exec(
                     "ALTER TABLE session_meta ADD COLUMN pending_pi_compaction_marker_state TEXT",
@@ -2209,10 +2290,6 @@ const MIGRATIONS: Migration[] = [
         version: 56,
         description: "record authority capture bounds and pending mirror references",
         up(db: Database): void {
-            // Guard-trigger recreation below targets the notes table, which mid-chain
-            // upgrade fixtures may not have created yet; v1's CREATE runs later in
-            // their replay and the fresh-DB path builds these triggers in storage-db.
-            const notesPresent = tableExists(db, "notes");
             db.exec(`
                 CREATE TABLE IF NOT EXISTS authority_capture_bounds (
                     project_path TEXT NOT NULL,
@@ -2240,46 +2317,7 @@ const MIGRATIONS: Migration[] = [
                     UNIQUE(context_row_id)
                 );
             `);
-            const native = db as unknown as {
-                function?: unknown;
-                createFunction?: unknown;
-            };
-            const privilegeCheck =
-                typeof native.function === "function" || typeof native.createFunction === "function"
-                    ? "mc_privileged_writer() = 0"
-                    : "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0";
-            const managed = (row: "OLD" | "NEW") => `(
-                EXISTS (SELECT 1 FROM authority_managed WHERE project_path = ${row}.project_path)
-                OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = ${row}.project_path)
-                OR EXISTS (
-                    SELECT 1 FROM session_projects sp
-                    JOIN authority_managed am ON am.project_path = sp.project_path
-                    WHERE sp.session_id = ${row}.session_id
-                )
-                OR EXISTS (
-                    SELECT 1 FROM session_projects sp
-                    JOIN authority_repair_pending arp ON arp.project_path = sp.project_path
-                    WHERE sp.session_id = ${row}.session_id
-                )
-            )`;
-            if (!notesPresent) return;
-            db.exec(`
-                DROP TRIGGER IF EXISTS notes_authority_guard_insert;
-                DROP TRIGGER IF EXISTS notes_authority_guard_update;
-                DROP TRIGGER IF EXISTS notes_authority_guard_delete;
-                CREATE TRIGGER notes_authority_guard_insert
-                BEFORE INSERT ON notes
-                WHEN ${managed("NEW")} AND ${privilegeCheck}
-                BEGIN SELECT RAISE(ABORT, 'context.db note writes are managed by the Rust module'); END;
-                CREATE TRIGGER notes_authority_guard_update
-                BEFORE UPDATE ON notes
-                WHEN (${managed("OLD")} OR ${managed("NEW")}) AND ${privilegeCheck}
-                BEGIN SELECT RAISE(ABORT, 'context.db note writes are managed by the Rust module'); END;
-                CREATE TRIGGER notes_authority_guard_delete
-                BEFORE DELETE ON notes
-                WHEN ${managed("OLD")} AND ${privilegeCheck}
-                BEGIN SELECT RAISE(ABORT, 'context.db note writes are managed by the Rust module'); END;
-            `);
+            installLatestAuthorityTriggers(db);
         },
     },
     {
@@ -2373,12 +2411,18 @@ const MIGRATIONS: Migration[] = [
         description: "retain complete memory snapshots for mirror healing",
         up(db: Database): void {
             // Existing live identities only retained category/hash, so force one bounded live
-            // resnapshot after this migration. Its complete snapshots heal rows clobbered by
-            // historical mapping feed records before normal incremental replay resumes.
+            // resnapshot after this migration. The schema_migrations row is the durable one-time
+            // marker: direct recovery replay must not re-arm a snapshot already completed at runtime.
             ensureColumn(db, "mirror_live_memory_rows", "full_row_snapshot", "TEXT");
             ensureColumn(db, "mirror_live_staging", "full_row_snapshot", "TEXT");
             db.prepare(
-                "UPDATE mirror_resnapshot_state SET status = 'pending_check', generation = NULL, updated_at = ? WHERE domain = 'memories' AND status = 'complete'",
+                `UPDATE mirror_resnapshot_state
+                    SET status = 'pending_check', generation = NULL, updated_at = ?
+                  WHERE domain = 'memories'
+                    AND status = 'complete'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM schema_migrations WHERE version = 61
+                    )`,
             ).run(Date.now());
         },
     },
@@ -2548,6 +2592,19 @@ const MIGRATIONS: Migration[] = [
             }
         },
     },
+    {
+        version: 69,
+        description: "index visibility mutation discovery and target loading",
+        up(db: Database): void {
+            if (!tableExists(db, "memory_mutation_log")) return;
+            db.exec(`
+                CREATE INDEX IF NOT EXISTS idx_memory_mutation_log_visibility
+                    ON memory_mutation_log(project_path, category, id, target_memory_id);
+                CREATE INDEX IF NOT EXISTS idx_memory_mutation_log_target
+                    ON memory_mutation_log(project_path, target_memory_id, id);
+            `);
+        },
+    },
 ];
 
 /**
@@ -2635,6 +2692,7 @@ export function runMigrations(db: Database): void {
     }
 
     let loggedPlan = false;
+    let touchedLegacyAuthorityBatch = false;
     while (true) {
         let migration: Migration | undefined;
         let currentVersion = 0;
@@ -2664,6 +2722,7 @@ export function runMigrations(db: Database): void {
                 .immediate();
 
             if (!applied || !migration) break;
+            if (migration.version <= 61) touchedLegacyAuthorityBatch = true;
             log(`[migrations] applied v${migration.version}: ${migration.description}`);
         } catch (error) {
             if (!migration && isSqliteLockError(error)) {
@@ -2691,6 +2750,16 @@ export function runMigrations(db: Database): void {
             );
             throw new Error(
                 `Migration v${version} failed: ${error instanceof Error ? error.message : String(error)}. Database may need manual repair.`,
+            );
+        }
+    }
+
+    if (touchedLegacyAuthorityBatch) {
+        try {
+            db.transaction(() => installLatestAuthorityTriggers(db)).immediate();
+        } catch (error) {
+            throw new Error(
+                `Migration authority-trigger postcondition failed: ${error instanceof Error ? error.message : String(error)}. Database may need manual repair.`,
             );
         }
     }

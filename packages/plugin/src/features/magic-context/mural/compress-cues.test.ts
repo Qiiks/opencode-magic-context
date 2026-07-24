@@ -4,6 +4,7 @@ import { describe, expect, test } from "bun:test";
 
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { ensureContextStoreUuid, installAuthorityManagedMarker } from "../context-authority";
 import { acquireLease } from "../dreamer/lease";
 import { getMemoryById, insertMemory, updateMemoryContent } from "../memory";
 import { computeNormalizedHash } from "../memory/normalize-hash";
@@ -156,9 +157,41 @@ describe("mural cue storage", () => {
                 sourceSessionId: "s",
             });
             const hash = computeCueContentHash("some fact");
-            setMuralCue(db, memory.id, "fact anchor", hash);
+            setMuralCue(db, memory.projectPath, memory.id, "fact anchor", hash);
             const state = getMuralCueState(db, [memory.id]).get(memory.id);
             expect(state).toEqual({ cue: "fact anchor", hash });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("writes only cue cache columns for an authority-managed memory", () => {
+        const db = freshDb();
+        try {
+            const memory = insertMemory(db, {
+                projectPath: "git:managed-cues",
+                category: "ARCHITECTURE",
+                content: "authoritative content",
+                sourceSessionId: "s",
+            });
+            const uuid = ensureContextStoreUuid(db);
+            installAuthorityManagedMarker(db, memory.projectPath, uuid);
+
+            const hash = computeCueContentHash(memory.content);
+            expect(() =>
+                setMuralCue(db, memory.projectPath, memory.id, "managed cue", hash),
+            ).not.toThrow();
+            expect(getMuralCueState(db, [memory.id]).get(memory.id)).toEqual({
+                cue: "managed cue",
+                hash,
+            });
+
+            expect(() =>
+                db
+                    .prepare("UPDATE memories SET content = ? WHERE id = ?")
+                    .run("forbidden edit", memory.id),
+            ).toThrow(/managed by the Rust module/i);
+            expect(getMemoryById(db, memory.id)?.content).toBe("authoritative content");
         } finally {
             closeQuietly(db);
         }
@@ -180,7 +213,13 @@ describe("mural cue storage", () => {
                 content: "old content",
                 sourceSessionId: "s",
             });
-            setMuralCue(db, memory.id, "old cue", computeCueContentHash("old content"));
+            setMuralCue(
+                db,
+                memory.projectPath,
+                memory.id,
+                "old cue",
+                computeCueContentHash("old content"),
+            );
             expect(getMuralCueState(db, [memory.id]).get(memory.id)?.cue).toBe("old cue");
 
             updateMemoryContent(db, memory.id, "new content", computeNormalizedHash("new content"));

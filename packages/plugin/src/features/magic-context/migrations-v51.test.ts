@@ -68,6 +68,65 @@ describe("migration v51 — durable backfill state and strict healing", () => {
         }
     });
 
+    test("coalesces all present NULL fallbacks in one table update", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec(`
+                CREATE TABLE session_meta (
+                    session_id TEXT PRIMARY KEY,
+                    cache_ttl TEXT,
+                    prior_boundary_ordinal INTEGER,
+                    memory_block_cache TEXT,
+                    memory_block_ids TEXT,
+                    memory_block_count INTEGER
+                );
+                INSERT INTO session_meta VALUES ('nulls', NULL, NULL, NULL, NULL, NULL);
+                INSERT INTO session_meta VALUES ('repair', '5m', 1, 'stale cache', '', 2);
+            `);
+            const preparedUpdates: string[] = [];
+            const originalPrepare = db.prepare.bind(db);
+            const observedDb = new Proxy(db, {
+                get(target, property) {
+                    if (property === "prepare") {
+                        return (sql: string) => {
+                            if (sql.startsWith("UPDATE session_meta")) preparedUpdates.push(sql);
+                            return originalPrepare(sql);
+                        };
+                    }
+                    const value = Reflect.get(target, property, target) as unknown;
+                    return typeof value === "function" ? value.bind(target) : value;
+                },
+            }) as DatabaseType;
+
+            healAllNullColumns(observedDb);
+
+            expect(preparedUpdates).toHaveLength(2);
+            expect(preparedUpdates[0]).toContain("cache_ttl = COALESCE(cache_ttl, ?)");
+            expect(
+                db
+                    .prepare(
+                        "SELECT cache_ttl, prior_boundary_ordinal, memory_block_cache, memory_block_ids, memory_block_count FROM session_meta WHERE session_id = 'nulls'",
+                    )
+                    .get(),
+            ).toEqual({
+                cache_ttl: "",
+                prior_boundary_ordinal: 1,
+                memory_block_cache: "",
+                memory_block_ids: "",
+                memory_block_count: 0,
+            });
+            expect(
+                db
+                    .prepare(
+                        "SELECT memory_block_cache FROM session_meta WHERE session_id = 'repair'",
+                    )
+                    .get(),
+            ).toEqual({ memory_block_cache: "" });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("non-schema healer errors roll back and leave v51 unrecorded", () => {
         const db = new Database(":memory:");
         try {
