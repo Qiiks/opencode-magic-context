@@ -10,7 +10,13 @@ import { getMemoryById, insertMemory, updateMemoryContent } from "../memory";
 import { computeNormalizedHash } from "../memory/normalize-hash";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
-import { applyCues, type CompressCuesArgs, runCompressCues } from "./compress-cues";
+import {
+    applyCues,
+    CHUNK_TIMEOUT_FLOOR_MS,
+    computeChunkSliceMs,
+    type CompressCuesArgs,
+    runCompressCues,
+} from "./compress-cues";
 import {
     computeCueContentHash,
     getMuralCueState,
@@ -45,6 +51,40 @@ function successfulCueClient(onPrompt?: () => void) {
     };
 }
 
+/** A client whose prompt always fails with the exact timeout error that
+ *  promptWithTimeout throws, so the chunk is classified as a timeout-class
+ *  failure (the kind that trips the consecutive-timeout circuit breaker). */
+function timeoutCueClient(onPrompt?: () => void) {
+    return {
+        session: {
+            create: async () => ({ data: { id: "cue-child" } }),
+            prompt: async () => {
+                onPrompt?.();
+                throw new Error("prompt timed out after 99997ms");
+            },
+            messages: async () => ({ data: [] }),
+            delete: async () => ({}),
+        },
+    };
+}
+
+/** A client whose prompt succeeds but returns output with no <cues> manifest,
+ *  so output validation fails. This is a VALIDATION-class failure (bad manifest),
+ *  which must NOT trip the timeout breaker — every chunk is still attempted. */
+function invalidOutputCueClient(onPrompt?: () => void) {
+    return {
+        session: {
+            create: async () => ({ data: { id: "cue-child" } }),
+            prompt: async () => {
+                onPrompt?.();
+                return {};
+            },
+            messages: async () => ({ data: assistantMessages("garbage without a cues root") }),
+            delete: async () => ({}),
+        },
+    };
+}
+
 function freshDb(): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
@@ -64,7 +104,10 @@ function cueArgs(db: Database, projectIdentity: string): CompressCuesArgs {
         sessionDirectory: process.cwd(),
         holderId,
         leaseKey,
-        deadline: Date.now() + 60_000,
+        // Comfortably above CHUNK_TIMEOUT_FLOOR_MS so the run loop actually
+        // attempts chunks instead of stopping at the floor guard. Tests that
+        // exercise the floor/deadline stops mutate this per case.
+        deadline: Date.now() + 600_000,
     };
 }
 
@@ -143,6 +186,118 @@ describe("runCompressCues disposition", () => {
         } finally {
             closeQuietly(db);
         }
+    });
+
+    test("stops banking progress when the remaining budget falls below the chunk floor", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:cues-floor-stop";
+            for (let index = 0; index < 41; index += 1) {
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content: `Cue fact ${index}.`,
+                    sourceSessionId: "ses",
+                });
+            }
+            const args = cueArgs(db, projectIdentity);
+            // First chunk succeeds and banks its 40 cues; the callback then drops
+            // the deadline to a value that is still > 0 but below the chunk floor,
+            // so the loop must stop at the floor guard (not the <= 0 guard) before
+            // attempting chunk 2.
+            args.client = successfulCueClient(() => {
+                args.deadline = Date.now() + 60_000; // > 0, < CHUNK_TIMEOUT_FLOOR_MS
+            }) as never;
+
+            const result = await runCompressCues(args);
+
+            expect(result.compressed).toBe(40);
+            expect(result.remaining).toBe(1);
+            expect(result.chunks).toBe(1);
+            expect(result.complete).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("two consecutive chunk timeouts trip the breaker; the third chunk is never attempted", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:cues-breaker";
+            // 120 memories = exactly 3 chunks of 40.
+            for (let index = 0; index < 120; index += 1) {
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content: `Cue fact ${index}.`,
+                    sourceSessionId: "ses",
+                });
+            }
+            const args = cueArgs(db, projectIdentity);
+            let promptCalls = 0;
+            args.client = timeoutCueClient(() => {
+                promptCalls += 1;
+            }) as never;
+
+            const result = await runCompressCues(args);
+
+            // The breaker trips after the 2nd consecutive timeout, so chunk 3 is
+            // never attempted: exactly 2 prompt calls, not 3.
+            expect(promptCalls).toBe(2);
+            expect(result.chunks).toBe(2);
+            expect(result.compressed).toBe(0);
+            expect(result.remaining).toBe(120);
+            expect(result.complete).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("validation failures do not trip the timeout breaker (every chunk still attempted)", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:cues-validation";
+            for (let index = 0; index < 120; index += 1) {
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content: `Cue fact ${index}.`,
+                    sourceSessionId: "ses",
+                });
+            }
+            const args = cueArgs(db, projectIdentity);
+            let promptCalls = 0;
+            args.client = invalidOutputCueClient(() => {
+                promptCalls += 1;
+            }) as never;
+
+            const result = await runCompressCues(args);
+
+            // Bad-manifest (validation) failures keep the per-chunk retry-next-run
+            // behavior: all 3 chunks are attempted, the run is not stopped early.
+            expect(promptCalls).toBe(3);
+            expect(result.chunks).toBe(3);
+            expect(result.compressed).toBe(0);
+            expect(result.complete).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("computeChunkSliceMs (chunk time floor)", () => {
+    test("applies the floor when the even split would be below it", () => {
+        // 12 chunks of a 1_200s budget → even split 100s < 240s floor → floor wins.
+        // This is the live failure shape: a 470-memory pool split into 12 chunks.
+        expect(computeChunkSliceMs(1_200_000, 12)).toBe(CHUNK_TIMEOUT_FLOOR_MS);
+    });
+
+    test("uses the even split when it already exceeds the floor", () => {
+        expect(computeChunkSliceMs(1_200_000, 2)).toBe(600_000);
+    });
+
+    test("never exceeds the remaining budget", () => {
+        expect(computeChunkSliceMs(300_000, 1)).toBe(300_000);
     });
 });
 
