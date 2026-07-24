@@ -35,7 +35,14 @@ import {
     resolveTrustedContextLimit,
 } from "./event-resolvers";
 import { replayLkg, resolveLkgModelKeys } from "./lkg-replay";
-import { captureSlot, dropSlot, getSlot, type LkgEntryNote, noteEntry } from "./lkg-slot";
+import {
+    captureSlot,
+    dropSlot,
+    getSlot,
+    type LkgEntryNote,
+    lkgContentDigest,
+    noteEntry,
+} from "./lkg-slot";
 import {
     type ModuleCompartmentMirrorResponse,
     type ModuleCompartmentReader,
@@ -911,6 +918,7 @@ export function createRustModeTransform(
         sessionMeta: ReturnType<typeof getOrCreateSessionMeta>,
     ) => Promise<void>;
     clearSession: (sessionId: string) => void;
+    invalidateWireState: (sessionId: string) => void;
     getState: (sessionId: string) => Readonly<RustSessionState>;
 } {
     const states = new Map<string, RustSessionState>();
@@ -959,15 +967,31 @@ export function createRustModeTransform(
         state.passesSincePark = 0;
         state.warningSent = true;
         const warning =
-            "Rust Magic Context is unavailable for this session; continuing with an unmodified prompt until the module recovers.";
+            "Rust Magic Context is unavailable for this session; retry after the module recovers.";
         sessionLog(sessionId, "rust transform parked after three consecutive failures");
         options.notifyParked?.(sessionId, warning);
+    };
+
+    const resetOrdinalMemo = (state: RustSessionState): void => {
+        state.idOrdinalMemo.clear();
+        state.ordinalMemoAnchor = null;
+        state.ordinalMemoStoredCount = null;
+        state.ordinalMemoCanonicalCount = 0;
+    };
+
+    const invalidateWireState = (sessionId: string): void => {
+        wireCaches.delete(sessionId);
+        const state = states.get(sessionId);
+        if (!state) return;
+        resetOrdinalMemo(state);
+        state.forceFullWire = true;
     };
 
     const replayLastGood = (
         sessionId: string,
         currentMessages: MessageLike[],
         output: { messages: unknown[] },
+        systemPromptTokens: number,
     ): boolean => {
         const slot = getSlot(sessionId);
         if (!slot) {
@@ -1010,6 +1034,47 @@ export function createRustModeTransform(
             sessionLog(sessionId, replay.reason);
             return false;
         }
+        const replayModel =
+            modelFromMessages(currentMessages) ?? findLastAssistantModelFromOpenCodeDb(sessionId);
+        const trustedReplayLimit = replayModel
+            ? resolveTrustedContextLimit(replayModel.providerID, replayModel.modelID, {
+                  db: deps.db,
+                  sessionID: sessionId,
+              })
+            : undefined;
+        let detectedReplayLimit = 0;
+        try {
+            detectedReplayLimit = getOverflowState(
+                deps.db,
+                sessionId,
+                keys.modelKey,
+            ).detectedContextLimit;
+        } catch {
+            // A limit read failure cannot admit cached bytes whose size is now unknown.
+            return false;
+        }
+        const replayLimit =
+            trustedReplayLimit ?? (detectedReplayLimit > 0 ? detectedReplayLimit : undefined);
+        if (replayLimit !== undefined && replayLimit > 0) {
+            try {
+                const estimate = estimateFinalWireInputTokens({
+                    messages: replay.messages,
+                    systemPromptTokens,
+                    providerID: replayModel?.providerID,
+                    modelID: replayModel?.modelID,
+                    agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                });
+                if (estimate.tokens > replayLimit) {
+                    sessionLog(
+                        sessionId,
+                        `lkg_over_context_limit estimated=${estimate.tokens} limit=${replayLimit}`,
+                    );
+                    return false;
+                }
+            } catch {
+                return false;
+            }
+        }
         replaceMessagesInPlace(output, replay.messages);
         sessionLog(sessionId, "lkg_replay_served");
         return true;
@@ -1019,21 +1084,25 @@ export function createRustModeTransform(
         sessionId: string,
         input: MessageLike[],
         response: Record<string, unknown>,
-    ): void => {
+    ): boolean => {
         const ids = input.map((message) => message.info.id);
         if (
             ids.some((id) => typeof id !== "string") ||
             new Set(ids).size !== ids.length ||
             ids.length === 0
-        )
-            return;
+        ) {
+            return false;
+        }
+        const inputContentDigests = input.map((message) => lkgContentDigest(message));
+        if (inputContentDigests.some((digest) => digest === null)) return false;
         const native = response.native_messages;
         const jsonPrefix = typeof native === "string" ? native : JSON.stringify(native);
-        if (typeof jsonPrefix !== "string") return;
+        if (typeof jsonPrefix !== "string") return false;
         const keys = resolveLkgModelKeys(input);
-        captureSlot(sessionId, {
+        return captureSlot(sessionId, {
             jsonPrefix,
             inputIdSeq: ids as string[],
+            inputContentDigests: inputContentDigests as string[],
             lastInputMessageId: ids[ids.length - 1] as string,
             modelKey: keys.modelKey,
             providerKey: keys.providerKey,
@@ -1068,11 +1137,52 @@ export function createRustModeTransform(
         let servedFrom = "none";
         let moduleElapsedMs = 0;
         let appliedAt: number | undefined;
-        let parkedEmergencyFailClosed = false;
+        let emergencyFailClosed = false;
         // Parking must not hide pressure from the recovery policy. Usage is cheap to read
         // and is the same value copied onto the module request when this pass runs.
         const passUsageSnapshot = loadContextUsage(deps.contextUsageMap, deps.db, sessionId);
         requestInputTokens = Math.max(0, Math.floor(passUsageSnapshot.inputTokens));
+        let preflightError: unknown;
+        let model = modelFromMessages(messages);
+        if (!model) {
+            try {
+                model = findLastAssistantModelFromOpenCodeDb(sessionId) ?? undefined;
+            } catch (error) {
+                preflightError = error;
+            }
+        }
+        const modelKey = model ? resolveModelKey(model.providerID, model.modelID) : null;
+        let resolvedContextLimit: number | undefined;
+        if (model) {
+            try {
+                resolvedContextLimit = resolveTrustedContextLimit(model.providerID, model.modelID, {
+                    db: deps.db,
+                    sessionID: sessionId,
+                });
+            } catch (error) {
+                preflightError ??= error;
+            }
+        }
+        let overflowState: ReturnType<typeof getOverflowState> | undefined;
+        try {
+            overflowState = getOverflowState(deps.db, sessionId, modelKey);
+        } catch (error) {
+            preflightError ??= error;
+        }
+        emergencyFailClosed =
+            passUsageSnapshot.percentage >= 95 &&
+            resolvedContextLimit !== undefined &&
+            resolvedContextLimit > 0;
+        if (overflowState) {
+            const detectedLimitMatchesModel =
+                overflowState.detectedContextLimitModelKey === null ||
+                overflowState.detectedContextLimitModelKey === modelKey;
+            emergencyFailClosed ||=
+                overflowState.needsEmergencyRecovery &&
+                overflowState.emergencyRecoveryOrigin === "provider_overflow" &&
+                overflowState.detectedContextLimit > 0 &&
+                detectedLimitMatchesModel;
+        }
         const finishPass = (applied: boolean, served = true): void => {
             const elapsedAt = applied && appliedAt !== undefined ? appliedAt : performance.now();
             const elapsedMs = Math.max(0, elapsedAt - passStartedAt);
@@ -1134,9 +1244,18 @@ export function createRustModeTransform(
             state.passesSincePark += 1;
             // The fifth live pass is the first retry opportunity after the
             // three-failure park; later retries use the same global cadence.
-            if (passUsageSnapshot.percentage < 90 && state.passCount % RUST_PROBE_INTERVAL !== 0) {
+            if (
+                !emergencyFailClosed &&
+                passUsageSnapshot.percentage < 90 &&
+                state.passCount % RUST_PROBE_INTERVAL !== 0
+            ) {
                 decision = "parked";
-                const replayed = replayLastGood(sessionId, messages, output);
+                const replayed = replayLastGood(
+                    sessionId,
+                    messages,
+                    output,
+                    sessionMeta.systemPromptTokens,
+                );
                 if (replayed) {
                     servedFrom = "lkg";
                 } else {
@@ -1152,30 +1271,18 @@ export function createRustModeTransform(
         // first persisted user message freezes the verdict for all later transform passes.
         const toolPresent = reduceAvailability.frozen && reduceAvailability.callable;
         try {
+            if (preflightError) throw preflightError;
+            if (!overflowState) throw new Error("rust overflow state unavailable");
             const { directory } = await getSessionDirectory(deps, sessionId);
-            const model =
-                modelFromMessages(messages) ?? findLastAssistantModelFromOpenCodeDb(sessionId);
-            const modelKey = model ? resolveModelKey(model.providerID, model.modelID) : null;
             if (model) deps.liveModelBySession?.set(sessionId, model);
             const usage = passUsageSnapshot;
             requestInputTokens = Math.max(0, Math.floor(usage.inputTokens));
-            const resolvedContextLimit = model
-                ? resolveTrustedContextLimit(model.providerID, model.modelID, {
-                      db: deps.db,
-                      sessionID: sessionId,
-                  })
-                : undefined;
             const contextLimit =
                 resolvedContextLimit && resolvedContextLimit > 0
                     ? resolvedContextLimit
                     : usage.percentage > 0
                       ? Math.round(usage.inputTokens / (usage.percentage / 100))
                       : 128_000;
-            parkedEmergencyFailClosed =
-                state.parked &&
-                usage.percentage >= 95 &&
-                resolvedContextLimit !== undefined &&
-                resolvedContextLimit > 0;
             const threshold = resolveExecuteThreshold(
                 deps.executeThresholdPercentage ?? 65,
                 modelKey ?? undefined,
@@ -1192,7 +1299,6 @@ export function createRustModeTransform(
             );
             const midTurn = isMidTurn(deps, sessionId);
             const requestObservedAtMs = Date.now();
-            const overflowState = getOverflowState(deps.db, sessionId, modelKey);
             const recoveryNoHeadEscape =
                 overflowState.needsEmergencyRecovery &&
                 loadProtectedTailMeta(deps.db, sessionId).recoveryNoEligibleHeadCount >=
@@ -1297,6 +1403,17 @@ export function createRustModeTransform(
                 timings,
                 wireDelta ? "mode=projection-tail" : "mode=projection-full",
             );
+            const provisionalBase = wireDelta
+                ? (() => {
+                      for (let index = wireDelta.rawStart - 1; index >= 0; index -= 1) {
+                          const priorId = messageIdOf(messages[index]);
+                          if (!priorId) continue;
+                          const prior = state.idOrdinalMemo.get(priorId);
+                          if (prior !== undefined) return prior;
+                      }
+                      return state.ordinalMemoCanonicalCount;
+                  })()
+                : undefined;
             const ordinalStartedAt = performance.now();
             let resolved = await resolveOrdinalsForModule({
                 sessionId,
@@ -1307,12 +1424,14 @@ export function createRustModeTransform(
                 memoAnchor: state.ordinalMemoAnchor,
                 memoStoredCount: state.ordinalMemoStoredCount,
                 memoCanonicalCount: state.ordinalMemoCanonicalCount,
+                provisionalBase,
             });
             logStage(sessionId, "ordinalResolve", ordinalStartedAt, timings);
-            if (!resolved.ok && wireDelta) {
-                // A cache miss or ordinal drift invalidates the delta assumption. Re-prime
-                // from the durable raw rows before deciding whether the pass can proceed.
+            if (!resolved.ok) {
+                // A removal or persistence race can invalidate every durable memo field.
+                // Retry once from a clean full-array prime on both delta and full attempts.
                 wireDelta = undefined;
+                resetOrdinalMemo(state);
                 const fullOrdinalStartedAt = performance.now();
                 resolved = await resolveOrdinalsForModule({
                     sessionId,
@@ -1321,6 +1440,7 @@ export function createRustModeTransform(
                     memoGeneration: state.idOrdinalMemoGeneration,
                     memo: state.idOrdinalMemo,
                     memoAnchor: state.ordinalMemoAnchor,
+                    memoStoredCount: state.ordinalMemoStoredCount,
                     memoCanonicalCount: state.ordinalMemoCanonicalCount,
                 });
                 logStage(
@@ -1328,7 +1448,7 @@ export function createRustModeTransform(
                     "ordinalResolve",
                     fullOrdinalStartedAt,
                     timings,
-                    "fallback=full",
+                    "fallback=clean_full",
                 );
             }
             if (!resolved.ok) {
@@ -1358,6 +1478,7 @@ export function createRustModeTransform(
                     : deps.projectPath;
             const stateSyncStartedAt = performance.now();
             const authoritySeqAdoption = { used: false };
+            let stateSyncRetryBusy = false;
             try {
                 await prepareRustMemoryAuthority({
                     db: deps.db,
@@ -1381,7 +1502,7 @@ export function createRustModeTransform(
                         };
                     }
                 }
-                await syncModuleState({
+                const stateSyncResult = await syncModuleState({
                     client: {
                         call: callModule,
                         stateSyncCapabilities: options.moduleClient.stateSyncCapabilities
@@ -1399,6 +1520,7 @@ export function createRustModeTransform(
                         authoritySeqAdoption,
                     },
                 });
+                stateSyncRetryBusy = stateSyncResult.status === "retry_busy";
             } finally {
                 logStage(sessionId, "stateSync", stateSyncStartedAt, timings);
             }
@@ -1518,7 +1640,7 @@ export function createRustModeTransform(
                 wireDelta = undefined;
                 // The delta-path ordinal resolve annotated only the tail slice;
                 // the full send must re-resolve the whole array.
-                const fullResolved = await resolveOrdinalsForModule({
+                let fullResolved = await resolveOrdinalsForModule({
                     sessionId,
                     messages,
                     generation: state.moduleGeneration,
@@ -1528,6 +1650,19 @@ export function createRustModeTransform(
                     memoStoredCount: state.ordinalMemoStoredCount,
                     memoCanonicalCount: state.ordinalMemoCanonicalCount,
                 });
+                if (!fullResolved.ok) {
+                    resetOrdinalMemo(state);
+                    fullResolved = await resolveOrdinalsForModule({
+                        sessionId,
+                        messages,
+                        generation: state.moduleGeneration,
+                        memoGeneration: state.idOrdinalMemoGeneration,
+                        memo: state.idOrdinalMemo,
+                        memoAnchor: state.ordinalMemoAnchor,
+                        memoStoredCount: state.ordinalMemoStoredCount,
+                        memoCanonicalCount: state.ordinalMemoCanonicalCount,
+                    });
+                }
                 if (!fullResolved.ok) {
                     throw new Error(
                         `rust ordinal ${fullResolved.reason} during delta-page full fallback`,
@@ -1620,7 +1755,7 @@ export function createRustModeTransform(
                 state.forceFullWire = true;
                 if (wireDelta) {
                     const retryOrdinalStartedAt = performance.now();
-                    const retryResolved = await resolveOrdinalsForModule({
+                    let retryResolved = await resolveOrdinalsForModule({
                         sessionId,
                         messages,
                         generation: state.moduleGeneration,
@@ -1637,6 +1772,19 @@ export function createRustModeTransform(
                         timings,
                         "retry=full",
                     );
+                    if (!retryResolved.ok) {
+                        resetOrdinalMemo(state);
+                        retryResolved = await resolveOrdinalsForModule({
+                            sessionId,
+                            messages,
+                            generation: state.moduleGeneration,
+                            memoGeneration: state.idOrdinalMemoGeneration,
+                            memo: state.idOrdinalMemo,
+                            memoAnchor: state.ordinalMemoAnchor,
+                            memoStoredCount: state.ordinalMemoStoredCount,
+                            memoCanonicalCount: state.ordinalMemoCanonicalCount,
+                        });
+                    }
                     if (!retryResolved.ok) {
                         throw new Error(`rust ordinal ${retryResolved.reason} during full retry`);
                     }
@@ -1795,7 +1943,10 @@ export function createRustModeTransform(
                 // in that window falls through LKG to a raw full-array serve. The
                 // first applied pass of a process seeds the slot unconditionally.
                 if (cacheBustingPass || !getSlot(sessionId)) {
-                    captureRustResponse(sessionId, messages, response);
+                    const captured = captureRustResponse(sessionId, messages, response);
+                    if (cacheBustingPass && !captured) {
+                        dropSlot(sessionId, "lkg_refresh_declined");
+                    }
                 }
                 logStage(
                     sessionId,
@@ -1825,8 +1976,10 @@ export function createRustModeTransform(
                     sessionLog(sessionId, "rust note delivery ack failed (will retry):", ackError);
                 }
             }
-            state.initialized = true;
-            state.seedPassPending = false;
+            if (!stateSyncRetryBusy) {
+                state.initialized = true;
+                state.seedPassPending = false;
+            }
             state.consecutiveFailures = 0;
             state.parked = false;
             state.passesSincePark = 0;
@@ -1922,20 +2075,24 @@ export function createRustModeTransform(
                     error,
                 );
             }
-            if (parkedEmergencyFailClosed) {
-                // A parked module cannot be allowed to replay stale cached bytes into a
-                // provider-proven overflow. Surface the established fail-closed error so
-                // the host aborts instead of sending a prompt that is guaranteed to 400.
+            if (emergencyFailClosed) {
+                // At 95% of a trusted limit, or while provider overflow recovery is armed,
+                // any adapter failure aborts. Parking controls retry cadence, not fallback admission.
                 markFailure(sessionId, state, error);
                 finishPass(false, false);
                 throw new EmergencyFailClosedError(
-                    "Rust Magic Context remained unavailable above 95% of a proven context limit",
+                    "Rust Magic Context was unavailable at a provider-proven context limit",
                     { cause: error },
                 );
             }
             // Validation happens before the caller-owned array is replaced, so the
             // original live array is still available for fail-open replay.
-            const replayed = replayLastGood(sessionId, messages, output);
+            const replayed = replayLastGood(
+                sessionId,
+                messages,
+                output,
+                sessionMeta.systemPromptTokens,
+            );
             if (!replayed) replaceMessagesInPlace(output, messages);
             servedFrom = replayed ? "lkg" : "raw";
             if (decision.toLowerCase() !== "need_full_sync") decision = "error";
@@ -1951,8 +2108,10 @@ export function createRustModeTransform(
         clearSession(sessionId: string): void {
             dropSlot(sessionId, "session-deleted");
             states.delete(sessionId);
+            wireCaches.delete(sessionId);
             options.moduleClient.closeSession?.(sessionId);
         },
+        invalidateWireState,
         getState(sessionId: string): Readonly<RustSessionState> {
             return {
                 ...ensureState(states, sessionId),

@@ -80,6 +80,8 @@ export async function resolveOrdinalsForModule(args: {
     memoAnchor?: RawMessageOrdinalAnchor | null;
     memoStoredCount?: number | null;
     memoCanonicalCount?: number;
+    /** Absolute ordinal immediately before a sliced unresolved tail. */
+    provisionalBase?: number;
 }): Promise<
     | {
           ok: true;
@@ -227,7 +229,10 @@ export async function resolveOrdinalsForModule(args: {
         }
     }
     if (suffixStart < annotated.length) {
-        const base = suffixStart > 0 ? (resolved[suffixStart - 1] as number) : -1;
+        const base =
+            suffixStart > 0
+                ? (resolved[suffixStart - 1] as number)
+                : Math.max(0, args.provisionalBase ?? canonicalCount);
         for (let index = suffixStart; index < annotated.length; index += 1) {
             resolved[index] = base + (index - suffixStart) + 1;
         }

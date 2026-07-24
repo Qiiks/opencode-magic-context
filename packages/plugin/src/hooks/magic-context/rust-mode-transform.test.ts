@@ -27,6 +27,7 @@ import { createMessagesTransformHandler } from "../../plugin/messages-transform"
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
+import { getSlot } from "./lkg-slot";
 import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
 import {
@@ -590,6 +591,56 @@ describe("Rust mode authority adapter", () => {
         expect(output.messages).toEqual(native);
     });
 
+    it("re-sends a full seed after historian busy while still applying the transform", async () => {
+        const sessionId = `rust-seed-busy-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const stateSyncBodies: Array<Record<string, unknown>> = [];
+        let rejectSeed = true;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "state_sync") {
+                    stateSyncBodies.push(body as Record<string, unknown>);
+                    if (rejectSeed) {
+                        rejectSeed = false;
+                        throw Object.assign(new Error("historian owns compartment snapshot"), {
+                            code: "historian_compartment_sync_busy",
+                        });
+                    }
+                    return { ok: true };
+                }
+                return method === "transform"
+                    ? { decision: "PASSTHROUGH", native_messages: makeMessages(sessionId) }
+                    : { ok: true };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const firstInput = makeMessages(sessionId);
+
+        await transform.run(
+            sessionId,
+            firstInput,
+            { messages: [...firstInput] },
+            makeMeta(db, sessionId),
+        );
+        expect(transform.getState(sessionId).initialized).toBe(false);
+        expect(transform.getState(sessionId).seedPassPending).toBe(true);
+
+        const secondInput = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            secondInput,
+            { messages: [...secondInput] },
+            makeMeta(db, sessionId),
+        );
+
+        expect(stateSyncBodies).toHaveLength(2);
+        expect(stateSyncBodies.every((body) => "seed_id" in body)).toBe(true);
+        expect(transform.getState(sessionId).initialized).toBe(true);
+        expect(transform.getState(sessionId).seedPassPending).toBe(false);
+    });
+
     it("fails after the second authority mismatch in one transform pass", async () => {
         const sessionId = `rust-adopt-once-${Date.now()}`;
         sessions.push(sessionId);
@@ -986,6 +1037,110 @@ describe("Rust mode authority adapter", () => {
         expect(output.messages).toEqual(native);
     });
 
+    it("re-primes all ordinal memo state after a durable message removal", async () => {
+        const sessionId = `rust-removal-reprime-${Date.now()}`;
+        sessions.push(sessionId);
+        const rows = [
+            { id: "m1", timeCreated: 1, contributesOrdinal: true, hasValidInfo: true },
+            { id: "m2", timeCreated: 2, contributesOrdinal: true, hasValidInfo: true },
+        ];
+        unregisters.push(
+            setRawMessageProvider(sessionId, {
+                readMessages: () => rows,
+                readMessageOrdinalPage: (after, limit) =>
+                    rows
+                        .filter(
+                            (row) =>
+                                !after ||
+                                row.timeCreated > after.timeCreated ||
+                                (row.timeCreated === after.timeCreated && row.id > after.id),
+                        )
+                        .slice(0, limit),
+                getStoredMessageCount: () => rows.length,
+            }),
+        );
+        const db = makeDb();
+        let transformCalls = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method === "transform") transformCalls += 1;
+                return method === "transform"
+                    ? { decision: "PASSTHROUGH", native_messages: [] }
+                    : { ok: true };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const messages = () =>
+            rows.map((row) => ({
+                info: { id: row.id, role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: row.id }],
+            }));
+        const initial = messages();
+        await transform.run(
+            sessionId,
+            initial,
+            { messages: [...initial] },
+            makeMeta(db, sessionId),
+        );
+
+        rows.splice(1, 1);
+        const afterRemoval = messages();
+        await transform.run(
+            sessionId,
+            afterRemoval,
+            { messages: [...afterRemoval] },
+            makeMeta(db, sessionId),
+        );
+
+        expect(transformCalls).toBe(2);
+        expect(transform.getState(sessionId).ordinalMemoStoredCount).toBe(1);
+        expect(transform.getState(sessionId).ordinalMemoCanonicalCount).toBe(1);
+        expect(transform.getState(sessionId).idOrdinalMemo).toEqual(new Map([["m1", 1]]));
+    });
+
+    it("clears Rust state, wire caches, and the transport route for a deleted session", async () => {
+        const sessionId = `rust-clear-session-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const transformBodies: Array<Record<string, unknown>> = [];
+        const closeSession = mock(() => {});
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform") transformBodies.push(body as Record<string, unknown>);
+                return method === "transform"
+                    ? { decision: "PASSTHROUGH", native_messages: [] }
+                    : { ok: true };
+            },
+            closeSession,
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        for (let pass = 0; pass < 2; pass += 1) {
+            const input = makeMessages(sessionId);
+            await transform.run(
+                sessionId,
+                input,
+                { messages: [...input] },
+                makeMeta(db, sessionId),
+            );
+        }
+        expect(transformBodies[1]?.tail_delta).toBeDefined();
+
+        transform.clearSession(sessionId);
+        expect(closeSession).toHaveBeenCalledWith(sessionId);
+        const afterClear = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            afterClear,
+            { messages: [...afterClear] },
+            makeMeta(db, sessionId),
+        );
+
+        expect(transformBodies[2]?.tail_delta).toBeUndefined();
+        expect(transformBodies[2]?.messages).toHaveLength(1);
+        expect(transform.getState(sessionId).passCount).toBe(1);
+    });
+
     it("keeps an 800-message steady-state pass on the incremental wire path", async () => {
         const sessionId = `rust-wire-delta-${Date.now()}`;
         sessions.push(sessionId);
@@ -1048,6 +1203,95 @@ describe("Rust mode authority adapter", () => {
             native_replace_from: 800,
         });
         expect(steadyElapsed).toBeLessThan(200);
+    });
+
+    it("serves raw instead of stale LKG after a stable-id content mutation", async () => {
+        const sessionId = `rust-lkg-content-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let failTransform = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                if (failTransform) throw new Error("daemon unavailable");
+                return {
+                    decision: "HARD",
+                    native_messages: [
+                        {
+                            info: { id: "m1", role: "user", sessionID: sessionId },
+                            parts: [{ type: "text", text: "captured stale content" }],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const input = makeMessages(sessionId);
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        expect(getSlot(sessionId)).toBeDefined();
+
+        (input[0]?.parts[0] as { text: string }).text = "same id, current content";
+        failTransform = true;
+        const output = { messages: [...input] as unknown[] };
+        await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+
+        expect(output.messages).toEqual(input);
+        expect((output.messages[0] as MessageLike).parts[0]).toEqual({
+            type: "text",
+            text: "same id, current content",
+        });
+        expect(getSlot(sessionId)).toBeUndefined();
+    });
+
+    it("drops the prior LKG slot when a successful cache-bust refresh is over budget", async () => {
+        const sessionId = `rust-lkg-refresh-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let pass = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                pass += 1;
+                return {
+                    decision: "HARD",
+                    native_messages: [
+                        {
+                            role: "assistant",
+                            parts: [
+                                {
+                                    type: "text",
+                                    text:
+                                        pass === 1
+                                            ? "small capture"
+                                            : "x".repeat(12 * 1024 * 1024 + 1_000),
+                                },
+                            ],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const firstInput = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            firstInput,
+            { messages: [...firstInput] },
+            makeMeta(db, sessionId),
+        );
+        expect(getSlot(sessionId)).toBeDefined();
+
+        const secondInput = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            secondInput,
+            { messages: [...secondInput] },
+            makeMeta(db, sessionId),
+        );
+
+        expect(getSlot(sessionId)).toBeUndefined();
     });
 
     it("passes through raw input, parks after three failures, then probes on the fifth pass", async () => {
@@ -1140,7 +1384,7 @@ describe("Rust mode authority adapter", () => {
         expect(transform.getState(sessionId).parked).toBe(true);
     });
 
-    it("fails closed when a parked module fails above 95% of a provider-proven limit", async () => {
+    it("fails closed on failures one through three above 95% of a provider-proven limit", async () => {
         const sessionId = `rust-park-fail-closed-${Date.now()}`;
         sessions.push(sessionId);
         const db = makeDb();
@@ -1175,27 +1419,163 @@ describe("Rust mode authority adapter", () => {
             },
         ] as MessageLike[];
 
-        for (let pass = 0; pass < 3; pass += 1) {
-            await transform.run(
-                sessionId,
-                input,
-                { messages: input as unknown[] },
-                makeMeta(db, sessionId),
-            );
+        for (let pass = 1; pass <= 3; pass += 1) {
+            const output = { messages: [...input] as unknown[] };
+            await expect(
+                transform.run(sessionId, input, output, makeMeta(db, sessionId)),
+            ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            expect(output.messages).toEqual(input);
+            expect(transformCalls).toBe(pass);
         }
         expect(transform.getState(sessionId).parked).toBe(true);
-        expect(transformCalls).toBe(3);
+    });
+
+    it("keeps below-95 failures on the existing fallback ladder", async () => {
+        const sessionId = `rust-below-fail-closed-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordDetectedContextLimit(db, sessionId, 100_000, "test-provider/test-model");
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method === "transform") throw new Error("daemon unavailable");
+                return { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.contextUsageMap.set(sessionId, {
+            usage: { inputTokens: 94_000, percentage: 94 },
+            updatedAt: Date.now(),
+        });
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = [
+            {
+                info: {
+                    id: "m1",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: "hello" }],
+            },
+        ] as MessageLike[];
+        const output = { messages: [...input] as unknown[] };
+
+        await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+
+        expect(output.messages).toEqual(input);
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(1);
+    });
+
+    it("aborts an overflow-armed failure instead of falling through refused LKG to raw", async () => {
+        const sessionId = `rust-overflow-fail-closed-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let failTransform = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                if (failTransform) throw new Error("daemon unavailable");
+                return {
+                    decision: "HARD",
+                    native_messages: [
+                        { role: "assistant", parts: [{ type: "text", text: "lkg" }] },
+                    ],
+                };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.contextUsageMap.set(sessionId, {
+            usage: { inputTokens: 30_000, percentage: 30 },
+            updatedAt: Date.now(),
+        });
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = [
+            {
+                info: {
+                    id: "m1",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: "current raw" }],
+            },
+        ] as MessageLike[];
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        expect(getSlot(sessionId)).toBeDefined();
+        recordOverflowDetected(db, sessionId, 100_000, "test-provider/test-model");
+        failTransform = true;
+        const output = { messages: [...input] as unknown[] };
 
         await expect(
-            transform.run(
-                sessionId,
-                input,
-                { messages: input as unknown[] },
-                makeMeta(db, sessionId),
-            ),
+            transform.run(sessionId, input, output, makeMeta(db, sessionId)),
         ).rejects.toBeInstanceOf(EmergencyFailClosedError);
-        expect(transformCalls).toBe(4);
-        expect(transform.getState(sessionId).parked).toBe(true);
+        expect(output.messages).toEqual(input);
+    });
+
+    it("refuses an LKG prefix plus pristine tail that exceeds the current limit", async () => {
+        const sessionId = `rust-lkg-limit-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordDetectedContextLimit(db, sessionId, 1_000, "test-provider/test-model");
+        let failTransform = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                if (failTransform) throw new Error("daemon unavailable");
+                return {
+                    decision: "HARD",
+                    native_messages: [
+                        {
+                            info: { id: "m1", role: "user", sessionID: sessionId },
+                            parts: [{ type: "text", text: "cached compact prefix" }],
+                        },
+                    ],
+                };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.contextUsageMap.set(sessionId, {
+            usage: { inputTokens: 100, percentage: 10 },
+            updatedAt: Date.now(),
+        });
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const firstInput = [
+            {
+                info: {
+                    id: "m1",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: "current prefix" }],
+            },
+        ] as MessageLike[];
+        const firstMeta = makeMeta(db, sessionId);
+        firstMeta.systemPromptTokens = 100;
+        await transform.run(sessionId, firstInput, { messages: [...firstInput] }, firstMeta);
+        expect(getSlot(sessionId)).toBeDefined();
+
+        const appended = [
+            ...firstInput,
+            {
+                info: { id: "m2", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: randomText(seededRandom(42), 20_000) }],
+            },
+        ] as MessageLike[];
+        failTransform = true;
+        const output = { messages: [...appended] as unknown[] };
+        const failureMeta = makeMeta(db, sessionId);
+        failureMeta.systemPromptTokens = 100;
+        await transform.run(sessionId, appended, output, failureMeta);
+
+        expect(output.messages).toEqual(appended);
+        expect((output.messages[0] as MessageLike).parts[0]).toEqual({
+            type: "text",
+            text: "current prefix",
+        });
     });
 });
 

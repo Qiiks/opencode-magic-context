@@ -835,7 +835,8 @@ describe("createEventHandler", () => {
         const deps = createDeps(contextUsageMap);
         const onCompacted = deps.compactionHandler.onCompacted;
         const taggerCleanup = deps.tagger.cleanup;
-        const handler = createEventHandler(deps);
+        const onSessionDeleted = mock(() => {});
+        const handler = createEventHandler({ ...deps, onSessionDeleted });
 
         insertTag(deps.db, "ses-clean", "m-1", "message", 100, 1);
         incrementCompressionDepth(deps.db, "ses-clean", 1, 3);
@@ -857,6 +858,7 @@ describe("createEventHandler", () => {
         expect(onCompacted).toHaveBeenCalledWith("ses-clean", expect.anything());
         expect(contextUsageMap.has("ses-clean")).toBe(false);
         expect(taggerCleanup).toHaveBeenCalledWith("ses-clean");
+        expect(onSessionDeleted).toHaveBeenCalledWith("ses-clean");
         expect(getTagsBySession(openDatabase(), "ses-clean")).toHaveLength(0);
         expect(getMaxCompressionDepth(openDatabase(), "ses-clean")).toBe(0);
         expect(getOrCreateSessionMeta(openDatabase(), "ses-clean").isSubagent).toBe(false);
@@ -924,7 +926,8 @@ describe("createEventHandler", () => {
     it("cleans up removed-message tags and indexed content", async () => {
         useTempDataHome("context-event-message-removed-tags-");
         const deps = createDeps(new Map());
-        const handler = createEventHandler(deps);
+        const onRustWireInvalidated = mock(() => {});
+        const handler = createEventHandler({ ...deps, onRustWireInvalidated });
         insertTag(deps.db, "ses-removed", "msg-removed:p0", "message", 32, 1);
         insertTag(deps.db, "ses-removed", "msg-removed:file1", "file", 48, 2);
         insertTag(deps.db, "ses-removed", "msg-keep:p0", "message", 64, 3);
@@ -974,6 +977,7 @@ describe("createEventHandler", () => {
         expect(countMessageIndexRows("ses-removed")).toBe(0);
         expect(isSessionReconciled("ses-removed")).toBe(false);
         expect(deps.tagger.cleanup).toHaveBeenCalledWith("ses-removed");
+        expect(onRustWireInvalidated).toHaveBeenCalledWith("ses-removed");
     });
 
     it("resets the reasoning watermark when removed tags exceed the remaining max tag", async () => {

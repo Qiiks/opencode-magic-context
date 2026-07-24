@@ -4,6 +4,7 @@ import {
     getSlot,
     type LkgEntryNote,
     type LkgSlot,
+    lkgContentDigest,
     noteEntry,
 } from "./lkg-slot";
 import { assertOpenAiCompatAdjacency } from "./openai-compat-adjacency";
@@ -45,6 +46,8 @@ export interface LkgEntryProjection {
     timeCreated: number | null;
     finish: unknown;
     hasIncompleteTool: boolean;
+    /** Compute the non-enumerable digest lazily so only LKG capture or replay validation hashes message content. */
+    contentDigest?: () => string | null;
 }
 
 export function projectLkgEntry(messages: MessageLike[]): LkgEntryProjection[] {
@@ -83,7 +86,7 @@ export function projectLkgEntry(messages: MessageLike[]): LkgEntryProjection[] {
             }
         }
         const id = info.id;
-        return {
+        const projection: LkgEntryProjection = {
             id: typeof id === "string" && id.length > 0 ? id : null,
             role: typeof info.role === "string" ? info.role : undefined,
             synthetic: info.synthetic === true,
@@ -91,6 +94,11 @@ export function projectLkgEntry(messages: MessageLike[]): LkgEntryProjection[] {
             finish: info.finish,
             hasIncompleteTool,
         };
+        Object.defineProperty(projection, "contentDigest", {
+            value: () => lkgContentDigest(message),
+            enumerable: false,
+        });
+        return projection;
     });
 }
 
@@ -106,6 +114,7 @@ export interface LkgCaptureInput {
 export type LkgValidationFailure =
     | "lkg_model_mismatch"
     | "lkg_invalidated_reshape"
+    | "lkg_content_mismatch"
     | "lkg_unsafe_seam"
     | "lkg_seam_invalid"
     | "lkg_anthropic_reasoning_run_invalid";
@@ -244,6 +253,7 @@ export function buildLkgPrefix(
     anchorIndex: number;
     anchorMessageId: string;
     inputIdSeq: string[];
+    inputContentDigests: string[];
     jsonPrefix: string;
 } | null {
     const projected = asEntryProjection(input);
@@ -254,6 +264,10 @@ export function buildLkgPrefix(
     const validIds = ids as string[];
     if (new Set(validIds).size !== validIds.length) return null;
     const anchorMessageId = validIds[anchorIndex];
+    const inputContentDigests = projected
+        .slice(0, anchorIndex + 1)
+        .map((message) => message.contentDigest?.() ?? null);
+    if (inputContentDigests.some((digest) => digest === null)) return null;
     const inputIndexById = new Map(validIds.map((id, index) => [id, index]));
     const prefix: MessageLike[] = [];
     for (const message of output) {
@@ -272,6 +286,7 @@ export function buildLkgPrefix(
         anchorIndex,
         anchorMessageId,
         inputIdSeq: validIds.slice(0, anchorIndex + 1),
+        inputContentDigests: inputContentDigests as string[],
         jsonPrefix,
     };
 }
@@ -282,6 +297,7 @@ export function captureLkgSlot(args: LkgCaptureInput): boolean {
     return captureSlot(args.sessionId, {
         jsonPrefix: built.jsonPrefix,
         inputIdSeq: built.inputIdSeq,
+        inputContentDigests: built.inputContentDigests,
         lastInputMessageId: built.anchorMessageId,
         modelKey: args.modelKey,
         providerKey: args.providerKey,
@@ -302,6 +318,13 @@ function entryIdsAreValid(slot: LkgSlot, entryIds: string[]): boolean {
         if (entryIds[index] !== slot.inputIdSeq[index]) return false;
     }
     return true;
+}
+
+function entryContentIsValid(slot: LkgSlot, entryDigests: string[]): boolean {
+    return (
+        entryDigests.length >= slot.inputContentDigests.length &&
+        slot.inputContentDigests.every((digest, index) => entryDigests[index] === digest)
+    );
 }
 
 function partCallIds(message: MessageLike): string[] {
@@ -466,6 +489,10 @@ export function replayLkg(args: {
     ) {
         dropSlot(args.sessionId, "lkg_invalidated_reshape");
         return { ok: false, reason: "lkg_invalidated_reshape" };
+    }
+    if (!entryContentIsValid(slot, entry.entryContentDigests)) {
+        dropSlot(args.sessionId, "lkg_content_mismatch");
+        return { ok: false, reason: "lkg_content_mismatch" };
     }
     let prefix: MessageLike[];
     try {

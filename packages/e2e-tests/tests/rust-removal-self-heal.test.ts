@@ -11,48 +11,20 @@
  * (parking the session). The fix is a self-heal re-prime that rebuilds the
  * ordinal map from the durable rows after a removal.
  *
- * Status on this branch: verified empirically that a real revert STILL wedges the
- * session permanently here (error → error → error → parked, no recovery) — and it
- * is NOT healed by the merged tail-readopt / park-self-heal fix, because that fix
- * addresses tail identity drift and park pressure, not the mid-array ordinal
- * mismatch a removal creates. In Rust mode tags/index live in the module store
- * (not context.db), so the plugin's clear-and-reindex finds no rows to reconcile
- * and the ordinal memo's stored-count never re-primes.
- *
- * So this regression is gated on its OWN flag (MC_RUST_E2E_REMOVAL=1), separate
- * from the shipped P0 fix, and activates cleanly once the removal
- * ordinal-reconcile self-heal lands. The assertion targets the OUTCOME — after a
- * real removal the transform keeps serving and the session never permanently
- * parks — so it validates the future fix regardless of mechanism.
+ * The assertion targets the outcome: after a real removal the transform keeps
+ * serving and the session never permanently parks.
  *
  * Drives the FULL production path: opencode → plugin → subc daemon → ck-mc.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { RustTestHarness } from "../src/rust-harness";
-import {
-    driveToSteadyState,
-    printSkip,
-    REMOVAL_SKIP_REASON,
-    removalHealEnabled,
-    rustPrereqs,
-} from "../src/rust-scenario-support";
-
-const active = rustPrereqs.ok && removalHealEnabled();
+import { driveToSteadyState, rustPrereqs } from "../src/rust-scenario-support";
 
 describe.skipIf(!rustPrereqs.ok)("rust incident regression: removal self-heal", () => {
-    // Visibility: when prereqs are met but the removal-reconcile self-heal is not
-    // yet available, print why this regression is dormant instead of silently
-    // omitting it.
-    it.skipIf(active)("is gated on the removal ordinal-reconcile self-heal", () => {
-        printSkip("removal-self-heal", REMOVAL_SKIP_REASON);
-        expect(removalHealEnabled()).toBe(false);
-    });
-
     let h: RustTestHarness;
 
     beforeEach(async () => {
-        if (!active) return;
         h = await RustTestHarness.create({
             modelContextLimit: 100_000,
             magicContextConfig: { execute_threshold_percentage: 40, protected_tags: 1 },
@@ -63,7 +35,7 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: removal self-heal", 
         await h?.dispose();
     });
 
-    it.skipIf(!active)(
+    it(
         "keeps transforming after a mid-session message is removed (no permanent park)",
         async () => {
             const sessionId = await h.createSession();
