@@ -1538,6 +1538,11 @@ function readAuthoritySeqMismatch(error: unknown): number | null {
  * used by the mirror sender and the Rust authority path. Callers own retries and
  * lineage handling because shadow and authority have different failure policy.
  */
+export type ModuleStateSyncResult =
+    | { status: "acked"; watermarks: ModuleWatermarks }
+    | { status: "no_change" }
+    | { status: "retry_busy" };
+
 export async function syncModuleState(args: {
     client: ModuleStateSyncClient;
     state: ModuleStateSyncState;
@@ -1545,7 +1550,7 @@ export async function syncModuleState(args: {
     projectRoot: string;
     force: boolean;
     options?: ModuleStateSyncOptions;
-}): Promise<ModuleWatermarks | null> {
+}): Promise<ModuleStateSyncResult> {
     let force = args.force;
     const adoption = args.options?.authoritySeqAdoption ?? { used: false };
     let stateSyncDeltas = args.options?.stateSyncDeltas;
@@ -1570,7 +1575,7 @@ export async function syncModuleState(args: {
             force,
             options: { ...args.options, stateSyncDeltas },
         });
-        if (payload === null) return null;
+        if (payload === null) return { status: "no_change" };
         if (
             payload === "m0_mutation" ||
             payload === "mismatch" ||
@@ -1605,10 +1610,9 @@ export async function syncModuleState(args: {
             }
         } catch (error) {
             if (isHistorianCompartmentSyncBusy(error)) {
-                // The module rejected only compartment rows while its historian owns a
-                // firing snapshot. Leave sender state untouched so the next pass retries
-                // this same delta after the run reaches Idle; never promote it into a full seed.
-                return null;
+                // Return a distinct retry result when the snapshot-owning historian rejects
+                // compartment updates, preserving any forced initialization seed obligation.
+                return { status: "retry_busy" };
             }
             const durableSeq = args.options?.authority ? readAuthoritySeqMismatch(error) : null;
             if (durableSeq === null || adoption.used) throw error;
@@ -1623,7 +1627,7 @@ export async function syncModuleState(args: {
         }
         args.state.lastAckedWatermarks = payload.watermarks;
         args.state.lastAckedSeq += 1;
-        return payload.watermarks;
+        return { status: "acked", watermarks: payload.watermarks };
     }
 }
 

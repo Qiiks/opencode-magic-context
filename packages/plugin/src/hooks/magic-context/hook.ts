@@ -986,11 +986,15 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             clearInjectionCache(sessionId);
             deps.onSessionCacheInvalidated?.(sessionId);
         },
+        onRustWireInvalidated: (sessionId: string) => {
+            transform.invalidateRustWireState(sessionId);
+        },
         // Clean up per-session state the system-prompt handler maintains so
         // these module/closure-scope maps don't accumulate entries over the
         // plugin's lifetime (Finding #3).
         onSessionDeleted: (sessionId: string) => {
             dropSlot(sessionId, "session-deleted");
+            transform.clearRustSession(sessionId);
             systemPromptHash.clearSession(sessionId);
             // Prune every per-session map this hook closure owns. These
             // accumulate one entry per session for the plugin process lifetime

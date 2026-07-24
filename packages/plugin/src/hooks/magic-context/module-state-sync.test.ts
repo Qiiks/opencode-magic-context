@@ -291,7 +291,7 @@ describe("historian compartment sync fence", () => {
             force: true,
         });
 
-        expect(result).toBeNull();
+        expect(result).toEqual({ status: "retry_busy" });
         expect(calls).toBe(1);
         expect(state.lastAckedSeq).toBe(0);
         expect(state.lastAckedWatermarks).toBeNull();

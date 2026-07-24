@@ -79,6 +79,7 @@ export interface EventHandlerDeps {
     contextUsageMap: Map<string, ContextUsageEntry>;
     compactionHandler: ReturnType<typeof createCompactionHandler>;
     onSessionCacheInvalidated?: (sessionId: string) => void;
+    onRustWireInvalidated?: (sessionId: string) => void;
     onSessionDeleted?: (sessionId: string) => void;
     config: {
         protected_tags: number;
@@ -640,6 +641,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
 
             dropSlot(info.sessionID, "message.removed");
+            deps.onRustWireInvalidated?.(info.sessionID);
             sessionLog(
                 info.sessionID,
                 `event message.removed: invalidating state for message ${info.messageID}`,

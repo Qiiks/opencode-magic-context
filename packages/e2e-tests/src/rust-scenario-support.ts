@@ -16,16 +16,6 @@
  *     are gated on `foldInfraEnabled()` and assert outcomes that activate once a
  *     hermetic broca runner is wired (MC_RUST_E2E_FOLD=1).
  *
- *  3. Removal-reconcile gating — mid-session message removal (session.revert →
- *     message.removed) still wedges the Rust ordinal resolver permanently on this
- *     branch: in Rust mode tags/index live in the module store (not context.db),
- *     so the plugin's clear-and-reindex finds no rows to reconcile and the
- *     ordinal memo's stored-count never re-primes (verified: error→park, no
- *     recovery). This is a DISTINCT gap from the shipped tail-readopt/park fix.
- *     The removal-self-heal scenario is gated on `removalHealEnabled()` and
- *     asserts the recovery OUTCOME so it activates cleanly once the removal
- *     ordinal-reconcile self-heal lands (MC_RUST_E2E_REMOVAL=1).
- *
  * The tail-mutation-readopt and park-self-heal scenarios are NOT gated: the P0
  * identity-drift / park-self-heal fix is merged into this branch's base, so they
  * assert the shipped mechanism (re-adopt, no permanent park) by default.
@@ -50,24 +40,10 @@ export function foldInfraEnabled(): boolean {
 export const FOLD_SKIP_REASON =
     "requires a hermetic broca LLM-runner module so the Rust module's historian can publish a compartment (fold); the current stack spawns only ck-subc + ck-mc (set MC_RUST_E2E_FOLD=1 once broca is wired)";
 
-/** True once the mid-session-removal ordinal-reconcile self-heal lands and is opted in. */
-export function removalHealEnabled(): boolean {
-    return process.env.MC_RUST_E2E_REMOVAL === "1";
-}
-
 /** Enable the duplicate-ID regression only when the stack can produce the selection refresh needed to reproduce duplicate IDs. */
 export function duplicateIdInfraEnabled(): boolean {
     return process.env.MC_RUST_E2E_DUPLICATE_IDS === "1";
 }
-
-/**
- * Reason string for the removal-self-heal skip. Distinct from the shipped
- * tail-readopt/park fix: a mid-session removal drives the Rust ordinal resolver
- * into a permanent mismatch because Rust-mode tags/index live in the module store
- * (the plugin's clear-and-reindex finds no context.db rows to reconcile).
- */
-export const REMOVAL_SKIP_REASON =
-    "mid-session message removal (session.revert) still wedges the Rust ordinal resolver — a distinct gap from the merged tail-readopt/park fix (set MC_RUST_E2E_REMOVAL=1 once the removal ordinal-reconcile self-heal lands)";
 
 /**
  * The hermetic stack has no broca runner, so it cannot complete the historian-backed

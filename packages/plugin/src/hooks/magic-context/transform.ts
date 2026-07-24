@@ -613,7 +613,7 @@ export function createTransform(deps: TransformDeps) {
     const deferredMaterializationSessions =
         deps.deferredMaterializationSessions ?? new Set<string>();
 
-    return async (
+    const transform = async (
         _input: Record<string, never>,
         output: { messages: unknown[] },
     ): Promise<void> => {
@@ -2093,13 +2093,16 @@ export function createTransform(deps: TransformDeps) {
                 ? `${modelForBudget.providerID}/${modelForBudget.modelID}`
                 : keys.modelKey;
             const providerKey = modelForBudget?.providerID ?? keys.providerKey;
-            captureLkgSlot({
+            const captured = captureLkgSlot({
                 sessionId,
                 input: lkgInput,
                 output: messages,
                 modelKey,
                 providerKey,
             });
+            if (postTransformResult.bustedThisPass && !captured) {
+                dropSlot(sessionId, "lkg_refresh_declined");
+            }
         } else if (passOutcome.degradations.length > 0) {
             sessionLog(
                 sessionId,
@@ -2360,6 +2363,15 @@ export function createTransform(deps: TransformDeps) {
 
         deps.maybeAutoEmbedSession?.(sessionId);
     };
+
+    return Object.assign(transform, {
+        invalidateRustWireState(sessionId: string): void {
+            rustModeTransform?.invalidateWireState(sessionId);
+        },
+        clearRustSession(sessionId: string): void {
+            rustModeTransform?.clearSession(sessionId);
+        },
+    });
 }
 
 export function resolveHistoryBudgetTokens(
