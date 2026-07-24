@@ -7,7 +7,7 @@ import { log, sessionLog } from "../../shared/logger";
 import { getSdkContextLimit, isSaneLimit } from "../../shared/models-dev-cache";
 
 export const DEFAULT_CONTEXT_LIMIT = 128_000;
-const MAX_EXECUTE_THRESHOLD = 80;
+export const MAX_EXECUTE_THRESHOLD = 80;
 
 type CacheTtlConfig = string | Record<string, string>;
 
@@ -169,6 +169,20 @@ export interface ExecuteThresholdDetail {
     absoluteTokens?: number;
     /** The config key that matched, if any (for display/debugging). `"default"` when default fallback. */
     matchedKey?: string;
+    /**
+     * True when the user's configured value exceeded the safe cap and was reduced.
+     * Tokens mode: configured tokens > 80% × contextLimit. Percentage mode:
+     * configured percentage > MAX_EXECUTE_THRESHOLD (80). Display surfaces read this
+     * to tell the user their value was clamped instead of silently ignoring it (#241).
+     * Only present (true) when a clamp actually happened; absent otherwise.
+     */
+    clamped?: boolean;
+    /**
+     * The raw configured value before clamping — a token count in tokens mode, a
+     * percentage in percentage mode. Populated only alongside `clamped` so display
+     * surfaces can show the math (e.g. "190,000 > 80% of 128,000").
+     */
+    configuredValue?: number;
 }
 
 // Module-level dedupe for clamp warnings. Key: `${sessionId}|${modelKey}|${tokenVal}|${cap}`.
@@ -257,12 +271,20 @@ export function resolveExecuteThresholdDetail(
                 }
             }
             const percentage = (effectiveTokens / contextLimit) * 100;
-            return {
+            const detail: ExecuteThresholdDetail = {
                 percentage: Math.min(percentage, MAX_EXECUTE_THRESHOLD),
                 mode: "tokens",
                 absoluteTokens: Math.floor(effectiveTokens),
                 matchedKey: tokenMatch.matchedKey,
             };
+            // effectiveTokens < requested means Math.min(value, cap) clamped the
+            // user's token budget down to 80% × contextLimit. Record the original
+            // value so status surfaces can show "190000 > 80% of 128000" (#241).
+            if (effectiveTokens < tokenMatch.value) {
+                detail.clamped = true;
+                detail.configuredValue = tokenMatch.value;
+            }
+            return detail;
         }
     }
 
@@ -305,7 +327,8 @@ export function resolveExecuteThresholdDetail(
     // load normally rejects >80 via zod, but a runtime-derived value can still
     // exceed it, so we clamp + warn here too.)
     const cappedPercentage = Math.min(resolved, MAX_EXECUTE_THRESHOLD);
-    if (cappedPercentage < resolved) {
+    const percentageClamped = cappedPercentage < resolved;
+    if (percentageClamped) {
         const dedupeKey = `pct|${options?.sessionId ?? "__global__"}|${modelKey ?? "__default__"}|${resolved}`;
         if (!clampWarnSeen.has(dedupeKey)) {
             clampWarnSeen.add(dedupeKey);
@@ -317,11 +340,18 @@ export function resolveExecuteThresholdDetail(
             }
         }
     }
-    return {
+    const detail: ExecuteThresholdDetail = {
         percentage: cappedPercentage,
         mode: "percentage",
         matchedKey,
     };
+    // A runtime-derived percentage above the 80% cap was reduced. Record the
+    // original so status surfaces can show "95% > 80%" alongside the value (#241).
+    if (percentageClamped) {
+        detail.clamped = true;
+        detail.configuredValue = resolved;
+    }
+    return detail;
 }
 
 /**

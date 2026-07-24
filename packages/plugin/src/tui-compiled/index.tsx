@@ -294,6 +294,7 @@ const StatusDialog = props => {
     _$insertNode(_el$11, _el$12);
     _$insert(_el$11, () => s().usagePercentage.toFixed(1), _el$12);
     _$insert(_el$10, () => formatThresholdPercent(s().executeThreshold), _el$14);
+    _$insert(_el$10, () => s().executeThresholdClamped ? "*" : "", null);
     _$insertNode(_el$15, _el$16);
     _$insertNode(_el$15, _el$17);
     _$insert(_el$15, () => fmt(s().inputTokens), _el$16);
@@ -632,7 +633,7 @@ const StatusDialog = props => {
       },
       l: "Execute threshold",
       get v() {
-        return `${formatThresholdPercent(s().executeThreshold)}%`;
+        return `${formatThresholdPercent(s().executeThreshold)}%${s().executeThresholdClamped ? "*" : ""}`;
       }
     }), _el$41);
     _$insert(_el$37, _$createComponent(R, {

@@ -22,4 +22,51 @@ describe("executeStatus", () => {
         expect(status).toContain(`- History block: ~${expected.toLocaleString()} tokens`);
         db.close();
     });
+
+    test("annotates the execute threshold when a tokens config is clamped (#241)", () => {
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        getOrCreateSessionMeta(db, SESSION_ID);
+
+        // 190K requested on a 128K model → clamped to 80% × 128K. The status must
+        // say so explicitly (configured value + cap) rather than silently showing
+        // the reduced value, which is what confused users in issue #241.
+        const status = executeStatus(
+            db,
+            SESSION_ID,
+            20,
+            65,
+            "some/model",
+            undefined,
+            undefined,
+            { "some/model": 190_000 },
+            128_000,
+        );
+
+        expect(status).toContain("[token-mode] [clamped:");
+        expect(status).toContain("> 80% of");
+        db.close();
+    });
+
+    test("omits the clamp annotation when the threshold is not clamped (#241)", () => {
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        getOrCreateSessionMeta(db, SESSION_ID);
+
+        const status = executeStatus(
+            db,
+            SESSION_ID,
+            20,
+            65,
+            "some/model",
+            undefined,
+            undefined,
+            undefined,
+            128_000,
+        );
+
+        expect(status).toContain("Execute threshold:");
+        expect(status).not.toContain("[clamped:");
+        db.close();
+    });
 });

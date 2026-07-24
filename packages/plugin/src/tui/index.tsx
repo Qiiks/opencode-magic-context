@@ -223,7 +223,7 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                 them how close they are to compaction triggering. */}
             <box flexDirection="row" justifyContent="space-between" width="100%">
                 <text fg={s().usagePercentage >= 80 ? t().error : s().usagePercentage >= 65 ? t().warning : t().accent}>
-                    <b>{s().usagePercentage.toFixed(1)}%</b> / {formatThresholdPercent(s().executeThreshold)}%
+                    <b>{s().usagePercentage.toFixed(1)}%</b> / {formatThresholdPercent(s().executeThreshold)}%{s().executeThresholdClamped ? "*" : ""}
                 </text>
                 <text fg={s().usagePercentage >= 80 ? t().error : s().usagePercentage >= 65 ? t().warning : t().accent}>
                     {fmt(s().inputTokens)} / {contextLimit() > 0 ? fmt(contextLimit()) : "?"} tokens
@@ -323,7 +323,7 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                 {/* Right column */}
                 <box flexDirection="column" flexGrow={1} flexBasis={0}>
                     <text fg={t().text}><b>Reductions</b></text>
-                    <R t={t()} l="Execute threshold" v={`${formatThresholdPercent(s().executeThreshold)}%`} />
+                    <R t={t()} l="Execute threshold" v={`${formatThresholdPercent(s().executeThreshold)}%${s().executeThresholdClamped ? "*" : ""}`} />
                     <R t={t()} l="Last reduce anchor" v={`${fmt(s().lastNudgeTokens)} tok`} />
                     <box marginTop={1}>
                         <text fg={t().text}><b>Context Details</b></text>

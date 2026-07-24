@@ -754,9 +754,11 @@ const SidebarContent = (props: {
                                 threshold (the value Magic Context compares
                                 against when scheduling historian / drops).
                                 "47.5% / 65%" tells the user how close they
-                                are to the next compaction trigger. */}
+                                are to the next compaction trigger. A trailing
+                                "*" marks a threshold that was clamped down from
+                                a higher configured value (issue #241). */}
                             <text fg={contextSummaryColor()}>
-                                <b>{s()!.usagePercentage.toFixed(1)}%</b> / {formatThresholdPercent(s()!.executeThreshold)}%
+                                <b>{s()!.usagePercentage.toFixed(1)}%</b> / {formatThresholdPercent(s()!.executeThreshold)}%{s()!.executeThresholdClamped ? "*" : ""}
                             </text>
                             {/* Right: absolute token usage vs the model's
                                 full context window (separate from the
