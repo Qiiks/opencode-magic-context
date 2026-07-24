@@ -2,6 +2,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { PiTestHarness } from "../src/pi-harness";
+import { buildMockHistorianPayload } from "../src/mock-historian";
 
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 
@@ -73,17 +74,12 @@ describe("pi historian success path", () => {
                     };
                 }
                 return {
-                    text: [
-                        "<output>",
-                        "<compartments>",
-                        `<compartment start="${range.start}" end="${range.end}" title="Pi e2e test chunk">`,
-                        "Driven by the Pi e2e harness to exercise historian publication.",
-                        "</compartment>",
-                        "</compartments>",
-                        "<facts></facts>",
-                        `<unprocessed_from>${range.end + 1}</unprocessed_from>`,
-                        "</output>",
-                    ].join("\n"),
+                    text: buildMockHistorianPayload({
+                        start: range.start,
+                        end: range.end,
+                        title: "Pi e2e test chunk",
+                        body: "Driven by the Pi e2e harness to exercise historian publication.",
+                    }),
                     usage: {
                         input_tokens: 500,
                         output_tokens: 200,

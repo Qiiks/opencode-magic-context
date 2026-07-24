@@ -26,6 +26,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { RustTestHarness } from "../src/rust-harness";
+import { buildMockHistorianPayload } from "../src/mock-historian";
 import {
     FOLD_SKIP_REASON,
     foldInfraEnabled,
@@ -70,17 +71,12 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: ctx_reduce round-trip", () => 
                 const system = JSON.stringify(body.system ?? "");
                 if (!system.includes("hippocampus of a long-running coding agent")) return null;
                 return {
-                    text: [
-                        "<output>",
-                        "<compartments>",
-                        '<compartment start="1" end="2" title="Rust reduce e2e chunk">',
-                        "Covered the warmup turns before the reduce.",
-                        "</compartment>",
-                        "</compartments>",
-                        "<facts></facts>",
-                        "<unprocessed_from>3</unprocessed_from>",
-                        "</output>",
-                    ].join("\n"),
+                    text: buildMockHistorianPayload({
+                        start: 1,
+                        end: 2,
+                        title: "Rust reduce e2e chunk",
+                        body: "Covered the warmup turns before the reduce.",
+                    }),
                     usage: {
                         input_tokens: 500,
                         output_tokens: 200,

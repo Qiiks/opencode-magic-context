@@ -51,6 +51,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
+import { buildMockHistorianPayload } from "../src/mock-historian";
 
 const HISTORIAN_MARKER = "the hippocampus of a long-running coding agent";
 
@@ -140,11 +141,12 @@ describe("context overflow recovery", () => {
                 const start = rangeHdr ? Number(rangeHdr[1]) : 0;
                 const end = rangeHdr ? Number(rangeHdr[2]) : 0;
                 return {
-                    text:
-                        `<output><compartments>` +
-                        `<compartment start="${start}" end="${end}" title="Overflow recovery">` +
-                        `Summary.</compartment></compartments><facts></facts>` +
-                        `<unprocessed_from>${end + 1}</unprocessed_from></output>`,
+                    text: buildMockHistorianPayload({
+                        start,
+                        end,
+                        title: "Overflow recovery",
+                        body: "Summary.",
+                    }),
                     usage: {
                         input_tokens: 500,
                         output_tokens: 50,
