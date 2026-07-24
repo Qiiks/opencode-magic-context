@@ -1,3 +1,4 @@
+import { extractTiersFromInner } from "../../hooks/magic-context/compartment-parser";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
@@ -46,6 +47,60 @@ function tableExists(db: Database, name: string): boolean {
     return Boolean(
         db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(name),
     );
+}
+
+/**
+ * Heal compartments stranded by a mismatched tier closing tag (issue #246).
+ *
+ * Before the lenient parser, a model that closed `<p1>` with `</p2>` made the
+ * strict tier regex miss P1 entirely, so the compartment stored as a flat legacy
+ * row: the whole tier markup landed in `content`, p1 stayed NULL, and legacy=1
+ * (which also trips the false "Historian V2 upgrade" nag). This re-runs the
+ * lenient tier extraction over `content`; when P1 comes out non-empty it fills
+ * the four tier columns — with the same denser→denser fallbacks the parser uses
+ * at ingest — and clears legacy, leaving `content` untouched. Rows that still
+ * don't parse keep legacy=1. Idempotent: healed rows no longer match the
+ * predicate, and the scan touches only the finite matching set (no full-table
+ * rewrite).
+ *
+ * `hasLegacy` distinguishes `compartments` (has a `legacy` column to clear) from
+ * `recomp_compartments` (same tier columns, but no `legacy` column).
+ */
+function healMismatchedTierClose(db: Database, table: string, hasLegacy: boolean): void {
+    if (!tableExists(db, table)) return;
+    const columns = new Set(
+        (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
+            (row) => row.name,
+        ),
+    );
+    for (const required of ["content", "p1", "p2", "p3", "p4"]) {
+        if (!columns.has(required)) return;
+    }
+    if (hasLegacy && !columns.has("legacy")) return;
+
+    const predicate = hasLegacy
+        ? "legacy = 1 AND p1 IS NULL AND content LIKE '%<p1%'"
+        : "p1 IS NULL AND content LIKE '%<p1%'";
+    const rows = db.prepare(`SELECT id, content FROM ${table} WHERE ${predicate}`).all() as Array<{
+        id: number;
+        content: string;
+    }>;
+
+    const update = db.prepare(
+        `UPDATE ${table} SET p1 = ?, p2 = ?, p3 = ?, p4 = ?${hasLegacy ? ", legacy = 0" : ""} WHERE id = ?`,
+    );
+    for (const row of rows) {
+        const tiers = extractTiersFromInner(row.content);
+        // Only heal when P1 actually extracts; otherwise leave the row legacy.
+        if (typeof tiers.p1 !== "string" || tiers.p1.length === 0) continue;
+        const p1 = tiers.p1;
+        // Mirror the parser's denser→denser fallbacks so a healed row is shaped
+        // exactly like one that parsed correctly at ingest.
+        const p2 = typeof tiers.p2 === "string" ? tiers.p2 : p1;
+        const p3 = typeof tiers.p3 === "string" ? tiers.p3 : p2;
+        const p4 = typeof tiers.p4 === "string" ? tiers.p4 : "";
+        update.run(p1, p2, p3, p4, row.id);
+    }
 }
 
 function assertForeignKeyIntegrity(db: Database, table?: string): void {
@@ -2603,6 +2658,15 @@ const MIGRATIONS: Migration[] = [
                 CREATE INDEX IF NOT EXISTS idx_memory_mutation_log_target
                     ON memory_mutation_log(project_path, target_memory_id, id);
             `);
+        },
+    },
+    {
+        version: 70,
+        description:
+            "heal legacy compartments stranded by mismatched tier closing tags (issue #246)",
+        up(db: Database): void {
+            healMismatchedTierClose(db, "compartments", true);
+            healMismatchedTierClose(db, "recomp_compartments", false);
         },
     },
 ];

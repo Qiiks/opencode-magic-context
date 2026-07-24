@@ -217,6 +217,24 @@ describe("tiered historian output validation", () => {
             });
         }
     });
+
+    test("accepts a mismatched-close compartment (issue #246) that strict parsing stranded as tierless", () => {
+        // The lenient parser runs FIRST: <p1> closed by </p2> now yields a real
+        // p1, so validation passes (legacy=0 path) instead of retrying forever.
+        const mangledXml = `<output><compartment start="1" end="2" title="mangled" importance="55"><p1>\nfull narrative\n</p2>\n<p2>condensed</p2><p3>outcome</p3><p4/></compartment></output>`;
+
+        const result = validateHistorianOutput(mangledXml, "ses-test", buildChunk(1, 2), [], 0);
+
+        expect(result.ok).toBe(true);
+        if (result.ok) {
+            expect(result.compartments[0]).toMatchObject({
+                p1: "full narrative",
+                p2: "condensed",
+                p3: "outcome",
+                p4: "",
+            });
+        }
+    });
 });
 
 describe("validateHistorianOutput primer candidate contract", () => {

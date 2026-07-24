@@ -64,11 +64,25 @@ const ATTR_END_REGEX = /\bend="(\d+)"/;
 const ATTR_TITLE_REGEX = /\btitle="([^"]*)"/;
 const ATTR_EPISODE_REGEX = /\bepisode_type="([^"]*)"/;
 const ATTR_IMPORTANCE_REGEX = /\bimportance="(\d+)"/;
-// Per-tier extractor: <p1>..</p1> paired, or <p1/> / <p1 /> self-close (P4 only, → "").
-function makeTierRegex(n: number): RegExp {
-    return new RegExp(`<p${n}\\s*/>|<p${n}\\s*>(.*?)</p${n}>`, "s");
+// Per-tier opener: matches `<p1>` / `<p1 >` (group 1 empty) or the self-close
+// `<p1/>` / `<p1 />` (group 1 = "/", P4 only → ""). The body that follows an
+// opener is bounded procedurally in extractTier rather than by an exact `</pN>`
+// close, because some models mismatch the closing digit (e.g. `<p1>…</p2>`).
+function makeTierOpenRegex(n: number): RegExp {
+    return new RegExp(`<p${n}\\s*(/?)>`);
 }
-const TIER_REGEXES = [makeTierRegex(1), makeTierRegex(2), makeTierRegex(3), makeTierRegex(4)];
+const TIER_OPEN_REGEXES = [
+    makeTierOpenRegex(1),
+    makeTierOpenRegex(2),
+    makeTierOpenRegex(3),
+    makeTierOpenRegex(4),
+];
+// Any tier's closing tag (`</p1>`…`</p9>`) — used to bound an opened tier's body
+// regardless of whether the close digit matches the opener.
+const TIER_CLOSE_ANY_REGEX = /<\/p\d/;
+// Any tier's OPENING tag (`<p1>`…`<p9>`) — the over-capture guard: a tier body
+// must never swallow a following tier's opener.
+const TIER_OPEN_ANY_REGEX = /<p\d/;
 // v2 world taxonomy (5 categories). The historian emits only these; legacy 9-cat
 // names are accepted at the ctx_memory layer (E3 aliases), not here.
 const CATEGORY_BLOCK_REGEX =
@@ -97,15 +111,52 @@ const EVENT_FIELD_REGEX = /<([a-z_]+)\s*>(.*?)<\/\1>/gs;
 
 /**
  * Extract a single tier body from a compartment inner string.
+ *
+ * Lenient about the close: an opened `<pN>` is terminated by the NEXT closing
+ * tier tag of ANY digit (`</p\d>`), because some models mismatch the close
+ * (observed: `<p1>…</p2>`). If the model omitted the close entirely, the next
+ * opening tier tag — or the end of the compartment — bounds the body instead.
+ *
  * Returns:
  *  - string (possibly "") when the <pN> element is present ("" = self-close or empty)
  *  - undefined when the element is absent entirely
  */
 function extractTier(inner: string, index: number): string | undefined {
-    const m = inner.match(TIER_REGEXES[index]);
-    if (!m) return undefined;
-    // Self-close form (<p4/>) → capture group is undefined → empty tier.
-    return unescapeXml((m[1] ?? "").trim());
+    const openMatch = TIER_OPEN_REGEXES[index].exec(inner);
+    if (!openMatch) return undefined;
+    // Self-close form (<p4/> or <p4 />) → empty tier.
+    if (openMatch[1] === "/") return "";
+    const rest = inner.slice(openMatch.index + openMatch[0].length);
+    // Bound the body at the next closing tier tag (any digit). When there is no
+    // close at all, run to the end of the compartment and let the guard below
+    // trim at the next opener if one is present.
+    const closeAt = rest.search(TIER_CLOSE_ANY_REGEX);
+    let body = closeAt === -1 ? rest : rest.slice(0, closeAt);
+    // Over-capture guard: never swallow a subsequent tier's opening tag into
+    // this tier's content. If an opener appears before the close, cut there.
+    const openInside = body.search(TIER_OPEN_ANY_REGEX);
+    if (openInside !== -1) body = body.slice(0, openInside);
+    return unescapeXml(body.trim());
+}
+
+/**
+ * Extract all four tier bodies from a compartment's inner markup using the
+ * lenient closing rules above. Exposed for the v70 heal migration, which
+ * re-parses flat `content` that the old strict parser stranded as legacy when a
+ * model mismatched a tier's closing tag. Each tier is undefined when absent.
+ */
+export function extractTiersFromInner(inner: string): {
+    p1?: string;
+    p2?: string;
+    p3?: string;
+    p4?: string;
+} {
+    return {
+        p1: extractTier(inner, 0),
+        p2: extractTier(inner, 1),
+        p3: extractTier(inner, 2),
+        p4: extractTier(inner, 3),
+    };
 }
 
 export function parseCompartmentOutput(text: string): ParsedCompartmentOutput {

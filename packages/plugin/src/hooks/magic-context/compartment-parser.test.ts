@@ -362,3 +362,71 @@ describe("parseCompartmentOutput — fact scoping (audit Fix 6)", () => {
         expect(parsed.facts.some((f) => f.category === "NAMING")).toBe(false);
     });
 });
+
+describe("parseCompartmentOutput — lenient tier closing (issue #246)", () => {
+    it("parses a mismatched close (<p1>…</p2>) into the correct tiers", () => {
+        // Exact observed failure shape: deepseek-v4-flash-free closes <p1> with
+        // </p2>. The opened <p1> must be terminated by the NEXT closing tier tag
+        // regardless of its digit, and the real <p2> must still parse cleanly.
+        const parsed = parseCompartmentOutput(`
+<output>
+<compartments>
+<compartment start="1" end="2" title="mangled" episode_type="bug" importance="55">
+<p1>
+the full p1 narrative
+</p2>
+<p2>the condensed p2</p2>
+<p3>the outcome</p3>
+<p4/>
+</compartment>
+</compartments>
+</output>`);
+        const c = parsed.compartments[0];
+        // p1 present (non-empty) ⇒ v2 tiered row, stored as legacy=0.
+        expect(c.p1).toBe("the full p1 narrative");
+        expect(c.content).toBe("the full p1 narrative"); // mirrors P1
+        expect(c.p2).toBe("the condensed p2");
+        expect(c.p3).toBe("the outcome");
+        expect(c.p4).toBe("");
+    });
+
+    it("bounds an unterminated tier at the next opening tag (close omitted)", () => {
+        const parsed = parseCompartmentOutput(`
+<compartment start="1" end="2" title="x" importance="50">
+<p1>first tier body<p2>second tier body</p2><p3>third</p3><p4/>
+</compartment>`);
+        const c = parsed.compartments[0];
+        expect(c.p1).toBe("first tier body");
+        expect(c.p2).toBe("second tier body");
+        expect(c.p3).toBe("third");
+        expect(c.p4).toBe("");
+    });
+
+    it("over-capture guard never swallows a later tier's opener into an earlier body", () => {
+        // Even when a stray closing tag sits past the next opener, the earlier
+        // tier's body is cut at the next <p\d> opener, not extended to the close.
+        const parsed = parseCompartmentOutput(`
+<compartment start="1" end="2" title="x" importance="50">
+<p1>alpha<p2>beta</p1><p3>gamma</p3><p4/>
+</compartment>`);
+        const c = parsed.compartments[0];
+        expect(c.p1).toBe("alpha");
+        expect(c.p2).toBe("beta");
+    });
+
+    it("still honors the self-closing <p4/> arm", () => {
+        const parsed = parseCompartmentOutput(`
+<compartment start="1" end="2" title="x" importance="50">
+<p1>a</p1><p2>b</p2><p3>c</p3><p4 />
+</compartment>`);
+        expect(parsed.compartments[0].p4).toBe("");
+    });
+
+    it("leaves p1 undefined for genuinely tier-free flat output (still rejects downstream)", () => {
+        const parsed = parseCompartmentOutput(`
+<compartment start="1" end="2" title="flat">just flat content, no tiers here</compartment>`);
+        const c = parsed.compartments[0];
+        expect(c.p1).toBeUndefined();
+        expect(c.content).toBe("just flat content, no tiers here");
+    });
+});
