@@ -17,12 +17,18 @@ import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-conte
 import { getSessionWorkMetrics } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { getNotes } from "@magic-context/core/features/magic-context/storage-notes";
 import { getTagsBySession } from "@magic-context/core/features/magic-context/storage-tags";
-import { MAX_EXECUTE_THRESHOLD, resolveExecuteThresholdDetail } from "@magic-context/core/hooks/magic-context/event-resolvers";
+import {
+	MAX_EXECUTE_THRESHOLD,
+	resolveExecuteThresholdDetail,
+} from "@magic-context/core/hooks/magic-context/event-resolvers";
 import { formatBytes } from "@magic-context/core/hooks/magic-context/format-bytes";
 import { computeM0BlockTokens } from "@magic-context/core/hooks/magic-context/m0-token-breakdown";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { countCompartmentsNeedingUpgrade } from "@magic-context/core/hooks/magic-context/upgrade-reminder";
-import { formatThresholdClampNote, formatThresholdPercent } from "@magic-context/core/shared/format-threshold";
+import {
+	formatThresholdClampNote,
+	formatThresholdPercent,
+} from "@magic-context/core/shared/format-threshold";
 
 import packageJson from "../../package.json";
 import { resolveSessionId } from "../commands/pi-command-utils";
@@ -330,13 +336,15 @@ function renderInner(
 	// Context / thresholds
 	lines.push(theme.fg("muted", "Context"));
 	lines.push(
-		`Execute threshold ${formatThresholdPercent(s.executeThreshold)}%${formatThresholdClampNote({
-			clamped: s.executeThresholdClamped,
-			mode: s.executeThresholdMode,
-			configuredValue: s.executeThresholdConfigured,
-			contextLimit: s.contextLimit,
-			maxPercentage: MAX_EXECUTE_THRESHOLD,
-		})}`,
+		`Execute threshold ${formatThresholdPercent(s.executeThreshold)}%${formatThresholdClampNote(
+			{
+				clamped: s.executeThresholdClamped,
+				mode: s.executeThresholdMode,
+				configuredValue: s.executeThresholdConfigured,
+				contextLimit: s.contextLimit,
+				maxPercentage: MAX_EXECUTE_THRESHOLD,
+			},
+		)}`,
 	);
 	lines.push(
 		`Protected tags ${s.protectedTagCount} · Subagent ${s.isSubagent ? "yes" : "no"} · History block ~${fmt(s.historyBlockTokens)} tok${

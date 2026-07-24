@@ -40,8 +40,8 @@ import {
     sweepStaleEmbeddingIdentitiesForProject,
 } from "./project-embedding-registry";
 import { recordSessionProjectIdentity } from "./session-project-storage";
-import { beginSynapseBatchLedger } from "./storage-embedding-measurements";
 import { closeDatabase, openDatabase } from "./storage";
+import { beginSynapseBatchLedger } from "./storage-embedding-measurements";
 
 class FakeEmbeddingProvider implements EmbeddingProvider {
     readonly modelId: string;

@@ -15,19 +15,19 @@ import {
 } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { setProjectState } from "../../features/magic-context/storage-project-state";
-import { insertUserMemory } from "../../features/magic-context/user-memory/storage-user-memory";
 import {
     insertTag,
     updateTagDropMode,
     updateTagStatus,
 } from "../../features/magic-context/storage-tags";
+import { insertUserMemory } from "../../features/magic-context/user-memory/storage-user-memory";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     buildModuleStateSyncPayload,
     buildPagedModuleStateSyncPayloads,
-    type ModuleStateSyncState,
     loadModuleWatermarks,
+    type ModuleStateSyncState,
     mirrorModuleCompartments,
     syncModuleState,
 } from "./module-state-sync";

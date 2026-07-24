@@ -9,8 +9,8 @@ import {
 } from "../../features/magic-context/context-authority";
 import { insertMemory } from "../../features/magic-context/memory/storage-memory";
 import { runMigrations } from "../../features/magic-context/migrations";
-import { getProjectState } from "../../features/magic-context/storage-project-state";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { getProjectState } from "../../features/magic-context/storage-project-state";
 import { Database } from "../../shared/sqlite";
 import type { RustModeModuleClient } from "./rust-mode-transform";
 import { recoverTsAuthorityProject } from "./transform";

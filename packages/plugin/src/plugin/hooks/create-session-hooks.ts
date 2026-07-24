@@ -19,8 +19,8 @@ export function buildMagicContextHookConfig(pluginConfig: MagicContextPluginConf
     // Pass the WHOLE plugin config through and only override the fields that
     // need defaulting. This was a hand-maintained field-by-field mapping, which
     // silently dropped every hook-config field added after the mapping was
-        // written: `smart_drops`, `language`, `embedding`, and `transform_mode`
-        // all read as undefined inside the hook even when set by
+    // written: `smart_drops`, `language`, `embedding`, and `transform_mode`
+    // all read as undefined inside the hook even when set by
     // the user, turning opted-in features off with no warning. The hook only
     // consumes the fields its config type declares, so the extra top-level keys
     // carried by the spread are inert.

@@ -1176,7 +1176,7 @@ export async function buildModuleStateSyncPayload(args: {
         currentWatermarks.project_user_profile_version !== acked.project_user_profile_version;
     const workspaceFingerprintChanged =
         args.force ||
-        !Object.prototype.hasOwnProperty.call(acked, "workspace_fingerprint") ||
+        !Object.hasOwn(acked, "workspace_fingerprint") ||
         (currentWatermarks.workspace_fingerprint ?? null) !== (acked.workspace_fingerprint ?? null);
     const useStateSyncDeltas = args.options?.stateSyncDeltas === true;
     const includeUserProfile = !useStateSyncDeltas || profileChanged;
@@ -1279,9 +1279,10 @@ export async function buildModuleStateSyncPayload(args: {
                   nowMs: args.pass.nowMs,
               })
         : [];
-    const userProfile = includeUserProfile && profileChanged
-        ? getActiveUserMemories(args.pass.db).map((memory) => memory.content)
-        : [];
+    const userProfile =
+        includeUserProfile && profileChanged
+            ? getActiveUserMemories(args.pass.db).map((memory) => memory.content)
+            : [];
     const memoryMutations =
         memoryMutationsChanged && args.pass.projectPath
             ? getMemoryMutationsForRenderByProjects(
@@ -1557,10 +1558,12 @@ export async function syncModuleState(args: {
     if (stateSyncDeltas === undefined && args.client.stateSyncCapabilities) {
         try {
             stateSyncDeltas =
-                (await args.client.stateSyncCapabilities({
-                    sessionId: args.pass.sessionId,
-                    projectRoot: args.projectRoot,
-                })).state_sync_deltas === true;
+                (
+                    await args.client.stateSyncCapabilities({
+                        sessionId: args.pass.sessionId,
+                        projectRoot: args.projectRoot,
+                    })
+                ).state_sync_deltas === true;
         } catch {
             // If the capability check fails, assume the module does not support
             // state_sync_deltas and send the older payload format with its state-sync

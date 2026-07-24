@@ -3,10 +3,10 @@
 import { describe, expect, it } from "bun:test";
 
 import {
-    FAIL_CLOSED_DOCTOR_COMMAND,
-    type FailClosedReason,
     createFailClosedBlockingError,
     createFailClosedController,
+    FAIL_CLOSED_DOCTOR_COMMAND,
+    type FailClosedReason,
     formatFailClosedBlockingMessage,
     isFailClosedBlockingError,
     resolveAgentNameFromMessages,

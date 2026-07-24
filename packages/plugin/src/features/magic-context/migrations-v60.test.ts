@@ -68,9 +68,7 @@ test("v60 heals a database whose v58 ran before the resnapshot table existed", (
         initializeDatabase(db);
         runMigrations(db);
         db.exec("DROP TABLE mirror_resnapshot_state");
-        db.prepare(
-            "DELETE FROM schema_migrations WHERE version >= 60",
-        ).run();
+        db.prepare("DELETE FROM schema_migrations WHERE version >= 60").run();
         runMigrations(db);
         const row = db
             .prepare(

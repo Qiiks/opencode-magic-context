@@ -21,7 +21,6 @@ import {
 import { recordChildInvocation } from "../subagent-token-capture";
 import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
-import { getModuleMemoryIdentities, type DreamerModuleRoute, DreamerModuleFailureError } from "./module-apply";
 import {
     buildMapMemoriesPrompt,
     extractMemoryCandidatePaths,
@@ -29,6 +28,11 @@ import {
     type MapMemoryInput,
     parseMapMemoriesManifest,
 } from "./map-memories-prompt";
+import {
+    DreamerModuleFailureError,
+    type DreamerModuleRoute,
+    getModuleMemoryIdentities,
+} from "./module-apply";
 
 /**
  * map-memories: ONE-TIME-style backfill that locates the backing file(s) for
@@ -285,28 +289,71 @@ export async function applyBatchMappings(
     let mapped = 0;
     let independent = 0;
     if (args.moduleRoute) {
-        const identities = getModuleMemoryIdentities(args.db, args.projectIdentity, planned.map((item) => item.id));
+        const identities = getModuleMemoryIdentities(
+            args.db,
+            args.projectIdentity,
+            planned.map((item) => item.id),
+        );
         const rows = planned.map((item) => {
             const identity = identities.get(item.id);
-            if (!identity) throw new DreamerModuleFailureError("memory.set_mapping", new Error(`missing mirror identity for ${item.id}`));
-            return { memory_id: identity.moduleId, content_hash_at_prompt: identity.normalizedHash, mapped_files: item.independent ? null : item.files };
+            if (!identity)
+                throw new DreamerModuleFailureError(
+                    "memory.set_mapping",
+                    new Error(`missing mirror identity for ${item.id}`),
+                );
+            return {
+                memory_id: identity.moduleId,
+                content_hash_at_prompt: identity.normalizedHash,
+                mapped_files: item.independent ? null : item.files,
+            };
         });
         let response: unknown;
         try {
-            response = await args.moduleRoute.moduleClient.call({ sessionId: args.moduleRoute.moduleSessionId, projectRoot: args.moduleRoute.moduleProjectRoot, method: "memory.set_mapping", body: { name: "memory.set_mapping", arguments: { memory_project: args.projectIdentity, context_store_uuid: args.moduleRoute.moduleContextStoreUuid, authority_generation: args.moduleRoute.moduleAuthorityGeneration, command_id: `${args.moduleRoute.moduleCommandId}:${createHash("sha256").update(rows.map((row) => row.memory_id).join(",")).digest("hex").slice(0, 16)}`, rows } } });
-        } catch (error) { throw new DreamerModuleFailureError("memory.set_mapping", error); }
-        const result = ((response as { result?: unknown })?.result ?? response) as { accepted?: unknown };
-        if (!Array.isArray(result?.accepted)) throw new DreamerModuleFailureError("memory.set_mapping", new Error("invalid response"));
-        const accepted = new Set(result.accepted.filter((id): id is number => typeof id === "number"));
+            response = await args.moduleRoute.moduleClient.call({
+                sessionId: args.moduleRoute.moduleSessionId,
+                projectRoot: args.moduleRoute.moduleProjectRoot,
+                method: "memory.set_mapping",
+                body: {
+                    name: "memory.set_mapping",
+                    arguments: {
+                        memory_project: args.projectIdentity,
+                        context_store_uuid: args.moduleRoute.moduleContextStoreUuid,
+                        authority_generation: args.moduleRoute.moduleAuthorityGeneration,
+                        command_id: `${args.moduleRoute.moduleCommandId}:${createHash("sha256")
+                            .update(rows.map((row) => row.memory_id).join(","))
+                            .digest("hex")
+                            .slice(0, 16)}`,
+                        rows,
+                    },
+                },
+            });
+        } catch (error) {
+            throw new DreamerModuleFailureError("memory.set_mapping", error);
+        }
+        const result = ((response as { result?: unknown })?.result ?? response) as {
+            accepted?: unknown;
+        };
+        if (!Array.isArray(result?.accepted))
+            throw new DreamerModuleFailureError(
+                "memory.set_mapping",
+                new Error("invalid response"),
+            );
+        const accepted = new Set(
+            result.accepted.filter((id): id is number => typeof id === "number"),
+        );
         for (const item of planned) {
             const identity = identities.get(item.id);
-            if (identity && accepted.has(identity.moduleId)) item.independent ? (independent += 1) : (mapped += 1);
+            if (identity && accepted.has(identity.moduleId))
+                item.independent ? (independent += 1) : (mapped += 1);
         }
         return { mapped, independent };
     }
     const now = Date.now();
     runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
-        for (const item of planned) { recordMemoryMapping(args.db, item.id, item.files, now); item.independent ? (independent += 1) : (mapped += 1); }
+        for (const item of planned) {
+            recordMemoryMapping(args.db, item.id, item.files, now);
+            item.independent ? (independent += 1) : (mapped += 1);
+        }
     });
     return { mapped, independent };
 }

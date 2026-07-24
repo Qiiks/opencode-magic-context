@@ -1,7 +1,10 @@
 import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
 import { embedBatchForProject, getProjectEmbeddingSnapshot } from "./embedding";
-import { type StoredMemoryEmbedding, saveEmbeddingIfHashMatches } from "./storage-memory-embeddings";
+import {
+    type StoredMemoryEmbedding,
+    saveEmbeddingIfHashMatches,
+} from "./storage-memory-embeddings";
 import type { Memory } from "./types";
 
 export async function ensureMemoryEmbeddings(args: {

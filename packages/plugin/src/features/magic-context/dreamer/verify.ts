@@ -29,8 +29,12 @@ import { queueMemoryMutation } from "../storage-memory-mutation-log";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
+import {
+    DreamerModuleFailureError,
+    type DreamerModuleRoute,
+    getModuleMemoryIdentities,
+} from "./module-apply";
 import { partitionVerifyScope } from "./verify-gate";
-import { getModuleMemoryIdentities, type DreamerModuleRoute, DreamerModuleFailureError } from "./module-apply";
 import {
     buildVerifyPrompt,
     parseVerifyManifest,
@@ -304,23 +308,66 @@ export async function applyVerifyManifest(
     let updated = 0;
     let archived = 0;
     if (args.moduleRoute) {
-        const identities = getModuleMemoryIdentities(args.db, args.projectIdentity, writes.map((write) => write.id));
+        const identities = getModuleMemoryIdentities(
+            args.db,
+            args.projectIdentity,
+            writes.map((write) => write.id),
+        );
         const rows = writes.map((write) => {
             const identity = identities.get(write.id);
-            if (!identity) throw new DreamerModuleFailureError("memory.set_verification", new Error(`missing mirror identity for ${write.id}`));
-            return { memory_id: identity.moduleId, content_hash_at_prompt: identity.normalizedHash, verification_status: write.kind === "verify" ? "verified" : write.kind, ...(write.kind === "update" ? { updated_content: write.content } : {}), ...(write.kind === "archive" ? { archive_reason: write.reason } : {}) };
+            if (!identity)
+                throw new DreamerModuleFailureError(
+                    "memory.set_verification",
+                    new Error(`missing mirror identity for ${write.id}`),
+                );
+            return {
+                memory_id: identity.moduleId,
+                content_hash_at_prompt: identity.normalizedHash,
+                verification_status: write.kind === "verify" ? "verified" : write.kind,
+                ...(write.kind === "update" ? { updated_content: write.content } : {}),
+                ...(write.kind === "archive" ? { archive_reason: write.reason } : {}),
+            };
         });
         let response: unknown;
         try {
-            response = await args.moduleRoute.moduleClient.call({ sessionId: args.moduleRoute.moduleSessionId, projectRoot: args.moduleRoute.moduleProjectRoot, method: "memory.set_verification", body: { name: "memory.set_verification", arguments: { memory_project: args.projectIdentity, context_store_uuid: args.moduleRoute.moduleContextStoreUuid, authority_generation: args.moduleRoute.moduleAuthorityGeneration, command_id: `${args.moduleRoute.moduleCommandId}:${createHash("sha256").update(rows.map((row) => row.memory_id).join(",")).digest("hex").slice(0, 16)}`, rows } } });
-        } catch (error) { throw new DreamerModuleFailureError("memory.set_verification", error); }
-        const result = ((response as { result?: unknown })?.result ?? response) as { accepted?: unknown };
-        if (!Array.isArray(result?.accepted)) throw new DreamerModuleFailureError("memory.set_verification", new Error("invalid response"));
-        const accepted = new Set(result.accepted.filter((id): id is number => typeof id === "number"));
+            response = await args.moduleRoute.moduleClient.call({
+                sessionId: args.moduleRoute.moduleSessionId,
+                projectRoot: args.moduleRoute.moduleProjectRoot,
+                method: "memory.set_verification",
+                body: {
+                    name: "memory.set_verification",
+                    arguments: {
+                        memory_project: args.projectIdentity,
+                        context_store_uuid: args.moduleRoute.moduleContextStoreUuid,
+                        authority_generation: args.moduleRoute.moduleAuthorityGeneration,
+                        command_id: `${args.moduleRoute.moduleCommandId}:${createHash("sha256")
+                            .update(rows.map((row) => row.memory_id).join(","))
+                            .digest("hex")
+                            .slice(0, 16)}`,
+                        rows,
+                    },
+                },
+            });
+        } catch (error) {
+            throw new DreamerModuleFailureError("memory.set_verification", error);
+        }
+        const result = ((response as { result?: unknown })?.result ?? response) as {
+            accepted?: unknown;
+        };
+        if (!Array.isArray(result?.accepted))
+            throw new DreamerModuleFailureError(
+                "memory.set_verification",
+                new Error("invalid response"),
+            );
+        const accepted = new Set(
+            result.accepted.filter((id): id is number => typeof id === "number"),
+        );
         for (const write of writes) {
             const identity = identities.get(write.id);
             if (!identity || !accepted.has(identity.moduleId)) continue;
-            if (write.kind === "verify") verified += 1; else if (write.kind === "update") updated += 1; else archived += 1;
+            if (write.kind === "verify") verified += 1;
+            else if (write.kind === "update") updated += 1;
+            else archived += 1;
         }
         return { verified, updated, archived };
     }
@@ -328,9 +375,28 @@ export async function applyVerifyManifest(
         for (const w of writes) {
             const memory = getMemoryById(args.db, w.id);
             if (!isPrimaryMutable(memory)) continue;
-            if (w.kind === "verify") { recordMemoryVerifications(args.db, w.id, w.files, now); verified += 1; }
-            else if (w.kind === "update") { rewriteMemoryContent(args.db, memory, w.content, w.hash); queueMemoryMutation(args.db, { projectPath: args.projectIdentity, mutationType: "update", targetMemoryId: w.id, category: memory.category, newContent: w.content }); updated += 1; }
-            else { archiveMemory(args.db, w.id, w.reason); queueMemoryMutation(args.db, { projectPath: args.projectIdentity, mutationType: "archive", targetMemoryId: w.id }); archived += 1; }
+            if (w.kind === "verify") {
+                recordMemoryVerifications(args.db, w.id, w.files, now);
+                verified += 1;
+            } else if (w.kind === "update") {
+                rewriteMemoryContent(args.db, memory, w.content, w.hash);
+                queueMemoryMutation(args.db, {
+                    projectPath: args.projectIdentity,
+                    mutationType: "update",
+                    targetMemoryId: w.id,
+                    category: memory.category,
+                    newContent: w.content,
+                });
+                updated += 1;
+            } else {
+                archiveMemory(args.db, w.id, w.reason);
+                queueMemoryMutation(args.db, {
+                    projectPath: args.projectIdentity,
+                    mutationType: "archive",
+                    targetMemoryId: w.id,
+                });
+                archived += 1;
+            }
         }
     });
     return { verified, updated, archived };

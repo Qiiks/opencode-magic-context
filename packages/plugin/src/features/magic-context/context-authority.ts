@@ -510,7 +510,9 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
                         sourceRowId: seedSourceRowId(page[index]),
                     }))
                     .filter(
-                        (identity): identity is {
+                        (
+                            identity,
+                        ): identity is {
                             moduleRowId: number;
                             sourceRowId: number;
                         } => identity.sourceRowId !== null,
@@ -518,17 +520,19 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
                 if (identities.length > 0) {
                     // Seed identities are one response batch: keeping the SELECT+insert
                     // sequence in one local transaction prevents one SQLite write lock per row.
-                    args.db.transaction(() => {
-                        for (const identity of identities) {
-                            rememberIdentity(
-                                args.db,
-                                domain,
-                                args.projectPath,
-                                identity.moduleRowId,
-                                identity.sourceRowId,
-                            );
-                        }
-                    }).immediate();
+                    args.db
+                        .transaction(() => {
+                            for (const identity of identities) {
+                                rememberIdentity(
+                                    args.db,
+                                    domain,
+                                    args.projectPath,
+                                    identity.moduleRowId,
+                                    identity.sourceRowId,
+                                );
+                            }
+                        })
+                        .immediate();
                 }
             }
             const digest = args.checksum?.(domain, rows) ?? checksumAuthoritySeedRows(rows);

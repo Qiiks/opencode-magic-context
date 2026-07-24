@@ -216,7 +216,9 @@ describe("persisted Pi text identity vectors", () => {
 			expect(textOf(seedMessages[0])).toBe("§1§ A§2§ B");
 
 			const survivorMessages = [twoTextMessage("B")];
-			const survivor = createPiTranscript(survivorMessages, sessionId, ["entry-m"]);
+			const survivor = createPiTranscript(survivorMessages, sessionId, [
+				"entry-m",
+			]);
 			const plan = contextHandlerInternals.buildPiTextIdentityPlan(
 				db,
 				sessionId,
@@ -234,7 +236,9 @@ describe("persisted Pi text identity vectors", () => {
 			});
 			survivor.commit();
 			const survivorContent = (
-				survivorMessages[0] as { content: Array<{ type: string; text?: string }> }
+				survivorMessages[0] as {
+					content: Array<{ type: string; text?: string }>;
+				}
 			).content;
 			expect(survivorContent[0]?.text).toBe("§3§ B");
 			expect(survivorContent[0]?.text?.startsWith("§1§")).toBe(false);

@@ -234,12 +234,7 @@ export function getMemoryMutationsForRender(
     afterId: number | null | undefined,
     renderedMemoryIds: readonly number[],
 ): MemoryMutationLogRow[] {
-    return getMemoryMutationsForRenderByIdentitySet(
-        db,
-        [projectPath],
-        afterId,
-        renderedMemoryIds,
-    );
+    return getMemoryMutationsForRenderByIdentitySet(db, [projectPath], afterId, renderedMemoryIds);
 }
 
 export function getMemoryMutationsForRenderByProjects(
@@ -248,12 +243,7 @@ export function getMemoryMutationsForRenderByProjects(
     afterId: number | null | undefined,
     renderedMemoryIds: readonly number[],
 ): MemoryMutationLogRow[] {
-    return getMemoryMutationsForRenderByIdentitySet(
-        db,
-        projectPaths,
-        afterId,
-        renderedMemoryIds,
-    );
+    return getMemoryMutationsForRenderByIdentitySet(db, projectPaths, afterId, renderedMemoryIds);
 }
 
 export function getMaxMemoryMutationId(db: Database, projectPath: string): number | null {

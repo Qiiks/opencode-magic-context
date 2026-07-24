@@ -11,9 +11,9 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
-	type FailClosedReason,
 	createFailClosedBlockingError,
 	createFailClosedController,
+	type FailClosedReason,
 	isFailClosedBlockingError,
 	shouldBypassFailClosedBlock,
 } from "@magic-context/core/features/magic-context/fail-closed-block";

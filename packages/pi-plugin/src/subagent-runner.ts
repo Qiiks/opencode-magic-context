@@ -1203,23 +1203,23 @@ export class PiSubagentRunner implements SubagentRunner {
 						trimmedAssistantText === null ||
 						trimmedAssistantText.length === 0
 					) {
-					settle({
-						ok: false,
-						reason: "no_assistant",
-						error:
-							trimmedAssistantText === null
-								? "pi agent_end did not include an assistant message"
-								: "pi assistant produced empty text",
-						durationMs: Date.now() - startTime,
-						// Pi machinery worked (agent_end / terminal message_end seen);
-						// the model just returned empty text. Mark protocol output as
-						// present so this legitimate empty response is NOT mistaken for
-						// the #238 silent failure and does not fire the isolated retry.
-						meta: {
-							stderr: stderr.length > 0 ? stderr : undefined,
-							sawProtocolOutput: true,
-						},
-					});
+						settle({
+							ok: false,
+							reason: "no_assistant",
+							error:
+								trimmedAssistantText === null
+									? "pi agent_end did not include an assistant message"
+									: "pi assistant produced empty text",
+							durationMs: Date.now() - startTime,
+							// Pi machinery worked (agent_end / terminal message_end seen);
+							// the model just returned empty text. Mark protocol output as
+							// present so this legitimate empty response is NOT mistaken for
+							// the #238 silent failure and does not fire the isolated retry.
+							meta: {
+								stderr: stderr.length > 0 ? stderr : undefined,
+								sawProtocolOutput: true,
+							},
+						});
 						return;
 					}
 					if (
@@ -1287,22 +1287,22 @@ export class PiSubagentRunner implements SubagentRunner {
 					return;
 				}
 
-			settle({
-				ok: false,
-				reason: "no_assistant",
-				error: `pi exited successfully without emitting agent_end. stderr: ${stderr.slice(0, 500) || "(empty)"}`,
-				durationMs: Date.now() - startTime,
-				meta: {
-					stderr: stderr.length > 0 ? stderr : undefined,
-					exitCode: code,
-					signal,
-					// #238: distinguish the silent failure (zero JSON stdout lines,
-					// no agent_end) from a partial run that emitted some events but
-					// never completed a turn. Only the zero-output case fires the
-					// isolated retry; eventCount counts parsed protocol lines.
-					sawProtocolOutput: eventCount > 0,
-				},
-			});
+				settle({
+					ok: false,
+					reason: "no_assistant",
+					error: `pi exited successfully without emitting agent_end. stderr: ${stderr.slice(0, 500) || "(empty)"}`,
+					durationMs: Date.now() - startTime,
+					meta: {
+						stderr: stderr.length > 0 ? stderr : undefined,
+						exitCode: code,
+						signal,
+						// #238: distinguish the silent failure (zero JSON stdout lines,
+						// no agent_end) from a partial run that emitted some events but
+						// never completed a turn. Only the zero-output case fires the
+						// isolated retry; eventCount counts parsed protocol lines.
+						sawProtocolOutput: eventCount > 0,
+					},
+				});
 			});
 		});
 	}
@@ -1358,8 +1358,7 @@ function isIsolatedRetryTrigger(
 	result: SubagentRunResult,
 ): result is FailedRunResult {
 	return (
-		isPiExtensionCollisionFailure(result) ||
-		isSilentNoAssistantFailure(result)
+		isPiExtensionCollisionFailure(result) || isSilentNoAssistantFailure(result)
 	);
 }
 

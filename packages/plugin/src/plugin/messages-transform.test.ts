@@ -2,8 +2,8 @@
 
 import { describe, expect, it } from "bun:test";
 import {
-    FAIL_CLOSED_DOCTOR_COMMAND,
     createFailClosedController,
+    FAIL_CLOSED_DOCTOR_COMMAND,
     isFailClosedBlockingError,
 } from "../features/magic-context/fail-closed-block";
 import { createMessagesTransformHandler } from "./messages-transform";
@@ -144,9 +144,7 @@ describe("createMessagesTransformHandler — fail-closed blocking (note #906)", 
             internalChildSessions,
         });
 
-        await expect(
-            handler({}, makeOutput({ sessionID: "ses_mc_child" })),
-        ).resolves.toBeDefined();
+        await expect(handler({}, makeOutput({ sessionID: "ses_mc_child" }))).resolves.toBeDefined();
         await expect(handler({}, makeOutput({ agent: "title" }))).resolves.toBeDefined();
         await expect(handler({}, makeOutput({ agent: "summary" }))).resolves.toBeDefined();
         expect(calls).toBe(3);

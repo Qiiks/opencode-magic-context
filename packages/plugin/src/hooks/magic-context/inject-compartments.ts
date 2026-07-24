@@ -1642,8 +1642,6 @@ function readNewCompartments(
     return rows.map(rowToM0Compartment);
 }
 
-
-
 /**
  * Incremental token accounting for the grouped memory block. Trimming probes
  * hundreds of candidates against the budget; re-rendering and re-tokenizing the
@@ -2047,7 +2045,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
                       currentWorkspace.ownIdentities,
                       currentWorkspace.shareCategories,
                       foldMaterializedAt,
-                   )
+                  )
                 : getMaxMemoryId(options.db, projectPath, foldMaterializedAt),
             maxMutationId: getMaxM0MutationId(options.db, options.sessionId) ?? 0,
             maxMemoryMutationId: currentWorkspace.isWorkspaced
@@ -2238,9 +2236,7 @@ function renderMemoryUpdatesBlock(args: {
             }
             if (!baselineIds.has(mutation.targetMemoryId)) continue;
             if (replacementId !== null && args.eligibleMemoryIds.has(replacementId)) {
-                lines.push(
-                    `  <superseded id="${mutation.targetMemoryId}" by="${replacementId}"/>`,
-                );
+                lines.push(`  <superseded id="${mutation.targetMemoryId}" by="${replacementId}"/>`);
             } else {
                 lines.push(`  <removed id="${mutation.targetMemoryId}"/>`);
             }
@@ -2248,10 +2244,7 @@ function renderMemoryUpdatesBlock(args: {
         }
 
         if (!baselineIds.has(mutation.targetMemoryId)) {
-            if (
-                mutation.visibilityChanged &&
-                args.eligibleMemoryIds.has(mutation.targetMemoryId)
-            ) {
+            if (mutation.visibilityChanged && args.eligibleMemoryIds.has(mutation.targetMemoryId)) {
                 forcedIds.add(mutation.targetMemoryId);
             }
             continue;

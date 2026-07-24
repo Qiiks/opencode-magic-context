@@ -189,10 +189,7 @@ function textIdentityDigest(value: string): string {
     return createHash("sha256").update(value).digest("hex");
 }
 
-function buildContentDerivedTextIds(
-    messageId: string,
-    parts: readonly TranscriptPart[],
-): string[] {
+function buildContentDerivedTextIds(messageId: string, parts: readonly TranscriptPart[]): string[] {
     const sources = parts
         .filter((part) => part.kind === "text")
         .map((part) => stripTagPrefix(part.getText() ?? ""));
@@ -247,8 +244,7 @@ export function tagTranscript(
         let toolResultOrdinal = 0;
         const parts = message.parts;
         const contentDerivedTextIds =
-            messageId !== undefined &&
-            options.textIdentityDriftMessageIds?.has(messageId) === true
+            messageId !== undefined && options.textIdentityDriftMessageIds?.has(messageId) === true
                 ? buildContentDerivedTextIds(messageId, parts)
                 : undefined;
 

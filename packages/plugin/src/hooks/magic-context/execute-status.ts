@@ -13,17 +13,14 @@ import {
     POST_DROP_TARGET_RATIO,
 } from "./compartment-trigger";
 import {
+    type ExecuteThresholdDetail,
     MAX_EXECUTE_THRESHOLD,
     resolveExecuteThresholdDetail,
-    type ExecuteThresholdDetail,
 } from "./event-resolvers";
 import { formatBytes } from "./format-bytes";
 import { estimateTokens } from "./read-session-formatting";
 
-function formatExecuteThreshold(
-    detail: ExecuteThresholdDetail,
-    contextLimit: number,
-): string {
+function formatExecuteThreshold(detail: ExecuteThresholdDetail, contextLimit: number): string {
     const { percentage, mode } = detail;
     // Surfaces the silent clamp from issue #241: when the configured value exceeded
     // the 80% safety cap, append a note showing the configured value and the cap so

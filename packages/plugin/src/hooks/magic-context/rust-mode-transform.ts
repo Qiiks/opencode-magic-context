@@ -27,14 +27,13 @@ import { writeRustTransformDecision } from "../../features/magic-context/transfo
 import type { ContextUsage } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
 import { resolveCtxReduceAvailability } from "./ctx-reduce-availability";
-import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
-import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     resolveExecuteThreshold,
     resolveModelKey,
     resolveTrustedContextLimit,
 } from "./event-resolvers";
+import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
 import { replayLkg, resolveLkgModelKeys } from "./lkg-replay";
 import {
     captureSlot,
@@ -57,6 +56,7 @@ import {
     encodeOpenCodeMessagesToCk,
     resolveOrdinalsForModule,
 } from "./module-wire";
+import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { findLastAssistantModelFromOpenCodeDb, isMidTurn } from "./read-session-db";
 import type { RawMessageOrdinalAnchor } from "./read-session-raw";
 import type { TransformDeps } from "./transform";

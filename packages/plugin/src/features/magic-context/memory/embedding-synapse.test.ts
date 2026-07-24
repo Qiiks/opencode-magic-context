@@ -303,8 +303,16 @@ describe("recommended batch policy", () => {
         });
         const big = "y".repeat(400);
         const items = [
-            { id: "big1", text: big, contentSha256: createHash("sha256").update(big).digest("hex") },
-            { id: "big2", text: big, contentSha256: createHash("sha256").update(big).digest("hex") },
+            {
+                id: "big1",
+                text: big,
+                contentSha256: createHash("sha256").update(big).digest("hex"),
+            },
+            {
+                id: "big2",
+                text: big,
+                contentSha256: createHash("sha256").update(big).digest("hex"),
+            },
         ];
         const vectors = await provider.embedItems(items);
         expect(vectors.size).toBe(2);

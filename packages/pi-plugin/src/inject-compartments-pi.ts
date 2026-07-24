@@ -32,6 +32,8 @@ import {
 	readNewMemoriesForM1Union,
 } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import type { Memory } from "@magic-context/core/features/magic-context/memory/types";
+import { resolveMuralWire } from "@magic-context/core/features/magic-context/mural/render-trigger";
+import type { MuralWireOptions } from "@magic-context/core/features/magic-context/mural/resolve-mural";
 import {
 	type ContextDatabase,
 	clearCachedM0M1,
@@ -70,8 +72,6 @@ import {
 	renderCompartmentAtTier,
 	renderDecayedCompartments,
 } from "@magic-context/core/hooks/magic-context/decay-render";
-import { resolveMuralWire } from "@magic-context/core/features/magic-context/mural/render-trigger";
-import type { MuralWireOptions } from "@magic-context/core/features/magic-context/mural/resolve-mural";
 import {
 	DEFAULT_MEMORY_BUDGET_TOKENS,
 	DEFAULT_USER_PROFILE_BUDGET_TOKENS,
@@ -1709,7 +1709,11 @@ export function materializeM0Pi(
 		);
 
 		db.exec("COMMIT");
-		rememberPiMuralPayload(state.sessionId, frozenMuralDataUrl, frozenMuralHash);
+		rememberPiMuralPayload(
+			state.sessionId,
+			frozenMuralDataUrl,
+			frozenMuralHash,
+		);
 		return {
 			m0,
 			m1: m1Render.text,

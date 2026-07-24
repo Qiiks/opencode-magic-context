@@ -42,8 +42,8 @@ import {
 	releaseCompartmentLease,
 	renewCompartmentLease,
 } from "@magic-context/core/features/magic-context/compartment-lease";
-import { isFailClosedBlockingError } from "@magic-context/core/features/magic-context/fail-closed-block";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
+import { isFailClosedBlockingError } from "@magic-context/core/features/magic-context/fail-closed-block";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	clearSessionTracking,
@@ -82,7 +82,6 @@ import {
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
-import { getSourceContents } from "@magic-context/core/features/magic-context/storage-source";
 import {
 	clearDeferredExecutePendingIfMatches,
 	clearDetectedContextLimit,
@@ -100,6 +99,7 @@ import {
 	resetLastNudgeCycleIfTailShrank,
 	setDeferredExecutePendingIfAbsent,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import { getSourceContents } from "@magic-context/core/features/magic-context/storage-source";
 import {
 	createTagger,
 	type Tagger,
@@ -151,17 +151,17 @@ import {
 	buildEditSupersessionReclaim,
 	buildSupersessionReclaimOps,
 } from "@magic-context/core/hooks/magic-context/supersession-reclaim";
+import { stripTagPrefix } from "@magic-context/core/hooks/magic-context/tag-content-primitives";
 import {
 	advanceToolReclaimWatermarkToCurrentMax,
 	buildSyntheticToolReclaimOps,
 } from "@magic-context/core/hooks/magic-context/tool-reclaim";
-import { stripTagPrefix } from "@magic-context/core/hooks/magic-context/tag-content-primitives";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import {
-	tagTranscript,
 	TEXT_TAG_IDENTITY_MARKER,
+	tagTranscript,
 } from "@magic-context/core/shared/tag-transcript";
 import {
 	clearAutoSearchForPiSession,
@@ -442,7 +442,10 @@ const piTagToolTokenCacheBySession = new Map<
 	string,
 	Map<string, { text: string; tokenCount: number }>
 >();
-const piTextIdentitySourceCacheBySession = new Map<string, Map<number, string>>();
+const piTextIdentitySourceCacheBySession = new Map<
+	string,
+	Map<number, string>
+>();
 
 interface PiTextIdentityPlan {
 	driftedMessageIds: Set<string>;
@@ -478,7 +481,8 @@ function buildPiTextIdentityPlan(
 		const markerIndex = contentId.lastIndexOf(TEXT_TAG_IDENTITY_MARKER);
 		if (markerIndex >= 0) {
 			const ownerId = contentId.slice(0, markerIndex);
-			if (currentSourcesByMessageId.has(ownerId)) versionedMessageIds.add(ownerId);
+			if (currentSourcesByMessageId.has(ownerId))
+				versionedMessageIds.add(ownerId);
 			continue;
 		}
 
@@ -503,7 +507,11 @@ function buildPiTextIdentityPlan(
 		.map((row) => row.tagId)
 		.filter((tagId) => !sourceCache.has(tagId));
 	for (let offset = 0; offset < missingTagIds.length; offset += 500) {
-		const loaded = getSourceContents(db, sessionId, missingTagIds.slice(offset, offset + 500));
+		const loaded = getSourceContents(
+			db,
+			sessionId,
+			missingTagIds.slice(offset, offset + 500),
+		);
 		for (const [tagId, source] of loaded) sourceCache.set(tagId, source);
 	}
 
@@ -520,7 +528,8 @@ function buildPiTextIdentityPlan(
 			legacyRows.length === currentSources.length &&
 			legacyRows.every(
 				(row, index) =>
-					row.ordinal === index && sourceCache.get(row.tagId) === currentSources[index],
+					row.ordinal === index &&
+					sourceCache.get(row.tagId) === currentSources[index],
 			);
 		if (!vectorMatches) driftedMessageIds.add(messageId);
 	}

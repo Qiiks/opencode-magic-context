@@ -13,8 +13,8 @@ import { initializeDatabase } from "../storage-db";
 import {
     applyCues,
     CHUNK_TIMEOUT_FLOOR_MS,
-    computeChunkSliceMs,
     type CompressCuesArgs,
+    computeChunkSliceMs,
     runCompressCues,
 } from "./compress-cues";
 import {

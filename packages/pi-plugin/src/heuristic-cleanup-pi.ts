@@ -351,7 +351,12 @@ export function applyPiHeuristicCleanup(
 						: (target?.drop?.() ?? "absent");
 					if (result === "removed" || result === "truncated") {
 						updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
-						updateTagDropMode(db, sessionId, tag.tagNumber, recent ? "truncated" : "full");
+						updateTagDropMode(
+							db,
+							sessionId,
+							tag.tagNumber,
+							recent ? "truncated" : "full",
+						);
 						droppedTools++;
 						emergencyDroppedTools++;
 					}

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-
+import { MURAL_FONT_GLYPHS } from "./mural-font.generated";
 import {
     MURAL_CELL_WIDTH,
     MURAL_HEIGHT,
@@ -11,7 +11,6 @@ import {
     muralImageTokenEstimateForDimensions,
     renderMural,
 } from "./render-mural";
-import { MURAL_FONT_GLYPHS } from "./mural-font.generated";
 
 const CATEGORIES = ["PROJECT_RULES", "ARCHITECTURE", "CONSTRAINTS", "CONFIG_VALUES", "NAMING"];
 

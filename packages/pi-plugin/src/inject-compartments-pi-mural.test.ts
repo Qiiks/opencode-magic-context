@@ -86,7 +86,13 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 			const state = baseState({ mural: muralOption() });
 
 			const hardMessages = [userMessage("hello")];
-			const first = injectM0M1Pi(state, db, hardMessages as never, undefined, true);
+			const first = injectM0M1Pi(
+				state,
+				db,
+				hardMessages as never,
+				undefined,
+				true,
+			);
 			expect(first.injected).toBe(true);
 			expect(first.m0Materialized).toBe(true);
 			expect(textOf(hardMessages[0])).toContain("<memory-mural>");

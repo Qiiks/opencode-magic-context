@@ -30,6 +30,10 @@ import {
     runManualDream,
 } from "../../features/magic-context/dreamer/task-scheduler";
 import {
+    clearHookInitFailure,
+    recordHookInitFailure,
+} from "../../features/magic-context/fail-closed-block";
+import {
     resolveProjectIdentityForSession,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
@@ -38,10 +42,6 @@ import {
     getEmbeddingCoverageStatus,
 } from "../../features/magic-context/project-embedding-registry";
 import type { Scheduler } from "../../features/magic-context/scheduler";
-import {
-    clearHookInitFailure,
-    recordHookInitFailure,
-} from "../../features/magic-context/fail-closed-block";
 import {
     getDatabasePersistenceError,
     getSessionsWithPendingMarker,
@@ -81,6 +81,7 @@ import {
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
 import { dropSlot } from "./lkg-slot";
+import { SubcModuleTransport } from "./module-transport";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
 import {
@@ -90,7 +91,6 @@ import {
     setRecompTerminal,
 } from "./recomp-orchestrator";
 import type { RustModeModuleClient } from "./rust-mode-transform";
-import { SubcModuleTransport } from "./module-transport";
 import { createTextCompleteHandler } from "./text-complete";
 import { createTransform } from "./transform";
 import { type ManagedWrapupContext, runManagedWrapup } from "./wrapup-orchestrator";
@@ -656,46 +656,46 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const authorityRecoveryModuleClient =
         deps.rustModeModuleClient ??
         (() => {
-                  const transport = new SubcModuleTransport();
-                  const client: RustModeModuleClient = {
-                      call: (args) => transport.call(args),
-                      stateSyncCapabilities: (args) => transport.stateSyncCapabilities(args),
-                      closeSession: (sessionId) => transport.closeSession(sessionId),
-                      authorityStatus: (args) => transport.authorityStatus(args),
-                      authorityPrepare: (args) => transport.authorityPrepare(args),
-                      authoritySeed: (args) => transport.authoritySeed(args),
-                      authorityDrain: (args) => transport.authorityDrain(args),
-                      mirrorPull: (args) => transport.mirrorPull(args),
-                      getCompartmentsAfter: async (sessionId, afterSequence) => {
-                          const response = await transport.call({
-                              sessionId,
-                              projectRoot: deps.directory,
-                              method: "session.status",
-                              body: {
-                                  method: "session.status",
-                                  v: 1,
-                                  session_id: sessionId,
-                                  include_compartments_after_seq: afterSequence,
-                              },
-                          });
-                          const value =
-                              response && typeof response === "object" && "result" in response
-                                  ? (response as { result?: unknown }).result
-                                  : response;
-                          const record = value && typeof value === "object" ? value : {};
-                          const compartments =
-                              "compartments" in record && Array.isArray(record.compartments)
-                                  ? record.compartments
-                                  : [];
-                          const maxSequence =
-                              "max_sequence" in record && typeof record.max_sequence === "number"
-                                  ? record.max_sequence
-                                  : afterSequence;
-                          return { max_sequence: maxSequence, compartments };
-                      },
-                  };
-                   return client;
-               })();
+            const transport = new SubcModuleTransport();
+            const client: RustModeModuleClient = {
+                call: (args) => transport.call(args),
+                stateSyncCapabilities: (args) => transport.stateSyncCapabilities(args),
+                closeSession: (sessionId) => transport.closeSession(sessionId),
+                authorityStatus: (args) => transport.authorityStatus(args),
+                authorityPrepare: (args) => transport.authorityPrepare(args),
+                authoritySeed: (args) => transport.authoritySeed(args),
+                authorityDrain: (args) => transport.authorityDrain(args),
+                mirrorPull: (args) => transport.mirrorPull(args),
+                getCompartmentsAfter: async (sessionId, afterSequence) => {
+                    const response = await transport.call({
+                        sessionId,
+                        projectRoot: deps.directory,
+                        method: "session.status",
+                        body: {
+                            method: "session.status",
+                            v: 1,
+                            session_id: sessionId,
+                            include_compartments_after_seq: afterSequence,
+                        },
+                    });
+                    const value =
+                        response && typeof response === "object" && "result" in response
+                            ? (response as { result?: unknown }).result
+                            : response;
+                    const record = value && typeof value === "object" ? value : {};
+                    const compartments =
+                        "compartments" in record && Array.isArray(record.compartments)
+                            ? record.compartments
+                            : [];
+                    const maxSequence =
+                        "max_sequence" in record && typeof record.max_sequence === "number"
+                            ? record.max_sequence
+                            : afterSequence;
+                    return { max_sequence: maxSequence, compartments };
+                },
+            };
+            return client;
+        })();
     const rustModeModuleClient =
         deps.config.transform_mode === "rust" ? authorityRecoveryModuleClient : undefined;
     const rustToolBackends: RustToolBackends | undefined =

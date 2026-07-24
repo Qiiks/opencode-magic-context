@@ -3,7 +3,12 @@ import type { Database } from "../../../shared/sqlite";
 import { CATEGORY_DEFAULT_TTL, PROMOTABLE_CATEGORIES } from "./constants";
 import { embedTextForProject } from "./embedding";
 import { computeNormalizedHash } from "./normalize-hash";
-import { getMemoryById, getMemoryByHash, insertMemory, updateMemorySeenCount } from "./storage-memory";
+import {
+    getMemoryByHash,
+    getMemoryById,
+    insertMemory,
+    updateMemorySeenCount,
+} from "./storage-memory";
 import { saveEmbeddingIfHashMatches } from "./storage-memory-embeddings";
 import type { MemoryCategory, MemoryInput } from "./types";
 

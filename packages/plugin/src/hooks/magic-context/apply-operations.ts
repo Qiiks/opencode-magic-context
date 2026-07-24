@@ -32,9 +32,9 @@ import type { TagTarget } from "./tag-messages";
  * byte-identically by `applyFlushedStatuses` on every later pass. A skeleton
  * is NEVER demoted to a full drop afterwards — that second mutation would be
  * a mid-prefix rewrite on some later pass (the volatile-boundary bust class).
-  * Emergency drops use the same newest-window skeleton rule as agent drops;
-  * heuristic dedup stays full-drop because dedup keeps the newest duplicate's
-  * full content as the nearby anchor.
+ * Emergency drops use the same newest-window skeleton rule as agent drops;
+ * heuristic dedup stays full-drop because dedup keeps the newest duplicate's
+ * full content as the nearby anchor.
  */
 export const RECENT_TOOL_SKELETON_WINDOW = 20;
 

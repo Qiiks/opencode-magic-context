@@ -11,14 +11,14 @@ import { migrateMagicContextConfigLocations } from "./config/migrate-config-loca
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
-import { resolveProjectIdentityForSession } from "./features/magic-context/memory/project-identity";
-import { runSessionProjectBackfill } from "./features/magic-context/session-project-backfill";
-import { SIDEKICK_SYSTEM_PROMPT } from "./features/magic-context/sidekick/agent";
-import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smart-notes/compiler-prompt";
 import {
     createFailClosedController,
     getLastHookInitFailure,
 } from "./features/magic-context/fail-closed-block";
+import { resolveProjectIdentityForSession } from "./features/magic-context/memory/project-identity";
+import { runSessionProjectBackfill } from "./features/magic-context/session-project-backfill";
+import { SIDEKICK_SYSTEM_PROMPT } from "./features/magic-context/sidekick/agent";
+import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smart-notes/compiler-prompt";
 import {
     getSchemaFenceRejection,
     isDatabasePersisted,
@@ -34,8 +34,8 @@ import {
     HISTORIAN_EDITOR_SYSTEM_PROMPT,
 } from "./hooks/magic-context/compartment-prompt";
 import { createLiveSessionState } from "./hooks/magic-context/live-session-state";
-import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
 import { SubcModuleTransport } from "./hooks/magic-context/module-transport";
+import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
 import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./plugin/boot-quiet";
 import { cleanupConflictWarnings, sendConflictWarning } from "./plugin/conflict-warning-hook";
 import { startDreamScheduleTimer } from "./plugin/dream-timer";
@@ -156,9 +156,7 @@ const server: Plugin = async (ctx) => {
 
     const liveSessionState = createLiveSessionState();
     const rustModeModuleClient: RustModeModuleClient | undefined =
-        pluginConfig.transform_mode === "rust"
-            ? new SubcModuleTransport()
-            : undefined;
+        pluginConfig.transform_mode === "rust" ? new SubcModuleTransport() : undefined;
 
     const hooks = await createSessionHooksAsync({
         ctx,

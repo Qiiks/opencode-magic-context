@@ -1,22 +1,20 @@
 import * as crypto from "node:crypto";
 import {
-    resolveProjectIdentity,
-    resolveProjectIdentityForSession,
-    takeDubiousOwnershipProjectIdentityWarning,
-} from "../../features/magic-context/memory/project-identity";
-import {
+    type AuthorityModuleClient,
     checksumAuthoritySeedRows,
     drainAuthority,
     ensureContextStoreUuid,
     getAuthorityManagedMarker,
-    type AuthorityModuleClient,
 } from "../../features/magic-context/context-authority";
-import { bumpProjectMemoryEpoch } from "../../features/magic-context/storage-project-state";
+import {
+    resolveProjectIdentity,
+    resolveProjectIdentityForSession,
+    takeDubiousOwnershipProjectIdentityWarning,
+} from "../../features/magic-context/memory/project-identity";
 import { scheduleReconciliation } from "../../features/magic-context/message-index-async";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import { parseCacheTtl } from "../../features/magic-context/scheduler";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
-
 import {
     type ContextDatabase,
     deriveTagLoadFloor,
@@ -45,6 +43,7 @@ import {
     resetProtectedTailNoEligibleHead,
     setDeferredExecutePendingIfAbsent,
 } from "../../features/magic-context/storage-meta-persisted";
+import { bumpProjectMemoryEpoch } from "../../features/magic-context/storage-project-state";
 import type { Tagger } from "../../features/magic-context/tagger";
 import {
     clearOpenCodePendingTransformDecision,
@@ -365,9 +364,7 @@ export async function recoverTsAuthorityProject(args: {
                 checksum: () => {
                     const table = domain === "memories" ? "memories" : "notes";
                     const rows = args.db
-                        .prepare(
-                            `SELECT * FROM ${table} WHERE project_path = ? ORDER BY id ASC`,
-                        )
+                        .prepare(`SELECT * FROM ${table} WHERE project_path = ? ORDER BY id ASC`)
                         .all(args.projectPath)
                         .filter(
                             (row): row is Record<string, unknown> =>
@@ -2359,7 +2356,6 @@ export function createTransform(deps: TransformDeps) {
             sessionId,
             `transform completed in ${elapsed}ms (${messages.length} messages, ${targets.size} targets, watermark: ${watermark})`,
         );
-
 
         deps.maybeAutoEmbedSession?.(sessionId);
     };

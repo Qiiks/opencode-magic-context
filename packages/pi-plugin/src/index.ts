@@ -35,6 +35,10 @@ import {
 	summarizeDreamSchedule,
 	userMemoryCollectionEnabled,
 } from "@magic-context/core/features/magic-context/dreamer/task-config";
+import {
+	type FailClosedReason,
+	formatFailClosedBlockingMessage,
+} from "@magic-context/core/features/magic-context/fail-closed-block";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { scheduleIncrementalIndex } from "@magic-context/core/features/magic-context/message-index-async";
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
@@ -46,10 +50,6 @@ import {
 	getSessionsWithPendingPiMarker,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
-import {
-	type FailClosedReason,
-	formatFailClosedBlockingMessage,
-} from "@magic-context/core/features/magic-context/fail-closed-block";
 import {
 	applySqliteTuningPragmas,
 	getSchemaFenceRejection,
@@ -91,7 +91,6 @@ import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import { resolveFallbackChain } from "@magic-context/core/shared/resolve-fallbacks";
 
 import { handlePiCloneSessionStart } from "./clone-inheritance";
-import { registerPiFailClosedSurface } from "./fail-closed-pi";
 import {
 	type PiSidekickConfig,
 	registerCtxAugCommand,
@@ -142,6 +141,7 @@ import {
 } from "./dreamer";
 import { loadDefaultPiSessionApi } from "./dreamer/pi-session-api";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
+import { registerPiFailClosedSurface } from "./fail-closed-pi";
 import { computePiPressure, extractAssistantUsage } from "./pi-pressure";
 import { awaitInFlightRecomps } from "./pi-recomp-runner";
 import { readPiSessionMessages } from "./read-session-pi";
@@ -641,7 +641,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		ensureConfigLocationsMigrated(projectDirForConfig);
 		const early = loadPiConfig({ cwd: projectDirForConfig });
 		if (!early.config.enabled) {
-			info("plugin DISABLED via config (enabled: false) — skipping registration");
+			info(
+				"plugin DISABLED via config (enabled: false) — skipping registration",
+			);
 			return;
 		}
 		const fence = getSchemaFenceRejection();

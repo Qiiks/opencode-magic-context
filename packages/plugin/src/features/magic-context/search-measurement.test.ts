@@ -11,8 +11,8 @@ import {
     _setTestProviderFactoryForProject,
     registerProjectShadowEmbedding,
 } from "./project-embedding-registry";
-import { recordShadowMeasurement } from "./search-measurement";
 import type { UnifiedSearchOptions, UnifiedSearchResult } from "./search";
+import { recordShadowMeasurement } from "./search-measurement";
 import { closeDatabase, openDatabase } from "./storage";
 
 class FakeShadowProvider implements EmbeddingProvider {
@@ -102,7 +102,9 @@ describe("recordShadowMeasurement", () => {
         const closedDb = new Database(":memory:");
         closedDb.close();
 
-        await expect(recordShadowMeasurement(makeMeasurementArgs(closedDb))).resolves.toBeUndefined();
+        await expect(
+            recordShadowMeasurement(makeMeasurementArgs(closedDb)),
+        ).resolves.toBeUndefined();
     });
 
     it("never raises an unhandled rejection when floated like the search call site", async () => {

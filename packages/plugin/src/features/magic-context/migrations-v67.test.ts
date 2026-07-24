@@ -5,8 +5,8 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
 import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
-import { clearCachedM0M1, persistCachedM0 } from "./storage-meta-shared";
 import { clearSession, getOrCreateSessionMeta } from "./storage-meta-session";
+import { clearCachedM0M1, persistCachedM0 } from "./storage-meta-shared";
 
 function columnNames(db: Database, table: string): Set<string> {
     return new Set(

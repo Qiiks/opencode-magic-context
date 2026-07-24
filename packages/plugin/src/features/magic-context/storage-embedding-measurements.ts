@@ -102,9 +102,11 @@ export function recordEmbeddingMeasurement(
         // was just added, so at most one row overflows the cap; delete exactly
         // the oldest overflow rather than re-scanning the whole session.
         const rowCount = (
-            db.prepare(
-                "SELECT COUNT(*) AS count FROM embedding_measurement_corpus WHERE session_id = ?",
-            ).get(input.sessionId) as { count: number }
+            db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM embedding_measurement_corpus WHERE session_id = ?",
+                )
+                .get(input.sessionId) as { count: number }
         ).count;
         const overflow = rowCount - MEASUREMENT_CORPUS_SESSION_ROW_CAP;
         if (overflow > 0) {

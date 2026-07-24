@@ -1,11 +1,13 @@
-import type { ClassifyModuleClient } from "./classify";
-import { getContextStoreUuid } from "../context-authority";
 import type { Database } from "../../../shared/sqlite";
+import { getContextStoreUuid } from "../context-authority";
+import type { ClassifyModuleClient } from "./classify";
 
 export class DreamerModuleFailureError extends Error {
     readonly transient = true;
     constructor(operation: string, cause: unknown) {
-        super(`Rust dreamer ${operation} failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+        super(
+            `Rust dreamer ${operation} failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
         this.name = "DreamerModuleFailureError";
         (this as Error & { cause?: unknown }).cause = cause;
     }
@@ -83,11 +85,25 @@ export function getModuleMemoryIdentities(
               WHERE identity.domain = 'memories' AND identity.module_project = ?
                 AND identity.context_row_id IN (${placeholders})`,
         )
-        .all(projectIdentity, ...contextIds) as Array<{ context_row_id?: number; module_row_id?: number; normalized_hash?: string | null }>;
+        .all(projectIdentity, ...contextIds) as Array<{
+        context_row_id?: number;
+        module_row_id?: number;
+        normalized_hash?: string | null;
+    }>;
     return new Map(
         rows.flatMap((row) =>
-            Number.isInteger(row.context_row_id) && Number.isInteger(row.module_row_id) && typeof row.normalized_hash === "string"
-                ? [[row.context_row_id as number, { moduleId: row.module_row_id as number, normalizedHash: row.normalized_hash }]]
+            Number.isInteger(row.context_row_id) &&
+            Number.isInteger(row.module_row_id) &&
+            typeof row.normalized_hash === "string"
+                ? [
+                      [
+                          row.context_row_id as number,
+                          {
+                              moduleId: row.module_row_id as number,
+                              normalizedHash: row.normalized_hash,
+                          },
+                      ],
+                  ]
                 : [],
         ),
     );

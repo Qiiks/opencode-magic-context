@@ -191,9 +191,11 @@ describe("partitionVerifyScope (per-memory verified_at gate)", () => {
         try {
             apply(0, "A in a.ts", "hash-a", null, ["a.ts"], "insert");
             const contextId = Number(
-                (db.prepare("SELECT id FROM memories WHERE project_path = ?").get(PROJECT) as {
-                    id: number;
-                }).id,
+                (
+                    db.prepare("SELECT id FROM memories WHERE project_path = ?").get(PROJECT) as {
+                        id: number;
+                    }
+                ).id,
             );
             const mappedGate = await partitionVerifyScope({
                 db,

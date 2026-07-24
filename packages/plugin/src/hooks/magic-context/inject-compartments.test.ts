@@ -37,9 +37,9 @@ import {
     prepareCompartmentInjection,
     readCurrentM0SnapshotMarkers,
     renderCompartmentInjection,
+    renderM1,
     renderMemoryBlockV2,
     renderMemoryLineV2,
-    renderM1,
     trimMemoriesToBudgetV2,
 } from "./inject-compartments";
 import { closeReadOnlySessionDb } from "./read-session-db";
@@ -2562,9 +2562,7 @@ describe("m[0]/m[1] materialization", () => {
                     Number(match[1]),
                 );
                 const expectedId =
-                    fixture.expectedTarget === null
-                        ? null
-                        : targets[fixture.expectedTarget]?.id;
+                    fixture.expectedTarget === null ? null : targets[fixture.expectedTarget]?.id;
                 expect(renderedIds, fixture.name).toEqual(expectedId === null ? [] : [expectedId]);
                 if (expectedId === null) {
                     expect(m1, fixture.name).toContain(`<removed id="${source.id}"/>`);
@@ -2573,7 +2571,9 @@ describe("m[0]/m[1] materialization", () => {
                     expect(m1, fixture.name).toContain(
                         `<superseded id="${source.id}" by="${expectedId}"/>`,
                     );
-                    expect(m1.match(new RegExp(`^#${expectedId}(?:\\s|\\[|:)`, "gm"))?.length).toBe(1);
+                    expect(m1.match(new RegExp(`^#${expectedId}(?:\\s|\\[|:)`, "gm"))?.length).toBe(
+                        1,
+                    );
                 }
             } finally {
                 caseDb.close();
@@ -2692,9 +2692,7 @@ describe("m[0]/m[1] materialization", () => {
         };
         const grant = renderM1(options, markers, [ownMemory.id]);
         expect(grant).toContain("foreign visibility memory below watermark");
-        expect(
-            grant.match(new RegExp(`^#${foreignMemory.id}(?:\\s|\\[|:)`, "gm"))?.length,
-        ).toBe(1);
+        expect(grant.match(new RegExp(`^#${foreignMemory.id}(?:\\s|\\[|:)`, "gm"))?.length).toBe(1);
 
         db.prepare("UPDATE memories SET shareable = 0 WHERE id = ?").run(foreignMemory.id);
         queueMemoryMutation(db, {
@@ -2703,11 +2701,10 @@ describe("m[0]/m[1] materialization", () => {
             targetMemoryId: foreignMemory.id,
             category: "__mc_visibility__",
         });
-        const revoke = renderM1(
-            options,
-            { ...markers, maxMemoryMutationId: grantMutation.id },
-            [foreignMemory.id, ownMemory.id],
-        );
+        const revoke = renderM1(options, { ...markers, maxMemoryMutationId: grantMutation.id }, [
+            foreignMemory.id,
+            ownMemory.id,
+        ]);
         expect(revoke).toContain(`<removed id="${foreignMemory.id}"/>`);
         expect(revoke).not.toContain("foreign visibility memory below watermark");
     });
