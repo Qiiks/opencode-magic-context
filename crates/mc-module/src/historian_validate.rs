@@ -1042,10 +1042,27 @@ fn capture_u64(regex: &Regex, haystack: &str) -> Option<u64> {
 }
 
 fn extract_tier(inner: &str, index: usize) -> Option<String> {
-    tier_regexes()[index].captures(inner).map(|caps| {
-        let body = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-        unescape_xml(body.trim())
-    })
+    let open_match = tier_open_regexes()[index].captures(inner)?;
+    let full = open_match.get(0)?;
+    // Self-close form (<p4/> or <p4 />) → empty tier.
+    if open_match.get(1).map(|m| m.as_str()) == Some("/") {
+        return Some(String::new());
+    }
+    let rest = &inner[full.end()..];
+    // Bound the body at the next closing tier tag (any digit). When there is no
+    // close at all, run to the end of the compartment and let the guard below
+    // trim at the next opener if one is present.
+    let end = tier_close_any_regex()
+        .find(rest)
+        .map(|m| m.start())
+        .unwrap_or(rest.len());
+    let mut body = &rest[..end];
+    // Over-capture guard: never swallow a subsequent tier's opening tag into
+    // this tier's content. If an opener appears before the close, cut there.
+    if let Some(open_inside) = tier_open_any_regex().find(body) {
+        body = &body[..open_inside.start()];
+    }
+    Some(unescape_xml(body.trim()))
 }
 
 fn split_anchor_prefix(text: &str) -> (Option<u64>, String) {
@@ -1110,16 +1127,34 @@ fn attr_importance_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r#"\bimportance="(\d+)""#).unwrap())
 }
 
-fn tier_regexes() -> &'static [Regex; 4] {
+/// Per-tier opener: matches `<p1>` / `<p1 >` (group 1 empty) or the self-close
+/// `<p1/>` / `<p1 />` (group 1 = "/"). The body that follows an opener is
+/// bounded procedurally in `extract_tier` rather than by an exact `</pN>` close,
+/// because some models mismatch the closing digit (e.g. `<p1>…</p2>`).
+fn tier_open_regexes() -> &'static [Regex; 4] {
     static RE: OnceLock<[Regex; 4]> = OnceLock::new();
     RE.get_or_init(|| {
         [
-            Regex::new(r#"(?s)<p1\s*/>|<p1\s*>(.*?)</p1>"#).unwrap(),
-            Regex::new(r#"(?s)<p2\s*/>|<p2\s*>(.*?)</p2>"#).unwrap(),
-            Regex::new(r#"(?s)<p3\s*/>|<p3\s*>(.*?)</p3>"#).unwrap(),
-            Regex::new(r#"(?s)<p4\s*/>|<p4\s*>(.*?)</p4>"#).unwrap(),
+            Regex::new(r"<p1\s*(/?)>").unwrap(),
+            Regex::new(r"<p2\s*(/?)>").unwrap(),
+            Regex::new(r"<p3\s*(/?)>").unwrap(),
+            Regex::new(r"<p4\s*(/?)>").unwrap(),
         ]
     })
+}
+
+/// Any tier's closing tag (`</p1>`…`</p9>`) — bounds an opened tier's body
+/// regardless of whether the close digit matches the opener.
+fn tier_close_any_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"</p\d").unwrap())
+}
+
+/// Any tier's OPENING tag (`<p1>`…`<p9>`) — the over-capture guard: a tier body
+/// must never swallow a following tier's opener.
+fn tier_open_any_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"<p\d").unwrap())
 }
 
 fn facts_block_regex() -> &'static Regex {
@@ -1373,6 +1408,58 @@ mod tests {
         assert_eq!(compartment.p2.as_deref(), Some("full summary"));
         assert_eq!(compartment.p3.as_deref(), Some("full summary"));
         assert_eq!(compartment.p4.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn mismatched_tier_close_parses_leniently_while_tierless_output_still_rejects() {
+        // Exact observed shape from issue #246: deepseek-v4-flash-free closes
+        // <p1> with </p2>. The lenient parser terminates the opened <p1> at the
+        // NEXT closing tier tag (any digit) and the real <p2> still parses, so
+        // validation passes (the legacy=0 tiered path) instead of retrying.
+        let mangled = r#"<output><compartment start="1" end="2" title="mangled" importance="55"><p1>
+full narrative
+</p2>
+<p2>condensed</p2><p3>outcome</p3><p4/></compartment><meta><unprocessed_from>3</unprocessed_from></meta></output>"#;
+        let validated = validate_historian_output(
+            mangled,
+            &chunk(1, 2),
+            &[],
+            ValidateOptions::default(),
+        )
+        .expect("mismatched close must parse leniently into a tiered compartment");
+        let compartment = &validated.compartments[0];
+        assert_eq!(compartment.p1.as_deref(), Some("full narrative"));
+        assert_eq!(compartment.content, "full narrative"); // mirrors P1
+        assert_eq!(compartment.p2.as_deref(), Some("condensed"));
+        assert_eq!(compartment.p3.as_deref(), Some("outcome"));
+        assert_eq!(compartment.p4.as_deref(), Some(""));
+
+        // Genuinely tier-free flat output still rejects into retry/fallback.
+        let flat = r#"<output><compartment start="1" end="2" title="flat">flat summary</compartment><meta><unprocessed_from>3</unprocessed_from></meta></output>"#;
+        let error = validate_historian_output(flat, &chunk(1, 2), &[], ValidateOptions::default())
+            .expect_err("tier-free flat output must still reject");
+        assert!(error
+            .message
+            .contains("missing the tiered paraphrase structure (p1..p4)"));
+    }
+
+    #[test]
+    fn lenient_tier_extraction_bounds_bodies_and_guards_overcapture() {
+        // Missing close entirely: an opened tier is bounded by the next opener.
+        let missing_close = r#"<output><compartments><compartment start="1" end="2" title="x" importance="50"><p1>first body<p2>second body</p2><p3>third</p3><p4/></compartment></compartments></output>"#;
+        let parsed = parse_compartment_output(missing_close).expect("parse missing-close");
+        let compartment = &parsed.compartments[0];
+        assert_eq!(compartment.p1.as_deref(), Some("first body"));
+        assert_eq!(compartment.p2.as_deref(), Some("second body"));
+        assert_eq!(compartment.p3.as_deref(), Some("third"));
+
+        // Over-capture guard: a stray close past the next opener must not extend
+        // the earlier tier's body across that opener.
+        let overcapture = r#"<output><compartments><compartment start="1" end="2" title="x" importance="50"><p1>alpha<p2>beta</p1><p3>gamma</p3><p4/></compartment></compartments></output>"#;
+        let parsed = parse_compartment_output(overcapture).expect("parse over-capture");
+        let compartment = &parsed.compartments[0];
+        assert_eq!(compartment.p1.as_deref(), Some("alpha"));
+        assert_eq!(compartment.p2.as_deref(), Some("beta"));
     }
 
     #[test]
