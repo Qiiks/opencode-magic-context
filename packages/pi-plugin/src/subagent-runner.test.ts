@@ -21,6 +21,8 @@ const ISOLATED_RETRY_LOG_MESSAGE =
 	"pi subagent: a loaded Pi extension started an agent turn before the child's prompt could run; retrying with an isolated extension set (user extensions disabled for this run)";
 const ISOLATED_RETRY_MODEL_UNAVAILABLE_LOG_MESSAGE =
 	"model unavailable in isolated retry: it is provided by a disabled extension; configure it through models.json or add a built-in/provider-configured fallback";
+const ISOLATED_RETRY_SILENT_LOG_MESSAGE =
+	"pi subagent: child exited successfully but emitted no protocol output (no agent_end, zero stdout); a loaded Pi extension likely broke print mode; retrying with an isolated extension set (user extensions disabled for this run)";
 
 beforeEach(() => {
 	__test.resetProviderFormCache();
@@ -1205,7 +1207,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			reason: "no_assistant",
 			error: "pi agent_end did not include an assistant message",
 			durationMs: expect.any(Number),
-			meta: { stderr: undefined },
+			meta: { stderr: undefined, sawProtocolOutput: true },
 		});
 	});
 
@@ -1230,16 +1232,23 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			reason: "no_assistant",
 			error: "pi assistant produced empty text",
 			durationMs: expect.any(Number),
-			meta: { stderr: undefined },
+			meta: { stderr: undefined, sawProtocolOutput: true },
 		});
 	});
 
 	it("returns no_assistant for empty stdout and successful exit", async () => {
-		const child = createMockChild();
-		const { runner } = runnerWith(child);
+		// Issue #238: an empty-stdout exit-0 primary now fires the one-shot
+		// isolated retry. When the isolated attempt ALSO exits 0 with no output,
+		// the run settles as no_assistant (the retry must not loop forever) and
+		// carries the no-protocol-output marker.
+		const first = createMockChild();
+		const second = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second]);
 
 		const resultPromise = runner.run(baseOptions);
-		child.emitClose(0);
+		first.emitClose(0);
+		await nextTick();
+		second.emitClose(0);
 
 		const result = await resultPromise;
 
@@ -1251,8 +1260,12 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				stderr: undefined,
 				exitCode: 0,
 				signal: null,
+				sawProtocolOutput: false,
 			});
 		}
+		expect(spawnImpl).toHaveBeenCalledTimes(2);
+		expect(spawnImpl.mock.calls[0]?.[1]).not.toContain("--no-extensions");
+		expect(spawnImpl.mock.calls[1]?.[1]).toContain("--no-extensions");
 	});
 
 	it("returns non_zero_exit with stderr and exit metadata", async () => {
@@ -1770,6 +1783,139 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		expect(spawnImpl.mock.calls[0]?.[1]).not.toContain("--no-extensions");
 		expect(spawnImpl.mock.calls[1]?.[1]).toContain("--no-extensions");
 		expect(spawnImpl.mock.calls[2]?.[1]).not.toContain("--no-extensions");
+	});
+
+	it("retries once with --no-extensions after a silent exit-0 primary (no agent_end, zero stdout)", async () => {
+		// Issue #238: certain user extension sets make Pi --print exit 0 with
+		// ZERO stdout (no agent_end). The primary is classified no_assistant
+		// with no protocol output, which must fire the one-shot isolated retry
+		// instead of falling through every fallback model identically.
+		const first = createMockChild();
+		const second = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second]);
+		const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
+			() => {},
+		);
+
+		try {
+			const resultPromise = runner.run({
+				...baseOptions,
+				model: "anthropic/claude-sonnet",
+			});
+			// Primary: exit 0, no stdout written at all.
+			first.emitClose(0);
+			await nextTick();
+			second.writeStdoutLine(
+				agentEnd([
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "isolated success" }],
+						stopReason: "stop",
+					},
+				]),
+			);
+			second.emitClose(0);
+
+			expect(await resultPromise).toEqual({
+				ok: true,
+				assistantText: "isolated success",
+				toolCallCount: 0,
+				durationMs: expect.any(Number),
+				meta: { stderr: undefined },
+			});
+			expect(spawnImpl).toHaveBeenCalledTimes(2);
+			expect(spawnImpl.mock.calls[0]?.[1]).not.toContain("--no-extensions");
+			expect(spawnImpl.mock.calls[1]?.[1]).toContain("--no-extensions");
+			expect(
+				logSpy.mock.calls.some(
+					(call) =>
+						call[0] === "pi-subagent" &&
+						call[1] === ISOLATED_RETRY_SILENT_LOG_MESSAGE,
+				),
+			).toBe(true);
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
+	it("does not fire the isolated retry when agent_end arrived with empty assistant text", async () => {
+		// A legitimate empty model response: Pi's machinery worked (agent_end
+		// observed) but the model returned only whitespace. This is no_assistant
+		// WITH protocol output, so it must fall through to fallback models rather
+		// than spend the one-shot isolated retry.
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child);
+		const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
+			() => {},
+		);
+
+		try {
+			const resultPromise = runner.run({
+				...baseOptions,
+				model: "anthropic/claude-sonnet",
+			});
+			child.writeStdoutLine(
+				agentEnd([
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "   " }],
+						stopReason: "stop",
+					},
+				]),
+			);
+			child.emitClose(0);
+
+			const result = await resultPromise;
+			expect(result.ok).toBe(false);
+			if (!result.ok) {
+				expect(result.reason).toBe("no_assistant");
+				expect(result.meta).toEqual({
+					stderr: undefined,
+					sawProtocolOutput: true,
+				});
+			}
+			// No isolated retry: exactly one spawn, discovery left enabled.
+			expect(spawnImpl).toHaveBeenCalledTimes(1);
+			expect(spawnImpl.mock.calls[0]?.[1]).not.toContain("--no-extensions");
+			expect(
+				logSpy.mock.calls.some(
+					(call) => call[1] === ISOLATED_RETRY_SILENT_LOG_MESSAGE,
+				),
+			).toBe(false);
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
+	it("isolated retry argv keeps explicit --extension entries while dropping discovered extensions", () => {
+		// The one-shot isolated retry re-runs buildArgs with
+		// disableDiscoveredExtensions: true. That must add --no-extensions (drop
+		// DISCOVERED user extensions) WITHOUT removing explicit --extension
+		// entries — the subagent-entry extension and any user-tier allowlist
+		// entries — because those supply the models/tools the child needs.
+		const args = buildArgsForTest(
+			{
+				...baseOptions,
+				agent: "sidekick",
+				model: "anthropic/claude-sonnet",
+			},
+			{
+				disableDiscoveredExtensions: true,
+				subagentEntryPath: "/tmp/subagent-entry.js",
+				subagentExtensions: ["provider-package"],
+			},
+		);
+
+		expect(args).toContain("--no-extensions");
+		expect(args).toEqual(
+			expect.arrayContaining(["--extension", "/tmp/subagent-entry.js"]),
+		);
+		expect(args).toEqual(
+			expect.arrayContaining([
+				"--extension",
+				join(homedir(), ".pi/agent/provider-package"),
+			]),
+		);
 	});
 
 	it("returns parse_failed when stdout is missing", async () => {

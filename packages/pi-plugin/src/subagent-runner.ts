@@ -348,6 +348,17 @@ type PiRunMode = {
 };
 
 const ALREADY_PROCESSING_PREFIX = "Agent is already processing";
+// Logged when the one-shot isolated retry (--no-extensions for discovered user
+// extensions) fires because a loaded extension started its own agent turn
+// before the child's prompt could run (issue #222). The text is asserted
+// verbatim by the subagent-runner tests; keep it stable.
+const ISOLATED_RETRY_COLLISION_LOG_MESSAGE =
+	"pi subagent: a loaded Pi extension started an agent turn before the child's prompt could run; retrying with an isolated extension set (user extensions disabled for this run)";
+// Logged when the same isolated retry fires for the issue #238 signature: the
+// child exited 0 but produced no protocol output at all (no agent_end / zero
+// stdout), which certain user extension sets cause in Pi --print mode.
+const ISOLATED_RETRY_SILENT_LOG_MESSAGE =
+	"pi subagent: child exited successfully but emitted no protocol output (no agent_end, zero stdout); a loaded Pi extension likely broke print mode; retrying with an isolated extension set (user extensions disabled for this run)";
 const ISOLATED_RETRY_MODEL_UNAVAILABLE_MESSAGE =
 	"model unavailable in isolated retry: it is provided by a disabled extension; configure it through models.json or add a built-in/provider-configured fallback";
 const MODEL_RESOLUTION_ERROR_PATTERNS = [
@@ -531,16 +542,13 @@ export class PiSubagentRunner implements SubagentRunner {
 		);
 		if (
 			this.spawnUsesNoExtensions(primaryRunMode) ||
-			!isPiExtensionCollisionFailure(primaryResult)
+			!isIsolatedRetryTrigger(primaryResult)
 		) {
 			return { result: primaryResult, extensionRetryUsed: false };
 		}
 
 		const sessionId = options.accountingSessionId ?? "pi-subagent";
-		sessionLog(
-			sessionId,
-			"pi subagent: a loaded Pi extension started an agent turn before the child's prompt could run; retrying with an isolated extension set (user extensions disabled for this run)",
-		);
+		sessionLog(sessionId, isolatedRetryLogMessage(primaryResult));
 		const isolatedResult = await this.runModelChain(
 			options,
 			{ disableDiscoveredExtensions: true },
@@ -580,15 +588,23 @@ export class PiSubagentRunner implements SubagentRunner {
 			);
 			if (result.ok) return result;
 			lastResult = result;
-			// Pi print mode discovers extensions before reading stdin. If one of those
-			// extensions starts its own turn during startup, the child run hits a prompt
-			// conflict before it can accept Magic Context's input. Stop this
-			// extension-enabled attempt and let the outer caller retry the same run with
-			// discovered extensions disabled; later top-level runs still start with
-			// extensions enabled so extension-provided models keep working normally.
+			// Pi print mode discovers extensions before reading stdin, and a loaded
+			// user extension can break the run in two ways that both look like the
+			// extension set is at fault:
+			//  1. (#222) it starts its own agent turn during startup, so the child
+			//     hits a prompt conflict before it can accept Magic Context's input
+			//     (non-zero exit + "Agent is already processing" on stderr);
+			//  2. (#238) it makes Pi --print exit 0 with NO protocol output at all
+			//     (no agent_end / zero stdout), classified as no_assistant.
+			// Either way, stop this extension-enabled attempt on the first model and
+			// let the outer caller retry the same run once with discovered extensions
+			// disabled, instead of burning every fallback model on the same doomed
+			// primary. Later top-level runs still start with extensions enabled (the
+			// degrade is per-attempt, not cached) so extension-provided models keep
+			// working normally.
 			if (
 				!this.spawnUsesNoExtensions(runMode) &&
-				isPiExtensionCollisionFailure(result)
+				isIsolatedRetryTrigger(result)
 			) {
 				return result;
 			}
@@ -1187,16 +1203,23 @@ export class PiSubagentRunner implements SubagentRunner {
 						trimmedAssistantText === null ||
 						trimmedAssistantText.length === 0
 					) {
-						settle({
-							ok: false,
-							reason: "no_assistant",
-							error:
-								trimmedAssistantText === null
-									? "pi agent_end did not include an assistant message"
-									: "pi assistant produced empty text",
-							durationMs: Date.now() - startTime,
-							meta: { stderr: stderr.length > 0 ? stderr : undefined },
-						});
+					settle({
+						ok: false,
+						reason: "no_assistant",
+						error:
+							trimmedAssistantText === null
+								? "pi agent_end did not include an assistant message"
+								: "pi assistant produced empty text",
+						durationMs: Date.now() - startTime,
+						// Pi machinery worked (agent_end / terminal message_end seen);
+						// the model just returned empty text. Mark protocol output as
+						// present so this legitimate empty response is NOT mistaken for
+						// the #238 silent failure and does not fire the isolated retry.
+						meta: {
+							stderr: stderr.length > 0 ? stderr : undefined,
+							sawProtocolOutput: true,
+						},
+					});
 						return;
 					}
 					if (
@@ -1264,17 +1287,22 @@ export class PiSubagentRunner implements SubagentRunner {
 					return;
 				}
 
-				settle({
-					ok: false,
-					reason: "no_assistant",
-					error: `pi exited successfully without emitting agent_end. stderr: ${stderr.slice(0, 500) || "(empty)"}`,
-					durationMs: Date.now() - startTime,
-					meta: {
-						stderr: stderr.length > 0 ? stderr : undefined,
-						exitCode: code,
-						signal,
-					},
-				});
+			settle({
+				ok: false,
+				reason: "no_assistant",
+				error: `pi exited successfully without emitting agent_end. stderr: ${stderr.slice(0, 500) || "(empty)"}`,
+				durationMs: Date.now() - startTime,
+				meta: {
+					stderr: stderr.length > 0 ? stderr : undefined,
+					exitCode: code,
+					signal,
+					// #238: distinguish the silent failure (zero JSON stdout lines,
+					// no agent_end) from a partial run that emitted some events but
+					// never completed a turn. Only the zero-output case fires the
+					// isolated retry; eventCount counts parsed protocol lines.
+					sawProtocolOutput: eventCount > 0,
+				},
+			});
 			});
 		});
 	}
@@ -1297,6 +1325,49 @@ function isPiExtensionCollisionFailure(
 		result.reason === "non_zero_exit" &&
 		getResultStderr(result).includes(ALREADY_PROCESSING_PREFIX)
 	);
+}
+
+/**
+ * Issue #238 signature: the child exited 0 but produced NO protocol output
+ * (no agent_end and zero JSON stdout lines), so it was classified
+ * `no_assistant`. Certain user extension sets make Pi --print silently exit
+ * this way. `runOnce` marks this case with `meta.sawProtocolOutput === false`.
+ *
+ * Deliberately NOT triggered by a legitimate empty model response: when Pi's
+ * machinery worked (agent_end / terminal message_end observed) but the model
+ * returned empty text, `sawProtocolOutput` is true and the failure is a plain
+ * `no_assistant` that should fall through to fallback models, not an isolated
+ * retry.
+ */
+function isSilentNoAssistantFailure(
+	result: SubagentRunResult,
+): result is FailedRunResult {
+	return (
+		!result.ok &&
+		result.reason === "no_assistant" &&
+		result.meta?.sawProtocolOutput === false
+	);
+}
+
+/**
+ * Whether a failed primary attempt should fire the one-shot isolated retry
+ * (--no-extensions for discovered user extensions). Covers both the #222
+ * extension turn collision and the #238 silent exit-0 signature.
+ */
+function isIsolatedRetryTrigger(
+	result: SubagentRunResult,
+): result is FailedRunResult {
+	return (
+		isPiExtensionCollisionFailure(result) ||
+		isSilentNoAssistantFailure(result)
+	);
+}
+
+/** Pick the accurate log message for whichever trigger fired the isolated retry. */
+function isolatedRetryLogMessage(result: FailedRunResult): string {
+	return isPiExtensionCollisionFailure(result)
+		? ISOLATED_RETRY_COLLISION_LOG_MESSAGE
+		: ISOLATED_RETRY_SILENT_LOG_MESSAGE;
 }
 
 function isIsolatedRetryModelUnavailable(
