@@ -20,6 +20,7 @@ import {
     getChannel2NudgeState,
     getOverflowState,
     isEmergencyRecoveryArmed,
+    isProviderOverflowReconfirmed,
     loadProtectedTailMeta,
 } from "../../features/magic-context/storage-meta-persisted";
 import { writeRustTransformDecision } from "../../features/magic-context/transform-decision-log";
@@ -1177,11 +1178,15 @@ export function createRustModeTransform(
             const detectedLimitMatchesModel =
                 overflowState.detectedContextLimitModelKey === null ||
                 overflowState.detectedContextLimitModelKey === modelKey;
+            const hasProviderProof =
+                (overflowState.detectedContextLimit > 0 && detectedLimitMatchesModel) ||
+                // An unknown persisted arm alone is not proof. A second provider rejection
+                // while that arm is durable records the process-local reconfirmation.
+                isProviderOverflowReconfirmed(sessionId);
             emergencyFailClosed ||=
                 overflowState.needsEmergencyRecovery &&
                 overflowState.emergencyRecoveryOrigin === "provider_overflow" &&
-                overflowState.detectedContextLimit > 0 &&
-                detectedLimitMatchesModel;
+                hasProviderProof;
         }
         const finishPass = (applied: boolean, served = true): void => {
             const elapsedAt = applied && appliedAt !== undefined ? appliedAt : performance.now();
