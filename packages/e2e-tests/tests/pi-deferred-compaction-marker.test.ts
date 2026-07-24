@@ -5,6 +5,7 @@ import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { PiTestHarness } from "../src/pi-harness";
+import { buildMockHistorianPayload } from "../src/mock-historian";
 import { openTestDb } from "../src/test-db";
 
 /**
@@ -187,17 +188,12 @@ describe("pi compaction marker", () => {
                 if (!isHistorianRequest(body)) return null;
                 const range = findOrdinalRange(body) ?? { start: 1, end: 2 };
                 return {
-                    text: [
-                        "<output>",
-                        "<compartments>",
-                        `<compartment start="${range.start}" end="${range.end}" title="pi compaction marker chunk">`,
-                        "Pi historian publication used by the compaction marker e2e.",
-                        "</compartment>",
-                        "</compartments>",
-                        "<facts></facts>",
-                        `<unprocessed_from>${range.end + 1}</unprocessed_from>`,
-                        "</output>",
-                    ].join("\n"),
+                    text: buildMockHistorianPayload({
+                        start: range.start,
+                        end: range.end,
+                        title: "pi compaction marker chunk",
+                        body: "Pi historian publication used by the compaction marker e2e.",
+                    }),
                     usage: { input_tokens: 500, output_tokens: 200, cache_creation_input_tokens: 500 },
                 };
             });

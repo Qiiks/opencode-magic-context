@@ -2,6 +2,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
+import { buildMockHistorianPayload } from "../src/mock-historian";
 
 /**
  * Plan v6: deferred compaction marker — publish-time persistence and
@@ -123,17 +124,12 @@ describe("deferred compaction marker (plan v6)", () => {
                         },
                     };
                 }
-                const payload = [
-                    "<output>",
-                    "<compartments>",
-                    `<compartment start="${range.start}" end="${range.end}" title="e2e marker drain chunk">`,
-                    "Initial turns driven by the e2e harness — exercises the deferred-marker drain path.",
-                    "</compartment>",
-                    "</compartments>",
-                    "<facts></facts>",
-                    `<unprocessed_from>${range.end + 1}</unprocessed_from>`,
-                    "</output>",
-                ].join("\n");
+                const payload = buildMockHistorianPayload({
+                    start: range.start,
+                    end: range.end,
+                    title: "e2e marker drain chunk",
+                    body: "Initial turns driven by the e2e harness — exercises the deferred-marker drain path.",
+                });
                 return {
                     text: payload,
                     usage: {

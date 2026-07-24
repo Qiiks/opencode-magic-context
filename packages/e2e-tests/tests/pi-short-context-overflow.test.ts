@@ -2,6 +2,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { PiTestHarness } from "../src/pi-harness";
+import { buildMockHistorianPayload } from "../src/mock-historian";
 
 /**
  * Pi short-context overflow survival guard.
@@ -78,11 +79,12 @@ describe("pi short context accumulating overflow", () => {
             const start = rangeHdr ? Number(rangeHdr[1]) : 0;
             const end = rangeHdr ? Number(rangeHdr[2]) : 0;
             return {
-                text:
-                    `<output><compartments>` +
-                    `<compartment start="${start}" end="${end}" title="Pi build-up">` +
-                    `Summary.</compartment></compartments><facts></facts>` +
-                    `<unprocessed_from>${end + 1}</unprocessed_from></output>`,
+                text: buildMockHistorianPayload({
+                    start,
+                    end,
+                    title: "Pi build-up",
+                    body: "Summary.",
+                }),
                 usage: {
                     input_tokens: 500,
                     output_tokens: 50,

@@ -2,6 +2,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
+import { buildMockHistorianPayload } from "../src/mock-historian";
 
 /**
  * Historian publishes a compartment end-to-end.
@@ -100,17 +101,12 @@ describe("historian success path", () => {
                         },
                     };
                 }
-                const payload = [
-                    "<output>",
-                    "<compartments>",
-                    `<compartment start="${range.start}" end="${range.end}" title="E2E test chunk">`,
-                    "Driven by the e2e harness: initial turns carry placeholder content used only to exercise historian.",
-                    "</compartment>",
-                    "</compartments>",
-                    "<facts></facts>",
-                    `<unprocessed_from>${range.end + 1}</unprocessed_from>`,
-                    "</output>",
-                ].join("\n");
+                const payload = buildMockHistorianPayload({
+                    start: range.start,
+                    end: range.end,
+                    title: "E2E test chunk",
+                    body: "Driven by the e2e harness: initial turns carry placeholder content used only to exercise historian.",
+                });
                 return {
                     text: payload,
                     usage: {

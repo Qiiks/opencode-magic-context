@@ -8,6 +8,7 @@ import { computeNormalizedHash } from "../../plugin/src/features/magic-context/m
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import { computeSyntheticCallId } from "../../plugin/src/hooks/magic-context/todo-view";
 import { PiTestHarness } from "../src/pi-harness";
+import { buildMockHistorianPayload } from "../src/mock-historian";
 import type { MockUsage } from "../src/mock-provider/server";
 import { openTestDb } from "../src/test-db";
 
@@ -273,17 +274,12 @@ describe("long-running Pi Magic Context session", () => {
                 const range = findOrdinalRange(body) ?? { start: 1, end: 2 };
                 historianRange = range;
                 return {
-                    text: [
-                        "<output>",
-                        "<compartments>",
-                        `<compartment start="${range.start}" end="${range.end}" title="Long Pi e2e chunk">`,
-                        "The long-running Pi test covered warmup, execute cleanup, notes, ctx_reduce, todo synthesis, and auto-search hints.",
-                        "</compartment>",
-                        "</compartments>",
-                        "<facts></facts>",
-                        `<unprocessed_from>${range.end + 1}</unprocessed_from>`,
-                        "</output>",
-                    ].join("\n"),
+                    text: buildMockHistorianPayload({
+                        start: range.start,
+                        end: range.end,
+                        title: "Long Pi e2e chunk",
+                        body: "The long-running Pi test covered warmup, execute cleanup, notes, ctx_reduce, todo synthesis, and auto-search hints.",
+                    }),
                     usage: { input_tokens: 500, output_tokens: 200, cache_creation_input_tokens: 500 },
                 };
             });

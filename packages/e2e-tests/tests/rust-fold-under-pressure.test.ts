@@ -26,6 +26,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { RustTestHarness } from "../src/rust-harness";
+import { buildMockHistorianPayload } from "../src/mock-historian";
 import {
     FOLD_SKIP_REASON,
     foldInfraEnabled,
@@ -74,17 +75,12 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: fold under pressure", () => {
                 const system = JSON.stringify(body.system ?? "");
                 if (!system.includes("hippocampus of a long-running coding agent")) return null;
                 return {
-                    text: [
-                        "<output>",
-                        "<compartments>",
-                        '<compartment start="1" end="2" title="Rust fold e2e chunk">',
-                        "Covered the warmup turns of the fold-under-pressure session.",
-                        "</compartment>",
-                        "</compartments>",
-                        "<facts></facts>",
-                        "<unprocessed_from>3</unprocessed_from>",
-                        "</output>",
-                    ].join("\n"),
+                    text: buildMockHistorianPayload({
+                        start: 1,
+                        end: 2,
+                        title: "Rust fold e2e chunk",
+                        body: "Covered the warmup turns of the fold-under-pressure session.",
+                    }),
                     usage: {
                         input_tokens: 500,
                         output_tokens: 200,
