@@ -871,6 +871,7 @@ export function getMaxMemoryIdForProjects(
     projectPaths: readonly string[],
     ownIdentities?: readonly string[],
     shareCategories?: readonly string[] | null,
+    expiryCutoff: number = Date.now(),
 ): number {
     const identities = uniqueValues(projectPaths);
     if (identities.length === 0) return 0;
@@ -880,19 +881,17 @@ export function getMaxMemoryIdForProjects(
         shareCategories,
         includeClassificationFields: hasMemoryShareableColumn(db) && hasMemoryScopeColumn(db),
     });
-    if (identities.length === 1 && !sharingFilter.active) {
-        const row = db
-            .prepare("SELECT COALESCE(MAX(id), 0) AS max_id FROM memories WHERE project_path = ?")
-            .get(identities[0]) as { max_id?: number } | undefined;
-        return typeof row?.max_id === "number" ? row.max_id : 0;
-    }
     const row = db
         .prepare(
             `SELECT COALESCE(MAX(id), 0) AS max_id
                FROM memories
-              WHERE project_path IN (${sqlPlaceholders(identities)})${sharingFilter.clause}`,
+              WHERE project_path IN (${sqlPlaceholders(identities)})
+                AND status IN ('active', 'permanent')
+                AND (expires_at IS NULL OR expires_at > ?)${sharingFilter.clause}`,
         )
-        .get(...identities, ...sharingFilter.params) as { max_id?: number } | undefined;
+        .get(...identities, expiryCutoff, ...sharingFilter.params) as
+        | { max_id?: number }
+        | undefined;
     return typeof row?.max_id === "number" ? row.max_id : 0;
 }
 

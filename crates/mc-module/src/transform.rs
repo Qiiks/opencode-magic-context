@@ -1933,6 +1933,11 @@ fn apply_once(
     // The in-session lane is pending work, not a bust trigger. The external lane and the
     // durable project epoch remain eager-HARD inputs. The body composes only below an
     // independently established bust opportunity.
+    let m1_visibility_cutoff_ms = if loaded.meta.initialized {
+        loaded.meta.expiry_cutoff_ms
+    } else {
+        ctx.now_ms
+    };
     let mut m1_signal = m1_revision_signal_parts_for_pass_timed(
         store,
         ctx.project_path,
@@ -1940,7 +1945,7 @@ fn apply_once(
         &req.session_id,
         loaded.meta.user_profile_version,
         ctx.memory_enabled,
-        ctx.now_ms,
+        m1_visibility_cutoff_ms,
         Some(&mut m1_revision_read_timings),
     )?;
     let mut current_m1_digest = m1_signal.revision;
@@ -2522,7 +2527,7 @@ fn apply_once(
                                 &req.session_id,
                                 loaded.meta.user_profile_version,
                                 ctx.memory_enabled,
-                                ctx.now_ms,
+                                m1_visibility_cutoff_ms,
                                 Some(&mut m1_revision_read_timings),
                             )?;
                             current_m1_digest = m1_signal.revision;
@@ -2681,7 +2686,7 @@ fn apply_once(
                     &req.session_id,
                     loaded.meta.user_profile_version,
                     ctx.memory_enabled,
-                    ctx.now_ms,
+                    meta.expiry_cutoff_ms,
                     Some(&mut m1_revision_read_timings),
                 )?;
                 meta.m1_revision = applied_m1_signal.revision;
@@ -2693,7 +2698,12 @@ fn apply_once(
             PassPlan::Soft => {
                 meta.memory_disabled = !ctx.memory_enabled;
                 commit_memory_revision = if ctx.memory_enabled {
-                    Some(memory_revision_fence(store, ctx.project_path, &m1_signal)?)
+                    Some(memory_revision_fence(
+                        store,
+                        ctx.project_path,
+                        meta.expiry_cutoff_ms,
+                        &m1_signal,
+                    )?)
                 } else {
                     None
                 };
@@ -2848,7 +2858,7 @@ fn apply_once(
                         &req.session_id,
                         loaded.meta.user_profile_version,
                         ctx.memory_enabled,
-                        ctx.now_ms,
+                        meta.expiry_cutoff_ms,
                         Some(&mut m1_revision_read_timings),
                     )?;
                     meta.m1_revision = applied_m1_signal.revision;
@@ -2941,7 +2951,7 @@ fn apply_once(
                         &req.session_id,
                         loaded.meta.user_profile_version,
                         ctx.memory_enabled,
-                        ctx.now_ms,
+                        meta.expiry_cutoff_ms,
                         Some(&mut m1_revision_read_timings),
                     )?;
                     if m1_has_content || memory_gate_digest_transition {
@@ -3437,6 +3447,7 @@ fn effective_context_limit_tokens(usage: &ModuleUsage) -> f64 {
 fn memory_revision_fence(
     store: &McStore,
     project_path: &str,
+    expiry_cutoff_ms: i64,
     signal: &crate::m1_compose::M1RevisionSignal,
 ) -> Result<MemoryRevision, McStoreError> {
     let project_paths = match store.resolve_workspace_membership(project_path)? {
@@ -3445,6 +3456,8 @@ fn memory_revision_fence(
     };
     Ok(MemoryRevision {
         project_paths,
+        reader_project_path: project_path.to_string(),
+        expiry_cutoff_ms,
         max_memory_id: signal.max_memory_id,
         mutation_cursor: signal.max_memory_mutation_id,
     })

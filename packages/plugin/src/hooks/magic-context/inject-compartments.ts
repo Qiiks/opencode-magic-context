@@ -19,7 +19,6 @@ import {
     getMemoriesByProjects,
     getMemorySelectColumns,
     isMemoryRow,
-    readNewMemoriesForM1Union,
 } from "../../features/magic-context/memory/storage-memory";
 import type { Memory } from "../../features/magic-context/memory/types";
 import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
@@ -729,6 +728,7 @@ const DEFAULT_HISTORY_BUDGET_TOKENS = 60_000;
 export const DEFAULT_MEMORY_BUDGET_TOKENS = 8_000;
 
 export const DEFAULT_USER_PROFILE_BUDGET_TOKENS = 4_000;
+const MAX_FORCED_MEMORIES_PER_DELTA = 10;
 const M0_EMPTY_BODY = "<session-history></session-history>";
 const M1_EMPTY_PLACEHOLDER =
     "<session-history-since>(no new content since last materialization)</session-history-since>";
@@ -895,13 +895,21 @@ function getMaxCompartmentSeq(db: Database, sessionId: string): number {
     return numberFromRow(row, "s");
 }
 
-function getMaxMemoryId(db: Database, projectPath: string | undefined): number {
+function getMaxMemoryId(
+    db: Database,
+    projectPath: string | undefined,
+    expiryCutoff: number = Date.now(),
+): number {
     if (!projectPath) return 0;
     const row = cachedStatement(
         maxMemoryIdStatements,
         db,
-        "SELECT COALESCE(MAX(id), 0) AS max_id FROM memories WHERE project_path = ?",
-    ).get(projectPath);
+        `SELECT COALESCE(MAX(id), 0) AS max_id
+           FROM memories
+          WHERE project_path = ?
+            AND status IN ('active', 'permanent')
+            AND (expires_at IS NULL OR expires_at > ?)`,
+    ).get(projectPath, expiryCutoff);
     return numberFromRow(row, "max_id");
 }
 
@@ -1000,6 +1008,8 @@ const MARKER_CHANGE_PROBE_SQL = `
         SELECT MAX(memory.id)
           FROM memories AS memory
          WHERE memory.project_path IN (SELECT project_path FROM expanded)
+           AND memory.status IN ('active', 'permanent')
+           AND (memory.expires_at IS NULL OR memory.expires_at > ?)
            AND (
              memory.project_path IN (SELECT project_path FROM own)
              OR (
@@ -1099,6 +1109,7 @@ function readMarkerChangeProbe(
         GLOBAL_USER_PROFILE_PROJECT_PATH,
         args.sessionId,
         args.sessionId,
+        Date.now(),
         args.sessionId,
         args.projectPath ?? "",
     ) as MarkerChangeProbeRow;
@@ -1137,6 +1148,7 @@ function readCurrentM0SnapshotMarkersUncached(args: M0SnapshotMarkerReadArgs): {
 } {
     const projectDirectory = args.projectDirectory ?? args.projectPath ?? "";
     const hard = args.hardSignals ?? EMPTY_HARD_SIGNALS;
+    const materializedAt = Date.now();
     const workspace = resolveWorkspaceRenderContext({
         db: args.db,
         projectPath: args.projectPath,
@@ -1157,8 +1169,9 @@ function readCurrentM0SnapshotMarkersUncached(args: M0SnapshotMarkerReadArgs): {
                       workspace.expandedIdentities,
                       workspace.ownIdentities,
                       workspace.shareCategories,
+                      materializedAt,
                   )
-                : getMaxMemoryId(args.db, args.projectPath),
+                : getMaxMemoryId(args.db, args.projectPath, materializedAt),
             maxMutationId: getMaxM0MutationId(args.db, args.sessionId) ?? 0,
             maxMemoryMutationId: workspace.isWorkspaced
                 ? (getMaxMemoryMutationIdForProjects(args.db, workspace.expandedIdentities) ?? 0)
@@ -1169,7 +1182,7 @@ function readCurrentM0SnapshotMarkersUncached(args: M0SnapshotMarkerReadArgs): {
                 projectDirectory && args.injectDocs !== false
                     ? computeProjectDocsHash(projectDirectory)
                     : "",
-            materializedAt: Date.now(),
+            materializedAt,
             sessionFactsVersion: getSessionFactsVersion(args.db, args.sessionId),
             upgradeState: getUpgradeState(args.db, args.sessionId),
             compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
@@ -1629,33 +1642,7 @@ function readNewCompartments(
     return rows.map(rowToM0Compartment);
 }
 
-function readNewMemoriesForM1(
-    db: Database,
-    projectPath: string | undefined,
-    afterId: number,
-    // Expiry cutoff is FROZEN to the m[0] materialization timestamp, NOT live
-    // Date.now(). Defer passes replay the same markers (same materializedAt), so
-    // the set of "not-yet-expired" memories rendered into m[1] stays byte-stable
-    // until the next materialization. Using live Date.now() here would let a
-    // memory crossing its expires_at between two defer passes silently change
-    // m[1] bytes with no DB mutation — a cache-stability (Anthropic prefix) bust.
-    expiryCutoff: number,
-): Memory[] {
-    if (!projectPath) return [];
-    const rows = db
-        .prepare(
-            `SELECT ${getMemorySelectColumns(db)}
-               FROM memories
-              WHERE project_path = ?
-                AND id > ?
-                AND status IN ('active', 'permanent')
-                AND (expires_at IS NULL OR expires_at > ?)
-              ORDER BY ${MEMORY_CATEGORY_ORDER_SQL}, id ASC`,
-        )
-        .all(projectPath, afterId, expiryCutoff)
-        .filter(isMemoryRow);
-    return rows.map((row) => ({ ...row }));
-}
+
 
 /**
  * Incremental token accounting for the grouped memory block. Trimming probes
@@ -2059,8 +2046,9 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
                       currentWorkspace.expandedIdentities,
                       currentWorkspace.ownIdentities,
                       currentWorkspace.shareCategories,
-                  )
-                : getMaxMemoryId(options.db, projectPath),
+                      foldMaterializedAt,
+                   )
+                : getMaxMemoryId(options.db, projectPath, foldMaterializedAt),
             maxMutationId: getMaxM0MutationId(options.db, options.sessionId) ?? 0,
             maxMemoryMutationId: currentWorkspace.isWorkspaced
                 ? (getMaxMemoryMutationIdForProjects(
@@ -2214,12 +2202,13 @@ function renderMemoryUpdatesBlock(args: {
     workspace: WorkspaceRenderContext;
     afterId: number;
     renderedMemoryIds: readonly number[];
-}): { block: string; count: number } {
-    if (!args.projectPath || args.renderedMemoryIds.length === 0) {
-        return { block: "", count: 0 };
+    eligibleMemoryIds: ReadonlySet<number>;
+}): { block: string; count: number; forcedMemoryIds: number[] } {
+    if (!args.projectPath) {
+        return { block: "", count: 0, forcedMemoryIds: [] };
     }
 
-    const renderedIds = new Set(args.renderedMemoryIds);
+    const baselineIds = new Set(args.renderedMemoryIds);
     const mutations = args.workspace.isWorkspaced
         ? getMemoryMutationsForRenderByProjects(
               args.db,
@@ -2233,32 +2222,62 @@ function renderMemoryUpdatesBlock(args: {
               args.afterId,
               args.renderedMemoryIds,
           );
-    if (mutations.length === 0) return { block: "", count: 0 };
+    if (mutations.length === 0) return { block: "", count: 0, forcedMemoryIds: [] };
 
+    const forcedIds = new Set<number>();
     const lines = ["These memories changed since the snapshot below — trust these:"];
     for (const mutation of mutations) {
-        if (mutation.mutationType === "update") {
-            lines.push(
-                `  <updated id="${mutation.targetMemoryId}">${escapeXmlContent(mutation.newContent ?? "")}</updated>`,
-            );
-            continue;
-        }
         if (mutation.mutationType === "superseded") {
-            if (mutation.supersededById !== null && renderedIds.has(mutation.supersededById)) {
+            const replacementId = mutation.supersededById;
+            if (
+                replacementId !== null &&
+                !baselineIds.has(replacementId) &&
+                args.eligibleMemoryIds.has(replacementId)
+            ) {
+                forcedIds.add(replacementId);
+            }
+            if (!baselineIds.has(mutation.targetMemoryId)) continue;
+            if (replacementId !== null && args.eligibleMemoryIds.has(replacementId)) {
                 lines.push(
-                    `  <superseded id="${mutation.targetMemoryId}" by="${mutation.supersededById}"/>`,
+                    `  <superseded id="${mutation.targetMemoryId}" by="${replacementId}"/>`,
                 );
             } else {
                 lines.push(`  <removed id="${mutation.targetMemoryId}"/>`);
             }
             continue;
         }
+
+        if (!baselineIds.has(mutation.targetMemoryId)) {
+            if (
+                mutation.visibilityChanged &&
+                args.eligibleMemoryIds.has(mutation.targetMemoryId)
+            ) {
+                forcedIds.add(mutation.targetMemoryId);
+            }
+            continue;
+        }
+        if (!args.eligibleMemoryIds.has(mutation.targetMemoryId)) {
+            lines.push(`  <removed id="${mutation.targetMemoryId}"/>`);
+            continue;
+        }
+        if (mutation.visibilityChanged && mutation.newContent === null) continue;
+        if (mutation.mutationType === "update") {
+            lines.push(
+                `  <updated id="${mutation.targetMemoryId}">${escapeXmlContent(mutation.newContent ?? "")}</updated>`,
+            );
+            continue;
+        }
         lines.push(`  <removed id="${mutation.targetMemoryId}"/>`);
     }
 
+    const forcedMemoryIds = [...forcedIds]
+        .sort((left, right) => left - right)
+        .slice(0, MAX_FORCED_MEMORIES_PER_DELTA);
+    if (lines.length === 1) return { block: "", count: 0, forcedMemoryIds };
     return {
         block: `<memory-updates>\n${lines.join("\n")}\n</memory-updates>`,
-        count: mutations.length,
+        count: lines.length - 1,
+        forcedMemoryIds,
     };
 }
 
@@ -2284,12 +2303,31 @@ function renderM1WithMetadata(
         workspaceIdentitySet: options.workspaceIdentitySet,
     });
 
+    const eligibleMemories = options.projectPath
+        ? workspace.isWorkspaced
+            ? getMemoriesByProjects(
+                  options.db,
+                  workspace.expandedIdentities,
+                  ["active", "permanent"],
+                  markers.materializedAt,
+                  workspace.ownIdentities,
+                  workspace.shareCategories,
+              )
+            : getMemoriesByProject(
+                  options.db,
+                  options.projectPath,
+                  ["active", "permanent"],
+                  markers.materializedAt,
+              )
+        : [];
+    const eligibleMemoryIds = new Set(eligibleMemories.map((memory) => memory.id));
     const memoryUpdates = renderMemoryUpdatesBlock({
         db: options.db,
         projectPath: options.projectPath,
         workspace,
         afterId: markers.maxMemoryMutationId,
         renderedMemoryIds,
+        eligibleMemoryIds,
     });
     if (memoryUpdates.block) blocks.push(memoryUpdates.block);
 
@@ -2306,26 +2344,13 @@ function renderM1WithMetadata(
         );
     }
 
-    const newMemories = workspace.isWorkspaced
-        ? readNewMemoriesForM1Union(
-              options.db,
-              workspace.expandedIdentities,
-              markers.maxMemoryId,
-              // Freeze expiry to the materialization timestamp for defer-pass byte stability.
-              markers.materializedAt,
-              workspace.ownIdentities,
-              workspace.shareCategories,
-          )
-        : readNewMemoriesForM1(
-              options.db,
-              options.projectPath,
-              markers.maxMemoryId,
-              // Freeze expiry to the materialization timestamp for defer-pass byte stability.
-              markers.materializedAt,
-          );
+    const forcedMemoryIds = new Set(memoryUpdates.forcedMemoryIds);
+    const newMemories = eligibleMemories.filter(
+        (memory) => memory.id > markers.maxMemoryId && !forcedMemoryIds.has(memory.id),
+    );
     const newMemoryRenderOptions: MemoryRenderOptions = {
         sourceNameByMemoryId: sourceNamesForMemories({
-            memories: newMemories,
+            memories: eligibleMemories,
             projectPath: options.projectPath,
             workspace,
         }),
@@ -2341,8 +2366,12 @@ function renderM1WithMetadata(
         ),
         newMemoryRenderOptions,
     ).renderOrder;
+    const deltaMemories = [
+        ...trimmedNewMemories,
+        ...eligibleMemories.filter((memory) => forcedMemoryIds.has(memory.id)),
+    ];
     const newMemoriesBlock = renderMemoryBlockV2(
-        trimmedNewMemories,
+        deltaMemories,
         "new-memories",
         newMemoryRenderOptions,
     );
