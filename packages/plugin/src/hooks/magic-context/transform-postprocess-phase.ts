@@ -40,7 +40,10 @@ import { isRecord } from "../../shared/record-type-guard";
 import { runAutoSearchHint } from "./auto-search-runner";
 import { applyDeferredCompactionMarker, MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { getActiveCompartmentRun } from "./compartment-runner";
-import type { CtxReduceAvailabilityVerdict } from "./ctx-reduce-availability";
+import type {
+    CtxReduceAvailabilityVerdict,
+    ToolAvailabilityVerdict,
+} from "./ctx-reduce-availability";
 import { dropStaleReduceCalls } from "./drop-stale-reduce-calls";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
 import {
@@ -367,6 +370,10 @@ interface RunPostTransformPhaseArgs {
     messageTagNumbers: Map<MessageLike, number>;
     tagger: Tagger;
     ctxReduceAvailability: CtxReduceAvailabilityVerdict;
+    /** Frozen-per-session verdict for the native `todowrite` tool. Gates the
+     *  synthetic todo-pair injection below: a session whose tools map filters
+     *  todowrite out must not get a synthetic pair for a tool it cannot call. */
+    todowriteAvailability: ToolAvailabilityVerdict;
     batch: { finalize: () => void } | null;
     contextUsage: { percentage: number; inputTokens: number };
     schedulerDecision: "execute" | "defer";
@@ -1531,7 +1538,26 @@ export async function runPostTransformPhase(
     //     callID — repeated defer-pass calls produce byte-identical output.
     if (args.fullFeatureMode) {
         const persistedAnchor = getPersistedTodoSyntheticAnchor(args.db, args.sessionId);
-        if (isCacheBustingPass) {
+        // A FROZEN "unavailable" verdict means the session's tools map filters
+        // the native todowrite tool out (user/agent config disabled it). Such a
+        // session must not be handed a synthetic todowrite pair for a tool it
+        // cannot call — confusing wire content and pointless tokens. A
+        // provisional (non-frozen) verdict fails open and injects as before.
+        //
+        // Cache discipline (detect-on-bust, replay-everywhere-else): the pair
+        // is only ever REMOVED on a cache-busting pass, because that pass is
+        // already rewriting provider bytes. On a defer pass we keep replaying
+        // the persisted pair byte-identically even though the verdict is
+        // unavailable — first-removing it on a defer would mutate bytes the
+        // provider has cached and bust the prefix. The next busting pass clears
+        // the anchor, after which defers have nothing left to replay.
+        const todowriteUnavailable =
+            args.todowriteAvailability.frozen && !args.todowriteAvailability.callable;
+        if (isCacheBustingPass && todowriteUnavailable) {
+            if (persistedAnchor) {
+                clearPersistedTodoSyntheticAnchor(args.db, args.sessionId);
+            }
+        } else if (isCacheBustingPass) {
             const part = buildSyntheticTodoPart(args.sessionMeta.lastTodoState);
             const persistedInjection =
                 part !== null && persistedAnchor && persistedAnchor.callId === part.callID

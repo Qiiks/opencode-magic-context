@@ -23,6 +23,7 @@ import { clearSidebarSnapshotCache } from "../../plugin/sidebar-snapshot-cache";
 import type { PluginContext } from "../../plugin/types";
 import { sessionLog } from "../../shared/logger";
 import { clearAutoSearchForSession } from "./auto-search-runner";
+import { resolveTodowriteAvailability } from "./ctx-reduce-availability";
 import {
     buildChannel1Reminder,
     CHANNEL1_SENTINEL,
@@ -511,6 +512,16 @@ export function createToolExecuteAfterHook(args: {
             }
         }
         if (typedInput.tool === "todowrite") {
+            // Belt-and-braces gate: when the session's tools map filters the
+            // native todowrite tool out (frozen "unavailable" verdict), do not
+            // persist todo state for it. A disabled tool never fires
+            // tool.execute.after under its exact name in the first place, so
+            // this mostly guards against MCP-shaped lookalikes (mcp_Todowrite,
+            // etc.) writing state that the synthetic injector would later replay
+            // for a tool the session does not have. A provisional verdict fails
+            // open and captures as before.
+            const todowriteVerdict = resolveTodowriteAvailability(typedInput.sessionID);
+            if (todowriteVerdict.frozen && !todowriteVerdict.callable) return;
             // Only trigger note nudge when ALL todo items are terminal (completed/cancelled).
             // Firing on every todowrite is too eager — agents call it repeatedly while working.
             const todoArgs = typedInput.args as { todos?: unknown } | undefined;
