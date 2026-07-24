@@ -3921,6 +3921,8 @@ interface RunPipelineArgs {
 		 *  injection budget. Drives compartment tier demotion in renderM0Pi. */
 		historyBudgetTokens?: number;
 		temporalAwareness?: boolean;
+		/** experimental.mural.enabled — on-demand deterministic mural image on HARD folds. */
+		muralEnabled?: boolean;
 	};
 	/**
 	 * Optional entry-id array, indexed 1:1 with `messages`, providing
