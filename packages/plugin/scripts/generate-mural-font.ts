@@ -141,7 +141,6 @@ function parseBitmapStrike(): BitmapStrike {
             }
             return {
                 firstGlyph,
-                imageFormat,
                 imageDataOffset: u32(subtable + 4),
                 imageSize,
             };

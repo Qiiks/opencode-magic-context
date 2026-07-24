@@ -22,6 +22,10 @@ const outDir = join(import.meta.dir, "mural-test-output");
 mkdirSync(outDir, { recursive: true });
 
 const db = openDatabase();
+if (!db) {
+    console.error("test-mural-render: could not open context.db");
+    process.exit(1);
+}
 const requested = process.argv.slice(2);
 const identities =
     requested.length > 0
