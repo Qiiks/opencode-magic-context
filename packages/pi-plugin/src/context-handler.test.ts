@@ -3565,6 +3565,7 @@ describe("registerPiContextHandler", () => {
 					renderedBoundary: contention
 						? { endMessageId: "entry-1", ordinal: 1 }
 						: { endMessageId: "entry-2", ordinal: 2 },
+					m1RenderedCoverage: null,
 					syntheticLeadingCount: 0,
 				}),
 			);
@@ -3724,6 +3725,167 @@ describe("registerPiContextHandler", () => {
 				expect(appendCompaction).toHaveBeenCalledTimes(1);
 				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
 			} finally {
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+
+		it("drains on m[1]-only coverage: fresh publication, no HARD fold", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-m1-coverage";
+			const appendCompaction = mock(() => "compact-1");
+			// The exact shape a normal publication produces: m[0] still carries
+			// the empty pre-publication baseline (renderedBoundary <none> — no
+			// HARD fold has moved the compartment into m[0]), while the new
+			// compartment rendered into THIS pass's m[1] delta covers the marker.
+			const restoreInjection = contextHandlerInternals.setInjectM0M1PiForTests(
+				(_state, _db, _messages) => ({
+					injected: true,
+					compartmentCount: 1,
+					factCount: 0,
+					memoryCount: 0,
+					skippedVisibleMessages: 0,
+					m0Materialized: false,
+					m0Reason: null,
+					m0Bytes: 35,
+					m1Bytes: 518,
+					contentionExhausted: false,
+					renderedBoundary: { endMessageId: null, ordinal: null },
+					m1RenderedCoverage: { endMessageId: "entry-2", ordinal: 2 },
+					syntheticLeadingCount: 0,
+				}),
+			);
+			try {
+				seedCompartment(db, sessionId);
+				setPendingPiCompactionMarkerState(db, sessionId, {
+					firstKeptEntryId: "entry-3",
+					endMessageId: "entry-2",
+					ordinal: 2,
+					tokensBefore: 10,
+					summary: "summary",
+					publishedAt: 1,
+				});
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiPendingMaterialization(sessionId);
+
+				await runDrainPass({
+					db,
+					sessionId,
+					appendCompaction,
+					contextPercent: 90,
+				});
+
+				expect(appendCompaction).toHaveBeenCalledTimes(1);
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
+				expect(consumeDeferredHistoryRefresh(sessionId)).toBe(false);
+			} finally {
+				restoreInjection();
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+
+		it("preserves the marker when a sibling-fallback serves stale m[1] (null coverage)", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-sibling-fallback";
+			const appendCompaction = mock(() => "compact-1");
+			// softRefreshCachedM1Pi's sibling-fallback serves a sibling's stale
+			// cached m[1] with recomputed=false while contentionExhausted stays
+			// FALSE — the contention veto alone does not catch it, so the
+			// injection reports null m[1] coverage and the drain must skip.
+			const restoreInjection = contextHandlerInternals.setInjectM0M1PiForTests(
+				(_state, _db, _messages) => ({
+					injected: true,
+					compartmentCount: 1,
+					factCount: 0,
+					memoryCount: 0,
+					skippedVisibleMessages: 0,
+					m0Materialized: false,
+					m0Reason: null,
+					m0Bytes: 35,
+					m1Bytes: 518,
+					contentionExhausted: false,
+					renderedBoundary: { endMessageId: null, ordinal: null },
+					m1RenderedCoverage: null,
+					syntheticLeadingCount: 0,
+				}),
+			);
+			try {
+				seedCompartment(db, sessionId);
+				setPendingPiCompactionMarkerState(db, sessionId, {
+					firstKeptEntryId: "entry-3",
+					endMessageId: "entry-2",
+					ordinal: 2,
+					tokensBefore: 10,
+					summary: "summary",
+					publishedAt: 1,
+				});
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiPendingMaterialization(sessionId);
+
+				await runDrainPass({
+					db,
+					sessionId,
+					appendCompaction,
+					contextPercent: 90,
+				});
+
+				expect(appendCompaction).not.toHaveBeenCalled();
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).not.toBeNull();
+				// The deferred-history signal survives so the next FRESH render
+				// (non-fallback) retries the drain instead of losing the marker.
+				expect(consumeDeferredHistoryRefresh(sessionId)).toBe(true);
+			} finally {
+				restoreInjection();
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+
+		it("does not fire the drain on a pure defer pass even with coverage present", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-defer-no-drain";
+			const appendCompaction = mock(() => "compact-1");
+			// Regression pin for the deferredHistoryDrainEligible gate: a pure
+			// SOFT+ defer/replay pass (no history-refresh consumption, no
+			// materialization this pass) must never drain — even when the
+			// pending marker exists and the injection reports full coverage.
+			const restoreInjection = contextHandlerInternals.setInjectM0M1PiForTests(
+				(_state, _db, _messages) => ({
+					injected: true,
+					compartmentCount: 1,
+					factCount: 0,
+					memoryCount: 0,
+					skippedVisibleMessages: 0,
+					m0Materialized: false,
+					m0Reason: null,
+					m0Bytes: 35,
+					m1Bytes: 518,
+					contentionExhausted: false,
+					renderedBoundary: { endMessageId: "entry-2", ordinal: 2 },
+					m1RenderedCoverage: { endMessageId: "entry-2", ordinal: 2 },
+					syntheticLeadingCount: 0,
+				}),
+			);
+			try {
+				seedCompartment(db, sessionId);
+				setPendingPiCompactionMarkerState(db, sessionId, {
+					firstKeptEntryId: "entry-3",
+					endMessageId: "entry-2",
+					ordinal: 2,
+					tokensBefore: 10,
+					summary: "summary",
+					publishedAt: 1,
+				});
+				// Deliberately NO deferred-history / materialization signals and
+				// no pressure: this is a replay pass, not a busting pass.
+
+				await runDrainPass({ db, sessionId, appendCompaction });
+
+				expect(appendCompaction).not.toHaveBeenCalled();
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).not.toBeNull();
+			} finally {
+				restoreInjection();
 				clearContextHandlerSession(sessionId);
 				closeQuietly(db);
 			}

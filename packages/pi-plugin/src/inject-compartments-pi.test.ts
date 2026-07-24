@@ -1857,3 +1857,237 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 		}
 	});
 });
+
+describe("injectM0M1Pi m[1]-rendered coverage watermark (marker-drain liveness)", () => {
+	it("reports the m[1] delta watermark on a fresh recompute and null on pure replay", () => {
+		const db = createTestDb();
+		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-coverage-"));
+		try {
+			const state = piState("ses-pi-m1-coverage", cwd);
+			appendCompartments(db, state.sessionId, [
+				{
+					sequence: 0,
+					startMessage: 1,
+					endMessage: 1,
+					startMessageId: "entry-0",
+					endMessageId: "entry-0",
+					title: "First",
+					content: "first compartment body",
+					p1: "first compartment body",
+				},
+			]);
+			const firstPass = [userMessage("hello", 10)];
+			const r0 = injectM0M1Pi(state, db, firstPass as never, ["entry-0"]);
+			expect(r0.m0Materialized).toBe(true);
+			// The full materialization folds the compartment into m[0], so the
+			// m[0] boundary covers it and the m[1] delta carries nothing beyond
+			// the m[0] snapshot watermark.
+			expect(r0.renderedBoundary.endMessageId).toBe("entry-0");
+			expect(r0.m1RenderedCoverage).toBeNull();
+
+			// Historian publishes a SECOND compartment — an m[1] delta; m[0] is
+			// NOT re-materialized (new_compartment is not a HARD trigger).
+			appendCompartments(db, state.sessionId, [
+				{
+					sequence: 1,
+					startMessage: 2,
+					endMessage: 2,
+					startMessageId: "entry-1",
+					endMessageId: "entry-1",
+					title: "Delta",
+					content: "second compartment body",
+					p1: "second compartment body",
+				},
+			]);
+
+			// Cache-busting pass: the soft refresh recomputes m[1] from the same
+			// compartment snapshot and certifies the m[1] delta watermark at the
+			// new compartment. (With a non-empty baseline the soft refresh also
+			// advances the persisted trim boundary string, so the m[0] arm moves
+			// too; the empty-baseline test below is the shape where ONLY the m[1]
+			// field certifies coverage.)
+			const secondPass = [
+				userMessage("covered-0", 10),
+				userMessage("covered-1", 11),
+				userMessage("keep", 12),
+			];
+			const r1 = injectM0M1Pi(
+				state,
+				db,
+				secondPass as never,
+				["entry-0", "entry-1", "keep"],
+				true,
+			);
+			expect(r1.m0Materialized).toBe(false);
+			expect(r1.contentionExhausted).toBe(false);
+			expect(r1.m1RenderedCoverage).toEqual({
+				endMessageId: "entry-1",
+				ordinal: 2,
+			});
+
+			// Pure replay pass (recomputeM1ThisPass=false): the served bytes
+			// were rendered by an earlier pass, so no fresh coverage may be
+			// certified — the field must be null.
+			const thirdPass = [
+				userMessage("covered-0", 10),
+				userMessage("covered-1", 11),
+				userMessage("keep", 12),
+			];
+			const r2 = injectM0M1Pi(
+				state,
+				db,
+				thirdPass as never,
+				["entry-0", "entry-1", "keep"],
+				false,
+			);
+			expect(r2.m0Materialized).toBe(false);
+			expect(r2.m1RenderedCoverage).toBeNull();
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("certifies coverage from the m[1] delta when the m[0] baseline is empty (the liveness-gap shape)", () => {
+		const db = createTestDb();
+		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-coverage-empty-"));
+		try {
+			const state = piState("ses-pi-m1-coverage-empty", cwd);
+			// Materialize with NO compartments: the empty m[0] baseline whose
+			// snapshot markers carry no compartment boundary at all.
+			const firstPass = [userMessage("hello", 10)];
+			const r0 = injectM0M1Pi(state, db, firstPass as never);
+			expect(r0.m0Materialized).toBe(true);
+			expect(r0.renderedBoundary).toEqual({
+				endMessageId: null,
+				ordinal: null,
+			});
+			expect(r0.m1RenderedCoverage).toBeNull();
+
+			// A normal publication lands (three compartments, mirroring the
+			// diagnosis: seq 0:1-2, 1:3-4, 2:5-7). It renders into m[1] only.
+			appendCompartments(db, state.sessionId, [
+				{
+					sequence: 0,
+					startMessage: 1,
+					endMessage: 2,
+					startMessageId: "entry-1",
+					endMessageId: "entry-2",
+					title: "A",
+					content: "chunk a",
+					p1: "chunk a",
+				},
+				{
+					sequence: 1,
+					startMessage: 3,
+					endMessage: 4,
+					startMessageId: "entry-3",
+					endMessageId: "entry-4",
+					title: "B",
+					content: "chunk b",
+					p1: "chunk b",
+				},
+				{
+					sequence: 2,
+					startMessage: 5,
+					endMessage: 7,
+					startMessageId: "entry-5",
+					endMessageId: "entry-7",
+					title: "C",
+					content: "chunk c",
+					p1: "chunk c",
+				},
+			]);
+
+			const secondPass = [userMessage("hello", 10), userMessage("tail", 12)];
+			const r1 = injectM0M1Pi(
+				state,
+				db,
+				secondPass as never,
+				["entry-1", "keep"],
+				true,
+			);
+			expect(r1.m0Materialized).toBe(false);
+			// The m[0] arm still reads <none>, so it cannot by itself certify
+			// coverage for the pending marker…
+			expect(r1.renderedBoundary).toEqual({
+				endMessageId: null,
+				ordinal: null,
+			});
+			// …while the fresh m[1] delta certifies coverage up to the latest
+			// published compartment, so a pending marker at ordinal 7 covers.
+			expect(r1.m1RenderedCoverage).toEqual({
+				endMessageId: "entry-7",
+				ordinal: 7,
+			});
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("soft m[1] refresh sibling-fallback reports null coverage even with a newer live compartment", () => {
+		const db = createTestDb();
+		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-coverage-sibling-"));
+		const originalExec = db.exec.bind(db);
+		try {
+			const state = piState("ses-pi-m1-coverage-sibling", cwd);
+			injectM0M1Pi(
+				state,
+				db,
+				[userMessage("hello", 10)] as never,
+				undefined,
+				true,
+			);
+
+			// A newer compartment lands in the live snapshot. A naive coverage
+			// derivation from live DB rows would certify it — but the stale
+			// sibling bytes served below were rendered BEFORE it existed.
+			appendCompartments(db, state.sessionId, [
+				{
+					sequence: 0,
+					startMessage: 1,
+					endMessage: 2,
+					startMessageId: "entry-1",
+					endMessageId: "entry-2",
+					title: "New",
+					content: "new compartment body",
+					p1: "new compartment body",
+				},
+			]);
+
+			let injectedSibling = false;
+			db.exec = ((sql: string) => {
+				if (sql === "BEGIN IMMEDIATE" && !injectedSibling) {
+					injectedSibling = true;
+					db.prepare(
+						"UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_max_memory_id = ?, cached_m1_bytes = ? WHERE session_id = ?",
+					).run(
+						Buffer.from(
+							`<session-history>${"baseline ".repeat(300)}</session-history>`,
+							"utf8",
+						),
+						99,
+						Buffer.from("sibling cached m1", "utf8"),
+						state.sessionId,
+					);
+				}
+				return originalExec(sql);
+			}) as typeof db.exec;
+
+			const bust = [userMessage("bust", 11)];
+			const result = injectM0M1Pi(state, db, bust as never, undefined, true);
+
+			expect(injectedSibling).toBe(true);
+			expect(result.m0Materialized).toBe(false);
+			expect(textOf(bust[1] as never)).toBe("sibling cached m1");
+			// The sibling-fallback leaves contentionExhausted FALSE (recomputed=
+			// false), so the existing contention veto does NOT catch it — the
+			// coverage field itself must be null to keep the deferred drain
+			// signal armed for the next fresh render.
+			expect(result.contentionExhausted).toBe(false);
+			expect(result.m1RenderedCoverage).toBeNull();
+		} finally {
+			db.exec = originalExec as typeof db.exec;
+			closeQuietly(db);
+		}
+	});
+});

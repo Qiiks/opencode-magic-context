@@ -364,7 +364,12 @@ describe("long-running Pi Magic Context session", () => {
 
             // Phase 5: Historian publishes. Pi uses native JSONL compaction entries, not OpenCode's deferred marker blob.
             await send("turn 17: Pi historian trigger pressure with eligible long tail", "pi phase 5 historian trigger", HISTORIAN_TRIGGER_USAGE);
-            await send("turn 18: Pi follow-up starts historian publication", "pi phase 5 historian follow-up");
+            // Turn 18's RESPONSE usage stays high so the first ordinary drive
+            // turn AFTER publication still sees >=85% and force-materializes
+            // (canConsumeDeferredLate) — that is the consuming pass which drains
+            // the staged marker. A low-usage turn 18 would leave the next pass
+            // in defer, where the deferred-history drain gate never opens.
+            await send("turn 18: Pi follow-up starts historian publication", "pi phase 5 historian follow-up", HISTORIAN_TRIGGER_USAGE);
             await h.waitFor(
                 () => {
                     const row = h
@@ -382,6 +387,15 @@ describe("long-running Pi Magic Context session", () => {
             expect(historianRange).not.toBeNull();
             expect(compartment.start_message).toBe(historianRange!.start);
             expect(compartment.end_message).toBe(historianRange!.end);
+            // Ordinary drive turn (NO HARD bust / m0-mutation injection): the
+            // publication's onPublished armed the deferred history-refresh +
+            // materialization signals, and this pass force-materializes (turn
+            // 18 kept pressure >=85%), rendering the new compartment into m[1].
+            // The widened coverage predicate (m[0] boundary OR current-pass
+            // m[1] delta) drains the staged marker into a native compaction
+            // entry on this consuming pass — parity with OpenCode's
+            // consuming-pass drain, which also rides ordinary send turns.
+            await send("turn 18b: ordinary Pi drive turn consumes the historian publication", "pi phase 5 consuming pass");
             const compactions = await h.waitFor(() => {
                 const entries = readCompactionEntries(h);
                 return entries.length > 0 ? entries : null;
