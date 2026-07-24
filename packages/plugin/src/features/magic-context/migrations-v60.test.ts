@@ -43,7 +43,7 @@ describe("migration v60: live memory resnapshot ownership", () => {
             ).run();
             db.exec(`
                 ALTER TABLE mirror_resnapshot_state DROP COLUMN generation;
-                DELETE FROM schema_migrations WHERE version IN (60, 61, 62, 63, 64, 65, 66, 67);
+                DELETE FROM schema_migrations WHERE version IN (60, 61, 62, 63, 64, 65, 66, 67, 68);
             `);
 
             runMigrations(db);
