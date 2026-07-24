@@ -4058,10 +4058,28 @@ function pendingPiMarkerCoveredByRenderedBoundary(
 	pending: PendingPiCompactionMarker,
 	injection: PiInjectionResult | null,
 ): boolean {
+	// Contention fallbacks must never authorize a native trim: the served
+	// bytes may lag the latest compartment snapshot.
 	if (!injection || injection.contentionExhausted) return false;
+	// m[0] arm: the boundary rendered into the m[0] snapshot.
 	const boundary = injection.renderedBoundary;
 	if (pending.endMessageId === boundary.endMessageId) return true;
-	return boundary.ordinal !== null && pending.ordinal <= boundary.ordinal;
+	if (boundary.ordinal !== null && pending.ordinal <= boundary.ordinal)
+		return true;
+	// m[1] arm (liveness fix): fresh publications render their compartment
+	// into the m[1] delta, not m[0] (which folds only on a HARD bust), so the
+	// m[0] snapshot boundary stays behind the pending marker until an
+	// unrelated HARD fold — starving the drain for hours in stable sessions.
+	// Accept coverage from a compartment actually rendered into m[1] THIS
+	// pass. The field is non-null only when m[1] was freshly recomputed this
+	// pass without a contention fallback (null on cached/sibling replay, where
+	// contentionExhausted alone would miss the sibling-fallback's stale
+	// bytes), so this restores OpenCode's consuming-pass drain parity without
+	// ever trimming getBranch() beyond content the model was shown this pass.
+	const m1Coverage = injection.m1RenderedCoverage;
+	if (!m1Coverage) return false;
+	if (pending.endMessageId === m1Coverage.endMessageId) return true;
+	return m1Coverage.ordinal !== null && pending.ordinal <= m1Coverage.ordinal;
 }
 
 function captureReasoningMutationRollback(
@@ -5184,9 +5202,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				suppressDeferredHistoryDrain = true;
 				preserveDeferredMaterializationForMarkerDrain = true;
 				const boundary = injectionResult?.renderedBoundary;
+				const m1Coverage = injectionResult?.m1RenderedCoverage;
 				sessionLog(
 					args.sessionId,
-					`Pi compaction-marker drain skipped: pending ordinal ${pending.ordinal} is newer than rendered boundary ${boundary?.ordinal ?? "<none>"} endMessageId=${boundary?.endMessageId ?? "<none>"}; preserving deferred signals`,
+					`Pi compaction-marker drain skipped: pending ordinal ${pending.ordinal} is newer than rendered boundary ${boundary?.ordinal ?? "<none>"} endMessageId=${boundary?.endMessageId ?? "<none>"} (m[1] coverage ${m1Coverage?.ordinal ?? "<none>"} endMessageId=${m1Coverage?.endMessageId ?? "<none>"}); preserving deferred signals`,
 				);
 			} else if (!args.appendCompaction || !args.readBranchEntries) {
 				suppressDeferredHistoryDrain = true;

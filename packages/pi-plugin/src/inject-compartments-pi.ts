@@ -803,6 +803,21 @@ export interface PiM0M1InjectionResult extends PiInjectionResult {
 	/** The compartment boundary actually represented by the m[0]/m[1] pair sent. */
 	renderedBoundary: PiRenderedCompartmentBoundary;
 	/**
+	 * Watermark of the compartment coverage rendered into the m[1] delta THIS
+	 * pass (max end ordinal / end message id of the compartments included in
+	 * the m[1] render), derived from the SAME compartment snapshot the render
+	 * used. NULL unless m[1] was freshly recomputed this pass without a
+	 * contention fallback: the soft-refresh sibling-fallback serves a sibling's
+	 * stale cached m[1] (recomputed=false while contentionExhausted stays
+	 * false) and the pure-replay branch serves bytes rendered by an earlier
+	 * pass — neither may certify coverage for compartments those bytes never
+	 * contained, so the deferred-marker drain keeps its signal armed and
+	 * retries on the next fresh render. Per-pass in-memory ONLY (never
+	 * persisted): the drain reads it solely on busting passes that freshly
+	 * recomputed m[1]; replay passes never evaluate the m[1] coverage arm.
+	 */
+	m1RenderedCoverage: PiRenderedCompartmentBoundary | null;
+	/**
 	 * Number of synthetic, id-less messages prepended at the FRONT of the array
 	 * by this injection (the m[0] + m[1] pair). These never resolve to a real
 	 * SessionEntry id, so downstream anchor-GC must exclude them from its
@@ -2545,6 +2560,38 @@ export function injectM0M1Pi(
 		currentCompartments,
 		boundaryId,
 	);
+	// m[1]-side coverage watermark for the deferred-marker drain (liveness
+	// fix): fresh publications render their compartment into the m[1] delta —
+	// m[0] folds new compartments only on a HARD bust — so the m[0] snapshot
+	// boundary above stays behind the pending marker until an unrelated HARD
+	// fold. The drain may apply once the marker is covered by a compartment
+	// THIS pass actually rendered into m[1]. Derived from the SAME compartment
+	// snapshot the m[1] render used (TOCTOU: the drain gate must never
+	// re-derive this from live DB rows), and only when m[1] was freshly
+	// recomputed this pass without a contention fallback — the sibling-
+	// fallback (stale bytes, recomputed=false) and pure-replay branches leave
+	// it null so the drain preserves the deferred signal. Compartments at or
+	// below markers.maxCompartmentSeq are m[0] content already certified by
+	// renderedBoundary; only compartments beyond that watermark are m[1]
+	// content, so the latest snapshot compartment qualifies exactly when the
+	// m[1] delta carried it.
+	let m1RenderedCoverage: PiRenderedCompartmentBoundary | null = null;
+	if (m1Recomputed && !contentionExhausted) {
+		const latestM1Compartment = currentCompartments.at(-1);
+		if (
+			latestM1Compartment &&
+			latestM1Compartment.sequence > markers.maxCompartmentSeq &&
+			latestM1Compartment.endMessageId.length > 0
+		) {
+			m1RenderedCoverage = {
+				endMessageId: latestM1Compartment.endMessageId,
+				ordinal:
+					typeof latestM1Compartment.endMessage === "number"
+						? latestM1Compartment.endMessage
+						: null,
+			};
+		}
+	}
 	const skippedVisibleMessages = boundaryId
 		? trimPiMessagesToBoundary(piMessages, entryIds, boundaryId)
 		: 0;
@@ -2586,6 +2633,7 @@ export function injectM0M1Pi(
 		m1Bytes: m1.length,
 		contentionExhausted,
 		renderedBoundary,
+		m1RenderedCoverage,
 		// prependM0M1Messages always unshifts exactly the m[0] + m[1] pair.
 		syntheticLeadingCount: 2,
 	};

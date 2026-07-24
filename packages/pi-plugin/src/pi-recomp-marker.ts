@@ -77,6 +77,18 @@ export function stagePiRecompMarker(args: {
 	signalPiDeferredHistoryRefresh(args.sessionId);
 }
 
+/**
+ * EAGER marker apply — bypasses the rendered-coverage gate that the pipeline's
+ * deferred drain enforces (pendingPiMarkerCoveredByRenderedBoundary). Safe ONLY
+ * in a context where a recomp/upgrade has JUST republished the compartments:
+ * recomp writes the m[0] mutation log, so the next transform pass HARD-folds
+ * m[0] over the republished compartments and the model is shown everything the
+ * marker trims in that same busting pass. Calling this without that same-pass
+ * rendered coverage could trim getBranch() beyond content the model has seen.
+ * The live background commands (/ctx-recomp, /ctx-session-upgrade) therefore
+ * use the DEFERRED stagePiRecompMarker instead; this eager path is kept for a
+ * same-turn caller that owns the rendered-coverage precondition itself.
+ */
 export function queueAndApplyPiRecompMarker(args: {
 	db: ContextDatabase;
 	sessionId: string;
