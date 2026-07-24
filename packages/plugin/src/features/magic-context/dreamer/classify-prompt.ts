@@ -43,6 +43,8 @@ Most memories are ordinary working facts — they belong in the middle, not the 
 
 Rough anchors (not quotas — spread naturally within them): transient/obvious observations 1-30, ordinary helpful project facts 40-65, load-bearing rules/architecture/constraints 70-100. A constraint that is a genuine must/never/always rule the project actively depends on floors around 60; but not every memory in a category is load-bearing — a niche, dated, or narrowly-scoped external quirk can sit lower even if it is a "constraint". Score the fact, not the label. If you assigned most of the pool to one band, re-read and differentiate.
 
+One hard floor: an operating rule whose VIOLATION causes a public-facing or irreversible mistake — posting under the wrong identity, committing/pushing without approval, leaking private content, running destructive commands — scores at least 80. These rules only work if they are always in view; a mid-band score silently drops them from context exactly when the pool grows, and the violation happens. Judge by consequence-of-forgetting, not by how mundane the rule text reads.
+
 ### Scope
 - \`project\` — only meaningful inside this repository/product (default when uncertain).
 - \`ecosystem\` — useful to sibling projects in the same stack, harness, provider, or company ecosystem.
