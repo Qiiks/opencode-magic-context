@@ -24,7 +24,6 @@ import {
 import type { Memory } from "../../features/magic-context/memory/types";
 import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
 import type { MuralWireOptions } from "../../features/magic-context/mural/resolve-mural";
-import { getMural, muralDataUrl } from "../../features/magic-context/mural/storage-mural";
 import {
     computeProjectDocsHash,
     GLOBAL_USER_PROFILE_PROJECT_PATH,
@@ -628,7 +627,7 @@ export interface M0M1State {
     cachedM0ModelKey: string | null;
     cachedM0ProjectIdentity?: string | null;
     snapshotMarkers?: M0SnapshotMarkers | null;
-    /** Keep a regenerated mural image unchanged for the current cached M0 prompt;
+    /** Keep the persisted mural image unchanged for the current cached M0 prompt;
      * replace it only when the next normal hard cache fold rebuilds that prompt. */
     cachedM0MuralDataUrl?: string | null;
     cachedM0MuralHash?: string | null;
@@ -1275,6 +1274,7 @@ function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null
         systemHash: state.cachedM0SystemHash ?? "",
         modelKey: state.cachedM0ModelKey ?? "",
         projectIdentity: state.cachedM0ProjectIdentity ?? null,
+        muralHash: state.cachedM0MuralHash ?? null,
     };
 }
 
@@ -1756,6 +1756,18 @@ function renderSessionHistoryWithDecay(args: {
     });
 }
 
+const MEMORY_MURAL_BLOCK =
+    "<memory-mural>\nThe project memory mural image follows.\n</memory-mural>";
+
+/** Remove a stale mural reference when a legacy cached baseline has no paired image payload. */
+export function stripMemoryMuralBlock(m0Text: string): string {
+    return m0Text
+        .split("\n\n")
+        .filter((section) => section !== MEMORY_MURAL_BLOCK)
+        .join("\n\n")
+        .trim();
+}
+
 export function renderM0(args: {
     projectDocs: string;
     userProfileBaseline: UserMemory[];
@@ -1800,7 +1812,7 @@ export function renderM0(args: {
     );
     if (memoriesBlock) sections.push(memoriesBlock);
     if (args.mural?.enabled && args.mural.supportsVision && args.mural.dataUrl) {
-        sections.push("<memory-mural>\nThe project memory mural image follows.\n</memory-mural>");
+        sections.push(MEMORY_MURAL_BLOCK);
     }
     return sections.join("\n\n").trim();
 }
@@ -1835,6 +1847,7 @@ function applyMarkersToState(
     state.cachedM0SystemHash = markers.systemHash;
     state.cachedM0ModelKey = markers.modelKey;
     state.cachedM0ProjectIdentity = markers.projectIdentity;
+    state.cachedM0MuralHash = markers.muralHash ?? null;
     state.snapshotMarkers = markers;
 }
 
@@ -2010,11 +2023,11 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
 
     if (m0Text.length === 0) m0Text = M0_EMPTY_BODY;
     const m0Bytes = Buffer.from(m0Text, "utf8");
-    options.state.cachedM0MuralDataUrl =
+    const frozenMuralDataUrl =
         mural?.enabled && mural.supportsVision ? (mural.dataUrl ?? null) : null;
-    options.state.cachedM0MuralHash =
+    const frozenMuralHash =
         mural?.enabled && mural.supportsVision ? (mural.contentHash ?? null) : null;
-    snapshotMarkers.muralHash = options.state.cachedM0MuralHash;
+    snapshotMarkers.muralHash = frozenMuralHash;
     snapshotMarkers.materializedAt = foldMaterializedAt;
     const renderedMemoryIds = trimmed.renderOrder.map((m) => m.id);
     const phase3ProjectDocsHash = readProjectDocsForM0(
@@ -2108,6 +2121,8 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
 
         persistCachedM0(options.db, options.sessionId, {
             m0Bytes,
+            muralDataUrl: frozenMuralDataUrl,
+            muralHash: frozenMuralHash,
             projectMemoryEpoch: snapshotMarkers.projectMemoryEpoch,
             workspaceFingerprint: snapshotMarkers.workspaceFingerprint,
             projectUserProfileVersion: snapshotMarkers.projectUserProfileVersion,
@@ -2157,6 +2172,8 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             .run(baselineEndMessageId, options.sessionId);
 
         options.db.exec("COMMIT");
+        options.state.cachedM0MuralDataUrl = frozenMuralDataUrl;
+        options.state.cachedM0MuralHash = frozenMuralHash;
     } catch (error) {
         try {
             options.db.exec("ROLLBACK");
@@ -2373,6 +2390,8 @@ function decodeM0Bytes(bytes: Buffer | Uint8Array | null): string | null {
 
 interface CachedM0M1Row {
     cached_m0_bytes: Buffer | Uint8Array | null;
+    cached_m0_mural_data_url: string | null;
+    cached_m0_mural_hash: string | null;
     cached_m1_bytes: Buffer | Uint8Array | null;
     cached_m0_project_memory_epoch: number | null;
     cached_m0_workspace_fingerprint: string | null;
@@ -2419,7 +2438,8 @@ function parseMemoryBlockIds(raw: string | null): number[] {
 function readCachedM0M1Row(db: Database, sessionId: string): CachedM0M1Row | null {
     return db
         .prepare(
-            `SELECT cached_m0_bytes, cached_m1_bytes,
+            `SELECT cached_m0_bytes, cached_m0_mural_data_url,
+                    cached_m0_mural_hash, cached_m1_bytes,
                     cached_m0_project_memory_epoch,
                     cached_m0_workspace_fingerprint,
                     cached_m0_project_user_profile_version,
@@ -2467,12 +2487,15 @@ function markersFromCachedRow(row: CachedM0M1Row): M0SnapshotMarkers | null {
         systemHash: row.cached_m0_system_hash ?? "",
         modelKey: row.cached_m0_model_key ?? "",
         projectIdentity: row.cached_m0_project_identity ?? null,
+        muralHash: row.cached_m0_mural_hash ?? null,
     };
 }
 
 function cachedRowMatchesState(row: CachedM0M1Row, state: M0M1State): boolean {
     return (
         bufferEqualsNullable(row.cached_m0_bytes, state.cachedM0Bytes) &&
+        (row.cached_m0_mural_data_url ?? null) === (state.cachedM0MuralDataUrl ?? null) &&
+        (row.cached_m0_mural_hash ?? null) === (state.cachedM0MuralHash ?? null) &&
         row.cached_m0_project_memory_epoch === state.cachedM0ProjectMemoryEpoch &&
         (row.cached_m0_workspace_fingerprint ?? null) ===
             (state.cachedM0WorkspaceFingerprint ?? null) &&
@@ -2499,6 +2522,8 @@ function applyCachedRowToState(state: M0M1State, row: CachedM0M1Row): void {
         throw new RenderM1InvalidMarkersError(state.sessionId);
     }
     state.cachedM0Bytes = toBuffer(row.cached_m0_bytes);
+    state.cachedM0MuralDataUrl = row.cached_m0_mural_data_url ?? null;
+    state.cachedM0MuralHash = row.cached_m0_mural_hash ?? null;
     state.cachedM1Bytes = toBuffer(row.cached_m1_bytes);
     state.cachedM0ProjectMemoryEpoch = markers.projectMemoryEpoch;
     state.cachedM0WorkspaceFingerprint = markers.workspaceFingerprint;
@@ -2753,19 +2778,14 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
 }
 
 export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
-    if (
-        options.state.cachedM0Bytes &&
-        options.state.cachedM0MuralDataUrl === undefined &&
-        options.projectPath
-    ) {
-        const cachedText = decodeM0Bytes(options.state.cachedM0Bytes) ?? "";
-        const row = getMural(options.db, options.projectPath);
-        if (cachedText.includes("<memory-mural>") && row) {
-            options.state.cachedM0MuralDataUrl = muralDataUrl(row);
-            options.state.cachedM0MuralHash = row.contentHash;
-        } else {
-            options.state.cachedM0MuralDataUrl = null;
-            options.state.cachedM0MuralHash = null;
+    // Callers normally pass getOrCreateSessionMeta(), which already contains the
+    // persisted mural payload. Keep compatibility with lean process-local states
+    // by hydrating only from the exact cached row whose m0 bytes they hold.
+    if (options.state.cachedM0Bytes && options.state.cachedM0MuralDataUrl === undefined) {
+        const row = readCachedM0M1Row(options.db, options.sessionId);
+        if (row && bufferEqualsNullable(row.cached_m0_bytes, options.state.cachedM0Bytes)) {
+            options.state.cachedM0MuralDataUrl = row.cached_m0_mural_data_url ?? null;
+            options.state.cachedM0MuralHash = row.cached_m0_mural_hash ?? null;
         }
     }
     if (!options.workspaceIdentitySet && options.projectPath) {
@@ -2945,6 +2965,13 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
             // (un-refolded) m[0]/m[1]; the next pass retries the fold.
             if (!(error instanceof MaterializeContentionError)) throw error;
         }
+    }
+
+    // Legacy rows can contain the marker without the new persisted image. Omitting
+    // an image part already changes provider-visible multipart bytes, so also remove
+    // the now-false textual reference rather than claiming an image follows.
+    if (!options.state.cachedM0MuralDataUrl) {
+        m0Text = stripMemoryMuralBlock(m0Text);
     }
 
     let prependedMessageCount = 0;

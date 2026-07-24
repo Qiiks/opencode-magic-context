@@ -46,7 +46,7 @@ export function getSchemaFenceRejection(): {
     return lastSchemaFenceRejection;
 }
 
-export const LATEST_SUPPORTED_VERSION = 66;
+export const LATEST_SUPPORTED_VERSION = 67;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -1015,6 +1015,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       -- setDeferredExecutePendingIfAbsent. Excluded from healNullTextColumns.
       deferred_execute_state TEXT,
       cached_m0_bytes BLOB,
+      cached_m0_mural_data_url TEXT,
+      cached_m0_mural_hash TEXT,
       cached_m0_project_memory_epoch INTEGER,
       cached_m0_workspace_fingerprint TEXT,
       cached_m0_project_user_profile_version INTEGER,
@@ -1405,6 +1407,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "memories", "mural_cue_at", "INTEGER");
     ensureColumn(db, "memory_verifications", "mapped_at", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "cached_m0_bytes", "BLOB");
+    ensureColumn(db, "session_meta", "cached_m0_mural_data_url", "TEXT");
+    ensureColumn(db, "session_meta", "cached_m0_mural_hash", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_project_memory_epoch", "INTEGER");
     ensureColumn(db, "session_meta", "cached_m0_workspace_fingerprint", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_project_user_profile_version", "INTEGER");

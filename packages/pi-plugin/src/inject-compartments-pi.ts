@@ -73,16 +73,13 @@ import {
 import { resolveMuralWire } from "@magic-context/core/features/magic-context/mural/render-trigger";
 import type { MuralWireOptions } from "@magic-context/core/features/magic-context/mural/resolve-mural";
 import {
-	getMural,
-	muralDataUrl,
-} from "@magic-context/core/features/magic-context/mural/storage-mural";
-import {
 	DEFAULT_MEMORY_BUDGET_TOKENS,
 	DEFAULT_USER_PROFILE_BUDGET_TOKENS,
 	type MemoryRenderOptions,
 	type PreparedCompartmentInjection,
 	prepareCompartmentInjection,
 	renderMemoryBlockV2,
+	stripMemoryMuralBlock,
 	trimMemoriesToBudgetV2,
 	trimUserMemoriesToBudget,
 	trimWorkspaceMemoriesToBudgetV2,
@@ -362,6 +359,7 @@ function getPiToolResultCallId(message: PiToolResultMessage): string | null {
 export const __test = {
 	trimPiMessagesToBoundary,
 	renderFreshM0PiNonPersisted,
+	clearPiMuralProcessCache,
 };
 
 /**
@@ -689,13 +687,7 @@ const injectionTokenCountsBySession = new Map<
 	PiInjectionTokenCountCache
 >();
 
-/**
- * Process-local mural image baked into the current cached m[0] baseline.
- * Set only on HARD materialization (or fresh non-persisted fallback); defer
- * passes replay these bytes so a mid-session cue re-render cannot swap the
- * image without a natural fold. Restart-safe hydrate reloads from
- * `mural_manifest` when the cached m[0] text still carries `<memory-mural>`.
- */
+/** Process-local mirror of the mural payload persisted with the cached m0 row. */
 interface CachedPiMural {
 	dataUrl: string | null;
 	contentHash: string | null;
@@ -703,38 +695,31 @@ interface CachedPiMural {
 
 const cachedMuralBySession = new Map<string, CachedPiMural>();
 
+function clearPiMuralProcessCache(sessionId?: string): void {
+	if (sessionId) cachedMuralBySession.delete(sessionId);
+	else cachedMuralBySession.clear();
+}
+
+function rememberPiMuralPayload(
+	sessionId: string,
+	dataUrl: string | null | undefined,
+	contentHash: string | null | undefined,
+): void {
+	cachedMuralBySession.set(sessionId, {
+		dataUrl: dataUrl ?? null,
+		contentHash: contentHash ?? null,
+	});
+}
+
 function rememberPiMural(
 	sessionId: string,
 	mural: MuralWireOptions | undefined,
 ): void {
-	if (mural?.enabled && mural.supportsVision && mural.dataUrl) {
-		cachedMuralBySession.set(sessionId, {
-			dataUrl: mural.dataUrl,
-			contentHash: mural.contentHash ?? null,
-		});
-		return;
-	}
-	cachedMuralBySession.set(sessionId, { dataUrl: null, contentHash: null });
-}
-
-function hydratePiMuralCache(
-	sessionId: string,
-	m0: string,
-	db: ContextDatabase,
-	projectIdentity: string | undefined,
-): void {
-	if (cachedMuralBySession.has(sessionId)) return;
-	if (m0.includes("<memory-mural>") && projectIdentity) {
-		const row = getMural(db, projectIdentity);
-		if (row) {
-			cachedMuralBySession.set(sessionId, {
-				dataUrl: muralDataUrl(row),
-				contentHash: row.contentHash,
-			});
-			return;
-		}
-	}
-	cachedMuralBySession.set(sessionId, { dataUrl: null, contentHash: null });
+	rememberPiMuralPayload(
+		sessionId,
+		mural?.enabled && mural.supportsVision ? mural.dataUrl : null,
+		mural?.enabled && mural.supportsVision ? mural.contentHash : null,
+	);
 }
 
 function muralForWire(sessionId: string): MuralWireOptions | undefined {
@@ -1578,7 +1563,10 @@ export function materializeM0Pi(
 		snapshotMarkers.modelKey,
 		memoryBudget,
 	);
-	rememberPiMural(state.sessionId, mural);
+	const frozenMuralDataUrl =
+		mural?.enabled && mural.supportsVision ? (mural.dataUrl ?? null) : null;
+	const frozenMuralHash =
+		mural?.enabled && mural.supportsVision ? (mural.contentHash ?? null) : null;
 	// Over-budget tightening loop (matches OpenCode materializeM0): if the
 	// rendered m[0] exceeds the history budget, escalate the decay pressure and
 	// re-render up to 3x so tight budgets demote more aggressively. Without this,
@@ -1674,6 +1662,8 @@ export function materializeM0Pi(
 
 		persistCachedM0(db, state.sessionId, {
 			m0Bytes,
+			muralDataUrl: frozenMuralDataUrl,
+			muralHash: frozenMuralHash,
 			projectMemoryEpoch: snapshotMarkers.projectMemoryEpoch,
 			workspaceFingerprint: snapshotMarkers.workspaceFingerprint,
 			projectUserProfileVersion: snapshotMarkers.projectUserProfileVersion,
@@ -1719,6 +1709,7 @@ export function materializeM0Pi(
 		);
 
 		db.exec("COMMIT");
+		rememberPiMuralPayload(state.sessionId, frozenMuralDataUrl, frozenMuralHash);
 		return {
 			m0,
 			m1: m1Render.text,
@@ -1963,6 +1954,8 @@ export function renderM1Pi(
 
 interface CachedPiM0M1Row {
 	cached_m0_bytes: Buffer | Uint8Array | null;
+	cached_m0_mural_data_url: string | null;
+	cached_m0_mural_hash: string | null;
 	cached_m1_bytes: Buffer | Uint8Array | null;
 	cached_m0_project_memory_epoch: number | null;
 	cached_m0_workspace_fingerprint: string | null;
@@ -2013,7 +2006,8 @@ function readCachedPiM0M1Row(
 ): CachedPiM0M1Row | null {
 	return db
 		.prepare(
-			`SELECT cached_m0_bytes, cached_m1_bytes,
+			`SELECT cached_m0_bytes, cached_m0_mural_data_url,
+					cached_m0_mural_hash, cached_m1_bytes,
 					cached_m0_project_memory_epoch,
 					cached_m0_workspace_fingerprint,
 					cached_m0_project_user_profile_version,
@@ -2158,6 +2152,11 @@ function applyCachedPiRow(args: {
 			`invalid cached m[0]/m[1] for ${args.state.sessionId}`,
 		);
 	}
+	rememberPiMuralPayload(
+		args.state.sessionId,
+		args.row.cached_m0_mural_data_url,
+		args.row.cached_m0_mural_hash,
+	);
 	return {
 		m0,
 		m1: decodeCachedM1(args.row, args.state.sessionId),
@@ -2409,6 +2408,11 @@ export function injectM0M1Pi(
 	} else {
 		const meta = getOrCreateSessionMeta(db, state.sessionId);
 		m0 = decodeCachedM0(meta.cachedM0Bytes) ?? "";
+		rememberPiMuralPayload(
+			state.sessionId,
+			meta.cachedM0MuralDataUrl,
+			meta.cachedM0MuralHash,
+		);
 		markers = getCachedMarkers(db, state, currentCompartments);
 		if (!m0 || !markers) {
 			decision = { value: true, reason: "cache_invalid" };
@@ -2540,19 +2544,13 @@ export function injectM0M1Pi(
 	const skippedVisibleMessages = boundaryId
 		? trimPiMessagesToBoundary(piMessages, entryIds, boundaryId)
 		: 0;
-	// Defer / restart: if this process never materialized, reload the baked-in
-	// mural image from mural_manifest when the cached m[0] still has the marker.
-	// Only attach when m0 text still carries the marker so a sibling process that
-	// re-folded without a mural cannot leave a stale process-local image on the wire.
-	hydratePiMuralCache(
-		state.sessionId,
-		m0,
-		db,
-		memoryProjectPath(state),
-	);
 	const muralWire = m0.includes("<memory-mural>")
 		? muralForWire(state.sessionId)
 		: undefined;
+	// A legacy row with no paired payload cannot replay its old image part. Since
+	// that omission already changes provider-visible bytes, remove the false text
+	// claiming an image follows and keep the fallback internally consistent.
+	if (!muralWire) m0 = stripMemoryMuralBlock(m0);
 	prependM0M1Messages(piMessages, m0, m1, muralWire);
 	logSession(
 		state.sessionId,

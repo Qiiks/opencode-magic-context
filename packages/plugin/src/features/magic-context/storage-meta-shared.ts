@@ -28,6 +28,8 @@ export interface SessionMetaRow {
     tool_reclaim_watermark: number | null;
     last_todo_state: string;
     cached_m0_bytes: Buffer | Uint8Array | null;
+    cached_m0_mural_data_url: string | null;
+    cached_m0_mural_hash: string | null;
     cached_m1_bytes: Buffer | Uint8Array | null;
     cached_m0_project_memory_epoch: number | null;
     cached_m0_workspace_fingerprint: string | null;
@@ -84,6 +86,8 @@ export const SESSION_META_SELECT_COLUMNS = [
     "tool_reclaim_watermark",
     "last_todo_state",
     "cached_m0_bytes",
+    "cached_m0_mural_data_url",
+    "cached_m0_mural_hash",
     "cached_m1_bytes",
     "cached_m0_project_memory_epoch",
     "cached_m0_workspace_fingerprint",
@@ -139,6 +143,8 @@ export const META_COLUMNS: Record<string, string> = {
     toolReclaimWatermark: "tool_reclaim_watermark",
     lastTodoState: "last_todo_state",
     cachedM0Bytes: "cached_m0_bytes",
+    cachedM0MuralDataUrl: "cached_m0_mural_data_url",
+    cachedM0MuralHash: "cached_m0_mural_hash",
     cachedM1Bytes: "cached_m1_bytes",
     cachedM0ProjectMemoryEpoch: "cached_m0_project_memory_epoch",
     cachedM0WorkspaceFingerprint: "cached_m0_workspace_fingerprint",
@@ -185,6 +191,8 @@ function ensureSessionFactsVersionColumn(db: Database): void {
 
 export const NULL_BIND_META_KEYS = new Set([
     "cachedM0Bytes",
+    "cachedM0MuralDataUrl",
+    "cachedM0MuralHash",
     "cachedM1Bytes",
     "cachedM0ProjectMemoryEpoch",
     "cachedM0WorkspaceFingerprint",
@@ -260,6 +268,8 @@ export function isSessionMetaRow(row: unknown): row is SessionMetaRow {
         isNumberOrNull(r.cleared_reasoning_through_tag) &&
         isStringOrNull(r.last_todo_state) &&
         isBlobOrNull(r.cached_m0_bytes) &&
+        isStringOrNull(r.cached_m0_mural_data_url) &&
+        isStringOrNull(r.cached_m0_mural_hash) &&
         isBlobOrNull(r.cached_m1_bytes) &&
         isNumberOrNull(r.cached_m0_project_memory_epoch) &&
         isStringOrNull(r.cached_m0_workspace_fingerprint) &&
@@ -317,6 +327,8 @@ export function getDefaultSessionMeta(sessionId: string): SessionMeta {
         toolReclaimWatermark: 0,
         lastTodoState: "",
         cachedM0Bytes: null,
+        cachedM0MuralDataUrl: null,
+        cachedM0MuralHash: null,
         cachedM1Bytes: null,
         cachedM0ProjectMemoryEpoch: null,
         cachedM0WorkspaceFingerprint: null,
@@ -435,6 +447,8 @@ export function toSessionMeta(row: SessionMetaRow): SessionMeta {
         toolReclaimWatermark: numOrZero(row.tool_reclaim_watermark),
         lastTodoState: lastTodoStateRaw,
         cachedM0Bytes: toBufferOrNull(row.cached_m0_bytes),
+        cachedM0MuralDataUrl: stringOrNull(row.cached_m0_mural_data_url),
+        cachedM0MuralHash: stringOrNull(row.cached_m0_mural_hash),
         cachedM1Bytes: toBufferOrNull(row.cached_m1_bytes),
         cachedM0ProjectMemoryEpoch: numOrNull(row.cached_m0_project_memory_epoch),
         cachedM0WorkspaceFingerprint: stringOrNull(row.cached_m0_workspace_fingerprint),
@@ -469,6 +483,8 @@ export function toSessionMeta(row: SessionMetaRow): SessionMeta {
 
 export interface PersistCachedM0Payload {
     m0Bytes: Buffer;
+    muralDataUrl?: string | null;
+    muralHash?: string | null;
     projectMemoryEpoch: number | null;
     workspaceFingerprint?: string | null;
     projectUserProfileVersion: number | null;
@@ -495,6 +511,8 @@ export function persistCachedM0(
     db.prepare(
         `UPDATE session_meta SET
             cached_m0_bytes = ?,
+            cached_m0_mural_data_url = ?,
+            cached_m0_mural_hash = ?,
             cached_m0_project_memory_epoch = ?,
             cached_m0_workspace_fingerprint = ?,
             cached_m0_project_user_profile_version = ?,
@@ -513,6 +531,8 @@ export function persistCachedM0(
          WHERE session_id = ?`,
     ).run(
         Buffer.from(payload.m0Bytes),
+        payload.muralDataUrl ?? null,
+        payload.muralHash ?? null,
         payload.projectMemoryEpoch,
         payload.workspaceFingerprint ?? null,
         payload.projectUserProfileVersion,
@@ -541,6 +561,8 @@ export function clearCachedM0M1(db: Database, sessionId: string): void {
     );
     const clears: Array<[string, string | number | null]> = [
         ["cached_m0_bytes", null],
+        ["cached_m0_mural_data_url", null],
+        ["cached_m0_mural_hash", null],
         ["cached_m1_bytes", null],
         ["cached_m0_project_memory_epoch", null],
         ["cached_m0_workspace_fingerprint", null],

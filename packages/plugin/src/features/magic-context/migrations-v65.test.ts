@@ -40,7 +40,7 @@ describe("migration v65: per-memory mural cue columns", () => {
             initializeDatabase(db);
             runMigrations(db);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
-            expect(LATEST_MIGRATION_VERSION).toBe(66);
+            expect(LATEST_MIGRATION_VERSION).toBe(67);
             const names = columnNames(db, "memories");
             expect(names.has("mural_cue")).toBe(true);
             expect(names.has("mural_cue_hash")).toBe(true);

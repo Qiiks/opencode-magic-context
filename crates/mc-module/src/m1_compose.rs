@@ -411,18 +411,22 @@ pub fn compose_m1_from_store(
     // Profile rows and their version arrive together through state sync. Render the block only
     // after a version change, and leave the applied version behind when trimming leaves no body
     // to send; that makes the next real render consume the pending delta instead of losing it.
-    let (new_user_profile_block, profile_rendered) = if memory_enabled
-        && meta.user_profile_version != meta.m1_user_profile_version
-    {
-        let profile_rows = store.load_active_user_memories()?;
-        let profile =
-            trim_user_profile_to_budget(profile_rows, user_profile_budget_tokens, estimate_tokens);
-        let block = render_user_profile_block(&profile, "new-user-profile");
-        let rendered = !block.is_empty();
-        (block, rendered)
-    } else {
-        (String::new(), false)
-    };
+    let (new_user_profile_block, profile_rendered) =
+        if memory_enabled && meta.user_profile_version != meta.m1_user_profile_version {
+            let profile_rows = store.load_active_user_memories()?;
+            // Allocate one quarter of the baseline profile budget to profile deltas, matching
+            // the quarter-budget allocation used for memory deltas.
+            let profile_delta_budget = (user_profile_budget_tokens.max(1.0) * 0.25)
+                .floor()
+                .max(1.0);
+            let profile =
+                trim_user_profile_to_budget(profile_rows, profile_delta_budget, estimate_tokens);
+            let block = render_user_profile_block(&profile, "new-user-profile");
+            let rendered = !block.is_empty();
+            (block, rendered)
+        } else {
+            (String::new(), false)
+        };
 
     // Rendered note BYTES, claims, and deliveries do not participate in
     // m1_revision_signal (note_status_version DOES — that is the evaluation-side
@@ -481,7 +485,7 @@ fn load_render_eligible_memories(
 mod tests {
     use super::*;
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
-    use mc_store::{InsertMemoryInput, StoredCompartment};
+    use mc_store::{InsertMemoryInput, ModuleStateSyncRequest, StoredCompartment};
 
     fn no_estimate(_: &str) -> usize {
         0
@@ -550,6 +554,54 @@ mod tests {
         }
     }
 
+    fn seed_user_profile(store: &McStore, profile: &[String]) {
+        store
+            .apply_authority_state_sync(ModuleStateSyncRequest {
+                session_id: "ses",
+                project_path: "git:proj",
+                shadow_generation: 0,
+                expected_shadow_seq: 0,
+                seed_boundary_id: None,
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
+                compartments: &[],
+                memories: &[],
+                memory_mutations: &[],
+                user_profile: profile,
+                user_profile_present: true,
+                workspace: None,
+                workspace_present: false,
+                last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: Some(2),
+                acked_watermarks: serde_json::json!({}),
+            })
+            .unwrap();
+    }
+
+    fn profile_delta_meta() -> ModuleMeta {
+        ModuleMeta {
+            initialized: true,
+            user_profile_version: 2,
+            m1_user_profile_version: 1,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn revision_signal_is_stable_and_moves_on_change() {
         let dir = tempfile::tempdir().unwrap();
@@ -566,6 +618,84 @@ mod tests {
             .unwrap();
         let s2 = m1_revision_signal(&store, p, "ses").unwrap();
         assert_ne!(s1, s2, "new compartment → signal moves");
+    }
+
+    #[test]
+    fn profile_version_moves_the_in_session_revision_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let before =
+            m1_revision_signal_parts_for_pass(&store, "git:proj", "git:proj", "ses", 1, true, 0)
+                .unwrap();
+        let after =
+            m1_revision_signal_parts_for_pass(&store, "git:proj", "git:proj", "ses", 2, true, 0)
+                .unwrap();
+
+        assert_ne!(before.revision, after.revision);
+        assert_eq!(after.user_profile_version, 2);
+    }
+
+    #[test]
+    fn profile_delta_uses_the_quarter_budget_boundary() {
+        let exact_dir = tempfile::tempdir().unwrap();
+        let exact_store = McStore::open(&descriptor(exact_dir.path())).unwrap();
+        seed_user_profile(&exact_store, &["exact-quarter".to_string()]);
+        let exact = compose_m1_from_store(
+            &exact_store,
+            "git:proj",
+            "git:proj",
+            "ses",
+            &profile_delta_meta(),
+            0,
+            true,
+            8_000.0,
+            100.0,
+            true,
+            |_| 21,
+        )
+        .unwrap();
+        assert!(exact.body.contains("- exact-quarter"), "{}", exact.body);
+        assert!(exact.profile_rendered);
+
+        let over_dir = tempfile::tempdir().unwrap();
+        let over_store = McStore::open(&descriptor(over_dir.path())).unwrap();
+        seed_user_profile(&over_store, &["one-token-over".to_string()]);
+        let over = compose_m1_from_store(
+            &over_store,
+            "git:proj",
+            "git:proj",
+            "ses",
+            &profile_delta_meta(),
+            0,
+            true,
+            8_000.0,
+            100.0,
+            true,
+            |_| 22,
+        )
+        .unwrap();
+        assert_eq!(over.body, M1_PLACEHOLDER);
+        assert!(!over.profile_rendered);
+
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty_store = McStore::open(&descriptor(empty_dir.path())).unwrap();
+        seed_user_profile(&empty_store, &["too-large".to_string()]);
+        let empty = compose_m1_from_store(
+            &empty_store,
+            "git:proj",
+            "git:proj",
+            "ses",
+            &profile_delta_meta(),
+            0,
+            true,
+            8_000.0,
+            1.0,
+            true,
+            |_| 1,
+        )
+        .unwrap();
+        assert_eq!(empty.body, M1_PLACEHOLDER);
+        assert!(!empty.profile_rendered);
     }
 
     #[test]

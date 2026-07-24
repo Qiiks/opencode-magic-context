@@ -26,6 +26,8 @@ const SESSION_META_FALLBACK_SELECTS: Partial<
     last_todo_state: "'' AS last_todo_state",
     tool_reclaim_watermark: "0 AS tool_reclaim_watermark",
     cached_m0_bytes: "NULL AS cached_m0_bytes",
+    cached_m0_mural_data_url: "NULL AS cached_m0_mural_data_url",
+    cached_m0_mural_hash: "NULL AS cached_m0_mural_hash",
     cached_m1_bytes: "NULL AS cached_m1_bytes",
     cached_m0_project_memory_epoch: "NULL AS cached_m0_project_memory_epoch",
     cached_m0_project_user_profile_version: "NULL AS cached_m0_project_user_profile_version",

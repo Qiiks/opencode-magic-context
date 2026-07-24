@@ -78,6 +78,9 @@ export interface SessionMeta {
     toolReclaimWatermark: number;
     lastTodoState: string;
     cachedM0Bytes: Buffer | null;
+    /** Frozen image payload paired atomically with cachedM0Bytes. */
+    cachedM0MuralDataUrl: string | null;
+    cachedM0MuralHash: string | null;
     cachedM1Bytes: Buffer | null;
     cachedM0ProjectMemoryEpoch: number | null;
     cachedM0WorkspaceFingerprint: string | null;

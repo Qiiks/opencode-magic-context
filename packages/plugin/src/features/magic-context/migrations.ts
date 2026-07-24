@@ -2486,6 +2486,15 @@ const MIGRATIONS: Migration[] = [
             );
         },
     },
+    {
+        version: 67,
+        description: "persist the frozen mural payload with each cached m0 baseline",
+        up(db: Database): void {
+            if (!tableExists(db, "session_meta")) return;
+            ensureColumn(db, "session_meta", "cached_m0_mural_data_url", "TEXT");
+            ensureColumn(db, "session_meta", "cached_m0_mural_hash", "TEXT");
+        },
+    },
 ];
 
 /**

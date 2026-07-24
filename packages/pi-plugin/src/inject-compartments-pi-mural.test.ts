@@ -9,7 +9,11 @@ import {
 	refreshModelLimitsFromApi,
 } from "@magic-context/core/shared/models-dev-cache";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
-import { injectM0M1Pi, type PiM0M1State } from "./inject-compartments-pi";
+import {
+	__test,
+	injectM0M1Pi,
+	type PiM0M1State,
+} from "./inject-compartments-pi";
 import { createTestDb, textOf, userMessage } from "./test-utils.test";
 
 const SESSION_ID = "ses_pi_mural_inject";
@@ -43,6 +47,16 @@ function baseState(overrides: Partial<PiM0M1State> = {}): PiM0M1State {
 		},
 		...overrides,
 	};
+}
+
+function replaceCurrentManifest(db: ReturnType<typeof createTestDb>): string {
+	const image = Buffer.from("current pi mural", "utf8");
+	db.prepare(
+		`INSERT OR REPLACE INTO mural_manifest
+			(project_path, image, content_hash, rendered_at, memory_ids_json, width, height)
+		 VALUES (?, ?, ?, ?, '[]', 1, 1)`,
+	).run("git:pi-mural", image, "current-pi-manifest", Date.now());
+	return image.toString("base64");
 }
 
 function findM0Image(messages: Array<{ content?: unknown }>): {
@@ -81,8 +95,10 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 			expect(hardImage?.mimeType).toBe("image/png");
 			expect(hardImage?.data).toBe(FAKE_MURAL_BASE64);
 
-			// Defer: no mural option, no recompute — must replay the same baked-in
-			// image without re-resolving (HARD-fold-only swap rule).
+			// Simulate restart after another session advances the project manifest.
+			// The defer must reload this session's persisted frozen payload instead.
+			const currentManifestBase64 = replaceCurrentManifest(db);
+			__test.clearPiMuralProcessCache(SESSION_ID);
 			const deferState = baseState();
 			const deferMessages = [userMessage("again")];
 			const second = injectM0M1Pi(
@@ -96,8 +112,70 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 			expect(textOf(deferMessages[0])).toContain("<memory-mural>");
 			const deferImage = findM0Image(deferMessages);
 			expect(deferImage?.data).toBe(FAKE_MURAL_BASE64);
+			expect(deferImage?.data).not.toBe(currentManifestBase64);
 			expect(textOf(deferMessages[0])).toBe(textOf(hardMessages[0]));
 		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("hydrates a sibling cached-row mural payload", () => {
+		const db = createTestDb();
+		try {
+			getOrCreateSessionMeta(db, SESSION_ID);
+			injectM0M1Pi(
+				baseState({ mural: muralOption() }),
+				db,
+				[userMessage("hard")] as never,
+				undefined,
+				true,
+			);
+
+			const siblingDataUrl = "data:image/png;base64,cGktc2libGluZy1tdXJhbA==";
+			db.prepare(
+				`UPDATE session_meta
+					SET cached_m0_mural_data_url = ?, cached_m0_mural_hash = ?,
+						cached_m0_materialized_at = cached_m0_materialized_at + 1
+				  WHERE session_id = ?`,
+			).run(siblingDataUrl, "pi-sibling-hash", SESSION_ID);
+
+			const messages = [userMessage("soft")];
+			injectM0M1Pi(baseState(), db, messages as never, undefined, true);
+			expect(findM0Image(messages)?.data).toBe(
+				siblingDataUrl.slice("data:image/png;base64,".length),
+			);
+		} finally {
+			__test.clearPiMuralProcessCache(SESSION_ID);
+			closeQuietly(db);
+		}
+	});
+
+	it("uses a text-only fallback when a legacy cached row lacks its image payload", () => {
+		const db = createTestDb();
+		try {
+			getOrCreateSessionMeta(db, SESSION_ID);
+			injectM0M1Pi(
+				baseState({ mural: muralOption() }),
+				db,
+				[userMessage("hard")] as never,
+				undefined,
+				true,
+			);
+			const currentManifestBase64 = replaceCurrentManifest(db);
+			db.prepare(
+				`UPDATE session_meta
+					SET cached_m0_mural_data_url = NULL, cached_m0_mural_hash = NULL
+				  WHERE session_id = ?`,
+			).run(SESSION_ID);
+			__test.clearPiMuralProcessCache(SESSION_ID);
+
+			const messages = [userMessage("defer")];
+			injectM0M1Pi(baseState(), db, messages as never, undefined, false);
+			expect(findM0Image(messages)).toBeNull();
+			expect(findM0Image(messages)?.data).not.toBe(currentManifestBase64);
+			expect(textOf(messages[0])).not.toContain("<memory-mural>");
+		} finally {
+			__test.clearPiMuralProcessCache(SESSION_ID);
 			closeQuietly(db);
 		}
 	});
