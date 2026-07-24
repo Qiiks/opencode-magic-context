@@ -421,6 +421,7 @@ export function buildSidebarSnapshot(
         // or when no config was passed in. Mirrors the resolution flow
         // used by `buildStatusDetail` so the dialog and sidebar agree.
         let executeThreshold = 65;
+        let executeThresholdClamped = false;
         if (config) {
             const modelKey =
                 activeProviderID && activeModelID
@@ -439,6 +440,7 @@ export function buildSidebarSnapshot(
                 sessionId,
             });
             executeThreshold = thresholdDetail.percentage;
+            executeThresholdClamped = thresholdDetail.clamped === true;
         }
 
         const calibration = resolveModelCalibration(activeProviderID, activeModelID);
@@ -482,6 +484,7 @@ export function buildSidebarSnapshot(
             toolCallTokens: calibrated.toolCallTokens,
             toolDefinitionTokens: calibrated.toolDefinitionTokens,
             executeThreshold,
+            executeThresholdClamped,
             boundaryPresent: moduleStatus?.boundary_present,
             coverageOrdinal: moduleStatus?.coverage_ordinal,
             newWorkTokens,
@@ -671,6 +674,7 @@ export function buildStatusDetail(
             });
             detail.executeThreshold = thresholdDetail.percentage;
             detail.executeThresholdMode = thresholdDetail.mode;
+            detail.executeThresholdClamped = thresholdDetail.clamped;
             if (thresholdDetail.absoluteTokens !== undefined) {
                 detail.executeThresholdTokens = thresholdDetail.absoluteTokens;
             }

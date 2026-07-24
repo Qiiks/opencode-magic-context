@@ -767,6 +767,7 @@ const SidebarContent = props => {
             _$insertNode(_el$35, _el$36);
             _$insert(_el$35, () => s().usagePercentage.toFixed(1), _el$36);
             _$insert(_el$34, () => formatThresholdPercent(s().executeThreshold), _el$38);
+            _$insert(_el$34, () => s().executeThresholdClamped ? "*" : "", null);
             _$insertNode(_el$39, _el$40);
             _$insert(_el$39, () => compactTokens(s().inputTokens), _el$40);
             _$insert(_el$39, () => compactTokens(s().contextLimit), null);
