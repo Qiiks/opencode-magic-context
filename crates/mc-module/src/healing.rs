@@ -119,14 +119,22 @@ pub const fn coverage(profile: SerializerProfile) -> HealingCoverage {
 
 /// The profile-default tail-reclaim capability.
 ///
-/// Full-array consumers apply both prefix and tail rewrites, so their profile default is
-/// true. Claude Code keeps a false default to preserve established sessions exactly; the
-/// transform derives its effective value per request from the canonical tool-presence
-/// signal. Prefix folding remains available regardless of the effective tail setting.
+/// Every shipping profile is a full-array consumer: the provider request is rebuilt from
+/// the transformed array each pass, so prefix and tail rewrites both round-trip and the
+/// profile default is true. Claude Code was historically the one verbatim-tail profile —
+/// its Thalamus gateway byte-spliced the live tail, so a false default avoided phantom
+/// reclaims (mutations frozen by the module that the splice never carried into the real
+/// context). The peer retired that byte-splice at U0: full-array apply is now the only
+/// serving path and the fail-open arm forwards the current raw request, never stale or
+/// retained bytes, so Claude Code is full-array too. A fenced pass forwards strictly more
+/// current content, and any tail mutation a fence skips simply reapplies on the next
+/// healthy pass. Prefix folding remains available regardless of the tail setting.
 pub const fn tail_reclaim(profile: SerializerProfile) -> bool {
+    // Single exhaustive arm: all shipping profiles reclaim the tail. The match stays
+    // exhaustive (not a wildcard) so a future profile forces an explicit decision here.
     match profile {
-        SerializerProfile::ClaudeCodeAnthropic => false,
-        SerializerProfile::OwnedLlmRunner
+        SerializerProfile::ClaudeCodeAnthropic
+        | SerializerProfile::OwnedLlmRunner
         | SerializerProfile::OwnedBroca
         | SerializerProfile::Pi
         | SerializerProfile::OpencodeAiSdk => true,
@@ -184,6 +192,24 @@ mod tests {
             Some(SerializerProfile::OwnedBroca)
         );
         assert_eq!(SerializerProfile::OwnedBroca.wire_id(), "owned-broca");
+    }
+
+    #[test]
+    fn tail_reclaim_is_full_array_for_every_shipping_profile() {
+        // U0 retired the Claude Code byte-splice, so every shipping profile is now a
+        // full-array consumer with tail reclaim enabled. Claude Code flips from its
+        // historical false default to true; owned-broca is unchanged (it was already
+        // full-array and is semantically identical to owned-llmrunner).
+        for profile in SerializerProfile::all() {
+            assert!(tail_reclaim(*profile), "{profile:?} must reclaim the tail");
+        }
+        assert!(tail_reclaim(SerializerProfile::ClaudeCodeAnthropic));
+        assert!(tail_reclaim(SerializerProfile::OwnedBroca));
+        assert_eq!(
+            tail_reclaim(SerializerProfile::OwnedBroca),
+            tail_reclaim(SerializerProfile::OwnedLlmRunner),
+            "broca stays full-array, identical to llmrunner"
+        );
     }
 
     #[test]
