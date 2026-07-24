@@ -162,8 +162,11 @@ pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = 2;
 pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = 2;
 /// Bumps when the rendered m0 prefix format changes for the claude-code-anthropic
 /// profile; epoch 1 includes covered system messages in m0 instead of sending them as
-/// separate system-role messages.
-pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 = 1;
+/// separate system-role messages. Epoch 2 flips the profile to full-array tail reclaim
+/// (the Thalamus peer retired the byte-splice at U0), so tool-absent sessions gain the
+/// age/pressure tail reclaim they never had; the bump forces one self-coordinated HARD
+/// fold on the first pass under the new binary, per the epoch contract above.
+pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 = 2;
 /// Bumps when any active tag overlay changes provider-visible bytes. Epoch 3 freezes
 /// temporal-marker decisions in durable rows instead of deriving them from each request array.
 /// Every change requires one cache-breaking fold before the new overlay can render. Inactive
@@ -13158,7 +13161,7 @@ mod tests {
         assert_eq!(status["session_id"], "ses");
         assert_eq!(status["row_version"], Value::Null);
         assert_eq!(status["historian"]["last_no_fire"], Value::Null);
-        assert_eq!(PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC, 1);
+        assert_eq!(PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC, 2);
         assert_eq!(
             status["epochs"]["memory_render_epoch"],
             json!(MEMORY_RENDER_FORMAT_EPOCH)
@@ -13167,7 +13170,7 @@ mod tests {
             status["epochs"]["compartment_render_epoch"],
             json!(COMPARTMENT_RENDER_FORMAT_EPOCH)
         );
-        assert_eq!(status["epochs"]["profile_epoch"], json!(1));
+        assert_eq!(status["epochs"]["profile_epoch"], json!(2));
         assert_eq!(
             status["epochs"]["tagger_epoch"],
             json!(TAGGER_FEATURE_EPOCH)

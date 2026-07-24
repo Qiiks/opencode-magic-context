@@ -2126,11 +2126,13 @@ fn apply_once(
         || reconcile_hard_due
         || emergency_arm_engaged
         || loaded.meta.soft_refresh_pending;
-    // Profile defaults remain conservative, while the request-local tool signal enables
-    // full-array tail reclaim for an active tagging surface. A false request therefore
-    // retains the exact pre-capability behavior without changing the global profile table.
-    let tail_reclaim_enabled = serializer_profile
-        .is_none_or(|profile| healing::tail_reclaim(profile) || tagging_surface_requested);
+    // Tail reclaim gates purely on the serializer profile. Every shipping profile is a
+    // full-array consumer (healing::tail_reclaim is true for all of them), so the request
+    // array round-trips both prefix and tail mutations on every pass. The U1-era layering
+    // that OR-ed in the request-local tagging surface is gone: it existed only to grant the
+    // then-verbatim-tail Claude Code profile reclaim on tool-present passes, and the
+    // profile default now covers every pass directly.
+    let tail_reclaim_enabled = serializer_profile.is_none_or(healing::tail_reclaim);
     let cached_m1_missing_due = cached_m1_missing(&loaded.core);
     let producer_gate = tail_reclaim_enabled
         && producer_gate(
@@ -2183,10 +2185,9 @@ fn apply_once(
     let selected_reductions = if producer_gate {
         let frozen = frozen_red_targets(&loaded.core);
         // No per-request gate here: producer_gate already requires
-        // tail_reclaim_enabled, which is the profile default OR the request-local
-        // surface. Gating again on the request-local surface alone would starve
-        // the durable queue on profiles whose default is true (owned/Pi/OpenCode
-        // legs drain unconditionally).
+        // tail_reclaim_enabled, which is the profile default. Gating again on the
+        // request-local tagging surface would starve the durable queue now that every
+        // shipping profile drains unconditionally (full-array tail reclaim).
         let agent_drop_ids = pending_agent_drops
             .iter()
             .map(|drop| drop.target_id.clone())
@@ -15816,7 +15817,13 @@ mod tests {
     }
 
     #[test]
-    fn subc_reversibility_pending_drop_survives_an_entire_false_window() {
+    fn subc_reversibility_full_array_cc_applies_pending_drop_without_an_active_window() {
+        // U1 history: while Claude Code was a verbatim-tail (byte-splice) consumer, tail
+        // reclaim was gated on the tool-present surface, so a queued agent drop survived
+        // every tool-absent ("false") pass and only applied once an active window returned.
+        // U0 retired the byte-splice — full-array apply is the only serving path — so reclaim
+        // now gates purely on the profile and a tool-absent emergency pass applies the drop
+        // directly; no active window is required.
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let messages = (1..=30)
@@ -15828,26 +15835,10 @@ mod tests {
             .append_pending_agent_drops("false-window", &["m1#0".to_string()], 1)
             .unwrap();
 
-        for pass in 1..=4 {
-            inactive.render_config = format!("cfg{pass}");
-            let response = run(&store, &with_usage(inactive.clone(), 99, 100), &spine());
-            assert_eq!(response.action, "HARD");
-            assert_eq!(
-                frozen_red_payload(&store.load("false-window").unwrap().core, "m1#0"),
-                None
-            );
-            assert_eq!(
-                store
-                    .load_pending_agent_drops("false-window")
-                    .unwrap()
-                    .len(),
-                1
-            );
-        }
-
-        let active = active_cc_req("false-window", &inactive.render_config, messages);
-        let applied = run(&store, &active, &spine());
-        assert_eq!(applied.action, "HARD");
+        // The first tool-absent emergency pass already applies the drop.
+        inactive.render_config = "cfg1".to_string();
+        let response = run(&store, &with_usage(inactive.clone(), 99, 100), &spine());
+        assert_eq!(response.action, "HARD");
         assert_eq!(
             frozen_red_payload(&store.load("false-window").unwrap().core, "m1#0"),
             Some("[dropped]")
@@ -16274,7 +16265,12 @@ mod tests {
     }
 
     #[test]
-    fn dormant_forced_hard_retains_pending_then_active_hard_applies_it() {
+    fn full_array_cc_dormant_forced_hard_applies_pending_drop_directly() {
+        // U1 history: a dormant (tool-absent) forced HARD retained a queued agent drop and
+        // only the subsequent active (tool-present) HARD applied it, because tail reclaim was
+        // gated on the tool-present surface for the then-verbatim-tail Claude Code profile.
+        // U0 retired the byte-splice, so reclaim gates purely on the profile and the dormant
+        // forced HARD applies the drop itself; the active pass then finds nothing pending.
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let messages = vec![item("a", 1, "drop me")];
@@ -16288,16 +16284,15 @@ mod tests {
         assert_eq!(dormant.action, "HARD");
         assert_eq!(
             frozen_red_payload(&store.load("dormant-hard").unwrap().core, "a#0"),
-            None
+            Some("[dropped]"),
+            "the dormant tool-absent forced HARD now applies the drop itself"
         );
-        assert_eq!(
-            store
-                .load_pending_agent_drops("dormant-hard")
-                .unwrap()
-                .len(),
-            1
-        );
+        assert!(store
+            .load_pending_agent_drops("dormant-hard")
+            .unwrap()
+            .is_empty());
 
+        // The active pass finds the drop already drained; the frozen unit persists.
         let active = run(
             &store,
             &active_cc_req("dormant-hard", "cfg1", messages),
@@ -17308,13 +17303,16 @@ mod tests {
         )
     }
 
-    /// The byte-splice consumer keeps tail bytes verbatim, so the module must not
-    /// mutate the tail for its profile under ANY pass class: mutations it froze
-    /// would never reach the real context (phantom reclaim). Drives execute-class
-    /// and emergency-class passes over reclaim-eligible content and asserts the
-    /// output tail is byte-identical to the input on every pass.
+    /// Claude Code is a full-array consumer since the Thalamus peer retired the
+    /// byte-splice at U0: every pass rebuilds the provider request from the transformed
+    /// array, so tail mutations round-trip into the real context instead of being lost to
+    /// a splice (the old "phantom reclaim" hazard). This is the inverse of the retired
+    /// verbatim-tail guarantee — a tool-absent CC session now selects reclaim candidates
+    /// under pressure, where it selected none before U0. Drives execute- and emergency-class
+    /// passes over reclaim-eligible content with a queued agent drop and asserts the tail is
+    /// mutated and the drop drains.
     #[test]
-    fn verbatim_tail_profile_never_mutates_tail_bytes_on_any_pass_class() {
+    fn full_array_cc_profile_reclaims_tail_and_applies_drops_under_pressure() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "m1", "SUMMARY")])
@@ -17324,64 +17322,46 @@ mod tests {
             item("m1", 1, "covered raw"),
             assistant_tool_call("m2", 2, "call_old"),
             tool_result("m3", 3, "call_old", "big old tool output that age-drops"),
-            todowrite_call(
-                "m4",
-                4,
-                serde_json::json!([{ "content": "x", "status": "done" }]),
-            ),
             item("m9", 9, "newest user text"),
         ];
-        // A queued agent drop targeting the old tool result: appendable always,
-        // consumable never (for this profile).
+        // A queued agent drop targeting the old tool result: under full-array CC it is
+        // consumable on any reclaiming pass, including a tool-absent one (it was
+        // appendable-but-never-consumable while CC was verbatim-tail).
         s.append_pending_agent_drops("ses", &["m3#0".to_string()], 1)
             .unwrap();
 
-        let expected_tail: Vec<Vec<u8>> = tail[1..]
-            .iter()
-            .map(|m| serde_json::to_vec(&m.ck).unwrap())
-            .collect();
-
-        // Bootstrap fold (HARD), then execute-class (70%) and emergency-class (96%)
-        // passes: each must leave tail bytes untouched and consume nothing.
         let ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        for (usage, limit) in [(1u64, 100u64), (70, 100), (96, 100)] {
-            let r = transform(
+        // Bootstrap fold (HARD) then an emergency-class pass (96%): the tool-absent CC
+        // session reclaims the tail and drains the queued drop on a healthy pass.
+        for (usage, limit) in [(1u64, 100u64), (96, 100)] {
+            let _ = transform(
                 &s,
                 &with_usage(cc_req("ses", "cfg0", tail.clone()), usage, limit),
                 &ctx,
             )
             .unwrap();
-            let out_tail: Vec<Vec<u8>> = r
-                .messages()
-                .iter()
-                .filter(|m| !m.meta.synthetic)
-                .map(|m| serde_json::to_vec(m).unwrap())
-                .collect();
-            assert_eq!(
-                out_tail, expected_tail,
-                "tail bytes must be verbatim at usage {usage}%"
-            );
         }
 
         let loaded = s.load("ses").unwrap();
+        assert_eq!(
+            frozen_red_payload(&loaded.core, "m3#0"),
+            Some("[dropped]"),
+            "the queued agent drop must freeze under full-array CC"
+        );
         assert!(
             loaded
                 .core
                 .frozen_units
                 .iter()
-                .all(|u| !u.key.starts_with("red:")),
-            "no reduction may freeze under a verbatim-tail profile"
-        );
-        assert!(
-            loaded.meta.synthetic_todo.is_none(),
-            "no synthetic todo may be captured under a verbatim-tail profile"
+                .any(|u| u.key.starts_with("red:")),
+            "a reduction must freeze under full-array CC"
         );
         assert_eq!(
             s.load_pending_agent_drops("ses").unwrap().len(),
-            1,
-            "queued agent drops stay durable (append accepted, drain gated)"
+            0,
+            "queued agent drops drain once reclaim runs"
         );
-        // The FOLD is not a tail mutation: the prefix compacted normally.
+        // The prefix fold still happens alongside tail reclaim.
         assert!(loaded.core.frozen_units.iter().any(|u| u.key == "m0"));
     }
 
@@ -18561,7 +18541,7 @@ mod tests {
 
     #[test]
     fn profile_epoch_fold_hards_epoch_zero_cc_state_once() {
-        assert_eq!(crate::PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC, 1);
+        assert_eq!(crate::PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC, 2);
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "m1", "SUMMARY")])
@@ -18600,11 +18580,22 @@ mod tests {
             m0_bytes(&transitioned)
         );
         assert!(!m0_bytes(&transitioned).contains("OLD-M0"));
+        // The bumped profile epoch (2) must flow into the committed effective render
+        // config as the `mpe2` member: that token is what makes the next pass see an
+        // unchanged config and stop folding.
+        assert!(
+            s.load("ses")
+                .unwrap()
+                .meta
+                .last_render_config
+                .contains("mpe2"),
+            "PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC=2 must fold into effective_render_config"
+        );
 
         let one_shot = run(&s, &current, &spine());
         assert_eq!(
             one_shot.action, "SOFT+",
-            "after last_render_config records mpe1, the profile fold must not loop"
+            "after last_render_config records mpe2, the profile fold must not loop"
         );
     }
 
