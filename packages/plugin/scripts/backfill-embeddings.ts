@@ -9,21 +9,96 @@
  * Run: bun scripts/backfill-embeddings.ts [--directory <cwd>] [--project <project_path>]
  *   --directory  Project directory used to resolve config and identity.
  *   --project    Only backfill memories for this project_path (must match --directory identity unless --force-project-path).
+ *   --shadow     Re-embed the HISTORICAL corpus under the current Synapse shadow
+ *                identity instead of backfilling primary memories. Use this after
+ *                a fingerprint rotation orphaned the shadow measurement cohort;
+ *                it drives the same bounded enqueue path the plugin runs, but to
+ *                completion with progress output.
  */
 import { Database } from "../src/shared/sqlite";
-import { loadPluginConfig } from "../src/config";
+import { loadPluginConfig, loadPluginConfigDetailed } from "../src/config";
 import {
     embedBatchForProject,
+    flushShadowEmbeddingBacklog,
     getProjectEmbeddingSnapshot,
+    getShadowBackfillRemaining,
     registerProjectEmbedding,
+    registerProjectShadowEmbedding,
 } from "../src/features/magic-context/memory/embedding";
 import { resolveProjectIdentity } from "../src/features/magic-context/memory/project-identity";
 import { saveEmbedding } from "../src/features/magic-context/memory/storage-memory-embeddings";
+import { isConfigLoadUntrusted } from "../src/plugin/embedding-bootstrap-helpers";
+import { resolveEmbeddingRouting } from "../src/plugin/embedding-routing";
 
 const DB_PATH = `${process.env.HOME}/.local/share/opencode/storage/plugin/magic-context/context.db`;
 function getArg(name: string): string | null {
     const index = process.argv.indexOf(name);
     return index >= 0 ? (process.argv[index + 1] ?? null) : null;
+}
+
+/**
+ * Drive the shadow historical backfill to completion with progress output.
+ * Registering the (possibly rotated) shadow identity arms the backfill inside
+ * the registry; this just resolves the live routing, registers both lanes the
+ * same way the boot path does, then flushes the bounded queue until the missing
+ * set is empty.
+ */
+async function runShadowBackfill(
+    db: Database,
+    directory: string,
+    projectIdentity: string,
+): Promise<void> {
+    const detailed = loadPluginConfigDetailed(directory);
+    if (isConfigLoadUntrusted(detailed)) {
+        console.error(
+            "Config load is untrusted for this project; refusing to run the shadow backfill off a config we don't trust.",
+        );
+        process.exitCode = 1;
+        return;
+    }
+    const routing = await resolveEmbeddingRouting({
+        config: detailed.config,
+        projectRoot: directory,
+        session: `shadow-backfill:${projectIdentity}`,
+    });
+    for (const warning of routing.warnings) console.warn(`[shadow] ${warning}`);
+    if (!routing.shadow) {
+        console.error(
+            "No shadow lane is armed for this project (shadow_embedding disabled or unavailable). Nothing to do.",
+        );
+        return;
+    }
+    registerProjectEmbedding(
+        db,
+        projectIdentity,
+        routing.primary,
+        {
+            memoryEnabled: detailed.config.memory.enabled,
+            gitCommitEnabled: detailed.config.memory.git_commit_indexing.enabled,
+        },
+        directory,
+    );
+    registerProjectShadowEmbedding(db, projectIdentity, routing.shadow, directory);
+
+    const before = getShadowBackfillRemaining(db, projectIdentity);
+    console.log(
+        `Shadow backfill for ${projectIdentity}: ${before.memory} memories, ${before.commit} commits, ${before.chunk} chunks missing under the current shadow identity.`,
+    );
+    if (before.memory === 0 && before.commit === 0 && before.chunk === 0) {
+        console.log("Nothing to do.");
+        return;
+    }
+    await flushShadowEmbeddingBacklog(projectIdentity, () => {
+        const remaining = getShadowBackfillRemaining(db, projectIdentity);
+        console.log(
+            `  remaining: ${remaining.memory} memories, ${remaining.commit} commits, ${remaining.chunk} chunks`,
+        );
+    });
+    const after = getShadowBackfillRemaining(db, projectIdentity);
+    console.log(
+        `Done. Embedded ${before.memory - after.memory} memories, ${before.commit - after.commit} commits, ${before.chunk - after.chunk} chunks. ` +
+            `Remaining: ${after.memory} memories, ${after.commit} commits, ${after.chunk} chunks.`,
+    );
 }
 
 async function main() {
@@ -42,6 +117,13 @@ async function main() {
 
     const db = new Database(DB_PATH);
     db.exec("PRAGMA journal_mode=WAL");
+
+    if (process.argv.includes("--shadow")) {
+        await runShadowBackfill(db, directory, projectIdentity);
+        db.close();
+        return;
+    }
+
     const config = loadPluginConfig(directory);
     registerProjectEmbedding(
         db,

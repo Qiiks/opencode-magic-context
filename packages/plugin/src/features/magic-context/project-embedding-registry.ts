@@ -179,6 +179,24 @@ const SHADOW_MAX_ITEMS_PER_TICK = 64;
 const SHADOW_MAX_BYTES_PER_TICK = 512 * 1024;
 const SHADOW_MAX_WALL_CLOCK_MS = 2_000;
 
+/**
+ * Shadow scopes that still owe a historical backfill for a project. A Synapse
+ * fingerprint rotation gives the shadow lane a brand-new modelId, so every row
+ * the primary lane already embedded lacks a counterpart under the new identity.
+ * Rather than dump the whole corpus into one transaction we mark the affected
+ * scopes here and let the shadow worker drain them a bounded chunk per tick
+ * (see pumpShadowBackfill). A scope drops out once its missing set is empty.
+ */
+const pendingShadowBackfills = new Map<string, Set<ShadowScope>>();
+/**
+ * Last missing-id batch enqueued per `${projectIdentity}:${scope}`. Used as a
+ * stall guard: if a pump produces the exact same id set as the previous one,
+ * nothing was written in between (the embeds are failing), so we stop
+ * re-enqueueing that scope instead of hot-looping the worker against a provider
+ * that cannot succeed. Any real progress changes the set and clears the stall.
+ */
+const shadowBackfillLastIds = new Map<string, string>();
+
 const loadUnembeddedMemoriesStatements = new WeakMap<Database, PreparedStatement>();
 const upsertActiveIdentityStatements = new WeakMap<Database, PreparedStatement>();
 const backfillActiveIdentityStatements = new Map<
@@ -1051,6 +1069,12 @@ export function registerProjectShadowEmbedding(
         recordScopeActiveIdentity(db, projectIdentity, "chunk", registration.chunkModelId, now);
         persistShadowDescriptor(db, registration);
     })();
+    // A new shadow identity just landed (rotation, or a first/again registration
+    // over a corpus that already has primary rows). Re-embed the historical
+    // corpus under it so the measurement cohort keeps its coverage; the old
+    // identity's rows age out through the 14-day GC. No-op when nothing is
+    // missing (fresh project / identity unchanged path returned above).
+    maybeArmShadowBackfill(db, projectIdentity, registration);
     return {
         projectIdentity,
         sourceDirectory,
@@ -1074,7 +1098,7 @@ function startShadowWorker(): void {
     if (shadowWorker) return;
     shadowWorker = runShadowWorker().finally(() => {
         shadowWorker = null;
-        if (shadowQueue.length > 0) startShadowWorker();
+        if (shadowQueue.length > 0 || hasPendingShadowBackfill()) startShadowWorker();
     });
 }
 
@@ -1139,6 +1163,252 @@ export function enqueueShadowEmbeddingItems(
     if (ids.length === 0 || !shadowRegistrations.has(projectIdentity)) return;
     shadowQueue.push({ projectIdentity, scope, ids: [...ids] });
     startShadowWorker();
+}
+
+/**
+ * Base missing-set query for one shadow scope: the items the PRIMARY lane has
+ * already embedded (row under the primary modelId) that have NO row under the
+ * shadow modelId yet. Mirrors the primary backfill's LEFT JOIN ... WHERE NULL
+ * shape. Returned without ORDER BY/LIMIT so callers can append a bounded LIMIT
+ * (id listing) or wrap it in a COUNT(*).
+ */
+function shadowBackfillMissingBase(
+    scope: ShadowScope,
+    primaryModelId: string,
+    shadowModelId: string,
+    projectIdentity: string,
+): { sql: string; params: unknown[]; orderBy: string } {
+    if (scope === "memory") {
+        return {
+            sql: `SELECT m.id AS id
+                  FROM memories m
+                  JOIN memory_embeddings mp ON mp.memory_id = m.id AND mp.model_id = ?
+                  LEFT JOIN memory_embeddings ms ON ms.memory_id = m.id AND ms.model_id = ?
+                  WHERE m.project_path = ? AND m.status = 'active' AND ms.memory_id IS NULL`,
+            params: [primaryModelId, shadowModelId, projectIdentity],
+            orderBy: " ORDER BY m.id",
+        };
+    }
+    if (scope === "commit") {
+        return {
+            sql: `SELECT gc.sha AS id
+                  FROM git_commits gc
+                  JOIN git_commit_embeddings gp ON gp.sha = gc.sha AND gp.model_id = ?
+                  LEFT JOIN git_commit_embeddings gs ON gs.sha = gc.sha AND gs.model_id = ?
+                  WHERE gc.project_path = ? AND gs.sha IS NULL`,
+            params: [primaryModelId, shadowModelId, projectIdentity],
+            orderBy: " ORDER BY gc.committed_at DESC, gc.sha",
+        };
+    }
+    return {
+        sql: `SELECT DISTINCT cp.compartment_id AS id
+              FROM compartment_chunk_embeddings cp
+              WHERE cp.project_path = ? AND cp.model_id = ?
+                AND NOT EXISTS (
+                    SELECT 1 FROM compartment_chunk_embeddings cs
+                    WHERE cs.compartment_id = cp.compartment_id AND cs.model_id = ?
+                )`,
+        params: [projectIdentity, primaryModelId, shadowModelId],
+        orderBy: " ORDER BY cp.compartment_id",
+    };
+}
+
+/** One bounded chunk of shadow-backfill ids for a scope (empty when drained). */
+function shadowBackfillMissingIds(
+    db: Database,
+    projectIdentity: string,
+    scope: ShadowScope,
+    primaryModelId: string,
+    shadowModelId: string,
+    limit: number,
+): string[] {
+    const { sql, params, orderBy } = shadowBackfillMissingBase(
+        scope,
+        primaryModelId,
+        shadowModelId,
+        projectIdentity,
+    );
+    const rows = db.prepare(`${sql}${orderBy} LIMIT ?`).all(...params, limit) as Array<{
+        id: number | string;
+    }>;
+    return rows.map((row) => String(row.id));
+}
+
+/** Total outstanding shadow-backfill rows for a scope (progress reporting). */
+function countShadowBackfillMissing(
+    db: Database,
+    projectIdentity: string,
+    scope: ShadowScope,
+    primaryModelId: string,
+    shadowModelId: string,
+): number {
+    const { sql, params } = shadowBackfillMissingBase(
+        scope,
+        primaryModelId,
+        shadowModelId,
+        projectIdentity,
+    );
+    return (
+        db.prepare(`SELECT COUNT(*) AS count FROM (${sql})`).get(...params) as { count: number }
+    ).count;
+}
+
+function shadowModelIdForScope(
+    registration: { modelId: string; chunkModelId: string },
+    scope: ShadowScope,
+): string {
+    return scope === "chunk" ? registration.chunkModelId : registration.modelId;
+}
+
+function hasPendingShadowBackfill(projectIdentity?: string): boolean {
+    if (projectIdentity === undefined) return pendingShadowBackfills.size > 0;
+    const scopes = pendingShadowBackfills.get(projectIdentity);
+    return scopes !== undefined && scopes.size > 0;
+}
+
+/**
+ * Refill the shadow queue from pending historical backfills. Called by the
+ * worker whenever the live queue runs dry: for each pending (project, scope) it
+ * enqueues one bounded chunk of the missing set. A scope is retired when its
+ * missing set is empty, or when the same id set comes back twice in a row (no
+ * write landed — see shadowBackfillLastIds), so a failing provider can never
+ * spin the worker forever.
+ */
+function pumpShadowBackfill(): void {
+    for (const [projectIdentity, scopes] of pendingShadowBackfills) {
+        const db = dbForShadowQueue.get(projectIdentity);
+        const shadow = shadowRegistrations.get(projectIdentity);
+        const primary = projectRegistrations.get(projectIdentity);
+        if (!db || !shadow || !primary) {
+            pendingShadowBackfills.delete(projectIdentity);
+            continue;
+        }
+        for (const scope of [...scopes]) {
+            const primaryModelId = shadowModelIdForScope(primary, scope);
+            const shadowModelId = shadowModelIdForScope(shadow, scope);
+            const stallKey = `${projectIdentity}:${scope}`;
+            if (primaryModelId === "off" || shadowModelId === "off") {
+                scopes.delete(scope);
+                shadowBackfillLastIds.delete(stallKey);
+                continue;
+            }
+            const ids = shadowBackfillMissingIds(
+                db,
+                projectIdentity,
+                scope,
+                primaryModelId,
+                shadowModelId,
+                SHADOW_MAX_ITEMS_PER_TICK,
+            );
+            if (ids.length === 0) {
+                scopes.delete(scope);
+                shadowBackfillLastIds.delete(stallKey);
+                continue;
+            }
+            const signature = ids.join(",");
+            if (shadowBackfillLastIds.get(stallKey) === signature) {
+                // No progress since the last pump for this scope; stop retrying.
+                scopes.delete(scope);
+                shadowBackfillLastIds.delete(stallKey);
+                continue;
+            }
+            shadowBackfillLastIds.set(stallKey, signature);
+            shadowQueue.push({ projectIdentity, scope, ids });
+        }
+        if (scopes.size === 0) pendingShadowBackfills.delete(projectIdentity);
+    }
+}
+
+/**
+ * Detect whether a freshly registered shadow identity owes a historical
+ * backfill and arm it. Runs whenever a NEW shadow identity lands — either a
+ * rotation (prior identity differed) or a first/again registration whose corpus
+ * already has primary rows but no shadow rows under the current identity (the
+ * rotation-while-down case). Cheap: a LIMIT-1 probe per scope; the actual
+ * embedding happens asynchronously in the bounded shadow worker, so this never
+ * blocks registration. Gated on the untrusted-config latch so a degraded load
+ * can never enqueue shadow work off a config we don't trust.
+ */
+function maybeArmShadowBackfill(
+    db: Database,
+    projectIdentity: string,
+    shadow: ShadowEmbeddingRegistration,
+): void {
+    if (untrustedLoadProjects.has(projectIdentity)) return;
+    const primary = projectRegistrations.get(projectIdentity);
+    if (!primary) return; // No primary cohort to mirror yet.
+    const pending = new Set<ShadowScope>();
+    for (const scope of ["memory", "commit", "chunk"] as const) {
+        const primaryModelId = shadowModelIdForScope(primary, scope);
+        const shadowModelId = shadowModelIdForScope(shadow, scope);
+        if (primaryModelId === "off" || shadowModelId === "off") continue;
+        const probe = shadowBackfillMissingIds(
+            db,
+            projectIdentity,
+            scope,
+            primaryModelId,
+            shadowModelId,
+            1,
+        );
+        if (probe.length > 0) pending.add(scope);
+    }
+    if (pending.size === 0) return;
+    pendingShadowBackfills.set(projectIdentity, pending);
+    pumpShadowBackfill();
+    startShadowWorker();
+}
+
+/** Outstanding shadow-backfill rows per scope, for progress/status reporting. */
+export function getShadowBackfillRemaining(
+    db: Database,
+    projectIdentity: string,
+): { memory: number; commit: number; chunk: number } {
+    const remaining = { memory: 0, commit: 0, chunk: 0 };
+    const primary = projectRegistrations.get(projectIdentity);
+    const shadow = shadowRegistrations.get(projectIdentity);
+    if (!primary || !shadow) return remaining;
+    for (const scope of ["memory", "commit", "chunk"] as const) {
+        const primaryModelId = shadowModelIdForScope(primary, scope);
+        const shadowModelId = shadowModelIdForScope(shadow, scope);
+        if (primaryModelId === "off" || shadowModelId === "off") continue;
+        remaining[scope] = countShadowBackfillMissing(
+            db,
+            projectIdentity,
+            scope,
+            primaryModelId,
+            shadowModelId,
+        );
+    }
+    return remaining;
+}
+
+/**
+ * Drain the shadow queue and any pending historical backfills to completion.
+ * Used by tests and the manual backfill script; the running plugin never calls
+ * this (it relies on the self-restarting bounded worker). `onSettled` fires
+ * after each bounded worker pass so callers can report progress.
+ */
+export async function flushShadowEmbeddingBacklog(
+    projectIdentity?: string,
+    onSettled?: () => void | Promise<void>,
+): Promise<void> {
+    if (shadowQueue.length > 0 || hasPendingShadowBackfill(projectIdentity)) {
+        startShadowWorker();
+    }
+    for (;;) {
+        const worker = shadowWorker;
+        if (worker) {
+            await worker;
+            await onSettled?.();
+            continue;
+        }
+        if (shadowQueue.length === 0 && !hasPendingShadowBackfill(projectIdentity)) return;
+        // Work remains but no worker is running (e.g. a fresh backfill was armed
+        // without a queue push); nudge it forward.
+        startShadowWorker();
+        if (!shadowWorker) await new Promise((resolve) => setTimeout(resolve, 10));
+        await onSettled?.();
+    }
 }
 
 async function embedShadowItems(
@@ -1335,11 +1605,19 @@ async function runShadowWorker(): Promise<void> {
     const startedAt = Date.now();
     let processed = 0;
     let processedBytes = 0;
-    while (
-        shadowQueue.length > 0 &&
-        processed < SHADOW_MAX_ITEMS_PER_TICK &&
-        Date.now() - startedAt < SHADOW_MAX_WALL_CLOCK_MS
-    ) {
+    for (;;) {
+        if (shadowQueue.length === 0) {
+            // Live mirror writes are drained; top up from any pending historical
+            // backfill before idling so a rotation backlog drains incrementally.
+            pumpShadowBackfill();
+            if (shadowQueue.length === 0) break;
+        }
+        if (
+            processed >= SHADOW_MAX_ITEMS_PER_TICK ||
+            Date.now() - startedAt >= SHADOW_MAX_WALL_CLOCK_MS
+        ) {
+            break;
+        }
         const item = shadowQueue.shift();
         if (!item) break;
         const itemBytes = item.ids.reduce((total, id) => total + id.length, 0);
@@ -2431,6 +2709,8 @@ export function _resetProjectEmbeddingRegistryForTests(): void {
     projectRegistrations.clear();
     shadowRegistrations.clear();
     shadowQueue.length = 0;
+    pendingShadowBackfills.clear();
+    shadowBackfillLastIds.clear();
     dbForShadowQueue.clear();
     untrustedLoadProjects.clear();
     globalRegistrationGeneration = 0;
