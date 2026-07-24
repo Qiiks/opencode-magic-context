@@ -50,6 +50,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use mc_store::MEMORY_VISIBILITY_MUTATION_CATEGORY;
 use tokio::sync::Notify;
 
 use chrono::{Local, TimeZone};
@@ -1427,6 +1428,8 @@ impl ModuleMemoryWire {
 
 impl ModuleMemoryMutationWire {
     fn into_row(self, project_path: String) -> ModuleMemoryMutationRow {
+        let visibility_changed =
+            self.category.as_deref() == Some(MEMORY_VISIBILITY_MUTATION_CATEGORY);
         ModuleMemoryMutationRow {
             project_path,
             mutation: StoredMemoryMutation {
@@ -1436,6 +1439,7 @@ impl ModuleMemoryMutationWire {
                 superseded_by_id: self.superseded_by_id,
                 category: self.category,
                 new_content: self.new_content,
+                visibility_changed,
                 queued_at: self.queued_at,
             },
         }

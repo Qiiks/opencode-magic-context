@@ -168,7 +168,7 @@ pub fn m1_revision_signal_parts_for_pass_timed(
     session_id: &str,
     user_profile_version: u64,
     memory_enabled: bool,
-    _now_ms: i64,
+    now_ms: i64,
     timings: Option<&mut M1RevisionReadTimings>,
 ) -> Result<M1RevisionSignal, McStoreError> {
     let snapshot_started_at = Instant::now();
@@ -177,6 +177,7 @@ pub fn m1_revision_signal_parts_for_pass_timed(
         note_project_path,
         session_id,
         memory_enabled,
+        now_ms,
     )?;
     let snapshot_ms = snapshot_started_at.elapsed().as_secs_f64() * 1_000.0;
     if let Some(timings) = timings {
@@ -341,44 +342,55 @@ pub fn compose_m1_from_store(
             .unwrap_or_else(|| vec![project_path.to_string()]);
 
         // --- memory-updates (corrections to in-m0 memories, past the cursor) ---
-        let mutations = store.memory_mutations_for_render(
+        // The store also returns visibility-transition markers for rows omitted from m0 and
+        // resolves supersede chains to their terminal target.
+        let pending_mutations = store.memory_mutations_for_render(
             &paths,
             meta.memory_mutation_cursor,
             &meta.rendered_memory_ids,
         )?;
         let baseline_ids: HashSet<i64> = meta.rendered_memory_ids.iter().copied().collect();
 
-        // Read through m0's visibility, lifecycle, and frozen-expiry predicates. A merge target
-        // may predate the folded max-memory watermark, so additions alone cannot discover it.
+        // Read through the exact m0 visibility, lifecycle, and frozen-expiry predicate. Existing
+        // merge targets and newly-visible rows may be below the folded numeric watermark.
         let eligible_memories =
             load_render_eligible_memories(store, membership.as_ref(), project_path, now_ms)?;
         let eligible_ids: HashSet<i64> = eligible_memories.iter().map(|memory| memory.id).collect();
-        let mut replacement_ids = mutations
+        let mut forced_ids = pending_mutations
             .iter()
-            .filter(|mutation| mutation.mutation_type == "superseded")
-            .filter_map(|mutation| mutation.superseded_by_id)
+            .filter_map(|mutation| {
+                if mutation.mutation_type == "superseded" {
+                    mutation.superseded_by_id
+                } else if mutation.visibility_changed
+                    && !baseline_ids.contains(&mutation.target_memory_id)
+                {
+                    Some(mutation.target_memory_id)
+                } else {
+                    None
+                }
+            })
             .filter(|id| !baseline_ids.contains(id) && eligible_ids.contains(id))
             .collect::<Vec<_>>();
-        replacement_ids.sort_unstable();
-        replacement_ids.dedup();
-        if replacement_ids.len() > MAX_MERGE_REPLACEMENTS_PER_DELTA {
+        forced_ids.sort_unstable();
+        forced_ids.dedup();
+        if forced_ids.len() > MAX_MERGE_REPLACEMENTS_PER_DELTA {
             eprintln!(
-                "mc-module: m1 merge replacement cap exceeded session={} replacements={} cap={}",
+                "mc-module: m1 forced-memory cap exceeded session={} memories={} cap={}",
                 session_id,
-                replacement_ids.len(),
+                forced_ids.len(),
                 MAX_MERGE_REPLACEMENTS_PER_DELTA
             );
-            replacement_ids.truncate(MAX_MERGE_REPLACEMENTS_PER_DELTA);
+            forced_ids.truncate(MAX_MERGE_REPLACEMENTS_PER_DELTA);
         }
-        let replacement_ids: HashSet<i64> = replacement_ids.into_iter().collect();
+        let forced_ids: HashSet<i64> = forced_ids.into_iter().collect();
 
-        // Additions keep the 25% sub-budget. Merge replacements are corrections to baseline
-        // facts and ride outside it so a source cannot become a removal-only delta solely
-        // because its existing target was budget-trimmed from m0.
+        // Numeric additions are limited to 25% of the m1 memory budget. Terminal merge
+        // replacements and visibility grants correct the rendered baseline, so they are emitted
+        // outside that additive limit and only once.
         let additive_candidates = eligible_memories
             .iter()
             .filter(|memory| memory.id > meta.max_memory_id)
-            .filter(|memory| !replacement_ids.contains(&memory.id))
+            .filter(|memory| !forced_ids.contains(&memory.id))
             .cloned()
             .collect();
         let source_name_by_id = membership
@@ -394,12 +406,34 @@ pub fn compose_m1_from_store(
         );
         delta_memories.extend(
             eligible_memories
-                .into_iter()
-                .filter(|memory| replacement_ids.contains(&memory.id)),
+                .iter()
+                .filter(|memory| forced_ids.contains(&memory.id))
+                .cloned(),
         );
 
-        let mut resolvable_ids = baseline_ids;
+        let mut resolvable_ids: HashSet<i64> =
+            baseline_ids.intersection(&eligible_ids).copied().collect();
         resolvable_ids.extend(delta_memories.iter().map(|memory| memory.id));
+        let mutations = pending_mutations
+            .into_iter()
+            .filter_map(|mut mutation| {
+                if !baseline_ids.contains(&mutation.target_memory_id) {
+                    return None;
+                }
+                if mutation.mutation_type == "superseded" {
+                    return Some(mutation);
+                }
+                if !eligible_ids.contains(&mutation.target_memory_id) {
+                    mutation.mutation_type = "delete".to_string();
+                    mutation.new_content = None;
+                    return Some(mutation);
+                }
+                if mutation.visibility_changed && mutation.new_content.is_none() {
+                    return None;
+                }
+                Some(mutation)
+            })
+            .collect::<Vec<_>>();
         let memory_updates_block = render_memory_updates(&mutations, &resolvable_ids);
         let new_memories_block =
             render_memory_block(&delta_memories, "new-memories", &source_name_by_id);
@@ -1020,6 +1054,324 @@ mod tests {
                 .contains(&format!("<superseded id=\"{source}\" by=\"{target}\"/>")),
             "{}",
             m1.body
+        );
+    }
+
+    #[test]
+    fn workspace_replacement_chain_crosses_an_invisible_intermediate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let own = "git:workspace-chain-own";
+        let foreign = "git:workspace-chain-foreign";
+        store
+            .seed_workspace_member("workspace-chain", own, "[\"CONSTRAINTS\"]")
+            .unwrap();
+        store
+            .seed_workspace_member("workspace-chain", foreign, "[\"CONSTRAINTS\"]")
+            .unwrap();
+        let source = store
+            .insert_memory(insert_input(
+                foreign,
+                "CONSTRAINTS",
+                "foreign chain source",
+                1,
+            ))
+            .unwrap();
+        let middle = store
+            .insert_memory(insert_input(
+                foreign,
+                "CONSTRAINTS",
+                "foreign private middle",
+                1,
+            ))
+            .unwrap();
+        let terminal = store
+            .insert_memory(insert_input(foreign, "CONSTRAINTS", "foreign terminal", 1))
+            .unwrap();
+        store
+            .set_memory_sharing_for_test(source, "project", true)
+            .unwrap();
+        store
+            .set_memory_sharing_for_test(terminal, "project", true)
+            .unwrap();
+        let membership = store.resolve_workspace_membership(own).unwrap().unwrap();
+        let baseline = store
+            .load_memory_render_snapshot(own, Some(&membership), 0)
+            .unwrap();
+        let cursor = baseline.revision.mutation_cursor;
+        store
+            .merge_memories(foreign, middle, &[source], "foreign middle merged", 2)
+            .unwrap();
+        store
+            .merge_memories(foreign, terminal, &[middle], "foreign terminal merged", 3)
+            .unwrap();
+        store
+            .set_memory_sharing_for_test(terminal, "project", true)
+            .unwrap();
+
+        let m1 = compose_m1_from_store(
+            &store,
+            own,
+            own,
+            "ses",
+            &meta_after_hard(0, None, terminal, cursor, vec![source]),
+            0,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+        assert!(
+            m1.body
+                .contains(&format!("<superseded id=\"{source}\" by=\"{terminal}\"/>")),
+            "{}",
+            m1.body
+        );
+        assert!(m1.body.contains("foreign terminal merged"), "{}", m1.body);
+        assert!(!m1.body.contains("foreign middle merged"), "{}", m1.body);
+    }
+
+    #[test]
+    fn replacement_chains_resolve_to_terminal_and_cycles_degrade_to_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:replacement-chain";
+        let source = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "chain source", 1))
+            .unwrap();
+        let middle = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "chain middle", 1))
+            .unwrap();
+        let terminal = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "chain terminal", 1))
+            .unwrap();
+        let folded_cursor = store
+            .max_memory_mutation_id(&[project.to_string()])
+            .unwrap();
+        store
+            .merge_memories(project, middle, &[source], "middle merged", 2)
+            .unwrap();
+        store
+            .merge_memories(project, terminal, &[middle], "terminal merged", 3)
+            .unwrap();
+        let chain = compose_m1_from_store(
+            &store,
+            project,
+            project,
+            "ses",
+            &meta_after_hard(0, None, terminal, folded_cursor, vec![source]),
+            0,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+        assert!(
+            chain
+                .body
+                .contains(&format!("<superseded id=\"{source}\" by=\"{terminal}\"/>")),
+            "{}",
+            chain.body
+        );
+        assert_eq!(chain.body.matches("terminal merged").count(), 1);
+        assert!(!chain.body.contains("middle merged"), "{}", chain.body);
+
+        let cycle_dir = tempfile::tempdir().unwrap();
+        let cycle_store = McStore::open(&descriptor(cycle_dir.path())).unwrap();
+        let cycle_source = cycle_store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "cycle source", 1))
+            .unwrap();
+        let cycle_target = cycle_store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "cycle target", 1))
+            .unwrap();
+        cycle_store
+            .seed_superseded_mutation(project, cycle_source, cycle_target)
+            .unwrap();
+        cycle_store
+            .seed_superseded_mutation(project, cycle_target, cycle_source)
+            .unwrap();
+        let cycle = compose_m1_from_store(
+            &cycle_store,
+            project,
+            project,
+            "ses",
+            &meta_after_hard(0, None, cycle_target, 0, vec![cycle_source]),
+            0,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+        assert!(
+            cycle
+                .body
+                .contains(&format!("<removed id=\"{cycle_source}\"/>")),
+            "{}",
+            cycle.body
+        );
+        assert!(!cycle.body.contains("<superseded"), "{}", cycle.body);
+    }
+
+    #[test]
+    fn archived_replacement_terminal_degrades_source_to_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:archived-terminal";
+        let source = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "source", 1))
+            .unwrap();
+        let target = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "target", 1))
+            .unwrap();
+        let cursor = store
+            .max_memory_mutation_id(&[project.to_string()])
+            .unwrap();
+        store
+            .merge_memories(project, target, &[source], "merged target", 2)
+            .unwrap();
+        store.archive_memory(project, target, None, 3).unwrap();
+        let m1 = compose_m1_from_store(
+            &store,
+            project,
+            project,
+            "ses",
+            &meta_after_hard(0, None, target, cursor, vec![source]),
+            0,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+        assert!(
+            m1.body.contains(&format!("<removed id=\"{source}\"/>")),
+            "{}",
+            m1.body
+        );
+        assert!(!m1.body.contains("merged target"), "{}", m1.body);
+    }
+
+    #[test]
+    fn classification_visibility_grant_and_revoke_render_on_m1() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let own = "git:visibility-own";
+        let foreign = "git:visibility-foreign";
+        store
+            .seed_workspace_member("visibility-ws", own, "[\"CONSTRAINTS\"]")
+            .unwrap();
+        store
+            .seed_workspace_member("visibility-ws", foreign, "[\"CONSTRAINTS\"]")
+            .unwrap();
+        let foreign_id = store
+            .insert_memory(insert_input(foreign, "CONSTRAINTS", "foreign below max", 1))
+            .unwrap();
+        let own_id = store
+            .insert_memory(insert_input(own, "ARCHITECTURE", "own high watermark", 1))
+            .unwrap();
+        store
+            .seed_module_memory_authority_for_test("store-uuid", foreign, 5)
+            .unwrap();
+        let membership = store.resolve_workspace_membership(own).unwrap().unwrap();
+        let baseline = store
+            .load_memory_render_snapshot(own, Some(&membership), 100)
+            .unwrap();
+        assert_eq!(baseline.revision.max_memory_id, own_id);
+        assert_eq!(
+            baseline
+                .memories
+                .iter()
+                .map(|memory| memory.id)
+                .collect::<Vec<_>>(),
+            vec![own_id]
+        );
+        let content_hash = store
+            .get_memory_full(foreign_id)
+            .unwrap()
+            .unwrap()
+            .normalized_hash;
+        store
+            .set_memory_classification(
+                "store-uuid",
+                foreign,
+                5,
+                &[mc_store::ClassificationUpdate {
+                    memory_id: foreign_id,
+                    content_hash_at_prompt: content_hash.clone(),
+                    importance: None,
+                    scope: Some("project".to_string()),
+                    shareable: Some(true),
+                }],
+                101,
+            )
+            .unwrap();
+        let grant_cursor = store
+            .max_memory_mutation_id(&membership.union_identities)
+            .unwrap();
+        let grant = compose_m1_from_store(
+            &store,
+            own,
+            own,
+            "ses",
+            &meta_after_hard(0, None, own_id, 0, vec![own_id]),
+            100,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+        assert!(grant.body.contains("foreign below max"), "{}", grant.body);
+        assert_eq!(grant.body.matches("foreign below max").count(), 1);
+
+        store
+            .set_memory_classification(
+                "store-uuid",
+                foreign,
+                5,
+                &[mc_store::ClassificationUpdate {
+                    memory_id: foreign_id,
+                    content_hash_at_prompt: content_hash,
+                    importance: None,
+                    scope: None,
+                    shareable: Some(false),
+                }],
+                102,
+            )
+            .unwrap();
+        let revoke = compose_m1_from_store(
+            &store,
+            own,
+            own,
+            "ses",
+            &meta_after_hard(0, None, own_id, grant_cursor, vec![foreign_id, own_id]),
+            100,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+        assert!(
+            revoke
+                .body
+                .contains(&format!("<removed id=\"{foreign_id}\"/>")),
+            "{}",
+            revoke.body
+        );
+        assert!(
+            !revoke.body.contains("foreign below max"),
+            "{}",
+            revoke.body
         );
     }
 

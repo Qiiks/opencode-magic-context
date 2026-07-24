@@ -50,6 +50,10 @@ pub fn canonical_root(path: impl AsRef<Path>) -> PathBuf {
 /// The plugin mirrors this literal to keep cache visibility and workspace policy aligned.
 pub const FOREIGN_VISIBLE_SQL: &str = "status IN ('active','permanent') AND (expires_at IS NULL OR expires_at > :now_ms) AND shareable = 1 AND scope IN ('project','ecosystem','universe') AND category IN (SELECT value FROM json_each(:share_categories)) AND project_path IN (SELECT project_path FROM mc_workspace_members WHERE workspace_id = :workspace_id) AND project_path <> :reader_project";
 
+/// Internal mutation category used to carry foreign-visibility transitions across state sync.
+pub const MEMORY_VISIBILITY_MUTATION_CATEGORY: &str = "__mc_visibility__";
+const MAX_MEMORY_REPLACEMENT_DEPTH: usize = 8;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2240,6 +2244,9 @@ pub struct StoredMemoryMutation {
     pub superseded_by_id: Option<i64>,
     pub category: Option<String>,
     pub new_content: Option<String>,
+    /// True when at least one coalesced row records a foreign-visibility transition.
+    /// The marker is derived from the internal mutation category and is not persisted separately.
+    pub visibility_changed: bool,
     pub queued_at: i64,
 }
 
@@ -3207,6 +3214,8 @@ pub struct StoredCompartment {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemoryRevision {
     pub project_paths: Vec<String>,
+    pub reader_project_path: String,
+    pub expiry_cutoff_ms: i64,
     pub max_memory_id: i64,
     pub mutation_cursor: i64,
 }
@@ -7153,9 +7162,10 @@ impl McStore {
     }
 
     /// Apply classifier metadata under the memories authority, updating each row only when its
-    /// content hash still matches the supplied hash. Classification does not append to the
-    /// mutation log because importance, scope, and shareability are cache-neutral metadata;
-    /// the feed trigger still mirrors the full updated row for module-owned consumers.
+    /// content hash still matches the supplied hash. Importance and classification writes that
+    /// keep foreign visibility unchanged remain mutation-neutral. A visibility grant/revocation
+    /// appends an internal correction marker in this same transaction so m1 can reconcile the row
+    /// without waiting for a HARD fold.
     pub fn set_memory_classification(
         &self,
         context_store_uuid: &str,
@@ -7187,6 +7197,7 @@ impl McStore {
                 ));
             }
 
+            let membership = workspace_membership_from_connection(tx, project)?;
             let mut accepted = Vec::new();
             let mut rejected = Vec::new();
             for update in rows {
@@ -7220,6 +7231,20 @@ impl McStore {
                         continue;
                     }
                 }
+                let visibility_before = memory_foreign_visibility_outcome(
+                    &memory,
+                    membership.as_ref(),
+                    now_ms,
+                    None,
+                    None,
+                );
+                let visibility_after = memory_foreign_visibility_outcome(
+                    &memory,
+                    membership.as_ref(),
+                    now_ms,
+                    update.scope.as_deref(),
+                    update.shareable,
+                );
                 let mut assignments = Vec::new();
                 let mut values: Vec<rusqlite::types::Value> = Vec::new();
                 if let Some(importance) = update.importance {
@@ -7248,6 +7273,20 @@ impl McStore {
                     assignments.join(", ")
                 );
                 tx.execute(&sql, rusqlite::params_from_iter(values.iter()))?;
+                if visibility_before != visibility_after {
+                    append_memory_mutation_tx(
+                        tx,
+                        MemoryMutationAppend {
+                            project_path: &memory.project_path,
+                            mutation_type: "update",
+                            target_memory_id: memory.id,
+                            superseded_by_id: None,
+                            category: Some(MEMORY_VISIBILITY_MUTATION_CATEGORY),
+                            new_content: None,
+                            queued_at: now_ms,
+                        },
+                    )?;
+                }
                 accepted.push(update.memory_id);
             }
             Ok(ClassificationTxnOutcome::Applied(
@@ -7711,11 +7750,34 @@ impl McStore {
                 let placeholders = std::iter::repeat_n("?", revision.project_paths.len())
                     .collect::<Vec<_>>()
                     .join(", ");
-                let current_memory: i64 = tx.query_row(
-                    &format!("SELECT COALESCE(MAX(id), 0) FROM mc_memories WHERE project_path IN ({placeholders})"),
-                    rusqlite::params_from_iter(revision.project_paths.iter()),
-                    |row| row.get(0),
-                )?;
+                let current_memory: i64 = if revision.reader_project_path.is_empty() {
+                    tx.query_row(
+                        &format!(
+                            "SELECT COALESCE(MAX(id), 0) FROM mc_memories \
+                             WHERE project_path IN ({placeholders})"
+                        ),
+                        rusqlite::params_from_iter(revision.project_paths.iter()),
+                        |row| row.get(0),
+                    )?
+                } else {
+                    let membership = workspace_membership_from_connection(
+                        tx,
+                        &revision.reader_project_path,
+                    )?;
+                    let (pool_filter, pool_binds) = memory_render_pool_filter_for_column(
+                        membership.as_ref(),
+                        &revision.reader_project_path,
+                        "project_path",
+                        revision.expiry_cutoff_ms,
+                    );
+                    tx.query_row(
+                        &format!(
+                            "SELECT COALESCE(MAX(id), 0) FROM mc_memories WHERE {pool_filter}"
+                        ),
+                        rusqlite::params_from_iter(pool_binds.iter()),
+                        |row| row.get(0),
+                    )?
+                };
                 let current_mutation: i64 = tx.query_row(
                     &format!("SELECT COALESCE(MAX(id), 0) FROM mc_memory_mutation_log WHERE project_path IN ({placeholders})"),
                     rusqlite::params_from_iter(revision.project_paths.iter()),
@@ -8437,14 +8499,15 @@ impl McStore {
     }
 
     /// Read the membership and all m1 revision watermarks from one SQLite read transaction.
-    /// Memory watermarks cover the same workspace union used by render, while note and
-    /// compartment watermarks retain their existing project/session scopes.
+    /// The memory-id watermark uses the same visible render-pool predicate as m0 and m1
+    /// additions at `now_ms`; note and compartment watermarks retain their existing scopes.
     pub fn load_m1_revision_snapshot(
         &self,
         project_path: &str,
         note_project_path: &str,
         session_id: &str,
         memory_enabled: bool,
+        now_ms: i64,
     ) -> Result<M1RevisionSnapshot, McStoreError> {
         self.inner
             .with_conn(|conn| {
@@ -8462,24 +8525,29 @@ impl McStore {
                 let (max_memory_id, max_memory_mutation_id) = if project_paths.is_empty() {
                     (0, 0)
                 } else {
-                    let mut projects = project_paths;
+                    let (pool_filter, pool_binds) = memory_render_pool_filter_for_column(
+                        membership.as_ref(),
+                        project_path,
+                        "project_path",
+                        now_ms,
+                    );
+                    let max_memory_id = transaction.query_row(
+                        &format!(
+                            "SELECT COALESCE(MAX(id), 0) FROM mc_memories WHERE {pool_filter}"
+                        ),
+                        rusqlite::params_from_iter(pool_binds.iter()),
+                        |row| row.get(0),
+                    )?;
+                    let mut projects = project_paths.clone();
                     projects.sort_unstable();
                     projects.dedup();
                     let placeholders = std::iter::repeat_n("?", projects.len())
                         .collect::<Vec<_>>()
                         .join(", ");
-                    let max_memory_id = transaction.query_row(
-                        &format!(
-                            "SELECT COALESCE(MAX(id), 0) FROM mc_memories
-                          WHERE project_path IN ({placeholders})"
-                        ),
-                        rusqlite::params_from_iter(projects.iter()),
-                        |row| row.get(0),
-                    )?;
                     let max_memory_mutation_id = transaction.query_row(
                         &format!(
                             "SELECT COALESCE(MAX(id), 0) FROM mc_memory_mutation_log
-                          WHERE project_path IN ({placeholders})"
+                              WHERE project_path IN ({placeholders})"
                         ),
                         rusqlite::params_from_iter(projects.iter()),
                         |row| row.get(0),
@@ -9996,38 +10064,24 @@ impl McStore {
         Ok(rows)
     }
 
-    /// The coalesced memory corrections to render as the delta, across one OR MORE
-    /// project identities (the workspace union — a single-project session passes a
-    /// 1-element slice). Mutation-log rows with `id > after_id`, from any of
-    /// `project_paths`, whose `target_memory_id` is in `rendered_memory_ids` (the exact
-    /// set of memories included in the last rendered baseline). The manifest membership
-    /// IS the share filter: a foreign non-shared memory never entered the baseline, so
-    /// it's not in `rendered_memory_ids`, so its mutation can't supersede here — no extra
-    /// category check needed. The manifest test (NOT an `id <= last_id` test) is required
-    /// because budget-trim can drop a low-importance in-range memory.
+    /// The coalesced memory corrections to render as the delta across the workspace union.
+    /// Baseline targets are always loaded. Visibility-transition markers are also loaded even
+    /// when their target was absent from m0, allowing grants below the numeric watermark to ride
+    /// m1 as additions and revocations to become removals.
     ///
-    /// Coalesced to ONE correction per target, deterministic latest-wins with terminal
-    /// precedence: a terminal mutation (archive/delete/superseded) always outranks a
-    /// later `update`, so an update queued after an archive can't resurrect a memory that
-    /// already left the set. Sorted by id for a stable render order. Coalescing by
-    /// target_id is union-safe (a memory id is unique across the store).
+    /// Supersede targets are followed through post-cursor mutations for at most eight edges.
+    /// The returned baseline mutation points directly at the terminal target; cycles and chains
+    /// beyond the cap degrade to an unresolved replacement. Coalescing retains terminal
+    /// precedence, so a later update never overwrites archive/delete/supersede.
     pub fn memory_mutations_for_render(
         &self,
         project_paths: &[String],
         after_id: i64,
         rendered_memory_ids: &[i64],
     ) -> Result<Vec<StoredMemoryMutation>, McStoreError> {
-        if rendered_memory_ids.is_empty() || project_paths.is_empty() {
+        if project_paths.is_empty() {
             return Ok(Vec::new());
         }
-        // dedup + sort the id set for a stable IN-clause.
-        let mut ids: Vec<i64> = rendered_memory_ids.to_vec();
-        ids.sort_unstable();
-        ids.dedup();
-        let id_ph = std::iter::repeat_n("?", ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        // dedup the project identities for a stable IN-clause.
         let mut projects: Vec<String> = project_paths.to_vec();
         projects.sort_unstable();
         projects.dedup();
@@ -10036,38 +10090,144 @@ impl McStore {
             .join(", ");
 
         let rows = self.inner.with_conn(|conn| {
-            let sql = format!(
-                "SELECT id, mutation_type, target_memory_id, superseded_by_id, category,
-                        new_content, queued_at
-                 FROM mc_memory_mutation_log
-                 WHERE project_path IN ({proj_ph}) AND id > ? AND target_memory_id IN ({id_ph})
-                 ORDER BY id ASC"
+            let tx = conn.unchecked_transaction()?;
+            let mut requested: BTreeSet<i64> = rendered_memory_ids.iter().copied().collect();
+            let visibility_sql = format!(
+                "SELECT DISTINCT target_memory_id
+                   FROM mc_memory_mutation_log
+                  WHERE project_path IN ({proj_ph}) AND id > ?
+                    AND category = ?"
             );
-            let mut stmt = conn.prepare(&sql)?;
-            // bind: the project set, then after_id, then the id set (matching SQL order).
-            let mut binds: Vec<rusqlite::types::Value> = projects
+            let mut visibility_binds: Vec<rusqlite::types::Value> = projects
                 .iter()
-                .map(|p| rusqlite::types::Value::from(p.clone()))
+                .map(|project| rusqlite::types::Value::from(project.clone()))
                 .collect();
-            binds.push(rusqlite::types::Value::from(after_id));
-            binds.extend(ids.iter().map(|&i| rusqlite::types::Value::from(i)));
-            let mapped = stmt
-                .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
-                    Ok(StoredMemoryMutation {
-                        id: r.get(0)?,
-                        mutation_type: r.get(1)?,
-                        target_memory_id: r.get(2)?,
-                        superseded_by_id: r.get(3)?,
-                        category: r.get(4)?,
-                        new_content: r.get(5)?,
-                        queued_at: r.get(6)?,
-                    })
+            visibility_binds.push(rusqlite::types::Value::from(after_id));
+            visibility_binds.push(rusqlite::types::Value::from(
+                MEMORY_VISIBILITY_MUTATION_CATEGORY.to_string(),
+            ));
+            let mut visibility_stmt = tx.prepare(&visibility_sql)?;
+            let visibility_targets = visibility_stmt
+                .query_map(rusqlite::params_from_iter(visibility_binds.iter()), |row| {
+                    row.get::<_, i64>(0)
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(mapped)
+            drop(visibility_stmt);
+            requested.extend(visibility_targets);
+            if requested.is_empty() {
+                tx.commit()?;
+                return Ok(Vec::new());
+            }
+
+            let mut queried = HashSet::new();
+            let mut frontier: Vec<i64> = requested.iter().copied().collect();
+            let mut loaded = Vec::new();
+            for _ in 0..=MAX_MEMORY_REPLACEMENT_DEPTH {
+                frontier.retain(|target| queried.insert(*target));
+                if frontier.is_empty() {
+                    break;
+                }
+                frontier.sort_unstable();
+                let target_ph = std::iter::repeat_n("?", frontier.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT id, mutation_type, target_memory_id, superseded_by_id, category,
+                            new_content, queued_at
+                       FROM mc_memory_mutation_log
+                      WHERE project_path IN ({proj_ph}) AND id > ?
+                        AND target_memory_id IN ({target_ph})
+                      ORDER BY id ASC"
+                );
+                let mut binds: Vec<rusqlite::types::Value> = projects
+                    .iter()
+                    .map(|project| rusqlite::types::Value::from(project.clone()))
+                    .collect();
+                binds.push(rusqlite::types::Value::from(after_id));
+                binds.extend(
+                    frontier
+                        .iter()
+                        .map(|target| rusqlite::types::Value::from(*target)),
+                );
+                let mut stmt = tx.prepare(&sql)?;
+                let batch = stmt
+                    .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                        let category: Option<String> = row.get(4)?;
+                        let visibility_changed =
+                            category.as_deref() == Some(MEMORY_VISIBILITY_MUTATION_CATEGORY);
+                        Ok(StoredMemoryMutation {
+                            id: row.get(0)?,
+                            mutation_type: row.get(1)?,
+                            target_memory_id: row.get(2)?,
+                            superseded_by_id: row.get(3)?,
+                            category,
+                            new_content: row.get(5)?,
+                            visibility_changed,
+                            queued_at: row.get(6)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(stmt);
+                frontier = coalesce_mutations(batch.clone())
+                    .into_iter()
+                    .filter(|mutation| mutation.mutation_type == "superseded")
+                    .filter_map(|mutation| mutation.superseded_by_id)
+                    .collect();
+                loaded.extend(batch);
+            }
+            tx.commit()?;
+            Ok(loaded)
         })?;
 
-        Ok(coalesce_mutations(rows))
+        use std::collections::HashMap;
+        let by_target: HashMap<i64, StoredMemoryMutation> = coalesce_mutations(rows)
+            .into_iter()
+            .map(|mutation| (mutation.target_memory_id, mutation))
+            .collect();
+        let mut resolved = Vec::new();
+        for target in rendered_memory_ids
+            .iter()
+            .copied()
+            .chain(
+                by_target
+                    .values()
+                    .filter(|mutation| mutation.visibility_changed)
+                    .map(|mutation| mutation.target_memory_id),
+            )
+            .collect::<BTreeSet<_>>()
+        {
+            let Some(mut mutation) = by_target.get(&target).cloned() else {
+                continue;
+            };
+            if mutation.mutation_type == "superseded" {
+                let mut terminal = mutation.superseded_by_id;
+                let mut visited = HashSet::from([target]);
+                let mut depth = 0usize;
+                while let Some(replacement_id) = terminal {
+                    if !visited.insert(replacement_id) {
+                        terminal = None;
+                        break;
+                    }
+                    let Some(next) = by_target.get(&replacement_id) else {
+                        break;
+                    };
+                    if next.mutation_type != "superseded" {
+                        break;
+                    }
+                    if depth >= MAX_MEMORY_REPLACEMENT_DEPTH - 1 {
+                        terminal = None;
+                        break;
+                    }
+                    terminal = next.superseded_by_id;
+                    depth += 1;
+                }
+                mutation.superseded_by_id = terminal;
+            }
+            resolved.push(mutation);
+        }
+        resolved.sort_by_key(|mutation| mutation.id);
+        resolved.dedup_by_key(|mutation| mutation.target_memory_id);
+        Ok(resolved)
     }
 
     /// Resolve a project's workspace membership: the union of member identities it
@@ -10129,24 +10289,24 @@ impl McStore {
         }
         let path_column = "project_path";
         let table = "mc_memories";
-        let (sharing, binds) =
-            workspace_union_memory_visibility_filter_for_column(membership, path_column);
+        let (pool_filter, binds) = memory_render_pool_filter_for_column(
+            Some(membership),
+            &membership.own_identity,
+            path_column,
+            now_ms,
+        );
 
         let rows = self.inner.with_conn(|conn| {
             let sql = format!(
                 "SELECT id, {path_column}, category, content, importance, status, expires_at,
                         superseded_by_memory_id, updated_at
                    FROM {table}
-                  WHERE ({sharing})
-                    AND status IN ('active', 'permanent')
-                    AND (expires_at IS NULL OR expires_at > ?)
+                  WHERE {pool_filter}
                   ORDER BY COALESCE(importance, 50) DESC, id ASC"
             );
             let mut stmt = conn.prepare(&sql)?;
-            let mut all_binds = binds.clone();
-            all_binds.push(rusqlite::types::Value::from(now_ms));
             let mapped = stmt
-                .query_map(rusqlite::params_from_iter(all_binds.iter()), |r| {
+                .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
                     Ok(StoredMemory {
                         id: r.get(0)?,
                         project_path: r.get(1)?,
@@ -10180,21 +10340,19 @@ impl McStore {
         let mutation_table = "mc_memory_mutation_log";
         let snapshot = self.inner.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
-            let (visibility, mut binds) = if let Some(membership) = membership {
-                workspace_union_memory_visibility_filter_for_column(membership, path_column)
-            } else {
-                (format!("{path_column} = ?"), vec![rusqlite::types::Value::from(project_path.to_string())])
-            };
+            let (pool_filter, binds) = memory_render_pool_filter_for_column(
+                membership,
+                project_path,
+                path_column,
+                now_ms,
+            );
             let sql = format!(
                 "SELECT id, {path_column}, category, content, importance, status, expires_at,
                         superseded_by_memory_id, updated_at
                    FROM {table}
-                  WHERE ({visibility})
-                    AND status IN ('active', 'permanent')
-                    AND (expires_at IS NULL OR expires_at > ?)
+                  WHERE {pool_filter}
                   ORDER BY COALESCE(importance, 50) DESC, id ASC"
             );
-            binds.push(rusqlite::types::Value::from(now_ms));
             let mut stmt = tx.prepare(&sql)?;
             let memories = stmt
                 .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
@@ -10216,17 +10374,11 @@ impl McStore {
             let placeholders = std::iter::repeat_n("?", project_paths.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let max_memory_id = if project_paths.is_empty() {
-                0
-            } else {
-                tx.query_row(
-                    &format!(
-                        "SELECT COALESCE(MAX(id), 0) FROM {table} WHERE {path_column} IN ({placeholders})"
-                    ),
-                    rusqlite::params_from_iter(project_paths.iter()),
-                    |row| row.get(0),
-                )?
-            };
+            let max_memory_id = tx.query_row(
+                &format!("SELECT COALESCE(MAX(id), 0) FROM {table} WHERE {pool_filter}"),
+                rusqlite::params_from_iter(binds.iter()),
+                |row| row.get(0),
+            )?;
             let mutation_cursor = if project_paths.is_empty() {
                 0
             } else {
@@ -10243,6 +10395,8 @@ impl McStore {
                 memories,
                 revision: MemoryRevision {
                     project_paths: project_paths.clone(),
+                    reader_project_path: project_path.to_string(),
+                    expiry_cutoff_ms: now_ms,
                     max_memory_id,
                     mutation_cursor,
                 },
@@ -11585,6 +11739,47 @@ impl McStore {
                     (project_path, mutation_type, target_memory_id, new_content, queued_at)
                  VALUES (?1, ?2, ?3, ?4, 0)",
                 params![project_path, mutation_type, target_memory_id, new_content],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    pub fn seed_superseded_mutation(
+        &self,
+        project_path: &str,
+        target_memory_id: i64,
+        superseded_by_id: i64,
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            append_memory_mutation_tx(
+                tx,
+                MemoryMutationAppend {
+                    project_path,
+                    mutation_type: "superseded",
+                    target_memory_id,
+                    superseded_by_id: Some(superseded_by_id),
+                    category: None,
+                    new_content: None,
+                    queued_at: 0,
+                },
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    pub fn seed_module_memory_authority_for_test(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        generation: u64,
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT INTO mc_authority(context_store_uuid, project, domain, state, generation)
+                 VALUES (?1, ?2, 'memories', 'MODULE', ?3)",
+                params![context_store_uuid, project, generation],
             )?;
             Ok(())
         })?;
@@ -14052,6 +14247,32 @@ fn workspace_union_memory_visibility_filter(
     workspace_union_memory_visibility_filter_for_column(membership, "project_path")
 }
 
+fn memory_foreign_visibility_outcome(
+    memory: &StoredMemoryFull,
+    membership: Option<&WorkspaceMembership>,
+    now_ms: i64,
+    scope_override: Option<&str>,
+    shareable_override: Option<bool>,
+) -> bool {
+    let Some(membership) = membership else {
+        return false;
+    };
+    let has_foreign_reader = membership
+        .union_identities
+        .iter()
+        .any(|identity| identity != &memory.project_path);
+    let scope = scope_override.unwrap_or(&memory.scope);
+    let shareable = shareable_override.unwrap_or(memory.shareable != 0);
+    has_foreign_reader
+        && membership.share_categories.contains(&memory.category)
+        && matches!(memory.status.as_str(), "active" | "permanent")
+        && memory
+            .expires_at
+            .is_none_or(|expires_at| expires_at > now_ms)
+        && shareable
+        && matches!(scope, "project" | "ecosystem" | "universe")
+}
+
 fn workspace_union_memory_visibility_filter_for_column(
     membership: &WorkspaceMembership,
     path_column: &str,
@@ -14097,6 +14318,31 @@ fn workspace_union_memory_visibility_filter_for_column(
     }
 
     (sharing, binds)
+}
+
+fn memory_render_pool_filter_for_column(
+    membership: Option<&WorkspaceMembership>,
+    project_path: &str,
+    path_column: &str,
+    now_ms: i64,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let (visibility, mut binds) = match membership {
+        Some(membership) => {
+            workspace_union_memory_visibility_filter_for_column(membership, path_column)
+        }
+        None => (
+            format!("{path_column} = ?"),
+            vec![rusqlite::types::Value::from(project_path.to_string())],
+        ),
+    };
+    binds.push(rusqlite::types::Value::from(now_ms));
+    (
+        format!(
+            "({visibility}) AND status IN ('active', 'permanent') \
+             AND (expires_at IS NULL OR expires_at > ?)"
+        ),
+        binds,
+    )
 }
 
 fn sql_like_pattern(query: &str) -> String {
@@ -14176,27 +14422,32 @@ fn idle_historian_after_success(firing_seq: u64) -> HistorianDurableState {
 
 /// Coalesce mutation-log rows to one per target memory: deterministic latest-wins with
 /// TERMINAL precedence (terminal always outranks a non-terminal `update`, regardless of
-/// id order). Among rows of the same terminality, the later id wins. Sorted by id for a
-/// stable render order.
+/// id order). Among rows of the same terminality, the later id wins. A visibility marker
+/// is sticky across the fold because the current render eligibility must still be reconciled
+/// even when a later content update is the selected row. Sorted by id for a stable render order.
 fn coalesce_mutations(rows: Vec<StoredMemoryMutation>) -> Vec<StoredMemoryMutation> {
     use std::collections::HashMap;
     let mut chosen: HashMap<i64, StoredMemoryMutation> = HashMap::new();
     // rows arrive id-ASC; iterate in that order so "later id wins" = last-write-wins
     // for same-terminality, and the terminal-precedence guard handles the rest.
-    for candidate in rows {
-        match chosen.get(&candidate.target_memory_id) {
+    for mut candidate in rows {
+        match chosen.remove(&candidate.target_memory_id) {
             None => {
                 chosen.insert(candidate.target_memory_id, candidate);
             }
-            Some(current) => {
+            Some(mut current) => {
+                let visibility_changed = current.visibility_changed || candidate.visibility_changed;
                 let current_terminal = current.is_terminal();
                 let candidate_terminal = candidate.is_terminal();
                 if current_terminal && !candidate_terminal {
-                    // keep the terminal; a later update can't resurrect it.
+                    // Keep the terminal; a later update cannot resurrect it.
+                    current.visibility_changed = visibility_changed;
+                    chosen.insert(current.target_memory_id, current);
                     continue;
                 }
-                // candidate-terminal-over-current-nonterminal, OR same-terminality
+                // Candidate-terminal-over-current-nonterminal, OR same-terminality
                 // later-id → candidate wins.
+                candidate.visibility_changed = visibility_changed;
                 chosen.insert(candidate.target_memory_id, candidate);
             }
         }
@@ -16471,6 +16722,9 @@ mod tests {
             .seed_memory(11, foreign, "CONSTRAINTS", "foreign", 50)
             .unwrap();
         store
+            .set_memory_sharing_for_test(11, "project", true)
+            .unwrap();
+        store
             .seed_mutation(own, "update", 7, "own updated")
             .unwrap();
         store
@@ -16511,7 +16765,7 @@ mod tests {
             .unwrap();
 
         let snapshot = store
-            .load_m1_revision_snapshot(own, own, "m1-session", true)
+            .load_m1_revision_snapshot(own, own, "m1-session", true, 0)
             .unwrap();
         let membership = snapshot.membership.clone().unwrap();
         assert_eq!(membership.union_identities, vec![foreign, own]);
@@ -16540,13 +16794,82 @@ mod tests {
         );
 
         let disabled = store
-            .load_m1_revision_snapshot(own, own, "m1-session", false)
+            .load_m1_revision_snapshot(own, own, "m1-session", false, 0)
             .unwrap();
         assert_eq!(disabled.membership, snapshot.membership);
         assert_eq!(disabled.max_memory_id, 0);
         assert_eq!(disabled.max_memory_mutation_id, 0);
         assert_eq!(disabled.max_compartment_seq, snapshot.max_compartment_seq);
         assert_eq!(disabled.note_status_version, snapshot.note_status_version);
+    }
+
+    #[test]
+    fn visible_memory_watermarks_match_the_render_pool_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let own = "git:watermark-own";
+        let foreign = "git:watermark-foreign";
+        store
+            .seed_workspace_member("watermark-ws", own, "[\"CONSTRAINTS\"]")
+            .unwrap();
+        store
+            .seed_workspace_member("watermark-ws", foreign, "[\"CONSTRAINTS\"]")
+            .unwrap();
+        store
+            .seed_memory(5, own, "ARCHITECTURE", "own visible", 50)
+            .unwrap();
+        store
+            .seed_memory(7, foreign, "CONSTRAINTS", "foreign visible", 50)
+            .unwrap();
+        store
+            .set_memory_sharing_for_test(7, "project", true)
+            .unwrap();
+        store
+            .seed_memory(11, foreign, "NAMING", "hidden category", 50)
+            .unwrap();
+        store
+            .set_memory_sharing_for_test(11, "project", true)
+            .unwrap();
+        store
+            .seed_memory(13, foreign, "CONSTRAINTS", "private", 50)
+            .unwrap();
+        store
+            .seed_memory(17, own, "ARCHITECTURE", "archived", 50)
+            .unwrap();
+        store
+            .seed_expiring_memory(19, foreign, "CONSTRAINTS", "expired", 50, 50)
+            .unwrap();
+        store
+            .set_memory_sharing_for_test(19, "project", true)
+            .unwrap();
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "UPDATE mc_memories SET status = 'archived' WHERE id = 17",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let membership = store.resolve_workspace_membership(own).unwrap().unwrap();
+        let baseline = store
+            .load_memory_render_snapshot(own, Some(&membership), 100)
+            .unwrap();
+        assert_eq!(
+            baseline
+                .memories
+                .iter()
+                .map(|memory| memory.id)
+                .collect::<Vec<_>>(),
+            vec![5, 7]
+        );
+        assert_eq!(baseline.revision.max_memory_id, 7);
+        let cheap = store
+            .load_m1_revision_snapshot(own, own, "watermark-session", true, 100)
+            .unwrap();
+        assert_eq!(cheap.max_memory_id, 7);
     }
 
     #[test]
@@ -16758,6 +17081,47 @@ mod tests {
     }
 
     #[test]
+    fn mutation_render_resolves_replacement_chains_and_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:replacement-chain";
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                for (target, replacement) in [(1, 2), (2, 3), (10, 11), (11, 10)] {
+                    append_memory_mutation_tx(
+                        tx,
+                        MemoryMutationAppend {
+                            project_path: project,
+                            mutation_type: "superseded",
+                            target_memory_id: target,
+                            superseded_by_id: Some(replacement),
+                            category: None,
+                            new_content: None,
+                            queued_at: target,
+                        },
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let mutations = store
+            .memory_mutations_for_render(&[project.to_string()], 0, &[1, 10])
+            .unwrap();
+        let chain = mutations
+            .iter()
+            .find(|mutation| mutation.target_memory_id == 1)
+            .unwrap();
+        assert_eq!(chain.superseded_by_id, Some(3));
+        let cycle = mutations
+            .iter()
+            .find(|mutation| mutation.target_memory_id == 10)
+            .unwrap();
+        assert_eq!(cycle.superseded_by_id, None, "cycles degrade to removals");
+    }
+
+    #[test]
     fn foreign_shareable_revocation_stays_on_m1_lane() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
@@ -16799,6 +17163,116 @@ mod tests {
                 .optional()
                 .map(|value| value.is_none()))
             .unwrap());
+    }
+
+    #[test]
+    fn classification_logs_only_foreign_visibility_transitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let own = "git:classify-own";
+        let foreign = "git:classify-foreign";
+        insert_memory(&store, foreign, 1, "shared", Some(50), "active", None);
+        store
+            .seed_workspace_member("classify-ws", own, "[\"ARCHITECTURE\"]")
+            .unwrap();
+        store
+            .seed_workspace_member("classify-ws", foreign, "[\"ARCHITECTURE\"]")
+            .unwrap();
+        store
+            .seed_module_memory_authority_for_test("store-uuid", foreign, 3)
+            .unwrap();
+        let content_hash = store.get_memory_full(1).unwrap().unwrap().normalized_hash;
+        let feed_cursor = store
+            .pull_changefeed("memories", 0, 100)
+            .unwrap()
+            .next_cursor;
+        let mutation_cursor = store
+            .max_memory_mutation_id(&[foreign.to_string()])
+            .unwrap();
+        let before = store
+            .load_m1_revision_snapshot(own, own, "session", true, 100)
+            .unwrap();
+
+        store
+            .set_memory_classification(
+                "store-uuid",
+                foreign,
+                3,
+                &[ClassificationUpdate {
+                    memory_id: 1,
+                    content_hash_at_prompt: content_hash.clone(),
+                    importance: Some(75),
+                    scope: Some("ecosystem".to_string()),
+                    shareable: None,
+                }],
+                100,
+            )
+            .unwrap();
+        let after = store
+            .load_m1_revision_snapshot(own, own, "session", true, 100)
+            .unwrap();
+        assert_eq!(before.max_memory_id, after.max_memory_id);
+        assert_eq!(before.max_memory_mutation_id, after.max_memory_mutation_id);
+        assert_eq!(
+            store
+                .max_memory_mutation_id(&[foreign.to_string()])
+                .unwrap(),
+            mutation_cursor,
+            "importance and eligible-scope changes stay mutation-neutral"
+        );
+        let feed = store.pull_changefeed("memories", feed_cursor, 100).unwrap();
+        assert_eq!(
+            feed.rows.len(),
+            1,
+            "classification still mirrors through the feed"
+        );
+
+        store
+            .set_memory_classification(
+                "store-uuid",
+                foreign,
+                3,
+                &[ClassificationUpdate {
+                    memory_id: 1,
+                    content_hash_at_prompt: content_hash.clone(),
+                    importance: None,
+                    scope: None,
+                    shareable: Some(false),
+                }],
+                101,
+            )
+            .unwrap();
+        let revoke_cursor = store
+            .max_memory_mutation_id(&[foreign.to_string()])
+            .unwrap();
+        assert!(revoke_cursor > mutation_cursor);
+        let revoke = store
+            .memory_mutations_for_render(&[foreign.to_string()], mutation_cursor, &[1])
+            .unwrap();
+        assert_eq!(revoke.len(), 1);
+        assert!(revoke[0].visibility_changed);
+
+        store
+            .set_memory_classification(
+                "store-uuid",
+                foreign,
+                3,
+                &[ClassificationUpdate {
+                    memory_id: 1,
+                    content_hash_at_prompt: content_hash,
+                    importance: None,
+                    scope: None,
+                    shareable: Some(true),
+                }],
+                102,
+            )
+            .unwrap();
+        let grant = store
+            .memory_mutations_for_render(&[foreign.to_string()], revoke_cursor, &[])
+            .unwrap();
+        assert_eq!(grant.len(), 1);
+        assert_eq!(grant[0].target_memory_id, 1);
+        assert!(grant[0].visibility_changed);
     }
 
     #[test]
