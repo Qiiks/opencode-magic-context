@@ -14,6 +14,7 @@ import {
     getPendingCompactionMarkerState,
     getPersistedNoteNudge,
     getPersistedReasoningWatermark,
+    markSessionCleanupPending,
     recordDetectedContextLimit,
     recordOverflowDetected,
     removeAutoSearchHintDecisionByMessageId,
@@ -741,6 +742,10 @@ export function createEventHandler(deps: EventHandlerDeps) {
 
             dropSlot(sessionId, "session.deleted");
             try {
+                // Commit the retry marker before any deletion work. clearSession removes
+                // it in the same transaction as the session data, so a BUSY/rollback
+                // leaves a durable retry for the next maintenance tick.
+                markSessionCleanupPending(deps.db, sessionId);
                 // Read and remove compaction marker BEFORE clearSession destroys session_meta.
                 // Plan v6: pending_compaction_marker_state lives on the same row, so
                 // clearSession's session_meta DELETE wipes it automatically — no

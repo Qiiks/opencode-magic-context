@@ -46,7 +46,7 @@ export function getSchemaFenceRejection(): {
     return lastSchemaFenceRejection;
 }
 
-export const LATEST_SUPPORTED_VERSION = 67;
+export const LATEST_SUPPORTED_VERSION = 68;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -936,6 +936,35 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       dirty_floor_ordinal INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL,
       harness TEXT NOT NULL DEFAULT 'opencode'
+    );
+    CREATE INDEX IF NOT EXISTS idx_message_history_index_orphan_sweep
+      ON message_history_index(harness, session_id, updated_at);
+
+    CREATE TABLE IF NOT EXISTS message_history_source (
+      session_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      message_ordinal INTEGER NOT NULL,
+      source_version TEXT NOT NULL,
+      normalized_content_hash TEXT NOT NULL,
+      role TEXT NOT NULL,
+      harness TEXT NOT NULL DEFAULT 'opencode',
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(session_id, message_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_message_history_source_session_ordinal
+      ON message_history_source(session_id, message_ordinal);
+
+    CREATE TABLE IF NOT EXISTS pending_session_cleanup (
+      session_id TEXT PRIMARY KEY,
+      harness TEXT NOT NULL DEFAULT 'opencode',
+      requested_at INTEGER NOT NULL,
+      last_attempt_at INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS message_history_orphan_sweep (
+      harness TEXT PRIMARY KEY,
+      cursor_session_id TEXT NOT NULL DEFAULT '',
+      last_swept_at INTEGER
     );
 
     CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN

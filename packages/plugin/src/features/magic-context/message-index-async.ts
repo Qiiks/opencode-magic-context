@@ -6,10 +6,11 @@ import {
     clearIndexedMessages,
     getLastIndexedOrdinal,
     getMessageIndexReconciliationStartOrdinal,
+    getMessageIndexSourceIdentity,
     indexMessagesAfterOrdinal,
     indexSingleMessage,
     isMessageIndexReconciledThrough,
-    markMessageIndexDirty,
+    isMessageIndexSourceCurrent,
 } from "./message-index";
 
 /**
@@ -47,8 +48,9 @@ function isDatabaseLockedError(error: unknown): boolean {
  * runs an FTS5 SELECT; writes happen through three asynchronous triggers:
  *
  * 1. Live incremental indexing: terminal `message.updated` events schedule a
- *    single-message read and `indexSingleMessage()` insert. Duplicate events for
- *    the same `(sessionId,messageId)` inside 100ms are dropped.
+ *    single-message read and `indexSingleMessage()` insert/replace. Events are
+ *    debounced per message for 100ms and completed revisions are keyed by the
+ *    source version plus normalized-content hash.
  * 2. Per-session lazy reconciliation: the first transform/hook touch schedules
  *    one catch-up pass. It reads raw messages, resumes from
  *    `message_history_index.last_indexed_ordinal`, rewinds from any recorded
@@ -215,18 +217,14 @@ export function scheduleIncrementalIndex(
     messageId: string,
     messageSource: IncrementalMessageSource,
 ): void {
-    const key = `${sessionId}\u0000${messageId}`;
-    if (
-        completedIncrementalKeys.has(key) ||
-        incrementalTimers.has(key) ||
-        pendingIncrementalKeys.has(key)
-    ) {
+    const schedulingKey = `${sessionId}\u0000${messageId}`;
+    if (incrementalTimers.has(schedulingKey) || pendingIncrementalKeys.has(schedulingKey)) {
         return;
     }
 
     const timer = setTimeout(() => {
-        incrementalTimers.delete(key);
-        pendingIncrementalKeys.add(key);
+        incrementalTimers.delete(schedulingKey);
+        pendingIncrementalKeys.add(schedulingKey);
         void runWithSessionLock(sessionId, () => {
             const message =
                 typeof messageSource === "function"
@@ -234,41 +232,36 @@ export function scheduleIncrementalIndex(
                     : messageSource;
             if (!message) return;
 
+            const revisionKey = `${schedulingKey}\u0000${getMessageIndexSourceIdentity(message)}`;
+            if (completedIncrementalKeys.has(revisionKey)) return;
+
             const currentWatermark = getLastIndexedOrdinal(db, sessionId);
             if (
                 message.ordinal <= currentWatermark &&
-                isMessageIndexReconciledThrough(db, sessionId, currentWatermark)
+                isMessageIndexSourceCurrent(db, sessionId, message)
             ) {
-                completedIncrementalKeys.add(key);
+                completedIncrementalKeys.add(revisionKey);
                 return;
             }
 
-            // Persist the earliest possibly missing ordinal before the risky FTS
-            // write. A crash after this point leaves a durable reconciliation
-            // floor; if the marker itself fails, clearing the local latch below
-            // ensures a later reconciliation tries the source again.
             const wasReconciled = reconciledSessions.delete(sessionId);
-            markMessageIndexDirty(
-                db,
-                sessionId,
-                Math.min(message.ordinal, getLastIndexedOrdinal(db, sessionId) + 1),
-            );
             indexSingleMessage(db, sessionId, message);
-            if (wasReconciled && isMessageIndexReconciledThrough(db, sessionId, message.ordinal)) {
+            const finalWatermark = getLastIndexedOrdinal(db, sessionId);
+            if (wasReconciled && isMessageIndexReconciledThrough(db, sessionId, finalWatermark)) {
                 reconciledSessions.add(sessionId);
             }
-            completedIncrementalKeys.add(key);
+            completedIncrementalKeys.add(revisionKey);
         })
             .catch((error) => {
                 reconciledSessions.delete(sessionId);
                 logIndexingError(sessionId, `incremental index for ${messageId}`, error);
             })
             .finally(() => {
-                pendingIncrementalKeys.delete(key);
+                pendingIncrementalKeys.delete(schedulingKey);
             });
     }, INCREMENTAL_DEBOUNCE_MS);
 
-    incrementalTimers.set(key, timer);
+    incrementalTimers.set(schedulingKey, timer);
 }
 
 export function scheduleClearAndReindex(

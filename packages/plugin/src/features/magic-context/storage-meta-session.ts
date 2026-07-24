@@ -166,6 +166,47 @@ export function advanceToolReclaimWatermark(
     })();
 }
 
+export interface PendingSessionCleanupRetryResult {
+    attempted: number;
+    cleared: number;
+    failedSessionIds: string[];
+}
+
+export function markSessionCleanupPending(db: Database, sessionId: string): void {
+    db.prepare(
+        `INSERT INTO pending_session_cleanup (session_id, harness, requested_at, last_attempt_at)
+         VALUES (?, ?, ?, NULL)
+         ON CONFLICT(session_id) DO UPDATE SET
+             harness = excluded.harness,
+             requested_at = MIN(pending_session_cleanup.requested_at, excluded.requested_at)`,
+    ).run(sessionId, getHarness(), Date.now());
+}
+
+export function retryPendingSessionCleanups(
+    db: Database,
+    limit = 200,
+): PendingSessionCleanupRetryResult {
+    const rows = db
+        .prepare(
+            "SELECT session_id FROM pending_session_cleanup ORDER BY requested_at ASC, session_id ASC LIMIT ?",
+        )
+        .all(Math.max(1, Math.floor(limit))) as Array<{ session_id: string }>;
+    const failedSessionIds: string[] = [];
+    let cleared = 0;
+    for (const row of rows) {
+        try {
+            db.prepare(
+                "UPDATE pending_session_cleanup SET last_attempt_at = ? WHERE session_id = ?",
+            ).run(Date.now(), row.session_id);
+            clearSession(db, row.session_id);
+            cleared += 1;
+        } catch {
+            failedSessionIds.push(row.session_id);
+        }
+    }
+    return { attempted: rows.length, cleared, failedSessionIds };
+}
+
 export function clearSession(db: Database, sessionId: string): void {
     // Every session-scoped table must be cleared here; the structural storage-db
     // test discovers tables with session_id and seeds each one to enforce this list.
@@ -197,6 +238,7 @@ export function clearSession(db: Database, sessionId: string): void {
         db.prepare("DELETE FROM transform_decisions WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM synapse_batch_ledger WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM embedding_measurement_corpus WHERE session_id = ?").run(sessionId);
+        db.prepare("DELETE FROM pending_session_cleanup WHERE session_id = ?").run(sessionId);
         clearIndexedMessages(db, sessionId);
     })();
 }

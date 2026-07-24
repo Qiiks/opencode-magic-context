@@ -36,12 +36,17 @@ import {
     embedUnembeddedMemoriesForProject,
     getProjectEmbeddingSnapshot,
 } from "../features/magic-context/memory/embedding";
+import { sweepOrphanedOpenCodeMessageIndexes } from "../features/magic-context/message-index";
 import {
     drainCommitBacklogForProject,
     sweepStaleEmbeddingIdentitiesForProject,
 } from "../features/magic-context/project-embedding-registry";
 import { runDueCompiledSmartNoteChecks } from "../features/magic-context/smart-notes/runner";
-import { openDatabase, runSqliteOptimize } from "../features/magic-context/storage";
+import {
+    openDatabase,
+    retryPendingSessionCleanups,
+    runSqliteOptimize,
+} from "../features/magic-context/storage";
 import type { RawMessageProvider } from "../hooks/magic-context/read-session-chunk";
 import { getErrorMessage } from "../shared/error-message";
 import { log } from "../shared/logger";
@@ -179,9 +184,8 @@ export async function startDreamScheduleTimer(
     const embeddingSweepEnabled = args.memoryEnabled === true;
     const commitIndexingEnabled = args.gitCommitIndexing?.enabled === true;
 
-    if (!dreamingEnabled && !embeddingSweepEnabled && !commitIndexingEnabled) {
-        return;
-    }
+    // The timer also owns global message-history privacy maintenance, so an
+    // enabled plugin registers even when project dream/embedding/git work is off.
 
     // Idempotent registration — re-registering the same directory replaces
     // the prior config (e.g., if config was reloaded for that project).
@@ -243,7 +247,7 @@ export async function startDreamScheduleTimer(
 }
 
 /**
- * Single tick body. Runs the global memory embedding sweep once, then
+ * Single tick body. Runs global message-history maintenance once, then
  * iterates every registered project for its per-directory work.
  */
 function runTick(origin: "startup" | "interval"): void {
@@ -252,6 +256,7 @@ function runTick(origin: "startup" | "interval"): void {
         try {
             const db = openTimerDatabaseOrNull("maintenance tick");
             if (!db) return;
+            runMessageHistoryMaintenance(db);
             // Per-project work — git commit indexing, dream schedule check,
             // dream queue processing. We iterate all registered projects so
             // Desktop's "open all projects at once" workflow indexes every one,
@@ -272,6 +277,22 @@ function runTick(origin: "startup" | "interval"): void {
             log("[magic-context] timer-triggered maintenance check failed:", error);
         }
     })();
+}
+
+function runMessageHistoryMaintenance(db: Database): void {
+    const cleanup = retryPendingSessionCleanups(db);
+    if (cleanup.cleared > 0 || cleanup.failedSessionIds.length > 0) {
+        log(
+            `[message-index] pending session cleanup: cleared=${cleanup.cleared} failed=${cleanup.failedSessionIds.length}`,
+        );
+    }
+
+    const sweep = sweepOrphanedOpenCodeMessageIndexes(db, openOpenCodeDb);
+    if (sweep.deleted > 0) {
+        log(
+            `[message-index] orphan sweep: scanned=${sweep.scanned} deleted=${sweep.deleted} cursor=${sweep.cursor || "<complete>"}`,
+        );
+    }
 }
 
 function startupJitterMs(directory: string): number {
@@ -303,6 +324,12 @@ async function runProjectMaintenance(
     origin: "startup" | "interval",
     db: Database,
 ): Promise<void> {
+    const projectMaintenanceEnabled =
+        Boolean(reg.dreamerConfig && reg.dreamerConfig.disable !== true) ||
+        reg.memoryEnabled === true ||
+        reg.gitCommitIndexing?.enabled === true;
+    if (!projectMaintenanceEnabled) return;
+
     await reg.ensureRegistered(reg.directory, db);
     const memorySnapshot = getProjectEmbeddingSnapshot(reg.projectIdentity);
     if (memorySnapshot?.enabled) {
