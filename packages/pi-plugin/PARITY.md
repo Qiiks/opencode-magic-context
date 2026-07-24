@@ -124,10 +124,10 @@ another) because one process can serve multiple sessions and TUI port discovery
 is newest-pid-wins.
 
 **Pi:** transient terminal notifications. The upgrade reminder passes
-`deliveryPersists=false` on Pi, so it does NOT durably stamp `upgrade_reminded_at`
-on display (the toast vanishes, leaving no scrollback) — it re-prompts each Pi
-start until the session is actually upgraded. OpenCode (persistent chat message)
-stamps on send.
+`deliveryPersists=false` on Pi, so a missed toast does not honor the old explicit-
+dismissal stamp. Both harnesses persist the 24-hour reminder cooldown and three-
+delivery cap, preventing repeated startup toasts while `/ctx-status` still reports
+compartments that need upgrading.
 
 ---
 
@@ -811,6 +811,37 @@ compartment boundary timestamps from `opencode.db` and emit `start-date` / `end-
 boundary-timestamp lookup equivalent to OpenCode's message table. Pi therefore omits
 these attributes while retaining temporal gap markers derived from Pi message data.
 Cached defer passes in both harnesses continue replaying their previously rendered bytes.
+
+---
+
+## 26. Memory mural image: same HARD-fold contract, different message envelope
+
+**Both harnesses** share `resolveMuralWire` (feature flag + vision gate + on-demand
+deterministic PNG with text-hash change detection). The mural injects only on a
+HARD m[0] materialization; defer passes replay the baked-in `<memory-mural>`
+marker and image bytes without re-rendering. Restart-safe replay reloads the PNG
+from `mural_manifest` when the cached m[0] text still carries the marker.
+
+**OpenCode:** prepends a synthetic user head with a `file` part
+(`mime: image/png`, `url: data:image/png;base64,…`, `synthetic: true`).
+
+**Pi:** prepends a synthetic user entry with Pi's native image content block
+(`{ type: "image", data: <raw base64>, mimeType: "image/png" }`). Pi provider
+serializers rebuild the data-URL form for the wire. Same PNG bytes; different
+envelope because Pi's `AgentMessage` shape has no OpenCode-style file parts.
+
+**Vision gate:** both call `modelSupportsVision` via the shared models.dev /
+SDK metadata cache. Pi-native provider prefixes (`openai-codex/…`,
+`google-antigravity/…`) are translated to the canonical OpenCode form before
+lookup. Pi does not warm that cache (see §14); when metadata is absent the gate
+**fails closed** (text-only baseline, no throw). A Pi-only install therefore
+never injects the mural image until vision metadata is available; OpenCode warms
+the cache from its SDK at startup.
+
+**Config:** both honor `experimental.mural.enabled` (and `experimental.mural.model`
+for the compress-cues dreamer task). No intentional per-provider image-part
+blacklist today — every Pi serializer path that accepts user image content takes
+raw base64 the same way.
 
 ## Pending parity
 

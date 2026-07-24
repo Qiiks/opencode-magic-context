@@ -8,7 +8,9 @@ import type { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { ensureContextStoreUuid } from "../../features/magic-context/context-authority";
 import { writeTaskScheduleState } from "../../features/magic-context/dreamer/storage-task-schedule";
+import { insertMemory } from "../../features/magic-context/memory";
 import {
     __resetProjectIdentityForTests,
     __setProjectIdentityTestHooks,
@@ -583,6 +585,98 @@ describe("magic-context hook", () => {
                 }),
             }),
         );
+    });
+
+    it("routes manual classify through MODULE before any transform has run", async () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-classify-module-manual-");
+        const promptMocks = createPromptMocks();
+        const deps = createMockDeps(promptMocks);
+        const projectPath = resolveProjectIdentity("/tmp");
+        deps.config = {
+            ...deps.config,
+            transform_mode: "rust",
+            dreamer: {
+                tasks: {
+                    "classify-memories": {
+                        schedule: "0 3 * * *",
+                        timeout_minutes: 10,
+                    },
+                },
+            },
+        } as never;
+
+        class StatefulModuleClient {
+            private readonly instanceState = "hook-transport";
+            readonly methods: string[] = [];
+
+            async authorityStatus() {
+                if (this.instanceState !== "hook-transport") throw new Error("lost transport this");
+                return { authority: { state: "MODULE", generation: 4 } };
+            }
+
+            async call(args: { method: string; body: unknown }) {
+                if (this.instanceState !== "hook-transport") throw new Error("lost transport this");
+                this.methods.push(args.method);
+                if (args.method === "dreamer.run_task") {
+                    const body = args.body as {
+                        payload: { items: Array<{ memory_id: number }> };
+                    };
+                    return {
+                        manifest_text: `<classify>${body.payload.items
+                            .map(
+                                ({ memory_id }) =>
+                                    `<memory id="${memory_id}" importance="75" scope="project" shareable="false"/>`,
+                            )
+                            .join("")}</classify>`,
+                        truncated: false,
+                    };
+                }
+                return {
+                    accepted: (
+                        args.body as { arguments: { rows: Array<{ memory_id: number }> } }
+                    ).arguments.rows.map((row) => row.memory_id),
+                    rejected: [],
+                };
+            }
+        }
+        const moduleClient = new StatefulModuleClient();
+        deps.rustModeModuleClient = moduleClient as never;
+        const hook = requireHook(createMagicContextHook(deps));
+        const db = openDatabase();
+        ensureContextStoreUuid(db);
+        const memories = [];
+        for (let i = 0; i < 12; i += 1) {
+            memories.push(
+                insertMemory(db, {
+                    projectPath,
+                    category: "ARCHITECTURE",
+                    content: `Manual classify memory ${i}.`,
+                }),
+            );
+        }
+        for (const [index, memory] of memories.entries()) {
+            db.prepare(
+                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
+            ).run(projectPath, 12000 + index, memory.id);
+            db.prepare(
+                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, ?, ?, ?)",
+            ).run(projectPath, 12000 + index, memory.category, memory.normalizedHash);
+        }
+
+        await expectSentinel(
+            hook["command.execute.before"]!(
+                {
+                    command: "ctx-dream",
+                    sessionID: "ses-classify-module-manual",
+                    arguments: "classify-memories",
+                },
+                { parts: [{ type: "text", text: "" }] },
+            ),
+            "__CONTEXT_MANAGEMENT_CTX-DREAM_HANDLED__",
+        );
+
+        expect(moduleClient.methods).toEqual(["dreamer.run_task", "memory.set_classification"]);
+        expect(promptMocks.createSession).not.toHaveBeenCalled();
     });
 
     it("runs sidekick for ctx-aug and sends the augmented user prompt", async () => {

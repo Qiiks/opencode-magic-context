@@ -14,6 +14,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { log } from "../../../shared/logger";
 
@@ -289,9 +290,17 @@ export function resolveProjectIdentityStrict(directory: string): string {
         throw classifyGitError(error, directory);
     }
 
-    const firstLine = output.split("\n")[0]?.trim() ?? "";
-    const rootCommit = firstLine.slice(0, 64);
-    if (rootCommit.length < 7) {
+    // Repos with grafted histories (merged with --allow-unrelated-histories) have
+    // MULTIPLE root commits, and git's enumeration order varies by traversal. Taking
+    // whichever line comes first samples nondeterministically from that set, flapping
+    // the project identity between sessions and splitting the memory pool. Pin the
+    // derivation to the lexicographic minimum so it is a pure function of the set.
+    const rootCommit = output
+        .split("\n")
+        .map((line) => line.trim().slice(0, 64))
+        .filter((line) => /^[0-9a-f]{7,64}$/.test(line))
+        .sort()[0];
+    if (!rootCommit) {
         throw new ProjectIdentityError(
             "unknown",
             directory,
@@ -397,6 +406,19 @@ export function takeDubiousOwnershipProjectIdentityWarning(directory: string): s
     return formatDubiousOwnershipWarning(canonical);
 }
 
+/**
+ * Compare filesystem-canonical paths so a symlink spelling of $HOME cannot
+ * accidentally create a second directory identity. Descendants remain valid
+ * project directories; only the exact home directory is rejected.
+ */
+export function isUserHomeDirectory(directory: string): boolean {
+    try {
+        return realpathSync.native(path.resolve(directory)) === realpathSync.native(homedir());
+    } catch {
+        return false;
+    }
+}
+
 export function resolveProjectIdentity(directory: string): string {
     const canonical = path.resolve(directory);
     const cachedFallback = directoryFallbackCache.get(canonical);
@@ -488,6 +510,11 @@ function hasGitDirInAncestorChain(startDirectory: string): boolean {
         }
         current = parent;
     }
+}
+
+export function resolveProjectIdentityForSession(directory: string): string | undefined {
+    if (isUserHomeDirectory(directory)) return undefined;
+    return resolveProjectIdentityOrFallback(directory);
 }
 
 /**

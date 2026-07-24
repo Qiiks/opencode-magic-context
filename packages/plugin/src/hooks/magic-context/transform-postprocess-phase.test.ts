@@ -1245,6 +1245,48 @@ describe("emergency fail-closed decision", () => {
             }),
         ).toEqual({ shouldAbort: false, reason: "below-emergency-band" });
     });
+
+    it("disarms an armed latch when a trusted final wire is safely below the proven limit", () => {
+        expect(
+            evaluateEmergencyFailClosed({
+                usagePercentage: 95,
+                emergencyRecoveryArmed: true,
+                emergencyRecoveryOrigin: "provider_overflow",
+                foldMaterializedThisPass: false,
+                finalWireEstimate: { tokens: 14_000, trusted: true },
+                providerProvenLimitTokens: 100_000,
+            }),
+        ).toEqual({
+            shouldAbort: false,
+            reason: "trusted-final-wire-disarm",
+            disarm: { finalWireTokens: 14_000, provenLimitTokens: 100_000 },
+        });
+    });
+
+    it("does not disarm from a catalog-only limit", () => {
+        expect(
+            evaluateEmergencyFailClosed({
+                usagePercentage: 95,
+                emergencyRecoveryArmed: true,
+                emergencyRecoveryOrigin: "provider_overflow",
+                foldMaterializedThisPass: false,
+                finalWireEstimate: { tokens: 14_000, trusted: true },
+            }),
+        ).toEqual({ shouldAbort: true, reason: "provider-overflow-abort" });
+    });
+
+    it("keeps provider-overflow blocking when the final-wire estimate is untrusted", () => {
+        expect(
+            evaluateEmergencyFailClosed({
+                usagePercentage: 95,
+                emergencyRecoveryArmed: true,
+                emergencyRecoveryOrigin: "provider_overflow",
+                foldMaterializedThisPass: false,
+                finalWireEstimate: { tokens: 14_000, trusted: false },
+                providerProvenLimitTokens: 100_000,
+            }),
+        ).toEqual({ shouldAbort: true, reason: "provider-overflow-abort" });
+    });
 });
 
 describe("confirmed emergency abort", () => {
@@ -1429,6 +1471,87 @@ describe("two-pass tool reclaim", () => {
         expect((second.parts[0] as { state?: { output?: string } }).state?.output).toBe(
             "[dropped]",
         );
+    });
+
+    it("keeps sub-floor arcs while reclaiming a larger sibling", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-reclaim-size-floor";
+        const trigger = makeToolMessage("tool-1");
+        const small = makeToolMessage("tool-2");
+        const large = makeToolMessage("tool-3");
+        insertTag(db, sessionId, "tool-1", "tool", 4000, 1, 0, "edit");
+        insertTag(db, sessionId, "tool-2", "tool", 4000, 2, 0, "bash", 0, null, null, {
+            tokenCount: 249,
+            inputTokenCount: 0,
+            reasoningTokenCount: 0,
+        });
+        insertTag(db, sessionId, "tool-3", "tool", 4000, 3, 0, "read", 0, null, null, {
+            tokenCount: 250,
+            inputTokenCount: 0,
+            reasoningTokenCount: 0,
+        });
+        queuePendingOp(db, sessionId, 1, "drop", 1);
+        advanceToolReclaimWatermark(db, sessionId, 3);
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, [trigger, small, large], {
+                schedulerDecision: "execute",
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: new Map([
+                    [1, makeDropTarget(trigger)],
+                    [2, makeDropTarget(small)],
+                    [3, makeDropTarget(large)],
+                ]),
+                sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            }),
+        );
+
+        const statuses = tagStatuses(sessionId);
+        expect(statuses.get(1)).toBe("dropped");
+        expect(statuses.get(2)).toBe("active");
+        expect(statuses.get(3)).toBe("dropped");
+    });
+
+    it("keeps the newest todowrite arc while reclaiming an older one", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-reclaim-newest-todowrite";
+        const trigger = makeToolMessage("tool-1");
+        const older = makeToolMessage("tool-2");
+        const newest = makeToolMessage("tool-3");
+        insertTag(db, sessionId, "tool-1", "tool", 4000, 1, 0, "edit");
+        insertTag(db, sessionId, "tool-2", "tool", 4000, 2, 0, "todowrite", 0, null, null, {
+            tokenCount: 300,
+            inputTokenCount: 0,
+            reasoningTokenCount: 0,
+        });
+        insertTag(db, sessionId, "tool-3", "tool", 4000, 3, 0, "todowrite", 0, null, null, {
+            tokenCount: 300,
+            inputTokenCount: 0,
+            reasoningTokenCount: 0,
+        });
+        queuePendingOp(db, sessionId, 1, "drop", 1);
+        advanceToolReclaimWatermark(db, sessionId, 3);
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, [trigger, older, newest], {
+                schedulerDecision: "execute",
+                smartDrops: false,
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: new Map([
+                    [1, makeDropTarget(trigger)],
+                    [2, makeDropTarget(older)],
+                    [3, makeDropTarget(newest)],
+                ]),
+                sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            }),
+        );
+
+        const statuses = tagStatuses(sessionId);
+        expect(statuses.get(1)).toBe("dropped");
+        expect(statuses.get(2)).toBe("dropped");
+        expect(statuses.get(3)).toBe("active");
     });
 
     it("does not persist a synthetic drop for an absent old DB tag", async () => {
@@ -1737,7 +1860,7 @@ describe("known m[0] hard-fold folds the execute pass in", () => {
         );
     });
 
-    it("drains two-pass reclaim and advances its watermark on a DEFER scheduler pass when m[0] HARD-folds", async () => {
+    it("drains pending ops but not two-pass reclaim or its watermark on a low-usage TTL fold", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-hardfold-reclaim-drain";
@@ -1771,7 +1894,8 @@ describe("known m[0] hard-fold folds the execute pass in", () => {
                     historyBudgetTokens: 98_000,
                     hardSignals: {
                         ...BASE_HARD,
-                        modelKey: "anthropic/sonnet",
+                        cacheExpired: true,
+                        lastResponseTime: Number.MAX_SAFE_INTEGER,
                     },
                 },
             }),
@@ -1781,9 +1905,9 @@ describe("known m[0] hard-fold folds the execute pass in", () => {
             getTagsBySession(db, sessionId).map((tag) => [tag.tagNumber, tag.status]),
         );
         expect(statuses.get(1)).toBe("dropped");
-        expect(statuses.get(2)).toBe("dropped");
+        expect(statuses.get(2)).toBe("active");
         expect(statuses.get(3)).toBe("active");
-        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(3);
+        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(2);
 
         const deferReplayBytes = JSON.stringify(messages);
         await runPostTransformPhase(
@@ -2485,5 +2609,58 @@ describe("final message representation", () => {
             mergedReasoningParts: 0,
         });
         expect(JSON.stringify(nonAnthropicMessages)).toBe(nonAnthropicBefore);
+    });
+
+    it("matches the former full cleared-reasoning walk on a mixed final fixture", () => {
+        const fixture = [
+            {
+                info: { role: "user", syntheticHead: true },
+                parts: [
+                    {
+                        type: "text",
+                        text: "<session-history>cached history</session-history>",
+                        synthetic: true,
+                    },
+                ],
+            },
+            {
+                info: { id: "synthetic-carrier", role: "assistant" },
+                parts: [
+                    { type: "reasoning", text: "[cleared]", signature: "new-head-signature" },
+                    { type: "tool", callID: "todo", state: { input: { todos: [] }, output: "ok" } },
+                ],
+            },
+            {
+                info: { id: "placeholder", role: "assistant" },
+                parts: [{ type: "text", text: "[dropped §3§]" }],
+            },
+            {
+                info: { id: "merged-a", role: "assistant" },
+                parts: [
+                    { type: "reasoning", text: "signed reasoning", signature: "keep-signature" },
+                    { type: "text", text: "<thinking>inline trace</thinking>answer" },
+                    { type: "file", mime: "image/png", url: "data:image/png;base64,AAAA" },
+                ],
+            },
+            {
+                info: { id: "merged-b", role: "assistant" },
+                parts: [
+                    { type: "thinking", thinking: "[cleared]", signature: "late-drop-signature" },
+                    { type: "text", text: "merged assistant tail" },
+                ],
+            },
+        ] as unknown as MessageLike[];
+        const fullWalk = cloneMessages(fixture);
+        const targeted = cloneMessages(fixture);
+        const targetedLateMutation = targeted.find((message) => message.info.id === "merged-b")!;
+
+        const oldResult = finalizeMessageRepresentation(fullWalk, "anthropic");
+        const targetedResult = finalizeMessageRepresentation(targeted, "anthropic", {
+            prependedMessageCount: 2,
+            reasoningMutatedMessages: [targetedLateMutation],
+        });
+
+        expect(targetedResult).toEqual(oldResult);
+        expect(JSON.stringify(targeted)).toBe(JSON.stringify(fullWalk));
     });
 });

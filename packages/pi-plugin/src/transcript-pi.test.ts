@@ -12,6 +12,36 @@ import {
 } from "./test-utils.test";
 import { createPiTranscript } from "./transcript-pi";
 
+type ToolTokenCacheEntry = { text: string; tokenCount: number };
+
+class CountingToolTokenCache extends Map<string, ToolTokenCacheEntry> {
+	writes = 0;
+
+	override set(key: string, value: ToolTokenCacheEntry): this {
+		this.writes += 1;
+		return super.set(key, value);
+	}
+
+	resetWrites(): void {
+		this.writes = 0;
+	}
+}
+
+class LegacyAggregateToolTokenCache extends CountingToolTokenCache {
+	private aggregateKey(key: string): string {
+		const suffix = key.indexOf("\0result-part:");
+		return suffix === -1 ? key : key.slice(0, suffix);
+	}
+
+	override get(key: string): ToolTokenCacheEntry | undefined {
+		return super.get(this.aggregateKey(key));
+	}
+
+	override set(key: string, value: ToolTokenCacheEntry): this {
+		return super.set(this.aggregateKey(key), value);
+	}
+}
+
 describe("createPiTranscript", () => {
 	it("round-trips Pi messages through transcript mutation and commit", () => {
 		const messages = [userMessage("hello", 10), assistantMessage("world", 11)];
@@ -278,6 +308,71 @@ describe("createPiTranscript", () => {
 		} finally {
 			closeQuietly(db);
 		}
+	});
+
+	it("keeps multi-block token memoization byte- and accounting-neutral", () => {
+		const runScenario = (toolTokenCache: CountingToolTokenCache) => {
+			const db = createTestDb();
+			const sessionId = "ses-multi-block-token-cache";
+			try {
+				const tagger = createTagger();
+				tagger.initFromDb(sessionId, db);
+				const makeMessages = () => [
+					assistantToolCall(
+						"call-multi-cache",
+						"Read",
+						{ path: "large.txt" },
+						11,
+					),
+					{
+						role: "toolResult" as const,
+						toolCallId: "call-multi-cache",
+						toolName: "Read",
+						content: [
+							{ type: "text" as const, text: "first block ".repeat(200) },
+							{ type: "text" as const, text: "second block ".repeat(300) },
+						],
+						isError: false,
+						timestamp: 12,
+					},
+				];
+				const entryIds = ["entry-assistant", "entry-tool-result"];
+
+				const seed = createPiTranscript(makeMessages(), sessionId, entryIds);
+				tagTranscript(sessionId, seed, tagger, db, { toolTokenCache });
+				seed.commit();
+				toolTokenCache.resetWrites();
+
+				const replay = createPiTranscript(makeMessages(), sessionId, entryIds);
+				tagTranscript(sessionId, replay, tagger, db, {
+					reuseMessageIds: new Set(["entry-assistant", "entry-tool-result"]),
+					toolTokenCache,
+				});
+				replay.commit();
+				const rows = db
+					.prepare(
+						`SELECT tag_number, message_id, tool_owner_message_id,
+						        byte_size, input_byte_size, token_count, input_token_count
+						 FROM tags WHERE session_id = ? ORDER BY tag_number`,
+					)
+					.all(sessionId);
+				return {
+					cacheWrites: toolTokenCache.writes,
+					outputBytes: JSON.stringify(replay.getOutputMessages()),
+					rows,
+				};
+			} finally {
+				closeQuietly(db);
+			}
+		};
+
+		const legacy = runScenario(new LegacyAggregateToolTokenCache());
+		const blockScoped = runScenario(new CountingToolTokenCache());
+
+		expect(legacy.cacheWrites).toBe(2);
+		expect(blockScoped.cacheWrites).toBe(0);
+		expect(blockScoped.outputBytes).toBe(legacy.outputBytes);
+		expect(blockScoped.rows).toEqual(legacy.rows);
 	});
 
 	it("truncates mixed tool-result image blocks into stable text sentinels", () => {

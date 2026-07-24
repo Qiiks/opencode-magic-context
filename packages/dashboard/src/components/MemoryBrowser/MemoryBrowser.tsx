@@ -1,12 +1,15 @@
 import { createEffect, createResource, createSignal, For, Show } from "solid-js";
+
 import {
   bulkDeleteMemory,
   bulkUpdateMemoryStatus,
   deleteMemory,
   enumerateMemoryProjects,
+  formatDateTime,
   formatRelativeTime,
   getMemories,
   getMemoryStats,
+  getMural,
   listWorkspaceSummaries,
   truncate,
   updateMemoryCategory,
@@ -14,7 +17,7 @@ import {
   updateMemoryStatus,
 } from "../../lib/api";
 import { ask } from "../../lib/platform";
-import type { Memory, MemoryCategory } from "../../lib/types";
+import type { Memory, MemoryCategory, MuralManifest } from "../../lib/types";
 import HarnessBadge from "../HarnessBadge";
 import FilterSelect from "../shared/FilterSelect";
 import MemoryDetail from "./MemoryDetail";
@@ -41,6 +44,18 @@ function saveCollapsedCategories(set: Set<string>): void {
   } catch {
     // localStorage full / disabled — ignore, in-memory state still works.
   }
+}
+
+function muralImageSrc(mural: MuralManifest): string {
+  if (typeof mural.image === "string") {
+    return mural.image.startsWith("data:") ? mural.image : `data:image/png;base64,${mural.image}`;
+  }
+  let binary = "";
+  // Chunk the conversion so large PNGs do not overflow the call stack.
+  for (let offset = 0; offset < mural.image.length; offset += 0x8000) {
+    binary += String.fromCharCode(...mural.image.slice(offset, offset + 0x8000));
+  }
+  return `data:image/png;base64,${btoa(binary)}`;
 }
 
 interface MemoryBrowserProps {
@@ -70,6 +85,11 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
 
   const [projects] = createResource(enumerateMemoryProjects);
   const [workspaceSummaries] = createResource(listWorkspaceSummaries);
+  const [mural] = createResource(
+    () => props.project?.identity,
+    (project) => (project ? getMural(project) : Promise.resolve(null)),
+  );
+  const [muralCollapsed, setMuralCollapsed] = createSignal(false);
 
   const fetchParams = () => {
     // Embedded in a project: lock to that identity, ignore workspace filter.
@@ -394,6 +414,54 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
             </Show>
           </div>
         </div>
+      </Show>
+
+      <Show when={embedded() && !mural.loading && mural()}>
+        {(entry) => (
+          <section class="memory-mural-section" style={{ padding: "0 20px 12px" }}>
+            <button
+              type="button"
+              class="category-header clickable"
+              style={{ width: "100%" }}
+              aria-expanded={!muralCollapsed()}
+              onClick={() => setMuralCollapsed((collapsed) => !collapsed)}
+            >
+              <span>Memory mural</span>
+              <span class="category-divider" />
+              <span
+                class="category-chevron"
+                classList={{ collapsed: muralCollapsed() }}
+                aria-hidden="true"
+              >
+                ▾
+              </span>
+            </button>
+            <Show when={!muralCollapsed()}>
+              <div class="card" style={{ padding: "12px" }}>
+                <img
+                  src={muralImageSrc(entry())}
+                  alt="Memory mural"
+                  width={entry().width}
+                  height={entry().height}
+                  decoding="async"
+                  style={{
+                    display: "block",
+                    width: "100%",
+                    height: "auto",
+                    "max-height": "70vh",
+                    "object-fit": "contain",
+                    "border-radius": "var(--radius-sm)",
+                  }}
+                />
+                <div class="card-meta" style={{ "margin-top": "8px" }}>
+                  <span>Rendered {formatDateTime(entry().rendered_at)}</span>
+                  <span>·</span>
+                  <span>{entry().token_estimate.toLocaleString()} token estimate</span>
+                </div>
+              </div>
+            </Show>
+          </section>
+        )}
       </Show>
 
       <div class="filter-bar">

@@ -40,7 +40,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { withContentLanguageDirective } from "@magic-context/core/agents/language-directive";
-import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	isEmptySidekickResult,
 	SIDEKICK_SYSTEM_PROMPT,
@@ -139,7 +139,14 @@ export function registerCtxAugCommand(
 			// session. This is what makes cross-harness memory sharing work:
 			// sidekick sees the same memories whether spawned from Pi or
 			// OpenCode at the same cwd.
-			const projectIdentity = resolveProjectIdentity(ctx.cwd);
+			const projectIdentity = resolveProjectIdentityForSession(ctx.cwd);
+			if (!projectIdentity) {
+				sessionLog(
+					sessionLabel,
+					"Error: Could not resolve project identity for sidekick.",
+				);
+				return;
+			}
 			sessionLog(sessionLabel, "/ctx-aug: project identity", projectIdentity);
 
 			const result = await runner.run({

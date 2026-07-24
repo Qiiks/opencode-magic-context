@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use serde_json::{json, Map, Value};
 
 use crate::ck_wire::{
@@ -9,8 +7,9 @@ use crate::ck_wire::{
 };
 
 use super::sidecar::{
-    meta_for_ck, stable_hash_prefix, BlockMeta, DecodeSidecar, DecodedHarnessMessages,
-    ExtractedBoundary, HarnessMessageMeta,
+    block_is_unchanged, decoded_block_fingerprint, match_block_metas, meta_for_ck,
+    stable_hash_prefix, stamp_block_identity, BlockMeta, DecodeSidecar, DecodedHarnessMessages,
+    ExtractedBoundary, HarnessMessageMeta, MatchedBlockMetas,
 };
 
 pub type PiSessionEntryJson = Value;
@@ -98,6 +97,7 @@ pub fn decode_pi_with_sidecar(
                 harness_id: Some(mid.clone()),
                 ordinal: Some(ordinal),
                 synthetic: false,
+                ..Default::default()
             },
         );
         decoded.push(CkIngressMessage {
@@ -129,9 +129,9 @@ pub fn encode_pi(messages: &[CkWireMessage], sidecar: &DecodeSidecar) -> Vec<PiS
     messages
         .iter()
         .enumerate()
-        .map(|(index, msg)| match meta_for_ck(sidecar, msg, index) {
+        .filter_map(|(index, msg)| match meta_for_ck(sidecar, msg, index) {
             Some(meta) => encode_with_meta(msg, meta),
-            None => encode_new_message(msg),
+            None => Some(encode_new_message(msg)),
         })
         .collect()
 }
@@ -294,12 +294,14 @@ fn decode_tool_result_message(
 fn push_block(
     content: &mut Vec<CkWireBlock>,
     block_metas: &mut Vec<BlockMeta>,
-    block: CkWireBlock,
+    mut block: CkWireBlock,
     native_index: usize,
     raw: &Value,
     kind: &str,
 ) {
     let block_index = content.len();
+    let content_fingerprint = decoded_block_fingerprint(&block);
+    stamp_block_identity(&mut block, block_index, native_index, &content_fingerprint);
     content.push(block);
     block_metas.push(BlockMeta {
         block_index,
@@ -307,6 +309,7 @@ fn push_block(
         native_index: Some(native_index),
         native_id: string_field(raw, "id").or_else(|| string_field(raw, "toolCallId")),
         item_id: None,
+        content_fingerprint: Some(content_fingerprint),
         raw: raw.clone(),
     });
 }
@@ -328,15 +331,19 @@ fn decode_opaque_entry(
         .unwrap_or("custom")
         .to_string();
     let block = opaque_block(&role, raw_entry.clone(), None);
+    let mut content = Vec::new();
+    let mut blocks = Vec::new();
+    push_block(&mut content, &mut blocks, block, 0, raw_entry, "opaque");
     let ck = CkWireMessage::from_parts(
         "user",
-        vec![block],
+        content,
         None,
         ProviderExtras::new(),
         HarnessMeta {
             harness_id: Some(mid.clone()),
             ordinal: Some(ordinal),
             synthetic: false,
+            ..Default::default()
         },
     );
     sidecar.remember_message(
@@ -347,38 +354,38 @@ fn decode_opaque_entry(
             role,
             raw: raw_entry.clone(),
             stable_key: Some(stable_key),
-            blocks: vec![BlockMeta {
-                block_index: 0,
-                kind: "opaque".to_string(),
-                native_index: Some(0),
-                native_id: string_field(raw_entry, "id"),
-                item_id: None,
-                raw: raw_entry.clone(),
-            }],
+            blocks,
         },
     );
     CkIngressMessage { mid, ordinal, ck }
 }
 
-fn encode_with_meta(msg: &CkWireMessage, meta: &HarnessMessageMeta) -> Value {
+fn encode_with_meta(msg: &CkWireMessage, meta: &HarnessMessageMeta) -> Option<Value> {
     let mut raw = meta.raw.clone();
+    let matched_metas = match_block_metas(&msg.content, &meta.blocks, block_matches_meta);
     if meta.role == "toolResult" || raw.get("role").and_then(Value::as_str) == Some("toolResult") {
-        if let Some(message) = pi_message_mut(&mut raw) {
-            update_tool_result_message(message, msg);
-        } else {
-            update_tool_result_message(&mut raw, msg);
+        let (block, matched_meta) = msg
+            .content
+            .iter()
+            .zip(&matched_metas.by_block)
+            .find(|(block, _)| matches!(&block.kind, CkKind::ToolResult { .. }))?;
+        if matched_meta.is_some_and(|meta| block_is_unchanged(block, meta)) {
+            return Some(meta.raw.clone());
         }
-        return raw;
+        if let Some(message) = pi_message_mut(&mut raw) {
+            update_tool_result_message(message, msg, matched_meta.is_some());
+        } else {
+            update_tool_result_message(&mut raw, msg, matched_meta.is_some());
+        }
+        return Some(if raw == meta.raw {
+            meta.raw.clone()
+        } else {
+            raw
+        });
     }
 
-    let block_meta_by_index: BTreeMap<usize, &BlockMeta> = meta
-        .blocks
-        .iter()
-        .map(|block_meta| (block_meta.block_index, block_meta))
-        .collect();
-
     if let Some(message) = pi_message_mut(&mut raw) {
-        update_pi_message_content(message, msg, &block_meta_by_index);
+        update_pi_message_content(message, msg, &matched_metas);
     } else if matches!(
         msg.content.first().map(|b| &b.kind),
         Some(CkKind::Opaque(_))
@@ -386,16 +393,55 @@ fn encode_with_meta(msg: &CkWireMessage, meta: &HarnessMessageMeta) -> Value {
         if let CkKind::Opaque(opaque) = &msg.content[0].kind {
             raw = opaque.raw.clone();
         }
+    } else if msg.content.is_empty() {
+        return None;
     }
-    raw
+    Some(if raw == meta.raw {
+        meta.raw.clone()
+    } else {
+        raw
+    })
+}
+
+fn block_matches_meta(block: &CkWireBlock, meta: &BlockMeta) -> bool {
+    match &block.kind {
+        CkKind::Text { text } => {
+            meta.kind == "text"
+                || (text.is_empty()
+                    && matches!(meta.kind.as_str(), "reasoning" | "redacted_reasoning"))
+        }
+        CkKind::Reasoning { .. } => meta.kind == "reasoning",
+        CkKind::RedactedReasoning { .. } => {
+            matches!(meta.kind.as_str(), "reasoning" | "redacted_reasoning")
+        }
+        CkKind::ToolCall { id, .. } => {
+            meta.kind == "tool_call"
+                && meta.native_id.as_deref().is_none_or(|native| {
+                    let (canonical, _) = canonical_tool_id(native);
+                    canonical == id.as_str()
+                })
+        }
+        CkKind::ToolResult { id, .. } => {
+            meta.kind == "tool_result"
+                && meta.native_id.as_deref().is_none_or(|native| {
+                    let (canonical, _) = canonical_tool_id(native);
+                    canonical == id.as_str()
+                })
+        }
+        CkKind::Media(_) => meta.kind == "image",
+        CkKind::Opaque(opaque) => meta.kind == opaque.kind,
+    }
 }
 
 fn update_pi_message_content(
     message: &mut Value,
     msg: &CkWireMessage,
-    block_meta_by_index: &BTreeMap<usize, &BlockMeta>,
+    matched_metas: &MatchedBlockMetas<'_>,
 ) {
-    if msg.role == "user" && message.get("content").is_some_and(Value::is_string) {
+    if msg.role == "user"
+        && msg.content.len() == 1
+        && message.get("content").is_some_and(Value::is_string)
+    {
         if let Some(CkWireBlock {
             kind: CkKind::Text { text },
             ..
@@ -411,22 +457,33 @@ fn update_pi_message_content(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    for (block_index, block) in msg.content.iter().enumerate() {
-        if let Some(block_meta) = block_meta_by_index.get(&block_index) {
-            if let Some(part_index) = block_meta.native_index {
-                if let Some(part) = parts.get_mut(part_index) {
-                    update_content_part(part, block);
+    for (block, block_meta) in msg.content.iter().zip(&matched_metas.by_block) {
+        if let Some(part_index) = block_meta.and_then(|block_meta| block_meta.native_index) {
+            if let Some(part) = parts.get_mut(part_index) {
+                if block_meta.is_some_and(|meta| block_is_unchanged(block, meta)) {
                     continue;
                 }
+                if !matches!(
+                    &block.kind,
+                    CkKind::Reasoning { .. } | CkKind::RedactedReasoning { .. }
+                ) {
+                    update_content_part(part, block);
+                }
+                continue;
             }
         }
         parts.push(render_block_as_content_part(block));
     }
+    parts = matched_metas.remove_unretained_native_parts(parts);
     set_value(message, "content", Value::Array(parts));
 }
 
-fn update_tool_result_message(raw: &mut Value, msg: &CkWireMessage) {
-    let Some(block) = msg.content.first() else {
+fn update_tool_result_message(raw: &mut Value, msg: &CkWireMessage, preserve_existing_id: bool) {
+    let Some(block) = msg
+        .content
+        .iter()
+        .find(|block| matches!(&block.kind, CkKind::ToolResult { .. }))
+    else {
         return;
     };
     if let CkKind::ToolResult {
@@ -436,7 +493,9 @@ fn update_tool_result_message(raw: &mut Value, msg: &CkWireMessage) {
         ..
     } = &block.kind
     {
-        let existing = string_field(raw, "toolCallId");
+        let existing = preserve_existing_id
+            .then(|| string_field(raw, "toolCallId"))
+            .flatten();
         set_string(raw, "role", "toolResult");
         set_string(
             raw,
@@ -448,6 +507,7 @@ fn update_tool_result_message(raw: &mut Value, msg: &CkWireMessage) {
             output.kind,
             CkOutputKind::ErrorText { .. }
                 | CkOutputKind::ErrorJson { .. }
+                | CkOutputKind::ErrorContent { .. }
                 | CkOutputKind::ExecutionDenied { .. }
         );
         set_value(raw, "isError", Value::Bool(is_error));
@@ -522,7 +582,7 @@ fn update_content_part(part: &mut Value, block: &CkWireBlock) {
 fn encode_new_message(msg: &CkWireMessage) -> Value {
     if msg.role == "tool" {
         let mut raw = json!({ "role": "toolResult", "content": [] });
-        update_tool_result_message(&mut raw, msg);
+        update_tool_result_message(&mut raw, msg, false);
         return raw;
     }
     let role = &msg.role;
@@ -782,39 +842,38 @@ fn pi_tool_result_output(message: &Value, is_error: bool) -> CkToolOutput {
         });
     };
 
-    let only_text = parts
-        .iter()
-        .all(|part| part.get("type").and_then(Value::as_str) == Some("text"));
-    if only_text {
-        let text = parts
-            .iter()
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
-        return CkToolOutput::bare(if is_error {
-            CkOutputKind::ErrorText { text }
-        } else {
-            CkOutputKind::Text { text }
+    if let [part] = parts.as_slice() {
+        let only_plain_fields = part.as_object().is_some_and(|object| {
+            object
+                .keys()
+                .all(|key| matches!(key.as_str(), "type" | "text"))
         });
+        if only_plain_fields && part.get("type").and_then(Value::as_str) == Some("text") {
+            let text = string_field(part, "text").unwrap_or_default();
+            return CkToolOutput::bare(if is_error {
+                CkOutputKind::ErrorText { text }
+            } else {
+                CkOutputKind::Text { text }
+            });
+        }
     }
 
     let blocks = parts
         .iter()
-        .map(|part| match part.get("type").and_then(Value::as_str) {
-            Some("text") => ResultBlock {
-                kind: ResultBlockKind::Text {
+        .map(|part| {
+            let mut provider_extras = ProviderExtras::new();
+            provider_extras
+                .entry(HARNESS.to_string())
+                .or_default()
+                .insert("rawResultPart".to_string(), part.clone());
+            let kind = match part.get("type").and_then(Value::as_str) {
+                Some("text") => ResultBlockKind::Text {
                     text: string_field(part, "text").unwrap_or_default(),
                 },
-                provider_extras: ProviderExtras::new(),
-            },
-            Some("image") => ResultBlock {
-                kind: ResultBlockKind::Media {
+                Some("image" | "file") => ResultBlockKind::Media {
                     media: pi_media_from_part(part),
                 },
-                provider_extras: ProviderExtras::new(),
-            },
-            Some(other) => ResultBlock {
-                kind: ResultBlockKind::Opaque {
+                Some(other) => ResultBlockKind::Opaque {
                     opaque: OpaqueBlock {
                         source: json!({ "type": "harness", "harness": HARNESS }),
                         kind: other.to_string(),
@@ -822,10 +881,7 @@ fn pi_tool_result_output(message: &Value, is_error: bool) -> CkToolOutput {
                         arc: None,
                     },
                 },
-                provider_extras: ProviderExtras::new(),
-            },
-            None => ResultBlock {
-                kind: ResultBlockKind::Opaque {
+                None => ResultBlockKind::Opaque {
                     opaque: OpaqueBlock {
                         source: json!({ "type": "harness", "harness": HARNESS }),
                         kind: "unknown".to_string(),
@@ -833,11 +889,18 @@ fn pi_tool_result_output(message: &Value, is_error: bool) -> CkToolOutput {
                         arc: None,
                     },
                 },
-                provider_extras: ProviderExtras::new(),
-            },
+            };
+            ResultBlock {
+                kind,
+                provider_extras,
+            }
         })
         .collect();
-    CkToolOutput::bare(CkOutputKind::Content { blocks })
+    CkToolOutput::bare(if is_error {
+        CkOutputKind::ErrorContent { blocks }
+    } else {
+        CkOutputKind::Content { blocks }
+    })
 }
 
 fn render_tool_result_content(output: &CkToolOutput) -> Vec<Value> {
@@ -852,14 +915,45 @@ fn render_tool_result_content(output: &CkToolOutput) -> Vec<Value> {
             "type": "text",
             "text": reason.clone().unwrap_or_else(|| "Execution denied".to_string())
         })],
-        CkOutputKind::Content { blocks } => blocks
-            .iter()
-            .map(|block| match &block.kind {
-                ResultBlockKind::Text { text } => json!({ "type": "text", "text": text }),
-                ResultBlockKind::Media { media } => render_media_part(media),
-                ResultBlockKind::Opaque { opaque } => opaque.raw.clone(),
-            })
-            .collect(),
+        CkOutputKind::Content { blocks } | CkOutputKind::ErrorContent { blocks } => {
+            blocks.iter().map(render_tool_result_block).collect()
+        }
+    }
+}
+
+fn render_tool_result_block(block: &ResultBlock) -> Value {
+    let retained = block
+        .provider_extras
+        .get(HARNESS)
+        .and_then(|namespace| namespace.get("rawResultPart"))
+        .cloned();
+    match &block.kind {
+        ResultBlockKind::Text { text } => {
+            let mut part = retained.unwrap_or_else(|| json!({ "type": "text" }));
+            set_string(&mut part, "type", "text");
+            set_string(&mut part, "text", text);
+            part
+        }
+        ResultBlockKind::Media { media } => {
+            let Some(mut retained) = retained else {
+                return render_media_part(media);
+            };
+            if pi_media_from_part(&retained) == *media {
+                return retained;
+            }
+            let fresh = render_media_part(media);
+            let Some(retained_object) = retained.as_object_mut() else {
+                return fresh;
+            };
+            for key in ["type", "mimeType", "mime", "filename", "data", "url"] {
+                retained_object.remove(key);
+            }
+            if let Some(fresh_object) = fresh.as_object() {
+                retained_object.extend(fresh_object.clone());
+            }
+            retained
+        }
+        ResultBlockKind::Opaque { opaque } => opaque.raw.clone(),
     }
 }
 
@@ -870,7 +964,7 @@ fn output_text(output: &CkToolOutput) -> String {
         CkOutputKind::ExecutionDenied { reason } => reason
             .clone()
             .unwrap_or_else(|| "Execution denied".to_string()),
-        CkOutputKind::Content { blocks } => blocks
+        CkOutputKind::Content { blocks } | CkOutputKind::ErrorContent { blocks } => blocks
             .iter()
             .filter_map(|block| match &block.kind {
                 ResultBlockKind::Text { text } => Some(text.as_str()),
@@ -1053,6 +1147,340 @@ mod tests {
             encode_pi(&[decoded.messages[0].ck.clone()], &decoded.sidecar),
             raw
         );
+    }
+
+    #[test]
+    fn adjacent_tool_deletion_matches_the_surviving_native_id() {
+        let raw = vec![json!({
+            "role": "assistant",
+            "content": [
+                { "type": "text", "text": "head" },
+                { "type": "toolCall", "id": "call-a|item-a", "name": "first", "arguments": { "a": 1 } },
+                { "type": "toolCall", "id": "call-b|item-b", "name": "second", "arguments": { "b": 2 } },
+                { "type": "text", "text": "tail" }
+            ],
+            "api": "responses",
+            "provider": "openai",
+            "model": "gpt-test",
+            "responseId": "resp-tools",
+            "usage": {},
+            "stopReason": "toolUse",
+            "timestamp": 8
+        })];
+        let decoded = decode_pi(&raw);
+        let mut message = decoded.messages[0].ck.clone();
+        message.content.remove(1);
+
+        let encoded = encode_pi(&[message], &decoded.sidecar);
+        let content = encoded[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0], raw[0]["content"][0]);
+        assert_eq!(content[1], raw[0]["content"][2]);
+        assert_eq!(content[2], raw[0]["content"][3]);
+    }
+
+    #[test]
+    fn leading_deletion_does_not_shift_the_next_block_onto_the_removed_slot() {
+        let raw = vec![json!({
+            "role": "assistant",
+            "content": [
+                { "type": "toolCall", "id": "call-a", "name": "first", "arguments": {} },
+                { "type": "text", "text": "survivor", "textSignature": "sig-survivor" }
+            ],
+            "timestamp": 9
+        })];
+        let decoded = decode_pi(&raw);
+        let mut message = decoded.messages[0].ck.clone();
+        message.content.remove(0);
+
+        let encoded = encode_pi(&[message], &decoded.sidecar);
+        assert_eq!(encoded[0]["content"], json!([raw[0]["content"][1].clone()]));
+    }
+
+    #[test]
+    fn duplicate_kind_adjacency_removes_only_the_deleted_text() {
+        let raw = vec![json!({
+            "role": "assistant",
+            "content": [
+                { "type": "text", "text": "A", "vendorPart": "A" },
+                {
+                    "type": "text",
+                    "text": "DELETE",
+                    "textSignature": "sig-delete",
+                    "vendorPart": "delete"
+                },
+                { "type": "text", "text": "SURVIVE", "vendorPart": "survive" }
+            ],
+            "timestamp": 10
+        })];
+        let decoded = decode_pi(&raw);
+        let mut message = decoded.messages[0].ck.clone();
+        message.content.remove(1);
+
+        let encoded = encode_pi(&[message], &decoded.sidecar);
+        assert_eq!(
+            encoded[0]["content"],
+            json!([
+                { "type": "text", "text": "A", "vendorPart": "A" },
+                { "type": "text", "text": "SURVIVE", "vendorPart": "survive" }
+            ])
+        );
+    }
+
+    #[test]
+    fn mutated_text_survivor_keeps_its_own_signature_and_vendor_extras() {
+        let raw = vec![json!({
+            "role": "assistant",
+            "content": [
+                { "type": "text", "text": "A", "vendorPart": "A" },
+                {
+                    "type": "text",
+                    "text": "DELETE",
+                    "textSignature": "sig-delete",
+                    "vendorPart": "delete"
+                },
+                {
+                    "type": "text",
+                    "text": "SURVIVE",
+                    "textSignature": "sig-survive",
+                    "vendorPart": "survive"
+                }
+            ],
+            "timestamp": 10
+        })];
+        let decoded = decode_pi(&raw);
+        let mut message = decoded.messages[0].ck.clone();
+        message.content.remove(1);
+        let survivor = &mut message.content[1];
+        survivor.kind = CkKind::Text {
+            text: "§3§ SURVIVE".to_string(),
+        };
+        survivor.mark_modified();
+        message.mark_modified();
+
+        let encoded = encode_pi(&[message], &decoded.sidecar);
+        assert_eq!(
+            encoded[0]["content"],
+            json!([
+                { "type": "text", "text": "A", "vendorPart": "A" },
+                {
+                    "type": "text",
+                    "text": "§3§ SURVIVE",
+                    "textSignature": "sig-survive",
+                    "vendorPart": "survive"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn untouched_multi_text_tool_result_replays_raw_part_boundaries_and_extras() {
+        let raw = vec![json!({
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "read",
+            "isError": false,
+            "content": [
+                { "type": "text", "text": "a", "vendor": "keep" },
+                { "type": "text", "text": "b" }
+            ]
+        })];
+        let decoded = decode_pi(&raw);
+        let CkKind::ToolResult { output, .. } = &decoded.messages[0].ck.content[0].kind else {
+            panic!("expected tool result");
+        };
+        assert!(matches!(output.kind, CkOutputKind::Content { .. }));
+        assert_eq!(
+            encode_pi(&[decoded.messages[0].ck.clone()], &decoded.sidecar),
+            raw
+        );
+    }
+
+    #[test]
+    fn mixed_image_error_tool_result_preserves_polarity_and_part_extras_on_mutation() {
+        let raw = vec![json!({
+            "role": "toolResult",
+            "toolCallId": "call-2",
+            "toolName": "inspect",
+            "isError": true,
+            "content": [
+                { "type": "text", "text": "failed", "vendor": "text-extra" },
+                {
+                    "type": "image",
+                    "mimeType": "image/png",
+                    "data": "aW1hZ2U=",
+                    "vendor": "image-extra"
+                }
+            ]
+        })];
+        let decoded = decode_pi(&raw);
+        let mut message = decoded.messages[0].ck.clone();
+        let block = &mut message.content[0];
+        let CkKind::ToolResult { output, .. } = &mut block.kind else {
+            panic!("expected tool result");
+        };
+        let CkOutputKind::ErrorContent { blocks } = &mut output.kind else {
+            panic!("mixed native error must decode as ErrorContent");
+        };
+        let ResultBlockKind::Text { text } = &mut blocks[0].kind else {
+            panic!("expected leading text result block");
+        };
+        *text = "tagged failed".to_string();
+        let ResultBlockKind::Media { media } = &mut blocks[1].kind else {
+            panic!("expected image result block");
+        };
+        media.filename = Some("failure.png".to_string());
+        block.mark_modified();
+        message.mark_modified();
+
+        let encoded = encode_pi(&[message], &decoded.sidecar);
+        assert_eq!(encoded[0]["isError"], true);
+        assert_eq!(
+            encoded[0]["content"],
+            json!([
+                { "type": "text", "text": "tagged failed", "vendor": "text-extra" },
+                {
+                    "type": "image",
+                    "mimeType": "image/png",
+                    "filename": "failure.png",
+                    "data": "aW1hZ2U=",
+                    "vendor": "image-extra"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn mixed_opaque_error_tool_result_retains_opaque_part() {
+        let raw = vec![json!({
+            "role": "toolResult",
+            "toolCallId": "call-opaque",
+            "toolName": "inspect",
+            "isError": true,
+            "content": [
+                { "type": "text", "text": "failed" },
+                { "type": "vendor-detail", "code": 17, "vendor": { "keep": true } }
+            ]
+        })];
+        let decoded = decode_pi(&raw);
+        let CkKind::ToolResult { output, .. } = &decoded.messages[0].ck.content[0].kind else {
+            panic!("expected tool result");
+        };
+        let CkOutputKind::ErrorContent { blocks } = &output.kind else {
+            panic!("mixed opaque error must decode as ErrorContent");
+        };
+        assert!(matches!(blocks[1].kind, ResultBlockKind::Opaque { .. }));
+        assert_eq!(
+            encode_pi(&[decoded.messages[0].ck.clone()], &decoded.sidecar),
+            raw
+        );
+
+        let mut message = decoded.messages[0].ck.clone();
+        let result = &mut message.content[0];
+        let CkKind::ToolResult { output, .. } = &mut result.kind else {
+            panic!("expected tool result");
+        };
+        let CkOutputKind::ErrorContent { blocks } = &mut output.kind else {
+            panic!("expected ErrorContent");
+        };
+        let ResultBlockKind::Text { text } = &mut blocks[0].kind else {
+            panic!("expected leading text block");
+        };
+        *text = "tagged failed".to_string();
+        result.mark_modified();
+        message.mark_modified();
+        let encoded = encode_pi(&[message], &decoded.sidecar);
+        assert_eq!(encoded[0]["isError"], true);
+        assert_eq!(
+            encoded[0]["content"],
+            json!([
+                { "type": "text", "text": "tagged failed" },
+                { "type": "vendor-detail", "code": 17, "vendor": { "keep": true } }
+            ])
+        );
+    }
+
+    #[test]
+    fn empty_error_tool_result_retains_empty_content_and_error_polarity() {
+        let raw = vec![json!({
+            "role": "toolResult",
+            "toolCallId": "call-empty",
+            "toolName": "inspect",
+            "isError": true,
+            "content": []
+        })];
+        let decoded = decode_pi(&raw);
+        let CkKind::ToolResult { output, .. } = &decoded.messages[0].ck.content[0].kind else {
+            panic!("expected tool result");
+        };
+        assert!(matches!(
+            output.kind,
+            CkOutputKind::ErrorContent { ref blocks } if blocks.is_empty()
+        ));
+        assert_eq!(
+            encode_pi(&[decoded.messages[0].ck.clone()], &decoded.sidecar),
+            raw
+        );
+    }
+
+    #[test]
+    fn frozen_deletion_replay_is_byte_stable() {
+        let raw = vec![json!({
+            "role": "assistant",
+            "content": [
+                { "type": "toolCall", "id": "call-a", "name": "first", "arguments": {} },
+                { "type": "toolCall", "id": "call-b", "name": "second", "arguments": {} }
+            ],
+            "timestamp": 11
+        })];
+        let decoded = decode_pi(&raw);
+        let mut message = decoded.messages[0].ck.clone();
+        message.content.remove(0);
+
+        let first = encode_pi(&[message.clone()], &decoded.sidecar);
+        let replay = encode_pi(&[message], &decoded.sidecar);
+        assert_eq!(replay, first);
+        assert_eq!(first[0]["content"], json!([raw[0]["content"][1].clone()]));
+    }
+
+    #[test]
+    fn untouched_message_replays_the_exact_retained_raw_value() {
+        let raw = vec![json!({
+            "type": "message",
+            "id": "entry-byte-identity",
+            "vendorEnvelope": { "unknown": [1, 2, 3] },
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "text",
+                    "text": "unchanged",
+                    "textSignature": "sig",
+                    "vendorPart": { "keep": true }
+                }],
+                "timestamp": 12,
+                "vendorMessage": "keep"
+            }
+        })];
+        let decoded = decode_pi(&raw);
+        let encoded = encode_pi(&[decoded.messages[0].ck.clone()], &decoded.sidecar);
+        assert_eq!(encoded, raw);
+    }
+
+    #[test]
+    fn deleted_tool_result_does_not_replay_the_retained_raw_entry() {
+        let raw = vec![json!({
+            "role": "toolResult",
+            "toolCallId": "call-a",
+            "toolName": "first",
+            "content": [{ "type": "text", "text": "done" }],
+            "isError": false,
+            "timestamp": 13
+        })];
+        let decoded = decode_pi(&raw);
+        let mut message = decoded.messages[0].ck.clone();
+        message.content.clear();
+
+        assert!(encode_pi(&[message], &decoded.sidecar).is_empty());
     }
 
     #[test]

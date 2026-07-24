@@ -1,4 +1,4 @@
-import type { Database } from "../../shared/sqlite";
+import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 
 export const GLOBAL_USER_PROFILE_PROJECT_PATH = "__global__";
 
@@ -29,14 +29,19 @@ function getNow(now?: number): number {
     return now ?? Date.now();
 }
 
+const getProjectStateStatements = new WeakMap<Database, PreparedStatement>();
+
 export function getProjectState(db: Database, projectPath: string): ProjectStateRow | null {
-    const row = db
-        .prepare(
+    let statement = getProjectStateStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
             `SELECT project_path, project_memory_epoch, project_user_profile_version, updated_at
              FROM project_state
              WHERE project_path = ?`,
-        )
-        .get(projectPath) as ProjectStateDbRow | undefined;
+        );
+        getProjectStateStatements.set(db, statement);
+    }
+    const row = statement.get(projectPath) as ProjectStateDbRow | undefined;
     return row ? toProjectState(row) : null;
 }
 

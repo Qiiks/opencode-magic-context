@@ -320,6 +320,11 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
             let conn = open_readonly(state)?;
             json(db::get_primer_candidates(&conn, a.project.as_deref()).map_err(to_command)?)
         }
+        "get_mural" => {
+            let a: ProjectArgs = parse_args(args)?;
+            let conn = open_readonly(state)?;
+            json(db::get_mural(&conn, a.project.as_deref()).map_err(to_command)?)
+        }
         "workspace_schema_ready" => {
             parse_args::<NoArgs>(args)?;
             let conn = open_readonly(state)?;

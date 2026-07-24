@@ -5,30 +5,45 @@ import { getPendingOps } from "../../features/magic-context/storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { getTagsBySession } from "../../features/magic-context/storage-tags";
 import { getErrorMessage } from "../../shared/error-message";
+import { formatThresholdClampNote } from "../../shared/format-threshold";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import {
     getProactiveCompartmentTriggerPercentage,
     POST_DROP_TARGET_RATIO,
 } from "./compartment-trigger";
-import { resolveExecuteThresholdDetail } from "./event-resolvers";
+import {
+    MAX_EXECUTE_THRESHOLD,
+    resolveExecuteThresholdDetail,
+    type ExecuteThresholdDetail,
+} from "./event-resolvers";
 import { formatBytes } from "./format-bytes";
 import { estimateTokens } from "./read-session-formatting";
 
 function formatExecuteThreshold(
-    thresholdPercentage: number,
-    mode: "tokens" | "percentage",
+    detail: ExecuteThresholdDetail,
     contextLimit: number,
 ): string {
+    const { percentage, mode } = detail;
+    // Surfaces the silent clamp from issue #241: when the configured value exceeded
+    // the 80% safety cap, append a note showing the configured value and the cap so
+    // the user sees the math (e.g. "190,000 > 80% of 128,000"). "" when not clamped.
+    const clampNote = formatThresholdClampNote({
+        clamped: detail.clamped,
+        mode,
+        configuredValue: detail.configuredValue,
+        contextLimit,
+        maxPercentage: MAX_EXECUTE_THRESHOLD,
+    });
     if (mode === "tokens" && contextLimit > 0) {
-        const tokens = Math.floor((thresholdPercentage / 100) * contextLimit);
-        return `${tokens.toLocaleString()} tokens (${thresholdPercentage.toFixed(1)}% of ${contextLimit.toLocaleString()}) [token-mode]`;
+        const tokens = Math.floor((percentage / 100) * contextLimit);
+        return `${tokens.toLocaleString()} tokens (${percentage.toFixed(1)}% of ${contextLimit.toLocaleString()}) [token-mode]${clampNote}`;
     }
     if (contextLimit > 0) {
-        const tokens = Math.floor((thresholdPercentage / 100) * contextLimit);
-        return `${thresholdPercentage}% (${tokens.toLocaleString()} of ${contextLimit.toLocaleString()})`;
+        const tokens = Math.floor((percentage / 100) * contextLimit);
+        return `${percentage}% (${tokens.toLocaleString()} of ${contextLimit.toLocaleString()})${clampNote}`;
     }
-    return `${thresholdPercentage}%`;
+    return `${percentage}%${clampNote}`;
 }
 
 export function executeStatus(
@@ -59,7 +74,6 @@ export function executeStatus(
         },
     );
     const executeThresholdPercentage = thresholdDetail.percentage;
-    const thresholdMode: "tokens" | "percentage" = thresholdDetail.mode;
     try {
         const meta = getOrCreateSessionMeta(db, sessionId);
         const tags = getTagsBySession(db, sessionId);
@@ -120,7 +134,7 @@ export function executeStatus(
             `- Queue will auto-execute: ${cacheExpired ? "yes (cache expired)" : `when TTL expires or context >= ${executeThresholdPercentage}%`}`,
             "",
             "### Execute Threshold",
-            `- Execute threshold: ${formatExecuteThreshold(executeThresholdPercentage, thresholdMode, displayContextLimit)}`,
+            `- Execute threshold: ${formatExecuteThreshold(thresholdDetail, displayContextLimit)}`,
             `- Last input tokens: ${meta.lastInputTokens.toLocaleString()} tokens`,
             "",
             `**Protected tags:** ${protectedTags}`,

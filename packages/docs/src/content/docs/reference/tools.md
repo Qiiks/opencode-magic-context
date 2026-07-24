@@ -85,10 +85,10 @@ Tool: Smart note #7 saved (pending).
 
 | Param | Meaning |
 | --- | --- |
-| `action` | `write`, `update`, `archive`, `merge` (primary); `list` is dreamer-only. |
+| `action` | `write`, `update`, `archive`, `merge`, `get` (primary); `list` is dreamer-only. |
 | `content` | Text for `write`, `update`, `merge`. |
 | `category` | Category for `write`. |
-| `ids` | One id for `update`; one or more for `archive`; two or more for `merge`. |
+| `ids` | One id for `update`; one or more for `archive`; two or more for `merge`; 1–20 for `get`. |
 | `reason` | Optional archive reason. |
 
 | Action | Primary agent | Dreamer |
@@ -97,7 +97,10 @@ Tool: Smart note #7 saved (pending).
 | `update` | Yes | Yes |
 | `archive` | Yes | Yes |
 | `merge` | Yes | Yes |
+| `get` | Yes | Yes |
 | `list` | No | Yes |
+
+`get` reads memories by id (own project, any status, plus shared categories of workspace neighbors). Not-visible or missing ids are reported per-id without distinguishing "foreign hidden" from "doesn't exist".
 
 ```text
 Agent: ctx_memory({ "action": "write", "category": "CONSTRAINTS",
@@ -109,26 +112,30 @@ Edit memories in the [dashboard](/reference/dashboard/) Mem tab; running session
 
 ## ctx_search
 
-**What it does.** Search project recall: memories, raw messages behind compacted history, and git commits when enabled. Skips content already visible in `<project-memory>` and the live tail.
+**What it does.** Search project recall: memories, raw messages behind compacted history, indexed git commits, parked notes, and promoted primers. Skips content already visible in `<project-memory>` and the live tail.
 
-**When the agent reaches for it.** Familiar problems, past decisions, regressions, or “where is X implemented?”
+**When the agent reaches for it.** Familiar problems, past decisions, regressions, or “where is X implemented?”. A whole-query id list (`#7234`, `12, 34`) bypasses text search and resolves those memories directly.
 
 | Param | Meaning |
 | --- | --- |
-| `query` | Search string. |
+| `query` | Search string — or a list of memory ids (`#12`, `12, 34`). |
 | `limit` | Max hits (default 10). |
-| `sources` | `memory`, `message`, `git_commit` — omit for all. |
+| `sources` | `memory`, `message`, `git_commit`, `note`, `primer` — omit for all. |
 
 | Question | Typical sources |
 | --- | --- |
 | When did this change? | `git_commit`, `message` |
 | Did we discuss this? | `message` |
 | Project rule for X? | `memory` |
+| Did we leave a follow-up / parked decision? | `note` |
+| Standing explanation for a recurring question? | `primer` |
 
 ```text
 Agent: ctx_search({ "query": "chunk size", "sources": ["message"] })
 Tool: ordinal 884: ... historianChunkTokens 12000 ...
 ```
+
+Note hits carry a `@msg N` anchor when they are tied to a specific message; the agent can `ctx_expand(start=N-10, end=N)` to read the surrounding conversation. Anchors only render for the current session, so a stale anchor can't point at the wrong conversation.
 
 :::tip
 Historian **facts** in `<session-history>` are not a search source — they are already in context.

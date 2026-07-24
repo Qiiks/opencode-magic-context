@@ -1,4 +1,5 @@
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
+import { getAuthorityManagedMarker } from "../../features/magic-context/context-authority";
 import { getLastIndexedOrdinal } from "../../features/magic-context/message-index";
 import {
     addNote,
@@ -10,7 +11,13 @@ import {
     setNoteLastReadAt,
     updateNote,
 } from "../../features/magic-context/storage";
+import type { RustNoteToolRequest, RustToolBackends } from "../../plugin/rust-tool-backends";
+import {
+    isRustAuthorityDrainingError,
+    toolCallIdFromContext,
+} from "../../plugin/rust-tool-backends";
 import type { Database } from "../../shared/sqlite";
+import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_NOTE_DESCRIPTION } from "./constants";
 import type { CtxNoteArgs, CtxNoteReadFilter } from "./types";
 
@@ -23,7 +30,8 @@ export interface CtxNoteToolDeps {
      * Optional — when undefined, smart-note creation is rejected with an
      * explanatory error.
      */
-    resolveProjectPath?: (directory: string) => string;
+    resolveProjectPath?: (directory: string) => string | undefined;
+    rustToolBackends?: RustToolBackends;
 }
 
 /** Capture the live-tail message ordinal so a note can be traced back to the
@@ -103,13 +111,12 @@ function buildReadSections(args: {
             sections.push(`## Session Notes\n\n${lines}${footer ? `\n\n${footer}` : ""}`);
         }
 
-        // Ready smart notes are few by construction (condition-gated) and
-        // time-sensitive — always show all of them, unpaged.
         if (readySmartNotes.length > 0) {
+            const { page, footer } = paginateNewestFirst(readySmartNotes, args.limit, args.offset);
             sections.push(
-                `## 🔔 Ready Smart Notes\n\n${readySmartNotes
+                `## 🔔 Ready Smart Notes\n\n${page
                     .map((note) => formatNoteLine(note))
-                    .join("\n\n")}`,
+                    .join("\n\n")}${footer ? `\n\n${footer}` : ""}`,
             );
         }
 
@@ -161,46 +168,100 @@ function buildReadSections(args: {
     return sections;
 }
 
+function moduleNoteText(response: unknown): string | null {
+    let value = response;
+    if (value !== null && typeof value === "object" && "result" in value) {
+        value = (value as { result?: unknown }).result;
+    }
+    if (isRustAuthorityDrainingError(value)) {
+        return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
+    }
+    if (typeof value === "string") return value;
+    if (value !== null && typeof value === "object") {
+        const record = value as Record<string, unknown>;
+        if (record.ok === false || record.error || typeof record.message === "string") {
+            const error = record.error;
+            const message =
+                typeof error === "string"
+                    ? error
+                    : error !== null && typeof error === "object" && "message" in error
+                      ? String((error as { message?: unknown }).message)
+                      : typeof record.message === "string"
+                        ? record.message
+                        : "module rejected ctx_note";
+            return `Error: ${message}`;
+        }
+        const content = record.content;
+        if (Array.isArray(content)) {
+            const text = content.find(
+                (item): item is { text: string } =>
+                    item !== null &&
+                    typeof item === "object" &&
+                    typeof (item as { text?: unknown }).text === "string",
+            )?.text;
+            if (text) return text;
+        }
+    }
+    return null;
+}
+
+const ctxNoteArgsShape = {
+    action: tool.schema
+        .enum(["write", "read", "dismiss", "update"])
+        .optional()
+        .describe(
+            "Operation to perform. Defaults to 'write' when content is provided, otherwise 'read'.",
+        ),
+    content: tool.schema.string().optional().describe("Note text to store when action is 'write'."),
+    surface_condition: tool.schema
+        .string()
+        .optional()
+        .describe(
+            "Externally verifiable condition for smart notes. A separate background agent (dreamer) checks this using gh CLI, web fetches, file reads, git, etc. — NOT your conversation history. Use only for things like GitHub PR/issue state, release tags, file contents, or workflow runs. DO NOT use for 'when the user mentions X' / 'when we revisit Y' / 'when relevant to current task' — dreamer has no access to session context. For session-relative reminders, omit this and write a regular note.",
+        ),
+    filter: tool.schema
+        .enum(["all", "active", "pending", "ready", "dismissed"])
+        .optional()
+        .describe(
+            "Optional read filter. Defaults to active session notes + ready smart notes. Use 'all' to inspect every status or 'pending' to inspect unsurfaced smart notes.",
+        ),
+    limit: tool.schema
+        .number()
+        .optional()
+        .describe("Max notes per section for read, newest first (default: 25)"),
+    offset: tool.schema
+        .number()
+        .optional()
+        .describe("Skip this many newest notes for read — page older ones (default: 0)"),
+    note_id: tool.schema
+        .number()
+        .optional()
+        .describe("Note ID (required for 'dismiss' and 'update' actions)."),
+};
+// The tool definition exposes only the documented argument shape to the model
+// provider, but older callers may still send extra arguments. Parse with
+// passthrough so execute() can receive those fields without advertising them.
+const ctxNoteArgsSchema = tool.schema.object(ctxNoteArgsShape).passthrough();
+
 function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
     return tool({
         description: CTX_NOTE_DESCRIPTION,
-        args: {
-            action: tool.schema
-                .enum(["write", "read", "dismiss", "update"])
-                .optional()
-                .describe(
-                    "Operation to perform. Defaults to 'write' when content is provided, otherwise 'read'.",
-                ),
-            content: tool.schema
-                .string()
-                .optional()
-                .describe("Note text to store when action is 'write'."),
-            surface_condition: tool.schema
-                .string()
-                .optional()
-                .describe(
-                    "Externally verifiable condition for smart notes. A separate background agent (dreamer) checks this using gh CLI, web fetches, file reads, git, etc. — NOT your conversation history. Use only for things like GitHub PR/issue state, release tags, file contents, or workflow runs. DO NOT use for 'when the user mentions X' / 'when we revisit Y' / 'when relevant to current task' — dreamer has no access to session context. For session-relative reminders, omit this and write a regular note.",
-                ),
-            filter: tool.schema
-                .enum(["all", "active", "pending", "ready", "dismissed"])
-                .optional()
-                .describe(
-                    "Optional read filter. Defaults to active session notes + ready smart notes. Use 'all' to inspect every status or 'pending' to inspect unsurfaced smart notes.",
-                ),
-            limit: tool.schema
-                .number()
-                .optional()
-                .describe("Max notes per section for read, newest first (default: 25)"),
-            offset: tool.schema
-                .number()
-                .optional()
-                .describe("Skip this many newest notes for read — page older ones (default: 0)"),
-            note_id: tool.schema
-                .number()
-                .optional()
-                .describe("Note ID (required for 'dismiss' and 'update' actions)."),
-        },
-        async execute(args: CtxNoteArgs, toolContext) {
+        args: ctxNoteArgsShape,
+        async execute(rawArgs: CtxNoteArgs, toolContext) {
+            const parsedArgs = ctxNoteArgsSchema.safeParse(rawArgs);
+            let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxNoteArgs;
+            args = unwrapImitatedReducedArgs(args, ["action", "content"], {
+                action: { type: "enum", values: ["write", "read", "dismiss", "update"] },
+                content: "string",
+                surface_condition: "string",
+                filter: {
+                    type: "enum",
+                    values: ["all", "active", "pending", "ready", "dismissed"],
+                },
+                limit: "number",
+                offset: "number",
+                note_id: "number",
+            });
             const sessionId = toolContext.sessionID;
             // Infer write only on NON-EMPTY content. GPT-family models fill every
             // optional param (content:"" for a read), so a bare `typeof === "string"`
@@ -212,6 +273,65 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
             // can differ from the session's working directory when the user
             // runs `opencode -s <id>` from outside the project.
             const projectIdentity = deps.resolveProjectPath?.(toolContext.directory);
+
+            const marker = projectIdentity
+                ? getAuthorityManagedMarker(deps.db, projectIdentity)
+                : null;
+            let notesAuthority: "TS" | "PREPARING" | "MODULE" | "DRAINING" | null = null;
+            if (projectIdentity && deps.rustToolBackends?.authorityState) {
+                try {
+                    notesAuthority = await deps.rustToolBackends.authorityState({
+                        projectPath: projectIdentity,
+                        projectRoot: toolContext.directory,
+                        domain: "notes",
+                    });
+                } catch (error) {
+                    if (marker) {
+                        return `Error: Rust notes authority is unavailable. ${error instanceof Error ? error.message : String(error)}`;
+                    }
+                }
+            }
+            if (notesAuthority === "MODULE") {
+                const rustNote = deps.rustToolBackends?.note;
+                if (!rustNote || !projectIdentity) {
+                    return "Error: Rust notes authority is active, but this module transport does not support ctx_note.";
+                }
+                if (
+                    action === "write" &&
+                    args.surface_condition?.trim() &&
+                    deps.rustToolBackends?.noteEvaluationAvailable?.(projectIdentity) !== true
+                ) {
+                    return "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not written.";
+                }
+                const commandId = toolCallIdFromContext(toolContext);
+                const request: RustNoteToolRequest = {
+                    ...(commandId ? { commandId } : {}),
+                    sessionId,
+                    projectRoot: toolContext.directory,
+                    projectPath: projectIdentity,
+                    memoryProject: projectIdentity,
+                    action,
+                    content: args.content,
+                    surfaceCondition: args.surface_condition,
+                    filter: args.filter,
+                    limit: args.limit,
+                    offset: args.offset,
+                    noteId: args.note_id,
+                };
+                try {
+                    const text = moduleNoteText(await rustNote(request));
+                    if (text !== null) return text;
+                    return "Error: Rust module returned an invalid ctx_note response.";
+                } catch (error) {
+                    if (isRustAuthorityDrainingError(error)) {
+                        return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
+                    }
+                    return `Error: Rust module ctx_note failed. ${error instanceof Error ? error.message : String(error)}`;
+                }
+            }
+            if (marker || notesAuthority === "PREPARING" || notesAuthority === "DRAINING") {
+                return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
+            }
 
             if (action === "write") {
                 const content = args.content?.trim();

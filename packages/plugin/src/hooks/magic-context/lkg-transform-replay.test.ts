@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
@@ -9,7 +9,13 @@ import {
     validateLkgEntry,
     validateLkgSeam,
 } from "./lkg-replay";
-import { captureSlot, getSlot, noteEntry, resetLkgSlotsForTest } from "./lkg-slot";
+import {
+    captureSlot,
+    getSlot,
+    lkgContentDigest,
+    noteEntry,
+    resetLkgSlotsForTest,
+} from "./lkg-slot";
 import { createPassOutcome } from "./pass-outcome";
 import type { MessageLike } from "./transform-operations";
 
@@ -130,6 +136,56 @@ describe("LKG transform replay", () => {
         }
     });
 
+    test("declines replay when stable-id content changes through the anchor", () => {
+        resetLkgSlotsForTest();
+        const input = [user("u0", 1), user("u1", 2)];
+        expect(
+            captureLkgSlot({
+                sessionId: "content-mismatch",
+                input,
+                output: structuredClone(input),
+                modelKey: "test/model",
+                providerKey: "test",
+            }),
+        ).toBe(true);
+        const current = structuredClone(input) as MessageLike[];
+        (current[1]?.parts[0] as { text: string }).text = "same id, changed content";
+
+        expect(
+            replayLkg({
+                sessionId: "content-mismatch",
+                messages: current,
+                modelKey: "test/model",
+                providerKey: "test",
+            }),
+        ).toEqual({ ok: false, reason: "lkg_content_mismatch" });
+        expect(getSlot("content-mismatch")).toBeUndefined();
+    });
+
+    test("serializes the capture prefix once and stores that artifact", () => {
+        resetLkgSlotsForTest();
+        const input = [user("u0", 1)];
+        const stringifySpy = spyOn(JSON, "stringify");
+
+        try {
+            expect(
+                captureLkgSlot({
+                    sessionId: "single-serialization",
+                    input,
+                    output: structuredClone(input),
+                    modelKey: "test/model",
+                    providerKey: "test",
+                }),
+            ).toBe(true);
+            expect(stringifySpy).toHaveBeenCalledTimes(1);
+            expect(getSlot("single-serialization")?.jsonPrefix).toBe(
+                stringifySpy.mock.results[0]?.value,
+            );
+        } finally {
+            stringifySpy.mockRestore();
+        }
+    });
+
     test("declines duplicate input ids instead of storing a full-output snapshot", () => {
         resetLkgSlotsForTest();
         const input = [user("u0", 1), user("u0", 2)];
@@ -142,6 +198,7 @@ describe("LKG transform replay", () => {
         captureSlot("session", {
             jsonPrefix: JSON.stringify([user("u1", 1)]),
             inputIdSeq: ["u1", "u2"],
+            inputContentDigests: ["digest-u1", "digest-u2"],
             lastInputMessageId: "u2",
             modelKey: "test/model",
             providerKey: "test",
@@ -159,6 +216,7 @@ describe("LKG transform replay", () => {
         captureSlot("session", {
             jsonPrefix: JSON.stringify([user("old", 1)]),
             inputIdSeq: ["old"],
+            inputContentDigests: ["digest-old"],
             lastInputMessageId: "old",
             modelKey: "test/model",
             providerKey: "test",
@@ -199,6 +257,84 @@ describe("LKG transform replay", () => {
             } as MessageLike,
         ];
         expect(validateLkgSeam(prefix, tail, "openai")).toBe(false);
+    });
+
+    test("declines Anthropic replay when adjacent assistants would merge signed thinking runs", () => {
+        resetLkgSlotsForTest();
+        captureSlot("anthropic-invalid", {
+            jsonPrefix: JSON.stringify([
+                assistant("a-prefix", 1, [
+                    { type: "thinking", thinking: "first signed trace", signature: "sig-a" },
+                    { type: "text", text: "first response" },
+                ]),
+            ]),
+            inputIdSeq: ["u-anchor"],
+            inputContentDigests: [
+                lkgContentDigest(
+                    user("u-anchor", 2, { providerID: "anthropic", modelID: "claude-test" }),
+                )!,
+            ],
+            lastInputMessageId: "u-anchor",
+            modelKey: "anthropic/claude-test",
+            providerKey: "anthropic",
+            capturedAt: 1,
+        });
+        const current = [
+            user("u-anchor", 2, { providerID: "anthropic", modelID: "claude-test" }),
+            assistant("a-tail", 3, [
+                { type: "thinking", thinking: "second signed trace", signature: "sig-b" },
+                { type: "text", text: "second response" },
+            ]),
+        ];
+
+        expect(
+            replayLkg({
+                sessionId: "anthropic-invalid",
+                messages: current,
+                modelKey: "anthropic/claude-test",
+                providerKey: "anthropic",
+            }),
+        ).toEqual({ ok: false, reason: "lkg_anthropic_reasoning_run_invalid" });
+        expect(getSlot("anthropic-invalid")).toBeUndefined();
+    });
+
+    test("serves an Anthropic replay with one leading thinking block in an assistant run", () => {
+        resetLkgSlotsForTest();
+        captureSlot("anthropic-valid", {
+            jsonPrefix: JSON.stringify([
+                assistant("a-prefix", 1, [
+                    { type: "thinking", thinking: "signed trace", signature: "sig-a" },
+                    { type: "text", text: "first response" },
+                ]),
+            ]),
+            inputIdSeq: ["u-anchor"],
+            inputContentDigests: [
+                lkgContentDigest(
+                    user("u-anchor", 2, { providerID: "anthropic", modelID: "claude-test" }),
+                )!,
+            ],
+            lastInputMessageId: "u-anchor",
+            modelKey: "anthropic/claude-test",
+            providerKey: "anthropic",
+            capturedAt: 1,
+        });
+        const current = [
+            user("u-anchor", 2, { providerID: "anthropic", modelID: "claude-test" }),
+            assistant("a-tail", 3, [{ type: "text", text: "second response" }]),
+        ];
+
+        const replay = replayLkg({
+            sessionId: "anthropic-valid",
+            messages: current,
+            modelKey: "anthropic/claude-test",
+            providerKey: "anthropic",
+        });
+        expect(replay.ok).toBe(true);
+        if (replay.ok)
+            expect(replay.messages.map((message) => message.info.id)).toEqual([
+                "a-prefix",
+                "a-tail",
+            ]);
     });
 
     test("outermost handler rethrows emergency fail-closed errors", async () => {

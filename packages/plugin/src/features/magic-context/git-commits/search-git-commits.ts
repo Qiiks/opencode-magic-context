@@ -14,7 +14,7 @@ import type { StoredGitCommit } from "./storage-git-commits";
 
 const ftsStatements = new WeakMap<Database, PreparedStatement>();
 const ftsPlainStatements = new WeakMap<Database, PreparedStatement>();
-const getBySHAStatements = new WeakMap<Database, PreparedStatement>();
+const getBySHAsStatements = new WeakMap<Database, PreparedStatement>();
 
 interface CommitRow {
     sha: string;
@@ -69,14 +69,16 @@ function getLikeFallbackStatement(db: Database): PreparedStatement {
     return stmt;
 }
 
-function getBySHAStatement(db: Database): PreparedStatement {
-    let stmt = getBySHAStatements.get(db);
+function getBySHAsStatement(db: Database): PreparedStatement {
+    let stmt = getBySHAsStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
             `SELECT sha, project_path, short_sha, message, author, committed_at, indexed_at
-             FROM git_commits WHERE sha = ?`,
+               FROM git_commits
+              WHERE project_path = ?
+                AND sha IN (SELECT value FROM json_each(?))`,
         );
-        getBySHAStatements.set(db, stmt);
+        getBySHAsStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -177,14 +179,15 @@ export function searchGitCommitsSync(
     const bySha = new Map<string, StoredGitCommit>();
     for (const commit of ftsCandidates) bySha.set(commit.sha, commit);
 
-    const getCommitStmt = getBySHAStatement(db);
-    // Pull semantic-only commits (may or may not be in ftsCandidates).
-    for (const sha of semanticScores.keys()) {
-        if (bySha.has(sha)) continue;
-        const row = getCommitStmt.get(sha) as CommitRow | undefined;
-        if (row && row.project_path === projectPath) {
-            bySha.set(sha, rowToCommit(row));
-        }
+    // Pull all semantic-only commit metadata in one statement. JSON avoids
+    // SQLite's positional-parameter limit for large semantic pools.
+    const semanticOnlyShas = [...semanticScores.keys()].filter((sha) => !bySha.has(sha));
+    if (semanticOnlyShas.length > 0) {
+        const rows = getBySHAsStatement(db).all(
+            projectPath,
+            JSON.stringify(semanticOnlyShas),
+        ) as CommitRow[];
+        for (const row of rows) bySha.set(row.sha, rowToCommit(row));
     }
 
     const results: GitCommitSearchHit[] = [];

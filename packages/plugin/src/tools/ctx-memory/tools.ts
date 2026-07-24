@@ -1,9 +1,11 @@
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { DREAMER_AGENT } from "../../agents/dreamer";
 import { SIDEKICK_AGENT } from "../../agents/sidekick";
+import { getAuthorityManagedMarker } from "../../features/magic-context/context-authority";
 import {
     archiveMemory,
     CATEGORY_PRIORITY,
+    getMemoriesByIds,
     getMemoriesByProject,
     getMemoryByHash,
     getMemoryById,
@@ -39,7 +41,12 @@ import {
     resolveWorkspaceShareCategories,
     storedPathBelongsToWorkspace,
 } from "../../features/magic-context/workspaces";
+import {
+    isRustAuthorityDrainingError,
+    toolCallIdFromContext,
+} from "../../plugin/rust-tool-backends";
 import { sessionLog } from "../../shared/logger";
+import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_MEMORY_DESCRIPTION, CTX_MEMORY_TOOL_NAME, DEFAULT_SEARCH_LIMIT } from "./constants";
 import {
     CTX_MEMORY_ACTIONS,
@@ -80,6 +87,38 @@ function getAllowedActions(deps: CtxMemoryToolDeps): [CtxMemoryAction, ...CtxMem
 function normalizeCategory(category?: string): string | undefined {
     const trimmed = category?.trim();
     return trimmed ? trimmed : undefined;
+}
+
+function moduleMemoryText(response: unknown): string | null {
+    let value = response;
+    if (value !== null && typeof value === "object" && "result" in value) {
+        value = (value as { result?: unknown }).result;
+    }
+    if (isRustAuthorityDrainingError(value)) {
+        return "Error: Rust memory authority is not ready; TypeScript fallback is disabled.";
+    }
+    if (typeof value === "string") return value;
+    if (value !== null && typeof value === "object") {
+        const record = value as Record<string, unknown>;
+        if (record.ok === false || record.error || typeof record.message === "string") {
+            const detail = record.error ?? record.message ?? "module rejected ctx_memory";
+            const message =
+                detail !== null && typeof detail === "object" && "message" in detail
+                    ? String((detail as { message?: unknown }).message)
+                    : String(detail);
+            return `Error: ${message}`;
+        }
+        if (Array.isArray(record.content)) {
+            const text = record.content.find(
+                (item): item is { text: string } =>
+                    item !== null &&
+                    typeof item === "object" &&
+                    typeof (item as { text?: unknown }).text === "string",
+            )?.text;
+            if (text) return text;
+        }
+    }
+    return null;
 }
 
 function formatMemoryList(memories: Memory[]): string {
@@ -145,6 +184,32 @@ function filterByCategory(memories: Memory[], category?: string): Memory[] {
     }
 
     return memories.filter((memory) => memory.category === category);
+}
+
+// Per-id not-found / not-visible wording. Sharing one message between the two
+// states avoids an existence oracle for foreign memories — a caller that knows
+// a memory is hidden by workspace share policy should not be able to
+// distinguish "this id is foreign and not shared" from "this id does not
+// exist" by reading the error text.
+const GET_NOT_VISIBLE_MESSAGE = (id: number): string =>
+    `id ${id}: not found or not visible from this project`;
+
+const GET_MAX_IDS = 20;
+
+function formatGetOutput(args: {
+    requestedIds: number[];
+    memoriesById: Map<number, Memory>;
+}): string {
+    const parts: string[] = [];
+    for (const id of args.requestedIds) {
+        const memory = args.memoriesById.get(id);
+        if (!memory) {
+            parts.push(GET_NOT_VISIBLE_MESSAGE(id));
+        } else {
+            parts.push(formatMemoryList([memory]));
+        }
+    }
+    return parts.join("\n\n");
 }
 
 function queueMemoryEmbedding(args: {
@@ -275,50 +340,62 @@ function updateMemoryContentInCurrentTransaction(
     invalidateMemory(memory.projectPath, memory.id);
 }
 
+const ctxMemoryArgsShape = {
+    // Keep the complete action argument shape available to execute(); it can reject
+    // actions that are unsafe for the current agent once that agent is known. The
+    // passthrough parser also retains extra arguments sent by older callers.
+    action: tool.schema
+        .enum([...CTX_MEMORY_DREAMER_ACTIONS])
+        .optional()
+        .describe("What to do: write, update, archive, merge, get, or list"),
+    content: tool.schema
+        .string()
+        .optional()
+        .describe("The memory text — one standalone fact (required for write, update, merge)"),
+    category: tool.schema
+        .enum([...V2_MEMORY_CATEGORIES])
+        .optional()
+        .describe("What kind of fact this is (required for write; optional merge override)"),
+    ids: tool.schema
+        .array(tool.schema.number())
+        .optional()
+        .describe(
+            "Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more, get one to twenty",
+        ),
+    limit: tool.schema.number().optional().describe("Max results for list (default: 10)"),
+    reason: tool.schema
+        .string()
+        .optional()
+        .describe("Why the memory is being archived (optional, recommended)"),
+};
+const ctxMemoryArgsSchema = tool.schema.object(ctxMemoryArgsShape).passthrough();
+
 function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
     const allowedActions = getAllowedActions(deps);
 
     return tool({
         description: CTX_MEMORY_DESCRIPTION,
-        args: {
-            // The OpenCode plugin exposes one shared tool definition for all agents, so
-            // schema-level narrowing to `allowedActions` blocks dreamer child sessions
-            // before execute() can inspect `toolContext.agent`. Keep the full action
-            // schema visible to the runtime and enforce primary-session safety below.
-            action: tool.schema
-                .enum([...CTX_MEMORY_DREAMER_ACTIONS])
-                .describe("What to do: write, update, archive, merge, or list"),
-            content: tool.schema
-                .string()
-                .optional()
-                .describe(
-                    "The memory text — one standalone fact (required for write, update, merge)",
-                ),
-            category: tool.schema
-                .enum([...V2_MEMORY_CATEGORIES])
-                .optional()
-                .describe(
-                    "What kind of fact this is (required for write; optional merge override)",
-                ),
-            ids: tool.schema
-                .array(tool.schema.number())
-                .optional()
-                .describe(
-                    "Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more",
-                ),
-            limit: tool.schema.number().optional().describe("Max results for list (default: 10)"),
-            reason: tool.schema
-                .string()
-                .optional()
-                .describe("Why the memory is being archived (optional, recommended)"),
-        },
-        async execute(args: CtxMemoryArgs, toolContext) {
+        args: ctxMemoryArgsShape,
+        async execute(rawArgs: CtxMemoryArgs, toolContext) {
+            const parsedArgs = ctxMemoryArgsSchema.safeParse(rawArgs);
+            let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxMemoryArgs;
+            args = unwrapImitatedReducedArgs(args, ["action"], {
+                action: { type: "enum", values: CTX_MEMORY_DREAMER_ACTIONS },
+                content: "string",
+                category: { type: "enum", values: V2_MEMORY_CATEGORIES },
+                ids: { type: "array", items: "number", maxItems: 100 },
+                limit: "number",
+                reason: "string",
+            });
             // Sidekick consumes untrusted `/ctx-aug` prompt text and is retrieval-only;
             // fail closed even if a future permission list accidentally exposes this tool.
             if (toolContext.agent === SIDEKICK_AGENT) {
                 return "Error: ctx_memory is not available to the sidekick agent.";
             }
-            if (toolContext.agent !== DREAMER_AGENT && !allowedActions.includes(args.action)) {
+            if (
+                args.action === undefined ||
+                (toolContext.agent !== DREAMER_AGENT && !allowedActions.includes(args.action))
+            ) {
                 return `Error: Action '${args.action}' is not allowed in this context.`;
             }
 
@@ -327,7 +404,60 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
             // can differ from the session's working directory when the user
             // runs `opencode -s <id>` from outside the project.
             const projectPath = deps.resolveProjectPath(toolContext.directory);
+            if (!projectPath) {
+                return "Error: Could not resolve project identity for memory action.";
+            }
             await deps.ensureProjectRegistered?.(toolContext.directory, deps.db);
+            if (args.action !== "list") {
+                const marker = getAuthorityManagedMarker(deps.db, projectPath);
+                let authorityState: "TS" | "PREPARING" | "MODULE" | "DRAINING" | null = null;
+                try {
+                    authorityState =
+                        (await deps.rustToolBackends?.authorityState?.({
+                            projectPath,
+                            projectRoot: toolContext.directory,
+                            domain: "memories",
+                        })) ?? null;
+                } catch (error) {
+                    if (marker) {
+                        return `Error: Rust memory authority is unavailable. ${error instanceof Error ? error.message : String(error)}`;
+                    }
+                }
+                if (authorityState === "MODULE") {
+                    const memoryBackend = deps.rustToolBackends?.memory;
+                    if (!memoryBackend) {
+                        return "Error: Rust memory authority is active, but this module transport does not support ctx_memory.";
+                    }
+                    try {
+                        const commandId = toolCallIdFromContext(toolContext);
+                        const text = moduleMemoryText(
+                            await memoryBackend({
+                                ...(commandId ? { commandId } : {}),
+                                sessionId: toolContext.sessionID,
+                                projectRoot: toolContext.directory,
+                                projectPath,
+                                memoryProject: projectPath,
+                                action: args.action,
+                                content: args.content,
+                                category: args.category,
+                                ids: args.ids,
+                                reason: args.reason,
+                            }),
+                        );
+                        return (
+                            text ?? "Error: Rust module returned an invalid ctx_memory response."
+                        );
+                    } catch (error) {
+                        if (isRustAuthorityDrainingError(error)) {
+                            return "Error: Rust memory authority is not ready; TypeScript fallback is disabled.";
+                        }
+                        return `Error: Rust module ctx_memory failed. ${error instanceof Error ? error.message : String(error)}`;
+                    }
+                }
+                if (marker || authorityState === "PREPARING" || authorityState === "DRAINING") {
+                    return "Error: Rust memory authority is not ready; TypeScript fallback is disabled.";
+                }
+            }
             const workspaceIdentitySet = resolveWorkspaceIdentitySet(deps.db, projectPath);
             const expandedWorkspace = expandWorkspaceIdentitySetWithAliases(
                 deps.db,
@@ -373,7 +503,13 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 }
                 const isOwn = targetIdentityForStoredPath(memory.projectPath) === projectPath;
                 if (isOwn) return true;
-                return toolShareCategories?.includes(memory.category) ?? false;
+                return (
+                    (memory.status === "active" || memory.status === "permanent") &&
+                    (memory.expiresAt === null || memory.expiresAt > Date.now()) &&
+                    memory.shareable === 1 &&
+                    ["project", "ecosystem", "universe"].includes(memory.scope) &&
+                    (toolShareCategories?.includes(memory.category) ?? false)
+                );
             };
             const memoryOwnedByTool = (memory: Memory): boolean =>
                 workspaceIdentitySet.identities.length > 1
@@ -449,6 +585,29 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 ).slice(0, limit);
 
                 return formatMemoryList(memories);
+            }
+
+            if (args.action === "get") {
+                const getIds = args.ids;
+                if (!getIds || getIds.length === 0 || !getIds.every(Number.isInteger)) {
+                    return "Error: 'ids' must contain at least one integer memory ID when action is 'get'.";
+                }
+                if (getIds.length > GET_MAX_IDS) {
+                    return `Error: 'ids' must contain at most ${GET_MAX_IDS} memory IDs when action is 'get' (got ${getIds.length}).`;
+                }
+                // De-dupe while preserving first-seen order so the output lists
+                // each requested id exactly once and never reflects a row twice.
+                const uniqueIds = [...new Set(getIds)];
+                const fetched = getMemoriesByIds(deps.db, uniqueIds);
+                const memoriesById = new Map<number, Memory>(
+                    fetched
+                        .filter((memory) => memoryVisibleToTool(memory))
+                        .map((memory) => [memory.id, memory]),
+                );
+                return formatGetOutput({
+                    requestedIds: uniqueIds,
+                    memoriesById,
+                });
             }
 
             if (args.action === "update") {

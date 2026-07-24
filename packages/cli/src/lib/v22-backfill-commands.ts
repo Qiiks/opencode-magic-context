@@ -1,3 +1,4 @@
+import { getPersistedSchemaVersion } from "@magic-context/core/features/magic-context/storage-db";
 import {
     doctorRekeyV22DirIdentity,
     doctorRetryV22Backfill,
@@ -13,7 +14,7 @@ export interface V22BackfillCommandArgs {
 
 export interface V22BackfillCommandHarness {
     name: string;
-    openDatabase(): Database | null;
+    openDatabase(readonly?: boolean): Database | null;
     closeDatabase?(): void;
     log: {
         info(message: string): void;
@@ -46,11 +47,16 @@ export async function runV22BackfillCommands(
 
     let db: Database | null = null;
     try {
-        db = harness.openDatabase();
+        // Status checks are read-only; repairs modify the database and must reject
+        // older schemas so they do not upgrade a database beyond the schema version
+        // that a running harness can support.
+        const readonly = !args.retryV22Backfill && args.rekeyV22DirIdentity === undefined;
+        db = harness.openDatabase(readonly);
         if (!db) {
             harness.log.error(`Could not open the ${harness.name} Magic Context database.`);
             return { handled: true, exitCode: 1 };
         }
+        const schemaVersionBefore = getPersistedSchemaVersion(db);
 
         if (args.checkV22Backfill) {
             const status = getV22BackfillStatus(db);
@@ -91,6 +97,13 @@ export async function runV22BackfillCommands(
             );
         }
 
+        const schemaVersionAfter = getPersistedSchemaVersion(db);
+        harness.log.info(`Magic Context schema: v${schemaVersionBefore} → v${schemaVersionAfter}`);
+        if (!readonly) {
+            harness.log.warn(
+                "If OpenCode or Pi is running, restart it before creating new sessions so every process reloads the same schema fence.",
+            );
+        }
         return { handled: true, exitCode: 0 };
     } catch (error) {
         harness.log.error(error instanceof Error ? error.message : String(error));

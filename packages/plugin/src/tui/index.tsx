@@ -223,7 +223,7 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                 them how close they are to compaction triggering. */}
             <box flexDirection="row" justifyContent="space-between" width="100%">
                 <text fg={s().usagePercentage >= 80 ? t().error : s().usagePercentage >= 65 ? t().warning : t().accent}>
-                    <b>{s().usagePercentage.toFixed(1)}%</b> / {formatThresholdPercent(s().executeThreshold)}%
+                    <b>{s().usagePercentage.toFixed(1)}%</b> / {formatThresholdPercent(s().executeThreshold)}%{s().executeThresholdClamped ? "*" : ""}
                 </text>
                 <text fg={s().usagePercentage >= 80 ? t().error : s().usagePercentage >= 65 ? t().warning : t().accent}>
                     {fmt(s().inputTokens)} / {contextLimit() > 0 ? fmt(contextLimit()) : "?"} tokens
@@ -323,7 +323,7 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                 {/* Right column */}
                 <box flexDirection="column" flexGrow={1} flexBasis={0}>
                     <text fg={t().text}><b>Reductions</b></text>
-                    <R t={t()} l="Execute threshold" v={`${formatThresholdPercent(s().executeThreshold)}%`} />
+                    <R t={t()} l="Execute threshold" v={`${formatThresholdPercent(s().executeThreshold)}%${s().executeThresholdClamped ? "*" : ""}`} />
                     <R t={t()} l="Last reduce anchor" v={`${fmt(s().lastNudgeTokens)} tok`} />
                     <box marginTop={1}>
                         <text fg={t().text}><b>Context Details</b></text>
@@ -574,6 +574,193 @@ function showResultDialog(api: TuiPluginApi, title: string, message: string): bo
     return true
 }
 
+type TuiProbeResult = {
+    hostConstructed: boolean
+    hostThrew: string | null
+    customThrew: string | null
+    opencodeVersion: string
+    hostPainted: boolean | null
+    hostPaint: string
+}
+
+function probeErrorMessage(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error)
+    return message.replace(/\s+/g, " ").trim() || "unknown error"
+}
+
+function probeVersion(api: TuiPluginApi): string {
+    try {
+        const version = api.app?.version
+        return typeof version === "string" && version.length > 0 ? version : "unavailable"
+    } catch {
+        return "unavailable"
+    }
+}
+
+function renderTuiProbeHostArm(api: TuiPluginApi, result: TuiProbeResult): void {
+    try {
+        api.ui.dialog.replace(() => {
+            try {
+                const element = (
+                    <api.ui.DialogAlert
+                        title="Magic Context TUI probe: host arm"
+                        message="Host-owned dialog probe is rendering. It will be replaced after 500ms."
+                        onConfirm={() => {}}
+                    />
+                )
+                result.hostConstructed = true
+                return element
+            } catch (error) {
+                result.hostThrew = probeErrorMessage(error)
+                return null as unknown as JSX.Element
+            }
+        })
+    } catch (error) {
+        result.hostThrew ??= probeErrorMessage(error)
+    }
+}
+
+function renderTuiProbeCustomArm(api: TuiPluginApi, result: TuiProbeResult): void {
+    try {
+        api.ui.dialog.replace(() => {
+            try {
+                return (
+                    <box>
+                        <text>probe</text>
+                    </box>
+                )
+            } catch (error) {
+                result.customThrew = probeErrorMessage(error)
+                return null as unknown as JSX.Element
+            }
+        })
+    } catch (error) {
+        result.customThrew ??= probeErrorMessage(error)
+    }
+}
+
+async function waitForTuiProbeHostPaint(api: TuiPluginApi, result: TuiProbeResult): Promise<void> {
+    if (result.hostThrew !== null) {
+        result.hostPainted = false
+        result.hostPaint = "not_reached_host_threw"
+        return
+    }
+
+    type ProbeRenderer = {
+        once?: (event: string, listener: () => void) => unknown
+        removeListener?: (event: string, listener: () => void) => unknown
+    }
+    let renderer: ProbeRenderer | undefined
+    try {
+        renderer = api.renderer as unknown as ProbeRenderer
+    } catch {
+        // Older hosts may not expose a renderer paint signal.
+    }
+    if (!renderer || typeof renderer.once !== "function") {
+        await new Promise<void>((resolve) => setTimeout(resolve, 500))
+        result.hostPainted = null
+        result.hostPaint = "no_frame_signal_after_500ms_visual_confirmation_required"
+        return
+    }
+
+    await new Promise<void>((resolve) => {
+        let settled = false
+        const onFrame = () => {
+            if (settled) return
+            settled = true
+            if (timer) clearTimeout(timer)
+            renderer.removeListener?.("frame", onFrame)
+            result.hostPainted = true
+            result.hostPaint = "observed_renderer_frame"
+            resolve()
+        }
+        const timer = setTimeout(() => {
+            if (settled) return
+            settled = true
+            renderer?.removeListener?.("frame", onFrame)
+            result.hostPainted = null
+            result.hostPaint = "no_frame_after_500ms_visual_confirmation_required"
+            resolve()
+        }, 500)
+        try {
+            renderer.once("frame", onFrame)
+        } catch (error) {
+            if (settled) return
+            settled = true
+            clearTimeout(timer)
+            renderer.removeListener?.("frame", onFrame)
+            result.hostPainted = null
+            result.hostPaint = `frame_signal_error_${probeErrorMessage(error)}`
+            resolve()
+        }
+    })
+}
+
+function tuiProbeSummary(result: TuiProbeResult): string[] {
+    return [
+        `host_constructed=${String(result.hostConstructed)}`,
+        `host_threw=${result.hostThrew ?? "false"}`,
+        `custom_threw=${result.customThrew ?? "false"}`,
+        `opencode_version=${result.opencodeVersion}`,
+        `host_painted=${result.hostPainted === null ? "unknown" : String(result.hostPainted)}`,
+        `host_paint=${result.hostPaint}`,
+    ]
+}
+
+function reportTuiProbe(api: TuiPluginApi, result: TuiProbeResult): void {
+    const lines = tuiProbeSummary(result)
+    for (const line of lines) {
+        console.error(`[mc-probe] ${line}`)
+    }
+
+    const summary = lines.join("\n")
+    if (result.customThrew === null) {
+        try {
+            api.ui.dialog.replace(() => (
+                <box>
+                    <text>{summary}</text>
+                </box>
+            ))
+            return
+        } catch (error) {
+            console.error(`[mc-probe] summary_custom_threw=${probeErrorMessage(error)}`)
+        }
+    }
+
+    if (result.hostThrew === null) {
+        try {
+            api.ui.dialog.replace(() => (
+                <api.ui.DialogAlert
+                    title="Magic Context TUI probe"
+                    message={summary}
+                    onConfirm={() => {}}
+                />
+            ))
+            return
+        } catch (error) {
+            console.error(`[mc-probe] summary_host_threw=${probeErrorMessage(error)}`)
+        }
+    }
+
+    console.error("[mc-probe] summary_rendered=console_only")
+}
+
+async function runTuiProbe(api: TuiPluginApi): Promise<void> {
+    const result: TuiProbeResult = {
+        hostConstructed: false,
+        hostThrew: null,
+        customThrew: null,
+        opencodeVersion: probeVersion(api),
+        hostPainted: null,
+        hostPaint: "not_checked",
+    }
+
+    renderTuiProbeHostArm(api, result)
+    await waitForTuiProbeHostPaint(api, result)
+
+    renderTuiProbeCustomArm(api, result)
+    reportTuiProbe(api, result)
+}
 
 /**
  * Register Magic Context command palette entries, preferring the v1.14.42+
@@ -637,6 +824,15 @@ function registerCommandPaletteEntries(api: TuiPluginApi): void {
                             showRecompDialog(api)
                         },
                     },
+                    {
+                        namespace: "palette",
+                        name: "ctx-tui-probe",
+                        title: "Magic Context: TUI Probe",
+                        category: "Magic Context",
+                        run() {
+                            void runTuiProbe(api)
+                        },
+                    },
                 ],
                 bindings: [],
             })
@@ -666,6 +862,14 @@ function registerCommandPaletteEntries(api: TuiPluginApi): void {
                 category: "Magic Context",
                 onSelect() {
                     showRecompDialog(api)
+                },
+            },
+            {
+                title: "Magic Context: TUI Probe",
+                value: "ctx-tui-probe",
+                category: "Magic Context",
+                onSelect() {
+                    void runTuiProbe(api)
                 },
             },
         ])

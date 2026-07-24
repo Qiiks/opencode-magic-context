@@ -19,7 +19,7 @@
  */
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { getLastIndexedOrdinal } from "@magic-context/core/features/magic-context/message-index";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
@@ -32,6 +32,7 @@ import {
 	updateNote,
 } from "@magic-context/core/features/magic-context/storage";
 import { CTX_NOTE_DESCRIPTION } from "@magic-context/core/tools/ctx-note/constants";
+import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
 const FILTER_VALUES = [
@@ -43,56 +44,62 @@ const FILTER_VALUES = [
 ] as const;
 type CtxNoteReadFilter = (typeof FILTER_VALUES)[number];
 
-const ParamsSchema = Type.Object({
-	action: Type.Optional(
-		Type.Union(
-			[
-				Type.Literal("write"),
-				Type.Literal("read"),
-				Type.Literal("dismiss"),
-				Type.Literal("update"),
-			],
-			{
-				description:
-					"Operation to perform. Defaults to 'write' when content is provided, otherwise 'read'.",
-			},
+const ParamsSchema = Type.Object(
+	{
+		action: Type.Optional(
+			Type.Union(
+				[
+					Type.Literal("write"),
+					Type.Literal("read"),
+					Type.Literal("dismiss"),
+					Type.Literal("update"),
+				],
+				{
+					description:
+						"Operation to perform. Defaults to 'write' when content is provided, otherwise 'read'.",
+				},
+			),
 		),
-	),
-	content: Type.Optional(
-		Type.String({ description: "Note text to store when action is 'write'." }),
-	),
-	surface_condition: Type.Optional(
-		Type.String({
-			description:
-				"Externally verifiable condition for smart notes. A background checker verifies it using ONLY outside signals (GitHub state via gh, files on disk, git history, web) — it cannot see this conversation. Use for PR/issue state, release tags, file contents, workflow runs. NOT for 'when the user mentions X' / 'when we revisit Y' — write a regular note instead.",
-		}),
-	),
-	note_id: Type.Optional(
-		Type.Number({
-			description: "Note ID (required for 'dismiss' and 'update' actions).",
-		}),
-	),
-	filter: Type.Optional(
-		Type.Union(
-			FILTER_VALUES.map((value) => Type.Literal(value)),
-			{
-				description:
-					"Optional read filter. Defaults to active session notes + ready smart notes. Use 'all' to inspect every status or 'pending' to inspect unsurfaced smart notes.",
-			},
+		content: Type.Optional(
+			Type.String({
+				description: "Note text to store when action is 'write'.",
+			}),
 		),
-	),
-	limit: Type.Optional(
-		Type.Number({
-			description: "Max notes per section for read, newest first (default: 25)",
-		}),
-	),
-	offset: Type.Optional(
-		Type.Number({
-			description:
-				"Skip this many newest notes for read — page older ones (default: 0)",
-		}),
-	),
-});
+		surface_condition: Type.Optional(
+			Type.String({
+				description:
+					"Externally verifiable condition for smart notes. A background checker verifies it using ONLY outside signals (GitHub state via gh, files on disk, git history, web) — it cannot see this conversation. Use for PR/issue state, release tags, file contents, workflow runs. NOT for 'when the user mentions X' / 'when we revisit Y' — write a regular note instead.",
+			}),
+		),
+		note_id: Type.Optional(
+			Type.Number({
+				description: "Note ID (required for 'dismiss' and 'update' actions).",
+			}),
+		),
+		filter: Type.Optional(
+			Type.Union(
+				FILTER_VALUES.map((value) => Type.Literal(value)),
+				{
+					description:
+						"Optional read filter. Defaults to active session notes + ready smart notes. Use 'all' to inspect every status or 'pending' to inspect unsurfaced smart notes.",
+				},
+			),
+		),
+		limit: Type.Optional(
+			Type.Number({
+				description:
+					"Max notes per section for read, newest first (default: 25)",
+			}),
+		),
+		offset: Type.Optional(
+			Type.Number({
+				description:
+					"Skip this many newest notes for read — page older ones (default: 0)",
+			}),
+		),
+	},
+	{ additionalProperties: true },
+);
 
 type CtxNoteParams = Static<typeof ParamsSchema>;
 
@@ -191,6 +198,18 @@ export function createCtxNoteTool(
 		description: CTX_NOTE_DESCRIPTION,
 		parameters: ParamsSchema,
 		async execute(_toolCallId, params: CtxNoteParams, _signal, _onUpdate, ctx) {
+			params = unwrapImitatedReducedArgs(params, ["action", "content"], {
+				action: {
+					type: "enum",
+					values: ["write", "read", "dismiss", "update"],
+				},
+				content: "string",
+				surface_condition: "string",
+				note_id: "number",
+				filter: { type: "enum", values: FILTER_VALUES },
+				limit: "number",
+				offset: "number",
+			});
 			const sessionId = ctx.sessionManager.getSessionId();
 			const dreamerEnabled =
 				deps.resolveDreamerEnabled?.(ctx) ?? deps.dreamerEnabled;
@@ -217,7 +236,7 @@ export function createCtxNoteTool(
 							"Error: Smart notes require dreamer to be enabled. Enable dreamer in magic-context.jsonc to use surface_condition.",
 						);
 					}
-					const projectIdentity = resolveProjectIdentity(ctx.cwd);
+					const projectIdentity = resolveProjectIdentityForSession(ctx.cwd);
 					if (!projectIdentity) {
 						return err(
 							"Error: Could not resolve project identity for smart note.",
@@ -247,7 +266,7 @@ export function createCtxNoteTool(
 				if (typeof params.note_id !== "number") {
 					return err("Error: 'note_id' is required when action is 'dismiss'.");
 				}
-				const projectIdentity = resolveProjectIdentity(ctx.cwd);
+				const projectIdentity = resolveProjectIdentityForSession(ctx.cwd);
 				if (!projectIdentity) {
 					return err(
 						"Error: Could not resolve project identity for note dismiss.",
@@ -277,7 +296,7 @@ export function createCtxNoteTool(
 						"Error: Provide 'content' and/or 'surface_condition' to update.",
 					);
 				}
-				const projectIdentity = resolveProjectIdentity(ctx.cwd);
+				const projectIdentity = resolveProjectIdentityForSession(ctx.cwd);
 				if (!projectIdentity) {
 					return err(
 						"Error: Could not resolve project identity for note update.",
@@ -367,7 +386,7 @@ function readNotes(args: {
 	limit: number;
 	offset: number;
 }): string[] {
-	const projectIdentity = resolveProjectIdentity(args.cwd);
+	const projectIdentity = resolveProjectIdentityForSession(args.cwd);
 
 	if (args.filter === undefined) {
 		// Default mixed view: active session notes + READY smart notes.

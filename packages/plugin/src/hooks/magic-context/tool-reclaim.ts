@@ -1,7 +1,8 @@
 import {
+    AGE_RECLAIM_MIN_TOKENS,
     advanceToolReclaimWatermark,
     type ContextDatabase,
-    getActiveTagsBySession,
+    getActiveToolTagsForAgeReclaim,
     getMaxTagNumberBySession,
 } from "../../features/magic-context/storage";
 import type { PendingOp } from "../../features/magic-context/types";
@@ -18,13 +19,22 @@ export function buildSyntheticToolReclaimOps(input: {
     if (watermark <= 0) return [];
 
     const realPendingTagIds = new Set((input.pendingOps ?? []).map((op) => op.tagId));
-    const tags = getActiveTagsBySession(input.db, input.sessionId);
+    const tags = getActiveToolTagsForAgeReclaim(input.db, input.sessionId);
+    const newestTodowriteTag = tags.reduce<number | null>(
+        (newest, tag) =>
+            tag.toolName === "todowrite" && (newest === null || tag.tagNumber > newest)
+                ? tag.tagNumber
+                : newest,
+        null,
+    );
     const synthetic: PendingOp[] = [];
 
     for (const tag of tags) {
-        if (tag.type !== "tool") continue;
-        if (tag.status !== "active") continue;
         if (tag.tagNumber > watermark) continue;
+        if (tag.reclaimableTokens !== null && tag.reclaimableTokens < AGE_RECLAIM_MIN_TOKENS) {
+            continue;
+        }
+        if (tag.tagNumber === newestTodowriteTag) continue;
         if (realPendingTagIds.has(tag.tagNumber)) continue;
         if (input.targets.get(tag.tagNumber)?.canDrop?.() !== true) continue;
         synthetic.push({

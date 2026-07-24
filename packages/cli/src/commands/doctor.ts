@@ -10,9 +10,14 @@
  * do I want to nuke?" prompt rather than two separate flows.
  */
 import { existsSync, rmSync } from "node:fs";
-import { closeDatabase, openDatabase } from "@magic-context/core/features/magic-context/storage";
+import { join } from "node:path";
+import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { getInstalledAdapters } from "../adapters";
 import type { HarnessAdapter } from "../adapters/types";
+import {
+    openExistingContextDatabase,
+    openExistingContextDatabaseForMutation,
+} from "../lib/database-access";
 import { resolveAdaptersForCommand } from "../lib/harness-select";
 import { confirm, intro, log, outro, selectMany, spinner } from "../lib/prompts";
 import {
@@ -51,8 +56,23 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
     // physical DB twice, producing confusing doubled output (e.g. the second
     // pass reports "Re-keyed 0 row(s)" because the first already moved them).
     if (hasV22Command(options)) {
+        let v22Db: ReturnType<typeof openExistingContextDatabase> = null;
         const result = await runV22BackfillCommands(
-            { name: "Magic Context", openDatabase, closeDatabase, log },
+            {
+                name: "Magic Context",
+                openDatabase: (readonly = true) => {
+                    const dbPath = join(getMagicContextStorageDir(), "context.db");
+                    v22Db = readonly
+                        ? openExistingContextDatabase(dbPath, { readonly: true })
+                        : openExistingContextDatabaseForMutation(dbPath);
+                    return v22Db;
+                },
+                closeDatabase: () => {
+                    v22Db?.close();
+                    v22Db = null;
+                },
+                log,
+            },
             options,
         );
         if (result.handled) return result.exitCode;

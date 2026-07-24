@@ -68,7 +68,7 @@ pub struct StoredCompartmentRange {
 }
 
 /// Options that are known by the runner but are not present in the historian XML.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidateOptions {
     /// Sequence number to assign to the first emitted compartment in this publish.
     #[serde(default)]
@@ -77,6 +77,35 @@ pub struct ValidateOptions {
     /// highest-quality final boundary for the newest compartment.
     #[serde(default)]
     pub in_emergency: bool,
+    /// Memory promotion is disabled when the durable memory feature is off.
+    #[serde(default = "default_true")]
+    pub memory_enabled: bool,
+    /// Facts are also gated by the explicit auto-promote switch.
+    #[serde(default = "default_true")]
+    pub auto_promote: bool,
+    /// Privacy gate for historian user-behavior observations.
+    #[serde(default)]
+    pub user_memory_collection_enabled: bool,
+    /// Explicit wrapup runs retain their final compartment instead of deleting it during cleanup.
+    #[serde(default)]
+    pub force_keep_last_compartment: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for ValidateOptions {
+    fn default() -> Self {
+        Self {
+            sequence_offset: 0,
+            in_emergency: false,
+            memory_enabled: true,
+            auto_promote: true,
+            user_memory_collection_enabled: false,
+            force_keep_last_compartment: false,
+        }
+    }
 }
 
 /// A parsed compartment before endpoint ids are resolved.
@@ -485,18 +514,16 @@ pub fn validate_historian_output(
     let mut compartments = emitted;
     let emitted_count = compartments.len();
     let mut discarded_last = false;
-    if !options.in_emergency && compartments.len() >= 2 {
+    if !options.in_emergency && !options.force_keep_last_compartment && compartments.len() >= 2 {
         let last_end = compartments
             .last()
             .map(|c| c.end_message)
             .unwrap_or(chunk.end_index);
-        // Discard-last measures real lookahead messages, not gaps in a sparse
-        // ordinal space where retired message numbers can be arbitrarily far apart.
-        let lookahead_count = present_ordinals
-            .iter()
-            .filter(|ordinal| **ordinal > last_end && **ordinal <= chunk.end_index)
-            .count() as u64;
-        if lookahead_count <= BOUNDARY_HEALING_SLACK {
+        // TypeScript uses numeric ordinal distance here. Retired message numbers are
+        // intentionally part of that distance, so a sparse coordinate gap still counts
+        // as lookahead for boundary healing.
+        let lookahead_distance = chunk.end_index.saturating_sub(last_end);
+        if lookahead_distance <= BOUNDARY_HEALING_SLACK {
             compartments.pop();
             discarded_last = true;
         }
@@ -519,27 +546,39 @@ pub fn validate_historian_output(
         .facts
         .into_iter()
         .filter(|fact| {
-            keep_side_channel(
-                fact.origin_compartment_index,
-                persisted_count,
-                discarded_last,
-            )
+            !options.force_keep_last_compartment
+                && keep_side_channel(
+                    fact.origin_compartment_index,
+                    persisted_count,
+                    discarded_last,
+                )
         })
         .collect();
+    // A discarded lookahead compartment invalidates the whole producer output's anchors.
+    // Keeping any side channel here would make a later re-read double-store it. A forced final
+    // wrapup chunk has the same weak lookahead for promotions, while retaining earlier anchored
+    // events that do not point at the final compartment.
     let events = parsed
         .events
         .into_iter()
-        .filter(|event| keep_side_channel(event.at_compartment, persisted_count, false))
+        .filter(|event| {
+            if options.force_keep_last_compartment {
+                matches!(event.at_compartment, Some(index) if (1..persisted_count).contains(&index))
+            } else {
+                keep_side_channel(event.at_compartment, persisted_count, discarded_last)
+            }
+        })
         .collect();
     let primer_candidates = parsed
         .primer_candidates
         .into_iter()
         .filter(|candidate| {
-            keep_side_channel(
-                candidate.origin_compartment_index,
-                persisted_count,
-                discarded_last,
-            )
+            !options.force_keep_last_compartment
+                && keep_side_channel(
+                    candidate.origin_compartment_index,
+                    persisted_count,
+                    discarded_last,
+                )
         })
         .take(1)
         .collect();
@@ -547,11 +586,12 @@ pub fn validate_historian_output(
         .user_observations
         .into_iter()
         .filter(|observation| {
-            keep_side_channel(
-                observation.origin_compartment_index,
-                persisted_count,
-                discarded_last,
-            )
+            !options.force_keep_last_compartment
+                && keep_side_channel(
+                    observation.origin_compartment_index,
+                    persisted_count,
+                    discarded_last,
+                )
         })
         .collect();
 
@@ -886,7 +926,18 @@ fn validate_parsed_compartments(
         .collect();
     let mut expected_start = chunk_ordinals.first().copied();
 
-    for compartment in compartments {
+    for (index, compartment) in compartments.iter().enumerate() {
+        // P1 is the required v2 boundary. Missing P2-P4 deliberately keep the
+        // parser's denser-tier fallbacks; only the flat v1 shape must retry.
+        match compartment.p1.as_deref() {
+            Some(p1) if !p1.trim().is_empty() => {}
+            _ => {
+                return Some(format!(
+                    "compartment {} is missing the tiered paraphrase structure (p1..p4); re-emit with all four tiers",
+                    index + 1
+                ));
+            }
+        }
         if compartment.end_message < compartment.start_message {
             return Some(format!(
                 "invalid range {}-{}",
@@ -969,6 +1020,9 @@ fn keep_side_channel(
     persisted_count: u64,
     discarded_last: bool,
 ) -> bool {
+    if discarded_last {
+        return false;
+    }
     match origin_compartment_index {
         Some(index) => (1..=persisted_count).contains(&index),
         None => !discarded_last,
@@ -1302,6 +1356,26 @@ mod tests {
     }
 
     #[test]
+    fn tierless_compartments_reject_while_p1_only_output_keeps_soft_fallbacks() {
+        let flat = r#"<output><compartment start="1" end="2" title="flat">flat summary</compartment><meta><unprocessed_from>3</unprocessed_from></meta></output>"#;
+        let error = validate_historian_output(flat, &chunk(1, 2), &[], ValidateOptions::default())
+            .expect_err("flat v1 output must re-enter the producer retry chain");
+        assert!(error.message.contains(
+            "compartment 1 is missing the tiered paraphrase structure (p1..p4); re-emit with all four tiers"
+        ));
+
+        let p1_only = r#"<output><compartment start="1" end="2" title="partial"><p1>full summary</p1></compartment><meta><unprocessed_from>3</unprocessed_from></meta></output>"#;
+        let validated =
+            validate_historian_output(p1_only, &chunk(1, 2), &[], ValidateOptions::default())
+                .expect("P1 is enough for the parser's deliberate soft-tier fallback");
+        let compartment = &validated.compartments[0];
+        assert_eq!(compartment.p1.as_deref(), Some("full summary"));
+        assert_eq!(compartment.p2.as_deref(), Some("full summary"));
+        assert_eq!(compartment.p3.as_deref(), Some("full summary"));
+        assert_eq!(compartment.p4.as_deref(), Some(""));
+    }
+
+    #[test]
     fn stored_compartment_validation_is_basis_agnostic_and_allows_sparse_gaps() {
         assert_eq!(
             validate_stored_compartments(&[
@@ -1452,7 +1526,7 @@ mod tests {
     }
 
     #[test]
-    fn discard_last_counts_present_sparse_lookahead_messages() {
+    fn discard_last_uses_numeric_sparse_ordinal_distance() {
         let sparse = HistorianChunk {
             start_index: 1,
             end_index: 100,
@@ -1471,9 +1545,9 @@ mod tests {
 
         let validated = validate_historian_output(&text, &sparse, &[], ValidateOptions::default())
             .expect("sparse chunk validates");
-        assert!(validated.discarded_last);
-        assert_eq!(validated.compartments.len(), 1);
-        assert_eq!(validated.unprocessed_from, 2);
+        assert!(!validated.discarded_last);
+        assert_eq!(validated.compartments.len(), 2);
+        assert_eq!(validated.unprocessed_from, 3);
     }
 
     #[test]
@@ -1518,7 +1592,7 @@ mod tests {
     }
 
     #[test]
-    fn discarded_last_filters_anchored_tail_side_channels_but_keeps_earlier_ones() {
+    fn discarded_last_suppresses_every_side_channel_for_the_whole_run() {
         let extra = r#"
 <facts>
 <PROJECT_RULES>
@@ -1545,37 +1619,31 @@ mod tests {
                 .expect("discard-last should still make forward progress");
 
         assert!(result.discarded_last);
-        assert_eq!(
-            result
-                .facts
-                .iter()
-                .map(|f| f.content.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Keep the earlier rule."]
-        );
-        assert_eq!(
-            result
-                .user_observations
-                .iter()
-                .map(|o| o.content.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Keep the earlier observation."]
-        );
-        assert_eq!(
-            result
-                .primer_candidates
-                .iter()
-                .map(|p| p.question.as_str())
-                .collect::<Vec<_>>(),
-            vec!["How does the kept subsystem work?"]
-        );
-        assert_eq!(
-            result
-                .events
-                .iter()
-                .map(|e| e.kind.as_str())
-                .collect::<Vec<_>>(),
-            vec!["causal_incident"]
-        );
+        assert!(result.facts.is_empty());
+        assert!(result.events.is_empty());
+        assert!(result.user_observations.is_empty());
+        assert!(result.primer_candidates.is_empty());
+    }
+
+    #[test]
+    fn force_keep_last_preserves_final_compartment_and_side_channels() {
+        let extra = r#"
+<events>
+<trajectory_correction at_compartment="1"><summary>earlier event</summary></trajectory_correction>
+<trajectory_correction at_compartment="2"><summary>final event</summary></trajectory_correction>
+</events>
+"#;
+        let text = xml(&[(1, 2, "first"), (3, 4, "final")], 5, extra);
+        let options = ValidateOptions {
+            force_keep_last_compartment: true,
+            ..ValidateOptions::default()
+        };
+        let result = validate_historian_output(&text, &chunk(1, 4), &[], options)
+            .expect("force-keep wrapup output should validate");
+
+        assert!(!result.discarded_last);
+        assert_eq!(result.compartments.len(), 2);
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.events[0].at_compartment, Some(1));
     }
 }

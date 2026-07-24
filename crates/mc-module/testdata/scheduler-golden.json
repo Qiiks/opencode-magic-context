@@ -394,7 +394,7 @@
       "last_response_time_ms": 10000,
       "ttl_ms": 300000,
       "expected_execute_fired": false,
-      "expected_hard_expired": true
+      "expected_hard_expired": false
     },
     {
       "label": "elapsed ttl plus one",

@@ -34,7 +34,9 @@ import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path"
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 import {
     backupDatabaseSnapshot,
+    getPersistedSchemaVersion,
     openExistingContextDatabase,
+    openExistingContextDatabaseForMutation,
     openExistingDatabase,
 } from "../lib/database-access";
 import { getOpenCodeDatabasePath } from "../lib/migration-paths";
@@ -512,6 +514,7 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
     const contextDbPath = defaultContextDbPath();
     let opencodeDb: DatabaseLike | null = null;
     let contextDb: DatabaseLike | null = null;
+    let contextSchemaVersionBefore: number | null = null;
     try {
         opencodeDb = openExistingDatabase(opencodeDbPath, { readonly: dryRun });
         if (opencodeDb === null) {
@@ -519,12 +522,16 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
                 `OpenCode database not found at ${opencodeDbPath}; nothing to migrate.`,
             );
         }
-        contextDb = openExistingContextDatabase(contextDbPath, { readonly: dryRun });
+        contextDb = dryRun
+            ? openExistingContextDatabase(contextDbPath, { readonly: true })
+            : openExistingContextDatabaseForMutation(contextDbPath);
         if (contextDb === null) {
             throw new Error(
                 `Magic Context database not found at ${contextDbPath}; nothing to migrate.`,
             );
         }
+
+        contextSchemaVersionBefore = getPersistedSchemaVersion(contextDb as DatabaseType);
 
         // The collision-merge path relies on foreign-key cascades when source
         // memories are deleted. These pragmas must be enabled before planning or writing.
@@ -650,7 +657,13 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
         if (result.epochsBumped.length > 0) {
             console.log(`  memory epoch bumped: ${result.epochsBumped.join(", ")}`);
         }
+        console.log(
+            `Magic Context schema: v${contextSchemaVersionBefore} → v${getPersistedSchemaVersion(contextDb as DatabaseType)}`,
+        );
         console.log("Restart OpenCode to pick up the moved session.");
+        console.log(
+            "If another harness is running, restart it too so every process reloads the same schema fence.",
+        );
         return 0;
     } catch (error) {
         console.error(error instanceof Error ? error.message : String(error));

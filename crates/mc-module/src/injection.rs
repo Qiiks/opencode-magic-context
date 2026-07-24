@@ -24,7 +24,7 @@ const DEFAULT_PRIORITY: &str = "medium";
 const COMPLETED_STATUS: &str = "completed";
 const TERMINAL_STATUSES: &[&str] = &["completed", "cancelled"];
 const TITLE_DONE_STATUSES: &[&str] = &["completed"];
-const SYNTHETIC_TIMESTAMP: i64 = 0;
+pub(crate) const SYNTHETIC_TIMESTAMP: i64 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct TodoItem {
@@ -470,6 +470,7 @@ mod tests {
             },
             provider_executed: false,
             byte_size: 0,
+            token_count: None,
             arc_id: Some(id.to_string()),
         }
     }

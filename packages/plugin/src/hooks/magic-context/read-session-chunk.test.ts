@@ -441,7 +441,7 @@ describe("readSessionChunk", () => {
             expect(chunk.text).toContain("[2-4] A: second arc");
 
             const result = validateHistorianOutput(
-                '<output><compartment start="1" end="1" title="first">First</compartment><compartment start="2" end="4" title="second">Second</compartment></output>',
+                '<output><compartment start="1" end="1" title="first"><p1>First</p1></compartment><compartment start="2" end="4" title="second"><p1>Second</p1></compartment></output>',
                 "ses-noise-boundary",
                 chunk,
                 [],

@@ -164,7 +164,6 @@ function renderTable(rows: LeafRow[]): string {
 // features; documenting them would invite support questions about internal
 // tooling that requires a local daemon setup users do not have.
 const DEV_ONLY_KEYS = new Set<string>([
-    "shadow_transform",
     "shadow_embedding",
     // Unsupported until the fleet stack ships publicly: activating it requires a
     // subc daemon no public install has, and documenting it would let the dev

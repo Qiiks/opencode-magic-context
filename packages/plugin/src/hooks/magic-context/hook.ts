@@ -11,6 +11,13 @@ import {
 } from "../../config/schema/magic-context";
 import type { ResolvedTransformMode } from "../../config/transform-mode";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
+import {
+    applyMirrorPage,
+    ensureContextStoreUuid,
+    getMirrorCursor,
+    getModuleNoteEvaluationBridge,
+    registerModuleNoteEvaluationBridge,
+} from "../../features/magic-context/context-authority";
 import { openOpenCodeDb } from "../../features/magic-context/dreamer/open-opencode-db";
 import { OpenCodeRetrospectiveRawProvider } from "../../features/magic-context/dreamer/retrospective-raw-provider";
 import {
@@ -23,7 +30,7 @@ import {
     runManualDream,
 } from "../../features/magic-context/dreamer/task-scheduler";
 import {
-    resolveProjectIdentityOrFallback,
+    resolveProjectIdentityForSession,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
 import {
@@ -32,12 +39,19 @@ import {
 } from "../../features/magic-context/project-embedding-registry";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import {
+    clearHookInitFailure,
+    recordHookInitFailure,
+} from "../../features/magic-context/fail-closed-block";
+import {
     getDatabasePersistenceError,
     getSessionsWithPendingMarker,
     isDatabasePersisted,
     openDatabase,
 } from "../../features/magic-context/storage";
-import { openDatabaseAsync } from "../../features/magic-context/storage-db";
+import {
+    getSchemaFenceRejection,
+    openDatabaseAsync,
+} from "../../features/magic-context/storage-db";
 import type { Tagger } from "../../features/magic-context/tagger";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
@@ -76,7 +90,7 @@ import {
     setRecompTerminal,
 } from "./recomp-orchestrator";
 import type { RustModeModuleClient } from "./rust-mode-transform";
-import { createShadowSender, SubcShadowTransport } from "./shadow-sender";
+import { SubcModuleTransport } from "./module-transport";
 import { createTextCompleteHandler } from "./text-complete";
 import { createTransform } from "./transform";
 import { type ManagedWrapupContext, runManagedWrapup } from "./wrapup-orchestrator";
@@ -150,8 +164,8 @@ export interface MagicContextDeps {
             min_chars: number;
         };
         transform_mode?: ResolvedTransformMode;
-        shadow_transform?: {
-            enabled: boolean;
+        experimental?: {
+            mural?: { enabled: boolean; model?: string };
         };
     };
     /** Test seam for the Rust authority adapter; production creates the subc client. */
@@ -199,6 +213,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const contextUsageMap = new Map<string, { usage: ContextUsage; updatedAt: number }>();
     let db: Database;
     try {
+        // Clear any prior init-failure latch so a successful reopen (or a
+        // non-storage null like home-directory) does not leave a stale arm.
+        clearHookInitFailure();
         const opened = deps.openDatabaseForHook ? deps.openDatabaseForHook() : openDatabase();
         if (!opened || !isDatabasePersisted(opened)) {
             const reason =
@@ -209,6 +226,17 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 reason,
             );
             notifyMagicContextDisabled(deps.client, reason);
+            const fence = getSchemaFenceRejection();
+            recordHookInitFailure({
+                type: "storage",
+                reason: fence
+                    ? {
+                          kind: "schema_fence",
+                          persistedVersion: fence.persistedVersion,
+                          supportedVersion: fence.supportedVersion,
+                      }
+                    : { kind: "storage_failure", cause: reason },
+            });
             return null;
         }
         db = opened;
@@ -216,10 +244,21 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         const reason = getErrorMessage(error);
         log("[magic-context] hook failed to open storage; disabling feature:", error);
         notifyMagicContextDisabled(deps.client, reason);
+        clearHookInitFailure();
+        recordHookInitFailure({
+            type: "storage",
+            reason: { kind: "storage_failure", cause: reason },
+        });
         return null;
     }
 
-    const projectPath = resolveProjectIdentityOrFallback(deps.directory);
+    const projectPath = resolveProjectIdentityForSession(deps.directory);
+    if (!projectPath) {
+        log("[magic-context] not binding a project identity for the user's home directory");
+        clearHookInitFailure();
+        recordHookInitFailure({ type: "no_project" });
+        return null;
+    }
 
     // Startup consistency check: reconcile any compaction markers whose state
     // references rows that no longer exist in OpenCode's DB. This can happen
@@ -299,6 +338,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // Written at the end of each transform pass (post-drop), read in
     // tool.execute.after. Only populated for primary sessions.
     const channel1StateBySession = new Map<string, import("./ctx-reduce-nudge").Channel1State>();
+    const channel2DirectiveTextBySession = new Map<string, string>();
 
     /**
      * Return the live provider/model for a session.
@@ -446,7 +486,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             return "Embedding is already running for this session.";
         }
         await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
-        const sessionProjectIdentity = resolveProjectIdentityOrFallback(directory);
+        const sessionProjectIdentity = resolveProjectIdentityForSession(directory);
+        if (!sessionProjectIdentity) return "No project identity is bound for the home directory.";
         maybeSendProjectIdentitySessionWarning(sessionId, directory);
         embedPauseBySession.delete(sessionId);
         const prior = embedRunStateBySession.get(sessionId);
@@ -538,7 +579,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         const ctrl = embedRunStateBySession.get(sessionId);
         if (ctrl) ctrl.abort();
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
-        const sessionProjectIdentity = resolveProjectIdentityOrFallback(directory);
+        const sessionProjectIdentity = resolveProjectIdentityForSession(directory);
+        if (!sessionProjectIdentity) return "No project identity is bound for the home directory.";
         maybeSendProjectIdentitySessionWarning(sessionId, directory);
         const cov = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
         return `Paused at ${cov.session.embedded}/${cov.session.total} compartments embedded.`;
@@ -546,7 +588,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const getEmbedStatusText = (sessionId: string): string => {
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
-        const sessionProjectIdentity = resolveProjectIdentityOrFallback(directory);
+        const sessionProjectIdentity = resolveProjectIdentityForSession(directory);
+        if (!sessionProjectIdentity) return "No project identity is bound for the home directory.";
         maybeSendProjectIdentitySessionWarning(sessionId, directory);
         const coverage = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
         const progress = recompProgressBySession.get(sessionId);
@@ -574,7 +617,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 // transform return first, keeping the hot path clean.
                 await new Promise((resolve) => setTimeout(resolve, 0));
                 await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
-                const sessionProjectIdentity = resolveProjectIdentityOrFallback(directory);
+                const sessionProjectIdentity = resolveProjectIdentityForSession(directory);
+                if (!sessionProjectIdentity) return;
                 maybeSendProjectIdentitySessionWarning(sessionId, directory);
                 const coverage = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
                 if (!coverage.enabled) return;
@@ -606,21 +650,22 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const sidekickRunnable = isSidekickRunnable(deps.config);
     const sidekickConfig = sidekickRunnable ? deps.config.sidekick : undefined;
-    // Rust is authoritative for a session, so never arm the asynchronous
-    // comparison sender alongside the authority lane.
-    const shadowSender =
-        deps.config.transform_mode !== "rust" && deps.config.shadow_transform?.enabled === true
-            ? createShadowSender()
-            : undefined;
     const rustMemorySyncRequestedSessions = new Set<string>();
-    const rustModeModuleClient =
+    // Build the same subc-backed client for the TS recovery arm. Constructing the
+    // transport is inert; it connects only if a marker actually needs draining.
+    const authorityRecoveryModuleClient =
         deps.rustModeModuleClient ??
-        (deps.config.transform_mode === "rust"
-            ? (() => {
-                  const transport = new SubcShadowTransport(undefined, undefined, undefined, "");
+        (() => {
+                  const transport = new SubcModuleTransport();
                   const client: RustModeModuleClient = {
                       call: (args) => transport.call(args),
+                      stateSyncCapabilities: (args) => transport.stateSyncCapabilities(args),
                       closeSession: (sessionId) => transport.closeSession(sessionId),
+                      authorityStatus: (args) => transport.authorityStatus(args),
+                      authorityPrepare: (args) => transport.authorityPrepare(args),
+                      authoritySeed: (args) => transport.authoritySeed(args),
+                      authorityDrain: (args) => transport.authorityDrain(args),
+                      mirrorPull: (args) => transport.mirrorPull(args),
                       getCompartmentsAfter: async (sessionId, afterSequence) => {
                           const response = await transport.call({
                               sessionId,
@@ -649,12 +694,23 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                           return { max_sequence: maxSequence, compartments };
                       },
                   };
-                  return client;
-              })()
-            : undefined);
+                   return client;
+               })();
+    const rustModeModuleClient =
+        deps.config.transform_mode === "rust" ? authorityRecoveryModuleClient : undefined;
     const rustToolBackends: RustToolBackends | undefined =
         deps.config.transform_mode === "rust" && rustModeModuleClient
             ? {
+                  authorityState: async ({ projectPath, projectRoot, domain }) => {
+                      if (!rustModeModuleClient.authorityStatus) return null;
+                      const result = await rustModeModuleClient.authorityStatus({
+                          context_store_uuid: ensureContextStoreUuid(db),
+                          project: projectPath,
+                          projectRoot,
+                          domain,
+                      });
+                      return result.authority?.state ?? null;
+                  },
                   reduce: ({ sessionId, projectRoot, drop, commandId }) =>
                       rustModeModuleClient.call({
                           sessionId,
@@ -668,11 +724,130 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               command_id: commandId,
                           },
                       }),
+                  note: ({
+                      commandId,
+                      sessionId,
+                      projectRoot,
+                      memoryProject,
+                      action,
+                      content,
+                      surfaceCondition,
+                      filter,
+                      limit,
+                      offset,
+                      noteId,
+                  }) =>
+                      rustModeModuleClient.call({
+                          sessionId,
+                          projectRoot,
+                          method: "ctx_note",
+                          body: {
+                              name: "ctx_note",
+                              arguments: {
+                                  ...(commandId ? { command_id: commandId } : {}),
+                                  action,
+                                  content,
+                                  memory_project: memoryProject,
+                                  surface_condition: surfaceCondition,
+                                  filter,
+                                  limit,
+                                  offset,
+                                  note_id: noteId,
+                              },
+                          },
+                      }),
+                  memory: ({
+                      commandId,
+                      sessionId,
+                      projectRoot,
+                      memoryProject,
+                      action,
+                      content,
+                      category,
+                      ids,
+                      reason,
+                  }) =>
+                      rustModeModuleClient.call({
+                          sessionId,
+                          projectRoot,
+                          method: "ctx_memory",
+                          body: {
+                              name: "ctx_memory",
+                              arguments: {
+                                  ...(commandId ? { command_id: commandId } : {}),
+                                  action,
+                                  content,
+                                  category,
+                                  ids,
+                                  reason,
+                                  memory_project: memoryProject,
+                              },
+                          },
+                      }),
+                  noteEvaluationAvailable: (evaluationProjectPath: string) =>
+                      getModuleNoteEvaluationBridge(evaluationProjectPath) !== undefined,
                   memorySync: (sessionId: string) => {
                       rustMemorySyncRequestedSessions.add(sessionId);
                   },
               }
             : undefined;
+    // Bridges are per resolved project, and sessions can resolve projects other
+    // than the plugin's launch directory (a /cd switch, multi-project hosts).
+    // Registration is therefore an idempotent ensure invoked for every project
+    // that reaches rust-mode preparation, not a one-shot at construction.
+    const ensureModuleNoteEvaluationBridge = (bridgeProjectPath: string): void => {
+        if (!rustModeModuleClient?.mirrorPull) return;
+        if (getModuleNoteEvaluationBridge(bridgeProjectPath)) return;
+        const syncModuleNotes = async (): Promise<void> => {
+            for (;;) {
+                const cursor = getMirrorCursor(db, "notes");
+                const response = await rustModeModuleClient.mirrorPull?.({
+                    domain: "notes",
+                    cursor,
+                    limit: 1000,
+                });
+                if (!response) throw new Error("mirror.pull is unavailable for notes");
+                const next = applyMirrorPage({ db, page: response.page });
+                if (!response.page.has_more || next === cursor) break;
+            }
+        };
+        registerModuleNoteEvaluationBridge(bridgeProjectPath, {
+            sync: syncModuleNotes,
+            async evaluate({ contextNoteId, sessionId, verdict }): Promise<void> {
+                const identity = db
+                    .prepare(
+                        `SELECT identity.module_row_id, revision.status_version
+                           FROM mirror_identity identity
+                           JOIN mirror_note_revisions revision
+                             ON revision.module_project = identity.module_project
+                            AND revision.module_row_id = identity.module_row_id
+                          WHERE identity.domain = 'notes' AND identity.module_project = ?
+                            AND identity.context_row_id = ?`,
+                    )
+                    .get(bridgeProjectPath, contextNoteId) as
+                    | { module_row_id: number; status_version: number }
+                    | undefined;
+                if (!identity) {
+                    throw new Error(`module identity is missing for smart note ${contextNoteId}`);
+                }
+                await rustModeModuleClient.call({
+                    sessionId,
+                    projectRoot: deps.directory,
+                    method: "note.evaluate",
+                    body: {
+                        method: "note.evaluate",
+                        v: 1,
+                        session_id: sessionId,
+                        note_id: identity.module_row_id,
+                        source_revision: identity.status_version,
+                        verdict,
+                    },
+                });
+                await syncModuleNotes();
+            },
+        });
+    };
+    ensureModuleNoteEvaluationBridge(projectPath);
     const notifyRustModeParked = (sessionId: string, message: string): void => {
         const client = deps.client as {
             tui?: {
@@ -706,6 +881,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         contextUsageMap,
         db,
         channel1StateBySession,
+        channel2DirectiveTextBySession,
         protectedTags: deps.config.protected_tags,
         smartDrops: deps.config.smart_drops === true,
         clearReasoningAge: deps.config.clear_reasoning_age ?? 50,
@@ -756,6 +932,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         historianRunnable,
         experimentalUserMemories: userMemoryCollectionEnabled(dreamerConfig),
         experimentalTemporalAwareness: deps.config.temporal_awareness === true,
+        experimentalMuralEnabled: deps.config.experimental?.mural?.enabled === true,
         historianTwoPass: deps.config.historian?.two_pass === true,
         liveModelBySession,
         sessionDirectoryBySession,
@@ -779,11 +956,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                   }
                 : undefined,
         maybeAutoEmbedSession,
-        shadowSender,
         transformMode: deps.config.transform_mode,
         rustModeModuleClient,
+        tsAuthorityRecoveryModuleClient: authorityRecoveryModuleClient,
         rustMemorySyncRequestedSessions,
         onRustModeParked: notifyRustModeParked,
+        onRustModeProjectPrepared: ensureModuleNoteEvaluationBridge,
     });
     const eventHandler = createEventHandler({
         contextUsageMap,
@@ -793,6 +971,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         db,
         client: deps.client,
         channel1StateBySession,
+        channel2DirectiveTextBySession,
         internalChildSessions,
         getNotificationParams: (sessionId) =>
             getLiveNotificationParams(
@@ -807,11 +986,15 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             clearInjectionCache(sessionId);
             deps.onSessionCacheInvalidated?.(sessionId);
         },
+        onRustWireInvalidated: (sessionId: string) => {
+            transform.invalidateRustWireState(sessionId);
+        },
         // Clean up per-session state the system-prompt handler maintains so
         // these module/closure-scope maps don't accumulate entries over the
         // plugin's lifetime (Finding #3).
         onSessionDeleted: (sessionId: string) => {
             dropSlot(sessionId, "session-deleted");
+            transform.clearRustSession(sessionId);
             systemPromptHash.clearSession(sessionId);
             // Prune every per-session map this hook closure owns. These
             // accumulate one entry per session for the plugin process lifetime
@@ -829,7 +1012,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             internalChildSessions.delete(sessionId);
             rustMemorySyncRequestedSessions.delete(sessionId);
             channel1StateBySession.delete(sessionId);
-            shadowSender?.clearSession(sessionId);
+            channel2DirectiveTextBySession.delete(sessionId);
             clearEmbedSessionState(sessionId);
         },
     });
@@ -873,6 +1056,13 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 }),
             userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreaming),
             language: deps.config.language,
+            transformMode: deps.config.transform_mode,
+            // Scheduled/message-triggered runs must share the same direct
+            // authority.status transport as the transform path. The
+            // executor uses the live MODULE verdict, not transform state
+            // cached in a session, so a cold process cannot fall back to
+            // the guarded TypeScript child path.
+            moduleClient: rustModeModuleClient,
         });
         void runDueTasksForProject({
             db,
@@ -986,6 +1176,14 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               userMemoryCollectionEnabled:
                                   userMemoryCollectionEnabled(dreamerConfig),
                               language: deps.config.language,
+                              experimentalMural: deps.config.experimental?.mural,
+                              memoryInjectionBudgetTokens:
+                                  deps.config.memory?.injection_budget_tokens,
+                              transformMode: deps.config.transform_mode,
+                              // Manual /ctx-dream uses the same live authority
+                              // lookup and module transport as scheduled runs.
+                              // Do not rely on a transform-populated cache.
+                              moduleClient: rustModeModuleClient,
                           }),
                           task,
                       }),
@@ -1141,11 +1339,17 @@ export async function createMagicContextHookAsync(
 ): Promise<ReturnType<typeof createMagicContextHook>> {
     let database: Database | null;
     try {
+        clearHookInitFailure();
         database = await openDatabaseAsync();
     } catch (error) {
         const reason = getErrorMessage(error);
         log("[magic-context] hook failed to open storage; disabling feature:", error);
         notifyMagicContextDisabled(deps.client, reason);
+        clearHookInitFailure();
+        recordHookInitFailure({
+            type: "storage",
+            reason: { kind: "storage_failure", cause: reason },
+        });
         return null;
     }
     return createMagicContextHook({

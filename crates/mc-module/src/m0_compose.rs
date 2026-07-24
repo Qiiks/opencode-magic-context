@@ -8,13 +8,14 @@
 //! cache depends on. The expiry cutoff (`now_ms`) is passed in (frozen at the HARD by the
 //! caller, never read here from a live clock) so a later defer replays identical bytes.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
-use mc_store::{McStore, McStoreError, MemoryRevision, SHADOW_SESSION_PREFIX};
+use mc_store::{McStore, McStoreError, MemoryRevision};
 
 use crate::compartment_coverage::{resolve_coverage, CoverageGap};
 use crate::decay_render::DecayRenderCompartment;
-use crate::memory_render::{render_m0, workspace_source_names, M0Inputs};
+use crate::memory_render::{render_m0, render_memory_line, workspace_source_names, M0Inputs};
 use crate::project_docs::read_project_docs_canonical;
 
 /// Why composing the HARD m0 from the store failed.
@@ -61,9 +62,8 @@ pub struct M0Composition {
     pub first_covered_ordinal: Option<u64>,
     /// The highest compartment sequence folded into m0 (advances only on a HARD).
     pub folded_compartment_seq: i64,
-    /// The memory ids actually rendered into m0 (the supersede manifest). Until the token
-    /// estimator lands this is every active memory (no budget trim — stability-safe: a
-    /// HARD rebuilds the prefix regardless, only m0 SIZE grows).
+    /// The memory ids actually rendered into m0 (the supersede manifest), after the
+    /// deterministic budget trim.
     pub rendered_memory_ids: Vec<i64>,
     /// The mutation-log cursor as of this HARD (corrections at/below it are folded in).
     pub memory_mutation_cursor: i64,
@@ -99,10 +99,186 @@ pub struct M0ComposeInputs<'a> {
     pub covered_system_messages: &'a [String],
     /// Disabled memory removes both project memories and the user-profile memory block.
     pub memory_enabled: bool,
+    /// Maximum token estimate for the grouped project-memory block.
+    pub memory_budget_tokens: f64,
+    /// Maximum token estimate for the user-profile block.
+    pub user_profile_budget_tokens: f64,
+    /// Whether the TypeScript materializer would include the project-docs block.
+    pub inject_docs: bool,
+    /// Gate temporal heading dates at render time, including rows persisted by a prior pass.
+    pub temporal_awareness: bool,
+}
+
+fn memory_selection_order(
+    left: &mc_store::StoredMemory,
+    right: &mc_store::StoredMemory,
+) -> Ordering {
+    let left_permanent = left.status == "permanent";
+    let right_permanent = right.status == "permanent";
+    if left_permanent != right_permanent {
+        return right_permanent.cmp(&left_permanent);
+    }
+    right
+        .importance
+        .unwrap_or(i32::MIN)
+        .cmp(&left.importance.unwrap_or(i32::MIN))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn memory_candidate_cost(
+    memory: &mc_store::StoredMemory,
+    categories: &HashSet<String>,
+    source_names: &HashMap<i64, String>,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> f64 {
+    let line = render_memory_line(memory, source_names.get(&memory.id).map(String::as_str));
+    let mut total = estimate_tokens(&(line + "\n"));
+    if !categories.contains(&memory.category) {
+        total += estimate_tokens(&format!("<{}>\n</{}>\n", memory.category, memory.category));
+    }
+    total as f64
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_memory(
+    memory: mc_store::StoredMemory,
+    member_used: &mut f64,
+    selected: &mut Vec<mc_store::StoredMemory>,
+    selected_ids: &mut HashSet<i64>,
+    categories: &mut HashSet<String>,
+    used: &mut f64,
+    budget: f64,
+    source_names: &HashMap<i64, String>,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> bool {
+    if selected_ids.contains(&memory.id) {
+        return false;
+    }
+    let candidate_cost = memory_candidate_cost(&memory, categories, source_names, estimate_tokens);
+    if *used + candidate_cost > budget {
+        return false;
+    }
+    *used += candidate_cost;
+    *member_used += candidate_cost;
+    categories.insert(memory.category.clone());
+    selected_ids.insert(memory.id);
+    selected.push(memory);
+    true
+}
+
+/// Select the same grouped-block candidates as TypeScript: permanent memories first,
+/// then importance descending and id (the durable recency tie-break) ascending. Workspace
+/// renders additionally reserve an equal floor for each member before filling leftovers.
+pub(crate) fn trim_memories_to_budget(
+    memories: Vec<mc_store::StoredMemory>,
+    membership: Option<&mc_store::WorkspaceMembership>,
+    source_names: &HashMap<i64, String>,
+    budget_tokens: f64,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> Vec<mc_store::StoredMemory> {
+    let budget = budget_tokens.max(1.0);
+    let wrapper_cost = estimate_tokens("<project-memory>\n</project-memory>");
+    let mut selected = Vec::new();
+    let mut selected_ids = HashSet::new();
+    let mut used = wrapper_cost as f64;
+    let mut categories = HashSet::<String>::new();
+
+    let mut ordered = memories;
+    ordered.sort_by(memory_selection_order);
+    if let Some(workspace) = membership {
+        for memory in ordered.iter().filter(|memory| memory.status == "permanent") {
+            let mut ignored = 0.0;
+            admit_memory(
+                memory.clone(),
+                &mut ignored,
+                &mut selected,
+                &mut selected_ids,
+                &mut categories,
+                &mut used,
+                budget,
+                source_names,
+                estimate_tokens,
+            );
+        }
+        let floor = (budget - used).max(0.0) / workspace.union_identities.len().max(1) as f64;
+        for identity in &workspace.union_identities {
+            let mut member_used = 0.0;
+            for memory in ordered
+                .iter()
+                .filter(|memory| memory.project_path == *identity && memory.status != "permanent")
+            {
+                let candidate_cost =
+                    memory_candidate_cost(memory, &categories, source_names, estimate_tokens);
+                if member_used + candidate_cost > floor {
+                    continue;
+                }
+                admit_memory(
+                    memory.clone(),
+                    &mut member_used,
+                    &mut selected,
+                    &mut selected_ids,
+                    &mut categories,
+                    &mut used,
+                    budget,
+                    source_names,
+                    estimate_tokens,
+                );
+            }
+        }
+        for memory in ordered {
+            let mut ignored = 0.0;
+            admit_memory(
+                memory,
+                &mut ignored,
+                &mut selected,
+                &mut selected_ids,
+                &mut categories,
+                &mut used,
+                budget,
+                source_names,
+                estimate_tokens,
+            );
+        }
+    } else {
+        for memory in ordered {
+            let mut ignored = 0.0;
+            admit_memory(
+                memory,
+                &mut ignored,
+                &mut selected,
+                &mut selected_ids,
+                &mut categories,
+                &mut used,
+                budget,
+                source_names,
+                estimate_tokens,
+            );
+        }
+    }
+    selected
+}
+
+pub(crate) fn trim_user_profile_to_budget(
+    profile: Vec<String>,
+    budget_tokens: f64,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> Vec<String> {
+    let mut used = 0usize;
+    profile
+        .into_iter()
+        .filter(|content| {
+            let cost = estimate_tokens(&format!("- {content}")) + 4;
+            if (used + cost) as f64 > budget_tokens.max(1.0) {
+                return false;
+            }
+            used += cost;
+            true
+        })
+        .collect()
 }
 
 /// Read the store and compose the HARD m0 bytes + watermarks. `estimate_tokens` is the
-/// (currently no-op) token estimator the decay renderer uses for its budget fit.
+/// token estimator used for every injection budget and the history fit.
 pub fn compose_m0_from_store(
     store: &McStore,
     inputs: &M0ComposeInputs<'_>,
@@ -145,27 +321,46 @@ pub fn compose_m0_from_store(
         .as_ref()
         .map(|value| workspace_source_names(&snapshot.memories, value))
         .unwrap_or_else(HashMap::new);
-    let rendered_memory_ids: Vec<i64> = snapshot.memories.iter().map(|memory| memory.id).collect();
+    let selected_memories = trim_memories_to_budget(
+        snapshot.memories,
+        membership.as_ref(),
+        &source_name_by_id,
+        inputs.memory_budget_tokens,
+        estimate_tokens,
+    );
+    let rendered_memory_ids: Vec<i64> = selected_memories.iter().map(|memory| memory.id).collect();
     let max_memory_id = snapshot.revision.max_memory_id;
     let memory_mutation_cursor = snapshot.revision.mutation_cursor;
 
     // --- user-profile + project-docs ---
     let user_profile = if inputs.memory_enabled {
-        if inputs.project_path.starts_with(SHADOW_SESSION_PREFIX) {
-            store.load_shadow_user_profile(inputs.project_path)?
-        } else {
-            store.load_active_user_memories()?
-        }
+        store.load_active_user_memories()?
     } else {
         Vec::new()
     };
-    let docs = read_project_docs_canonical(inputs.project_directory);
+    let user_profile = trim_user_profile_to_budget(
+        user_profile,
+        inputs.user_profile_budget_tokens,
+        estimate_tokens,
+    );
+    let docs = if inputs.inject_docs {
+        read_project_docs_canonical(inputs.project_directory)
+    } else {
+        crate::project_docs::ProjectDocs::default()
+    };
 
-    // --- compose the m0 bytes via the shared render_m0 (no trim until the estimator
-    // lands → loose budget, decay-pressure 1.0; the render is pure + estimator-independent) ---
+    // Compose m0 through the shared renderer after the project/profile budgets have selected
+    // their candidates. History keeps its existing decay-pressure fit in this same render.
     let decay_compartments: Vec<DecayRenderCompartment> = compartments
         .iter()
-        .map(DecayRenderCompartment::from)
+        .map(|compartment| {
+            let mut rendered = DecayRenderCompartment::from(compartment);
+            if !inputs.temporal_awareness {
+                rendered.start_date = None;
+                rendered.end_date = None;
+            }
+            rendered
+        })
         .collect();
     let m0_bytes = render_m0(
         &M0Inputs {
@@ -173,7 +368,7 @@ pub fn compose_m0_from_store(
             user_profile: &user_profile,
             covered_system_messages: inputs.covered_system_messages,
             compartments: &decay_compartments,
-            memories: &snapshot.memories,
+            memories: &selected_memories,
             source_name_by_id: &source_name_by_id,
             history_budget_tokens: inputs.history_budget_tokens,
             decay_pressure_multiplier: 1.0,
@@ -199,7 +394,7 @@ pub fn compose_m0_from_store(
 mod tests {
     use super::*;
     use cortexkit_store_types::StorageDescriptor;
-    use mc_store::{InsertMemoryInput, ModuleMeta, ShadowStateSyncRequest, StoredCompartment};
+    use mc_store::{InsertMemoryInput, ModuleMeta, StoredCompartment};
 
     fn no_estimate(_: &str) -> usize {
         0
@@ -251,6 +446,10 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
+            memory_budget_tokens: 8_000.0,
+            user_profile_budget_tokens: 4_000.0,
+            inject_docs: true,
+            temporal_awareness: true,
         };
         let m0 = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
 
@@ -266,44 +465,27 @@ mod tests {
     }
 
     #[test]
-    fn shadow_profile_seed_matches_typescript_profile_block_bytes() {
+    fn disabled_docs_render_empty_block_and_hash_without_reading_files() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
-        let session_id = "shadow:profile";
-        let profile = vec!["prefers root cause".to_string(), "x < y & z".to_string()];
-        store
-            .apply_shadow_state_sync(ShadowStateSyncRequest {
-                session_id,
-                shadow_project_path: session_id,
-                shadow_generation: 0,
-                expected_shadow_seq: 0,
-                seed_boundary_id: None,
-                compartments: &[],
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &profile,
-                workspace: None,
-                last_todo_state: None,
-                acked_watermarks: serde_json::Value::Null,
-            })
-            .unwrap();
-
-        let project_dir = dir.path().join("repo");
-        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(dir.path().join("ARCHITECTURE.md"), "secret docs").unwrap();
         let inputs = M0ComposeInputs {
-            session_id,
-            project_path: session_id,
-            project_directory: project_dir.to_str().unwrap(),
+            session_id: "docs-off",
+            project_path: "git:docs-off",
+            project_directory: dir.path().to_str().unwrap(),
             now_ms: 0,
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
+            memory_budget_tokens: 8_000.0,
+            user_profile_budget_tokens: 4_000.0,
+            inject_docs: false,
+            temporal_awareness: true,
         };
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
-        assert_eq!(
-            composed.m0_bytes,
-            "<user-profile>\n- prefers root cause\n- x &lt; y &amp; z\n</user-profile>\n\n<session-history></session-history>"
-        );
+        assert!(!composed.m0_bytes.contains("secret docs"));
+        assert!(!composed.m0_bytes.contains("<project-docs>"));
+        assert!(composed.docs_hash.is_empty());
     }
 
     #[test]
@@ -321,6 +503,10 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
+            memory_budget_tokens: 8_000.0,
+            user_profile_budget_tokens: 4_000.0,
+            inject_docs: true,
+            temporal_awareness: true,
         };
         let m0 = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
 
@@ -338,6 +524,7 @@ mod tests {
         store
             .insert_memory(InsertMemoryInput {
                 project_path: "git:proj",
+                route_project_root: None,
                 category: "CONSTRAINTS",
                 content: "must stay hidden",
                 source_session_id: None,
@@ -356,6 +543,10 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: false,
+            memory_budget_tokens: 8_000.0,
+            user_profile_budget_tokens: 4_000.0,
+            inject_docs: true,
+            temporal_awareness: true,
         };
 
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
@@ -386,6 +577,10 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
+            memory_budget_tokens: 8_000.0,
+            user_profile_budget_tokens: 4_000.0,
+            inject_docs: true,
+            temporal_awareness: true,
         };
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         assert_eq!(composed.coverage_ordinal, Some(30));
@@ -410,6 +605,10 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
+            memory_budget_tokens: 8_000.0,
+            user_profile_budget_tokens: 4_000.0,
+            inject_docs: true,
+            temporal_awareness: true,
         };
         let a = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         let b = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();

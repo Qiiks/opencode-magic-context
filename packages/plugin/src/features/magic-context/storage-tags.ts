@@ -197,6 +197,11 @@ export interface ToolReclaimHintTag {
     toolName: string | null;
 }
 
+export interface AgeReclaimToolTag extends ToolReclaimHintTag {
+    /** Cached output + input tokens; null means the legacy row has no size estimate. */
+    reclaimableTokens: number | null;
+}
+
 /**
  * Oldest active tool tags the agent can actually drop (excludes the protected
  * newest active tag window, matching ctx_reduce/applyPendingOperations). Used
@@ -219,7 +224,7 @@ const RECLAIM_HINT_EXCLUDED_TOOLS = ["todowrite"] as const;
  * skipped. A tag with NO cached token count is NOT excluded by the floor (we
  * cannot size it, so we never hide a potentially-large output).
  */
-const RECLAIM_HINT_MIN_TOKENS = 250;
+export const AGE_RECLAIM_MIN_TOKENS = 250;
 
 // Constant-folded literal list (the names are compile-time constants, never
 // user input), so the prepared SQL text stays static across calls.
@@ -256,8 +261,8 @@ export function getOldestActiveUnprotectedToolTags(
         )`;
     const params =
         protectedTags > 0
-            ? [sessionId, RECLAIM_HINT_MIN_TOKENS, sessionId, protectedTags - 1, boundedLimit]
-            : [sessionId, RECLAIM_HINT_MIN_TOKENS, boundedLimit];
+            ? [sessionId, AGE_RECLAIM_MIN_TOKENS, sessionId, protectedTags - 1, boundedLimit]
+            : [sessionId, AGE_RECLAIM_MIN_TOKENS, boundedLimit];
     const rows = db
         .prepare(
             `SELECT tag_number, tool_name
@@ -276,6 +281,49 @@ export function getOldestActiveUnprotectedToolTags(
             tagNumber: row.tag_number as number,
             toolName: typeof row.tool_name === "string" ? row.tool_name : null,
         }));
+}
+
+const getActiveToolTagsForAgeReclaimStatements = new WeakMap<Database, PreparedStatement>();
+
+/**
+ * Return active tool tags with the same persisted token estimate used by reclaim hints.
+ * Legacy rows with neither token column populated remain eligible for fail-safe reclaim.
+ */
+export function getActiveToolTagsForAgeReclaim(
+    db: Database,
+    sessionId: string,
+): AgeReclaimToolTag[] {
+    let stmt = getActiveToolTagsForAgeReclaimStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            `SELECT tag_number, tool_name, token_count, input_token_count
+             FROM tags
+             WHERE session_id = ? AND status = 'active' AND type = 'tool'
+             ORDER BY tag_number ASC, id ASC`,
+        );
+        getActiveToolTagsForAgeReclaimStatements.set(db, stmt);
+    }
+    const rows = stmt.all(sessionId) as Array<{
+        tag_number?: unknown;
+        tool_name?: unknown;
+        token_count?: unknown;
+        input_token_count?: unknown;
+    }>;
+    return rows
+        .filter((row) => typeof row.tag_number === "number")
+        .map((row) => {
+            const outputTokens = typeof row.token_count === "number" ? row.token_count : null;
+            const inputTokens =
+                typeof row.input_token_count === "number" ? row.input_token_count : null;
+            return {
+                tagNumber: row.tag_number as number,
+                toolName: typeof row.tool_name === "string" ? row.tool_name : null,
+                reclaimableTokens:
+                    outputTokens === null && inputTokens === null
+                        ? null
+                        : (outputTokens ?? 0) + (inputTokens ?? 0),
+            };
+        });
 }
 
 /**
@@ -1559,6 +1607,7 @@ export function getTagsBySession(db: Database, sessionId: string): TagEntry[] {
 // apply-operations, heuristic-cleanup, nudger) should switch to these.
 
 const getActiveTagsBySessionStatements = new WeakMap<Database, PreparedStatement>();
+const getDroppedTagsBySessionStatements = new WeakMap<Database, PreparedStatement>();
 const getMaxDroppedTagNumberStatements = new WeakMap<Database, PreparedStatement>();
 
 function getActiveTagsBySessionStatement(db: Database): PreparedStatement {
@@ -1568,6 +1617,17 @@ function getActiveTagsBySessionStatement(db: Database): PreparedStatement {
             `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND status = 'active' ORDER BY tag_number ASC, id ASC`,
         );
         getActiveTagsBySessionStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function getDroppedTagsBySessionStatement(db: Database): PreparedStatement {
+    let stmt = getDroppedTagsBySessionStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND status = 'dropped' ORDER BY tag_number ASC, id ASC`,
+        );
+        getDroppedTagsBySessionStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -1598,6 +1658,15 @@ function getMaxDroppedTagNumberStatement(db: Database): PreparedStatement {
  */
 export function getActiveTagsBySession(db: Database, sessionId: string): TagEntry[] {
     const rows = getActiveTagsBySessionStatement(db).all(sessionId).filter(isTagRow);
+    return rows.map(toTagEntry);
+}
+
+/**
+ * Return only dropped tags for a session. The partial dropped-tag index avoids
+ * loading active and compacted history when a force seed only needs drop state.
+ */
+export function getDroppedTagsBySession(db: Database, sessionId: string): TagEntry[] {
+    const rows = getDroppedTagsBySessionStatement(db).all(sessionId).filter(isTagRow);
     return rows.map(toTagEntry);
 }
 

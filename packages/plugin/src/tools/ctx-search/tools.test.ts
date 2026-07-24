@@ -255,4 +255,100 @@ describe("createCtxSearchTools", () => {
             spy.mockRestore();
         }
     });
+
+    it("resolves a `#1234` query directly to the matching memory without calling unifiedSearch", async () => {
+        const memory = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "ARCHITECTURE_DECISIONS",
+            content: "Direct id hit for the short-circuit.",
+        });
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => {
+            throw new Error("unifiedSearch must not run for ID-shaped queries");
+        });
+        try {
+            const tools = createCtxSearchTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                readMessages: () => [],
+            });
+
+            const result = await tools.ctx_search.execute(
+                { query: `#${memory.id}` },
+                toolContext(),
+            );
+
+            expect(result).toContain("[1] [memory]");
+            expect(result).toContain(`id=${memory.id}`);
+            expect(result).toContain("Direct id hit for the short-circuit.");
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it("falls through to unifiedSearch when the bare-id query has no matching memory", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+            async () =>
+                [
+                    {
+                        source: "memory",
+                        content: "Numeric query that survived into text search.",
+                        score: 0.5,
+                        memoryId: 1,
+                        category: "USER_DIRECTIVES",
+                        matchType: "fts",
+                    },
+                ] as UnifiedSearchResult[],
+        );
+        try {
+            const tools = createCtxSearchTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                readMessages: () => [],
+            });
+
+            const result = await tools.ctx_search.execute({ query: "7234" }, toolContext());
+
+            // The id short-circuit found nothing for 7234, so the call must
+            // reach the normal text lanes (which we mocked here).
+            expect(result).toContain("[1] [memory]");
+            expect(result).toContain("Numeric query that survived into text search.");
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it("does NOT treat a phrase containing a number as an id lookup", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+            async () =>
+                [
+                    {
+                        source: "memory",
+                        content: "Text search hit, not an id lookup.",
+                        score: 0.6,
+                        memoryId: 1,
+                        category: "USER_DIRECTIVES",
+                        matchType: "fts",
+                    },
+                ] as UnifiedSearchResult[],
+        );
+        try {
+            const tools = createCtxSearchTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                readMessages: () => [],
+            });
+
+            const result = await tools.ctx_search.execute({ query: "fix bug 1234" }, toolContext());
+
+            expect(result).toContain("Text search hit, not an id lookup.");
+        } finally {
+            spy.mockRestore();
+        }
+    });
 });

@@ -78,6 +78,9 @@ export interface SessionMeta {
     toolReclaimWatermark: number;
     lastTodoState: string;
     cachedM0Bytes: Buffer | null;
+    /** Frozen image payload paired atomically with cachedM0Bytes. */
+    cachedM0MuralDataUrl: string | null;
+    cachedM0MuralHash: string | null;
     cachedM1Bytes: Buffer | null;
     cachedM0ProjectMemoryEpoch: number | null;
     cachedM0WorkspaceFingerprint: string | null;
@@ -112,7 +115,12 @@ export interface SessionMeta {
     recoveryNoEligibleHeadCount: number;
     forceEmergencyBypassWindowStart: number;
     forceEmergencyBypassUsed: number;
+    /** Set only after an explicit OpenCode dialog choice; keeps the fresh dialog dismissed. */
     upgradeRemindedAt: number | null;
+    /** Most recent push reminder delivery, used for the bounded re-notification cooldown. */
+    upgradeReminderLastSentAt: number | null;
+    /** Total delivered upgrade reminders; the hard cap prevents an endless nag loop. */
+    upgradeReminderCount: number;
 }
 
 export type SchedulerDecision = "execute" | "defer";

@@ -14,6 +14,7 @@ import {
     getPendingCompactionMarkerState,
     getPersistedNoteNudge,
     getPersistedReasoningWatermark,
+    markSessionCleanupPending,
     recordDetectedContextLimit,
     recordOverflowDetected,
     removeAutoSearchHintDecisionByMessageId,
@@ -22,7 +23,10 @@ import {
     setPersistedReasoningWatermark,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
-import { getPersistedCompactionMarkerState } from "../../features/magic-context/storage-meta-persisted";
+import {
+    getChannel2NudgeState,
+    getPersistedCompactionMarkerState,
+} from "../../features/magic-context/storage-meta-persisted";
 import type { Tagger } from "../../features/magic-context/tagger";
 import {
     clearTransformDecisionSession,
@@ -75,6 +79,7 @@ export interface EventHandlerDeps {
     contextUsageMap: Map<string, ContextUsageEntry>;
     compactionHandler: ReturnType<typeof createCompactionHandler>;
     onSessionCacheInvalidated?: (sessionId: string) => void;
+    onRustWireInvalidated?: (sessionId: string) => void;
     onSessionDeleted?: (sessionId: string) => void;
     config: {
         protected_tags: number;
@@ -93,6 +98,8 @@ export interface EventHandlerDeps {
     client?: unknown;
     /** Channel 1 per-session metric baseline; read for the Channel 2 ceiling-nudge wording. */
     channel1StateBySession?: Map<string, import("./ctx-reduce-nudge").Channel1State>;
+    /** Hold Rust module directives until the terminal `message.updated` event, just like TypeScript nudge directives, so both use the same host-side delivery path. */
+    channel2DirectiveTextBySession?: Map<string, string>;
     getNotificationParams?: (sessionId: string) => NotificationParams;
     /**
      * Process-scoped set of Magic Context's own hidden child sessions, keyed by
@@ -138,15 +145,19 @@ async function deliverChannel2IfPending(deps: EventHandlerDeps, sessionId: strin
         // baseline. Parity with Pi's maybeDeliverChannel2Pi (reducedSinceRefresh
         // guard). The pending intent stays armed for that fresh re-evaluation.
         if (baseline?.reducedSinceRefresh) return;
-        await maybeDeliverChannel2(sessionId, {
+        const delivered = await maybeDeliverChannel2(sessionId, {
             db: deps.db,
             client: deps.client,
+            directiveText: deps.channel2DirectiveTextBySession?.get(sessionId),
             reclaimableTokens: baseline
                 ? baseline.tailToolTokens + baseline.turnToolTokens
                 : undefined,
             usableTokens: baseline?.usableTokens,
             oldestReclaimableToolTags: baseline?.oldestReclaimableToolTags,
         });
+        if (delivered || getChannel2NudgeState(deps.db, sessionId) !== "pending") {
+            deps.channel2DirectiveTextBySession?.delete(sessionId);
+        }
     } catch (error) {
         sessionLog(sessionId, "channel2 delivery wrapper failed (ignored):", error);
     }
@@ -630,6 +641,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
 
             dropSlot(info.sessionID, "message.removed");
+            deps.onRustWireInvalidated?.(info.sessionID);
             sessionLog(
                 info.sessionID,
                 `event message.removed: invalidating state for message ${info.messageID}`,
@@ -732,6 +744,10 @@ export function createEventHandler(deps: EventHandlerDeps) {
 
             dropSlot(sessionId, "session.deleted");
             try {
+                // Commit the retry marker before any deletion work. clearSession removes
+                // it in the same transaction as the session data, so a BUSY/rollback
+                // leaves a durable retry for the next maintenance tick.
+                markSessionCleanupPending(deps.db, sessionId);
                 // Read and remove compaction marker BEFORE clearSession destroys session_meta.
                 // Plan v6: pending_compaction_marker_state lives on the same row, so
                 // clearSession's session_meta DELETE wipes it automatically — no

@@ -1,7 +1,18 @@
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { findOnPath, isExecutableFile } from "./find-on-path";
+
+/** Where a detectable OpenCode installation was found. */
+export type OpenCodeInstallSource = "PATH" | "home-bin" | "desktop" | "app";
+
+/** A single OpenCode installation found by the filesystem detection ladder. */
+export interface OpenCodeInstallation {
+    /** The canonical path used for display and, for CLI installs, execution. */
+    path: string;
+    source: OpenCodeInstallSource;
+    kind: "cli" | "desktop";
+}
 
 /**
  * How OpenCode is present on this machine.
@@ -14,6 +25,9 @@ import { findOnPath, isExecutableFile } from "./find-on-path";
  *   Electron), so the CLI commands are unavailable; setup must degrade to
  *   manual model entry rather than claim OpenCode is absent (issue #196).
  * - `none`: no sign of OpenCode at all.
+ *
+ * `detectOpenCodeInstallations` exposes every rung. `detectOpenCode` below keeps
+ *   the original single-install API by returning the first (active) rung.
  */
 export type OpenCodeDetection =
     | { kind: "cli"; binary: string }
@@ -44,6 +58,8 @@ export interface DetectDeps {
     env: NodeJS.ProcessEnv;
     /** PATH lookup for a bare `opencode` (the host PATH walk). */
     onPath: (binary: string) => string | null;
+    /** Optional realpath function, injectable for tests, used to deduplicate installations that are symlink aliases. */
+    realpath?: (path: string) => string;
 }
 
 function defaultDeps(): DetectDeps {
@@ -94,16 +110,29 @@ function extraCliCandidates(d: DetectDeps): string[] {
     ];
 }
 
-/** Resolve a runnable `opencode` CLI binary, or null. */
-function resolveCliBinary(d: DetectDeps): string | null {
-    const stockBin = stockCliBinary(d);
-    if (d.isExecutable(stockBin)) return stockBin;
-    const onPath = d.onPath("opencode");
-    if (onPath && d.isExecutable(onPath)) return onPath;
-    for (const candidate of extraCliCandidates(d)) {
-        if (d.isExecutable(candidate)) return candidate;
+function canonicalPath(d: DetectDeps, path: string): string {
+    try {
+        return d.realpath ? d.realpath(path) : realpathSync(path);
+    } catch {
+        // A virtual test path or a path that disappeared between the probe and
+        // realpath lookup is still useful to report; retain its resolved spelling.
+        return path;
     }
-    return null;
+}
+
+/** Add a candidate once, using its real path to collapse symlink aliases. */
+function addCandidate(
+    installations: OpenCodeInstallation[],
+    seenRealpaths: Set<string>,
+    d: DetectDeps,
+    candidate: string,
+    source: OpenCodeInstallSource,
+    kind: OpenCodeInstallation["kind"],
+): void {
+    const path = canonicalPath(d, candidate);
+    if (seenRealpaths.has(path)) return;
+    seenRealpaths.add(path);
+    installations.push({ path, source, kind });
 }
 
 /** XDG-aware config base used for the Linux Desktop userData location. */
@@ -155,22 +184,60 @@ export function openCodeDesktopSettingsMarkers(deps?: Partial<DetectDeps>): stri
 }
 
 /**
- * Detect how OpenCode is installed, CLI-first then Desktop. Pure filesystem
- * checks (no exec), so it works in sandboxes where exec is blocked. Pass `deps`
- * to test against a virtual filesystem.
+ * Enumerate every detectable OpenCode installation.
+ *
+ * This intentionally keeps the existing probes and their priority: the
+ * resolved PATH binary is the active install, followed by the stock home-bin
+ * binary, other known CLI locations, Desktop userData markers, and GUI app
+ * paths. Pure filesystem checks (no exec) keep this safe in restricted shells.
+ * Pass `deps` to test against a virtual filesystem.
  */
-export function detectOpenCode(deps?: Partial<DetectDeps>): OpenCodeDetection {
+export function detectOpenCodeInstallations(deps?: Partial<DetectDeps>): OpenCodeInstallation[] {
     const d = { ...defaultDeps(), ...deps };
+    const installations: OpenCodeInstallation[] = [];
+    const seenRealpaths = new Set<string>();
 
-    const binary = resolveCliBinary(d);
-    if (binary) return { kind: "cli", binary };
+    // PATH is deliberately first: this is the binary a shell and the plugin
+    // registration workflow resolve when more than one install is present.
+    const onPath = d.onPath("opencode");
+    if (onPath && d.isExecutable(onPath)) {
+        addCandidate(installations, seenRealpaths, d, onPath, "PATH", "cli");
+    }
+
+    const stockBin = stockCliBinary(d);
+    if (d.isExecutable(stockBin)) {
+        addCandidate(installations, seenRealpaths, d, stockBin, "home-bin", "cli");
+    }
+
+    for (const candidate of extraCliCandidates(d)) {
+        if (d.isExecutable(candidate)) {
+            addCandidate(installations, seenRealpaths, d, candidate, "PATH", "cli");
+        }
+    }
 
     for (const appId of OPENCODE_DESKTOP_APP_IDS) {
         const marker = join(desktopUserDataDir(d, appId), OPENCODE_DESKTOP_SETTINGS_FILE);
-        if (d.exists(marker)) return { kind: "desktop", marker };
+        if (d.exists(marker)) {
+            addCandidate(installations, seenRealpaths, d, marker, "desktop", "desktop");
+        }
     }
     for (const appPath of desktopAppPaths(d)) {
-        if (d.exists(appPath)) return { kind: "desktop", marker: appPath };
+        if (d.exists(appPath)) {
+            addCandidate(installations, seenRealpaths, d, appPath, "app", "desktop");
+        }
     }
-    return { kind: "none" };
+
+    return installations;
+}
+
+/**
+ * Return the first detected installation in the original single-installation
+ * shape so existing callers continue to use the installation selected for checks.
+ */
+export function detectOpenCode(deps?: Partial<DetectDeps>): OpenCodeDetection {
+    const active = detectOpenCodeInstallations(deps)[0];
+    if (!active) return { kind: "none" };
+    return active.kind === "cli"
+        ? { kind: "cli", binary: active.path }
+        : { kind: "desktop", marker: active.path };
 }

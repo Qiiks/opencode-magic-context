@@ -333,6 +333,16 @@ describe("bundleIssueReport secret redaction", () => {
                 pluginVersion: "0.18.0",
                 opencodeInstalled: true,
                 opencodeVersion: "1.0.0",
+                opencodeInstallKind: "cli",
+                opencodeInstallations: [
+                    {
+                        path: join(root, "opencode"),
+                        source: "PATH",
+                        kind: "cli",
+                        version: "1.0.0",
+                        active: true,
+                    },
+                ],
                 configPaths: {
                     configDir: join(root, ".config", "opencode"),
                     opencodeConfig: join(root, ".config", "opencode", "opencode.jsonc"),
@@ -390,6 +400,8 @@ describe("bundleIssueReport secret redaction", () => {
             expect(body).not.toContain("header-secret-value");
             expect(body).not.toContain("custom-header-secret");
             expect(body).not.toContain("historian-last-error-secret");
+            expect(body).not.toContain("### OpenCode installations");
+            expect(body).toContain("- OpenCode installed: true [cli] (1.0.0)");
         } finally {
             process.chdir(originalCwd);
         }
@@ -409,6 +421,23 @@ describe("bundleIssueReport secret redaction", () => {
                 pluginVersion: "0.18.0",
                 opencodeInstalled: true,
                 opencodeVersion: "1.0.0",
+                opencodeInstallKind: "cli",
+                opencodeInstallations: [
+                    {
+                        path: "/Users/alice/.opencode/bin/opencode",
+                        source: "PATH",
+                        kind: "cli",
+                        version: "1.18.0",
+                        active: true,
+                    },
+                    {
+                        path: "/Users/alice/Applications/OpenCode.app",
+                        source: "app",
+                        kind: "desktop",
+                        version: "unknown",
+                        active: false,
+                    },
+                ],
                 configPaths: {
                     configDir: "/Users/alice/.config/opencode",
                     opencodeConfig: "/Users/alice/.config/opencode/opencode.jsonc",
@@ -461,6 +490,13 @@ describe("bundleIssueReport secret redaction", () => {
             );
             expect(body).toContain(
                 '"title": "Problem at /Users/<USER>/private token=<REDACTED:token>"',
+            );
+            expect(body).toContain("### OpenCode installations");
+            expect(body).toContain(
+                "| [active] | `/Users/<USER>/.opencode/bin/opencode` | 1.18.0 | PATH |",
+            );
+            expect(body).toContain(
+                "|  | `/Users/<USER>/Applications/OpenCode.app` | unknown | app |",
             );
             expect(body).not.toContain("alice");
             expect(body).not.toContain("abc123");

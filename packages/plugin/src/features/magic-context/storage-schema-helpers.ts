@@ -51,39 +51,15 @@ export function ensureColumn(
  * execute pass mutated message content — a sustained cache-bust cascade.
  *
  * The validator now tolerates NULL, but we normalize the data too so every
- * code path sees well-formed values. Healers tolerate only absent columns,
- * detected before each UPDATE; lock, I/O, and other execution errors must
+ * code path sees well-formed values. A single table-info read excludes absent
+ * columns from the combined UPDATE; lock, I/O, and other execution errors must
  * propagate so the surrounding migration rolls back and can retry.
  *
  * Exported so migration v5 can call it. Not exported from any barrel.
  */
 export function healAllNullColumns(db: Database): void {
-    healNullTextColumns(db);
-    healNullIntegerColumns(db);
-    healMissingMemoryBlockIds(db);
-}
-
-function getSessionMetaColumns(db: Database): Set<string> {
-    const rows = db.prepare("PRAGMA table_info(session_meta)").all() as Array<{ name?: string }>;
-    return new Set(rows.flatMap((row) => (typeof row.name === "string" ? [row.name] : [])));
-}
-
-function healMissingMemoryBlockIds(db: Database): void {
-    const columns = getSessionMetaColumns(db);
-    if (
-        !columns.has("memory_block_cache") ||
-        !columns.has("memory_block_ids") ||
-        !columns.has("memory_block_count")
-    ) {
-        return;
-    }
-    db.prepare(
-        "UPDATE session_meta SET memory_block_cache = '' WHERE memory_block_cache != '' AND (memory_block_ids IS NULL OR memory_block_ids = '') AND memory_block_count > 0",
-    ).run();
-}
-
-function healNullTextColumns(db: Database): void {
-    const columns: Array<[string, string]> = [
+    const existingColumns = getSessionMetaColumns(db);
+    const fallbacks: Array<readonly [string, string | number]> = [
         ["cache_ttl", ""],
         ["last_nudge_band", ""],
         ["last_nudge_level", ""],
@@ -108,21 +84,6 @@ function healNullTextColumns(db: Database): void {
         ["memory_block_ids", ""],
         ["compaction_marker_state", ""],
         ["key_files", ""],
-    ];
-    const existingColumns = getSessionMetaColumns(db);
-    for (const [column, fallback] of columns) {
-        if (!existingColumns.has(column)) continue;
-        db.prepare(`UPDATE session_meta SET ${column} = ? WHERE ${column} IS NULL`).run(fallback);
-    }
-}
-
-function healNullIntegerColumns(db: Database): void {
-    // INTEGER columns added via ensureColumn against pre-existing rows.
-    // SQLite does not backfill the DEFAULT on ALTER TABLE, so old rows have
-    // NULL. The validator tolerates null as of this release, but we still
-    // normalize to 0 so subsequent reads from any path (including paths
-    // that bypass toSessionMeta) see a well-formed row.
-    const columns: Array<[string, number]> = [
         ["times_execute_threshold_reached", 0],
         ["compartment_in_progress", 0],
         ["historian_failure_count", 0],
@@ -149,9 +110,33 @@ function healNullIntegerColumns(db: Database): void {
         ["emergency_drain_active", 0],
         ["historian_drain_failure_at", 0],
     ];
-    const existingColumns = getSessionMetaColumns(db);
-    for (const [column, fallback] of columns) {
-        if (!existingColumns.has(column)) continue;
-        db.prepare(`UPDATE session_meta SET ${column} = ? WHERE ${column} IS NULL`).run(fallback);
+    const presentFallbacks = fallbacks.filter(([column]) => existingColumns.has(column));
+    if (presentFallbacks.length > 0) {
+        const assignments = presentFallbacks
+            .map(([column]) => `${column} = COALESCE(${column}, ?)`)
+            .join(", ");
+        const nullPredicate = presentFallbacks.map(([column]) => `${column} IS NULL`).join(" OR ");
+        db.prepare(`UPDATE session_meta SET ${assignments} WHERE ${nullPredicate}`).run(
+            ...presentFallbacks.map(([, fallback]) => fallback),
+        );
     }
+    healMissingMemoryBlockIds(db, existingColumns);
+}
+
+function getSessionMetaColumns(db: Database): Set<string> {
+    const rows = db.prepare("PRAGMA table_info(session_meta)").all() as Array<{ name?: string }>;
+    return new Set(rows.flatMap((row) => (typeof row.name === "string" ? [row.name] : [])));
+}
+
+function healMissingMemoryBlockIds(db: Database, columns: ReadonlySet<string>): void {
+    if (
+        !columns.has("memory_block_cache") ||
+        !columns.has("memory_block_ids") ||
+        !columns.has("memory_block_count")
+    ) {
+        return;
+    }
+    db.prepare(
+        "UPDATE session_meta SET memory_block_cache = '' WHERE memory_block_cache != '' AND (memory_block_ids IS NULL OR memory_block_ids = '') AND memory_block_count > 0",
+    ).run();
 }

@@ -32,35 +32,39 @@ import {
 	renderMessageByOrdinal,
 	renderVerboseRange,
 } from "@magic-context/core/tools/ctx-expand/render";
+import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 import { readPiSessionMessages } from "../read-session-pi";
 
-const ParamsSchema = Type.Object({
-	start: Type.Optional(
-		Type.Number({
-			description:
-				'First message ordinal to expand — a compartment\'s start="N" attribute, or an ordinal from a ctx_search message hit',
-		}),
-	),
-	end: Type.Optional(
-		Type.Number({
-			description:
-				'Last message ordinal to expand (inclusive) — a compartment\'s end="M" attribute',
-		}),
-	),
-	verbose: Type.Optional(
-		Type.Boolean({
-			description:
-				"With start/end: list each message separately with its ordinal [N] and per-part preview, so you can recover one in full by ordinal.",
-		}),
-	),
-	message: Type.Optional(
-		Type.Number({
-			description:
-				"Full untruncated recovery of ONE message by its ordinal (every text part + every tool call's complete input/output). Use an ordinal from a compartment, ctx_search hit, or verbose range. Recovers a tool output you dropped with ctx_reduce.",
-		}),
-	),
-});
+const ParamsSchema = Type.Object(
+	{
+		start: Type.Optional(
+			Type.Number({
+				description:
+					'First message ordinal to expand — a compartment\'s start="N" attribute, or an ordinal from a ctx_search message hit',
+			}),
+		),
+		end: Type.Optional(
+			Type.Number({
+				description:
+					'Last message ordinal to expand (inclusive) — a compartment\'s end="M" attribute',
+			}),
+		),
+		verbose: Type.Optional(
+			Type.Boolean({
+				description:
+					"With start/end: list each message separately with its ordinal [N] and per-part preview, so you can recover one in full by ordinal.",
+			}),
+		),
+		message: Type.Optional(
+			Type.Number({
+				description:
+					"Full untruncated recovery of ONE message by its ordinal (every text part + every tool call's complete input/output). Use an ordinal from a compartment, ctx_search hit, or verbose range. Recovers a tool output you dropped with ctx_reduce.",
+			}),
+		),
+	},
+	{ additionalProperties: true },
+);
 
 type CtxExpandParams = Static<typeof ParamsSchema>;
 
@@ -95,6 +99,12 @@ export function createCtxExpandTool(
 			_onUpdate,
 			ctx,
 		) {
+			params = unwrapImitatedReducedArgs(params, ["message", "start"], {
+				start: "number",
+				end: "number",
+				verbose: "boolean",
+				message: "number",
+			});
 			const sessionId = ctx.sessionManager.getSessionId();
 			if (!sessionId) {
 				return err("Error: no active Pi session.");

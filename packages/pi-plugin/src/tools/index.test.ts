@@ -36,6 +36,62 @@ describe("registerMagicContextTools", () => {
 		}
 	});
 
+	it("advertises only real ctx_* fields and allows additional properties", () => {
+		const db = createTestDb();
+		try {
+			const registered = new Map<
+				string,
+				{
+					name: string;
+					parameters: {
+						properties?: Record<string, unknown>;
+						additionalProperties?: unknown;
+					};
+				}
+			>();
+			const pi = {
+				registerTool: (tool: {
+					name: string;
+					parameters: {
+						properties?: Record<string, unknown>;
+						additionalProperties?: unknown;
+					};
+				}) => registered.set(tool.name, tool),
+				registerCommand: () => undefined,
+			} as never;
+
+			registerMagicContextTools(pi, { db });
+
+			const expectedFields: Record<string, string[]> = {
+				ctx_search: ["query", "limit", "sources"],
+				ctx_memory: ["action", "content", "category", "ids", "limit", "reason"],
+				ctx_note: [
+					"action",
+					"content",
+					"surface_condition",
+					"note_id",
+					"filter",
+					"limit",
+					"offset",
+				],
+				ctx_expand: ["start", "end", "verbose", "message"],
+				ctx_reduce: ["drop"],
+			};
+			for (const [name, fields] of Object.entries(expectedFields)) {
+				const definition = registered.get(name);
+				expect(definition).toBeDefined();
+				expect(
+					Object.keys(definition?.parameters.properties ?? {}).sort(),
+				).toEqual([...fields].sort());
+				expect(definition?.parameters.properties).not.toHaveProperty("reduced");
+				expect(definition?.parameters.properties).not.toHaveProperty("summary");
+				expect(definition?.parameters.additionalProperties).toBe(true);
+			}
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("registered tools resolve smart-note gating from the invocation cwd", async () => {
 		const db = createTestDb();
 		try {

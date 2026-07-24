@@ -82,6 +82,16 @@ export interface PrimerCandidate {
   created_at: number;
 }
 
+export interface MuralManifest {
+  project_path: string;
+  /** PNG BLOB serialized by Tauri as a byte array, or a data URL from a server transport. */
+  image: number[] | string;
+  rendered_at: number;
+  token_estimate: number;
+  width: number;
+  height: number;
+}
+
 export interface CategoryCount {
   category: string;
   count: number;

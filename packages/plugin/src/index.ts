@@ -11,10 +11,14 @@ import { migrateMagicContextConfigLocations } from "./config/migrate-config-loca
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
-import { resolveProjectIdentityOrFallback } from "./features/magic-context/memory/project-identity";
+import { resolveProjectIdentityForSession } from "./features/magic-context/memory/project-identity";
 import { runSessionProjectBackfill } from "./features/magic-context/session-project-backfill";
 import { SIDEKICK_SYSTEM_PROMPT } from "./features/magic-context/sidekick/agent";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smart-notes/compiler-prompt";
+import {
+    createFailClosedController,
+    getLastHookInitFailure,
+} from "./features/magic-context/fail-closed-block";
 import {
     getSchemaFenceRejection,
     isDatabasePersisted,
@@ -31,10 +35,11 @@ import {
 } from "./hooks/magic-context/compartment-prompt";
 import { createLiveSessionState } from "./hooks/magic-context/live-session-state";
 import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
-import { SubcShadowTransport } from "./hooks/magic-context/shadow-sender";
+import { SubcModuleTransport } from "./hooks/magic-context/module-transport";
 import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./plugin/boot-quiet";
 import { cleanupConflictWarnings, sendConflictWarning } from "./plugin/conflict-warning-hook";
 import { startDreamScheduleTimer } from "./plugin/dream-timer";
+import { createDreamTimerModuleClient } from "./plugin/dream-timer-module-client";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./plugin/embedding-bootstrap";
 import { createEventHandler } from "./plugin/event";
 import { createSessionHooksAsync } from "./plugin/hooks/create-session-hooks";
@@ -152,7 +157,7 @@ const server: Plugin = async (ctx) => {
     const liveSessionState = createLiveSessionState();
     const rustModeModuleClient: RustModeModuleClient | undefined =
         pluginConfig.transform_mode === "rust"
-            ? new SubcShadowTransport(undefined, undefined, undefined, "")
+            ? new SubcModuleTransport()
             : undefined;
 
     const hooks = await createSessionHooksAsync({
@@ -162,17 +167,67 @@ const server: Plugin = async (ctx) => {
         rustModeModuleClient,
     });
 
+    // Mutable holder so a healed storage reopen can install real hooks without
+    // rebuilding the outer messages-transform wrapper.
+    const magicContextRuntime: {
+        magicContext: typeof hooks.magicContext;
+        rustToolBackends: typeof hooks.rustToolBackends;
+    } = {
+        magicContext: hooks.magicContext,
+        rustToolBackends: hooks.rustToolBackends,
+    };
+
+    // Loud fail-closed gate: when the user enabled MC but storage cannot open
+    // (schema fence / migration hard failure), block primary transforms instead
+    // of silently unregistering hooks and falling through to native compaction.
+    const failClosed = createFailClosedController();
+    const failClosedBlockingEnabled =
+        pluginConfig.enabled === true && pluginConfig.fail_closed_blocking !== false;
+    if (pluginConfig.enabled === true && !magicContextRuntime.magicContext) {
+        const initFailure = getLastHookInitFailure();
+        if (initFailure?.type === "storage") {
+            failClosed.arm(initFailure.reason);
+            log(
+                `[magic-context] fail-closed blocking armed (${initFailure.reason.kind}); primary sessions will error until storage recovers or the build is upgraded`,
+            );
+        }
+    }
+
+    const tryReopenStorage = async (): Promise<boolean> => {
+        if (magicContextRuntime.magicContext) {
+            failClosed.clear();
+            return true;
+        }
+        try {
+            const reopened = await createSessionHooksAsync({
+                ctx,
+                pluginConfig,
+                liveSessionState,
+                rustModeModuleClient,
+            });
+            if (!reopened.magicContext) return false;
+            magicContextRuntime.magicContext = reopened.magicContext;
+            magicContextRuntime.rustToolBackends = reopened.rustToolBackends;
+            failClosed.clear();
+            log("[magic-context] storage re-probe succeeded; Magic Context runtime restored");
+            return true;
+        } catch (error) {
+            log(`[magic-context] storage re-probe failed: ${error}`);
+            return false;
+        }
+    };
+
     const tools = createToolRegistry({
         ctx,
         pluginConfig,
-        rustToolBackends: hooks.rustToolBackends,
+        rustToolBackends: magicContextRuntime.rustToolBackends,
     });
 
     // v22 deferred legacy-memory identity backfill. createSessionHooks() opens
     // the shared DB and runs migrations before returning a non-null hook, so
     // this fire-and-forget runner starts only after the schema is ready. Its
     // batch transactions serialize naturally with concurrent ctx_memory writes.
-    if (pluginConfig.enabled && hooks.magicContext) {
+    if (pluginConfig.enabled && magicContextRuntime.magicContext) {
         try {
             const db = openDatabase();
             if (db && isDatabasePersisted(db)) {
@@ -190,7 +245,7 @@ const server: Plugin = async (ctx) => {
     // Gated like the v22 backfill above: a conflict-disabled plugin must not
     // touch storage at all (openDatabase() would CREATE context.db, breaking
     // the disabled-path invariant that no state is written).
-    if (pluginConfig.enabled && hooks.magicContext) {
+    if (pluginConfig.enabled && magicContextRuntime.magicContext) {
         scheduleAfterBootQuiet(() => {
             void (async () => {
                 const db = openDatabase();
@@ -253,34 +308,46 @@ const server: Plugin = async (ctx) => {
     // so overnight dreaming works even when the user isn't chatting.
     if (pluginConfig.enabled) {
         const dreamerRunnable = isDreamerRunnable(pluginConfig);
-        const timerRegistration = {
-            directory: ctx.directory,
-            projectIdentity: resolveProjectIdentityOrFallback(ctx.directory),
-            client: ctx.client,
-            dreamerConfig: dreamerRunnable ? pluginConfig.dreamer : undefined,
-            language: pluginConfig.language,
-            embeddingConfig: pluginConfig.embedding,
-            memoryEnabled: pluginConfig.memory?.enabled === true,
-            gitCommitIndexing: pluginConfig.memory.git_commit_indexing?.enabled
-                ? {
-                      enabled: true,
-                      since_days: pluginConfig.memory.git_commit_indexing.since_days,
-                      max_commits: pluginConfig.memory.git_commit_indexing.max_commits,
-                  }
-                : undefined,
-            ensureRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
-        };
-        // Fail OPEN: the dream timer is best-effort background maintenance and must
-        // never abort the plugin load. This block is awaited and runs BEFORE the
-        // hooks are returned, so an unguarded throw here (e.g. a fatal DB open, or
-        // ensureRegistered failing) would escape server() and leave the transform /
-        // compaction pipeline unregistered — ballooning every session's context.
-        // openTimerDatabaseOrNull already degrades a fatal open to null, but we wrap
-        // the whole registration as defense in depth against any other throw path.
-        try {
-            stopDreamTimerRegistration = await startDreamScheduleTimer(timerRegistration);
-        } catch (err) {
-            log(`[magic-context] dream timer registration failed (continuing without it): ${err}`);
+        const classifyModuleClient = createDreamTimerModuleClient(rustModeModuleClient);
+        const timerProjectIdentity = resolveProjectIdentityForSession(ctx.directory);
+        if (!timerProjectIdentity) {
+            log("[magic-context] dream timer skipped: cwd is the user's home directory");
+        } else {
+            const timerRegistration = {
+                directory: ctx.directory,
+                projectIdentity: timerProjectIdentity,
+                client: ctx.client,
+                dreamerConfig: dreamerRunnable ? pluginConfig.dreamer : undefined,
+                language: pluginConfig.language,
+                transformMode: pluginConfig.transform_mode,
+                embeddingConfig: pluginConfig.embedding,
+                memoryEnabled: pluginConfig.memory?.enabled === true,
+                memoryInjectionBudgetTokens: pluginConfig.memory?.injection_budget_tokens,
+                experimentalMural: pluginConfig.experimental?.mural,
+                gitCommitIndexing: pluginConfig.memory.git_commit_indexing?.enabled
+                    ? {
+                          enabled: true,
+                          since_days: pluginConfig.memory.git_commit_indexing.since_days,
+                          max_commits: pluginConfig.memory.git_commit_indexing.max_commits,
+                      }
+                    : undefined,
+                ensureRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+                moduleClient: classifyModuleClient,
+            };
+            // Fail OPEN: the dream timer is best-effort background maintenance and must
+            // never abort the plugin load. This block is awaited and runs BEFORE the
+            // hooks are returned, so an unguarded throw here (e.g. a fatal DB open, or
+            // ensureRegistered failing) would escape server() and leave the transform /
+            // compaction pipeline unregistered — ballooning every session's context.
+            // openTimerDatabaseOrNull already degrades a fatal open to null, but we wrap
+            // the whole registration as defense in depth against any other throw path.
+            try {
+                stopDreamTimerRegistration = await startDreamScheduleTimer(timerRegistration);
+            } catch (err) {
+                log(
+                    `[magic-context] dream timer registration failed (continuing without it): ${err}`,
+                );
+            }
         }
 
         // Start RPC server for TUI↔server communication (replaces SQLite plugin_messages bus).
@@ -422,7 +489,11 @@ const server: Plugin = async (ctx) => {
     return {
         tool: tools,
         event: createEventHandler({
-            magicContext: hooks.magicContext,
+            magicContext: {
+                event: async (input) => {
+                    await magicContextRuntime.magicContext?.event?.(input);
+                },
+            },
             autoUpdateChecker: createAutoUpdateCheckerHook(ctx, {
                 autoUpdate: pluginConfig.auto_update !== false,
                 signal: autoUpdateAbort.signal,
@@ -467,13 +538,21 @@ const server: Plugin = async (ctx) => {
             },
         }),
         "experimental.chat.messages.transform": createMessagesTransformHandler({
-            magicContext: hooks.magicContext,
+            magicContext: magicContextRuntime.magicContext,
+            getMagicContext: () => magicContextRuntime.magicContext,
+            failClosed,
+            failClosedBlockingEnabled,
+            internalChildSessions: liveSessionState.internalChildSessions,
+            tryReopenStorage,
         }) as unknown as NonNullable<Hooks["experimental.chat.messages.transform"]>,
         "experimental.chat.system.transform": async (input, output) => {
-            await hooks.magicContext?.["experimental.chat.system.transform"]?.(input, output);
+            await magicContextRuntime.magicContext?.["experimental.chat.system.transform"]?.(
+                input,
+                output,
+            );
         },
         "command.execute.before": async (input, output) => {
-            await hooks.magicContext?.["command.execute.before"]?.(input, output);
+            await magicContextRuntime.magicContext?.["command.execute.before"]?.(input, output);
         },
         "chat.message": async (input, _output) => {
             // Update tool-def measurement latch before delegating to magic-context
@@ -490,7 +569,7 @@ const server: Plugin = async (ctx) => {
             if (provId && modId && agent) {
                 lastChatContext = { providerID: provId, modelID: modId, agentName: agent };
             }
-            await hooks.magicContext?.["chat.message"]?.(input);
+            await magicContextRuntime.magicContext?.["chat.message"]?.(input);
         },
         "tool.definition": async (input, output) => {
             // Attribute tool schema tokens to the most recent chat-message context.
@@ -512,10 +591,10 @@ const server: Plugin = async (ctx) => {
             );
         },
         "tool.execute.after": async (input, output) => {
-            await hooks.magicContext?.["tool.execute.after"]?.(input, output);
+            await magicContextRuntime.magicContext?.["tool.execute.after"]?.(input, output);
         },
         "experimental.text.complete": async (input, output) => {
-            await hooks.magicContext?.["experimental.text.complete"]?.(input, output);
+            await magicContextRuntime.magicContext?.["experimental.text.complete"]?.(input, output);
         },
         config: async (config) => {
             try {

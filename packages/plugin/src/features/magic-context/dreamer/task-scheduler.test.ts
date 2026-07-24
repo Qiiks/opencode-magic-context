@@ -138,10 +138,11 @@ describe("task-scheduler — planDueTasks", () => {
         expect(getTaskScheduleState(db, PROJECT, "verify")?.lastRunAt).toBe(555000);
     });
 
-    it("prunes retired task rows (v1 names) not in the canonical config set", () => {
+    it("prunes retired task rows not in the canonical config set", () => {
         db = freshDb();
-        // Simulate stale v1 rows left by the verify/curate split.
-        for (const task of ["improve", "consolidate", "archive-stale"] as const) {
+        // Simulate stale rows from old scheduler configurations so pruning can
+        // remove task names that are no longer canonical.
+        for (const task of ["improve", "consolidate", "archive-stale", "render-mural"] as const) {
             writeTaskScheduleState(db, {
                 projectPath: PROJECT,
                 task,
@@ -162,7 +163,7 @@ describe("task-scheduler — planDueTasks", () => {
             [cfg("verify", "0 3 * * *"), cfg("curate", "0 4 * * 0")],
             Date.now(),
         );
-        for (const task of ["improve", "consolidate", "archive-stale"] as const) {
+        for (const task of ["improve", "consolidate", "archive-stale", "render-mural"] as const) {
             expect(getTaskScheduleState(db, PROJECT, task)).toBeNull();
         }
         // Canonical tasks survive.
@@ -319,6 +320,7 @@ describe("task-scheduler — runDueTasksForProject", () => {
         expect(ran).toEqual(["verify"]);
         const state = getTaskScheduleState(db, PROJECT, "verify");
         expect(state?.lastStatus).toBe("completed");
+        expect(state?.lastRunAt).toBeGreaterThanOrEqual(now);
         expect(state?.nextDueAt).toBeGreaterThan(now);
     });
 
@@ -505,6 +507,7 @@ describe("task-scheduler — runDueTasksForProject", () => {
             await runDueTasksForProject({ db, projectIdentity: PROJECT, tasks, executor, now });
             const s = getTaskScheduleState(db, PROJECT, "verify");
             expect(s?.retryCount).toBe(attempt);
+            expect(s?.lastRunAt).toBeNull();
             expect(s?.nextDueAt).toBeLessThan(now); // still due
         }
         // Attempt 4 exceeds MAX_TASK_RETRIES=3 → advance + reset.

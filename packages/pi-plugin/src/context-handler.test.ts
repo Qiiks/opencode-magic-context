@@ -46,6 +46,7 @@ import { clearModelsDevCache } from "@magic-context/core/shared/models-dev-cache
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
+
 import { clearAutoSearchForPiSession } from "./auto-search-pi";
 import {
 	awaitInFlightHistorians,
@@ -189,6 +190,108 @@ describe("stable tag identity reuse window", () => {
 				).sort(),
 			).toEqual(["entry-b", "entry-c"]);
 		} finally {
+			clearContextHandlerSession(sessionId);
+		}
+	});
+});
+
+describe("persisted Pi text identity vectors", () => {
+	const twoTextMessage = (first: string, second?: string) =>
+		assistantMessage("unused", 2, {
+			content: [first, second]
+				.filter((text): text is string => text !== undefined)
+				.map((text) => ({ type: "text", text })),
+		});
+
+	it("does not rebind the deleted leading sibling's tag to the survivor", () => {
+		const db = createTestDb();
+		const sessionId = "ses-text-sibling-drift";
+		try {
+			const tagger = createTagger();
+			tagger.initFromDb(sessionId, db);
+			const seedMessages = [twoTextMessage("A", "B")];
+			const seed = createPiTranscript(seedMessages, sessionId, ["entry-m"]);
+			tagTranscript(sessionId, seed, tagger, db);
+			seed.commit();
+			expect(textOf(seedMessages[0])).toBe("§1§ A§2§ B");
+
+			const survivorMessages = [twoTextMessage("B")];
+			const survivor = createPiTranscript(survivorMessages, sessionId, ["entry-m"]);
+			const plan = contextHandlerInternals.buildPiTextIdentityPlan(
+				db,
+				sessionId,
+				tagger,
+				survivor,
+				new Set(["entry-m"]),
+			);
+			expect(plan.driftedMessageIds.has("entry-m")).toBe(true);
+			expect(plan.reusableMessageIds.has("entry-m")).toBe(false);
+
+			tagTranscript(sessionId, survivor, tagger, db, {
+				reuseMessageIds: plan.reusableMessageIds,
+				textIdentityDriftMessageIds: plan.driftedMessageIds,
+				textIdentitySourceCache: plan.sourceCache,
+			});
+			survivor.commit();
+			const survivorContent = (
+				survivorMessages[0] as { content: Array<{ type: string; text?: string }> }
+			).content;
+			expect(survivorContent[0]?.text).toBe("§3§ B");
+			expect(survivorContent[0]?.text?.startsWith("§1§")).toBe(false);
+			const rows = db
+				.prepare(
+					"SELECT tag_number AS tagNumber, message_id AS messageId FROM tags WHERE session_id = ? ORDER BY tag_number",
+				)
+				.all(sessionId) as Array<{ tagNumber: number; messageId: string }>;
+			expect(rows).toHaveLength(3);
+			expect(rows[2]?.messageId).toContain(":mc-text-v1:");
+		} finally {
+			closeQuietly(db);
+			clearContextHandlerSession(sessionId);
+		}
+	});
+
+	it("keeps unchanged messages byte-identical without database writes", () => {
+		const db = createTestDb();
+		const sessionId = "ses-text-vector-unchanged";
+		try {
+			const tagger = createTagger();
+			tagger.initFromDb(sessionId, db);
+			const seedMessages = [twoTextMessage("A", "B")];
+			const seed = createPiTranscript(seedMessages, sessionId, ["entry-m"]);
+			tagTranscript(sessionId, seed, tagger, db);
+			seed.commit();
+			const expectedBytes = JSON.stringify(seed.getOutputMessages());
+
+			const replayMessages = [twoTextMessage("A", "B")];
+			const replay = createPiTranscript(replayMessages, sessionId, ["entry-m"]);
+			const plan = contextHandlerInternals.buildPiTextIdentityPlan(
+				db,
+				sessionId,
+				tagger,
+				replay,
+				new Set(["entry-m"]),
+			);
+			expect(plan.driftedMessageIds.size).toBe(0);
+			expect(plan.reusableMessageIds.has("entry-m")).toBe(true);
+			const beforeChanges = (
+				db.prepare("SELECT total_changes() AS count").get() as { count: number }
+			).count;
+
+			tagTranscript(sessionId, replay, tagger, db, {
+				reuseMessageIds: plan.reusableMessageIds,
+				textIdentityDriftMessageIds: plan.driftedMessageIds,
+				textIdentitySourceCache: plan.sourceCache,
+			});
+			replay.commit();
+			const afterChanges = (
+				db.prepare("SELECT total_changes() AS count").get() as { count: number }
+			).count;
+
+			expect(JSON.stringify(replay.getOutputMessages())).toBe(expectedBytes);
+			expect(afterChanges).toBe(beforeChanges);
+		} finally {
+			closeQuietly(db);
 			clearContextHandlerSession(sessionId);
 		}
 	});
@@ -2330,7 +2433,7 @@ describe("registerPiContextHandler", () => {
 				run: mock(async () => ({
 					ok: true as const,
 					assistantText:
-						'<compartment start="1" end="2" title="Forward">Forward pressure history.</compartment>',
+						'<compartment start="1" end="2" title="Forward"><p1>Forward pressure history.</p1></compartment>',
 					durationMs: 1,
 				})),
 			} as unknown as SubagentRunner;
@@ -2410,7 +2513,7 @@ describe("registerPiContextHandler", () => {
 				run: mock(async () => ({
 					ok: true as const,
 					assistantText:
-						'<compartment start="1" end="2" title="Skipped">Should not run.</compartment>',
+						'<compartment start="1" end="2" title="Skipped"><p1>Should not run.</p1></compartment>',
 					durationMs: 1,
 				})),
 			} as unknown as SubagentRunner;
@@ -2487,7 +2590,7 @@ describe("registerPiContextHandler", () => {
 				run: mock(async () => ({
 					ok: true as const,
 					assistantText:
-						'<compartment start="1" end="2" title="Expired">Expired wrapup marker no longer blocks.</compartment>',
+						'<compartment start="1" end="2" title="Expired"><p1>Expired wrapup marker no longer blocks.</p1></compartment>',
 					durationMs: 1,
 				})),
 			} as unknown as SubagentRunner;
@@ -2929,7 +3032,7 @@ describe("registerPiContextHandler", () => {
 				run: mock(async () => ({
 					ok: true as const,
 					assistantText:
-						'<compartment start="1" end="2" title="Recovered">Recovered prior Pi history.</compartment>',
+						'<compartment start="1" end="2" title="Recovered"><p1>Recovered prior Pi history.</p1></compartment>',
 					durationMs: 1,
 				})),
 			} as unknown as SubagentRunner;
@@ -3045,7 +3148,7 @@ describe("registerPiContextHandler", () => {
 					return {
 						ok: true as const,
 						assistantText:
-							'<compartment start="1" end="2" title="Cleared">Cleared session publication.</compartment>',
+							'<compartment start="1" end="2" title="Cleared"><p1>Cleared session publication.</p1></compartment>',
 						durationMs: 1,
 					};
 				}),
@@ -3107,7 +3210,7 @@ describe("registerPiContextHandler", () => {
 					return {
 						ok: true as const,
 						assistantText:
-							'<compartment start="1" end="2" title="Active">Active session publication.</compartment>',
+							'<compartment start="1" end="2" title="Active"><p1>Active session publication.</p1></compartment>',
 						durationMs: 1,
 					};
 				}),
@@ -3168,7 +3271,7 @@ describe("registerPiContextHandler", () => {
 					});
 					return {
 						ok: true as const,
-						assistantText: `<compartment start="1" end="2" title="Multi ${callIndex}">Multi-session publication.</compartment>`,
+						assistantText: `<compartment start="1" end="2" title="Multi ${callIndex}"><p1>Multi-session publication.</p1></compartment>`,
 						durationMs: 1,
 					};
 				}),

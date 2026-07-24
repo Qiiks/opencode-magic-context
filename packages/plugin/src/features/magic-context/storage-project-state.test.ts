@@ -47,6 +47,42 @@ describe("storage-project-state", () => {
         expect(bumpProjectMemoryEpoch(database, "git:abc", 30).projectMemoryEpoch).toBe(2);
     });
 
+    test("reuses the prepared read statement without changing returned state", () => {
+        const database = makeDb();
+        setProjectState(database, "git:cached", {
+            projectMemoryEpoch: 7,
+            projectUserProfileVersion: 3,
+            updatedAt: 99,
+        });
+        let selectPrepares = 0;
+        const observedDb = new Proxy(database, {
+            get(target, property, receiver) {
+                if (property === "prepare") {
+                    return (sql: string) => {
+                        if (
+                            sql.includes("FROM project_state") &&
+                            sql.includes("WHERE project_path")
+                        ) {
+                            selectPrepares += 1;
+                        }
+                        return target.prepare(sql);
+                    };
+                }
+                return Reflect.get(target, property, receiver);
+            },
+        }) as Database;
+        const expected = {
+            projectPath: "git:cached",
+            projectMemoryEpoch: 7,
+            projectUserProfileVersion: 3,
+            updatedAt: 99,
+        };
+
+        expect(getProjectState(observedDb, "git:cached")).toEqual(expected);
+        expect(getProjectState(observedDb, "git:cached")).toEqual(expected);
+        expect(selectPrepares).toBe(1);
+    });
+
     test("updates user profile sentinel rows and supports set/delete CRUD", () => {
         const database = makeDb();
 

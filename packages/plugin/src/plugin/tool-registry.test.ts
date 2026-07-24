@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ToolDefinition } from "@opencode-ai/plugin";
+import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import type { MagicContextPluginConfig } from "../config";
 import { closeDatabase, openDatabase } from "../features/magic-context/storage";
 import type { RustToolBackends } from "./rust-tool-backends";
@@ -49,6 +49,37 @@ function buildRegistry(
 }
 
 describe("createToolRegistry — memory gating", () => {
+    it("advertises only real ctx_* fields", () => {
+        isolateDb();
+        const tools = buildRegistry({});
+        const expectedFields: Record<string, string[]> = {
+            ctx_reduce: ["drop"],
+            ctx_expand: ["start", "end", "verbose", "message"],
+            ctx_note: [
+                "action",
+                "content",
+                "surface_condition",
+                "filter",
+                "limit",
+                "offset",
+                "note_id",
+            ],
+            ctx_search: ["query", "limit", "sources"],
+            ctx_memory: ["action", "content", "category", "ids", "limit", "reason"],
+        };
+
+        for (const [name, fields] of Object.entries(expectedFields)) {
+            const definition = tools[name];
+            expect(definition).toBeDefined();
+            const jsonSchema = tool.schema.toJSONSchema(
+                tool.schema.object(definition?.args ?? {}),
+            ) as { properties?: Record<string, unknown> };
+            expect(Object.keys(jsonSchema.properties ?? {}).sort()).toEqual([...fields].sort());
+            expect(jsonSchema.properties).not.toHaveProperty("reduced");
+            expect(jsonSchema.properties).not.toHaveProperty("summary");
+        }
+    });
+
     it("registers ctx_memory when memory is enabled (default)", () => {
         isolateDb();
         const tools = buildRegistry({});

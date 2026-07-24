@@ -22,7 +22,7 @@ import {
     promoteSessionFactsDurable,
 } from "../../features/magic-context/memory";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
-import { getMemoriesByProject } from "../../features/magic-context/memory/storage-memory";
+import { ModuleMemoryAuthorityError, getMemoriesByProject } from '../../features/magic-context/memory/storage-memory';
 import {
     clearEmergencyDrainLatch,
     clearEmergencyRecovery,
@@ -648,12 +648,30 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             // floor below so a crash cannot advance past facts that never became
             // project memories.
             if (promotionActive && !skipUnanchoredPromotion) {
-                promotedFactRefs = promoteSessionFactsDurable(
-                    db,
-                    sessionId,
-                    promotionProjectIdentity,
-                    validatedPass.facts ?? [],
-                );
+                try {
+                    promotedFactRefs = promoteSessionFactsDurable(
+                        db,
+                        sessionId,
+                        promotionProjectIdentity,
+                        validatedPass.facts ?? [],
+                    );
+                } catch (error) {
+                    if (error instanceof ModuleMemoryAuthorityError) {
+                        // A project flipped back to the TS transform can still have
+                        // MODULE memory authority (authority does not follow the
+                        // transform-mode knob). Fact promotion is a side channel;
+                        // failing the whole publish here blocks history compaction
+                        // entirely, which starves overflow recovery. Skip the facts,
+                        // keep the compartments.
+                        promotedFactRefs = [];
+                        sessionLog(
+                            sessionId,
+                            "fact promotion skipped: project memory is module-managed; compartments publish without facts",
+                        );
+                    } else {
+                        throw error;
+                    }
+                }
             }
 
             // v2 (E2): persist historian-extracted events (stored, NOT rendered).

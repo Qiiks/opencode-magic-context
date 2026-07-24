@@ -40,6 +40,7 @@ The dreamer has these tasks, each independently scheduled:
 | **promote-primers** | nightly | Promote recurring standing questions the historian noticed into durable primers. |
 | **refresh-primers** | nightly | Re-investigate stale primers against current code and refresh their answers. |
 | **evaluate-smart-notes** | nightly | Check whether any smart-note conditions (`ctx_note` with a surface condition) have come true and surface the ready ones. |
+| **compress-cues** | when mural enabled | Compress each project memory into a short mural cue (content-hash cached). Feeds the experimental [memory mural](/concepts/mural/). |
 
 Each task has its own schedule, an optional per-task model override (falling back to the dreamer-level model), and a timeout (default: 20 minutes). `map-memories`, `verify`, `verify-broad`, `curate`, `classify-memories`, `retrospective`, and the primer tasks share the per-project memory lease so they never collide; the others run independently. verify gates per-memory on each memory's own last-checked time, so a run that times out banks its progress and the next run continues.
 

@@ -16,8 +16,8 @@ import { parseCompartmentOutput } from "@magic-context/core/hooks/magic-context/
 import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import { getProjectMagicContextHistorianDir } from "@magic-context/core/shared/data-path";
 import { parse as parseJsonc } from "comment-json";
-import { detectOpenCode } from "./opencode-detect";
-import { getOpenCodeVersion } from "./opencode-helpers";
+import { detectOpenCodeInstallations } from "./opencode-detect";
+import { describeOpenCodeInstallations, type OpenCodeInstallationReport } from "./opencode-helpers";
 import {
     getOpenCodePluginCacheRoots,
     getOpenCodePluginPackageJsonPaths,
@@ -41,6 +41,8 @@ export interface DiagnosticReport {
     opencodeInstalled: boolean;
     opencodeInstallKind: "cli" | "desktop" | "none";
     opencodeVersion: string | null;
+    /** Every detected install, with the first detection-ladder rung marked active. */
+    opencodeInstallations: OpenCodeInstallationReport[];
     configPaths: ConfigPaths;
     opencodeConfigHasPlugin: boolean;
     tuiConfigHasPlugin: boolean;
@@ -730,9 +732,10 @@ export async function collectDiagnostics(): Promise<DiagnosticReport> {
 
     const conflictResult = detectConflicts(process.cwd());
     const recentSessions = await collectRecentSessions();
-    const openCodeDetection = detectOpenCode();
-    const openCodeInstallKind = openCodeDetection.kind;
-    const openCodeBinary = openCodeDetection.kind === "cli" ? openCodeDetection.binary : null;
+    const opencodeInstallations = describeOpenCodeInstallations(detectOpenCodeInstallations());
+    const activeInstallation = opencodeInstallations[0];
+    let openCodeInstallKind: "cli" | "desktop" | "none" = "none";
+    if (activeInstallation) openCodeInstallKind = activeInstallation.kind;
 
     return {
         timestamp: new Date().toISOString(),
@@ -742,7 +745,11 @@ export async function collectDiagnostics(): Promise<DiagnosticReport> {
         pluginVersion,
         opencodeInstalled: openCodeInstallKind !== "none",
         opencodeInstallKind: openCodeInstallKind,
-        opencodeVersion: getOpenCodeVersion(openCodeBinary),
+        opencodeVersion:
+            activeInstallation?.kind === "cli" && activeInstallation.version !== "unknown"
+                ? activeInstallation.version
+                : null,
+        opencodeInstallations,
         configPaths,
         opencodeConfigHasPlugin: configHasPluginEntry(opencodeConfig.value),
         tuiConfigHasPlugin: configHasPluginEntry(tuiConfig.value),
@@ -805,6 +812,21 @@ export function renderDiagnosticsMarkdown(report: DiagnosticReport): string {
         context_db_size: formatBytes(report.storageDir.contextDbSizeBytes),
     };
 
+    const openCodeInstallations = report.opencodeInstallations ?? [];
+    const openCodeInstallationTable =
+        openCodeInstallations.length > 1
+            ? [
+                  "",
+                  "### OpenCode installations",
+                  "| Marker | Path | Version | Source |",
+                  "| --- | --- | --- | --- |",
+                  ...openCodeInstallations.map(
+                      (installation) =>
+                          `| ${installation.active ? "[active]" : ""} | \`${sanitizeString(installation.path)}\` | ${installation.version} | ${installation.source} |`,
+                  ),
+              ]
+            : [];
+
     const historianDumps = {
         byProject: report.historianDumps.byProject.map((bucket) => ({
             directory: sanitizeString(bucket.directory),
@@ -837,6 +859,7 @@ export function renderDiagnosticsMarkdown(report: DiagnosticReport): string {
         `- Plugin registered in tui config: ${report.tuiConfigHasPlugin}`,
         `- magic-context.jsonc parse error: ${report.magicContextConfig.parseError ?? "none"}`,
         `- Conflicts detected: ${report.conflicts.hasConflict ? report.conflicts.reasons.join("; ") : "none"}`,
+        ...openCodeInstallationTable,
         "",
         "### Config paths",
         "```json",

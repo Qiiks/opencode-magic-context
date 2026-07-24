@@ -511,6 +511,58 @@ describe("event-resolvers", () => {
             expect(a).toEqual(b);
             expect(b).toEqual(c);
         });
+
+        it("sets clamped + configuredValue when a tokens config is reduced to the cap (#241)", () => {
+            //#when — 190K requested on a 128K model → cap is 80% × 128K = 102.4K
+            const detail = resolveExecuteThresholdDetail(65, "some/model", 65, {
+                tokensConfig: { "some/model": 190_000 },
+                contextLimit: 128_000,
+                sessionId: "ses-test-clamped-flag-tokens",
+            });
+
+            //#then — clamp surfaced with the original value so displays can show the math
+            expect(detail.mode).toBe("tokens");
+            expect(detail.clamped).toBe(true);
+            expect(detail.configuredValue).toBe(190_000);
+            expect(detail.absoluteTokens).toBe(102_400);
+            expect(detail.percentage).toBe(80);
+        });
+
+        it("leaves clamped unset when a tokens config fits under the cap (#241)", () => {
+            //#when — 100K on a 200K model = 50%, well under the 80% cap
+            const detail = resolveExecuteThresholdDetail(65, "some/model", 65, {
+                tokensConfig: { "some/model": 100_000 },
+                contextLimit: 200_000,
+            });
+
+            //#then — no clamp occurred, no clamp metadata attached
+            expect(detail.mode).toBe("tokens");
+            expect(detail.clamped).toBeUndefined();
+            expect(detail.configuredValue).toBeUndefined();
+            expect(detail.absoluteTokens).toBe(100_000);
+        });
+
+        it("sets clamped + configuredValue when a percentage config is capped at 80 (#241)", () => {
+            //#when — a runtime-derived percentage above the 80% cap
+            const detail = resolveExecuteThresholdDetail(95, "some/model", 65);
+
+            //#then — capped to 80, original 95 surfaced for display
+            expect(detail.mode).toBe("percentage");
+            expect(detail.clamped).toBe(true);
+            expect(detail.configuredValue).toBe(95);
+            expect(detail.percentage).toBe(80);
+        });
+
+        it("leaves clamped unset for an in-range percentage config (#241)", () => {
+            //#when
+            const detail = resolveExecuteThresholdDetail(65, "some/model", 65);
+
+            //#then
+            expect(detail.mode).toBe("percentage");
+            expect(detail.clamped).toBeUndefined();
+            expect(detail.configuredValue).toBeUndefined();
+            expect(detail.percentage).toBe(65);
+        });
     });
 
     describe("resolveModelKey", () => {

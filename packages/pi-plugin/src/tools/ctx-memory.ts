@@ -35,6 +35,7 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
 	archiveMemory,
+	getMemoriesByIds,
 	getMemoriesByProject,
 	getMemoryByHash,
 	getMemoryById,
@@ -58,7 +59,7 @@ import { invalidateMemory } from "@magic-context/core/features/magic-context/mem
 import { computeNormalizedHash } from "@magic-context/core/features/magic-context/memory/normalize-hash";
 import {
 	normalizeStoredProjectPath,
-	resolveProjectIdentity,
+	resolveProjectIdentityForSession,
 	storedPathBelongsToIdentity,
 } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
@@ -75,61 +76,80 @@ import {
 import { log } from "@magic-context/core/shared/logger";
 import { CTX_MEMORY_DESCRIPTION } from "@magic-context/core/tools/ctx-memory/constants";
 import { runImmediateTransaction } from "@magic-context/core/tools/ctx-memory/verification-recording";
+import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
 const DEFAULT_LIST_LIMIT = 10;
 
 // Mirrors OpenCode CTX_MEMORY_DREAMER_ACTIONS. `delete` was removed — it was an
 // exact alias of `archive` (both soft-archive); `archive` is the single
-// soft-remove action. Primary agents get write/archive/update/merge on the
+// soft-remove action. Primary agents get write/archive/update/merge/get on the
 // memories they already see (with ids) in the injected project-memory block;
-// `list` (bulk enumeration) stays dreamer-only. Memory verification (file
-// mapping) and classification are no longer tool actions — the verify and
-// classify dreamer tasks apply them host-side from a manifest.
-const ALL_ACTIONS = ["write", "archive", "update", "merge", "list"] as const;
+// `list` (bulk enumeration) stays dreamer-only. `get` is the id-shaped read
+// that the user-facing <project-memory> ids imply but no other primary action
+// covered — the agent is given a memory id (dashboard, guidance) and there is
+// no other way to look it up. Memory verification (file mapping) and
+// classification are no longer tool actions — the verify and classify dreamer
+// tasks apply them host-side from a manifest.
+const ALL_ACTIONS = [
+	"write",
+	"archive",
+	"update",
+	"merge",
+	"get",
+	"list",
+] as const;
 type CtxMemoryAction = (typeof ALL_ACTIONS)[number];
 
 const DREAMER_ONLY_ACTIONS: ReadonlySet<CtxMemoryAction> = new Set(["list"]);
 
-const ParamsSchema = Type.Object({
-	action: Type.Union(
-		ALL_ACTIONS.map((a) => Type.Literal(a)),
-		{
-			description: "What to do: write, update, archive, merge, or list",
-		},
-	),
-	content: Type.Optional(
-		Type.String({
-			description:
-				"The memory text — one standalone fact (required for write, update, merge)",
-		}),
-	),
-	category: Type.Optional(
-		Type.Union(
-			V2_MEMORY_CATEGORIES.map((c) => Type.Literal(c)),
-			{
-				description:
-					"What kind of fact this is (required for write; optional merge override)",
-			},
+const GET_MAX_IDS = 20;
+
+const ParamsSchema = Type.Object(
+	{
+		action: Type.Optional(
+			Type.Union(
+				ALL_ACTIONS.map((a) => Type.Literal(a)),
+				{
+					description:
+						"What to do: write, update, archive, merge, get, or list",
+				},
+			),
 		),
-	),
-	ids: Type.Optional(
-		Type.Array(Type.Number(), {
-			description:
-				"Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more",
-		}),
-	),
-	limit: Type.Optional(
-		Type.Number({
-			description: "Max results for list (default: 10)",
-		}),
-	),
-	reason: Type.Optional(
-		Type.String({
-			description: "Why the memory is being archived (optional, recommended)",
-		}),
-	),
-});
+		content: Type.Optional(
+			Type.String({
+				description:
+					"The memory text — one standalone fact (required for write, update, merge)",
+			}),
+		),
+		category: Type.Optional(
+			Type.Union(
+				V2_MEMORY_CATEGORIES.map((c) => Type.Literal(c)),
+				{
+					description:
+						"What kind of fact this is (required for write; optional merge override)",
+				},
+			),
+		),
+		ids: Type.Optional(
+			Type.Array(Type.Number(), {
+				description:
+					"Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more, get one to twenty",
+			}),
+		),
+		limit: Type.Optional(
+			Type.Number({
+				description: "Max results for list (default: 10)",
+			}),
+		),
+		reason: Type.Optional(
+			Type.String({
+				description: "Why the memory is being archived (optional, recommended)",
+			}),
+		),
+	},
+	{ additionalProperties: true },
+);
 
 type CtxMemoryParams = Static<typeof ParamsSchema>;
 
@@ -228,6 +248,30 @@ function inactiveMemoryError(
 	return `Error: Memory with ID ${id} is archived or superseded; restore it before ${action}.`;
 }
 
+// Per-id not-found / not-visible wording. Sharing one message between the two
+// states avoids an existence oracle for foreign memories — a caller that knows
+// a memory is hidden by workspace share policy should not be able to
+// distinguish "this id is foreign and not shared" from "this id does not
+// exist" by reading the error text.
+const getNotVisibleMessage = (id: number): string =>
+	`id ${id}: not found or not visible from this project`;
+
+function formatGetOutput(args: {
+	requestedIds: number[];
+	memoriesById: Map<number, Memory>;
+}): string {
+	const parts: string[] = [];
+	for (const id of args.requestedIds) {
+		const memory = args.memoriesById.get(id);
+		if (!memory) {
+			parts.push(getNotVisibleMessage(id));
+		} else {
+			parts.push(formatMemoryList([memory]));
+		}
+	}
+	return parts.join("\n\n");
+}
+
 function updateMemoryContentInCurrentTransaction(
 	db: ContextDatabase,
 	memory: Memory,
@@ -319,6 +363,17 @@ export function createCtxMemoryTool(
 			_onUpdate,
 			ctx,
 		) {
+			params = unwrapImitatedReducedArgs(params, ["action"], {
+				action: { type: "enum", values: ALL_ACTIONS },
+				content: "string",
+				category: { type: "enum", values: V2_MEMORY_CATEGORIES },
+				ids: { type: "array", items: "number", maxItems: 100 },
+				limit: "number",
+				reason: "string",
+			});
+			if (params.action === undefined) {
+				return err("Error: Action 'undefined' is not allowed in this context.");
+			}
 			// Gate dreamer-only actions on the allowlist flag. Mirrors
 			// OpenCode's `if (toolContext.agent !== DREAMER_AGENT && !allowedActions.includes(args.action))`.
 			if (!dreamerAllowed && DREAMER_ONLY_ACTIONS.has(params.action)) {
@@ -327,7 +382,12 @@ export function createCtxMemoryTool(
 				);
 			}
 
-			const projectIdentity = resolveProjectIdentity(ctx.cwd);
+			const projectIdentity = resolveProjectIdentityForSession(ctx.cwd);
+			if (!projectIdentity) {
+				return err(
+					"Error: Could not resolve project identity for memory action.",
+				);
+			}
 			await deps.ensureProjectRegistered?.(ctx.cwd, deps.db);
 			const workspaceIdentitySet = resolveWorkspaceIdentitySet(
 				deps.db,
@@ -448,6 +508,35 @@ export function createCtxMemoryTool(
 					? filtered.filter((m) => m.category === category)
 					: filtered;
 				return ok(formatMemoryList(filtered2.slice(0, limit)));
+			}
+
+			if (params.action === "get") {
+				const getIds = params.ids;
+				if (!getIds || getIds.length === 0 || !getIds.every(Number.isInteger)) {
+					return err(
+						"Error: 'ids' must contain at least one integer memory ID when action is 'get'.",
+					);
+				}
+				if (getIds.length > GET_MAX_IDS) {
+					return err(
+						`Error: 'ids' must contain at most ${GET_MAX_IDS} memory IDs when action is 'get' (got ${getIds.length}).`,
+					);
+				}
+				// De-dupe while preserving first-seen order so the output lists
+				// each requested id exactly once and never reflects a row twice.
+				const uniqueIds = [...new Set(getIds)];
+				const fetched = getMemoriesByIds(deps.db, uniqueIds);
+				const memoriesById = new Map<number, Memory>(
+					fetched
+						.filter((memory) => memoryVisibleToTool(memory))
+						.map((memory) => [memory.id, memory]),
+				);
+				return ok(
+					formatGetOutput({
+						requestedIds: uniqueIds,
+						memoriesById,
+					}),
+				);
 			}
 
 			if (params.action === "update") {

@@ -5,23 +5,47 @@
 //! visibility is read-only for primary agents; facade mutations require project ownership,
 //! which the store rechecks inside the mutation transaction.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use mc_store::{
     McStore, McStoreError, StoredCompartmentSearchRow, StoredMemoryFull, StoredMemorySearchRow,
     StoredNoteSearchRow,
 };
 
+pub use mc_store::FOREIGN_VISIBLE_SQL;
+
 #[derive(Debug)]
 pub enum MemoryToolError {
     Store(McStoreError),
     EmptyContent,
     EmptyMerge,
-    DuplicateSourceId { id: i64 },
-    NotFound { id: i64 },
-    Inactive { id: i64, status: String },
-    Superseded { id: i64, superseded_by: i64 },
-    CrossCategoryMerge { categories: Vec<String> },
+    DuplicateSourceId {
+        id: i64,
+    },
+    NotFound {
+        id: i64,
+    },
+    Inactive {
+        id: i64,
+        status: String,
+    },
+    Superseded {
+        id: i64,
+        superseded_by: i64,
+    },
+    CrossCategoryMerge {
+        categories: Vec<String>,
+    },
+    /// Cap on the `get` op's per-call id list (matches the plugin/pi twins). Returning a
+    /// dedicated error lets the facade translate it into a clear user-facing message
+    /// instead of papering over the difference with a generic "not found".
+    TooManyIds {
+        requested: usize,
+        max: usize,
+    },
+    /// A `get` call with no ids is an input error distinct from merge validation, so the
+    /// message names the read action instead of talking about merge sources.
+    EmptyGet,
 }
 
 impl std::fmt::Display for MemoryToolError {
@@ -45,6 +69,16 @@ impl std::fmt::Display for MemoryToolError {
                 "cannot merge memories from different categories ({})",
                 categories.join(", ")
             ),
+            MemoryToolError::TooManyIds { requested, max } => write!(
+                f,
+                "'ids' must contain at most {max} memory IDs when action is 'get' (got {requested})"
+            ),
+            MemoryToolError::EmptyGet => {
+                write!(
+                    f,
+                    "'ids' must contain at least one memory ID when action is 'get'"
+                )
+            }
         }
     }
 }
@@ -102,6 +136,57 @@ pub fn update_memory(
     store
         .update_memory_content(project_path, id, content, now_ms)?
         .ok_or(MemoryToolError::NotFound { id })
+}
+
+/// Cap on the `get` op's per-call id list. Mirrors the plugin/pi twins so the same
+/// user-facing "got 21 ids" error is produced regardless of which harness dispatches
+/// the action.
+pub const GET_MAX_IDS: usize = 20;
+
+/// Read memories by id through the project's workspace-visibility scope.
+///
+/// Returns memories in the caller's id order; ids that are not visible to the project
+/// (missing, hard-deleted, or foreign to a non-shared category) are absent from the
+/// returned vector. The facade wrapper translates those misses into the per-id
+/// "not found or not visible" message — sharing one wording between not-found and
+/// not-visible avoids an existence oracle for foreign memories (the same discipline
+/// the plugin layer follows).
+///
+/// Any status is readable: active, permanent, AND archived. A primary agent may
+/// need to surface an archived memory to the user when they reference it by id
+/// from <project-memory>'s history or a prior transcript.
+pub fn get_memories(
+    store: &McStore,
+    project_path: &str,
+    ids: &[i64],
+) -> Result<Vec<StoredMemoryFull>, MemoryToolError> {
+    if ids.is_empty() {
+        return Err(MemoryToolError::EmptyGet);
+    }
+    if ids.len() > GET_MAX_IDS {
+        return Err(MemoryToolError::TooManyIds {
+            requested: ids.len(),
+            max: GET_MAX_IDS,
+        });
+    }
+    // Dedupe while preserving first-seen order so the per-id report maps 1:1 to the
+    // caller's id list even when the same id is passed twice.
+    let mut seen = BTreeSet::new();
+    let mut unique_ids: Vec<i64> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if seen.insert(*id) {
+            unique_ids.push(*id);
+        }
+    }
+    let by_id: HashMap<i64, StoredMemoryFull> =
+        store.get_visible_memories_by_ids(project_path, &unique_ids)?;
+    let mut ordered: Vec<StoredMemoryFull> = Vec::with_capacity(unique_ids.len());
+    for id in &unique_ids {
+        if let Some(memory) = by_id.get(id) {
+            ordered.push(memory.clone());
+        }
+    }
+    Ok(ordered)
 }
 
 /// Archive a visible memory. Re-archiving an already archived, non-superseded row is a
@@ -460,6 +545,7 @@ mod tests {
     ) -> InsertMemoryInput<'a> {
         InsertMemoryInput {
             project_path: project,
+            route_project_root: None,
             category,
             content,
             source_session_id: None,
@@ -744,5 +830,96 @@ mod tests {
             limited[1].source_kind,
             MemorySearchSourceKind::CompartmentTitle
         );
+    }
+
+    #[test]
+    fn get_memories_returns_own_project_hits_in_call_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let own = "git:own";
+        let first = insert(&store, own, "CONSTRAINTS", "own first", 1);
+        let second = insert(&store, own, "CONSTRAINTS", "own second", 2);
+
+        let fetched = get_memories(&store, own, &[second, first]).unwrap();
+        assert_eq!(fetched.len(), 2);
+        assert_eq!(fetched[0].id, second);
+        assert_eq!(fetched[1].id, first);
+        assert_eq!(fetched[0].content, "own second");
+    }
+
+    #[test]
+    fn get_memories_surfaces_archived_rows_with_status_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let own = "git:own";
+        let memory = insert(&store, own, "KNOWN_ISSUES", "retired issue", 1);
+        store
+            .archive_memory(own, memory, Some("superseded"), 2)
+            .unwrap();
+
+        let fetched = get_memories(&store, own, &[memory]).unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].status, "archived");
+        assert_eq!(fetched[0].content, "retired issue");
+    }
+
+    #[test]
+    fn get_memories_skips_foreign_non_shared_category_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let own = "git:own";
+        let foreign = "git:foreign";
+        // Workspace shares only CONSTRAINTS; the foreign ARCHITECTURE row is
+        // off-limits and must not be returned (no existence oracle: callers
+        // see the id as "not visible" via the tool layer's per-id report).
+        workspace(&store, own, foreign);
+        let foreign_hidden = insert(&store, foreign, "ARCHITECTURE", "hidden", 1);
+
+        let fetched = get_memories(&store, own, &[foreign_hidden]).unwrap();
+        assert!(
+            fetched.is_empty(),
+            "foreign non-shared memory leaked: {fetched:?}"
+        );
+    }
+
+    #[test]
+    fn get_memories_returns_foreign_shared_category_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let own = "git:own";
+        let foreign = "git:foreign";
+        workspace(&store, own, foreign);
+        let foreign_shared = insert(&store, foreign, "CONSTRAINTS", "shared", 1);
+        // Foreign visibility is fail-closed: a workspace neighbor's memory is readable
+        // only once classification marks it shareable with a workspace-eligible scope.
+        store
+            .set_memory_sharing_for_test(foreign_shared, "project", true)
+            .unwrap();
+
+        let fetched = get_memories(&store, own, &[foreign_shared]).unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].id, foreign_shared);
+        assert_eq!(fetched[0].content, "shared");
+    }
+
+    #[test]
+    fn get_memories_rejects_more_than_the_per_call_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let own = "git:own";
+        let ids: Vec<i64> = (1..=(GET_MAX_IDS as i64) + 1).collect();
+        let error = get_memories(&store, own, &ids).unwrap_err().to_string();
+        assert!(error.contains("at most 20"), "got: {error}");
+    }
+
+    #[test]
+    fn get_memories_rejects_an_empty_id_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let own = "git:own";
+        assert!(matches!(
+            get_memories(&store, own, &[]),
+            Err(MemoryToolError::EmptyGet)
+        ));
     }
 }

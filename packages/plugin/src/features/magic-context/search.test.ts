@@ -23,7 +23,7 @@ import {
     _resetProjectEmbeddingRegistryForTests,
     registerProjectEmbedding,
 } from "./project-embedding-registry";
-import { unifiedSearch } from "./search";
+import { parseIdShapedQuery, unifiedSearch } from "./search";
 import { initializeDatabase } from "./storage-db";
 import { addNote, dismissNote, updateNote } from "./storage-notes";
 import { createPrimer } from "./storage-primers";
@@ -219,6 +219,7 @@ describe("unifiedSearch", () => {
             category: "CONSTRAINTS",
             content: "foreign constraint needle",
         });
+        db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(foreignShared.id);
         const foreignHidden = insertMemory(db, {
             projectPath: "git:foreign",
             category: "NAMING",
@@ -301,6 +302,7 @@ describe("unifiedSearch", () => {
             category: "CONSTRAINTS",
             content: "foreign legacy-null constraint needle",
         });
+        db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(foreignConstraint.id);
         const foreignNaming = insertMemory(db, {
             projectPath: "git:foreign",
             category: "NAMING",
@@ -1211,5 +1213,36 @@ describe("unifiedSearch", () => {
         });
         expect(memoryOffResults.some((result) => result.source === "compartment")).toBe(false);
         expect(embeddingQueries).toEqual([]);
+    });
+});
+
+describe("parseIdShapedQuery", () => {
+    it("recognizes a bare numeric id", () => {
+        expect(parseIdShapedQuery("7234")).toEqual([7234]);
+    });
+    it("recognizes a `#id` token", () => {
+        expect(parseIdShapedQuery("#7234")).toEqual([7234]);
+    });
+    it("recognizes a comma-separated id list (≤5 tokens)", () => {
+        expect(parseIdShapedQuery("12, 34, 56")).toEqual([12, 34, 56]);
+    });
+    it("recognizes a space-separated id list (≤5 tokens)", () => {
+        expect(parseIdShapedQuery("#12 34 56")).toEqual([12, 34, 56]);
+    });
+    it("rejects phrases that contain a number but are not id-shaped", () => {
+        expect(parseIdShapedQuery("fix bug 1234")).toBeNull();
+        expect(parseIdShapedQuery("error at line 42 in foo.ts")).toBeNull();
+    });
+    it("rejects id lists over the 5-token cap", () => {
+        expect(parseIdShapedQuery("1 2 3 4 5 6")).toBeNull();
+    });
+    it("rejects empty / whitespace-only queries", () => {
+        expect(parseIdShapedQuery("")).toBeNull();
+        expect(parseIdShapedQuery("   ")).toBeNull();
+    });
+    it("rejects tokens that are not pure digits (e.g. negative or hex)", () => {
+        expect(parseIdShapedQuery("-1")).toBeNull();
+        expect(parseIdShapedQuery("0x10")).toBeNull();
+        expect(parseIdShapedQuery("id 7234")).toBeNull();
     });
 });

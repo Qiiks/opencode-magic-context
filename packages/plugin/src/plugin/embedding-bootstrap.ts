@@ -5,7 +5,7 @@ import {
     registerProjectShadowEmbedding,
 } from "../features/magic-context/memory/embedding";
 import { invalidateProject } from "../features/magic-context/memory/embedding-cache";
-import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
+import { resolveProjectIdentityForSession } from "../features/magic-context/memory/project-identity";
 import { log } from "../shared/logger";
 import type { Database } from "../shared/sqlite";
 import { handleUntrustedLoad, isConfigLoadUntrusted } from "./embedding-bootstrap-helpers";
@@ -15,7 +15,8 @@ export async function ensureProjectRegisteredFromOpenCodeDirectory(
     directory: string,
     db: Database,
 ): Promise<void> {
-    const projectIdentity = resolveProjectIdentity(directory);
+    const projectIdentity = resolveProjectIdentityForSession(directory);
+    if (!projectIdentity) return;
     invalidateProject(projectIdentity);
 
     const detailed = loadPluginConfigDetailed(directory);

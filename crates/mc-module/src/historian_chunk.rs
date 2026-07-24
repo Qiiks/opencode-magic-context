@@ -3,7 +3,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
-use mc_store::{McStore, StoredCompartment};
+use chrono::{Local, TimeZone};
+use mc_store::{
+    BlockIdentity, CompartmentSetGeneration, HistorianSelectedMessageIdentity, McStore,
+    StoredCompartment,
+};
 use mc_tokenizer::estimate_tokens;
 use regex::Regex;
 use serde_json::Value;
@@ -262,7 +266,12 @@ impl Builder {
             return true;
         };
         let block_text = format_block(&block);
-        let block_tokens = estimate_tokens(&block_text);
+        let separator_tokens = if self.lines.is_empty() {
+            0
+        } else {
+            estimate_tokens("\n")
+        };
+        let block_tokens = estimate_tokens(&block_text) + separator_tokens;
         if self.total_tokens + block_tokens > self.budget && self.total_tokens > 0 {
             self.current_block = Some(block);
             return false;
@@ -329,6 +338,7 @@ pub fn build_historian_chunk(
     let tool_call_summaries = build_tool_call_summary_lookup(blocks);
     let mut builder = Builder::new(token_budget, start, tool_call_summaries);
     let blocks_by_mid = grouped_blocks_by_mid(blocks);
+    let mut highest_scanned_ordinal = end_placeholder(start);
     for message in messages.iter().filter(|message| !message.ck.meta.synthetic) {
         if message.ordinal >= eligible_end_ordinal {
             continue;
@@ -351,10 +361,22 @@ pub fn build_historian_chunk(
         if !builder.push_message(&flat_message) {
             break;
         }
+        if builder.current_block.is_none() {
+            highest_scanned_ordinal = highest_scanned_ordinal.max(
+                builder
+                    .pending_noise_meta
+                    .last()
+                    .map(|meta| meta.ordinal)
+                    .unwrap_or(highest_scanned_ordinal),
+            );
+        }
     }
     let _ = builder.flush_current_block();
     let tool_only_ranges = merge_tool_only_ranges(&builder.tool_only_ranges);
     let end = builder.last_ordinal;
+    // Filtering removes some scanned messages from the chunk text, but they still advance
+    // the reader. TS uses the furthest scanned ordinal for has_more rather than the last
+    // rendered line, otherwise a filtered tail is repeatedly offered to the historian.
     let present_ordinals = input_ordinals;
     let snapshot = blocks
         .iter()
@@ -367,7 +389,7 @@ pub fn build_historian_chunk(
         .map(|block| ChunkSnapshotOwnedItem {
             id: block.id.clone(),
             kind: block.kind_tag.clone(),
-            bytes: block.bytes.clone(),
+            bytes: block.bytes.to_string(),
         })
         .collect();
     HistorianBuiltChunk {
@@ -382,7 +404,8 @@ pub fn build_historian_chunk(
         snapshot,
         end_message_id: builder.last_message_id,
         token_estimate: builder.total_tokens,
-        has_more: end < eligible_end_ordinal.saturating_sub(1).min(total_count),
+        has_more: end.max(highest_scanned_ordinal)
+            < eligible_end_ordinal.saturating_sub(1).min(total_count),
         commit_cluster_count: builder.commit_cluster_count,
     }
 }
@@ -396,8 +419,11 @@ pub struct HistorianAssemblerConfig {
     pub token_budget: usize,
     pub boundary: BoundaryResolution,
     pub memory_enabled: bool,
+    pub auto_promote: bool,
+    pub user_memory_collection_enabled: bool,
     pub extraction_free: bool,
     pub in_emergency: bool,
+    pub force_keep_last_compartment: bool,
     /// When true, tail reducers are off and the historian fold is the sole reclaim path
     /// (e.g. Claude Code byte-splice). The substance floor must not block firing.
     pub fold_is_only_reclaim: bool,
@@ -417,6 +443,9 @@ pub enum HistorianNoFireReason {
         token_estimate: usize,
         minimum: usize,
     },
+    MissingBlockIdentity {
+        message_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -425,13 +454,17 @@ pub struct AssembledHistorianFiring {
     pub model_chain: Vec<String>,
     pub chunk: HistorianBuiltChunk,
     pub chunk_fingerprint: String,
+    pub selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
     pub expected_revert_epoch: u64,
+    pub compartment_set_generation: CompartmentSetGeneration,
     pub prior_compartments: Vec<StoredCompartmentRange>,
     pub validate_options: ValidateOptions,
     pub from_ordinal: u64,
     pub to_ordinal: u64,
     pub now_ms: i64,
     pub failure_backoff_at_ms: i64,
+    /// Native message ids mapped to local YYYY-MM-DD dates for temporal headings.
+    pub boundary_dates: BTreeMap<String, String>,
 }
 
 impl AssembledHistorianFiring {
@@ -456,10 +489,13 @@ impl AssembledHistorianFiring {
             from_ordinal: self.from_ordinal,
             to_ordinal: self.to_ordinal,
             chunk_fingerprint: &self.chunk_fingerprint,
+            selected_range_identities: self.selected_range_identities.clone(),
             expected_revert_epoch: self.expected_revert_epoch,
+            compartment_set_generation: self.compartment_set_generation,
             observed_chunk_fingerprint: &self.chunk_fingerprint,
             validation_chunk: &self.chunk.chunk,
             chunk_transcript: &self.chunk.text,
+            boundary_dates: &self.boundary_dates,
             prior_compartments: &self.prior_compartments,
             validate_options: self.validate_options,
             now_ms: self.now_ms,
@@ -480,6 +516,7 @@ pub fn assemble_historian_firing(
     store: &McStore,
     messages: &[CkIngressMessage],
     live: &[FlatBlock],
+    block_identities_by_mid: &BTreeMap<String, Vec<BlockIdentity>>,
     config: HistorianAssemblerConfig,
     now_ms: i64,
 ) -> Result<AssembleHistorianFiringOutcome, mc_store::McStoreError> {
@@ -491,6 +528,7 @@ pub fn assemble_historian_firing(
     let snapshot = store.load_historian_assembly_snapshot(&config.session_id)?;
     let compartments = snapshot.compartments;
     let expected_revert_epoch = snapshot.revert_epoch;
+    let compartment_set_generation = snapshot.compartment_set_generation;
     let eligible_end = config.boundary.eligible_head.end;
     let chunk_start =
         if let Some(last_end) = compartments.iter().map(|c| c.end_message as u64).max() {
@@ -561,6 +599,26 @@ pub fn assemble_historian_firing(
         ));
     }
 
+    let mut selected_range_identities = Vec::new();
+    for message in messages.iter().filter(|message| {
+        !message.ck.meta.synthetic
+            && message.ordinal >= chunk.chunk.start_index
+            && message.ordinal <= chunk.chunk.end_index
+    }) {
+        let Some(block_identities) = block_identities_by_mid.get(&message.mid) else {
+            return Ok(AssembleHistorianFiringOutcome::NoFire(
+                HistorianNoFireReason::MissingBlockIdentity {
+                    message_id: message.mid.clone(),
+                },
+            ));
+        };
+        selected_range_identities.push(HistorianSelectedMessageIdentity {
+            mid: message.mid.clone(),
+            block_identities: block_identities.clone(),
+        });
+    }
+
+    let boundary_dates = native_boundary_dates(messages);
     let reference_blocks = build_reference_blocks_from_stored(
         &config.session_id,
         chunk.chunk.start_index as i64,
@@ -597,14 +655,21 @@ pub fn assemble_historian_firing(
             from_ordinal: chunk.chunk.start_index,
             to_ordinal: chunk.chunk.end_index,
             chunk_fingerprint,
+            selected_range_identities,
             expected_revert_epoch,
+            compartment_set_generation,
             prior_compartments,
             validate_options: ValidateOptions {
                 sequence_offset,
                 in_emergency: config.in_emergency,
+                memory_enabled: config.memory_enabled,
+                auto_promote: config.auto_promote,
+                user_memory_collection_enabled: config.user_memory_collection_enabled,
+                force_keep_last_compartment: config.force_keep_last_compartment,
             },
             now_ms,
             failure_backoff_at_ms: config.failure_backoff_at_ms,
+            boundary_dates,
             chunk,
         },
     )))
@@ -618,17 +683,18 @@ pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> S
         return input.to_string();
     }
 
-    // TypeScript slices by UTF-16 code units. Rust strings cannot be sliced at
-    // arbitrary UTF-16 offsets, so this port uses Unicode scalar-value indices
-    // while preserving the marker bytes, `<=` budget checks, and midpoint math.
+    // TypeScript slices by UTF-16 code units. Keep the same search space rather than
+    // treating an astral character as one scalar; a cut through a surrogate pair is
+    // represented by the replacement scalar Rust can safely emit for that lone unit.
+    let input_units: Vec<u16> = input.encode_utf16().collect();
     let mut lo = 0usize;
-    let mut hi = input.chars().count();
+    let mut hi = input_units.len();
     let mut best = 0usize;
     while lo <= hi {
         let mid = (lo + hi) >> 1;
         let candidate = format!(
             "{}{}",
-            input.chars().take(mid).collect::<String>(),
+            utf16_prefix(&input_units, mid),
             HISTORIAN_TRUNCATION_MARKER
         );
         if estimate_tokens(&candidate) <= token_budget {
@@ -643,9 +709,42 @@ pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> S
 
     format!(
         "{}{}",
-        input.chars().take(best).collect::<String>(),
+        utf16_prefix(&input_units, best),
         HISTORIAN_TRUNCATION_MARKER
     )
+}
+
+fn utf16_prefix(units: &[u16], requested: usize) -> String {
+    let mut end = requested.min(units.len());
+    if end > 0 && (0xD800..=0xDBFF).contains(&units[end - 1]) {
+        end -= 1;
+    }
+    String::from_utf16_lossy(&units[..end])
+}
+
+fn end_placeholder(start: u64) -> u64 {
+    start.saturating_sub(1)
+}
+
+pub(crate) fn native_boundary_dates(messages: &[CkIngressMessage]) -> BTreeMap<String, String> {
+    messages
+        .iter()
+        .filter_map(|message| {
+            message
+                .ck
+                .meta
+                .created_at_ms
+                .and_then(format_native_date)
+                .map(|date| (message.mid.clone(), date))
+        })
+        .collect()
+}
+
+fn format_native_date(timestamp_ms: i64) -> Option<String> {
+    Local
+        .timestamp_millis_opt(timestamp_ms)
+        .single()
+        .map(|date| date.format("%Y-%m-%d").to_string())
 }
 
 pub(crate) fn stored_range(c: &StoredCompartment) -> StoredCompartmentRange {
@@ -1346,6 +1445,7 @@ mod tests {
             &store,
             &messages,
             &projection.blocks,
+            &projection.identity_by_mid,
             HistorianAssemblerConfig {
                 session_id: "ses-below-budget".to_string(),
                 project_path: "/proj".to_string(),
@@ -1364,8 +1464,11 @@ mod tests {
                     boundary_reason: "test".to_string(),
                 },
                 memory_enabled: false,
+                auto_promote: true,
+                user_memory_collection_enabled: false,
                 extraction_free: false,
                 in_emergency,
+                force_keep_last_compartment: false,
                 fold_is_only_reclaim: false,
                 failure_backoff_at_ms: 0,
                 min_chunk_tokens: 512,
@@ -1397,6 +1500,7 @@ mod tests {
             &store,
             &messages,
             &projection.blocks,
+            &projection.identity_by_mid,
             HistorianAssemblerConfig {
                 session_id: "ses-fold-only".to_string(),
                 project_path: "/proj".to_string(),
@@ -1415,8 +1519,11 @@ mod tests {
                     boundary_reason: "test".to_string(),
                 },
                 memory_enabled: false,
+                auto_promote: true,
+                user_memory_collection_enabled: false,
                 extraction_free: false,
                 in_emergency,
+                force_keep_last_compartment: false,
                 fold_is_only_reclaim: true,
                 failure_backoff_at_ms: 0,
                 min_chunk_tokens: 512,
@@ -1473,6 +1580,7 @@ mod tests {
             &store,
             &messages,
             &projection.blocks,
+            &projection.identity_by_mid,
             HistorianAssemblerConfig {
                 session_id: "ses-sparse".to_string(),
                 project_path: "/proj".to_string(),
@@ -1491,8 +1599,11 @@ mod tests {
                     boundary_reason: "test".to_string(),
                 },
                 memory_enabled: false,
+                auto_promote: true,
+                user_memory_collection_enabled: false,
                 extraction_free: false,
                 in_emergency: false,
+                force_keep_last_compartment: false,
                 fold_is_only_reclaim: false,
                 failure_backoff_at_ms: 0,
                 min_chunk_tokens: 0,
@@ -1642,6 +1753,52 @@ mod tests {
     }
 
     #[test]
+    fn separator_accounting_keeps_joined_32k_chunk_within_budget() {
+        let messages: Vec<_> = (1..=3_000)
+            .map(|ordinal| {
+                let role = if ordinal % 2 == 0 {
+                    "assistant"
+                } else {
+                    "user"
+                };
+                msg(
+                    &format!("m{ordinal}"),
+                    ordinal,
+                    role,
+                    vec![text(&format!(
+                        "I implemented the cache transform for raw message {ordinal} in src/hooks/magic-context/transform.ts, checked the invariant, diagnosed provider behavior, and recorded benchmark evidence for the production path."
+                    ))],
+                )
+            })
+            .collect();
+        let budget = 32_000;
+        let built = project_and_build(&messages, 1, budget, 3_001);
+        let joined_tokens = estimate_tokens(&built.text);
+
+        assert_eq!(built.chunk.lines.len(), 706);
+        assert_eq!(built.token_estimate, 31_992);
+        assert_eq!(joined_tokens, built.token_estimate);
+        assert!(joined_tokens <= budget);
+        assert_eq!(
+            truncate_historian_input_if_needed(&built.text, budget),
+            built.text
+        );
+    }
+
+    #[test]
+    fn forced_overflow_preserves_existing_truncation_output() {
+        let root: GoldenRoot =
+            serde_json::from_str(include_str!("../testdata/historian-chunk-golden.json")).unwrap();
+        let case = &root.truncation_cases[0];
+
+        assert!(estimate_tokens(&case.input) > case.budget);
+        assert_eq!(
+            truncate_historian_input_if_needed(&case.input, case.budget),
+            case.expected
+        );
+    }
+
+    #[test]
     fn truncation_uses_marker_and_keeps_multibyte_boundaries() {
         let input = "αβγ🙂 historian chunk ".repeat(80);
         let budget = estimate_tokens(HISTORIAN_TRUNCATION_MARKER) + 12;
@@ -1699,9 +1856,17 @@ mod tests {
                 "{} count",
                 case.label
             );
+            let separator_tokens = built.text.matches('\n').count() * estimate_tokens("\n");
             assert_eq!(
-                built.token_estimate, case.expected.token_estimate,
-                "{} tokens",
+                built.token_estimate,
+                case.expected.token_estimate + separator_tokens,
+                "{} separator-aware tokens",
+                case.label
+            );
+            assert_eq!(
+                built.token_estimate,
+                estimate_tokens(&built.text),
+                "{} joined tokens",
                 case.label
             );
             assert_eq!(built.text, case.expected.text, "{} text", case.label);

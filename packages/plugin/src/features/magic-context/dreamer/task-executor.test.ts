@@ -1,8 +1,10 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, mock, test } from "bun:test";
+import { createDreamTimerModuleClient } from "../../../plugin/dream-timer-module-client";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { ensureContextStoreUuid } from "../context-authority";
 import {
     getMemoriesByProject,
     getUnclassifiedMemoryIds,
@@ -283,6 +285,293 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         // stamped → no longer unclassified) and importance moved off the default.
         const stillUnclassified = getUnclassifiedMemoryIds(db, ids);
         expect(stillUnclassified).toEqual([]);
+    });
+
+    test("direct authority.status selects rust MODULE without a prior transform", async () => {
+        db = freshDb();
+        const project = "/repo/rust-classify";
+        ensureContextStoreUuid(db);
+        const sensitive = insertMemory(db, {
+            projectPath: project,
+            category: "PROJECT_RULES",
+            content: "Use token sk-test-secret only on my localhost machine.",
+        });
+        const contextMemories = [sensitive];
+        for (let i = 0; i < 11; i += 1) {
+            contextMemories.push(
+                insertMemory(db, {
+                    projectPath: project,
+                    category: "ARCHITECTURE",
+                    content: `The cache-neutral classification path is module-owned (${i}).`,
+                }),
+            );
+        }
+        for (const [index, memory] of contextMemories.entries()) {
+            db.prepare(
+                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
+            ).run(project, 10000 + index, memory.id);
+            db.prepare(
+                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, ?, ?, ?)",
+            ).run(project, 10000 + index, memory.category, memory.normalizedHash);
+        }
+        const moduleCalls: Array<{ method: string; body: unknown }> = [];
+        let authorityStatusCalls = 0;
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [{ id: "parent" }] })),
+                create: mock(async () => ({ data: { id: "must-not-create" } })),
+                delete: mock(async () => ({})),
+            },
+        };
+        // This must be a class-backed fake: object-literal mocks cannot expose a detached-method
+        // regression because they do not need instance state through the timer adapter.
+        class StatefulTimerModuleClient {
+            private readonly instanceState = "timer-transport";
+
+            async authorityStatus() {
+                authorityStatusCalls += 1;
+                if (this.instanceState !== "timer-transport")
+                    throw new Error("lost transport this");
+                return { authority: { state: "MODULE", generation: 3 } };
+            }
+
+            async call(args: { method: string; body: unknown }) {
+                if (this.instanceState !== "timer-transport")
+                    throw new Error("lost transport this");
+                moduleCalls.push(args);
+                if (args.method === "dreamer.run_task") {
+                    const body = args.body as { payload: { items: Array<{ memory_id: number }> } };
+                    return {
+                        ok: true,
+                        manifest_text: `<classify>${body.payload.items
+                            .map(
+                                (item) =>
+                                    `<memory id="${item.memory_id}" importance="80" scope="project" shareable="true"/>`,
+                            )
+                            .join("")}</classify>`,
+                        truncated: false,
+                    };
+                }
+                const rows = (args.body as { arguments: { rows: Array<{ memory_id: number }> } })
+                    .arguments.rows;
+                return { accepted: rows.map((row) => row.memory_id), rejected: [] };
+            }
+        }
+        const moduleClient = createDreamTimerModuleClient(new StatefulTimerModuleClient() as never);
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            moduleClient: moduleClient as never,
+        });
+        const leaseKey = leaseKeyFor("classify-memories", project);
+        expect(acquireLease(db, "holder-rust-classify", leaseKey)).toBe(true);
+        const result = await executor(
+            { task: "classify-memories", schedule: "0 6 * * *", timeoutMinutes: 20 },
+            { db, projectIdentity: project, holderId: "holder-rust-classify", leaseKey },
+        );
+        expect(result.status).toBe("completed");
+        expect(authorityStatusCalls).toBe(1);
+        expect(client.session.create).not.toHaveBeenCalled();
+        expect(moduleCalls.map((call) => call.method)).toEqual([
+            "dreamer.run_task",
+            "memory.set_classification",
+        ]);
+        const applyBody = moduleCalls[1].body as {
+            arguments: { rows: Array<{ memory_id: number; shareable: boolean }> };
+        };
+        expect(applyBody.arguments.rows.find((row) => row.memory_id === 10000)?.shareable).toBe(
+            false,
+        );
+    });
+    test("module failures are transient and never fall back to a TypeScript child", async () => {
+        db = freshDb();
+        const project = "/repo/rust-classify-failure";
+        ensureContextStoreUuid(db);
+        for (let i = 0; i < 12; i += 1) {
+            const memory = insertMemory(db, {
+                projectPath: project,
+                category: "ARCHITECTURE",
+                content: `Module classification failure fixture ${i}.`,
+            });
+            db.prepare(
+                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
+            ).run(project, 11000 + i, memory.id);
+            db.prepare(
+                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, ?, ?, ?)",
+            ).run(project, 11000 + i, memory.category, memory.normalizedHash);
+        }
+
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "must-not-create" } })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const moduleCalls: string[] = [];
+        class FailingTimerModuleClient {
+            private readonly instanceState = "timer-transport";
+
+            async authorityStatus() {
+                if (this.instanceState !== "timer-transport")
+                    throw new Error("lost transport this");
+                return { authority: { state: "MODULE", generation: 9 } };
+            }
+
+            async call(args: { method: string }) {
+                if (this.instanceState !== "timer-transport")
+                    throw new Error("lost transport this");
+                moduleCalls.push(args.method);
+                throw new Error("module transport unavailable");
+            }
+        }
+        const moduleClient = createDreamTimerModuleClient(new FailingTimerModuleClient() as never);
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            moduleClient: moduleClient as never,
+        });
+        const leaseKey = leaseKeyFor("classify-memories", project);
+        expect(acquireLease(db, "holder-rust-classify-failure", leaseKey)).toBe(true);
+
+        const result = await executor(
+            { task: "classify-memories", schedule: "0 6 * * *", timeoutMinutes: 20 },
+            {
+                db,
+                projectIdentity: project,
+                holderId: "holder-rust-classify-failure",
+                leaseKey,
+            },
+        );
+
+        expect(result.status).toBe("failed");
+        expect(result.transient).toBe(true);
+        expect(result.error).toContain("Rust classify module failed");
+        expect(client.session.create).not.toHaveBeenCalled();
+        expect(moduleCalls).toEqual(["dreamer.run_task"]);
+    });
+});
+
+describe("createDreamTaskExecutor — compress-cues", () => {
+    test("parks MODULE authority before any provider call", async () => {
+        db = freshDb();
+        const project = "/repo/module-cues";
+        ensureContextStoreUuid(db);
+        insertMemory(db, {
+            projectPath: project,
+            category: "ARCHITECTURE",
+            content: "A cue candidate that must not be sent to a provider.",
+        });
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "must-not-create" } })),
+                prompt: mock(async () => ({})),
+            },
+        };
+        const authorityStatus = mock(async () => ({
+            authority: { state: "MODULE", generation: 12 },
+        }));
+        const moduleCall = mock(async () => ({}));
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            experimentalMural: { enabled: true },
+            moduleClient: { authorityStatus, call: moduleCall } as never,
+        });
+        const leaseKey = leaseKeyFor("compress-cues", project);
+        expect(acquireLease(db, "holder-module-cues", leaseKey)).toBe(true);
+
+        const result = await executor(
+            { task: "compress-cues", schedule: "0 7 * * *", timeoutMinutes: 20 },
+            { db, projectIdentity: project, holderId: "holder-module-cues", leaseKey },
+        );
+
+        expect(result.status).toBe("failed");
+        expect(result.transient).toBe(true);
+        expect(result.error).toContain("MODULE memory authority has no cue write facade");
+        expect(authorityStatus).toHaveBeenCalledTimes(1);
+        expect(client.session.create).not.toHaveBeenCalled();
+        expect(client.session.prompt).not.toHaveBeenCalled();
+        expect(moduleCall).not.toHaveBeenCalled();
+    });
+
+    test("reports a structural membership failure as transient", async () => {
+        db = freshDb();
+        const project = "/repo/malformed-cues";
+        insertMemory(db, {
+            projectPath: project,
+            category: "ARCHITECTURE",
+            content: "A cue candidate omitted by the manifest.",
+        });
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "cue-child" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({ data: assistantMessages("<cues></cues>") })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            experimentalMural: { enabled: true },
+        });
+        const leaseKey = leaseKeyFor("compress-cues", project);
+        expect(acquireLease(db, "holder-malformed-cues", leaseKey)).toBe(true);
+
+        const result = await executor(
+            { task: "compress-cues", schedule: "0 7 * * *", timeoutMinutes: 20 },
+            { db, projectIdentity: project, holderId: "holder-malformed-cues", leaseKey },
+        );
+
+        expect(result.status).toBe("failed");
+        expect(result.transient).toBe(true);
+        expect(result.error).toContain("1 selected memories remain");
+        expect(client.session.prompt).toHaveBeenCalledTimes(1);
+    });
+
+    test("reports a fully drained cue set as completed", async () => {
+        db = freshDb();
+        const project = "/repo/complete-cues";
+        const memory = insertMemory(db, {
+            projectPath: project,
+            category: "ARCHITECTURE",
+            content: "A cue candidate completed by the manifest.",
+        });
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "cue-child" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({
+                    data: assistantMessages(
+                        `<cues><cue id="${memory.id}">completed anchor</cue></cues>`,
+                    ),
+                })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            experimentalMural: { enabled: true },
+        });
+        const leaseKey = leaseKeyFor("compress-cues", project);
+        expect(acquireLease(db, "holder-complete-cues", leaseKey)).toBe(true);
+
+        const result = await executor(
+            { task: "compress-cues", schedule: "0 7 * * *", timeoutMinutes: 20 },
+            { db, projectIdentity: project, holderId: "holder-complete-cues", leaseKey },
+        );
+
+        expect(result).toEqual({ status: "completed" });
     });
 });
 

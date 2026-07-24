@@ -12,6 +12,7 @@ import {
     getMemoriesByProjects,
     getProjectEmbeddings,
     type Memory,
+    ModuleMemoryAuthorityError,
     peekProjectEmbeddings,
     searchMemoriesFTS,
     searchMemoriesFTSUnion,
@@ -20,6 +21,7 @@ import {
 import { cosineSimilarity } from "./memory/cosine-similarity";
 import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./memory/embedding";
 import { sanitizeFtsQuery } from "./memory/storage-memory-fts";
+import { getIndexedMessageCorpusSize } from "./message-index";
 import { recordShadowMeasurement } from "./search-measurement";
 import { getNotes, type Note } from "./storage-notes";
 import { getActivePrimers, type Primer } from "./storage-primers";
@@ -58,8 +60,20 @@ interface MessageSearchRow {
     content?: string;
 }
 
+interface BatchedMessageSearchRow extends MessageSearchRow {
+    queryIndex?: number;
+    ftsRank?: number;
+}
+
+interface BatchedFtsCountRow {
+    queryIndex?: number;
+    count?: number;
+}
+
 const messageSearchStatements = new WeakMap<Database, PreparedStatement>();
 const messageSearchStatementsWithCutoff = new WeakMap<Database, PreparedStatement>();
+const batchedMessageSearchStatements = new WeakMap<Database, Map<string, PreparedStatement>>();
+const batchedFtsCountStatements = new WeakMap<Database, Map<string, PreparedStatement>>();
 
 export type SearchSource = "memory" | "message" | "git_commit" | "primer" | "note";
 
@@ -203,6 +217,41 @@ function normalizeLimit(limit?: number): number {
     return Math.max(1, Math.floor(limit));
 }
 
+// ID-shaped short-circuit: when the whole trimmed query is one memory id (with
+// or without a leading `#`) or a comma/space-separated list of up to
+// `ID_SHAPED_QUERY_MAX_TOKENS` such tokens, we treat it as a direct id lookup.
+// Anything else — `"fix bug 1234"`, a quoted sentence containing a number — is
+// left alone so the normal lexical+semantic lanes still run. Reused by
+// ctx_search and any future consumer that needs to decide whether a query
+// should bypass the normal search pipeline.
+export const ID_SHAPED_QUERY_MAX_TOKENS = 5;
+// Matches one ID token: an optional leading `#` followed by one or more digits.
+// The `+` requires at least one digit, so a bare `#` does not match.
+const ID_SHAPED_TOKEN = /^#?\d+$/;
+
+export function parseIdShapedQuery(query: string): number[] | null {
+    const trimmed = query.trim();
+    if (trimmed.length === 0) {
+        return null;
+    }
+    const tokens = trimmed.split(/[\s,]+/).filter((token) => token.length > 0);
+    if (tokens.length === 0 || tokens.length > ID_SHAPED_QUERY_MAX_TOKENS) {
+        return null;
+    }
+    const ids: number[] = [];
+    for (const token of tokens) {
+        if (!ID_SHAPED_TOKEN.test(token)) {
+            return null;
+        }
+        const parsed = Number.parseInt(token.replace(/^#/, ""), 10);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+            return null;
+        }
+        ids.push(parsed);
+    }
+    return ids;
+}
+
 function normalizeCosineScore(score: number): number {
     if (!Number.isFinite(score)) {
         return 0;
@@ -313,78 +362,66 @@ function getMessageSearchStatementWithCutoff(db: Database): PreparedStatement {
     return stmt;
 }
 
-const ftsRowCountStatements = new WeakMap<Database, PreparedStatement>();
-const ftsRowCountStatementsWithCutoff = new WeakMap<Database, PreparedStatement>();
-const ftsMatchCountStatements = new WeakMap<Database, PreparedStatement>();
-const ftsMatchCountStatementsWithCutoff = new WeakMap<Database, PreparedStatement>();
-
-/** Total indexed FTS rows for one session (probe-weight denominator). */
-function getSessionFtsRowCount(db: Database, sessionId: string, cutoff: number | null): number {
-    const stmt =
-        cutoff === null
-            ? (() => {
-                  let cached = ftsRowCountStatements.get(db);
-                  if (!cached) {
-                      cached = db.prepare(
-                          "SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ?",
-                      );
-                      ftsRowCountStatements.set(db, cached);
-                  }
-                  return cached;
-              })()
-            : (() => {
-                  let cached = ftsRowCountStatementsWithCutoff.get(db);
-                  if (!cached) {
-                      cached = db.prepare(
-                          "SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ? AND CAST(message_ordinal AS INTEGER) <= ?",
-                      );
-                      ftsRowCountStatementsWithCutoff.set(db, cached);
-                  }
-                  return cached;
-              })();
-    const row = (cutoff === null ? stmt.get(sessionId) : stmt.get(sessionId, cutoff)) as
-        | { n?: number }
-        | undefined;
-    return typeof row?.n === "number" ? row.n : 0;
+function getBatchedFtsCountStatement(
+    db: Database,
+    queryCount: number,
+    cutoff: number | null,
+): PreparedStatement {
+    let statements = batchedFtsCountStatements.get(db);
+    if (!statements) {
+        statements = new Map();
+        batchedFtsCountStatements.set(db, statements);
+    }
+    const key = `${queryCount}:${cutoff === null ? "all" : "cutoff"}`;
+    let statement = statements.get(key);
+    if (!statement) {
+        const cutoffSql = cutoff === null ? "" : " AND CAST(message_ordinal AS INTEGER) <= ?";
+        statement = db.prepare(
+            Array.from(
+                { length: queryCount },
+                (_, index) =>
+                    `SELECT ${index} AS queryIndex, COUNT(*) AS count
+                       FROM message_history_fts
+                      WHERE session_id = ? AND message_history_fts MATCH ?${cutoffSql}`,
+            ).join("\nUNION ALL\n"),
+        );
+        statements.set(key, statement);
+    }
+    return statement;
 }
 
-/** Document frequency of one (sanitized) FTS query within a session. */
-function countSessionFtsMatches(
+/** Read all per-probe document frequencies in one SQLite statement. */
+function countSessionFtsMatchesBatch(
     db: Database,
     sessionId: string,
-    ftsQuery: string,
+    ftsQueries: readonly string[],
     cutoff: number | null,
-): number {
-    const stmt =
-        cutoff === null
-            ? (() => {
-                  let cached = ftsMatchCountStatements.get(db);
-                  if (!cached) {
-                      cached = db.prepare(
-                          "SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ?",
-                      );
-                      ftsMatchCountStatements.set(db, cached);
-                  }
-                  return cached;
-              })()
-            : (() => {
-                  let cached = ftsMatchCountStatementsWithCutoff.get(db);
-                  if (!cached) {
-                      cached = db.prepare(
-                          "SELECT COUNT(*) AS n FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ? AND CAST(message_ordinal AS INTEGER) <= ?",
-                      );
-                      ftsMatchCountStatementsWithCutoff.set(db, cached);
-                  }
-                  return cached;
-              })();
+): number[] {
+    if (ftsQueries.length === 0) return [];
+    const bindings: unknown[] = [];
+    for (const query of ftsQueries) {
+        bindings.push(sessionId, query);
+        if (cutoff !== null) bindings.push(cutoff);
+    }
     try {
-        const row = (
-            cutoff === null ? stmt.get(sessionId, ftsQuery) : stmt.get(sessionId, ftsQuery, cutoff)
-        ) as { n?: number } | undefined;
-        return typeof row?.n === "number" ? row.n : 0;
+        const rows = getBatchedFtsCountStatement(db, ftsQueries.length, cutoff).all(
+            ...bindings,
+        ) as BatchedFtsCountRow[];
+        const counts = Array.from({ length: ftsQueries.length }, () => 0);
+        for (const row of rows) {
+            if (
+                typeof row.queryIndex === "number" &&
+                row.queryIndex >= 0 &&
+                row.queryIndex < counts.length &&
+                typeof row.count === "number"
+            ) {
+                counts[row.queryIndex] = row.count;
+            }
+        }
+        return counts;
     } catch {
-        // Malformed FTS syntax that survived sanitization — treat as rare.
-        return 0;
+        // Malformed FTS syntax that survived sanitization is non-discriminative.
+        return Array.from({ length: ftsQueries.length }, () => 0);
     }
 }
 
@@ -714,8 +751,32 @@ interface NormalizedMessageRow {
     content: string;
 }
 
+/** Convert one FTS row into the validated shape consumed by message ranking. */
+function normalizeMessageSearchRow(
+    row: MessageSearchRow,
+    cutoff: number | null,
+): NormalizedMessageRow | null {
+    const messageOrdinal = getMessageOrdinal(row.messageOrdinal);
+    if (
+        messageOrdinal === null ||
+        typeof row.messageId !== "string" ||
+        typeof row.role !== "string" ||
+        typeof row.content !== "string"
+    ) {
+        return null;
+    }
+    // Defense-in-depth: every SQL path applies the cutoff before LIMIT.
+    if (cutoff !== null && messageOrdinal > cutoff) return null;
+    return {
+        messageOrdinal,
+        messageId: row.messageId,
+        role: row.role,
+        content: row.content,
+    };
+}
+
 /** Run one FTS query and return ordinal-cutoff-filtered, validated rows in
- *  bm25 rank order. `ftsQuery` must already be sanitized. */
+ * bm25 rank order. `ftsQuery` must already be sanitized. */
 function runMessageFtsQuery(
     db: Database,
     sessionId: string,
@@ -734,26 +795,78 @@ function runMessageFtsQuery(
 
     const result: NormalizedMessageRow[] = [];
     for (const row of rows) {
-        const messageOrdinal = getMessageOrdinal(row.messageOrdinal);
+        const normalized = normalizeMessageSearchRow(row, cutoff);
+        if (normalized) result.push(normalized);
+    }
+    return result;
+}
+
+function getBatchedMessageSearchStatement(
+    db: Database,
+    queryCount: number,
+    cutoff: number | null,
+): PreparedStatement {
+    let statements = batchedMessageSearchStatements.get(db);
+    if (!statements) {
+        statements = new Map();
+        batchedMessageSearchStatements.set(db, statements);
+    }
+    const key = `${queryCount}:${cutoff === null ? "all" : "cutoff"}`;
+    let statement = statements.get(key);
+    if (!statement) {
+        const cutoffSql = cutoff === null ? "" : " AND CAST(message_ordinal AS INTEGER) <= ?";
+        const branches = Array.from(
+            { length: queryCount },
+            (_, index) => `SELECT * FROM (
+                SELECT ${index} AS queryIndex,
+                       message_ordinal AS messageOrdinal,
+                       message_id AS messageId,
+                       role,
+                       content,
+                       bm25(message_history_fts) AS ftsRank
+                  FROM message_history_fts
+                 WHERE session_id = ? AND message_history_fts MATCH ?${cutoffSql}
+                 ORDER BY ftsRank
+                 LIMIT ?
+            )`,
+        );
+        statement = db.prepare(
+            `${branches.join("\nUNION ALL\n")}\nORDER BY queryIndex ASC, ftsRank ASC`,
+        );
+        statements.set(key, statement);
+    }
+    return statement;
+}
+
+/** Run all base/probe result queries as one compound SQLite statement. */
+function runMessageFtsQueriesBatch(
+    db: Database,
+    sessionId: string,
+    ftsQueries: readonly string[],
+    fetchLimit: number,
+    cutoff: number | null,
+): NormalizedMessageRow[][] {
+    if (ftsQueries.length === 0) return [];
+    const bindings: unknown[] = [];
+    for (const query of ftsQueries) {
+        bindings.push(sessionId, query);
+        if (cutoff !== null) bindings.push(cutoff);
+        bindings.push(fetchLimit);
+    }
+    const rows = getBatchedMessageSearchStatement(db, ftsQueries.length, cutoff).all(
+        ...bindings,
+    ) as BatchedMessageSearchRow[];
+    const result = Array.from({ length: ftsQueries.length }, () => [] as NormalizedMessageRow[]);
+    for (const row of rows) {
         if (
-            messageOrdinal === null ||
-            typeof row.messageId !== "string" ||
-            typeof row.role !== "string" ||
-            typeof row.content !== "string"
+            typeof row.queryIndex !== "number" ||
+            row.queryIndex < 0 ||
+            row.queryIndex >= result.length
         ) {
             continue;
         }
-        // Defense-in-depth: the SQL cutoff above already excluded these, but keep
-        // the guard so a future caller that skips the cutoff statement stays safe.
-        if (cutoff !== null && messageOrdinal > cutoff) {
-            continue;
-        }
-        result.push({
-            messageOrdinal,
-            messageId: row.messageId,
-            role: row.role,
-            content: row.content,
-        });
+        const normalized = normalizeMessageSearchRow(row, cutoff);
+        if (normalized) result[row.queryIndex].push(normalized);
     }
     return result;
 }
@@ -791,7 +904,7 @@ function searchMessages(args: {
     /** Only return messages with ordinal ≤ this value. Omit or -1 to search all indexed messages. */
     maxOrdinal?: number;
     /** Literal probes to additionally query (multi-probe recall). Empty = the
-     *  original single-query behavior (unchanged for NL queries / hot path). */
+     * original single-query behavior (unchanged for NL queries / hot path). */
     probes?: string[];
 }): MessageSearchResult[] {
     const cutoff = args.maxOrdinal != null && args.maxOrdinal >= 0 ? args.maxOrdinal : null;
@@ -821,32 +934,48 @@ function searchMessages(args: {
         }));
     }
 
-    // Multi-probe: run the full query plus each literal probe as its OWN FTS
-    // query, then RRF-fuse the ranked lists. This recovers messages that
-    // contain a literal symbol but not the query's other (AND-joined) tokens.
-    // Each probe list is weighted by its discrimination (document frequency):
-    // a probe matching 2% of the corpus contributes a third of a rare probe.
-    const corpusSize = getSessionFtsRowCount(args.db, args.sessionId, cutoff);
+    // Multi-probe: run the full query plus every literal probe as separate FTS
+    // rankings, but batch each phase into one compound SQLite statement. This
+    // preserves independent bm25 ranks while avoiding statement amplification.
+    const sanitizedProbes = probes
+        .map((probe) => ({ probe, query: sanitizeFtsQuery(probe) }))
+        .filter((entry) => entry.query.length > 0);
+    const corpusSize = getIndexedMessageCorpusSize(args.db, args.sessionId, cutoff);
+    const probeCounts = countSessionFtsMatchesBatch(
+        args.db,
+        args.sessionId,
+        sanitizedProbes.map((entry) => entry.query),
+        cutoff,
+    );
+    const searchQueries = [
+        ...(baseQuery.length > 0 ? [baseQuery] : []),
+        ...sanitizedProbes.map((entry) => entry.query),
+    ];
+    const rowsByQuery = runMessageFtsQueriesBatch(
+        args.db,
+        args.sessionId,
+        searchQueries,
+        fetchLimit,
+        cutoff,
+    );
+
     const queryLists: Array<{ rows: NormalizedMessageRow[]; weight: number }> = [];
+    let queryIndex = 0;
     if (baseQuery.length > 0) {
         queryLists.push({
-            rows: runMessageFtsQuery(args.db, args.sessionId, baseQuery, fetchLimit, cutoff),
+            rows: rowsByQuery[queryIndex] ?? [],
             // The full query is AND-joined and inherently discriminative.
             weight: 1,
         });
+        queryIndex += 1;
     }
     const probeWeights = new Map<string, number>();
-    for (const probe of probes) {
-        const probeQuery = sanitizeFtsQuery(probe);
-        if (probeQuery.length === 0) continue;
-        const df = countSessionFtsMatches(args.db, args.sessionId, probeQuery, cutoff);
-        const weight = probeDiscriminationWeight(df, corpusSize);
-        probeWeights.set(probe, weight);
-        queryLists.push({
-            rows: runMessageFtsQuery(args.db, args.sessionId, probeQuery, fetchLimit, cutoff),
-            weight,
-        });
-    }
+    sanitizedProbes.forEach((entry, probeIndex) => {
+        const weight = probeDiscriminationWeight(probeCounts[probeIndex] ?? 0, corpusSize);
+        probeWeights.set(entry.probe, weight);
+        queryLists.push({ rows: rowsByQuery[queryIndex] ?? [], weight });
+        queryIndex += 1;
+    });
 
     const fused = new Map<string, { row: NormalizedMessageRow; score: number }>();
     for (const list of queryLists) {
@@ -887,9 +1016,7 @@ function searchMessages(args: {
     // Map fused RRF scores into the same linear 0..1 band the single-query path
     // emits (linearDecayScore), so the unified ranker sees comparable scales
     // from both message paths and source boosts behave consistently. Rank is
-    // what RRF actually determines; the band keeps cross-source comparability
-    // (a rank-0 message no longer pins to exactly 1.0 unless it leads a full
-    // result set, and mid-ranked messages no longer all read as ~1.0).
+    // what RRF actually determines; the band keeps cross-source comparability.
     return ranked.map((entry, rank) => ({
         source: "message" as const,
         content: previewText(entry.row.content),
@@ -1388,6 +1515,81 @@ function resolveSources(sources: SearchSource[] | undefined): Set<SearchSource> 
     return set;
 }
 
+/** Turn memories already filtered through the visibility predicate into
+ *  MemorySearchResult rows. Used by the ctx_search ID short-circuit so the
+ *  direct-by-id path can return the same shape the normal search lanes emit
+ *  (and reuse formatResult without a second code path). */
+function memoriesToIdLookupResults(args: {
+    memories: readonly Memory[];
+    limit: number;
+    sourceNameByMemoryId?: ReadonlyMap<number, string>;
+}): MemorySearchResult[] {
+    // Preserve the caller's order so a `parseIdShapedQuery` result like
+    // `["#12", "34"]` renders hits in the same order the user typed them.
+    const ordered = args.memories.slice(0, args.limit);
+    return ordered.map((memory, rank) => ({
+        source: "memory",
+        content: previewText(memory.content),
+        score: 1 - rank * 0.01,
+        memoryId: memory.id,
+        category: memory.category,
+        matchType: "fts" as const,
+        sourceName: args.sourceNameByMemoryId?.get(memory.id),
+    }));
+}
+
+/** Resolve a parsed id list through the session's visibility scope. Returns
+ *  MemorySearchResult rows in the caller's id order, or `null` when nothing
+ *  resolved (signals the caller to fall through to the normal search lanes). */
+export function resolveMemoriesByIdsForSearch(args: {
+    db: Database;
+    projectPath: string;
+    ids: readonly number[];
+    limit: number;
+    /** Optional filter mirroring the m[0] hard-filter — already-rendered
+     *  memories are skipped so the agent doesn't see the same content twice. */
+    visibleMemoryIds?: Set<number> | null;
+}): MemorySearchResult[] | null {
+    if (args.ids.length === 0) {
+        return null;
+    }
+    const workspace = resolveSearchWorkspaceContext(args.db, args.projectPath);
+    const fetched = workspace.isWorkspaced
+        ? getMemoriesByProjects(
+              args.db,
+              workspace.expandedIdentities,
+              ["active", "permanent", "archived"],
+              Date.now(),
+              workspace.ownIdentities,
+              workspace.shareCategories,
+          )
+        : getMemoriesByProject(args.db, args.projectPath, ["active", "permanent", "archived"]);
+    if (fetched.length === 0) {
+        return null;
+    }
+    const memoriesById = new Map(fetched.map((memory) => [memory.id, memory]));
+    const ordered: Memory[] = [];
+    for (const id of args.ids) {
+        const memory = memoriesById.get(id);
+        if (!memory) continue;
+        if (args.visibleMemoryIds?.has(id)) continue;
+        ordered.push(memory);
+        if (ordered.length >= args.limit) break;
+    }
+    if (ordered.length === 0) {
+        return null;
+    }
+    return memoriesToIdLookupResults({
+        memories: ordered,
+        limit: args.limit,
+        sourceNameByMemoryId: sourceNamesForSearchMemories({
+            memories: ordered,
+            projectPath: args.projectPath,
+            workspace,
+        }),
+    });
+}
+
 export async function unifiedSearch(
     db: Database,
     sessionId: string,
@@ -1593,6 +1795,8 @@ export async function unifiedSearch(
     // Only count retrievals for explicit agent-driven searches. Plugin-internal
     // automatic surfacing (auto-search hints) should not inflate retrieval_count
     // because the agent may never actually consume the hint.
+    // retrieval_count is telemetry, not correctness: under MODULE authority the
+    // TS write path is fenced, so skip the bump rather than failing the search.
     const countRetrievals = options.countRetrievals ?? true;
     if (countRetrievals) {
         const memoryIds = results
@@ -1602,7 +1806,13 @@ export async function unifiedSearch(
         if (memoryIds.length > 0) {
             db.transaction(() => {
                 for (const memoryId of memoryIds) {
-                    updateMemoryRetrievalCount(db, memoryId);
+                    try {
+                        updateMemoryRetrievalCount(db, memoryId);
+                    } catch (error) {
+                        // Telemetry only — module-managed rows must not fail the search.
+                        if (error instanceof ModuleMemoryAuthorityError) continue;
+                        throw error;
+                    }
                 }
             })();
         }

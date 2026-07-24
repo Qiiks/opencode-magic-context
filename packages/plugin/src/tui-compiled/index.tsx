@@ -294,6 +294,7 @@ const StatusDialog = props => {
     _$insertNode(_el$11, _el$12);
     _$insert(_el$11, () => s().usagePercentage.toFixed(1), _el$12);
     _$insert(_el$10, () => formatThresholdPercent(s().executeThreshold), _el$14);
+    _$insert(_el$10, () => s().executeThresholdClamped ? "*" : "", null);
     _$insertNode(_el$15, _el$16);
     _$insertNode(_el$15, _el$17);
     _$insert(_el$15, () => fmt(s().inputTokens), _el$16);
@@ -632,7 +633,7 @@ const StatusDialog = props => {
       },
       l: "Execute threshold",
       get v() {
-        return `${formatThresholdPercent(s().executeThreshold)}%`;
+        return `${formatThresholdPercent(s().executeThreshold)}%${s().executeThresholdClamped ? "*" : ""}`;
       }
     }), _el$41);
     _$insert(_el$37, _$createComponent(R, {
@@ -1009,6 +1010,159 @@ function showResultDialog(api, title, message) {
   }));
   return true;
 }
+function probeErrorMessage(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/\s+/g, " ").trim() || "unknown error";
+}
+function probeVersion(api) {
+  try {
+    const version = api.app?.version;
+    return typeof version === "string" && version.length > 0 ? version : "unavailable";
+  } catch {
+    return "unavailable";
+  }
+}
+function renderTuiProbeHostArm(api, result) {
+  try {
+    api.ui.dialog.replace(() => {
+      try {
+        const element = _$createComponent(api.ui.DialogAlert, {
+          title: "Magic Context TUI probe: host arm",
+          message: "Host-owned dialog probe is rendering. It will be replaced after 500ms.",
+          onConfirm: () => {}
+        });
+        result.hostConstructed = true;
+        return element;
+      } catch (error) {
+        result.hostThrew = probeErrorMessage(error);
+        return null;
+      }
+    });
+  } catch (error) {
+    result.hostThrew ??= probeErrorMessage(error);
+  }
+}
+function renderTuiProbeCustomArm(api, result) {
+  try {
+    api.ui.dialog.replace(() => {
+      try {
+        return (() => {
+          var _el$71 = _$createElement("box"),
+            _el$72 = _$createElement("text");
+          _$insertNode(_el$71, _el$72);
+          _$insertNode(_el$72, _$createTextNode(`probe`));
+          return _el$71;
+        })();
+      } catch (error) {
+        result.customThrew = probeErrorMessage(error);
+        return null;
+      }
+    });
+  } catch (error) {
+    result.customThrew ??= probeErrorMessage(error);
+  }
+}
+async function waitForTuiProbeHostPaint(api, result) {
+  if (result.hostThrew !== null) {
+    result.hostPainted = false;
+    result.hostPaint = "not_reached_host_threw";
+    return;
+  }
+  let renderer;
+  try {
+    renderer = api.renderer;
+  } catch {
+    // Older hosts may not expose a renderer paint signal.
+  }
+  if (!renderer || typeof renderer.once !== "function") {
+    await new Promise(resolve => setTimeout(resolve, 500));
+    result.hostPainted = null;
+    result.hostPaint = "no_frame_signal_after_500ms_visual_confirmation_required";
+    return;
+  }
+  await new Promise(resolve => {
+    let settled = false;
+    const onFrame = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      renderer.removeListener?.("frame", onFrame);
+      result.hostPainted = true;
+      result.hostPaint = "observed_renderer_frame";
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      renderer?.removeListener?.("frame", onFrame);
+      result.hostPainted = null;
+      result.hostPaint = "no_frame_after_500ms_visual_confirmation_required";
+      resolve();
+    }, 500);
+    try {
+      renderer.once("frame", onFrame);
+    } catch (error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      renderer.removeListener?.("frame", onFrame);
+      result.hostPainted = null;
+      result.hostPaint = `frame_signal_error_${probeErrorMessage(error)}`;
+      resolve();
+    }
+  });
+}
+function tuiProbeSummary(result) {
+  return [`host_constructed=${String(result.hostConstructed)}`, `host_threw=${result.hostThrew ?? "false"}`, `custom_threw=${result.customThrew ?? "false"}`, `opencode_version=${result.opencodeVersion}`, `host_painted=${result.hostPainted === null ? "unknown" : String(result.hostPainted)}`, `host_paint=${result.hostPaint}`];
+}
+function reportTuiProbe(api, result) {
+  const lines = tuiProbeSummary(result);
+  for (const line of lines) {
+    console.error(`[mc-probe] ${line}`);
+  }
+  const summary = lines.join("\n");
+  if (result.customThrew === null) {
+    try {
+      api.ui.dialog.replace(() => (() => {
+        var _el$74 = _$createElement("box"),
+          _el$75 = _$createElement("text");
+        _$insertNode(_el$74, _el$75);
+        _$insert(_el$75, summary);
+        return _el$74;
+      })());
+      return;
+    } catch (error) {
+      console.error(`[mc-probe] summary_custom_threw=${probeErrorMessage(error)}`);
+    }
+  }
+  if (result.hostThrew === null) {
+    try {
+      api.ui.dialog.replace(() => _$createComponent(api.ui.DialogAlert, {
+        title: "Magic Context TUI probe",
+        message: summary,
+        onConfirm: () => {}
+      }));
+      return;
+    } catch (error) {
+      console.error(`[mc-probe] summary_host_threw=${probeErrorMessage(error)}`);
+    }
+  }
+  console.error("[mc-probe] summary_rendered=console_only");
+}
+async function runTuiProbe(api) {
+  const result = {
+    hostConstructed: false,
+    hostThrew: null,
+    customThrew: null,
+    opencodeVersion: probeVersion(api),
+    hostPainted: null,
+    hostPaint: "not_checked"
+  };
+  renderTuiProbeHostArm(api, result);
+  await waitForTuiProbeHostPaint(api, result);
+  renderTuiProbeCustomArm(api, result);
+  reportTuiProbe(api, result);
+}
 
 /**
  * Register Magic Context command palette entries, preferring the v1.14.42+
@@ -1057,6 +1211,14 @@ function registerCommandPaletteEntries(api) {
           run() {
             showRecompDialog(api);
           }
+        }, {
+          namespace: "palette",
+          name: "ctx-tui-probe",
+          title: "Magic Context: TUI Probe",
+          category: "Magic Context",
+          run() {
+            void runTuiProbe(api);
+          }
         }],
         bindings: []
       });
@@ -1080,6 +1242,13 @@ function registerCommandPaletteEntries(api) {
       category: "Magic Context",
       onSelect() {
         showRecompDialog(api);
+      }
+    }, {
+      title: "Magic Context: TUI Probe",
+      value: "ctx-tui-probe",
+      category: "Magic Context",
+      onSelect() {
+        void runTuiProbe(api);
       }
     }]);
     return;

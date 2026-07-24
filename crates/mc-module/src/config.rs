@@ -3,9 +3,9 @@
 //! This intentionally reads user and project tiers directly instead of depending on a
 //! daemon config plane. Per-leaf trust policy is enforced during the read: model choice
 //! is user-tier only because it affects spend; project config may only raise the execute
-//! threshold (fire less often), and may override the benign memory toggle. This is
-//! stricter than the current TypeScript side for `historian.model`; align that side at
-//! plugin cutover/shadow mode rather than weakening the module leg.
+//! threshold (fire less often), and may override memory, promotion, privacy, and context-limit
+//! settings. The Rust module intentionally keeps stricter model-selection policy than the current
+//! TypeScript implementation until both implementations are deliberately aligned.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,22 +16,55 @@ use serde_json::Value;
 /// Default execute threshold percentage (65.0). The Rust module reads config without the
 /// plugin, so this must stay identical to packages/plugin/src/config/schema/magic-context.ts.
 pub const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 65.0;
+/// Default token budget for project-memory injection. It must remain 8,000 tokens so the Rust
+/// module and the TypeScript renderer use the same default.
+pub const DEFAULT_MEMORY_BUDGET_TOKENS: f64 = 8_000.0;
+/// Default token budget for user-profile injection. It must remain 4,000 tokens so the Rust
+/// module and the TypeScript renderer use the same default.
+pub const DEFAULT_USER_PROFILE_BUDGET_TOKENS: f64 = 4_000.0;
 /// Maximum execute threshold percentage (80.0). The Rust module reads config without the
 /// plugin, so this must stay identical to packages/plugin/src/config/schema/magic-context.ts.
 const MAX_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 80.0;
+/// Minimum historian producer chunk size. The derived budget is one quarter of the model
+/// context limit, but it is never allowed to fall below 8,000 tokens.
+pub const MIN_HISTORIAN_CHUNK_TOKENS: usize = 8_000;
+/// Maximum historian producer chunk size. The derived budget is one quarter of the model
+/// context limit, but it is never allowed to exceed 50,000 tokens.
+pub const MAX_HISTORIAN_CHUNK_TOKENS: usize = 50_000;
+/// Matches the TypeScript historian fallback when no model catalog value is available.
+/// The explicit config override still wins when a binding supplies one.
+pub const DEFAULT_HISTORIAN_CONTEXT_LIMIT_TOKENS: usize = 128_000;
+
+/// Derive the historian producer budget from its own context window, as the TS runner does.
+pub fn derive_historian_chunk_tokens(context_limit_tokens: usize) -> usize {
+    (((context_limit_tokens as f64) * 0.25).round() as usize)
+        .clamp(MIN_HISTORIAN_CHUNK_TOKENS, MAX_HISTORIAN_CHUNK_TOKENS)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct McModuleConfig {
     pub model_chain: Vec<String>,
     pub execute_threshold_percentage: f64,
     pub memory_enabled: bool,
+    /// Mirrors the TS auto-promote switch. Facts are dropped when this is false.
+    pub auto_promote: bool,
+    /// Privacy gate controlling whether historian user observations may be collected for later
+    /// review and promotion.
+    pub user_memory_collection_enabled: bool,
+    /// Historian model context limit; configurable until the module has a model catalog.
+    pub historian_context_limit_tokens: usize,
+    pub memory_budget_tokens: f64,
+    pub user_profile_budget_tokens: f64,
+    /// Controls whether the frozen m0 baseline includes the canonical project-docs block.
+    pub inject_docs: bool,
+    /// Controls temporal gap overlays when the active wire surface supports overlays.
+    pub temporal_awareness: bool,
     pub smart_drops: bool,
     pub cache_ttl: String,
-    /// Kill switch for the shadow byte-compare lane, honored module-side so a
-    /// runaway shadow loop can be stopped by a config flip plus module bounce
-    /// without restarting any harness process (plugin senders are constructed
-    /// once per session hook and hold the old flag until their host restarts).
-    pub shadow_enabled: bool,
+    /// Per-model TTL overrides from the object config shape; keys are full
+    /// provider/model keys or bare model ids, mirroring the TS resolveCacheTtl
+    /// precedence (exact key, then bare id, then default).
+    pub cache_ttl_by_model: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for McModuleConfig {
@@ -40,10 +73,36 @@ impl Default for McModuleConfig {
             model_chain: Vec::new(),
             execute_threshold_percentage: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
             memory_enabled: true,
+            auto_promote: true,
+            user_memory_collection_enabled: false,
+            historian_context_limit_tokens: DEFAULT_HISTORIAN_CONTEXT_LIMIT_TOKENS,
+            memory_budget_tokens: DEFAULT_MEMORY_BUDGET_TOKENS,
+            user_profile_budget_tokens: DEFAULT_USER_PROFILE_BUDGET_TOKENS,
+            inject_docs: true,
+            temporal_awareness: true,
             smart_drops: false,
-            shadow_enabled: true,
             cache_ttl: "5m".to_string(),
+            cache_ttl_by_model: std::collections::BTreeMap::new(),
         }
+    }
+}
+
+impl McModuleConfig {
+    /// Resolve the effective cache TTL for a model, mirroring the TS adapter's
+    /// resolveCacheTtl precedence: exact provider/model key, then the bare model id
+    /// (config written without the provider prefix), then the default.
+    pub fn resolve_cache_ttl(&self, model_key: Option<&str>) -> String {
+        if let Some(key) = model_key {
+            if let Some(ttl) = self.cache_ttl_by_model.get(key) {
+                return ttl.clone();
+            }
+            if let Some((_, bare)) = key.split_once('/') {
+                if let Some(ttl) = self.cache_ttl_by_model.get(bare) {
+                    return ttl.clone();
+                }
+            }
+        }
+        self.cache_ttl.clone()
     }
 }
 
@@ -162,19 +221,61 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         if let Some(enabled) = user.pointer("/memory/enabled").and_then(Value::as_bool) {
             cfg.memory_enabled = enabled;
         }
+        if let Some(budget) = number_at(user, "/memory/budget_tokens") {
+            cfg.memory_budget_tokens = budget.max(1.0);
+        }
+        if let Some(budget) = number_at(user, "/memory/user_profile_budget_tokens") {
+            cfg.user_profile_budget_tokens = budget.max(1.0);
+        }
         if let Some(enabled) = user
-            .pointer("/shadow_transform/enabled")
+            .pointer("/memory/auto_promote")
             .and_then(Value::as_bool)
         {
-            cfg.shadow_enabled = enabled;
+            cfg.auto_promote = enabled;
+        }
+        if let Some(enabled) = user_memory_collection_at(user) {
+            cfg.user_memory_collection_enabled = enabled;
+        }
+        if let Some(limit) = positive_usize_at(user, "/historian/context_limit_tokens") {
+            cfg.historian_context_limit_tokens = limit;
         }
         if let Some(enabled) = user.pointer("/smart_drops").and_then(Value::as_bool) {
             cfg.smart_drops = enabled;
         }
-        if let Some(cache_ttl) = user.pointer("/cache_ttl").and_then(Value::as_str) {
-            if !cache_ttl.trim().is_empty() {
-                cfg.cache_ttl = cache_ttl.trim().to_string();
+        if let Some(enabled) = user
+            .pointer("/dreamer/inject_docs")
+            .and_then(Value::as_bool)
+        {
+            cfg.inject_docs = enabled;
+        }
+        if let Some(enabled) = user.pointer("/temporal_awareness").and_then(Value::as_bool) {
+            cfg.temporal_awareness = enabled;
+        }
+        match user.pointer("/cache_ttl") {
+            Some(Value::String(cache_ttl)) => {
+                if !cache_ttl.trim().is_empty() {
+                    cfg.cache_ttl = cache_ttl.trim().to_string();
+                }
             }
+            // Per-model map: { "default": "5m", "anthropic/claude-opus-4-8": "300m", ... }.
+            // Silently ignoring this shape left the module on the 5m default while the
+            // user had configured 300m for Anthropic models (a spurious idle-TTL HARD on
+            // a still-warm provider cache).
+            Some(Value::Object(map)) => {
+                for (key, value) in map {
+                    let Some(ttl) = value.as_str() else { continue };
+                    if ttl.trim().is_empty() {
+                        continue;
+                    }
+                    if key == "default" {
+                        cfg.cache_ttl = ttl.trim().to_string();
+                    } else {
+                        cfg.cache_ttl_by_model
+                            .insert(key.clone(), ttl.trim().to_string());
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -187,8 +288,38 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         if let Some(enabled) = project.pointer("/memory/enabled").and_then(Value::as_bool) {
             cfg.memory_enabled = enabled;
         }
+        if let Some(enabled) = project
+            .pointer("/memory/auto_promote")
+            .and_then(Value::as_bool)
+        {
+            cfg.auto_promote = enabled;
+        }
+        if let Some(enabled) = user_memory_collection_at(project) {
+            cfg.user_memory_collection_enabled = enabled;
+        }
+        if let Some(limit) = positive_usize_at(project, "/historian/context_limit_tokens") {
+            cfg.historian_context_limit_tokens = limit;
+        }
+        if let Some(budget) = number_at(project, "/memory/budget_tokens") {
+            cfg.memory_budget_tokens = budget.max(1.0);
+        }
+        if let Some(budget) = number_at(project, "/memory/user_profile_budget_tokens") {
+            cfg.user_profile_budget_tokens = budget.max(1.0);
+        }
         if let Some(enabled) = project.pointer("/smart_drops").and_then(Value::as_bool) {
             cfg.smart_drops = enabled;
+        }
+        if let Some(enabled) = project
+            .pointer("/dreamer/inject_docs")
+            .and_then(Value::as_bool)
+        {
+            cfg.inject_docs = enabled;
+        }
+        if let Some(enabled) = project
+            .pointer("/temporal_awareness")
+            .and_then(Value::as_bool)
+        {
+            cfg.temporal_awareness = enabled;
         }
     }
 
@@ -197,6 +328,26 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         .clamp(1.0, MAX_EXECUTE_THRESHOLD_PERCENTAGE);
     cfg.model_chain.dedup();
     cfg
+}
+
+fn user_memory_collection_at(value: &Value) -> Option<bool> {
+    if let Some(schedule) = value
+        .pointer("/dreamer/tasks/review-user-memories/schedule")
+        .and_then(Value::as_str)
+    {
+        return Some(!schedule.trim().is_empty());
+    }
+    value
+        .pointer("/user_memories/enabled")
+        .and_then(Value::as_bool)
+}
+
+fn positive_usize_at(value: &Value, pointer: &str) -> Option<usize> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .filter(|v| *v > 0)
 }
 
 fn number_at(value: &Value, pointer: &str) -> Option<f64> {
@@ -284,21 +435,54 @@ pub fn strip_jsonc(input: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+mod cache_ttl_tests {
+    use super::*;
+    use serde_json::json;
 
     #[test]
-    fn shadow_transform_flag_parses_and_defaults_on() {
-        let cfg = merge_tiers(None, None);
-        assert!(cfg.shadow_enabled);
-        let user: Value =
-            serde_json::from_str(r#"{ "shadow_transform": { "enabled": false } }"#).unwrap();
+    fn per_model_cache_ttl_object_shape_parses_and_resolves() {
+        let user = json!({
+            "cache_ttl": {
+                "default": "10m",
+                "anthropic/claude-opus-4-8": "300m",
+                "gpt-5.6-sol": "30m"
+            }
+        });
         let cfg = merge_tiers(Some(&user), None);
-        assert!(!cfg.shadow_enabled);
-        let user: Value =
-            serde_json::from_str(r#"{ "shadow_transform": { "enabled": true } }"#).unwrap();
-        let cfg = merge_tiers(Some(&user), None);
-        assert!(cfg.shadow_enabled);
+        assert_eq!(cfg.cache_ttl, "10m");
+        assert_eq!(
+            cfg.resolve_cache_ttl(Some("anthropic/claude-opus-4-8")),
+            "300m"
+        );
+        // Bare model id matches a provider-prefixed request key.
+        assert_eq!(cfg.resolve_cache_ttl(Some("openai/gpt-5.6-sol")), "30m");
+        assert_eq!(cfg.resolve_cache_ttl(Some("unknown/model")), "10m");
+        assert_eq!(cfg.resolve_cache_ttl(None), "10m");
     }
+
+    #[test]
+    fn string_cache_ttl_shape_still_parses() {
+        let user = json!({ "cache_ttl": "45m" });
+        let cfg = merge_tiers(Some(&user), None);
+        assert_eq!(cfg.cache_ttl, "45m");
+        assert_eq!(
+            cfg.resolve_cache_ttl(Some("anthropic/claude-opus-4-8")),
+            "45m"
+        );
+    }
+
+    #[test]
+    fn project_tier_cannot_set_cache_ttl() {
+        let project = json!({ "cache_ttl": { "default": "600m" } });
+        let cfg = merge_tiers(None, Some(&project));
+        assert_eq!(cfg.cache_ttl, "5m");
+        assert!(cfg.cache_ttl_by_model.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
     use super::*;
 
     #[test]
@@ -331,6 +515,56 @@ mod tests {
     fn default_threshold_matches_typescript_schema() {
         let cfg = merge_tiers(None, None);
         assert_eq!(cfg.execute_threshold_percentage, 65.0);
+    }
+
+    #[test]
+    fn historian_budget_derivation_clamps_at_both_bounds() {
+        assert_eq!(derive_historian_chunk_tokens(1), 8_000);
+        assert_eq!(derive_historian_chunk_tokens(32_000), 8_000);
+        assert_eq!(derive_historian_chunk_tokens(128_000), 32_000);
+        assert_eq!(derive_historian_chunk_tokens(200_000), 50_000);
+        assert_eq!(derive_historian_chunk_tokens(400_000), 50_000);
+    }
+
+    #[test]
+    fn docs_and_temporal_flags_follow_user_then_project_tiers() {
+        let user = serde_json::json!({
+            "dreamer": { "inject_docs": false },
+            "temporal_awareness": false
+        });
+        let project = serde_json::json!({
+            "dreamer": { "inject_docs": true },
+            "temporal_awareness": true
+        });
+        let cfg = merge_tiers(Some(&user), Some(&project));
+        assert!(cfg.inject_docs);
+        assert!(cfg.temporal_awareness);
+        let defaults = merge_tiers(None, None);
+        assert!(defaults.inject_docs);
+        assert!(defaults.temporal_awareness);
+    }
+
+    #[test]
+    fn historian_gates_and_context_limit_parse_from_user_and_project_tiers() {
+        let user = serde_json::json!({
+            "memory": { "auto_promote": false },
+            "dreamer": { "tasks": { "review-user-memories": { "schedule": "daily" } } },
+            "historian": { "context_limit_tokens": 128000 }
+        });
+        let project = serde_json::json!({
+            "memory": { "auto_promote": true },
+            "user_memories": { "enabled": false },
+            "historian": { "context_limit_tokens": 64000 }
+        });
+        assert!(user_memory_collection_at(&user).unwrap());
+        let cfg = merge_tiers(Some(&user), Some(&project));
+        assert!(cfg.auto_promote);
+        assert!(!cfg.user_memory_collection_enabled);
+        assert_eq!(cfg.historian_context_limit_tokens, 64_000);
+        let legacy_disabled = serde_json::json!({
+            "user_memories": { "enabled": false }
+        });
+        assert!(!user_memory_collection_at(&legacy_disabled).unwrap());
     }
 
     #[test]

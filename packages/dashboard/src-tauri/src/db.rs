@@ -80,6 +80,48 @@ pub fn open_readonly(path: &PathBuf) -> Result<Connection, rusqlite::Error> {
     Ok(conn)
 }
 
+fn ensure_context_store_uuid(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_table: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'context_store_meta'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if has_table.is_none() {
+        return Ok(());
+    }
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT value FROM context_store_meta WHERE key = 'store_uuid'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing.is_some() {
+        return Ok(());
+    }
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|error| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            error.to_string(),
+        )))
+    })?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let uuid = format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    );
+    conn.execute(
+        "INSERT INTO context_store_meta(key, value) VALUES ('store_uuid', ?1) ON CONFLICT(key) DO NOTHING",
+        [&uuid],
+    )?;
+    Ok(())
+}
+
 /// Opens a read-write connection for write operations (memory edits, queue entries).
 pub fn open_readwrite(path: &PathBuf) -> Result<Connection, rusqlite::Error> {
     // READ_WRITE WITHOUT CREATE: if the DB file vanished after startup,
@@ -96,6 +138,9 @@ pub fn open_readwrite(path: &PathBuf) -> Result<Connection, rusqlite::Error> {
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // This opener has no module client, so a marker-less store cannot be classified as
+    // regressed here. The later module handshake performs the authoritative reconciliation.
+    ensure_context_store_uuid(&conn)?;
     Ok(conn)
 }
 
@@ -170,6 +215,16 @@ pub struct PrimerCandidate {
     pub source_compartment_end: Option<i64>,
     pub source_message_time: i64,
     pub created_at: i64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct MuralManifest {
+    pub project_path: String,
+    pub image: Vec<u8>,
+    pub rendered_at: i64,
+    pub token_estimate: i64,
+    pub width: i64,
+    pub height: i64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -840,6 +895,11 @@ fn transform_decision_reason_label(reason: &str) -> Option<&'static str> {
         "pressure_refold" => Some("Compaction pressure"),
         "upgrade_state" => Some("Session upgrade"),
         "cached_m1_missing" => Some("Cache rebuild"),
+        "m1_delta" => Some("M1 delta"),
+        "ttl_expiry" => Some("TTL expiry"),
+        "epoch_change" => Some("Epoch change"),
+        "coverage_fold" => Some("Coverage fold"),
+        "profile_transition" => Some("Profile transition"),
         _ => None,
     }
 }
@@ -850,9 +910,11 @@ fn transform_decision_cause(decision: Option<&TransformDecisionCause>) -> Option
         return Some("Compaction pressure".to_string());
     }
     if let Some(reason) = decision.materialize_reason.as_deref() {
-        if let Some(label) = transform_decision_reason_label(reason) {
-            return Some(label.to_string());
-        }
+        return Some(
+            transform_decision_reason_label(reason)
+                .unwrap_or(reason)
+                .to_string(),
+        );
     }
     if decision.decision == "execute" {
         return Some("Execute pass (reclaimed tool output)".to_string());
@@ -3467,6 +3529,45 @@ pub fn get_primer_candidates(
     } else {
         stmt.query_map([], map_row)?.collect()
     }
+}
+
+/// Read the latest project-scoped memory mural without requiring the dashboard
+/// to migrate the plugin database. Older databases simply have no mural row.
+pub fn get_mural(
+    conn: &Connection,
+    project: Option<&str>,
+) -> Result<Option<MuralManifest>, rusqlite::Error> {
+    let Some(project) = project else {
+        return Ok(None);
+    };
+    if !table_exists(conn, "mural_manifest") {
+        return Ok(None);
+    }
+
+    // The mural has a fixed size, so use 1,521 as its fallback vision-token
+    // estimate. Older databases may not have a token_estimate column; if a newer
+    // database does, use its value instead.
+    let token_estimate = if table_has_column(conn, "mural_manifest", "token_estimate") {
+        "COALESCE(token_estimate, 1521)"
+    } else {
+        "1521"
+    };
+    let sql = format!(
+        "SELECT project_path, image, rendered_at, {token_estimate} AS token_estimate, width, height
+         FROM mural_manifest
+         WHERE project_path = ?1"
+    );
+    conn.query_row(&sql, params![project], |row| {
+        Ok(MuralManifest {
+            project_path: row.get(0)?,
+            image: row.get(1)?,
+            rendered_at: row.get(2)?,
+            token_estimate: row.get(3)?,
+            width: row.get(4)?,
+            height: row.get(5)?,
+        })
+    })
+    .optional()
 }
 
 fn table_exists(conn: &Connection, table: &str) -> bool {
@@ -7423,6 +7524,34 @@ mod cache_turn_tests {
         let events = build_db_cache_events_with_decisions(rows, true, Some(decisions));
         assert_eq!(events[1].severity, "full_bust");
         assert_eq!(events[1].cause.as_deref(), Some("Manual flush"));
+    }
+
+    #[test]
+    fn rust_module_reasons_are_labeled_and_unknown_reasons_are_preserved() {
+        for (reason, label) in [
+            ("m1_delta", "M1 delta"),
+            ("ttl_expiry", "TTL expiry"),
+            ("epoch_change", "Epoch change"),
+            ("coverage_fold", "Coverage fold"),
+            ("profile_transition", "Profile transition"),
+        ] {
+            let cause = TransformDecisionCause {
+                decision: "execute".to_string(),
+                materialize_reason: Some(reason.to_string()),
+                emergency: false,
+            };
+            assert_eq!(transform_decision_cause(Some(&cause)).as_deref(), Some(label));
+        }
+
+        let unknown = TransformDecisionCause {
+            decision: "execute".to_string(),
+            materialize_reason: Some("future_module_reason".to_string()),
+            emergency: false,
+        };
+        assert_eq!(
+            transform_decision_cause(Some(&unknown)).as_deref(),
+            Some("future_module_reason")
+        );
     }
 
     #[test]

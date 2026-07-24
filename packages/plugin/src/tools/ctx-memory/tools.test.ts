@@ -34,6 +34,12 @@ const { createCtxMemoryTools } = await import("./tools");
 function createTestDb(dbPath = ":memory:"): Database {
     const db = new Database(dbPath);
     db.exec(`
+        CREATE TABLE IF NOT EXISTS authority_managed (
+            project_path TEXT PRIMARY KEY,
+            context_store_uuid TEXT NOT NULL,
+            marked_at INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS memories
         (
             id                      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -345,6 +351,88 @@ describe("createCtxMemoryTools", () => {
                 toolContext(),
             );
             expect(syncSessions).toEqual(["ses-memory"]);
+        });
+
+        it("routes all module-owned memory actions without writing the TS table", async () => {
+            const routed: Array<{ action: string; ids?: number[]; memoryProject: string }> = [];
+            const moduleTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                rustToolBackends: {
+                    authorityState: async () => "MODULE",
+                    memory: async (request) => {
+                        routed.push({
+                            action: request.action,
+                            ids: request.ids,
+                            memoryProject: request.memoryProject,
+                        });
+                        return { content: [{ type: "text", text: `module ${request.action}` }] };
+                    },
+                },
+            });
+            const actions = [
+                { action: "write", category: "CONSTRAINTS", content: "module write" },
+                { action: "update", ids: [1], content: "module update" },
+                { action: "archive", ids: [1] },
+                { action: "merge", ids: [1, 2], content: "module merge" },
+                { action: "get", ids: [1] },
+            ] as const;
+            for (const request of actions) {
+                const result = await moduleTools.ctx_memory.execute(request, toolContext());
+                expect(result).toContain(`module ${request.action}`);
+            }
+            expect(routed.map((request) => request.action)).toEqual([
+                "write",
+                "update",
+                "archive",
+                "merge",
+                "get",
+            ]);
+            expect(routed.every((request) => request.memoryProject === "/repo/project")).toBe(true);
+            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
+        });
+
+        it("maps a raced module drain rejection to the transition retry message", async () => {
+            const moduleTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                rustToolBackends: {
+                    authorityState: async () => "MODULE",
+                    memory: async () => {
+                        const error = new Error("authority is draining") as Error & {
+                            code: string;
+                        };
+                        error.code = "authority_draining";
+                        throw error;
+                    },
+                },
+            });
+            const result = await moduleTools.ctx_memory.execute(
+                { action: "write", category: "CONSTRAINTS", content: "retry me" },
+                toolContext(),
+            );
+            expect(result).toBe(
+                "Error: Rust memory authority is not ready; TypeScript fallback is disabled.",
+            );
+            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
+        });
+
+        it("fails closed when module authority is active without the memory protocol", async () => {
+            const moduleTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                rustToolBackends: { authorityState: async () => "MODULE" },
+            });
+            const result = await moduleTools.ctx_memory.execute(
+                { action: "write", category: "CONSTRAINTS", content: "must not fall back" },
+                toolContext(),
+            );
+            expect(result).toContain("does not support ctx_memory");
+            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
         });
 
         it("creates a new memory with agent source type", async () => {
@@ -968,6 +1056,9 @@ describe("createCtxMemoryTools", () => {
             category: "CONSTRAINTS", // shared
             content: "Foreign constraint shared with the workspace.",
         });
+        db.prepare("UPDATE memories SET shareable = 1, scope = 'project' WHERE id = ?").run(
+            foreignShared.id,
+        );
 
         const result = await tools.ctx_memory.execute(
             {
@@ -1606,6 +1697,191 @@ describe("createCtxMemoryTools", () => {
             expect(res).not.toContain("Error");
             expect(getMemoryById(db, memory.id)).toMatchObject({ shareable: 0 });
             expect(getUnclassifiedMemoryIds(db, [memory.id])).toEqual([memory.id]); // re-scorable
+        });
+    });
+
+    describe("#given get action", () => {
+        it("returns an own-project memory by id", async () => {
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONSTRAINTS",
+                content: "Always run bun before shipping.",
+            });
+            const result = await tools.ctx_memory.execute(
+                { action: "get", ids: [memory.id] },
+                toolContext(),
+            );
+            expect(result).toContain(`Found 1 active memory`);
+            expect(result).toContain(String(memory.id));
+            expect(result).toContain("Always run bun before shipping.");
+        });
+
+        it("unwraps imitated reduced get calls without overriding real arguments", async () => {
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONSTRAINTS",
+                content: "Run the focused test suite.",
+            });
+            const plain = await tools.ctx_memory.execute(
+                { action: "get", ids: [memory.id] },
+                toolContext(),
+            );
+            const imitated = await tools.ctx_memory.execute(
+                {
+                    reduced: true,
+                    summary: JSON.stringify({ action: "get", ids: [memory.id] }),
+                },
+                toolContext(),
+            );
+            const malformed = await tools.ctx_memory.execute(
+                { reduced: true, summary: "not JSON" },
+                toolContext(),
+            );
+            const realArguments = await tools.ctx_memory.execute(
+                {
+                    action: "get",
+                    ids: [memory.id],
+                    reduced: true,
+                    summary: JSON.stringify({ action: "archive", ids: [memory.id] }),
+                },
+                toolContext(),
+            );
+
+            expect(imitated).toBe(plain);
+            expect(malformed).toBe("Error: Action 'undefined' is not allowed in this context.");
+            expect(realArguments).toBe(plain);
+            expect(getMemoryById(db, memory.id)?.status).toBe("active");
+        });
+
+        it("labels archived rows with their status instead of hiding them", async () => {
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "KNOWN_ISSUES",
+                content: "Retired issue entry the user just referenced.",
+            });
+            db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(memory.id);
+
+            const result = await tools.ctx_memory.execute(
+                { action: "get", ids: [memory.id] },
+                toolContext(),
+            );
+            expect(result).toContain(String(memory.id));
+            expect(result).toContain("archived");
+            expect(result).toContain("Retired issue entry the user just referenced.");
+        });
+
+        it("surfaces a foreign shared-category memory (workspace visibility)", async () => {
+            db.exec(`
+                INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
+                VALUES (1, 'ws', 1, 1, '["CONSTRAINTS"]');
+                INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+                VALUES (1, '/repo/project', 'Own', '/repo/project', 1),
+                       (1, '/repo/foreign', 'Foreign', '/repo/foreign', 1);
+            `);
+            const foreign = insertMemory(db, {
+                projectPath: "/repo/foreign",
+                category: "CONSTRAINTS",
+                content: "Foreign shared constraint.",
+            });
+
+            db.prepare("UPDATE memories SET shareable = 1, scope = 'project' WHERE id = ?").run(
+                foreign.id,
+            );
+            const result = await tools.ctx_memory.execute(
+                { action: "get", ids: [foreign.id] },
+                toolContext(),
+            );
+            expect(result).toContain(String(foreign.id));
+            expect(result).toContain("Foreign shared constraint.");
+        });
+
+        it("hides foreign private, archived, and expired rows in a shared category", async () => {
+            db.exec(`
+                INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
+                VALUES (1, 'ws', 1, 1, '["CONSTRAINTS"]');
+                INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+                VALUES (1, '/repo/project', 'Own', '/repo/project', 1),
+                       (1, '/repo/foreign', 'Foreign', '/repo/foreign', 1);
+            `);
+            const privateMemory = insertMemory(db, {
+                projectPath: "/repo/foreign",
+                category: "CONSTRAINTS",
+                content: "private foreign memory",
+            });
+            const archived = insertMemory(db, {
+                projectPath: "/repo/foreign",
+                category: "CONSTRAINTS",
+                content: "archived foreign memory",
+            });
+            const expired = insertMemory(db, {
+                projectPath: "/repo/foreign",
+                category: "CONSTRAINTS",
+                content: "expired foreign memory",
+            });
+            db.prepare(
+                "UPDATE memories SET shareable = 1, scope = 'project', status = 'archived' WHERE id = ?",
+            ).run(archived.id);
+            db.prepare(
+                "UPDATE memories SET shareable = 1, scope = 'project', expires_at = 0 WHERE id = ?",
+            ).run(expired.id);
+            const result = await tools.ctx_memory.execute(
+                { action: "get", ids: [privateMemory.id, archived.id, expired.id] },
+                toolContext(),
+            );
+            for (const memory of [privateMemory, archived, expired]) {
+                expect(result).toContain(
+                    `id ${memory.id}: not found or not visible from this project`,
+                );
+                expect(result).not.toContain(memory.content);
+            }
+        });
+
+        it("reports a foreign non-shared-category memory as not visible (no existence oracle)", async () => {
+            db.exec(`
+                INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
+                VALUES (1, 'ws', 1, 1, '["CONSTRAINTS"]');
+                INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+                VALUES (1, '/repo/project', 'Own', '/repo/project', 1),
+                       (1, '/repo/foreign', 'Foreign', '/repo/foreign', 1);
+            `);
+            const foreign = insertMemory(db, {
+                projectPath: "/repo/foreign",
+                category: "ARCHITECTURE",
+                content: "Foreign architecture hidden by the share policy.",
+            });
+
+            const result = await tools.ctx_memory.execute(
+                { action: "get", ids: [foreign.id] },
+                toolContext(),
+            );
+            // The id must be reported as not visible, NOT as a normal hit.
+            expect(result).toContain(
+                `id ${foreign.id}: not found or not visible from this project`,
+            );
+            expect(result).not.toContain("Foreign architecture hidden by the share policy.");
+        });
+
+        it("rejects >20 ids with a clear error and emits nothing", async () => {
+            const ids = Array.from({ length: 21 }, (_, i) => i + 1);
+            const result = await tools.ctx_memory.execute({ action: "get", ids }, toolContext());
+            expect(result).toContain("at most 20");
+        });
+
+        it("returns a per-id report mixing hits and misses in call order", async () => {
+            const own = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONSTRAINTS",
+                content: "Own constraint present.",
+            });
+            const missing = 999_999;
+
+            const result = await tools.ctx_memory.execute(
+                { action: "get", ids: [own.id, missing] },
+                toolContext(),
+            );
+            expect(result).toContain(String(own.id));
+            expect(result).toContain("Own constraint present.");
+            expect(result).toContain(`id ${missing}: not found or not visible from this project`);
         });
     });
 });

@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
     __resetProjectIdentityForTests,
     __setProjectIdentityTestHooks,
     resolveProjectIdentity,
+    resolveProjectIdentityForSession,
 } from "./project-identity";
 
 function tempDir(): string {
@@ -22,6 +23,10 @@ afterEach(() => {
 });
 
 describe("resolveProjectIdentity directory fallback", () => {
+    test("does not bind the exact canonical home directory", () => {
+        expect(resolveProjectIdentityForSession(homedir())).toBeUndefined();
+        expect(resolveProjectIdentityForSession(join(homedir(), "a-project"))).not.toBeUndefined();
+    });
     test("flips dir: fallback to git: once a repo gains its first commit (no stale cache)", () => {
         const dir = tempDir();
         try {
@@ -36,6 +41,22 @@ describe("resolveProjectIdentity directory fallback", () => {
             expect(second).toBe("git:abc1234");
             expect(second).not.toBe(first);
             expect(resolveProjectIdentity(dir)).toBe(second);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("derives a deterministic identity from grafted-history repos (multiple root commits)", () => {
+        const dir = tempDir();
+        try {
+            mkdirSync(join(dir, ".git"));
+            // Repos merged with --allow-unrelated-histories keep several live root
+            // commits, and git's enumeration order varies by traversal. The identity
+            // must be the lexicographic minimum of the SET, not the first line.
+            __setProjectIdentityTestHooks({
+                execFileSync: (() => "7e96b9e\n1e394c2\n4058752\n") as typeof execFileSync,
+            });
+            expect(resolveProjectIdentity(dir)).toBe("git:1e394c2");
         } finally {
             rmSync(dir, { recursive: true, force: true });
         }

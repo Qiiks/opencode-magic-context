@@ -17,9 +17,13 @@ import {
     HEADER_LEN,
     PROTOCOL_VERSION,
     Priority,
+    type RouteHandle,
     SERVER_PROOF_DOMAIN,
+    StaleRouteHandleError,
+    type SubcClient,
 } from "@cortexkit/subc-client";
-import { __shadowSenderTest } from "./shadow-sender";
+
+import { __moduleTransportTest, SubcModuleTransport } from "./module-transport";
 
 class FakeServerReader {
     private buffered = Buffer.alloc(0);
@@ -89,9 +93,9 @@ async function listen(server: Server): Promise<number> {
     return address.port;
 }
 
-describe("SubcShadowTransport", () => {
+describe("SubcModuleTransport", () => {
     it("uses the shared v2 client while preserving route identity and flat request bytes", async () => {
-        const tempDir = mkdtempSync(join(tmpdir(), "shadow-subc-v2-"));
+        const tempDir = mkdtempSync(join(tmpdir(), "module-subc-v2-"));
         const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
         const daemonId = Uint8Array.from({ length: 16 }, (_, index) => 100 + index);
         const serverNonce = Uint8Array.from({ length: 32 }, (_, index) => 200 - index);
@@ -167,22 +171,17 @@ describe("SubcShadowTransport", () => {
             );
             chmodSync(connectionFile, 0o600);
 
-            const transport = new __shadowSenderTest.SubcShadowTransport(
-                connectionFile,
-                "magic-context",
-                1_000,
-            );
+            const transport = new SubcModuleTransport(connectionFile, "magic-context", 1_000);
             const flatBody = {
-                method: "shadow_transform",
-                shadow_generation: 4,
-                seed_pass: false,
+                method: "transform",
+                v: 1,
                 input: [{ id: "m1" }],
             };
             await expect(
                 transport.call({
                     sessionId: "session-1",
                     projectRoot: "/workspace/project",
-                    method: "shadow_transform",
+                    method: "transform",
                     body: flatBody,
                 }),
             ).resolves.toEqual({ result: { ok: true } });
@@ -204,7 +203,7 @@ describe("SubcShadowTransport", () => {
                 identity: {
                     project_root: "/workspace/project",
                     harness: "opencode",
-                    session: "shadow:session-1",
+                    session: "session-1",
                 },
                 ...consumerIdentity,
             });
@@ -238,5 +237,162 @@ describe("SubcShadowTransport", () => {
             await new Promise<void>((resolve) => server.close(() => resolve()));
             rmSync(tempDir, { recursive: true, force: true });
         }
+    });
+
+    it("recognizes a stale route error from a foreign subc-client prototype", () => {
+        const foreignStaleRouteError = Object.assign(Object.create(null), {
+            name: "StaleRouteHandleError",
+            message: "route handle (1, 1) is not live on the current connection",
+        });
+
+        expect(foreignStaleRouteError).not.toBeInstanceOf(StaleRouteHandleError);
+        expect(__moduleTransportTest.isConnectionFailure(foreignStaleRouteError)).toBe(true);
+    });
+
+    it("reopens a route and retries when a restarted module leaves a stale route token", async () => {
+        const tempDir = mkdtempSync(join(tmpdir(), "module-subc-restart-"));
+        const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
+        const daemonId = Uint8Array.from({ length: 16 }, (_, index) => 100 + index);
+        const serverNonce = Uint8Array.from({ length: 32 }, (_, index) => 200 - index);
+        const sockets = new Set<Socket>();
+        let routeOpenCount = 0;
+        let requestCount = 0;
+        let serverError: unknown;
+        let transport: SubcModuleTransport | null = null;
+        const server = createServer((socket) => {
+            sockets.add(socket);
+            socket.once("close", () => sockets.delete(socket));
+            void (async () => {
+                const reader = new FakeServerReader(socket);
+                const hello = await readAuthMessage(reader);
+                const clientNonce = Uint8Array.from(hello.client_nonce as number[]);
+                writeAuthMessage(socket, {
+                    server_nonce: [...serverNonce],
+                    daemon_id: [...daemonId],
+                    server_proof: [
+                        ...computeProof(
+                            key,
+                            SERVER_PROOF_DOMAIN,
+                            clientNonce,
+                            serverNonce,
+                            daemonId,
+                        ),
+                    ],
+                });
+                const auth = await readAuthMessage(reader);
+                expect(auth.client_auth).toEqual([
+                    ...computeProof(key, CLIENT_AUTH_DOMAIN, clientNonce, serverNonce, daemonId),
+                ]);
+
+                const routeOpen = await readFrame(reader);
+                routeOpenCount += 1;
+                writeJsonResponse(socket, routeOpen.header, {
+                    route_channel: 6 + routeOpenCount,
+                    route_epoch: 76 + routeOpenCount,
+                });
+
+                const request = await readFrame(reader);
+                requestCount += 1;
+                writeJsonResponse(socket, request.header, { result: { requestCount } });
+            })().catch((error: unknown) => {
+                serverError = error;
+                socket.destroy();
+            });
+        });
+
+        try {
+            const port = await listen(server);
+            const connectionFile = join(tempDir, "subc-connection.json");
+            writeFileSync(
+                connectionFile,
+                JSON.stringify({
+                    schema: 1,
+                    endpoints: [{ host: "127.0.0.1", port }],
+                    key: [...key],
+                    daemon_id: [...daemonId],
+                    pid: process.pid,
+                    daemon_ver: "fake-v2",
+                }),
+            );
+            chmodSync(connectionFile, 0o600);
+
+            transport = new SubcModuleTransport(connectionFile, "magic-context", 1_000);
+            const args = {
+                sessionId: "session-restart",
+                projectRoot: "/workspace/project",
+                method: "transform" as const,
+                body: { method: "transform", v: 1 },
+            };
+            await expect(transport.call(args)).resolves.toEqual({ result: { requestCount: 1 } });
+
+            const internals = transport as unknown as {
+                client: { connectionToken: object } | null;
+            };
+            if (!internals.client) throw new Error("transport did not retain its first connection");
+            // Replacing the token emulates a module restart that invalidated the daemon route.
+            internals.client.connectionToken = Object.freeze({});
+
+            await expect(transport.call(args)).resolves.toEqual({ result: { requestCount: 2 } });
+            expect(routeOpenCount).toBe(2);
+            expect(requestCount).toBe(2);
+            expect(serverError).toBeUndefined();
+        } finally {
+            transport?.closeSession("session-restart");
+            for (const socket of sockets) socket.destroy();
+            await new Promise<void>((resolve) => server.close(() => resolve()));
+            rmSync(tempDir, { recursive: true, force: true });
+        }
+    });
+
+    it("bounds canonical-root entries with least-recently-used eviction", () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const internals = transport as unknown as {
+            canonicalRoot(root: string): string;
+            canonicalRootCache: Map<string, string>;
+        };
+        for (let index = 0; index < 256; index += 1) {
+            internals.canonicalRoot(`/missing-canonical-root-${index}`);
+        }
+        // A cache hit refreshes its recency before the next insert evicts an entry.
+        internals.canonicalRoot("/missing-canonical-root-0");
+        internals.canonicalRoot("/missing-canonical-root-256");
+
+        expect(internals.canonicalRootCache.size).toBe(256);
+        expect(internals.canonicalRootCache.has("/missing-canonical-root-0")).toBe(true);
+        expect(internals.canonicalRootCache.has("/missing-canonical-root-1")).toBe(false);
+    });
+
+    it("does not reuse a route cached under an earlier connection generation", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const oldRoute = { channel: 7, epoch: 77 } as RouteHandle;
+        const newRoute = { channel: 8, epoch: 88 } as RouteHandle;
+        let routeOpenCount = 0;
+        const client = {
+            routeOpen: async () => {
+                routeOpenCount += 1;
+                return newRoute;
+            },
+        } as unknown as SubcClient;
+        const projectRoot = "/module-transport-generation-test-root";
+        const routeKey = `session-generation\0${projectRoot}`;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            connectionGeneration: number;
+            routes: Map<string, { route: RouteHandle; generation: number }>;
+            ensureRoute: (
+                sessionId: string,
+                rawProjectRoot: string,
+            ) => Promise<{ route: RouteHandle; generation: number }>;
+        };
+        internals.client = client;
+        internals.connectionGeneration = 1;
+        internals.routes.set(routeKey, { route: oldRoute, generation: 0 });
+
+        const ensured = await internals.ensureRoute("session-generation", projectRoot);
+
+        expect(routeOpenCount).toBe(1);
+        expect(ensured.route).toBe(newRoute);
+        expect(ensured.generation).toBe(1);
+        expect(internals.routes.get(routeKey)).toEqual({ route: newRoute, generation: 1 });
     });
 });

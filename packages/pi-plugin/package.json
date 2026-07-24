@@ -26,7 +26,7 @@
 		"README.md"
 	],
 	"scripts": {
-		"build": "bun build src/index.ts src/subagent-entry.ts --outdir dist --target node --format esm --external @earendil-works/pi-coding-agent --external @earendil-works/pi-tui --external @huggingface/transformers --external node:sqlite",
+		"build": "bun build src/index.ts src/subagent-entry.ts --outdir dist --target node --format esm --splitting --external @earendil-works/pi-coding-agent --external @earendil-works/pi-tui --external @huggingface/transformers --external node:sqlite",
 		"typecheck": "tsc --noEmit",
 		"test": "bun test",
 		"lint": "biome check src",

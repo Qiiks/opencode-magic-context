@@ -10,6 +10,7 @@
  *     --clear         Interactive picker to clear plugin caches.
  *   doctor migrate  Migrate OpenCode session content to Pi JSONL.
  *   doctor migrate-session  Re-home an OpenCode session to another directory/project.
+ *   doctor merge-identity   Merge all project-scoped rows between identities.
  *
  * Common flags:
  *   --harness opencode|pi   Target one harness (default: auto-detect / prompt)
@@ -61,8 +62,12 @@ function printUsage(): void {
     console.log("    doctor --check-v22-backfill       Show v22 memory backfill status");
     console.log("    doctor --retry-v22-backfill       Retry failed v22 memory backfill rows");
     console.log("    doctor --rekey-v22-dir-identity <path>  Re-key legacy dir identity rows");
+    console.log("    doctor drain-authority <project>  Drain module memory/note authority back to TypeScript");
     console.log("    doctor migrate   Migrate OpenCode session to Pi JSONL");
     console.log("    doctor migrate-session   Re-home an OpenCode session to another directory");
+    console.log(
+        "    doctor merge-identity   Merge project rows (--from ID --to ID [--dry-run] [--yes])",
+    );
     console.log("");
     console.log("  Harness selection:");
     console.log("    --harness opencode    Target OpenCode only");
@@ -100,6 +105,27 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         }
 
         if (command === "doctor") {
+            if (rest[0] === "drain-authority") {
+                const projectRoot = rest[1];
+                if (!projectRoot || projectRoot.startsWith("-")) {
+                    console.error("Usage: magic-context doctor drain-authority <project>");
+                    return 1;
+                }
+                const [{ runDoctorDrainAuthority }, { getMagicContextStorageDir }, { join }] =
+                    await Promise.all([
+                        import("./commands/doctor-authority"),
+                        import("@magic-context/core/shared/data-path"),
+                        import("node:path"),
+                    ]);
+                return runDoctorDrainAuthority(
+                    projectRoot,
+                    join(getMagicContextStorageDir(), "context.db"),
+                );
+            }
+            if (rest[0] === "merge-identity") {
+                const { runMergeIdentityCli } = await import("./commands/doctor-merge-identity");
+                return runMergeIdentityCli(rest.slice(1));
+            }
             if (rest[0] === "migrate") {
                 const { runMigrateCli } = await import("./commands/migrate");
                 return runMigrateCli(rest.slice(1));

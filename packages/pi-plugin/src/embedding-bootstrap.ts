@@ -7,7 +7,7 @@ import {
 	type EmbeddingFeatures,
 	registerProjectEmbedding,
 } from "@magic-context/core/features/magic-context/memory/embedding";
-import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
 	handleUntrustedLoad,
@@ -57,7 +57,8 @@ export async function ensureProjectRegisteredFromPiDirectory(
 	directory: string,
 	db: ContextDatabase,
 ): Promise<void> {
-	const projectIdentity = resolveProjectIdentity(directory);
+	const projectIdentity = resolveProjectIdentityForSession(directory);
+	if (!projectIdentity) return;
 	let registrationFingerprints = registrationFingerprintsByDatabase.get(db);
 	if (!registrationFingerprints) {
 		registrationFingerprints = new Map();

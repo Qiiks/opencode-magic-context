@@ -565,9 +565,6 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
     const resolvedTransformMode = resolveTransformMode({
         configured: config.transform_mode,
         userTierHasSubc: hasUserTierSubcConfig(userLoaded?.config),
-        shadowTransformEnabled: config.shadow_transform.enabled,
-        cavemanCompressionEnabled: config.caveman_text_compression.enabled,
-        projectKey: directory,
     });
     config.transform_mode = resolvedTransformMode.mode;
     allWarnings.push(...resolvedTransformMode.warnings.map((warning) => `[config] ${warning}`));

@@ -44,7 +44,7 @@ describe("historian timeout wiring", () => {
         const db = openDatabase();
         const client = createHistorianClient(
             "/tmp/incremental-timeout",
-            `<compartment start="1" end="2" title="Eligible history">Summary</compartment>`,
+            `<compartment start="1" end="2" title="Eligible history"><p1>Summary</p1></compartment>`,
         );
         const promptSyncSpy = spyOn(shared, "promptSyncWithModelSuggestionRetry").mockResolvedValue(
             undefined,
@@ -87,7 +87,7 @@ describe("historian timeout wiring", () => {
         const db = openDatabase();
         const client = createHistorianClient(
             "/tmp/recomp-timeout",
-            `<compartment start="1" end="4" title="Recovered history">Summary</compartment>`,
+            `<compartment start="1" end="4" title="Recovered history"><p1>Summary</p1></compartment>`,
         );
         const promptSyncSpy = spyOn(shared, "promptSyncWithModelSuggestionRetry").mockResolvedValue(
             undefined,

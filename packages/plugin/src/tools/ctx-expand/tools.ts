@@ -2,6 +2,7 @@ import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { getLastCompartmentEndMessage } from "../../features/magic-context/compartment-storage";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { readSessionChunk } from "../../hooks/magic-context/read-session-chunk";
+import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_EXPAND_DESCRIPTION, CTX_EXPAND_TOKEN_BUDGET } from "./constants";
 import { renderMessageByOrdinal, renderVerboseRange } from "./render";
 import type { CtxExpandArgs } from "./types";
@@ -10,36 +11,50 @@ export interface CtxExpandToolDeps {
     db: ContextDatabase;
 }
 
+const ctxExpandArgsShape = {
+    start: tool.schema
+        .number()
+        .optional()
+        .describe(
+            'First message ordinal to expand — a compartment\'s start="N" attribute, or an ordinal from a ctx_search message hit',
+        ),
+    end: tool.schema
+        .number()
+        .optional()
+        .describe(
+            'Last message ordinal to expand (inclusive) — a compartment\'s end="M" attribute',
+        ),
+    verbose: tool.schema
+        .boolean()
+        .optional()
+        .describe(
+            "With start/end: list each message separately with its ordinal [N] and per-part preview (each tool call shown with its output size), so you can pick one to recover in full by ordinal.",
+        ),
+    message: tool.schema
+        .number()
+        .optional()
+        .describe(
+            "Full untruncated recovery of ONE message by its ordinal (every text part + every tool call's complete input/output). Use an ordinal from a compartment, ctx_search hit, or verbose range. Recovers a tool output you dropped with ctx_reduce.",
+        ),
+};
+// The tool definition exposes only the documented argument shape to the model
+// provider, but older callers may still send extra arguments. Parse with
+// passthrough so execute() can receive those fields without advertising them.
+const ctxExpandArgsSchema = tool.schema.object(ctxExpandArgsShape).passthrough();
+
 function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
     return tool({
         description: CTX_EXPAND_DESCRIPTION,
-        args: {
-            start: tool.schema
-                .number()
-                .optional()
-                .describe(
-                    'First message ordinal to expand — a compartment\'s start="N" attribute, or an ordinal from a ctx_search message hit',
-                ),
-            end: tool.schema
-                .number()
-                .optional()
-                .describe(
-                    'Last message ordinal to expand (inclusive) — a compartment\'s end="M" attribute',
-                ),
-            verbose: tool.schema
-                .boolean()
-                .optional()
-                .describe(
-                    "With start/end: list each message separately with its ordinal [N] and per-part preview (each tool call shown with its output size), so you can pick one to recover in full by ordinal.",
-                ),
-            message: tool.schema
-                .number()
-                .optional()
-                .describe(
-                    "Full untruncated recovery of ONE message by its ordinal (every text part + every tool call's complete input/output). Use an ordinal from a compartment, ctx_search hit, or verbose range. Recovers a tool output you dropped with ctx_reduce.",
-                ),
-        },
-        async execute(args: CtxExpandArgs, toolContext) {
+        args: ctxExpandArgsShape,
+        async execute(rawArgs: CtxExpandArgs, toolContext) {
+            const parsedArgs = ctxExpandArgsSchema.safeParse(rawArgs);
+            let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxExpandArgs;
+            args = unwrapImitatedReducedArgs(args, ["message", "start"], {
+                start: "number",
+                end: "number",
+                verbose: "boolean",
+                message: "number",
+            });
             const sessionId = toolContext.sessionID;
 
             // By-ordinal mode: full recovery of a single message from stored history.

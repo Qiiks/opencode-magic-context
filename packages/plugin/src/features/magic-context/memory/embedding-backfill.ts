@@ -1,7 +1,7 @@
 import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
 import { embedBatchForProject, getProjectEmbeddingSnapshot } from "./embedding";
-import { type StoredMemoryEmbedding, saveEmbedding } from "./storage-memory-embeddings";
+import { type StoredMemoryEmbedding, saveEmbeddingIfHashMatches } from "./storage-memory-embeddings";
 import type { Memory } from "./types";
 
 export async function ensureMemoryEmbeddings(args: {
@@ -41,8 +41,23 @@ export async function ensureMemoryEmbeddings(args: {
                     continue;
                 }
 
-                saveEmbedding(args.db, memory.id, embedding, result.modelId);
-                staged.set(memory.id, { embedding, modelId: result.modelId });
+                // The vector was computed from the content this memory had when the
+                // batch was assembled. If the memory was edited while the provider
+                // call was in flight, its normalized_hash no longer matches and the
+                // guarded save discards the stale vector — leaving the row unembedded
+                // so the proactive drain re-embeds the current content next round.
+                // A skipped memory must not enter the cache either: a stale cached
+                // vector would score searches until the cache is rebuilt.
+                const saved = saveEmbeddingIfHashMatches(
+                    args.db,
+                    memory.id,
+                    embedding,
+                    result.modelId,
+                    memory.normalizedHash,
+                );
+                if (saved) {
+                    staged.set(memory.id, { embedding, modelId: result.modelId });
+                }
             }
         })();
 

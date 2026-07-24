@@ -199,3 +199,83 @@ export type Database = BetterSqlite3.Database;
  * historical behavior in this codebase).
  */
 export type Statement = BetterSqlite3.Statement<unknown[], unknown>;
+
+const privilegeDepth = new WeakMap<Database, number>();
+const registeredPrivilegeFunctions = new WeakSet<Database>();
+const privilegeUdfAvailable = new WeakSet<Database>();
+
+/** Register the connection-local privilege predicate used by managed-write guards. */
+export function registerPrivilegedWriter(db: Database): void {
+    if (registeredPrivilegeFunctions.has(db)) return;
+    const native = db as unknown as {
+        function?: (name: string, implementation: () => number) => void;
+        createFunction?: (name: string, implementation: () => number) => void;
+    };
+    const implementation = (): number => ((privilegeDepth.get(db) ?? 0) > 0 ? 1 : 0);
+    if (typeof native.function === "function") {
+        native.function("mc_privileged_writer", implementation);
+    } else if (typeof native.createFunction === "function") {
+        native.createFunction("mc_privileged_writer", implementation);
+    } else {
+        // Older Bun releases do not expose scalar UDF registration. Migration 55
+        // retains the pre-UDF state-table trigger on those runtimes.
+        registeredPrivilegeFunctions.add(db);
+        return;
+    }
+    privilegeUdfAvailable.add(db);
+    registeredPrivilegeFunctions.add(db);
+}
+
+function isInTransaction(db: Database): boolean {
+    const candidate = db as unknown as { inTransaction?: unknown; isTransaction?: unknown };
+    return candidate.inTransaction === true || candidate.isTransaction === true;
+}
+
+/**
+ * Run a storage operation while the connection-local privilege predicate is enabled.
+ * The depth lives outside SQLite, so a second connection can never observe or inherit it.
+ */
+export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
+    registerPrivilegedWriter(db);
+    const previousDepth = privilegeDepth.get(db) ?? 0;
+    const nested = isInTransaction(db);
+    const savepoint = "mc_privilege_scope";
+    if (nested) {
+        db.exec(`SAVEPOINT ${savepoint}`);
+    } else {
+        db.exec("BEGIN IMMEDIATE");
+    }
+    privilegeDepth.set(db, previousDepth + 1);
+    try {
+        if (!privilegeUdfAvailable.has(db)) {
+            db.prepare(
+                "INSERT INTO context_privilege_state(id, enabled) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET enabled = 1",
+            ).run();
+        }
+        const result = operation();
+        if (!privilegeUdfAvailable.has(db) && previousDepth === 0) {
+            db.prepare("UPDATE context_privilege_state SET enabled = 0 WHERE id = 1").run();
+        }
+        if (nested) {
+            db.exec(`RELEASE ${savepoint}`);
+        } else {
+            db.exec("COMMIT");
+        }
+        if (previousDepth > 0) privilegeDepth.set(db, previousDepth);
+        else privilegeDepth.delete(db);
+        return result;
+    } catch (error) {
+        try {
+            if (nested) {
+                db.exec(`ROLLBACK TO ${savepoint}`);
+                db.exec(`RELEASE ${savepoint}`);
+            } else {
+                db.exec("ROLLBACK");
+            }
+        } finally {
+            if (previousDepth > 0) privilegeDepth.set(db, previousDepth);
+            else privilegeDepth.delete(db);
+        }
+        throw error;
+    }
+}

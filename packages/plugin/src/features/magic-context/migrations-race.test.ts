@@ -9,6 +9,7 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     isSiblingMigrationConflict,
+    LATEST_MIGRATION_VERSION,
     MigrationLockBusyError,
     runMigrations,
     runMigrationsWithRetry,
@@ -59,8 +60,8 @@ describe("migration race tolerance", () => {
                 $`bun -e ${script}`.json() as Promise<{ version: number; table: boolean }>,
             ]);
 
-            expect(first).toEqual({ version: 53, table: true });
-            expect(second).toEqual({ version: 53, table: true });
+            expect(first).toEqual({ version: LATEST_MIGRATION_VERSION, table: true });
+            expect(second).toEqual({ version: LATEST_MIGRATION_VERSION, table: true });
 
             const verify = new Database(path);
             expect(
@@ -267,8 +268,14 @@ describe("migration race tolerance", () => {
             );
             closeQuietly(setup);
 
+            // Resolve from the package root like the sibling script above: the suite
+            // runs from the repo root in the combined gate and from packages/plugin in
+            // a package-local run, and a bare cwd path only works for the latter.
+            const holderRoot = process.cwd().endsWith("/packages/plugin")
+                ? process.cwd()
+                : join(process.cwd(), "packages", "plugin");
             const holderScript = `
-                const { Database } = await import(${JSON.stringify(`file://${process.cwd()}/src/shared/sqlite.ts`)});
+                const { Database } = await import(${JSON.stringify(`file://${holderRoot}/src/shared/sqlite.ts`)});
                 const db = new Database(${JSON.stringify(path)});
                 db.exec("PRAGMA busy_timeout=1; BEGIN IMMEDIATE;");
                 console.log("locked");
@@ -288,7 +295,7 @@ describe("migration race tolerance", () => {
                         version: number;
                     }
                 ).version,
-            ).toBe(53);
+            ).toBe(LATEST_MIGRATION_VERSION);
             closeQuietly(db);
             await holder.exited;
         } finally {

@@ -14,11 +14,7 @@ import {
     type EmbeddingProbeOutcome,
     probeEmbeddingEndpoint,
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
-import {
-    type ContextDatabase,
-    closeDatabase,
-    openDatabase,
-} from "@magic-context/core/features/magic-context/storage";
+import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { loadPiConfig } from "@magic-context/pi-core/config";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
@@ -28,7 +24,10 @@ import {
     hasUserConfigLocationMigrationRefusal,
     migrateConfigLocationsForCli,
 } from "../lib/config-location-migration";
-import { openExistingContextDatabase } from "../lib/database-access";
+import {
+    openExistingContextDatabase,
+    openExistingContextDatabaseForMutation,
+} from "../lib/database-access";
 import { collectDiagnostics } from "../lib/diagnostics-pi";
 import {
     checkLocalEmbeddingRuntimeByResolution,
@@ -97,8 +96,6 @@ interface DoctorDeps {
     selfVersion: () => string;
     probeEmbeddingEndpoint: typeof probeEmbeddingEndpoint;
     openExistingContextDatabase: typeof openExistingContextDatabase;
-    openDatabase: typeof openDatabase;
-    closeDatabase: typeof closeDatabase;
     now: () => Date;
     execFileSync: typeof execFileSync;
     spawnSync: typeof spawnSync;
@@ -122,8 +119,6 @@ const DEFAULT_DEPS: DoctorDeps = {
     selfVersion,
     probeEmbeddingEndpoint,
     openExistingContextDatabase,
-    openDatabase,
-    closeDatabase,
     now: () => new Date(),
     execFileSync,
     spawnSync,
@@ -1013,11 +1008,21 @@ export async function runDoctor(options: RunDoctorOptions = {}): Promise<number>
         return runIssueFlow({ cwd, prompts, deps });
     }
 
+    let v22Db: ReturnType<typeof openExistingContextDatabase> = null;
     const v22Result = await runV22BackfillCommands(
         {
             name: "Pi",
-            openDatabase: deps.openDatabase,
-            closeDatabase: deps.closeDatabase,
+            openDatabase: (readonly = true) => {
+                const dbPath = join(getMagicContextStorageDir(), "context.db");
+                v22Db = readonly
+                    ? openExistingContextDatabase(dbPath, { readonly: true })
+                    : openExistingContextDatabaseForMutation(dbPath);
+                return v22Db;
+            },
+            closeDatabase: () => {
+                v22Db?.close();
+                v22Db = null;
+            },
             log: prompts.log,
         },
         options,

@@ -15,6 +15,28 @@ export {
     incrementCompressionDepth,
 } from "./compression-depth-storage";
 export {
+    AUTHORITY_DOMAINS,
+    type AuthorityDomain,
+    type AuthorityManagedMarker,
+    type AuthorityModuleClient,
+    type AuthorityState,
+    type AuthorityStatus,
+    applyMirrorPage,
+    type ChangefeedPage,
+    type ChangefeedRow,
+    ensureContextStoreUuid,
+    getAuthorityManagedMarker,
+    getContextStoreUuid,
+    getMirrorCursor,
+    installAuthorityManagedMarker,
+    listAuthorityManagedMarkers,
+    type PrepareAuthorityArgs,
+    prepareAuthority,
+    pullAndApplyMirrorPage,
+    reconcileAuthorityMarker,
+    removeAuthorityManagedMarker,
+} from "./context-authority";
+export {
     clearIndexedMessages,
     deleteIndexedMessage,
 } from "./message-index";
@@ -149,6 +171,7 @@ export {
     getStaleReduceStrippedIds,
     getStrippedPlaceholderIds,
     getWrapupInProgressState,
+    markSessionCleanupPending,
     incrementHistorianFailure,
     isWrapupInProgress,
     loadPersistedUsage,
@@ -183,6 +206,7 @@ export {
     resetLastNudgeCycle,
     resetLastNudgeCycleIfTailShrank,
     resetProtectedTailNoEligibleHead,
+    retryPendingSessionCleanups,
     rollbackProtectedTailDrainReservation,
     setChannel2NudgeState,
     setDeferredExecutePendingIfAbsent,
@@ -250,7 +274,9 @@ export {
     type SubagentTotals,
 } from "./storage-subagent-invocations";
 export {
+    AGE_RECLAIM_MIN_TOKENS,
     type ActiveTagTokenAggregate,
+    type AgeReclaimToolTag,
     adoptFallbackTagMessageId,
     adoptPiFallbackMessageTag,
     adoptPiFallbackToolOwnerTag,
@@ -260,6 +286,7 @@ export {
     findPiFallbackToolOwnerTags,
     getActiveTagsBySession,
     getActiveTagTokenAggregate,
+    getActiveToolTagsForAgeReclaim,
     getActiveTagTokenTotalsByMessage,
     getAllStatusTagTokenTotalsFlat,
     getMaxDroppedTagNumber,

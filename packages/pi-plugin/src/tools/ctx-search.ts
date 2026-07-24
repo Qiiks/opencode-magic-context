@@ -20,46 +20,54 @@ import {
 	embedTextForProject,
 	getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
-import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
+	parseIdShapedQuery,
+	resolveMemoriesByIdsForSearch,
 	type UnifiedSearchResult,
 	unifiedSearch,
 } from "@magic-context/core/features/magic-context/search";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { CTX_SEARCH_DESCRIPTION } from "@magic-context/core/tools/ctx-search/constants";
+import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
 const DEFAULT_LIMIT = 10;
 const NOTE_EXPAND_HINT =
 	"Use ctx_expand(start=N-10, end=N) around any note @msg anchor above to read the surrounding conversation context.";
 
-const ParamsSchema = Type.Object({
-	query: Type.String({
-		description:
-			"Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
-	}),
-	limit: Type.Optional(
-		Type.Number({
-			description: "Maximum results to return (default: 10)",
-		}),
-	),
-	sources: Type.Optional(
-		Type.Array(
-			Type.Union([
-				Type.Literal("memory"),
-				Type.Literal("message"),
-				Type.Literal("git_commit"),
-				Type.Literal("primer"),
-				Type.Literal("note"),
-			]),
-			{
+const ParamsSchema = Type.Object(
+	{
+		query: Type.Optional(
+			Type.String({
 				description:
-					'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources.',
-			},
+					"Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
+			}),
 		),
-	),
-});
+		limit: Type.Optional(
+			Type.Number({
+				description: "Maximum results to return (default: 10)",
+			}),
+		),
+		sources: Type.Optional(
+			Type.Array(
+				Type.Union([
+					Type.Literal("memory"),
+					Type.Literal("message"),
+					Type.Literal("git_commit"),
+					Type.Literal("primer"),
+					Type.Literal("note"),
+				]),
+				{
+					description:
+						'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources.',
+				},
+			),
+		),
+	},
+	{ additionalProperties: true },
+);
 
 type CtxSearchParams = Static<typeof ParamsSchema>;
 
@@ -200,6 +208,16 @@ export function createCtxSearchTool(
 			_onUpdate,
 			ctx,
 		) {
+			params = unwrapImitatedReducedArgs(params, ["query"], {
+				query: "string",
+				limit: "number",
+				sources: {
+					type: "array",
+					items: "string",
+					maxItems: 5,
+					values: ["memory", "message", "git_commit", "primer", "note"],
+				},
+			});
 			const query = params.query?.trim();
 			if (!query) {
 				return {
@@ -210,7 +228,19 @@ export function createCtxSearchTool(
 			}
 
 			const sessionId = ctx.sessionManager.getSessionId();
-			const projectIdentity = resolveProjectIdentity(ctx.cwd);
+			const projectIdentity = resolveProjectIdentityForSession(ctx.cwd);
+			if (!projectIdentity) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Error: Could not resolve project identity for search.",
+						},
+					],
+					details: undefined,
+					isError: true,
+				};
+			}
 			await deps.ensureProjectRegistered?.(ctx.cwd, deps.db);
 			const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
 			const memoryEnabled =
@@ -238,6 +268,33 @@ export function createCtxSearchTool(
 
 			// Hard-filter memories already rendered in <session-history>.
 			const visibleMemoryIds = getVisibleMemoryIds(deps.db, sessionId);
+
+			// ID-shaped short-circuit (parity with OpenCode ctx_search): when the
+			// whole query is one or more memory ids, bypass the lexical+semantic
+			// lanes and look the ids up directly. If nothing resolves we fall
+			// through to the normal lanes so a numeric query with no matching
+			// memory still searches text.
+			const idShape = parseIdShapedQuery(query);
+			if (idShape && memoryEnabled) {
+				const idResults = resolveMemoriesByIdsForSearch({
+					db: deps.db,
+					projectPath: projectIdentity,
+					ids: idShape,
+					limit: Math.max(normalizeLimit(params.limit), idShape.length),
+					visibleMemoryIds,
+				});
+				if (idResults !== null) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: formatSearchResults(query, idResults, sessionId),
+							},
+						],
+						details: undefined,
+					};
+				}
+			}
 
 			const results = await unifiedSearch(
 				deps.db,

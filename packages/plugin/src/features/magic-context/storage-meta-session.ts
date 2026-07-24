@@ -26,6 +26,8 @@ const SESSION_META_FALLBACK_SELECTS: Partial<
     last_todo_state: "'' AS last_todo_state",
     tool_reclaim_watermark: "0 AS tool_reclaim_watermark",
     cached_m0_bytes: "NULL AS cached_m0_bytes",
+    cached_m0_mural_data_url: "NULL AS cached_m0_mural_data_url",
+    cached_m0_mural_hash: "NULL AS cached_m0_mural_hash",
     cached_m1_bytes: "NULL AS cached_m1_bytes",
     cached_m0_project_memory_epoch: "NULL AS cached_m0_project_memory_epoch",
     cached_m0_project_user_profile_version: "NULL AS cached_m0_project_user_profile_version",
@@ -43,6 +45,8 @@ const SESSION_META_FALLBACK_SELECTS: Partial<
     cached_m0_project_identity: "NULL AS cached_m0_project_identity",
     last_observed_model_key: "NULL AS last_observed_model_key",
     upgrade_reminded_at: "NULL AS upgrade_reminded_at",
+    upgrade_reminder_last_sent_at: "NULL AS upgrade_reminder_last_sent_at",
+    upgrade_reminder_count: "0 AS upgrade_reminder_count",
 };
 
 // Per-connection memo of the resolved projection SQL. getOrCreateSessionMeta is
@@ -162,6 +166,47 @@ export function advanceToolReclaimWatermark(
     })();
 }
 
+export interface PendingSessionCleanupRetryResult {
+    attempted: number;
+    cleared: number;
+    failedSessionIds: string[];
+}
+
+export function markSessionCleanupPending(db: Database, sessionId: string): void {
+    db.prepare(
+        `INSERT INTO pending_session_cleanup (session_id, harness, requested_at, last_attempt_at)
+         VALUES (?, ?, ?, NULL)
+         ON CONFLICT(session_id) DO UPDATE SET
+             harness = excluded.harness,
+             requested_at = MIN(pending_session_cleanup.requested_at, excluded.requested_at)`,
+    ).run(sessionId, getHarness(), Date.now());
+}
+
+export function retryPendingSessionCleanups(
+    db: Database,
+    limit = 200,
+): PendingSessionCleanupRetryResult {
+    const rows = db
+        .prepare(
+            "SELECT session_id FROM pending_session_cleanup ORDER BY requested_at ASC, session_id ASC LIMIT ?",
+        )
+        .all(Math.max(1, Math.floor(limit))) as Array<{ session_id: string }>;
+    const failedSessionIds: string[] = [];
+    let cleared = 0;
+    for (const row of rows) {
+        try {
+            db.prepare(
+                "UPDATE pending_session_cleanup SET last_attempt_at = ? WHERE session_id = ?",
+            ).run(Date.now(), row.session_id);
+            clearSession(db, row.session_id);
+            cleared += 1;
+        } catch {
+            failedSessionIds.push(row.session_id);
+        }
+    }
+    return { attempted: rows.length, cleared, failedSessionIds };
+}
+
 export function clearSession(db: Database, sessionId: string): void {
     // Every session-scoped table must be cleared here; the structural storage-db
     // test discovers tables with session_id and seeds each one to enforce this list.
@@ -193,6 +238,7 @@ export function clearSession(db: Database, sessionId: string): void {
         db.prepare("DELETE FROM transform_decisions WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM synapse_batch_ledger WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM embedding_measurement_corpus WHERE session_id = ?").run(sessionId);
+        db.prepare("DELETE FROM pending_session_cleanup WHERE session_id = ?").run(sessionId);
         clearIndexedMessages(db, sessionId);
     })();
 }

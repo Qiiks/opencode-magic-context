@@ -3,6 +3,8 @@ import type { Database } from "../../shared/sqlite";
 export type MemoryMutationType = "archive" | "delete" | "update" | "superseded";
 
 const MEMORY_MUTATION_TYPES = new Set<string>(["archive", "delete", "update", "superseded"]);
+const MEMORY_VISIBILITY_MUTATION_CATEGORY = "__mc_visibility__";
+const MAX_MEMORY_REPLACEMENT_DEPTH = 8;
 
 // Terminal mutations mean the memory LEFT the active set (renders as
 // <removed>/<superseded>). `update` is non-terminal — the memory is still
@@ -24,6 +26,7 @@ export interface MemoryMutationLogRow {
     supersededById: number | null;
     category: string | null;
     newContent: string | null;
+    visibilityChanged: boolean;
     queuedAt: number;
 }
 
@@ -55,6 +58,7 @@ function toMemoryMutation(row: MemoryMutationLogDbRow): MemoryMutationLogRow {
         supersededById: row.superseded_by_id,
         category: row.category,
         newContent: row.new_content,
+        visibilityChanged: row.category === MEMORY_VISIBILITY_MUTATION_CATEGORY,
         queuedAt: row.queued_at,
     };
 }
@@ -125,16 +129,103 @@ function coalesceMutations(rows: MemoryMutationLogDbRow[]): MemoryMutationLogRow
             chosenByTarget.set(candidate.targetMemoryId, candidate);
             continue;
         }
+        const visibilityChanged = current.visibilityChanged || candidate.visibilityChanged;
         const currentTerminal = isTerminalMutation(current);
         const candidateTerminal = isTerminalMutation(candidate);
-        if (currentTerminal && !candidateTerminal) continue;
-        if (!currentTerminal && candidateTerminal) {
-            chosenByTarget.set(candidate.targetMemoryId, candidate);
+        if (currentTerminal && !candidateTerminal) {
+            chosenByTarget.set(candidate.targetMemoryId, { ...current, visibilityChanged });
             continue;
         }
-        chosenByTarget.set(candidate.targetMemoryId, candidate);
+        chosenByTarget.set(candidate.targetMemoryId, { ...candidate, visibilityChanged });
     }
     return [...chosenByTarget.values()].sort((left, right) => left.id - right.id);
+}
+
+function getMemoryMutationsForRenderByIdentitySet(
+    db: Database,
+    projectPaths: readonly string[],
+    afterId: number | null | undefined,
+    renderedMemoryIds: readonly number[],
+): MemoryMutationLogRow[] {
+    const identities = uniqueProjectPaths(projectPaths);
+    if (identities.length === 0) return [];
+    const cursor = afterId ?? 0;
+    const visibilityTargets = db
+        .prepare(
+            `SELECT DISTINCT target_memory_id
+               FROM memory_mutation_log
+              WHERE project_path IN (${placeholders(identities)})
+                AND id > ?
+                AND category = ?`,
+        )
+        .all(...identities, cursor, MEMORY_VISIBILITY_MUTATION_CATEGORY) as Array<{
+        target_memory_id: number;
+    }>;
+    const requestedTargets = new Set(renderedMemoryIds);
+    for (const row of visibilityTargets) requestedTargets.add(row.target_memory_id);
+    if (requestedTargets.size === 0) return [];
+
+    const queried = new Set<number>();
+    let frontier = [...requestedTargets].sort((left, right) => left - right);
+    const loaded: MemoryMutationLogDbRow[] = [];
+    for (let depth = 0; depth <= MAX_MEMORY_REPLACEMENT_DEPTH; depth += 1) {
+        frontier = frontier.filter((target) => {
+            if (queried.has(target)) return false;
+            queried.add(target);
+            return true;
+        });
+        if (frontier.length === 0) break;
+        const batch = db
+            .prepare(
+                `SELECT id, project_path, mutation_type, target_memory_id,
+                        superseded_by_id, category, new_content, queued_at
+                   FROM memory_mutation_log
+                  WHERE project_path IN (${placeholders(identities)})
+                    AND id > ?
+                    AND target_memory_id IN (${placeholders(frontier)})
+                  ORDER BY id ASC`,
+            )
+            .all(...identities, cursor, ...frontier) as MemoryMutationLogDbRow[];
+        loaded.push(...batch);
+        frontier = coalesceMutations(batch)
+            .filter((mutation) => mutation.mutationType === "superseded")
+            .flatMap((mutation) =>
+                mutation.supersededById === null ? [] : [mutation.supersededById],
+            );
+    }
+
+    const byTarget = new Map(
+        coalesceMutations(loaded).map((mutation) => [mutation.targetMemoryId, mutation] as const),
+    );
+    const resolved: MemoryMutationLogRow[] = [];
+    for (const target of [...requestedTargets].sort((left, right) => left - right)) {
+        const mutation = byTarget.get(target);
+        if (!mutation) continue;
+        if (mutation.mutationType !== "superseded") {
+            resolved.push(mutation);
+            continue;
+        }
+        let terminal = mutation.supersededById;
+        const visited = new Set([target]);
+        let depth = 0;
+        while (terminal !== null) {
+            if (visited.has(terminal)) {
+                terminal = null;
+                break;
+            }
+            visited.add(terminal);
+            const next = byTarget.get(terminal);
+            if (!next || next.mutationType !== "superseded") break;
+            if (depth >= MAX_MEMORY_REPLACEMENT_DEPTH - 1) {
+                terminal = null;
+                break;
+            }
+            terminal = next.supersededById;
+            depth += 1;
+        }
+        resolved.push({ ...mutation, supersededById: terminal });
+    }
+    return resolved.sort((left, right) => left.id - right.id);
 }
 
 export function getMemoryMutationsForRender(
@@ -143,28 +234,12 @@ export function getMemoryMutationsForRender(
     afterId: number | null | undefined,
     renderedMemoryIds: readonly number[],
 ): MemoryMutationLogRow[] {
-    if (renderedMemoryIds.length === 0) return [];
-
-    const uniqueIds = [...new Set(renderedMemoryIds)].sort((left, right) => left - right);
-    const placeholders = uniqueIds.map(() => "?").join(", ");
-    const rows = db
-        .prepare(
-            `SELECT id, project_path, mutation_type, target_memory_id,
-                    superseded_by_id, category, new_content, queued_at
-               FROM memory_mutation_log
-              WHERE project_path = ?
-                AND id > ?
-                AND target_memory_id IN (${placeholders})
-              ORDER BY id ASC`,
-        )
-        .all(projectPath, afterId ?? 0, ...uniqueIds) as MemoryMutationLogDbRow[];
-
-    // Coalesce to one row per target. Newest-id wins among same-terminality, BUT
-    // a terminal mutation (archive/delete/superseded) always outranks a
-    // non-terminal `update` regardless of id order — otherwise an update queued
-    // after an archive would render the memory as still-present/updated even
-    // though it left the active set (it won't appear in the next m[0] baseline).
-    return coalesceMutations(rows);
+    return getMemoryMutationsForRenderByIdentitySet(
+        db,
+        [projectPath],
+        afterId,
+        renderedMemoryIds,
+    );
 }
 
 export function getMemoryMutationsForRenderByProjects(
@@ -173,27 +248,12 @@ export function getMemoryMutationsForRenderByProjects(
     afterId: number | null | undefined,
     renderedMemoryIds: readonly number[],
 ): MemoryMutationLogRow[] {
-    if (renderedMemoryIds.length === 0) return [];
-    const identities = uniqueProjectPaths(projectPaths);
-    if (identities.length === 0) return [];
-    if (identities.length === 1) {
-        return getMemoryMutationsForRender(db, identities[0], afterId, renderedMemoryIds);
-    }
-
-    const uniqueIds = [...new Set(renderedMemoryIds)].sort((left, right) => left - right);
-    const rows = db
-        .prepare(
-            `SELECT id, project_path, mutation_type, target_memory_id,
-                    superseded_by_id, category, new_content, queued_at
-               FROM memory_mutation_log
-              WHERE project_path IN (${placeholders(identities)})
-                AND id > ?
-                AND target_memory_id IN (${placeholders(uniqueIds)})
-              ORDER BY id ASC`,
-        )
-        .all(...identities, afterId ?? 0, ...uniqueIds) as MemoryMutationLogDbRow[];
-
-    return coalesceMutations(rows);
+    return getMemoryMutationsForRenderByIdentitySet(
+        db,
+        projectPaths,
+        afterId,
+        renderedMemoryIds,
+    );
 }
 
 export function getMaxMemoryMutationId(db: Database, projectPath: string): number | null {

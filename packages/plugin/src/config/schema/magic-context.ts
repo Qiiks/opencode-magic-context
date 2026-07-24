@@ -39,6 +39,20 @@ export const PiThinkingLevelSchema = z
     .optional();
 export type PiThinkingLevel = z.infer<typeof PiThinkingLevelSchema>;
 
+/** Pi-only child-process controls. This block is intentionally optional so an
+ * absent allowlist preserves Pi's normal extension discovery behavior. */
+export const PiConfigSchema = z
+    .object({
+        subagent_extensions: z
+            .array(z.string().trim().min(1))
+            .optional()
+            .describe(
+                "User-only allowlist of Pi extensions for Magic Context subagent children. When set, children use --no-extensions and load only these entries (plus Magic Context's scoped child extension where applicable). Relative paths resolve from ~/.pi/agent, matching Pi's settings.json package location. Unset preserves normal Pi extension discovery.",
+            ),
+    })
+    .optional();
+export type PiConfig = NonNullable<z.infer<typeof PiConfigSchema>>;
+
 /** A 5-field cron expression, or "" to disable the task. */
 const CronScheduleSchema = z
     .string()
@@ -104,6 +118,9 @@ const DEFAULT_TASK_SCHEDULES: Record<DreamTaskName, string> = {
     verify: "0 3 * * *",
     "verify-broad": "0 4 * * 0",
     curate: "0 4 * * 0",
+    // Daily trickle: chunks are small (~40 memories), so after the initial
+    // backfill the per-memory cue compression is cheap to run every night.
+    "compress-cues": "0 4 * * *",
     "classify-memories": "0 6 * * *",
     retrospective: "0 5 * * *",
     "maintain-docs": "",
@@ -138,6 +155,9 @@ export const DreamTasksSchema = z
         ),
         curate: DreamTaskBaseConfigSchema.default(() =>
             DreamTaskBaseConfigSchema.parse(defaultTaskConfig("curate")),
+        ),
+        "compress-cues": DreamTaskBaseConfigSchema.default(() =>
+            DreamTaskBaseConfigSchema.parse(defaultTaskConfig("compress-cues")),
         ),
         "classify-memories": DreamTaskBaseConfigSchema.default(() =>
             DreamTaskBaseConfigSchema.parse(defaultTaskConfig("classify-memories")),
@@ -351,8 +371,20 @@ export interface ShadowEmbeddingConfig {
     enabled: boolean;
 }
 
+export interface ExperimentalMuralConfig {
+    enabled: boolean;
+    /** The CUE COMPRESSOR model for the compress-cues dreamer task (the mural is
+     *  now rendered deterministically, so this no longer names an author model). */
+    model?: string;
+}
+
+export interface ExperimentalConfig {
+    mural: ExperimentalMuralConfig;
+}
+
 export interface MagicContextConfig {
     enabled: boolean;
+    experimental: ExperimentalConfig;
     /** Selects the runtime implementation for this project. Rust mode is experimental and requires user-level subc configuration. */
     transform_mode: "ts" | "rust";
     /** Auto-update the cached OpenCode plugin wrapper when a newer npm version is available.
@@ -413,11 +445,20 @@ export interface MagicContextConfig {
      *  of deleting them on success. For short-term inspection/data collection;
      *  kept sessions accumulate until manually cleared. Default false. */
     keep_subagents: boolean;
+    /**
+     * When true (default), deterministic inoperability (schema fence, storage
+     * open/migration failure) blocks the primary-session transform with a loud
+     * recovery error instead of silently falling through to native compaction.
+     * USER config only — project tier cannot set this. Not recommended to disable.
+     */
+    fail_closed_blocking: boolean;
     /** Pi-only controls for Magic Context's OpenCode-parity todowrite surface. */
     todowrite: {
         enabled: boolean;
         overlay: boolean;
     };
+    /** Pi-only child-process extension controls. */
+    pi?: PiConfig;
     /** Content-aware reclaim of tool output that a later call supersedes, added
      *  to the normal age-based auto-drop: superseded todowrite/ctx_reduce/meta
      *  outputs are dropped, and older edits to a file are compressed to a marker
@@ -484,15 +525,35 @@ export interface MagicContextConfig {
             max_commits: number;
         };
     };
-    shadow_transform: {
-        enabled: boolean;
-    };
     sidekick?: SidekickConfig;
 }
 
 export const MagicContextConfigSchema = z
     .object({
         enabled: z.boolean().default(true).describe("Enable magic context (default: true)"),
+        experimental: z
+            .object({
+                mural: z
+                    .object({
+                        enabled: z.boolean().default(false),
+                        model: z
+                            .string()
+                            .trim()
+                            .min(1)
+                            .optional()
+                            .describe(
+                                "Model for the compress-cues task that compresses each memory into a mural cue. The mural image itself is rendered deterministically (no author model).",
+                            ),
+                    })
+                    .default({ enabled: false })
+                    .describe(
+                        "Experimental mural: a single deterministically-rendered image of project memories that did not fit the context budget. Cues are compressed per-memory by the compress-cues dreamer task.",
+                    ),
+            })
+            .default({ mural: { enabled: false } })
+            .describe(
+                "Experimental feature switches. User and project configuration are both accepted.",
+            ),
         transform_mode: z
             .enum(["ts", "rust"])
             .default("ts")
@@ -694,18 +755,11 @@ export const MagicContextConfigSchema = z
             .describe(
                 "Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect.",
             ),
-        shadow_transform: z
-            .object({
-                enabled: z
-                    .boolean()
-                    .default(false)
-                    .describe(
-                        "Dev flag: mirror every transform pass to the Magic Context Rust module over subc and byte-compare outputs. No behavior impact; default off.",
-                    ),
-            })
-            .default({ enabled: false })
+        fail_closed_blocking: z
+            .boolean()
+            .default(true)
             .describe(
-                "Developer-only shadow transform lane. When enabled, the plugin fire-and-forgets a copy of each finalized transform to the Rust module for comparison; the live output is unchanged.",
+                "When Magic Context cannot operate (schema fence mismatch, storage open/migration failure), block the primary-session prompt with a loud recovery error instead of silently degrading to native compaction. Default true. Set false only to restore the old degrade-silently behavior (not recommended). USER-LEVEL ONLY — ignored in project config for security. Requires a restart.",
             ),
         todowrite: z
             .object({
@@ -726,6 +780,9 @@ export const MagicContextConfigSchema = z
             .describe(
                 "Pi-only todowrite tool and overlay controls. Pi registers tools and widgets at extension boot, so changing this after /cd requires /reload or restart.",
             ),
+        pi: PiConfigSchema.describe(
+            "Pi-only child-process extension controls. This setting is user-level only; project configuration cannot choose which extensions a user's subagent children load.",
+        ),
         smart_drops: z
             .boolean()
             .default(false)

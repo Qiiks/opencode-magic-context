@@ -14,6 +14,7 @@ import {
     setMemoryClassification,
 } from "../../features/magic-context/memory/storage-memory";
 import type { Memory } from "../../features/magic-context/memory/types";
+import { unifiedSearch } from "../../features/magic-context/search";
 import {
     bumpSessionFactsVersion,
     getOrCreateSessionMeta,
@@ -27,15 +28,18 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { COMPARTMENT_RENDER_EPOCH } from "./compartment-render-epoch";
 import {
     clearInjectionCache,
+    getVisibleMemoryIds,
     injectM0M1,
     MaterializeContentionError,
     materializeM0,
     materializeWithRetry,
     mustMaterialize,
     prepareCompartmentInjection,
+    readCurrentM0SnapshotMarkers,
     renderCompartmentInjection,
     renderMemoryBlockV2,
     renderMemoryLineV2,
+    renderM1,
     trimMemoriesToBudgetV2,
 } from "./inject-compartments";
 import { closeReadOnlySessionDb } from "./read-session-db";
@@ -330,16 +334,35 @@ describe("prepareCompartmentInjection — workspace memory sharing", () => {
             category: "NAMING",
             content: "own workspace naming remains visible",
         });
-        insertMemory(db, {
+        const foreignShared = insertMemory(db, {
             projectPath: "/tmp/foreign-project",
             category: "CONSTRAINTS",
             content: "foreign workspace constraint is shared",
         });
+        db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(foreignShared.id);
         insertMemory(db, {
             projectPath: "/tmp/foreign-project",
             category: "NAMING",
             content: "foreign workspace naming is hidden",
         });
+        insertMemory(db, {
+            projectPath: "/tmp/foreign-project",
+            category: "CONSTRAINTS",
+            content: "foreign private constraint is hidden",
+        });
+        const archived = insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "ARCHITECTURE",
+            content: "archived high id is hidden",
+        });
+        db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(archived.id);
+        const expired = insertMemory(db, {
+            projectPath: "/tmp/foreign-project",
+            category: "CONSTRAINTS",
+            content: "expired high id is hidden",
+            expiresAt: 1,
+        });
+        db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(expired.id);
 
         const result = materializeM0({
             db,
@@ -352,6 +375,10 @@ describe("prepareCompartmentInjection — workspace memory sharing", () => {
         expect(result.m0Text).toContain("own workspace naming remains visible");
         expect(result.m0Text).toContain("foreign workspace constraint is shared");
         expect(result.m0Text).not.toContain("foreign workspace naming is hidden");
+        expect(result.m0Text).not.toContain("foreign private constraint is hidden");
+        expect(result.m0Text).not.toContain("archived high id is hidden");
+        expect(result.m0Text).not.toContain("expired high id is hidden");
+        expect(result.snapshotMarkers.maxMemoryId).toBe(foreignShared.id);
     });
 
     it("does not render foreign memories when share_categories is malformed", () => {
@@ -670,6 +697,53 @@ describe("m[0]/m[1] materialization", () => {
         expect(third.m1Text).toBe(second.m1Text);
     });
 
+    it("keeps mixed message bytes identical when the marker probe replays cached injection", () => {
+        db = makeDb();
+        const state = readStateFromMeta();
+        const fixture = [
+            userMessage("mixed-user", "[dropped §1§] user boundary"),
+            {
+                info: { id: "mixed-a", role: "assistant", sessionID: SESSION_ID },
+                parts: [
+                    { type: "reasoning", text: "signed reasoning", signature: "sig" },
+                    { type: "text", text: "<thinking>inline trace</thinking>answer" },
+                    { type: "file", mime: "image/png", url: "data:image/png;base64,AAAA" },
+                ],
+            },
+            {
+                info: { id: "mixed-b", role: "assistant", sessionID: SESSION_ID },
+                parts: [{ type: "text", text: "[dropped §2§]" }],
+            },
+        ] as unknown as MessageLike[];
+        const firstMessages = structuredClone(fixture) as MessageLike[];
+        const secondMessages = structuredClone(fixture) as MessageLike[];
+
+        const first = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: firstMessages,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory: "",
+            isCacheBustingPass: true,
+        });
+        const second = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: secondMessages,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory: "",
+            isCacheBustingPass: false,
+        });
+
+        expect(first.prependedMessageCount).toBe(2);
+        expect(second.prependedMessageCount).toBe(2);
+        expect(second.m0Bytes).toEqual(first.m0Bytes);
+        expect(second.m1Text).toBe(first.m1Text);
+        expect(JSON.stringify(secondMessages)).toBe(JSON.stringify(firstMessages));
+    });
+
     it("mustMaterialize returns true on first call", () => {
         db = makeDb();
         const decision = mustMaterialize({
@@ -703,6 +777,227 @@ describe("m[0]/m[1] materialization", () => {
         });
 
         expect(decision).toEqual({ value: false, reason: null });
+    });
+
+    it("invalidates cached marker reads after background writes for every observed marker", () => {
+        type MutableMarkerField =
+            | "projectMemoryEpoch"
+            | "workspaceFingerprint"
+            | "projectUserProfileVersion"
+            | "maxCompartmentSeq"
+            | "maxMemoryId"
+            | "maxMutationId"
+            | "maxMemoryMutationId"
+            | "sessionFactsVersion"
+            | "upgradeState";
+        const cases: Array<{
+            name: string;
+            field: MutableMarkerField;
+            mutate: (writer: Database) => void;
+            changes: boolean;
+        }> = [
+            {
+                name: "project memory epoch",
+                field: "projectMemoryEpoch",
+                mutate: (writer) => {
+                    setProjectState(writer, PROJECT_PATH, { projectMemoryEpoch: 1 });
+                },
+                changes: true,
+            },
+            {
+                name: "workspace membership",
+                field: "workspaceFingerprint",
+                mutate: (writer) => {
+                    const workspaceId = Number(
+                        (
+                            writer
+                                .prepare(
+                                    "INSERT INTO workspaces (name, created_at, updated_at) VALUES (?, ?, ?)",
+                                )
+                                .run("background-workspace", 1, 1) as { lastInsertRowid: number }
+                        ).lastInsertRowid,
+                    );
+                    const insertMember = writer.prepare(
+                        "INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at) VALUES (?, ?, ?, ?, ?)",
+                    );
+                    insertMember.run(workspaceId, PROJECT_PATH, "primary", PROJECT_PATH, 1);
+                    insertMember.run(
+                        workspaceId,
+                        "/tmp/background-member",
+                        "background",
+                        "/tmp/background-member",
+                        1,
+                    );
+                },
+                changes: true,
+            },
+            {
+                name: "global user profile version",
+                field: "projectUserProfileVersion",
+                mutate: (writer) => {
+                    setProjectState(writer, "__global__", { projectUserProfileVersion: 1 });
+                },
+                changes: true,
+            },
+            {
+                name: "historian compartment publish",
+                field: "maxCompartmentSeq",
+                mutate: (writer) => {
+                    appendCompartments(writer, SESSION_ID, [
+                        {
+                            sequence: 0,
+                            startMessage: 1,
+                            endMessage: 1,
+                            title: "background publish",
+                            content: "background summary",
+                        },
+                    ]);
+                },
+                changes: true,
+            },
+            {
+                name: "memory write",
+                field: "maxMemoryId",
+                mutate: (writer) => {
+                    insertMemory(writer, {
+                        projectPath: PROJECT_PATH,
+                        category: "PROJECT_RULES",
+                        content: "Background memory write must invalidate the probe.",
+                    });
+                },
+                changes: true,
+            },
+            {
+                name: "m0 mutation",
+                field: "maxMutationId",
+                mutate: (writer) => {
+                    queueM0Mutation(writer, {
+                        sessionId: SESSION_ID,
+                        mutationType: "compartment_merge",
+                        queuedAt: 1,
+                    });
+                },
+                changes: true,
+            },
+            {
+                name: "memory mutation",
+                field: "maxMemoryMutationId",
+                mutate: (writer) => {
+                    queueMemoryMutation(writer, {
+                        projectPath: PROJECT_PATH,
+                        mutationType: "update",
+                        targetMemoryId: 1,
+                        newContent: "updated in background",
+                        queuedAt: 1,
+                    });
+                },
+                changes: true,
+            },
+            {
+                name: "retired session facts version",
+                field: "sessionFactsVersion",
+                mutate: (writer) => {
+                    bumpSessionFactsVersion(writer, SESSION_ID);
+                },
+                changes: false,
+            },
+            {
+                name: "legacy upgrade state",
+                field: "upgradeState",
+                mutate: (writer) => {
+                    writer
+                        .prepare(
+                            `INSERT INTO compartments
+                                (session_id, sequence, start_message, end_message, title, content, legacy, created_at)
+                             VALUES (?, 0, 1, 1, 'legacy', 'legacy summary', 1, 1)`,
+                        )
+                        .run(SESSION_ID);
+                },
+                changes: true,
+            },
+        ];
+
+        for (const testCase of cases) {
+            const directory = makeProjectDir();
+            const reader = new Database(join(directory, `${testCase.field}.db`));
+            initializeDatabase(reader);
+            getOrCreateSessionMeta(reader, SESSION_ID);
+            const writer = new Database(join(directory, `${testCase.field}.db`));
+            initializeDatabase(writer);
+            try {
+                const before = readCurrentM0SnapshotMarkers({
+                    db: reader,
+                    sessionId: SESSION_ID,
+                    projectPath: PROJECT_PATH,
+                    projectDirectory: "",
+                });
+                testCase.mutate(writer);
+                const after = readCurrentM0SnapshotMarkers({
+                    db: reader,
+                    sessionId: SESSION_ID,
+                    projectPath: PROJECT_PATH,
+                    projectDirectory: "",
+                });
+
+                if (testCase.changes) {
+                    expect(after[testCase.field], testCase.name).not.toEqual(
+                        before[testCase.field],
+                    );
+                } else {
+                    expect(after[testCase.field], testCase.name).toEqual(before[testCase.field]);
+                }
+            } finally {
+                closeQuietly(writer);
+                closeQuietly(reader);
+            }
+        }
+    });
+
+    it("uses one cached statement execution for an unchanged marker decision", () => {
+        db = makeDb();
+        let prepares = 0;
+        let executions = 0;
+        const observedDb = new Proxy(db, {
+            get(target, property, receiver) {
+                if (property !== "prepare") return Reflect.get(target, property, receiver);
+                return (sql: string) => {
+                    prepares += 1;
+                    const statement = target.prepare(sql);
+                    if (!sql.includes("json_each(?)")) return statement;
+                    return {
+                        get: (...parameters: unknown[]) => {
+                            executions += 1;
+                            return statement.get(...parameters);
+                        },
+                    };
+                };
+            },
+        }) as Database;
+        const args = {
+            db: observedDb,
+            sessionId: SESSION_ID,
+            projectPath: PROJECT_PATH,
+            projectDirectory: "",
+        };
+
+        const before = readCurrentM0SnapshotMarkers(args);
+        prepares = 0;
+        executions = 0;
+        const after = readCurrentM0SnapshotMarkers(args);
+
+        expect(after).toMatchObject({
+            projectMemoryEpoch: before.projectMemoryEpoch,
+            workspaceFingerprint: before.workspaceFingerprint,
+            projectUserProfileVersion: before.projectUserProfileVersion,
+            maxCompartmentSeq: before.maxCompartmentSeq,
+            maxMemoryId: before.maxMemoryId,
+            maxMutationId: before.maxMutationId,
+            maxMemoryMutationId: before.maxMemoryMutationId,
+            sessionFactsVersion: before.sessionFactsVersion,
+            upgradeState: before.upgradeState,
+        });
+        expect(prepares).toBe(0);
+        expect(executions).toBe(1);
     });
 
     it("folds a legacy render epoch once, then replays m[0]/m[1] byte-identically", () => {
@@ -1447,6 +1742,50 @@ describe("m[0]/m[1] materialization", () => {
         expect(new Set(ids)).toEqual(new Set([id1, id2]));
     });
 
+    it("filters a memory rendered only in m[1] while returning a memory rendered in neither", async () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        let m1OnlyId = 0;
+        const materialized = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state: readStateFromMeta(),
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            beforePhase3ForTest: () => {
+                m1OnlyId = insertMemory(db, {
+                    projectPath: PROJECT_PATH,
+                    category: "ARCHITECTURE",
+                    content: "RecallFilterToken rendered only in the incremental block",
+                }).id;
+            },
+        });
+        expect(materialized.m1Text).toContain("RecallFilterToken");
+
+        const hiddenId = insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "ARCHITECTURE",
+            content: "RecallFilterToken created after both cached blocks",
+        }).id;
+        const visibleMemoryIds = getVisibleMemoryIds(db, SESSION_ID);
+        expect(visibleMemoryIds?.has(m1OnlyId)).toBe(true);
+        expect(visibleMemoryIds?.has(hiddenId)).toBe(false);
+
+        const results = await unifiedSearch(db, SESSION_ID, PROJECT_PATH, "RecallFilterToken", {
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            sources: ["memory"],
+            visibleMemoryIds: visibleMemoryIds ?? undefined,
+            countRetrievals: false,
+            measurementDisabled: true,
+        });
+        const resultIds = results
+            .filter((result) => result.source === "memory")
+            .map((result) => result.memoryId);
+        expect(resultIds).not.toContain(m1OnlyId);
+        expect(resultIds).toContain(hiddenId);
+    });
+
     it("materializeM0 sizes session-history to the HISTORY budget, not budget minus project-docs", () => {
         // Regression: the over-budget tightening loop measured the WHOLE m[0]
         // (which includes <project-docs>/<user-profile>/<project-memory>) against
@@ -2006,11 +2345,11 @@ describe("m[0]/m[1] materialization", () => {
         });
         const initialM1 = renderedText(first[1]);
 
-        insertMemory(db, {
+        const m1MemoryId = insertMemory(db, {
             projectPath: PROJECT_PATH,
             category: "ARCHITECTURE",
             content: "New additive memory appears only after a bust.",
-        });
+        }).id;
 
         const deferOne = [userMessage("m2", "defer one")];
         injectM0M1({
@@ -2049,6 +2388,328 @@ describe("m[0]/m[1] materialization", () => {
         });
         expect(renderedText(bust[1])).toContain("<new-memories>");
         expect(renderedText(bust[1])).toContain("New additive memory appears only after a bust.");
+        expect(getVisibleMemoryIds(db, SESSION_ID)?.has(m1MemoryId)).toBe(true);
+    });
+
+    it("resolves direct and chained merge replacements with bounded failure semantics", () => {
+        const cases = [
+            {
+                name: "direct-old-target",
+                seedTargetBeforeMarker: true,
+                mutate(caseDb: Database, source: Memory, targets: Memory[]) {
+                    caseDb
+                        .prepare(
+                            "UPDATE memories SET status = 'archived', superseded_by_memory_id = ? WHERE id = ?",
+                        )
+                        .run(targets[0].id, source.id);
+                    queueMemoryMutation(caseDb, {
+                        projectPath: PROJECT_PATH,
+                        mutationType: "superseded",
+                        targetMemoryId: source.id,
+                        supersededById: targets[0].id,
+                    });
+                },
+                expectedTarget: 0,
+                removed: false,
+            },
+            {
+                name: "new-target",
+                seedTargetBeforeMarker: false,
+                mutate(caseDb: Database, source: Memory, targets: Memory[]) {
+                    caseDb
+                        .prepare(
+                            "UPDATE memories SET status = 'archived', superseded_by_memory_id = ? WHERE id = ?",
+                        )
+                        .run(targets[0].id, source.id);
+                    queueMemoryMutation(caseDb, {
+                        projectPath: PROJECT_PATH,
+                        mutationType: "superseded",
+                        targetMemoryId: source.id,
+                        supersededById: targets[0].id,
+                    });
+                },
+                expectedTarget: 0,
+                removed: false,
+            },
+            {
+                name: "two-hop-chain",
+                seedTargetBeforeMarker: true,
+                targetCount: 2,
+                mutate(caseDb: Database, source: Memory, targets: Memory[]) {
+                    caseDb
+                        .prepare(
+                            "UPDATE memories SET status = 'archived', superseded_by_memory_id = ? WHERE id = ?",
+                        )
+                        .run(targets[0].id, source.id);
+                    caseDb
+                        .prepare(
+                            "UPDATE memories SET status = 'archived', superseded_by_memory_id = ? WHERE id = ?",
+                        )
+                        .run(targets[1].id, targets[0].id);
+                    queueMemoryMutation(caseDb, {
+                        projectPath: PROJECT_PATH,
+                        mutationType: "superseded",
+                        targetMemoryId: source.id,
+                        supersededById: targets[0].id,
+                    });
+                    queueMemoryMutation(caseDb, {
+                        projectPath: PROJECT_PATH,
+                        mutationType: "superseded",
+                        targetMemoryId: targets[0].id,
+                        supersededById: targets[1].id,
+                    });
+                },
+                expectedTarget: 1,
+                removed: false,
+            },
+            {
+                name: "cycle",
+                seedTargetBeforeMarker: true,
+                mutate(caseDb: Database, source: Memory, targets: Memory[]) {
+                    queueMemoryMutation(caseDb, {
+                        projectPath: PROJECT_PATH,
+                        mutationType: "superseded",
+                        targetMemoryId: source.id,
+                        supersededById: targets[0].id,
+                    });
+                    queueMemoryMutation(caseDb, {
+                        projectPath: PROJECT_PATH,
+                        mutationType: "superseded",
+                        targetMemoryId: targets[0].id,
+                        supersededById: source.id,
+                    });
+                },
+                expectedTarget: null,
+                removed: true,
+            },
+            {
+                name: "archived-terminal",
+                seedTargetBeforeMarker: true,
+                mutate(caseDb: Database, source: Memory, targets: Memory[]) {
+                    caseDb
+                        .prepare(
+                            "UPDATE memories SET status = 'archived', superseded_by_memory_id = ? WHERE id = ?",
+                        )
+                        .run(targets[0].id, source.id);
+                    caseDb
+                        .prepare("UPDATE memories SET status = 'archived' WHERE id = ?")
+                        .run(targets[0].id);
+                    queueMemoryMutation(caseDb, {
+                        projectPath: PROJECT_PATH,
+                        mutationType: "superseded",
+                        targetMemoryId: source.id,
+                        supersededById: targets[0].id,
+                    });
+                    queueMemoryMutation(caseDb, {
+                        projectPath: PROJECT_PATH,
+                        mutationType: "archive",
+                        targetMemoryId: targets[0].id,
+                    });
+                },
+                expectedTarget: null,
+                removed: true,
+            },
+        ] as const;
+
+        for (const fixture of cases) {
+            const caseDb = makeDb();
+            try {
+                const source = insertMemory(caseDb, {
+                    projectPath: PROJECT_PATH,
+                    category: "CONSTRAINTS",
+                    content: `${fixture.name} source`,
+                });
+                const targetCount = "targetCount" in fixture ? fixture.targetCount : 1;
+                const targets: Memory[] = [];
+                if (fixture.seedTargetBeforeMarker) {
+                    for (let index = 0; index < targetCount; index += 1) {
+                        targets.push(
+                            insertMemory(caseDb, {
+                                projectPath: PROJECT_PATH,
+                                category: "CONSTRAINTS",
+                                content: `${fixture.name} target ${index}`,
+                            }),
+                        );
+                    }
+                }
+                const markers = readCurrentM0SnapshotMarkers({
+                    db: caseDb,
+                    sessionId: SESSION_ID,
+                    projectPath: PROJECT_PATH,
+                });
+                if (!fixture.seedTargetBeforeMarker) {
+                    targets.push(
+                        insertMemory(caseDb, {
+                            projectPath: PROJECT_PATH,
+                            category: "CONSTRAINTS",
+                            content: `${fixture.name} target 0`,
+                        }),
+                    );
+                }
+                fixture.mutate(caseDb, source, targets);
+                const m1 = renderM1(
+                    {
+                        db: caseDb,
+                        sessionId: SESSION_ID,
+                        state: getOrCreateSessionMeta(caseDb, SESSION_ID),
+                        projectPath: PROJECT_PATH,
+                        memoryInjectionBudgetTokens: 8_000,
+                    },
+                    markers,
+                    [source.id],
+                );
+                const renderedIds = [...m1.matchAll(/^#(\d+)(?:\s|\[|:)/gm)].map((match) =>
+                    Number(match[1]),
+                );
+                const expectedId =
+                    fixture.expectedTarget === null
+                        ? null
+                        : targets[fixture.expectedTarget]?.id;
+                expect(renderedIds, fixture.name).toEqual(expectedId === null ? [] : [expectedId]);
+                if (expectedId === null) {
+                    expect(m1, fixture.name).toContain(`<removed id="${source.id}"/>`);
+                    expect(m1, fixture.name).not.toContain("<superseded");
+                } else {
+                    expect(m1, fixture.name).toContain(
+                        `<superseded id="${source.id}" by="${expectedId}"/>`,
+                    );
+                    expect(m1.match(new RegExp(`^#${expectedId}(?:\\s|\\[|:)`, "gm"))?.length).toBe(1);
+                }
+            } finally {
+                caseDb.close();
+            }
+        }
+    });
+
+    it("follows a merge chain through an invisible workspace intermediate", () => {
+        db = makeDb();
+        const foreign = "/tmp/foreign-replacement-project";
+        db.exec(`
+            INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
+            VALUES (1, 'replacement-ws', '["CONSTRAINTS"]', 1, 1);
+            INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+            VALUES (1, '${PROJECT_PATH}', 'Own', '${PROJECT_PATH}', 1),
+                   (1, '${foreign}', 'Foreign', '${foreign}', 1);
+        `);
+        const source = insertMemory(db, {
+            projectPath: foreign,
+            category: "CONSTRAINTS",
+            content: "workspace chain source",
+        });
+        const middle = insertMemory(db, {
+            projectPath: foreign,
+            category: "CONSTRAINTS",
+            content: "workspace invisible middle",
+        });
+        const terminal = insertMemory(db, {
+            projectPath: foreign,
+            category: "CONSTRAINTS",
+            content: "workspace visible terminal",
+        });
+        db.prepare("UPDATE memories SET shareable = 1 WHERE id IN (?, ?)").run(
+            source.id,
+            terminal.id,
+        );
+        const markers = readCurrentM0SnapshotMarkers({
+            db,
+            sessionId: SESSION_ID,
+            projectPath: PROJECT_PATH,
+        });
+        db.prepare(
+            "UPDATE memories SET status = 'archived', superseded_by_memory_id = ? WHERE id = ?",
+        ).run(middle.id, source.id);
+        db.prepare(
+            "UPDATE memories SET status = 'archived', superseded_by_memory_id = ? WHERE id = ?",
+        ).run(terminal.id, middle.id);
+        queueMemoryMutation(db, {
+            projectPath: foreign,
+            mutationType: "superseded",
+            targetMemoryId: source.id,
+            supersededById: middle.id,
+        });
+        queueMemoryMutation(db, {
+            projectPath: foreign,
+            mutationType: "superseded",
+            targetMemoryId: middle.id,
+            supersededById: terminal.id,
+        });
+
+        const m1 = renderM1(
+            {
+                db,
+                sessionId: SESSION_ID,
+                state: readStateFromMeta(),
+                projectPath: PROJECT_PATH,
+                memoryInjectionBudgetTokens: 8_000,
+            },
+            markers,
+            [source.id],
+        );
+        expect(m1).toContain(`<superseded id="${source.id}" by="${terminal.id}"/>`);
+        expect(m1).toContain("workspace visible terminal");
+        expect(m1).not.toContain("workspace invisible middle");
+    });
+
+    it("renders workspace visibility grants and revocations independent of insertion id", () => {
+        db = makeDb();
+        const foreign = "/tmp/foreign-visibility-project";
+        db.exec(`
+            INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
+            VALUES (1, 'visibility-ws', '["CONSTRAINTS"]', 1, 1);
+            INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+            VALUES (1, '${PROJECT_PATH}', 'Own', '${PROJECT_PATH}', 1),
+                   (1, '${foreign}', 'Foreign', '${foreign}', 1);
+        `);
+        const foreignMemory = insertMemory(db, {
+            projectPath: foreign,
+            category: "CONSTRAINTS",
+            content: "foreign visibility memory below watermark",
+        });
+        const ownMemory = insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "ARCHITECTURE",
+            content: "own high watermark",
+        });
+        const markers = readCurrentM0SnapshotMarkers({
+            db,
+            sessionId: SESSION_ID,
+            projectPath: PROJECT_PATH,
+        });
+        expect(markers.maxMemoryId).toBe(ownMemory.id);
+        db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(foreignMemory.id);
+        const grantMutation = queueMemoryMutation(db, {
+            projectPath: foreign,
+            mutationType: "update",
+            targetMemoryId: foreignMemory.id,
+            category: "__mc_visibility__",
+        });
+        const options = {
+            db,
+            sessionId: SESSION_ID,
+            state: readStateFromMeta(),
+            projectPath: PROJECT_PATH,
+            memoryInjectionBudgetTokens: 8_000,
+        };
+        const grant = renderM1(options, markers, [ownMemory.id]);
+        expect(grant).toContain("foreign visibility memory below watermark");
+        expect(
+            grant.match(new RegExp(`^#${foreignMemory.id}(?:\\s|\\[|:)`, "gm"))?.length,
+        ).toBe(1);
+
+        db.prepare("UPDATE memories SET shareable = 0 WHERE id = ?").run(foreignMemory.id);
+        queueMemoryMutation(db, {
+            projectPath: foreign,
+            mutationType: "update",
+            targetMemoryId: foreignMemory.id,
+            category: "__mc_visibility__",
+        });
+        const revoke = renderM1(
+            options,
+            { ...markers, maxMemoryMutationId: grantMutation.id },
+            [foreignMemory.id, ownMemory.id],
+        );
+        expect(revoke).toContain(`<removed id="${foreignMemory.id}"/>`);
+        expect(revoke).not.toContain("foreign visibility memory below watermark");
     });
 
     it("renders memory mutation removals on cache-busting pass and replays them on defer", () => {

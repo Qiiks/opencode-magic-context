@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { DREAMER_MEMORY_MAPPER_AGENT } from "../../../agents/dreamer";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
@@ -19,6 +21,7 @@ import {
 import { recordChildInvocation } from "../subagent-token-capture";
 import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
+import { getModuleMemoryIdentities, type DreamerModuleRoute, DreamerModuleFailureError } from "./module-apply";
 import {
     buildMapMemoriesPrompt,
     extractMemoryCandidatePaths,
@@ -61,6 +64,7 @@ export interface MapMemoriesArgs {
     deadline: number;
     model?: string;
     fallbackModels?: readonly string[];
+    moduleRoute?: DreamerModuleRoute;
 }
 
 export interface MapMemoriesResult {
@@ -68,6 +72,7 @@ export interface MapMemoriesResult {
     independent: number;
     batches: number;
     remaining: number;
+    complete: boolean;
 }
 
 /** Resolve the unmapped active memories into prompt inputs (with path seeds). */
@@ -94,7 +99,13 @@ function loadUnmappedInputs(
 }
 
 export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesResult> {
-    const result: MapMemoriesResult = { mapped: 0, independent: 0, batches: 0, remaining: 0 };
+    const result: MapMemoriesResult = {
+        mapped: 0,
+        independent: 0,
+        batches: 0,
+        remaining: 0,
+        complete: true,
+    };
     const inputs = loadUnmappedInputs(args.db, args.projectIdentity, args.sessionDirectory);
     if (inputs.length === 0) return result;
 
@@ -123,8 +134,9 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
             result.remaining -= counts.mapped + counts.independent;
             result.batches += 1;
         }
+        result.complete = result.remaining === 0;
         log(
-            `[dreamer] map-memories: mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining}`,
+            `[dreamer] map-memories: mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}`,
         );
         return result;
     } finally {
@@ -212,6 +224,7 @@ async function mapOneBatch(
             desc.stackHead ? { stackHead: desc.stackHead } : undefined,
         );
         recordInvocation(args, startedAt, { status: "failed", error });
+        if (error instanceof DreamerModuleFailureError) throw error;
         // Swallow per-batch failures: the batch's memories stay unmapped and are
         // retried next run. Only an abort/lease-loss should stop the whole task.
         if (signal.aborted) throw error;
@@ -269,15 +282,31 @@ export async function applyBatchMappings(
     }
     if (planned.length === 0) return { mapped: 0, independent: 0 };
 
-    const now = Date.now();
     let mapped = 0;
     let independent = 0;
-    runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
+    if (args.moduleRoute) {
+        const identities = getModuleMemoryIdentities(args.db, args.projectIdentity, planned.map((item) => item.id));
+        const rows = planned.map((item) => {
+            const identity = identities.get(item.id);
+            if (!identity) throw new DreamerModuleFailureError("memory.set_mapping", new Error(`missing mirror identity for ${item.id}`));
+            return { memory_id: identity.moduleId, content_hash_at_prompt: identity.normalizedHash, mapped_files: item.independent ? null : item.files };
+        });
+        let response: unknown;
+        try {
+            response = await args.moduleRoute.moduleClient.call({ sessionId: args.moduleRoute.moduleSessionId, projectRoot: args.moduleRoute.moduleProjectRoot, method: "memory.set_mapping", body: { name: "memory.set_mapping", arguments: { memory_project: args.projectIdentity, context_store_uuid: args.moduleRoute.moduleContextStoreUuid, authority_generation: args.moduleRoute.moduleAuthorityGeneration, command_id: `${args.moduleRoute.moduleCommandId}:${createHash("sha256").update(rows.map((row) => row.memory_id).join(",")).digest("hex").slice(0, 16)}`, rows } } });
+        } catch (error) { throw new DreamerModuleFailureError("memory.set_mapping", error); }
+        const result = ((response as { result?: unknown })?.result ?? response) as { accepted?: unknown };
+        if (!Array.isArray(result?.accepted)) throw new DreamerModuleFailureError("memory.set_mapping", new Error("invalid response"));
+        const accepted = new Set(result.accepted.filter((id): id is number => typeof id === "number"));
         for (const item of planned) {
-            recordMemoryMapping(args.db, item.id, item.files, now);
-            if (item.independent) independent += 1;
-            else mapped += 1;
+            const identity = identities.get(item.id);
+            if (identity && accepted.has(identity.moduleId)) item.independent ? (independent += 1) : (mapped += 1);
         }
+        return { mapped, independent };
+    }
+    const now = Date.now();
+    runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
+        for (const item of planned) { recordMemoryMapping(args.db, item.id, item.files, now); item.independent ? (independent += 1) : (mapped += 1); }
     });
     return { mapped, independent };
 }

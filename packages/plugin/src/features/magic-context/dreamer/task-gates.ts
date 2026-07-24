@@ -117,6 +117,12 @@ export function evaluateTaskGate(task: DreamTaskName, ctx: TaskGateContext): boo
             // taking the shared memory lease.
             return countActiveMemories(db, project) > 0;
 
+        case "compress-cues":
+            // Cheap pre-gate: only take the memory lease when a pool exists. The
+            // executor's selectCandidates does the precise NULL/stale-hash cue
+            // partition and no-ops when everything is already compressed.
+            return countActiveMemories(db, project) > 0;
+
         case "classify-memories":
             // Classification scores the active project memory pool directly. It has
             // no file gate, watermark, or completeness prerequisites.

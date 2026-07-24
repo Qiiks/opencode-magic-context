@@ -17,16 +17,18 @@ import { log } from "../../../shared/logger";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { getCompartmentEvents } from "../compartment-events";
+import { getContextStoreUuid } from "../context-authority";
 import {
     getMemoriesByProject,
     getMemoryCountsByStatus,
     getMemoryVerifications,
     type Memory,
 } from "../memory";
+import { runCompressCues } from "../mural/compress-cues";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
 import { getActiveUserMemories } from "../user-memory/storage-user-memory";
-import { runClassify } from "./classify";
+import { type ClassifyModuleClient, ClassifyModuleFailureError, runClassify } from "./classify";
 import { evaluateSmartNotes } from "./evaluate-smart-notes";
 import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import {
@@ -34,11 +36,17 @@ import {
     snapshotMaintainDocsFiles,
 } from "./maintain-docs-protected-enforcement";
 import { mapMemories } from "./map-memories";
+import {
+    DreamerModuleFailureError,
+    type DreamerModuleRoute,
+    resolveDreamerModuleRoute,
+} from "./module-apply";
 import { promotePrimers } from "./promote-primers";
 import { refreshPrimers } from "./refresh-primers";
 import {
     applyRetrospectiveLearnings,
     parseRetrospectiveLearnings,
+    validateRetrospectiveLearningText,
 } from "./retrospective-learnings";
 import {
     type RetrospectiveRawMessage,
@@ -62,7 +70,6 @@ import {
     RETROSPECTIVE_SYSTEM_PROMPT,
     type RetrospectivePromptEvent,
 } from "./task-prompts";
-
 import type { DreamTaskRuntimeConfig, TaskExecOutcome, TaskExecutor } from "./task-scheduler";
 import { runVerify } from "./verify";
 
@@ -90,6 +97,20 @@ export interface DreamTaskExecutorDeps {
         sessionId: string,
     ) => Promise<RawMessageProvider | null> | RawMessageProvider | null;
     language?: string;
+    /** Resolved project transform mode; an explicit TS mode always stays on TS. */
+    transformMode?: "ts" | "rust";
+    /** Rust-mode module transport; classify uses it only after MODULE authority is confirmed. */
+    dreamerModel?: string;
+    experimentalMural?: { enabled: boolean; model?: string };
+    memoryInjectionBudgetTokens?: number;
+    moduleClient?: ClassifyModuleClient & {
+        authorityStatus?: (args: {
+            context_store_uuid: string;
+            project: string;
+            projectRoot?: string;
+            domain: "memories" | "notes";
+        }) => Promise<{ authority: { state?: string; generation?: number } | null }>;
+    };
 }
 
 /** A failed task either hot-retries (transient: provider/network/rate-limit/
@@ -99,8 +120,13 @@ function classifyFailure(error: unknown): { transient: boolean; brief: string } 
     const described = describeError(error);
     const brief = described.brief;
     const name = error instanceof Error ? error.name : "";
+    const explicitTransient =
+        error !== null &&
+        typeof error === "object" &&
+        (error as { transient?: unknown }).transient === true;
     const combined = `${name} ${brief}`.toLowerCase();
     const transient =
+        explicitTransient ||
         name === "AbortError" ||
         /abort|lease|timeout|timed out|econn|socket|network|rate.?limit|429|503|overloaded|sqlite_busy|database is locked/.test(
             combined,
@@ -188,6 +214,27 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         const startedAt = Date.now();
         const deadline = startedAt + config.timeoutMinutes * 60 * 1000;
         const parent = await resolveParentSessionId();
+        let moduleRoute: Awaited<ReturnType<typeof resolveDreamerModuleRoute>>;
+        if (
+            config.task === "map-memories" ||
+            config.task === "compress-cues" ||
+            config.task === "verify" ||
+            config.task === "verify-broad" ||
+            config.task === "retrospective"
+        ) {
+            try {
+                moduleRoute = await resolveDreamerModuleRoute({
+                    db,
+                    projectIdentity,
+                    projectRoot: deps.sessionDirectory,
+                    transformMode: deps.transformMode,
+                    moduleClient: deps.moduleClient,
+                    commandId: `${startedAt}:${holderId}:${config.task}`,
+                });
+            } catch (error) {
+                throw new DreamerModuleFailureError("authority.status", error);
+            }
+        }
 
         const recordRun = (
             status: "completed" | "failed",
@@ -249,6 +296,48 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         }
 
         try {
+            if (config.task === "compress-cues") {
+                if (deps.experimentalMural?.enabled !== true) {
+                    // Config-gated no-op, but say so: a silent "completed" here
+                    // reads as a successful run in /ctx-dream summaries and would
+                    // otherwise mask a wiring gap.
+                    log("[dreamer] compress-cues: skipped (experimental.mural is not enabled)");
+                    recordRun("completed", null);
+                    return { status: "completed" };
+                }
+                if (moduleRoute) {
+                    const reason =
+                        "compress-cues parked: MODULE memory authority has no cue write facade";
+                    log(`[dreamer] compress-cues: skipped (${reason})`);
+                    recordRun("failed", reason);
+                    return { status: "failed", transient: true, error: reason };
+                }
+                // Model ladder mirrors classify: task override → experimental.mural
+                // model (the cue COMPRESSOR model) → dreamer model → session model.
+                const result = await runCompressCues({
+                    db,
+                    client: deps.client,
+                    projectIdentity,
+                    parentSessionId: parent,
+                    sessionDirectory: deps.sessionDirectory,
+                    holderId,
+                    leaseKey,
+                    deadline,
+                    model: config.model ?? deps.experimentalMural.model ?? deps.dreamerModel,
+                    fallbackModels: config.fallbackModels,
+                });
+                log(
+                    `[dreamer] compress-cues: compressed=${result.compressed} skipped=${result.skipped} chunks=${result.chunks} remaining=${result.remaining}`,
+                );
+                if (!result.complete) {
+                    const error = `compress-cues incomplete: ${result.remaining} selected memories remain`;
+                    recordRun("failed", error);
+                    return { status: "failed", transient: true, error };
+                }
+                recordRun("completed", null);
+                return { status: "completed" };
+            }
+
             if (config.task === "review-user-memories") {
                 const result = await reviewUserMemories({
                     db,
@@ -282,17 +371,23 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     deadline,
                     model: config.model,
                     fallbackModels: config.fallbackModels,
+                    moduleRoute,
                 });
-                recordRun("completed", null);
                 log(
                     `[dreamer] map-memories: mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining}`,
                 );
+                if (!result.complete) {
+                    const error = `map-memories incomplete: ${result.remaining} selected memories remain`;
+                    recordRun("failed", error);
+                    return { status: "failed", transient: true, error };
+                }
+                recordRun("completed", null);
                 return { status: "completed" };
             }
 
             if (config.task === "verify" || config.task === "verify-broad") {
                 const memoryBefore = getMemoryCountsByStatus(db, projectIdentity);
-                await runVerify({
+                const result = await runVerify({
                     db,
                     client: deps.client,
                     projectIdentity,
@@ -305,7 +400,15 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
+                    moduleRoute,
                 });
+                if (!result.complete) {
+                    const error = `${config.task} incomplete: ${result.remaining} selected memories remain`;
+                    recordRun("failed", error, {
+                        memoryChanges: computeMemoryDelta(memoryBefore),
+                    });
+                    return { status: "failed", transient: true, error };
+                }
                 recordRun("completed", null, {
                     memoryChanges: computeMemoryDelta(memoryBefore),
                 });
@@ -315,6 +418,57 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             if (config.task === "classify-memories") {
                 // Cache-neutral metadata write (classified_at/importance/scope/
                 // shareable) — no memory_changes telemetry (status counts unchanged).
+                let moduleArgs:
+                    | Pick<
+                          import("./classify").ClassifyArgs,
+                          | "moduleClient"
+                          | "moduleSessionId"
+                          | "moduleProjectRoot"
+                          | "moduleContextStoreUuid"
+                          | "moduleAuthorityGeneration"
+                          | "moduleCommandId"
+                      >
+                    | undefined;
+                const moduleTransport = deps.transformMode === "ts" ? undefined : deps.moduleClient;
+                if (moduleTransport?.authorityStatus) {
+                    const contextStoreUuid = getContextStoreUuid(db);
+                    if (!contextStoreUuid) {
+                        throw new Error("Rust classify requires a context store identity");
+                    }
+                    let authority: {
+                        authority: { state?: string; generation?: number } | null;
+                    };
+                    try {
+                        authority = await moduleTransport.authorityStatus({
+                            context_store_uuid: contextStoreUuid,
+                            project: projectIdentity,
+                            projectRoot: deps.sessionDirectory,
+                            domain: "memories",
+                        });
+                    } catch (error) {
+                        throw new ClassifyModuleFailureError("authority.status", error);
+                    }
+                    if (authority.authority?.state === "MODULE") {
+                        const generation = authority.authority.generation;
+                        if (typeof generation !== "number") {
+                            throw new ClassifyModuleFailureError(
+                                "authority.status",
+                                new Error("response omitted generation"),
+                            );
+                        }
+                        const moduleClient: ClassifyModuleClient = {
+                            call: (callArgs) => moduleTransport.call(callArgs),
+                        };
+                        moduleArgs = {
+                            moduleClient,
+                            moduleSessionId: projectIdentity,
+                            moduleProjectRoot: deps.sessionDirectory,
+                            moduleContextStoreUuid: contextStoreUuid,
+                            moduleAuthorityGeneration: generation,
+                            moduleCommandId: `${startedAt}:${holderId}`,
+                        };
+                    }
+                }
                 const result = await runClassify({
                     db,
                     client: deps.client,
@@ -326,11 +480,17 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     deadline,
                     model: config.model,
                     fallbackModels: config.fallbackModels,
+                    ...moduleArgs,
                 });
-                recordRun("completed", null);
                 log(
-                    `[dreamer] classify-memories: stage=${result.stage} classified=${result.classified} changed=${result.changed} chunks=${result.chunks}`,
+                    `[dreamer] classify-memories: stage=${result.stage} classified=${result.classified} changed=${result.changed} chunks=${result.chunks} remaining=${result.remaining}`,
                 );
+                if (!result.complete) {
+                    const error = `classify-memories incomplete: ${result.remaining} selected memories remain`;
+                    recordRun("failed", error);
+                    return { status: "failed", transient: true, error };
+                }
+                recordRun("completed", null);
                 return { status: "completed" };
             }
 
@@ -402,6 +562,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     deadline,
                     parent,
                     invocationStartedAt: startedAt,
+                    moduleRoute,
                 });
                 recordRun("completed", null, {
                     memoryChanges: computeMemoryDelta(memoryBefore),
@@ -576,6 +737,7 @@ async function runRetrospectiveTask(
         deadline: number;
         parent: string | undefined;
         invocationStartedAt: number;
+        moduleRoute?: DreamerModuleRoute;
     },
 ): Promise<{ retrospectiveWatermarkMs: number | null }> {
     const { db, projectIdentity, holderId, leaseKey } = ctx;
@@ -754,6 +916,53 @@ async function runRetrospectiveTask(
         const sourceSessionId =
             flagged[0]?.sessionId ?? userMessages[0]?.sessionId ?? "retrospective";
         const learnings = parseRetrospectiveLearnings(deepenRun.validated);
+        let moduleMemoryWritten = 0;
+        const moduleRejected: Array<{ content: string; reason: string }> = [];
+        let hostLearnings = learnings;
+        if (helpers.moduleRoute) {
+            const moduleLearnings = learnings.filter((learning) => {
+                if (learning.route !== "memory") return false;
+                const reason = validateRetrospectiveLearningText(
+                    learning.content,
+                    userMessages.map((message) => message.text ?? ""),
+                );
+                if (reason || !learning.category) {
+                    if (reason) moduleRejected.push({ content: learning.content, reason });
+                    return false;
+                }
+                return true;
+            });
+            hostLearnings = learnings.filter((learning) => learning.route !== "memory");
+            for (const learning of moduleLearnings) {
+                try {
+                    const response = await helpers.moduleRoute.moduleClient.call({
+                        sessionId: helpers.moduleRoute.moduleSessionId,
+                        projectRoot: helpers.moduleRoute.moduleProjectRoot,
+                        method: "ctx_memory",
+                        body: {
+                            name: "ctx_memory",
+                            arguments: {
+                                action: "write",
+                                memory_project: projectIdentity,
+                                category: learning.category,
+                                content: learning.content,
+                                command_id: `${helpers.moduleRoute.moduleCommandId}:${moduleMemoryWritten}`,
+                            },
+                        },
+                    });
+                    const body = ((response as { result?: unknown })?.result ?? response) as {
+                        ok?: unknown;
+                        error?: unknown;
+                    };
+                    if (body?.ok === false || body?.error)
+                        throw new Error("module rejected retrospective memory");
+                    moduleMemoryWritten += 1;
+                } catch (error) {
+                    throw new DreamerModuleFailureError("ctx_memory retrospective write", error);
+                }
+            }
+            // Invalid memory learnings remain rejected, but never reach a TypeScript memory insert.
+        }
         // Apply learnings AND record the processed-window key in ONE transaction
         // so a crash between them can't leave the window un-recorded (which would
         // re-deepen + risk a duplicate observation next run, since
@@ -767,7 +976,7 @@ async function runRetrospectiveTask(
                     db,
                     projectIdentity,
                     sourceSessionId,
-                    learnings,
+                    learnings: hostLearnings,
                     userMemoryCollectionEnabled: deps.userMemoryCollectionEnabled === true,
                     // Source user lines for the near-transcription reject: a learning
                     // that echoes a long verbatim run of the user's words is a
@@ -776,6 +985,8 @@ async function runRetrospectiveTask(
                         .map((message) => message.text ?? "")
                         .filter((text) => text.length > 0),
                 });
+                result.memoryWritten += moduleMemoryWritten;
+                result.rejected.push(...moduleRejected);
                 recordRetrospectiveWindowProcessed(db, projectIdentity, windowKey);
                 return result;
             },

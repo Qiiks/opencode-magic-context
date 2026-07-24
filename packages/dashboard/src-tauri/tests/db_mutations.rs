@@ -1,6 +1,7 @@
 use magic_context_dashboard_lib::db;
 use magic_context_dashboard_lib::project_identity::normalize_stored_project_path;
 use rusqlite::{params, Connection};
+use tempfile::tempdir;
 
 fn make_db() -> Connection {
     let conn = Connection::open_in_memory().expect("open test db");
@@ -701,4 +702,50 @@ fn test_update_memory_category_invalid() {
         )
         .expect("get category");
     assert_eq!(category, "CONSTRAINTS");
+}
+
+
+#[test]
+fn managed_memory_update_is_rejected_by_the_database_guard() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("context.db");
+    {
+        let conn = Connection::open(&path).expect("open context db");
+        create_schema(&conn);
+        conn.execute_batch(
+            "CREATE TABLE context_store_meta (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
+             CREATE TABLE authority_managed (
+                 project_path TEXT PRIMARY KEY,
+                 context_store_uuid TEXT NOT NULL,
+                 marked_at INTEGER NOT NULL
+             );
+             CREATE TABLE context_privilege_state (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 enabled INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO authority_managed(project_path, context_store_uuid, marked_at)
+             VALUES ('/managed', 'store', 0);
+             CREATE TRIGGER memories_authority_guard_update
+             BEFORE UPDATE ON memories
+             WHEN EXISTS (
+                 SELECT 1 FROM authority_managed WHERE project_path = OLD.project_path
+             ) AND COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0
+             BEGIN
+                 SELECT RAISE(ABORT, 'context.db memory writes are managed by the Rust module');
+             END;",
+        )
+        .expect("create authority guard");
+        conn.execute(
+            "INSERT INTO memories(project_path, content, normalized_hash) VALUES (?, ?, ?)",
+            params!["/managed", "old", "old"],
+        )
+        .expect("insert managed memory");
+    }
+
+    let mut conn = db::open_readwrite(&path).expect("open managed context db");
+    let error = db::update_memory_content(&mut conn, 1, "new").expect_err("guard must reject");
+    assert!(error.to_string().contains("managed by the Rust module"));
 }

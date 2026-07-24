@@ -333,32 +333,38 @@ export function applyPiHeuristicCleanup(
 		});
 		if (plan.shouldDrop) {
 			const toDrop = new Set(plan.tagNumbers);
+			const newestEmergencyTags = new Set(
+				droppableTags
+					.slice()
+					.sort((left, right) => right.tagNumber - left.tagNumber)
+					.slice(0, 20)
+					.map((tag) => tag.tagNumber),
+			);
 			db.transaction(() => {
 				for (const tag of tags) {
 					if (!toDrop.has(tag.tagNumber)) continue;
 					if (tag.status !== "active" || tag.type !== "tool") continue;
 					const target = targets.get(tag.tagNumber);
-					const result = target?.drop?.() ?? "absent";
+					const recent = newestEmergencyTags.has(tag.tagNumber);
+					const result = recent
+						? (target?.truncate?.() ?? target?.drop?.() ?? "absent")
+						: (target?.drop?.() ?? "absent");
 					if (result === "removed" || result === "truncated") {
 						updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
-						updateTagDropMode(db, sessionId, tag.tagNumber, "full");
+						updateTagDropMode(db, sessionId, tag.tagNumber, recent ? "truncated" : "full");
 						droppedTools++;
 						emergencyDroppedTools++;
 					}
 				}
-				// Latch the usage sample on any ACTING pass (even zero real drops)
-				// so the next ≥85% pass on this stale sample no-ops. Dropped tags
-				// leave status='active' (re-selection guard). Mirrors OpenCode.
-				setEmergencyDropSample(
-					db,
-					sessionId,
-					emergency.currentTotalInputTokens,
-				);
+				// The sample is latched after the transaction below for every acting
+				// emergency pass, including zero removals.
 			})();
 			sessionLog(sessionId, `emergency tiered drop: ${plan.reason}`);
 		} else {
 			sessionLog(sessionId, `emergency tiered drop skipped: ${plan.reason}`);
 		}
+		// Record every acting emergency sample, including when no target was eligible.
+		setEmergencyDropSample(db, sessionId, emergency.currentTotalInputTokens);
 	}
 
 	// ── Pass 1b: stale ctx_reduce calls (Pi persisted-drop replay) ──────
@@ -471,7 +477,7 @@ export function applyPiHeuristicCleanup(
 				for (let i = 0; i < group.length - 1; i++) {
 					const tag = group[i];
 					const target = targets.get(tag.tagNumber);
-					// Always full-drop (Phase 2 removed truncate-mode).
+					// Deduplication stays full-drop; only emergency recent arcs keep skeletons.
 					const result = target?.drop?.() ?? "absent";
 					if (result === "incomplete") continue;
 					updateTagDropMode(db, sessionId, tag.tagNumber, "full");

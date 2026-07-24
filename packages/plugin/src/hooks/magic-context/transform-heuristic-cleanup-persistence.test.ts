@@ -176,8 +176,8 @@ describe("createTransform heuristic cleanup persistence", () => {
         const executePass = buildMessages();
         await transform({}, { messages: executePass });
 
-        // The large tool output is fully dropped by the tiered emergency drop.
-        expect(getMessage(executePass, "m-tool")).toBeUndefined();
+        // The newest-window emergency arm keeps a skeleton for the tool arc.
+        expect(getMessage(executePass, "m-tool")).toBeDefined();
         const executeInjection = getMessage(executePass, "m-injection");
         expect(executeInjection).toBeDefined();
         expect(stripTagPrefix(getTextPart(executeInjection!).text)).toBe("Visible answer");
@@ -186,7 +186,7 @@ describe("createTransform heuristic cleanup persistence", () => {
         const deferPass = buildMessages();
         await transform({}, { messages: deferPass });
 
-        expect(getMessage(deferPass, "m-tool")).toBeUndefined();
+        expect(getMessage(deferPass, "m-tool")).toBeDefined();
         const deferredInjection = getMessage(deferPass, "m-injection");
         expect(deferredInjection).toBeDefined();
         expect(stripTagPrefix(getTextPart(deferredInjection!).text)).toBe("Visible answer");

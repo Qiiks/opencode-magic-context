@@ -4,6 +4,7 @@ import {
     getSlot,
     type LkgEntryNote,
     type LkgSlot,
+    lkgContentDigest,
     noteEntry,
 } from "./lkg-slot";
 import { assertOpenAiCompatAdjacency } from "./openai-compat-adjacency";
@@ -45,6 +46,8 @@ export interface LkgEntryProjection {
     timeCreated: number | null;
     finish: unknown;
     hasIncompleteTool: boolean;
+    /** Compute the non-enumerable digest lazily so only LKG capture or replay validation hashes message content. */
+    contentDigest?: () => string | null;
 }
 
 export function projectLkgEntry(messages: MessageLike[]): LkgEntryProjection[] {
@@ -83,7 +86,7 @@ export function projectLkgEntry(messages: MessageLike[]): LkgEntryProjection[] {
             }
         }
         const id = info.id;
-        return {
+        const projection: LkgEntryProjection = {
             id: typeof id === "string" && id.length > 0 ? id : null,
             role: typeof info.role === "string" ? info.role : undefined,
             synthetic: info.synthetic === true,
@@ -91,6 +94,11 @@ export function projectLkgEntry(messages: MessageLike[]): LkgEntryProjection[] {
             finish: info.finish,
             hasIncompleteTool,
         };
+        Object.defineProperty(projection, "contentDigest", {
+            value: () => lkgContentDigest(message),
+            enumerable: false,
+        });
+        return projection;
     });
 }
 
@@ -106,8 +114,10 @@ export interface LkgCaptureInput {
 export type LkgValidationFailure =
     | "lkg_model_mismatch"
     | "lkg_invalidated_reshape"
+    | "lkg_content_mismatch"
     | "lkg_unsafe_seam"
-    | "lkg_seam_invalid";
+    | "lkg_seam_invalid"
+    | "lkg_anthropic_reasoning_run_invalid";
 
 function recordValue(info: unknown, key: string): unknown {
     return info && typeof info === "object" ? (info as Record<string, unknown>)[key] : undefined;
@@ -231,6 +241,11 @@ function outputMessageIsPostAnchor(
     return linkedIndex === undefined ? null : linkedIndex > anchorIndex;
 }
 
+/**
+ * Build the replay prefix and serialize it once. The returned `jsonPrefix` is
+ * the exact artifact stored in the last-known-good replay entry; callers must
+ * use it as-is rather than serialize the prefix again.
+ */
 export function buildLkgPrefix(
     input: LkgEntryProjection[] | MessageLike[],
     output: MessageLike[],
@@ -238,7 +253,8 @@ export function buildLkgPrefix(
     anchorIndex: number;
     anchorMessageId: string;
     inputIdSeq: string[];
-    prefix: MessageLike[];
+    inputContentDigests: string[];
+    jsonPrefix: string;
 } | null {
     const projected = asEntryProjection(input);
     const anchorIndex = findLkgAnchor(projected);
@@ -248,6 +264,10 @@ export function buildLkgPrefix(
     const validIds = ids as string[];
     if (new Set(validIds).size !== validIds.length) return null;
     const anchorMessageId = validIds[anchorIndex];
+    const inputContentDigests = projected
+        .slice(0, anchorIndex + 1)
+        .map((message) => message.contentDigest?.() ?? null);
+    if (inputContentDigests.some((digest) => digest === null)) return null;
     const inputIndexById = new Map(validIds.map((id, index) => [id, index]));
     const prefix: MessageLike[] = [];
     for (const message of output) {
@@ -255,12 +275,10 @@ export function buildLkgPrefix(
         if (postAnchor === null) return null;
         if (!postAnchor) prefix.push(message);
     }
-    let json: string;
+    let jsonPrefix: string;
     try {
-        json = JSON.stringify(prefix);
-        if (typeof json !== "string") return null;
-        const parsed = JSON.parse(json);
-        if (!Array.isArray(parsed) || JSON.stringify(parsed) !== json) return null;
+        jsonPrefix = JSON.stringify(prefix);
+        if (typeof jsonPrefix !== "string") return null;
     } catch {
         return null;
     }
@@ -268,23 +286,18 @@ export function buildLkgPrefix(
         anchorIndex,
         anchorMessageId,
         inputIdSeq: validIds.slice(0, anchorIndex + 1),
-        prefix,
+        inputContentDigests: inputContentDigests as string[],
+        jsonPrefix,
     };
 }
 
 export function captureLkgSlot(args: LkgCaptureInput): boolean {
     const built = buildLkgPrefix(args.input, args.output);
     if (!built) return false;
-    let jsonPrefix: string;
-    try {
-        jsonPrefix = JSON.stringify(built.prefix);
-        if (typeof jsonPrefix !== "string") return false;
-    } catch {
-        return false;
-    }
     return captureSlot(args.sessionId, {
-        jsonPrefix,
+        jsonPrefix: built.jsonPrefix,
         inputIdSeq: built.inputIdSeq,
+        inputContentDigests: built.inputContentDigests,
         lastInputMessageId: built.anchorMessageId,
         modelKey: args.modelKey,
         providerKey: args.providerKey,
@@ -305,6 +318,13 @@ function entryIdsAreValid(slot: LkgSlot, entryIds: string[]): boolean {
         if (entryIds[index] !== slot.inputIdSeq[index]) return false;
     }
     return true;
+}
+
+function entryContentIsValid(slot: LkgSlot, entryDigests: string[]): boolean {
+    return (
+        entryDigests.length >= slot.inputContentDigests.length &&
+        slot.inputContentDigests.every((digest, index) => entryDigests[index] === digest)
+    );
 }
 
 function partCallIds(message: MessageLike): string[] {
@@ -335,6 +355,42 @@ function partIsReasoning(part: unknown): boolean {
     return Boolean(
         part && typeof part === "object" && (part as Record<string, unknown>).type === "reasoning",
     );
+}
+
+function partIsAnthropicThinking(part: unknown): boolean {
+    if (!part || typeof part !== "object") return false;
+    const type = (part as Record<string, unknown>).type;
+    return type === "thinking" || type === "reasoning" || type === "redacted_thinking";
+}
+
+/**
+ * The Anthropic adapter merges adjacent assistant messages before sending them.
+ * A merged run may contain only one leading thinking block; moving or retaining a
+ * later signed block would invalidate its provider signature, so recovery declines
+ * the entire replay instead of attempting a rewrite.
+ */
+export function validateAnthropicReasoningRuns(messages: MessageLike[]): boolean {
+    let index = 0;
+    while (index < messages.length) {
+        if (messageRole(messages[index]) !== "assistant") {
+            index += 1;
+            continue;
+        }
+        let thinkingBlocks = 0;
+        let sawOtherContent = false;
+        while (index < messages.length && messageRole(messages[index]) === "assistant") {
+            for (const part of messageParts(messages[index])) {
+                if (partIsAnthropicThinking(part)) {
+                    thinkingBlocks += 1;
+                    if (thinkingBlocks > 1 || sawOtherContent) return false;
+                } else {
+                    sawOtherContent = true;
+                }
+            }
+            index += 1;
+        }
+    }
+    return true;
 }
 
 export function validateLkgSeamBoundary(prefix: MessageLike[], tail: MessageLike[]): boolean {
@@ -434,6 +490,10 @@ export function replayLkg(args: {
         dropSlot(args.sessionId, "lkg_invalidated_reshape");
         return { ok: false, reason: "lkg_invalidated_reshape" };
     }
+    if (!entryContentIsValid(slot, entry.entryContentDigests)) {
+        dropSlot(args.sessionId, "lkg_content_mismatch");
+        return { ok: false, reason: "lkg_content_mismatch" };
+    }
     let prefix: MessageLike[];
     try {
         const parsed = JSON.parse(slot.jsonPrefix) as unknown;
@@ -453,7 +513,12 @@ export function replayLkg(args: {
             return { ok: false, reason: "lkg_seam_invalid" };
         }
     }
-    return { ok: true, messages: [...prefix, ...entry.pristineTail] };
+    const replayed = [...prefix, ...entry.pristineTail];
+    if (args.providerKey === "anthropic" && !validateAnthropicReasoningRuns(replayed)) {
+        dropSlot(args.sessionId, "lkg_anthropic_reasoning_run_invalid");
+        return { ok: false, reason: "lkg_anthropic_reasoning_run_invalid" };
+    }
+    return { ok: true, messages: replayed };
 }
 
 export function validateLkgEntry(slot: LkgSlot, entryIds: string[]): boolean {

@@ -1,8 +1,17 @@
 import * as crypto from "node:crypto";
 import {
     resolveProjectIdentity,
+    resolveProjectIdentityForSession,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
+import {
+    checksumAuthoritySeedRows,
+    drainAuthority,
+    ensureContextStoreUuid,
+    getAuthorityManagedMarker,
+    type AuthorityModuleClient,
+} from "../../features/magic-context/context-authority";
+import { bumpProjectMemoryEpoch } from "../../features/magic-context/storage-project-state";
 import { scheduleReconciliation } from "../../features/magic-context/message-index-async";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import { parseCacheTtl } from "../../features/magic-context/scheduler";
@@ -46,7 +55,7 @@ import type { ContextUsage, SchedulerDecision } from "../../features/magic-conte
 import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
-import { sessionLog } from "../../shared/logger";
+import { log, sessionLog } from "../../shared/logger";
 import { getSdkContextLimit } from "../../shared/models-dev-cache";
 import { applyMidTurnDeferral, detectMidTurnBypassReason } from "./boundary-execution";
 import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
@@ -94,11 +103,6 @@ import { extractInMemoryMessageViews } from "./read-session-raw";
 import { createRustModeTransform, type RustModeModuleClient } from "./rust-mode-transform";
 import { sendIgnoredMessage } from "./send-session-notification";
 import { modelAcceptsEmptyContent } from "./sentinel";
-import {
-    resolveDeclaredTrimForShadow,
-    type ShadowSender,
-    type ShadowTransformDecision,
-} from "./shadow-sender";
 import {
     replayClearedReasoning,
     replayStrippedInlineThinking,
@@ -185,20 +189,6 @@ export function clearMessageTokensCache(sessionId: string, messageId?: string): 
 // appears (or changes) for a session in this process — not on every transform
 // pass. Bounded so crashed/abandoned sessions can't leak the guard forever.
 const recordedSessionProjectIdentity = new BoundedSessionMap<string>(MESSAGE_TOKENS_CACHE_MAX);
-
-function cloneForShadow<T>(value: T): T {
-    return JSON.parse(JSON.stringify(value)) as T;
-}
-
-function classifyShadowDecision(args: {
-    schedulerDecision: SchedulerDecision;
-    materialized: boolean;
-    bustedThisPass: boolean;
-}): ShadowTransformDecision["class"] {
-    if (args.materialized) return "hard";
-    if (args.schedulerDecision === "execute" || args.bustedThisPass) return "soft";
-    return "defer";
-}
 
 // Tagger / trigger load-scoping floor (OpenCode only). Several hot-path reads
 // preload an in-memory map or aggregate over a session's tags; on a large/old
@@ -303,6 +293,156 @@ function findNewestUserModel(
     return null;
 }
 
+type TsAuthorityRecoveryOutcome = "completed" | "retryable";
+
+const tsAuthorityRecoveryStateByProject = new Map<string, "running" | "complete">();
+const tsAuthorityMismatchLoggedProjects = new Set<string>();
+const tsAuthorityUnreachableLoggedProjects = new Set<string>();
+
+function authorityModuleForProject(
+    module: RustModeModuleClient,
+    projectRoot: string,
+): AuthorityModuleClient {
+    if (!module.authorityStatus || !module.authorityDrain || !module.mirrorPull) {
+        throw new Error(
+            "the module does not expose authority.status, authority.drain, and mirror.pull",
+        );
+    }
+    return {
+        authorityStatus: (request) => module.authorityStatus!({ ...request, projectRoot }),
+        authorityPrepare: (request) => {
+            if (!module.authorityPrepare) {
+                throw new Error("the module does not expose authority.prepare");
+            }
+            return module.authorityPrepare({ ...request, projectRoot });
+        },
+        authorityDrain: (request) => module.authorityDrain!({ ...request, projectRoot }),
+        mirrorPull: (request) => module.mirrorPull!({ ...request, projectRoot }),
+    };
+}
+
+/**
+ * Restore a project to TypeScript ownership after its transform_mode setting no
+ * longer selects Rust. The durable marker keeps writes fenced until the module
+ * confirms every module-owned domain has drained back through its normal protocol.
+ */
+export async function recoverTsAuthorityProject(args: {
+    db: ContextDatabase;
+    projectPath: string;
+    projectRoot: string;
+    module: RustModeModuleClient;
+}): Promise<TsAuthorityRecoveryOutcome> {
+    const module = authorityModuleForProject(args.module, args.projectRoot);
+    const domains = ["memories", "notes"] as const;
+    const statuses = await Promise.all(
+        domains.map(async (domain) => ({
+            domain,
+            authority: (
+                await module.authorityStatus({
+                    context_store_uuid: ensureContextStoreUuid(args.db),
+                    project: args.projectPath,
+                    domain,
+                })
+            ).authority,
+        })),
+    );
+
+    let drainedDomain = false;
+    for (const { domain, authority } of statuses) {
+        if (!authority || authority.state === "TS") continue;
+        // The module's begin route owns MODULE → DRAINING. Calling drainAuthority
+        // preserves the lease, mirror replay, checksum, and recovery choreography.
+        if (authority.state !== "MODULE" && authority.state !== "DRAINING") {
+            return "retryable";
+        }
+        let drained: Awaited<ReturnType<typeof drainAuthority>> | undefined;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            drained = await drainAuthority({
+                db: args.db,
+                projectPath: args.projectPath,
+                domain,
+                module,
+                checksum: () => {
+                    const table = domain === "memories" ? "memories" : "notes";
+                    const rows = args.db
+                        .prepare(
+                            `SELECT * FROM ${table} WHERE project_path = ? ORDER BY id ASC`,
+                        )
+                        .all(args.projectPath)
+                        .filter(
+                            (row): row is Record<string, unknown> =>
+                                row !== null && typeof row === "object",
+                        );
+                    return checksumAuthoritySeedRows(rows);
+                },
+            });
+            if (!("code" in drained)) break;
+        }
+        if (!drained || "code" in drained) return "retryable";
+        drainedDomain = true;
+    }
+
+    // drainAuthority removes the shared marker only after every domain is TS.
+    // After a completed replay, bump the project memory epoch once so the memory
+    // view re-renders any changes mirrored during recovery.
+    if (drainedDomain && !getAuthorityManagedMarker(args.db, args.projectPath)) {
+        bumpProjectMemoryEpoch(args.db, args.projectPath);
+        return "completed";
+    }
+    return "retryable";
+}
+
+function scheduleTsAuthorityRecovery(args: {
+    db: ContextDatabase;
+    projectPath: string;
+    projectRoot: string;
+    module?: RustModeModuleClient;
+}): void {
+    if (!getAuthorityManagedMarker(args.db, args.projectPath)) return;
+    if (tsAuthorityRecoveryStateByProject.has(args.projectPath)) return;
+
+    if (!tsAuthorityMismatchLoggedProjects.has(args.projectPath)) {
+        tsAuthorityMismatchLoggedProjects.add(args.projectPath);
+        log(
+            `[magic-context] project ${args.projectPath} is module-authority-managed but transform_mode is TS; draining authority back to TypeScript`,
+        );
+    }
+    if (!args.module) {
+        tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
+        if (!tsAuthorityUnreachableLoggedProjects.has(args.projectPath)) {
+            tsAuthorityUnreachableLoggedProjects.add(args.projectPath);
+            log(
+                `[magic-context] authority recovery for ${args.projectPath} cannot reach subc; writes remain fenced. Run magic-context doctor drain-authority ${args.projectRoot} with rust mode or restore subc connectivity.`,
+            );
+        }
+        return;
+    }
+
+    tsAuthorityRecoveryStateByProject.set(args.projectPath, "running");
+    void Promise.resolve()
+        .then(() => recoverTsAuthorityProject({ ...args, module: args.module! }))
+        .then((outcome) => {
+            if (outcome === "completed") {
+                tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
+                log(`[magic-context] authority drain complete for project ${args.projectPath}`);
+            } else {
+                // A bounded contention result is durable and resumable. Do not cache it
+                // so the next project setup can resume the module's DRAINING state.
+                tsAuthorityRecoveryStateByProject.delete(args.projectPath);
+            }
+        })
+        .catch((error) => {
+            tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
+            if (!tsAuthorityUnreachableLoggedProjects.has(args.projectPath)) {
+                tsAuthorityUnreachableLoggedProjects.add(args.projectPath);
+                log(
+                    `[magic-context] authority recovery for ${args.projectPath} cannot reach subc; writes remain fenced. Run magic-context doctor drain-authority ${args.projectRoot} with rust mode or restore subc connectivity.`,
+                    error,
+                );
+            }
+        });
+}
+
 export interface TransformDeps {
     tagger: Tagger;
     scheduler: Scheduler;
@@ -317,6 +457,8 @@ export interface TransformDeps {
      * and read in tool.execute.after.
      */
     channel1StateBySession?: Map<string, import("./ctx-reduce-nudge").Channel1State>;
+    /** Module-authored Channel 2 text held until the terminal `message.updated` event, when the host delivers the pending nudge. */
+    channel2DirectiveTextBySession?: Map<string, string>;
     protectedTags: number;
     /**
      * ctx_reduce visibility is resolved per session from the session's tool
@@ -387,6 +529,10 @@ export interface TransformDeps {
      *  add compact date ranges to compartment headings in <session-history>.
      *  Controlled by `experimental.temporal_awareness` config. */
     experimentalTemporalAwareness?: boolean;
+    /** experimental.mural.enabled — when true (and the fold's model accepts
+     *  images), materializeM0 renders the deterministic mural on demand and folds
+     *  its image into the m[0] baseline. */
+    experimentalMuralEnabled?: boolean;
     /** When true, run a second editor pass after historian to clean U: lines.
      *  Enables the historian-editor agent. Controlled by `historian.two_pass` config. */
     historianTwoPass?: boolean;
@@ -431,14 +577,20 @@ export interface TransformDeps {
     };
     /** Fire-and-forget active-session embed backfill after transform returns. */
     maybeAutoEmbedSession?: (sessionId: string) => void;
-    /** Dev-only sender that mirrors transform events for comparison; undefined disables that debug path. */
-    shadowSender?: ShadowSender;
     /** Resolved project mode. Rust mode bypasses every TS mutation below. */
     transformMode?: "ts" | "rust";
     /** Module transport injected by the hook; tests use a deterministic mock. */
     rustModeModuleClient?: RustModeModuleClient;
+    /** Test-only opt-out for transform-wire fixtures without the authority protocol. */
+    rustModeAllowAuthorityProtocolBypassForTests?: boolean;
     rustModeProjectRoot?: string;
+    /**
+     * Module route used only to recover a project whose config changed from Rust
+     * transforms back to TypeScript while the durable authority marker remains.
+     */
+    tsAuthorityRecoveryModuleClient?: RustModeModuleClient;
     onRustModeParked?: (sessionId: string, message: string) => void;
+    onRustModeProjectPrepared?: (projectPath: string) => void;
     rustMemorySyncRequestedSessions?: Set<string>;
 }
 
@@ -449,16 +601,19 @@ export function createTransform(deps: TransformDeps) {
             ? createRustModeTransform(deps, {
                   moduleClient: deps.rustModeModuleClient,
                   hostClient: deps.client,
-                  projectRoot: deps.rustModeProjectRoot ?? deps.directory,
+                  projectRoot: deps.rustModeProjectRoot,
                   notifyParked: deps.onRustModeParked,
+                  onProjectPrepared: deps.onRustModeProjectPrepared,
                   memorySyncRequestedSessions: deps.rustMemorySyncRequestedSessions,
+                  allowAuthorityProtocolBypassForTests:
+                      deps.rustModeAllowAuthorityProtocolBypassForTests,
               })
             : undefined;
     const deferredHistoryRefreshSessions = deps.deferredHistoryRefreshSessions ?? new Set<string>();
     const deferredMaterializationSessions =
         deps.deferredMaterializationSessions ?? new Set<string>();
 
-    return async (
+    const transform = async (
         _input: Record<string, never>,
         output: { messages: unknown[] },
     ): Promise<void> => {
@@ -475,25 +630,6 @@ export function createTransform(deps: TransformDeps) {
         logTransformTiming(sessionId, "findSessionId", startTime, `messages=${messages.length}`);
 
         const db = deps.db;
-        const shadowSender = deps.shadowSender;
-        let shadowCapture:
-            | {
-                  nowMs: number;
-                  inputMessages: MessageLike[];
-                  declaredTrimBefore: ReturnType<typeof resolveDeclaredTrimForShadow>;
-              }
-            | undefined;
-        if (shadowSender) {
-            try {
-                shadowCapture = {
-                    nowMs: Date.now(),
-                    inputMessages: cloneForShadow(messages),
-                    declaredTrimBefore: resolveDeclaredTrimForShadow({ db, sessionId }),
-                };
-            } catch (error) {
-                sessionLog(sessionId, "shadow: capture failed (ignored):", error);
-            }
-        }
         if (deps.client !== undefined) {
             scheduleReconciliation(db, sessionId, readRawSessionMessages);
         }
@@ -1239,8 +1375,26 @@ export function createTransform(deps: TransformDeps) {
         const sessionProjectIdentity =
             projectIdentity ??
             (sessionDirectory ? resolveProjectIdentity(sessionDirectory) : deps.projectPath);
+        const sessionIdentityForBinding = sessionDirectory
+            ? resolveProjectIdentityForSession(sessionDirectory)
+            : undefined;
         if (sessionDirectory) {
             maybeSendProjectIdentityWarning(deps, sessionId, sessionDirectory, notificationParams);
+        }
+        // Keep the marker lookup in the same identity vocabulary that Rust authority
+        // setup used: memory-enabled projects use their MC identity, never a raw path.
+        // Scheduling only starts background recovery; this transform continues normally.
+        const authorityProjectPath =
+            (deps.memoryConfig?.enabled ? projectIdentity : undefined) ??
+            deps.projectPath ??
+            sessionProjectIdentity;
+        if (authorityProjectPath) {
+            scheduleTsAuthorityRecovery({
+                db,
+                projectPath: authorityProjectPath,
+                projectRoot: sessionDirectory || memoryProjectDirectory,
+                module: deps.tsAuthorityRecoveryModuleClient,
+            });
         }
         // Persist only host-resolved session bindings. The launch-directory
         // fallback keeps transforms non-fatal, but storing it as ownership would
@@ -1248,12 +1402,12 @@ export function createTransform(deps: TransformDeps) {
         // Guarded to fire once per (session, identity) in this process so the
         // hot path carries no per-pass DB write once the binding is recorded.
         if (
-            sessionProjectIdentity &&
+            sessionIdentityForBinding &&
             sessionDirectoryResolvedFromHost &&
-            recordedSessionProjectIdentity.get(sessionId) !== sessionProjectIdentity
+            recordedSessionProjectIdentity.get(sessionId) !== sessionIdentityForBinding
         ) {
-            recordSessionProjectIdentity(db, sessionId, sessionProjectIdentity);
-            recordedSessionProjectIdentity.set(sessionId, sessionProjectIdentity);
+            recordSessionProjectIdentity(db, sessionId, sessionIdentityForBinding);
+            recordedSessionProjectIdentity.set(sessionId, sessionIdentityForBinding);
         }
 
         // Historian trigger decision — relocated here from the message.updated
@@ -1826,6 +1980,7 @@ export function createTransform(deps: TransformDeps) {
                 historyBudgetTokens,
                 temporalAwareness: deps.experimentalTemporalAwareness,
                 hardSignals: m0HardSignals,
+                muralEnabled: deps.experimentalMuralEnabled,
             },
         });
         passOutcome.markFinalized();
@@ -1848,12 +2003,37 @@ export function createTransform(deps: TransformDeps) {
                 `transform: final-wire telemetry estimate=${finalWireEstimate.tokens} trusted=${finalWireEstimate.trusted} conversation=${finalWireEstimate.messageTokens.conversation} tools=${finalWireEstimate.messageTokens.toolCall} system=${finalWireEstimate.systemTokens} toolDefinitions=${finalWireEstimate.toolDefinitionTokens ?? "unknown"}`,
             );
         }
+        const currentModelKeyForRecovery = deps.getModelKey?.(sessionId);
+        const overflowStateForFinalWire = getOverflowState(
+            db,
+            sessionId,
+            currentModelKeyForRecovery,
+        );
+        // A catalog or user-configured limit is useful for budgeting, but it cannot
+        // prove that this provider accepts the recovered wire shape. Only the limit
+        // parsed from this model's own overflow response may disarm recovery.
+        const providerProvenLimitTokens =
+            typeof currentModelKeyForRecovery === "string" &&
+            currentModelKeyForRecovery.length > 0 &&
+            overflowStateForFinalWire.detectedContextLimit > 0 &&
+            overflowStateForFinalWire.detectedContextLimitModelKey === currentModelKeyForRecovery
+                ? overflowStateForFinalWire.detectedContextLimit
+                : undefined;
         const emergencyFailClosed = evaluateEmergencyFailClosed({
             usagePercentage: contextUsage.percentage,
             emergencyRecoveryArmed,
             emergencyRecoveryOrigin,
             foldMaterializedThisPass: postTransformResult.historianFoldMaterializedThisPass,
+            finalWireEstimate,
+            providerProvenLimitTokens,
         });
+        if (emergencyFailClosed.disarm) {
+            clearEmergencyRecovery(db, sessionId);
+            sessionLog(
+                sessionId,
+                `emergency disarm: trusted final-wire ${emergencyFailClosed.disarm.finalWireTokens} under limit ${emergencyFailClosed.disarm.provenLimitTokens}`,
+            );
+        }
         if (emergencyFailClosed.shouldAbort) {
             if (!deps.client) {
                 throw new EmergencyFailClosedError(
@@ -1913,13 +2093,16 @@ export function createTransform(deps: TransformDeps) {
                 ? `${modelForBudget.providerID}/${modelForBudget.modelID}`
                 : keys.modelKey;
             const providerKey = modelForBudget?.providerID ?? keys.providerKey;
-            captureLkgSlot({
+            const captured = captureLkgSlot({
                 sessionId,
                 input: lkgInput,
                 output: messages,
                 modelKey,
                 providerKey,
             });
+            if (postTransformResult.bustedThisPass && !captured) {
+                dropSlot(sessionId, "lkg_refresh_declined");
+            }
         } else if (passOutcome.degradations.length > 0) {
             sessionLog(
                 sessionId,
@@ -2177,50 +2360,18 @@ export function createTransform(deps: TransformDeps) {
             `transform completed in ${elapsed}ms (${messages.length} messages, ${targets.size} targets, watermark: ${watermark})`,
         );
 
-        if (shadowSender && shadowCapture) {
-            try {
-                const shadowDecision: ShadowTransformDecision = {
-                    class: classifyShadowDecision({
-                        schedulerDecision,
-                        materialized: postTransformResult.materialized,
-                        bustedThisPass: postTransformResult.bustedThisPass,
-                    }),
-                    marker_state: { advanced_this_pass: false },
-                    materialize_reason: postTransformResult.materializeReason,
-                    emergency: postTransformResult.emergency,
-                };
-                shadowSender.enqueue({
-                    sessionId,
-                    isSubagent: sessionMeta.isSubagent,
-                    db,
-                    inputMessages: shadowCapture.inputMessages,
-                    outputMessages: messages,
-                    normalizationTargets: tagNormalizationTargets,
-                    projectRoot: sessionDirectory ?? deps.directory ?? process.cwd(),
-                    projectPath: sessionProjectIdentity,
-                    passInputs: {
-                        now_ms: shadowCapture.nowMs,
-                        model_key: deps.getModelKey?.(sessionId) ?? hardModelKey ?? null,
-                        usage: {
-                            input_tokens: contextUsage.inputTokens,
-                            limit: resolvedContextLimit ?? boundaryContextLimit,
-                        },
-                        effective_execute_threshold: boundaryExecuteThreshold,
-                        history_budget_tokens: historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
-                        cache_ttl: sessionMeta.cacheTtl,
-                        mid_turn: midTurn,
-                        is_subagent: sessionMeta.isSubagent,
-                    },
-                    tsDecision: shadowDecision,
-                    declaredTrimBefore: shadowCapture.declaredTrimBefore,
-                });
-            } catch (error) {
-                sessionLog(sessionId, "shadow: capture failed (ignored):", error);
-            }
-        }
 
         deps.maybeAutoEmbedSession?.(sessionId);
     };
+
+    return Object.assign(transform, {
+        invalidateRustWireState(sessionId: string): void {
+            rustModeTransform?.invalidateWireState(sessionId);
+        },
+        clearRustSession(sessionId: string): void {
+            rustModeTransform?.clearSession(sessionId);
+        },
+    });
 }
 
 export function resolveHistoryBudgetTokens(

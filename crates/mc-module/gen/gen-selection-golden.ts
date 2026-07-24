@@ -54,8 +54,12 @@ interface TagFixture {
     n: number;
     /** ToolResult (output) bytes. */
     byteSize: number;
+    /** Persisted ToolResult token estimate; undefined models an unsized legacy row. */
+    tokenCount?: number;
     /** ToolCall (input) bytes. */
     inputByteSize?: number;
+    /** Persisted ToolCall input-token estimate. */
+    inputTokenCount?: number;
     /** Reasoning bytes (0 = no reasoning block). */
     reasoningByteSize?: number;
     /** ToolCall.input JSON (filePath / action / diff keys / edit content). */
@@ -95,6 +99,7 @@ interface SelItemJson {
     kind: Record<string, unknown>;
     provider_executed: boolean;
     byte_size: number;
+    token_count: number | null;
     arc_id: string | null;
 }
 
@@ -178,15 +183,21 @@ function buildItems(tags: TagFixture[]): SelItemJson[] {
             kind: { ToolCall: { name: t.toolName, input: t.input ?? {} } },
             provider_executed: providerExecuted,
             byte_size: t.inputByteSize ?? 0,
+            token_count: null,
             arc_id: callBlockId(t.id),
         });
         // ToolResult block
+        const reclaimableTokens =
+            t.tokenCount === undefined && t.inputTokenCount === undefined
+                ? null
+                : (t.tokenCount ?? 0) + (t.inputTokenCount ?? 0);
         items.push({
             id: resultBlockId(t.id),
             ordinal: t.n,
             kind: { ToolResult: { tool_name: t.toolName } },
             provider_executed: providerExecuted,
             byte_size: t.byteSize,
+            token_count: reclaimableTokens,
             arc_id: callBlockId(t.id),
         });
         // optional Reasoning block adjacent to the call
@@ -197,6 +208,7 @@ function buildItems(tags: TagFixture[]): SelItemJson[] {
                 kind: "Reasoning",
                 provider_executed: false,
                 byte_size: t.reasoningByteSize ?? 0,
+                token_count: null,
                 arc_id: callBlockId(t.id),
             });
         }
@@ -259,6 +271,15 @@ function runTsSelector(spec: CaseSpec): Record<string, string> {
                 t.reasoningByteSize ?? 0,
                 t.toolName,
                 t.inputByteSize ?? 0,
+                null,
+                null,
+                t.tokenCount === undefined && t.inputTokenCount === undefined
+                    ? null
+                    : {
+                          tokenCount: t.tokenCount ?? 0,
+                          inputTokenCount: t.inputTokenCount ?? 0,
+                          reasoningTokenCount: 0,
+                      },
             );
             targets.set(t.n, makeTarget(t.input));
             tagNumberToArc.set(t.n, t.id);
@@ -304,6 +325,7 @@ function buildCtx(spec: CaseSpec): Record<string, unknown> {
         // protected tail cutoff = maxTag − protectedTags (ordinal space == tag space).
         protected_cutoff_ordinal: em ? Math.max(maxN - em.protectedTags, 0) : 0,
         last_execute_ordinal: spec.lastExecuteOrdinal ?? 0,
+        scheduler_pressure_execute: spec.passClass === "Execute",
         prior_input_sample: em?.priorInputSample ?? 0,
         has_prior_drop: em?.hasPriorDrop ?? false,
         agent_drop_ids: [],
@@ -391,6 +413,28 @@ const cases: CaseSpec[] = [
             { id: "c3", toolName: "grep", n: 3, byteSize: 200 },
             { id: "c4", toolName: "bash", n: 4, byteSize: 200 },
             { id: "c5", toolName: "edit", n: 5, byteSize: 200 },
+        ],
+    },
+    {
+        label: "two_pass: skip sub-floor arcs",
+        selector: "two_pass",
+        smartDrops: false,
+        passClass: "Execute",
+        lastExecuteOrdinal: 2,
+        tags: [
+            { id: "c1", toolName: "bash", n: 1, byteSize: 2000, tokenCount: 249 },
+            { id: "c2", toolName: "read", n: 2, byteSize: 2000, tokenCount: 250 },
+        ],
+    },
+    {
+        label: "two_pass: keep newest todowrite",
+        selector: "two_pass",
+        smartDrops: false,
+        passClass: "Execute",
+        lastExecuteOrdinal: 2,
+        tags: [
+            { id: "c1", toolName: "todowrite", n: 1, byteSize: 2000, tokenCount: 300 },
+            { id: "c2", toolName: "todowrite", n: 2, byteSize: 2000, tokenCount: 300 },
         ],
     },
     {

@@ -1,4 +1,5 @@
 import { describe, expect, it, spyOn } from "bun:test";
+import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { UnifiedSearchResult } from "@magic-context/core/features/magic-context/search";
 import * as searchModule from "@magic-context/core/features/magic-context/search";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
@@ -136,6 +137,51 @@ describe("createCtxSearchTool", () => {
 			expect(text).not.toContain(
 				"Use ctx_expand(start=N-10, end=N) around any note @msg anchor above",
 			);
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("resolves a `#1234` query directly without calling unifiedSearch (Pi parity)", async () => {
+		const db = createTestDb();
+		// Dynamically import `insertMemory` to seed a memory for this test,
+		// then verify that an ID-shaped query uses `resolveMemoriesByIdsForSearch`
+		// instead of `unifiedSearch`.
+		const { insertMemory } = await import(
+			"@magic-context/core/features/magic-context/memory"
+		);
+		const projectIdentity = resolveProjectIdentity(process.cwd());
+		const memory = insertMemory(db, {
+			projectPath: projectIdentity,
+			category: "USER_DIRECTIVES",
+			content: "Direct id hit for the short-circuit.",
+		});
+		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+			async () => {
+				throw new Error("unifiedSearch must not run for ID-shaped queries");
+			},
+		);
+		try {
+			const tool = createCtxSearchTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				gitCommitsEnabled: false,
+			});
+
+			const result = await tool.execute(
+				"call-id",
+				{ query: `#${memory.id}` },
+				new AbortController().signal,
+				undefined,
+				fakeContext("ses-search", process.cwd()) as never,
+			);
+
+			const text = result.content[0]?.text ?? "";
+			expect(text).toContain("[1] [memory]");
+			expect(text).toContain(`id=${memory.id}`);
+			expect(text).toContain("Direct id hit for the short-circuit.");
 		} finally {
 			spy.mockRestore();
 			closeQuietly(db);

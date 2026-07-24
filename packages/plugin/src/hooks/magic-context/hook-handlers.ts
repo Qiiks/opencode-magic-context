@@ -334,6 +334,8 @@ export function createEventHook(args: {
         }
 
         if (input.event.type === "session.deleted") {
+            // createEventHandler has already persisted pending_session_cleanup before
+            // this process-local indexing latch is discarded.
             args.liveModelBySession.delete(sessionId);
             args.variantBySession.delete(sessionId);
             args.agentBySession.delete(sessionId);

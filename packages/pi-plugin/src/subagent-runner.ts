@@ -1,14 +1,23 @@
 import * as childProcess from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve as resolvePath } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import {
+	basename,
+	dirname,
+	isAbsolute,
+	join,
+	resolve as resolvePath,
+} from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { openDatabase } from "@magic-context/core/features/magic-context/storage";
 import type { SubagentKind } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
 import { recordChildInvocation } from "@magic-context/core/features/magic-context/subagent-token-capture";
-import { resolveModelRefForPi } from "@magic-context/core/shared/harness-provider-map";
+import {
+	piModelRefToCanonical,
+	resolveModelRefForPi,
+} from "@magic-context/core/shared/harness-provider-map";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type {
 	SubagentProgressEvent,
@@ -166,6 +175,30 @@ const TERMINAL_DRAIN_GRACE_MS = 2_000;
 
 export const MAGIC_CONTEXT_PI_SUBAGENT_ENV = "MAGIC_CONTEXT_PI_SUBAGENT";
 
+// Pi resolves local entries in its user settings package list from the
+// settings directory, not from the spawned child's project cwd. Keep the same
+// base for explicit --extension entries; the installed Pi package is not
+// available in every development worktree to import its resolver directly.
+// Pi's current resolver treats bare names as local paths too; npm packages
+// should use the explicit `npm:` source form.
+const PI_AGENT_SETTINGS_DIR = join(homedir(), ".pi", "agent");
+let configuredSubagentExtensions: readonly string[] | undefined;
+
+/** Configure the user-tier extension allowlist used by new Pi child runners. */
+export function configurePiSubagentExtensions(
+	extensions: readonly string[] | undefined,
+): void {
+	configuredSubagentExtensions = extensions?.slice();
+}
+
+function resolveSubagentExtensionEntry(entry: string): string {
+	const trimmed = entry.trim();
+	const isNpmSource = trimmed.startsWith("npm:");
+	return !isNpmSource && !isAbsolute(trimmed)
+		? resolvePath(PI_AGENT_SETTINGS_DIR, trimmed)
+		: trimmed;
+}
+
 const PI_READ_ONLY_BUILTINS = ["read", "grep", "find", "ls"] as const;
 const PI_AFT_READ_TOOLS = ["aft_outline", "aft_zoom", "aft_search"] as const;
 const PI_HISTORIAN_TOOLS = [...PI_READ_ONLY_BUILTINS, "aft_search"] as const;
@@ -315,6 +348,17 @@ type PiRunMode = {
 };
 
 const ALREADY_PROCESSING_PREFIX = "Agent is already processing";
+// Logged when the one-shot isolated retry (--no-extensions for discovered user
+// extensions) fires because a loaded extension started its own agent turn
+// before the child's prompt could run (issue #222). The text is asserted
+// verbatim by the subagent-runner tests; keep it stable.
+const ISOLATED_RETRY_COLLISION_LOG_MESSAGE =
+	"pi subagent: a loaded Pi extension started an agent turn before the child's prompt could run; retrying with an isolated extension set (user extensions disabled for this run)";
+// Logged when the same isolated retry fires for the issue #238 signature: the
+// child exited 0 but produced no protocol output at all (no agent_end / zero
+// stdout), which certain user extension sets cause in Pi --print mode.
+const ISOLATED_RETRY_SILENT_LOG_MESSAGE =
+	"pi subagent: child exited successfully but emitted no protocol output (no agent_end, zero stdout); a loaded Pi extension likely broke print mode; retrying with an isolated extension set (user extensions disabled for this run)";
 const ISOLATED_RETRY_MODEL_UNAVAILABLE_MESSAGE =
 	"model unavailable in isolated retry: it is provided by a disabled extension; configure it through models.json or add a built-in/provider-configured fallback";
 const MODEL_RESOLUTION_ERROR_PATTERNS = [
@@ -326,6 +370,22 @@ const MODEL_RESOLUTION_ERROR_PATTERNS = [
 	/no models? (matched|available|configured)/i,
 	/model.+not configured/i,
 ] as const;
+
+/** Canonical provider prefix -> the Pi provider form that last succeeded. */
+const PI_PROVIDER_FORM_CACHE = new Map<string, string>();
+
+type ProviderModelAttempt = {
+	canonicalRef: string;
+	canonicalProvider: string;
+	modelRef: string;
+	attemptedProvider: string;
+	translated: boolean;
+};
+
+type ExtensionRetryResult = {
+	result: SubagentRunResult;
+	extensionRetryUsed: boolean;
+};
 
 /**
  * Pi-side implementation of `SubagentRunner`.
@@ -396,12 +456,16 @@ export class PiSubagentRunner implements SubagentRunner {
 	private readonly spawnImpl: typeof childProcess.spawn;
 	private readonly platform: NodeJS.Platform;
 	private readonly extraArgs: readonly string[];
+	/** `undefined` means preserve Pi's normal extension discovery behavior. */
+	private readonly subagentExtensions: readonly string[] | undefined;
 
 	constructor(
 		options: {
 			piBinary?: string;
 			platform?: NodeJS.Platform;
 			extraArgs?: readonly string[];
+			/** User-tier explicit extension allowlist; an empty list disables all discovered extensions. */
+			subagentExtensions?: readonly string[];
 			/** Test seam for subprocess lifecycle tests. Production uses child_process.spawn. */
 			spawnImpl?: typeof childProcess.spawn;
 		} = {},
@@ -412,36 +476,98 @@ export class PiSubagentRunner implements SubagentRunner {
 		this.spawnImpl = options.spawnImpl ?? childProcess.spawn;
 		this.platform = options.platform ?? process.platform;
 		this.extraArgs = options.extraArgs ?? [];
+		this.subagentExtensions =
+			options.subagentExtensions ?? configuredSubagentExtensions;
 	}
 
 	async run(options: SubagentRunOptions): Promise<SubagentRunResult> {
+		const providerAttempt = resolveProviderModelAttempt(options.model);
+		const firstOptions = providerAttempt
+			? { ...options, model: providerAttempt.canonicalRef }
+			: options;
+		const firstRun = await this.runWithExtensionRetry(
+			firstOptions,
+			providerAttempt?.modelRef,
+		);
+		if (!providerAttempt) return firstRun.result;
+		if (firstRun.result.ok) {
+			PI_PROVIDER_FORM_CACHE.set(
+				providerAttempt.canonicalProvider,
+				providerAttempt.attemptedProvider,
+			);
+			return firstRun.result;
+		}
+		if (!isProviderCredentialFailure(firstRun.result, providerAttempt)) {
+			return firstRun.result;
+		}
+
+		// The canonical prefix is the second Pi choice for ambiguous providers.
+		// If the extension retry already ran, keep its isolated mode for this
+		// provider retry instead of starting a second independent retry tree.
+		const fallbackOptions = {
+			...options,
+			model: providerAttempt.canonicalRef,
+		};
+		const fallbackRun: ExtensionRetryResult = firstRun.extensionRetryUsed
+			? {
+					result: await this.runModelChain(
+						fallbackOptions,
+						{ disableDiscoveredExtensions: true },
+						providerAttempt.canonicalRef,
+					),
+					extensionRetryUsed: true,
+				}
+			: await this.runWithExtensionRetry(
+					fallbackOptions,
+					providerAttempt.canonicalRef,
+				);
+		if (fallbackRun.result.ok) {
+			PI_PROVIDER_FORM_CACHE.set(
+				providerAttempt.canonicalProvider,
+				providerAttempt.canonicalProvider,
+			);
+		}
+		return fallbackRun.result;
+	}
+
+	private async runWithExtensionRetry(
+		options: SubagentRunOptions,
+		modelRefOverride?: string,
+	): Promise<ExtensionRetryResult> {
 		const primaryRunMode: PiRunMode = { disableDiscoveredExtensions: false };
-		const primaryResult = await this.runModelChain(options, primaryRunMode);
+		const primaryResult = await this.runModelChain(
+			options,
+			primaryRunMode,
+			modelRefOverride,
+		);
 		if (
 			this.spawnUsesNoExtensions(primaryRunMode) ||
-			!isPiExtensionCollisionFailure(primaryResult)
+			!isIsolatedRetryTrigger(primaryResult)
 		) {
-			return primaryResult;
+			return { result: primaryResult, extensionRetryUsed: false };
 		}
 
 		const sessionId = options.accountingSessionId ?? "pi-subagent";
-		sessionLog(
-			sessionId,
-			"pi subagent: a loaded Pi extension started an agent turn before the child's prompt could run; retrying with an isolated extension set (user extensions disabled for this run)",
+		sessionLog(sessionId, isolatedRetryLogMessage(primaryResult));
+		const isolatedResult = await this.runModelChain(
+			options,
+			{ disableDiscoveredExtensions: true },
+			modelRefOverride,
 		);
-		const isolatedResult = await this.runModelChain(options, {
-			disableDiscoveredExtensions: true,
-		});
 		if (!isolatedResult.ok && isIsolatedRetryModelUnavailable(isolatedResult)) {
 			sessionLog(sessionId, ISOLATED_RETRY_MODEL_UNAVAILABLE_MESSAGE);
-			return annotateIsolatedRetryModelUnavailable(isolatedResult);
+			return {
+				result: annotateIsolatedRetryModelUnavailable(isolatedResult),
+				extensionRetryUsed: true,
+			};
 		}
-		return isolatedResult;
+		return { result: isolatedResult, extensionRetryUsed: true };
 	}
 
 	private async runModelChain(
 		options: SubagentRunOptions,
 		runMode: PiRunMode,
+		primaryModelRef?: string,
 	): Promise<SubagentRunResult> {
 		const models = [options.model, ...(options.fallbackModels ?? [])].filter(
 			(model): model is string => typeof model === "string" && model.length > 0,
@@ -455,18 +581,30 @@ export class PiSubagentRunner implements SubagentRunner {
 				model,
 				fallbackModels: undefined,
 			};
-			const result = await this.runOnce(attemptOptions, runMode);
+			const result = await this.runOnce(
+				attemptOptions,
+				runMode,
+				index === 0 ? primaryModelRef : undefined,
+			);
 			if (result.ok) return result;
 			lastResult = result;
-			// Pi print mode discovers extensions before reading stdin. If one of those
-			// extensions starts its own turn during startup, the child run hits a prompt
-			// conflict before it can accept Magic Context's input. Stop this
-			// extension-enabled attempt and let the outer caller retry the same run with
-			// discovered extensions disabled; later top-level runs still start with
-			// extensions enabled so extension-provided models keep working normally.
+			// Pi print mode discovers extensions before reading stdin, and a loaded
+			// user extension can break the run in two ways that both look like the
+			// extension set is at fault:
+			//  1. (#222) it starts its own agent turn during startup, so the child
+			//     hits a prompt conflict before it can accept Magic Context's input
+			//     (non-zero exit + "Agent is already processing" on stderr);
+			//  2. (#238) it makes Pi --print exit 0 with NO protocol output at all
+			//     (no agent_end / zero stdout), classified as no_assistant.
+			// Either way, stop this extension-enabled attempt on the first model and
+			// let the outer caller retry the same run once with discovered extensions
+			// disabled, instead of burning every fallback model on the same doomed
+			// primary. Later top-level runs still start with extensions enabled (the
+			// degrade is per-attempt, not cached) so extension-provided models keep
+			// working normally.
 			if (
 				!this.spawnUsesNoExtensions(runMode) &&
-				isPiExtensionCollisionFailure(result)
+				isIsolatedRetryTrigger(result)
 			) {
 				return result;
 			}
@@ -476,13 +614,18 @@ export class PiSubagentRunner implements SubagentRunner {
 		}
 		return (
 			lastResult ??
-			this.runOnce({ ...options, fallbackModels: undefined }, runMode)
+			this.runOnce(
+				{ ...options, fallbackModels: undefined },
+				runMode,
+				primaryModelRef,
+			)
 		);
 	}
 
 	private spawnUsesNoExtensions(runMode: PiRunMode): boolean {
 		return (
 			runMode.disableDiscoveredExtensions ||
+			this.subagentExtensions !== undefined ||
 			hasNoExtensionsArg([...this.invocation.prefixArgs, ...this.extraArgs])
 		);
 	}
@@ -490,6 +633,7 @@ export class PiSubagentRunner implements SubagentRunner {
 	private async runOnce(
 		options: SubagentRunOptions,
 		runMode: PiRunMode,
+		modelRefOverride?: string,
 	): Promise<SubagentRunResult> {
 		const startTime = Date.now();
 		let recordedAccounting = false;
@@ -621,8 +765,10 @@ export class PiSubagentRunner implements SubagentRunner {
 		}
 		const args = buildArgs(options, {
 			disableDiscoveredExtensions: runMode.disableDiscoveredExtensions,
+			subagentExtensions: this.subagentExtensions,
 			omitPositionalMessage: deliverViaStdin,
 			systemPromptPath,
+			modelRef: modelRefOverride,
 		});
 
 		// The model spec is `provider/model` — Pi accepts that directly via
@@ -1057,16 +1203,23 @@ export class PiSubagentRunner implements SubagentRunner {
 						trimmedAssistantText === null ||
 						trimmedAssistantText.length === 0
 					) {
-						settle({
-							ok: false,
-							reason: "no_assistant",
-							error:
-								trimmedAssistantText === null
-									? "pi agent_end did not include an assistant message"
-									: "pi assistant produced empty text",
-							durationMs: Date.now() - startTime,
-							meta: { stderr: stderr.length > 0 ? stderr : undefined },
-						});
+					settle({
+						ok: false,
+						reason: "no_assistant",
+						error:
+							trimmedAssistantText === null
+								? "pi agent_end did not include an assistant message"
+								: "pi assistant produced empty text",
+						durationMs: Date.now() - startTime,
+						// Pi machinery worked (agent_end / terminal message_end seen);
+						// the model just returned empty text. Mark protocol output as
+						// present so this legitimate empty response is NOT mistaken for
+						// the #238 silent failure and does not fire the isolated retry.
+						meta: {
+							stderr: stderr.length > 0 ? stderr : undefined,
+							sawProtocolOutput: true,
+						},
+					});
 						return;
 					}
 					if (
@@ -1134,17 +1287,22 @@ export class PiSubagentRunner implements SubagentRunner {
 					return;
 				}
 
-				settle({
-					ok: false,
-					reason: "no_assistant",
-					error: `pi exited successfully without emitting agent_end. stderr: ${stderr.slice(0, 500) || "(empty)"}`,
-					durationMs: Date.now() - startTime,
-					meta: {
-						stderr: stderr.length > 0 ? stderr : undefined,
-						exitCode: code,
-						signal,
-					},
-				});
+			settle({
+				ok: false,
+				reason: "no_assistant",
+				error: `pi exited successfully without emitting agent_end. stderr: ${stderr.slice(0, 500) || "(empty)"}`,
+				durationMs: Date.now() - startTime,
+				meta: {
+					stderr: stderr.length > 0 ? stderr : undefined,
+					exitCode: code,
+					signal,
+					// #238: distinguish the silent failure (zero JSON stdout lines,
+					// no agent_end) from a partial run that emitted some events but
+					// never completed a turn. Only the zero-output case fires the
+					// isolated retry; eventCount counts parsed protocol lines.
+					sawProtocolOutput: eventCount > 0,
+				},
+			});
 			});
 		});
 	}
@@ -1167,6 +1325,49 @@ function isPiExtensionCollisionFailure(
 		result.reason === "non_zero_exit" &&
 		getResultStderr(result).includes(ALREADY_PROCESSING_PREFIX)
 	);
+}
+
+/**
+ * Issue #238 signature: the child exited 0 but produced NO protocol output
+ * (no agent_end and zero JSON stdout lines), so it was classified
+ * `no_assistant`. Certain user extension sets make Pi --print silently exit
+ * this way. `runOnce` marks this case with `meta.sawProtocolOutput === false`.
+ *
+ * Deliberately NOT triggered by a legitimate empty model response: when Pi's
+ * machinery worked (agent_end / terminal message_end observed) but the model
+ * returned empty text, `sawProtocolOutput` is true and the failure is a plain
+ * `no_assistant` that should fall through to fallback models, not an isolated
+ * retry.
+ */
+function isSilentNoAssistantFailure(
+	result: SubagentRunResult,
+): result is FailedRunResult {
+	return (
+		!result.ok &&
+		result.reason === "no_assistant" &&
+		result.meta?.sawProtocolOutput === false
+	);
+}
+
+/**
+ * Whether a failed primary attempt should fire the one-shot isolated retry
+ * (--no-extensions for discovered user extensions). Covers both the #222
+ * extension turn collision and the #238 silent exit-0 signature.
+ */
+function isIsolatedRetryTrigger(
+	result: SubagentRunResult,
+): result is FailedRunResult {
+	return (
+		isPiExtensionCollisionFailure(result) ||
+		isSilentNoAssistantFailure(result)
+	);
+}
+
+/** Pick the accurate log message for whichever trigger fired the isolated retry. */
+function isolatedRetryLogMessage(result: FailedRunResult): string {
+	return isPiExtensionCollisionFailure(result)
+		? ISOLATED_RETRY_COLLISION_LOG_MESSAGE
+		: ISOLATED_RETRY_SILENT_LOG_MESSAGE;
 }
 
 function isIsolatedRetryModelUnavailable(
@@ -1200,6 +1401,59 @@ function isFallbackEligible(reason: string): boolean {
 	);
 }
 
+function providerPrefix(ref: string): string | undefined {
+	const slash = ref.indexOf("/");
+	return slash > 0 ? ref.slice(0, slash) : undefined;
+}
+
+function replaceProviderPrefix(ref: string, provider: string): string {
+	const slash = ref.indexOf("/");
+	return slash > 0 ? `${provider}${ref.slice(slash)}` : ref;
+}
+
+function resolveProviderModelAttempt(
+	model: string | undefined,
+): ProviderModelAttempt | undefined {
+	if (typeof model !== "string" || model.length === 0) return undefined;
+
+	const canonicalRef = piModelRefToCanonical(model);
+	const canonicalProvider = providerPrefix(canonicalRef);
+	if (!canonicalProvider) return undefined;
+
+	const translatedRef = resolveModelRefForPi(canonicalRef);
+	const translatedProvider = providerPrefix(translatedRef);
+	const cachedProvider = PI_PROVIDER_FORM_CACHE.get(canonicalProvider);
+	if (
+		!translatedProvider ||
+		(translatedProvider === canonicalProvider && cachedProvider === undefined)
+	) {
+		return undefined;
+	}
+
+	const attemptedProvider = cachedProvider ?? translatedProvider;
+	return {
+		canonicalRef,
+		canonicalProvider,
+		modelRef: replaceProviderPrefix(canonicalRef, attemptedProvider),
+		attemptedProvider,
+		translated: attemptedProvider !== canonicalProvider,
+	};
+}
+
+function isProviderCredentialFailure(
+	result: SubagentRunResult,
+	attempt: ProviderModelAttempt,
+): result is FailedRunResult {
+	return (
+		attempt.translated &&
+		!result.ok &&
+		result.reason === "non_zero_exit" &&
+		getResultStderr(result).includes(
+			`No API key found for ${attempt.attemptedProvider}`,
+		)
+	);
+}
+
 /**
  * Max bytes we will pass as the positional message argv argument. Linux caps a
  * SINGLE argv entry at MAX_ARG_STRLEN (128 KiB); a historian chunk clamps to
@@ -1226,9 +1480,11 @@ export function buildArgs(
 	options: SubagentRunOptions,
 	opts?: {
 		disableDiscoveredExtensions?: boolean;
+		subagentExtensions?: readonly string[];
 		omitPositionalMessage?: boolean;
 		subagentEntryPath?: string;
 		systemPromptPath?: string;
+		modelRef?: string;
 	},
 ): string[] {
 	const args: string[] = [
@@ -1245,13 +1501,13 @@ export function buildArgs(
 		// historian etc. stay invisible to the user even though they're
 		// real LLM rounds the user pays for.
 		"--no-session",
-		// Leave extension discovery enabled in child processes so provider
-		// extensions can register their models and the Pi extension can expose
-		// optional read tools. Prevent recursive startup by setting
-		// MAGIC_CONTEXT_PI_SUBAGENT=1 in the child environment, which makes the
-		// main entry exit early before registering hooks, tools, or timers. Disable
-		// skills and prompt templates because subagents only need a minimal startup
-		// path.
+		// Extension discovery is enabled by default so provider extensions can
+		// register their models. A configured user allowlist adds --no-extensions
+		// below and explicitly loads only its entries. Prevent recursive startup by
+		// setting MAGIC_CONTEXT_PI_SUBAGENT=1 in the child environment, which makes
+		// the main entry exit early before registering hooks, tools, or timers.
+		// Disable skills and prompt templates because subagents only need a minimal
+		// startup path.
 		"--no-skills",
 		"--no-prompt-templates",
 		// Hidden one-shot subagents must receive EXACTLY the system prompt we built.
@@ -1262,18 +1518,25 @@ export function buildArgs(
 		// Every known Magic Context child gets an explicit --tools allow-list so Pi's
 		// discovered extension registry cannot leak unrelated tools into subagents.
 	];
-	if (opts?.disableDiscoveredExtensions) {
-		// When a discovered extension starts a turn during startup, the child's
-		// first prompt can fail before Magic Context sends its own prompt. For that
-		// isolated retry, disable auto-discovered extensions with
-		// `--no-extensions`, but still allow explicit `--extension` entries so the
-		// lightweight ctx_* extension can load.
+	if (
+		opts?.disableDiscoveredExtensions ||
+		opts?.subagentExtensions !== undefined
+	) {
+		// When an allowlist is active, or when the collision retry asks for an
+		// isolated child, disable auto-discovered extensions. Explicit entries are
+		// added below in their configured order.
 		args.push("--no-extensions");
 	}
 
+	if (opts?.subagentExtensions !== undefined) {
+		for (const extension of opts.subagentExtensions) {
+			args.push("--extension", resolveSubagentExtensionEntry(extension));
+		}
+	}
+
 	// Load Magic Context's lean subagent extension entry in children that need the
-	// scoped ctx_* tools. Discovered extensions are now intentionally enabled so
-	// provider/AFT extensions can register, while the full Magic Context entry sees
+	// scoped ctx_* tools. With no allowlist, discovered extensions remain enabled
+	// so provider and other auto-discovered extensions can register, while the full Magic Context entry sees
 	// MAGIC_CONTEXT_PI_SUBAGENT=1 and returns before wiring recursive hooks. The
 	// lean entry is explicitly loaded via --extension and is NOT guarded; it only
 	// registers subagent-scoped tools and never historian/dreamer/event handlers.
@@ -1347,7 +1610,7 @@ export function buildArgs(
 		// google->google-antigravity). Translate to Pi's form HERE, at the only
 		// point the model reaches the spawned process, so options.model stays
 		// canonical everywhere else (accounting, logging, fallback selection).
-		args.push("--model", resolveModelRefForPi(options.model));
+		args.push("--model", opts?.modelRef ?? resolveModelRefForPi(options.model));
 	}
 
 	// Pass --thinking <level> only when explicitly configured.
@@ -1510,4 +1773,5 @@ export const __test = {
 	KNOWN_PI_SUBAGENT_AGENTS,
 	STRICT_TOOL_ALLOWLIST,
 	ZERO_TOOL_PROMPT_REQUIRED_AGENTS,
+	resetProviderFormCache: () => PI_PROVIDER_FORM_CACHE.clear(),
 };

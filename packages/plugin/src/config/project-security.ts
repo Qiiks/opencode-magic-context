@@ -190,6 +190,8 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  * Closes:
  *  - `auto_update` — a repo must not suppress plugin self-updates (which can
  *    carry security fixes).
+ *  - `fail_closed_blocking` — a repo must not un-block (or force-block) the
+ *    loud inoperability gate; only the user may restore silent degrade.
  *  - `language`: a repo must not inject prompt text through a user preference.
  *  - `sqlite` — `sqlite.cache_size_mb` / `mmap_size_mb` become PRAGMAs on the
  *    process-global shared DB handle (one connection across every project in the
@@ -199,13 +201,13 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *  - `embedding.endpoint` / `embedding.provider` — a repo must not choose
  *    where private memory/search/commit text is embedded. User-level config is
  *    the trust boundary for embedding destinations.
- *  - `shadow_transform` — developer-only subc mirror lane. A repository must
- *    not enable extra local module traffic or comparison telemetry.
  *  - `transform_mode` is intentionally allowed at project tier so a repository
  *    can opt its own runtime into the experimental Rust pipeline. The resolver
  *    requires trusted user-level `subc` configuration before Rust can activate.
  *  - `historian.model` / `historian.fallback_models` — historian model spend is
  *    user-level only; a cloned repo cannot force extra compaction cost.
+ *  - `pi.subagent_extensions` — a cloned repo must not choose which extensions
+ *    the user's Pi child processes load.
  *  - hidden-agent `prompt`/`permission`/`tools` — a repo must not reprogram or
  *    re-permission the historian/dreamer/sidekick.
  */
@@ -216,6 +218,13 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         delete projectRaw.auto_update;
         warnings.push(
             "Ignoring auto_update from project config (security: this setting only honors user-level config).",
+        );
+    }
+
+    if ("fail_closed_blocking" in projectRaw) {
+        delete projectRaw.fail_closed_blocking;
+        warnings.push(
+            "Ignoring fail_closed_blocking from project config (security: only user-level config may disable or force the loud inoperability gate).",
         );
     }
 
@@ -234,10 +243,11 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         );
     }
 
-    if ("shadow_transform" in projectRaw) {
-        delete projectRaw.shadow_transform;
+    const pi = projectRaw.pi;
+    if (isPlainObject(pi) && "subagent_extensions" in pi) {
+        delete pi.subagent_extensions;
         warnings.push(
-            "Ignoring shadow_transform from project config (security: this developer-only mirror lane is user-level only).",
+            "Ignoring pi.subagent_extensions from project config (security: only user-level config may choose extensions loaded by Pi subagent children).",
         );
     }
 

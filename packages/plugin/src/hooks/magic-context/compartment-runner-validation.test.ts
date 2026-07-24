@@ -56,7 +56,7 @@ function buildXml(
 ): string {
     const blocks = compartments.map(
         (c) =>
-            `<compartment start="${c.start}" end="${c.end}" title="${c.title ?? "t"}">summary</compartment>`,
+            `<compartment start="${c.start}" end="${c.end}" title="${c.title ?? "t"}"><p1>summary</p1></compartment>`,
     );
     const inner = blocks.join("\n");
     const meta =
@@ -185,6 +185,37 @@ describe("healCompartmentGaps via validateHistorianOutput", () => {
             const result = validateHistorianOutput(xml, "ses-test", chunk, [], 0);
             expect(result.ok).toBe(true);
         });
+    });
+});
+
+describe("tiered historian output validation", () => {
+    test("rejects flat v1 compartments with actionable tier feedback", () => {
+        const flatXml = `<output><compartment start="1" end="2" title="flat">flat summary</compartment></output>`;
+
+        const result = validateHistorianOutput(flatXml, "ses-test", buildChunk(1, 2), [], 0);
+
+        expect(result).toEqual({
+            ok: false,
+            error: expect.stringContaining(
+                "compartment 1 is missing the tiered paraphrase structure (p1..p4); re-emit with all four tiers",
+            ),
+        });
+    });
+
+    test("accepts P1-only output by filling the softer missing tiers", () => {
+        const p1OnlyXml = `<output><compartment start="1" end="2" title="partial"><p1>full summary</p1></compartment></output>`;
+
+        const result = validateHistorianOutput(p1OnlyXml, "ses-test", buildChunk(1, 2), [], 0);
+
+        expect(result.ok).toBe(true);
+        if (result.ok) {
+            expect(result.compartments[0]).toMatchObject({
+                p1: "full summary",
+                p2: "full summary",
+                p3: "full summary",
+                p4: "",
+            });
+        }
     });
 });
 

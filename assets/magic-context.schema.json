@@ -10,6 +10,35 @@
       "description": "Enable magic context (default: true)",
       "type": "boolean"
     },
+    "experimental": {
+      "default": {
+        "mural": {
+          "enabled": false
+        }
+      },
+      "description": "Experimental feature switches. User and project configuration are both accepted.",
+      "type": "object",
+      "properties": {
+        "mural": {
+          "default": {
+            "enabled": false
+          },
+          "description": "Experimental mural: a single deterministically-rendered image of project memories that did not fit the context budget. Cues are compressed per-memory by the compress-cues dreamer task.",
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "default": false,
+              "type": "boolean"
+            },
+            "model": {
+              "description": "Model for the compress-cues task that compresses each memory into a mural cue. The mural image itself is rendered deterministically (no author model).",
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    },
     "transform_mode": {
       "default": "ts",
       "description": "Experimental: routes the entire Magic Context runtime for the project through the ck-mc Rust module over subc (requires user-level `subc` config); \"ts\" is the current TypeScript pipeline.",
@@ -371,6 +400,10 @@
               "schedule": "0 4 * * 0",
               "timeout_minutes": 20
             },
+            "compress-cues": {
+              "schedule": "0 4 * * *",
+              "timeout_minutes": 20
+            },
             "classify-memories": {
               "schedule": "0 6 * * *",
               "timeout_minutes": 20
@@ -557,6 +590,56 @@
             "curate": {
               "default": {
                 "schedule": "0 4 * * 0",
+                "timeout_minutes": 20
+              },
+              "type": "object",
+              "properties": {
+                "schedule": {
+                  "default": "",
+                  "type": "string",
+                  "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "model": {
+                  "description": "Per-task model override (inherits dreamer.model)",
+                  "type": "string"
+                },
+                "fallback_models": {
+                  "description": "Per-task fallback chain (inherits dreamer.fallback_models)",
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  ]
+                },
+                "thinking_level": {
+                  "description": "Pi only: per-task thinking level",
+                  "type": "string",
+                  "enum": [
+                    "off",
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh"
+                  ]
+                },
+                "timeout_minutes": {
+                  "default": 20,
+                  "description": "Minutes allowed for this task before it is aborted",
+                  "type": "number",
+                  "minimum": 5
+                }
+              }
+            },
+            "compress-cues": {
+              "default": {
+                "schedule": "0 4 * * *",
                 "timeout_minutes": 20
               },
               "type": "object",
@@ -1256,19 +1339,10 @@
       "description": "Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect.",
       "type": "boolean"
     },
-    "shadow_transform": {
-      "default": {
-        "enabled": false
-      },
-      "description": "Developer-only shadow transform lane. When enabled, the plugin fire-and-forgets a copy of each finalized transform to the Rust module for comparison; the live output is unchanged.",
-      "type": "object",
-      "properties": {
-        "enabled": {
-          "default": false,
-          "description": "Dev flag: mirror every transform pass to the Magic Context Rust module over subc and byte-compare outputs. No behavior impact; default off.",
-          "type": "boolean"
-        }
-      }
+    "fail_closed_blocking": {
+      "default": true,
+      "description": "When Magic Context cannot operate (schema fence mismatch, storage open/migration failure), block the primary-session prompt with a loud recovery error instead of silently degrading to native compaction. Default true. Set false only to restore the old degrade-silently behavior (not recommended). USER-LEVEL ONLY — ignored in project config for security. Requires a restart.",
+      "type": "boolean"
     },
     "todowrite": {
       "default": {
@@ -1287,6 +1361,20 @@
           "default": true,
           "description": "Pi only: show the persistent todo overlay above the editor while tasks are active.",
           "type": "boolean"
+        }
+      }
+    },
+    "pi": {
+      "description": "Pi-only child-process extension controls. This setting is user-level only; project configuration cannot choose which extensions a user's subagent children load.",
+      "type": "object",
+      "properties": {
+        "subagent_extensions": {
+          "description": "User-only allowlist of Pi extensions for Magic Context subagent children. When set, children use --no-extensions and load only these entries (plus Magic Context's scoped child extension where applicable). Relative paths resolve from ~/.pi/agent, matching Pi's settings.json package location. Unset preserves normal Pi extension discovery.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
         }
       }
     },

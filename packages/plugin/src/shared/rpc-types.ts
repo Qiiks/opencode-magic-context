@@ -67,6 +67,14 @@ export interface SidebarSnapshot {
      * scheduler and transform paths.
      */
     executeThreshold: number;
+    /**
+     * True when `executeThreshold` was clamped down from a higher configured value
+     * (tokens config above 80% × contextLimit, or a percentage above the 80% cap).
+     * The sidebar/status dialog append a small marker so the user knows their
+     * configured value was reduced rather than applied verbatim (issue #241).
+     * Absent when no clamp occurred.
+     */
+    executeThresholdClamped?: boolean;
     /** Rust module cache boundary state, when the session uses Rust authority mode. */
     boundaryPresent?: boolean;
     coverageOrdinal?: number | null;
@@ -125,6 +133,8 @@ export interface StatusDetail extends SidebarSnapshot {
     compressionUsage: string | null;
     /** Effective configured toast duration in ms after config resolution. */
     toastDurationMs: number;
+    /** One-line status data for the experimental memory mural. */
+    mural?: { present: boolean; ageMs: number | null };
 }
 
 /** Embedding coverage for `/ctx-embed` status (mirrors getEmbeddingCoverageStatus). */

@@ -45,6 +45,7 @@
  *   - Tag prefix primitives (`prependTag`, `stripTagPrefix`, `byteSize`).
  */
 
+import { createHash } from "node:crypto";
 import type { ContextDatabase } from "../features/magic-context/storage";
 import { saveSourceContent } from "../features/magic-context/storage-source";
 import {
@@ -64,6 +65,8 @@ import {
 } from "../hooks/magic-context/tag-content-primitives";
 import type { TagTarget } from "../hooks/magic-context/tag-messages";
 import type { Transcript, TranscriptPart } from "./transcript";
+
+export const TEXT_TAG_IDENTITY_MARKER = ":mc-text-v1:";
 
 export interface TagTranscriptOptions {
     /**
@@ -89,6 +92,15 @@ export interface TagTranscriptOptions {
      * rebuilds the complete set of messages affected by each tag.
      */
     reuseMessageIds?: ReadonlySet<string>;
+    /**
+     * Pi message ids whose persisted text-part vector no longer matches the
+     * current vector. Their parts use content-derived identities instead of
+     * positional `:pN` keys, so sibling insertion/deletion cannot rebind an
+     * older durable tag to different text.
+     */
+    textIdentityDriftMessageIds?: ReadonlySet<string>;
+    /** Source-content cache shared with Pi's batched identity preflight. */
+    textIdentitySourceCache?: Map<number, string>;
     /** Exact text/count pairs retained by Pi for safe lazy-token backfill reuse. */
     textTokenCache?: Map<string, { text: string; tokenCount: number }>;
     /** Exact tool-result text/count pairs retained under composite tag identity. */
@@ -173,6 +185,28 @@ interface ToolAggregate {
     inputTokenCount: number | null;
 }
 
+function textIdentityDigest(value: string): string {
+    return createHash("sha256").update(value).digest("hex");
+}
+
+function buildContentDerivedTextIds(
+    messageId: string,
+    parts: readonly TranscriptPart[],
+): string[] {
+    const sources = parts
+        .filter((part) => part.kind === "text")
+        .map((part) => stripTagPrefix(part.getText() ?? ""));
+    const vectorFingerprint = textIdentityDigest(JSON.stringify(sources));
+    const occurrences = new Map<string, number>();
+
+    return sources.map((source) => {
+        const contentFingerprint = textIdentityDigest(source);
+        const occurrence = occurrences.get(contentFingerprint) ?? 0;
+        occurrences.set(contentFingerprint, occurrence + 1);
+        return `${messageId}${TEXT_TAG_IDENTITY_MARKER}${vectorFingerprint}:${contentFingerprint}:o${occurrence}`;
+    });
+}
+
 export function tagTranscript(
     sessionId: string,
     transcript: Transcript,
@@ -210,11 +244,19 @@ export function tagTranscript(
             messageId !== undefined && options.reuseMessageIds?.has(messageId) === true;
 
         let textOrdinal = 0;
+        let toolResultOrdinal = 0;
         const parts = message.parts;
+        const contentDerivedTextIds =
+            messageId !== undefined &&
+            options.textIdentityDriftMessageIds?.has(messageId) === true
+                ? buildContentDerivedTextIds(messageId, parts)
+                : undefined;
 
         for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
             const part = parts[partIndex];
             if (part === undefined) continue;
+            const resultBlockOrdinal =
+                part.kind === "tool_result" ? toolResultOrdinal++ : undefined;
 
             if (part.kind !== "tool_result") {
                 activeToolResultRun = undefined;
@@ -234,6 +276,8 @@ export function tagTranscript(
                     sessionId,
                     message,
                     messageId,
+                    contentId:
+                        contentDerivedTextIds?.[textOrdinal] ?? `${messageId}:p${textOrdinal}`,
                     msgIndex,
                     textOrdinal,
                     part,
@@ -242,8 +286,9 @@ export function tagTranscript(
                     targets,
                     skipPrefixInjection,
                     entryFingerprint: options.entryFingerprintByMessageId?.get(messageId) ?? null,
-                    reuseIdentity,
+                    reuseIdentity: reuseIdentity || contentDerivedTextIds !== undefined,
                     timing,
+                    textIdentitySourceCache: options.textIdentitySourceCache,
                     textTokenCache: options.textTokenCache,
                 });
                 textOrdinal += 1;
@@ -294,6 +339,12 @@ export function tagTranscript(
                     }
                 }
                 const aggregateKey: string = existingKey ?? makeToolCompositeKey(messageId, callId);
+                // Keep block memoization separate from aggregate tag identity. The
+                // ordinal comes from this message's stable result-part order, not cache writes.
+                const tokenCacheKey =
+                    resultBlockOrdinal === undefined
+                        ? aggregateKey
+                        : `${aggregateKey}\0result-part:${messageId}:${resultBlockOrdinal}`;
                 const existing = toolAggregates.get(aggregateKey);
                 if (existing) {
                     existing.occurrences.push({ message, part, kind: part.kind });
@@ -315,7 +366,7 @@ export function tagTranscript(
                                 text,
                                 timing,
                                 tokenCache: options.toolTokenCache,
-                                tokenCacheKey: aggregateKey,
+                                tokenCacheKey,
                             });
                         }
                         if (timing) timing.identity += performance.now() - identityStart;
@@ -324,7 +375,7 @@ export function tagTranscript(
                             part,
                             timing,
                             options.toolTokenCache,
-                            aggregateKey,
+                            tokenCacheKey,
                         );
                         text = accounting.text;
                         if (part.kind === "tool_result") {
@@ -428,7 +479,7 @@ export function tagTranscript(
                             text,
                             timing,
                             tokenCache: options.toolTokenCache,
-                            tokenCacheKey: aggregateKey,
+                            tokenCacheKey,
                         });
                     }
                     if (timing) timing.identity += performance.now() - identityStart;
@@ -437,7 +488,7 @@ export function tagTranscript(
                         part,
                         timing,
                         options.toolTokenCache,
-                        aggregateKey,
+                        tokenCacheKey,
                     );
                     text = accounting.text;
                     const outputByteSize = part.kind === "tool_result" ? accounting.byteSize : 0;
@@ -749,6 +800,7 @@ interface TagTextPartArgs {
     sessionId: string;
     message: { info: { id?: string; role: string } };
     messageId: string;
+    contentId: string;
     msgIndex: number;
     textOrdinal: number;
     part: TranscriptPart;
@@ -759,13 +811,14 @@ interface TagTextPartArgs {
     entryFingerprint: string | null;
     reuseIdentity: boolean;
     timing?: TagTranscriptTiming;
+    textIdentitySourceCache?: Map<number, string>;
     textTokenCache?: Map<string, { text: string; tokenCount: number }>;
 }
 
 function tagTextPart(args: TagTextPartArgs): void {
     const identityStart = args.timing ? performance.now() : 0;
     const text = args.part.getText() ?? "";
-    const contentId = `${args.messageId}:p${args.textOrdinal}`;
+    const contentId = args.contentId;
     const reusableTagId = args.reuseIdentity
         ? args.tagger.getTag(args.sessionId, contentId, "message")
         : undefined;
@@ -820,6 +873,7 @@ function tagTextPart(args: TagTextPartArgs): void {
     const sourceContent = stripTagPrefix(text);
     if (sourceContent.trim().length > 0) {
         saveSourceContent(args.db, args.sessionId, tagId, sourceContent);
+        args.textIdentitySourceCache?.set(tagId, sourceContent);
     }
     if (args.timing) args.timing.identity += performance.now() - identityStart;
     applyTextPrefixAndTarget(args, tagId, text);

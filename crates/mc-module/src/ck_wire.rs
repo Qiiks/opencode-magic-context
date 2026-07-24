@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use mc_core::CkItem;
 use mc_store::BlockIdentity;
@@ -49,7 +50,10 @@ pub struct FlatBlock {
     pub provider_executed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arc_id: Option<String>,
-    pub bytes: String,
+    pub bytes: Arc<str>,
+    /// SHA-256 of the serialized block bytes, retained so consumers can verify that the block content has not changed.
+    #[serde(skip_serializing)]
+    pub content_hash: [u8; 32],
     pub synthetic: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -127,6 +131,7 @@ pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection,
     let mut blocks = Vec::new();
     let mut identity_by_mid: BTreeMap<String, Vec<BlockIdentity>> = BTreeMap::new();
     let mut pending_calls: BTreeMap<String, VecDeque<String>> = BTreeMap::new();
+    let mut call_arcs: BTreeMap<String, String> = BTreeMap::new();
 
     for msg in messages {
         if msg.mid.contains('#') {
@@ -136,12 +141,26 @@ pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection,
         let role = msg.ck.role.as_str();
         if role == "assistant" {
             pending_calls.clear();
+            call_arcs.clear();
+            let mut call_counts = BTreeMap::<&str, usize>::new();
+            for block in &msg.ck.content {
+                if let CkKind::ToolCall { id, .. } = &block.kind {
+                    *call_counts.entry(id.as_str()).or_default() += 1;
+                }
+            }
             for (index, block) in msg.ck.content.iter().enumerate() {
                 if let CkKind::ToolCall { id, .. } = &block.kind {
+                    let block_id = block_id(&msg.mid, index);
+                    let arc_id = if call_counts.get(id.as_str()).copied().unwrap_or(0) > 1 {
+                        tool_arc_id(&msg.mid, id)
+                    } else {
+                        block_id.clone()
+                    };
+                    call_arcs.insert(block_id, arc_id.clone());
                     pending_calls
                         .entry(id.clone())
                         .or_default()
-                        .push_back(block_id(&msg.mid, index));
+                        .push_back(arc_id);
                 }
             }
         }
@@ -149,12 +168,12 @@ pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection,
         let mut identities = Vec::new();
         for (index, block) in msg.ck.content.iter().enumerate() {
             let id = block_id(&msg.mid, index);
-            let arc_id = arc_for_block(&msg.mid, index, &msg.ck, &mut pending_calls)?;
+            let arc_id = arc_for_block(&msg.mid, index, &msg.ck, &mut pending_calls, &call_arcs)?;
             let flat = flatten_block(msg, index, block, id, arc_id)?;
             if !flat.synthetic {
                 identities.push(BlockIdentity {
                     kind_tag: flat.kind_tag.clone(),
-                    byte_fingerprint: fingerprint(&flat.bytes),
+                    byte_fingerprint: fingerprint_digest(&flat.content_hash),
                 });
             }
             blocks.push(flat);
@@ -258,6 +277,7 @@ fn flatten_block(
         block_index: index,
         kind: block.kind.tag().to_string(),
     })?;
+    let content_hash: [u8; 32] = Sha256::digest(bytes.as_bytes()).into();
     let (name, file_path, tool_input, provider_executed, tool_call_id, output_kind) =
         match &block.kind {
             CkKind::ToolCall {
@@ -301,7 +321,8 @@ fn flatten_block(
         tool_input,
         provider_executed,
         arc_id,
-        bytes,
+        bytes: Arc::from(bytes),
+        content_hash,
         synthetic: msg.ck.meta.synthetic,
         tool_call_id,
         output_kind,
@@ -309,14 +330,21 @@ fn flatten_block(
     })
 }
 
+fn tool_arc_id(mid: &str, call_id: &str) -> String {
+    format!("{mid}#call:{call_id}")
+}
+
 fn arc_for_block(
     mid: &str,
     index: usize,
     msg: &CkWireMessage,
     pending_calls: &mut BTreeMap<String, VecDeque<String>>,
+    call_arcs: &BTreeMap<String, String>,
 ) -> Result<Option<String>, CkWireError> {
     match &msg.content[index].kind {
-        CkKind::ToolCall { .. } if msg.role == "assistant" => Ok(Some(block_id(mid, index))),
+        CkKind::ToolCall { .. } if msg.role == "assistant" => {
+            Ok(call_arcs.get(&block_id(mid, index)).cloned())
+        }
         CkKind::ToolResult { id, .. } => {
             let Some(queue) = pending_calls.get_mut(id) else {
                 return Err(CkWireError::UnpairedToolResult {
@@ -358,13 +386,34 @@ fn extract_file_path(input: &Value) -> Option<String> {
         .find_map(|key| obj.get(*key).and_then(Value::as_str).map(str::to_string))
 }
 
-fn fingerprint(bytes: &str) -> String {
-    let digest = Sha256::digest(bytes.as_bytes());
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
+pub(crate) fn fingerprint_digest(content_hash: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(content_hash.len() * 2);
+    for byte in content_hash {
         let _ = write!(&mut out, "{byte:02x}");
     }
     out
+}
+
+pub(crate) fn fingerprint(bytes: &str) -> String {
+    let content_hash: [u8; 32] = Sha256::digest(bytes.as_bytes()).into();
+    fingerprint_digest(&content_hash)
+}
+
+/// Hex fingerprint + serialized length when `served` is still the projected block wire.
+///
+/// Projection stores SHA-256 of the same `serde_json::to_string(CkWireBlock)` basis that
+/// divergence attribution uses. Reuse that digest only when the served wire is still
+/// identical (including retained ingress bytes); modified/reduced/overlaid blocks must
+/// re-hash.
+pub(crate) fn fingerprint_from_projected_wire(
+    served: &CkWireBlock,
+    projected: Option<&FlatBlock>,
+) -> Option<(String, usize)> {
+    let flat = projected?;
+    if &flat.wire != served {
+        return None;
+    }
+    Some((fingerprint_digest(&flat.content_hash), flat.bytes.len()))
 }
 
 pub fn duplicate_ids(blocks: &[FlatBlock]) -> Option<String> {
@@ -417,6 +466,40 @@ mod tests {
                 HarnessMeta::default(),
             ),
         }
+    }
+
+    #[test]
+    fn repeated_call_id_within_owner_message_shares_one_arc_identity() {
+        let message = CkIngressMessage {
+            mid: "assistant-1".to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![
+                    CkWireBlock::bare(CkKind::ToolCall {
+                        id: "duplicate".into(),
+                        name: "read".into(),
+                        input: serde_json::json!({"path": "one"}),
+                        provider_executed: false,
+                    }),
+                    CkWireBlock::bare(CkKind::ToolCall {
+                        id: "duplicate".into(),
+                        name: "read".into(),
+                        input: serde_json::json!({"path": "two"}),
+                        provider_executed: false,
+                    }),
+                ],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta::default(),
+            ),
+        };
+        let projection = project_messages(&[message]).expect("duplicate call ids are projectable");
+        assert_eq!(projection.blocks[0].arc_id, projection.blocks[1].arc_id);
+        assert_eq!(
+            projection.blocks[0].arc_id.as_deref(),
+            Some("assistant-1#call:duplicate")
+        );
     }
 
     // Claude Code emits the tool_result INSIDE the next user message (alongside the

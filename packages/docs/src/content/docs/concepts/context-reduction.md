@@ -73,6 +73,12 @@ So if your session's bulk is **tool calls** (common for heavy file-reading or bu
 
 This division is intentional: the historian works safely in the background on settled history, while tool-output reduction stays under the agent's control (or the 85% net) so an in-progress task never loses the outputs it's still using.
 
+## Smart drops (opt-in)
+
+`smart_drops` is an opt-in content-aware reclaim that layers on top of the age-based auto-drop. When on, it drops provably-superseded tool output during a pass that is already rewriting the message array: superseded `todowrite` snapshots (keep newest 1), spent `ctx_reduce` outputs (keep newest 5), and zero-value meta outputs (`bash_status`, `bash_kill`, `ctx_note` read/dismiss) are dropped; older edits to the same file are compressed to a filePath-preserving marker while the newest edit per file stays full. It only acts on passes already busting the cache, so it never originates a cache bust on its own, and it honors the protected-tag reserve.
+
+When `smart_drops` is off (the default), the messages sent to the model are byte-identical to the age-based-only behavior — the feature is entirely inert. It is opt-in and default off until cache stability is proven at scale; enable it in `magic-context.jsonc` and restart for the setting to take effect. See the [configuration reference](/reference/configuration/) for the full description.
+
 ## Hiding the reduce surface
 
 To remove the agent-facing reduction machinery for a particular agent, deny or omit `ctx_reduce` in that agent's tool allow-list. Magic Context freezes that availability verdict per session and then omits:

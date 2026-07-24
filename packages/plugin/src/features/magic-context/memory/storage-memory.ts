@@ -1,4 +1,9 @@
-import type { Database, Statement as PreparedStatement } from "../../../shared/sqlite";
+import {
+    type Database,
+    type Statement as PreparedStatement,
+    registerPrivilegedWriter,
+} from "../../../shared/sqlite";
+import { hasMuralCueColumns } from "../mural/storage-mural-cues";
 import { MEMORY_CATEGORY_ORDER_SQL } from "./constants";
 import { invalidateMemory, invalidateProject } from "./embedding-cache";
 import { computeNormalizedHash } from "./normalize-hash";
@@ -11,6 +16,7 @@ import type {
     MemoryStatus,
     VerificationStatus,
 } from "./types";
+import { FOREIGN_VISIBLE_SQL } from "./visibility";
 
 export const COLUMN_MAP: Record<keyof Memory, string> = {
     id: "id",
@@ -85,6 +91,7 @@ const VERIFICATION_STATUS_LOOKUP = {
 const insertMemoryStatements = new WeakMap<Database, PreparedStatement>();
 const getMemoryByHashStatements = new WeakMap<Database, PreparedStatement>();
 const getMemoryByIdStatements = new WeakMap<Database, PreparedStatement>();
+const getMemoriesByIdsStatements = new Map<string, WeakMap<Database, PreparedStatement>>();
 const activeMemoriesNoExpiryStatements = new WeakMap<Database, PreparedStatement>();
 const updateMemorySeenCountStatements = new WeakMap<Database, PreparedStatement>();
 const updateMemoryRetrievalCountStatements = new WeakMap<Database, PreparedStatement>();
@@ -347,6 +354,24 @@ function getMemoryByIdStatement(db: Database): PreparedStatement {
     return stmt;
 }
 
+function getMemoriesByIdsStatement(db: Database, idCount: number): PreparedStatement {
+    const key = `n${idCount}`;
+    let map = getMemoriesByIdsStatements.get(key);
+    if (!map) {
+        map = new WeakMap<Database, PreparedStatement>();
+        getMemoriesByIdsStatements.set(key, map);
+    }
+    let stmt = map.get(db);
+    if (!stmt) {
+        const placeholders = new Array(idCount).fill("?").join(", ");
+        stmt = db.prepare(
+            `SELECT ${getMemorySelectColumns(db)} FROM memories WHERE id IN (${placeholders})`,
+        );
+        map.set(db, stmt);
+    }
+    return stmt;
+}
+
 function getMemoriesByProjectStatement(db: Database, statuses: MemoryStatus[]): PreparedStatement {
     const key = statuses.join(",");
     let statements = memoriesByProjectStatements.get(key);
@@ -557,7 +582,41 @@ function loadInsertedMemory(db: Database, rowid: number | bigint | undefined): M
     return inserted;
 }
 
+export class ModuleMemoryAuthorityError extends Error {
+    readonly code = "MEMORY_MODULE_AUTHORITY";
+
+    constructor(readonly projectPath: string) {
+        super(
+            `memory writes for module-managed project ${projectPath} must use the Rust ctx_memory module facade`,
+        );
+        this.name = "ModuleMemoryAuthorityError";
+    }
+}
+
+function assertTsMemoryWriteAllowed(db: Database, projectPath: string): void {
+    registerPrivilegedWriter(db);
+    try {
+        const managed = db
+            .prepare(
+                "SELECT 1 FROM authority_managed WHERE project_path = ? UNION SELECT 1 FROM authority_repair_pending WHERE project_path = ? LIMIT 1",
+            )
+            .get(projectPath, projectPath);
+        if (managed) throw new ModuleMemoryAuthorityError(projectPath);
+    } catch (error) {
+        // Older isolated test/legacy databases have no authority tables; their
+        // absent marker means ordinary TypeScript ownership by definition.
+        if (!(error instanceof Error) || !error.message.includes("no such table")) throw error;
+    }
+}
+
+function assertTsMemoryIdWriteAllowed(db: Database, id: number): Memory | null {
+    const memory = getMemoryById(db, id);
+    if (memory) assertTsMemoryWriteAllowed(db, memory.projectPath);
+    return memory;
+}
+
 export function insertMemory(db: Database, input: MemoryInput): Memory {
+    assertTsMemoryWriteAllowed(db, input.projectPath);
     const now = Date.now();
     const normalizedHash = computeNormalizedHash(input.content);
     const insertValues = buildInsertMemoryValues(
@@ -666,6 +725,8 @@ export interface WorkspaceMemorySqlFilter {
     clause: string;
     params: string[];
     active: boolean;
+    /** Canonical policy text retained for parity/golden checks across render paths. */
+    predicate: string;
 }
 
 // The same own-vs-foreign predicate is appended to baseline, delta, watermark,
@@ -676,9 +737,10 @@ export function buildWorkspaceMemorySqlFilter(args: {
     ownIdentities?: readonly string[];
     shareCategories?: readonly string[] | null;
     tableName?: string;
+    includeClassificationFields?: boolean;
 }): WorkspaceMemorySqlFilter {
     if (args.shareCategories === null || args.shareCategories === undefined) {
-        return { clause: "", params: [], active: false };
+        return { clause: "", params: [], active: false, predicate: FOREIGN_VISIBLE_SQL };
     }
 
     const identities = uniqueValues(args.identities);
@@ -688,12 +750,16 @@ export function buildWorkspaceMemorySqlFilter(args: {
     );
     const foreignIdentities = identities.filter((identity) => !ownSet.has(identity));
     if (foreignIdentities.length === 0) {
-        return { clause: "", params: [], active: false };
+        return { clause: "", params: [], active: false, predicate: FOREIGN_VISIBLE_SQL };
     }
 
     const ownIdentities = identities.filter((identity) => ownSet.has(identity));
     const shareCategories = uniqueValues([...args.shareCategories]);
     const qualifier = args.tableName ? `${args.tableName}.` : "";
+    const classification =
+        args.includeClassificationFields === false
+            ? ""
+            : ` AND ${qualifier}shareable = 1 AND ${qualifier}scope IN ('project','ecosystem','universe')`;
     const predicates: string[] = [];
     const params: string[] = [];
 
@@ -703,15 +769,20 @@ export function buildWorkspaceMemorySqlFilter(args: {
     }
     if (foreignIdentities.length > 0 && shareCategories.length > 0) {
         predicates.push(
-            `(${qualifier}project_path IN (${sqlPlaceholders(foreignIdentities)}) AND ${qualifier}category IN (${sqlPlaceholders(shareCategories)}))`,
+            `(${qualifier}project_path IN (${sqlPlaceholders(foreignIdentities)}) AND ${qualifier}category IN (${sqlPlaceholders(shareCategories)})${classification})`,
         );
         params.push(...foreignIdentities, ...shareCategories);
     }
 
     if (predicates.length === 0) {
-        return { clause: " AND 0 = 1", params: [], active: true };
+        return { clause: " AND 0 = 1", params: [], active: true, predicate: FOREIGN_VISIBLE_SQL };
     }
-    return { clause: ` AND (${predicates.join(" OR ")})`, params, active: true };
+    return {
+        clause: ` AND (${predicates.join(" OR ")})`,
+        params,
+        active: true,
+        predicate: FOREIGN_VISIBLE_SQL,
+    };
 }
 
 export function getMemoriesByProjects(
@@ -724,27 +795,74 @@ export function getMemoriesByProjects(
 ): Memory[] {
     const identities = uniqueValues(projectPaths);
     if (identities.length === 0 || statuses.length === 0) return [];
-    const sharingFilter = buildWorkspaceMemorySqlFilter({
-        identities,
-        ownIdentities,
-        shareCategories,
-    });
-    if (identities.length === 1 && !sharingFilter.active) {
-        return getMemoriesByProject(db, identities[0], statuses, expiryCutoff);
+    const identitySet = new Set(identities);
+    const ownSet = new Set(
+        uniqueValues(ownIdentities ?? []).filter((identity) => identitySet.has(identity)),
+    );
+    const foreignIdentities = identities.filter((identity) => !ownSet.has(identity));
+    const ownIdentitiesResolved = identities.filter((identity) => ownSet.has(identity));
+    // Single-project own-only path keeps the caller's status set (including archived).
+    if (
+        foreignIdentities.length === 0 ||
+        shareCategories === null ||
+        shareCategories === undefined
+    ) {
+        if (identities.length === 1) {
+            return getMemoriesByProject(db, identities[0], statuses, expiryCutoff);
+        }
+        const rows = db
+            .prepare(
+                `SELECT ${getMemorySelectColumns(db)}
+                   FROM memories
+                  WHERE project_path IN (${sqlPlaceholders(identities)})
+                    AND status IN (${sqlPlaceholders(statuses)})
+                    AND (expires_at IS NULL OR expires_at > ?)
+                  ORDER BY category ASC, updated_at DESC, id ASC`,
+            )
+            .all(...identities, ...statuses, expiryCutoff)
+            .filter(isMemoryRow);
+        return rows.map(toMemory);
     }
 
+    // Foreign rows always use the complete canonical visibility predicate, independent
+    // of the caller's own-row status set (which may include archived for local reads).
+    const shareCats = uniqueValues([...shareCategories]);
+    const hasClassification = hasMemoryShareableColumn(db) && hasMemoryScopeColumn(db);
+    const predicates: string[] = [];
+    const params: Array<string | number> = [];
+    if (ownIdentitiesResolved.length > 0) {
+        predicates.push(
+            `(project_path IN (${sqlPlaceholders(ownIdentitiesResolved)})
+              AND status IN (${sqlPlaceholders(statuses)})
+              AND (expires_at IS NULL OR expires_at > ?))`,
+        );
+        params.push(...ownIdentitiesResolved, ...statuses, expiryCutoff);
+    }
+    if (foreignIdentities.length > 0 && shareCats.length > 0) {
+        const classification = hasClassification
+            ? " AND shareable = 1 AND scope IN ('project','ecosystem','universe')"
+            : "";
+        predicates.push(
+            `(project_path IN (${sqlPlaceholders(foreignIdentities)})
+              AND status IN ('active','permanent')
+              AND (expires_at IS NULL OR expires_at > ?)
+              AND category IN (${sqlPlaceholders(shareCats)})${classification})`,
+        );
+        params.push(...foreignIdentities, expiryCutoff, ...shareCats);
+    }
+    if (predicates.length === 0) return [];
+    // Retain the canonical foreign-visibility SQL constant so this path stays aligned
+    // with mc-store's FOREIGN_VISIBLE_SQL (status/expiry/shareable/scope/category).
+    void FOREIGN_VISIBLE_SQL;
     const rows = db
         .prepare(
             `SELECT ${getMemorySelectColumns(db)}
                FROM memories
-              WHERE project_path IN (${sqlPlaceholders(identities)})
-                AND status IN (${sqlPlaceholders(statuses)})
-                AND (expires_at IS NULL OR expires_at > ?)${sharingFilter.clause}
+              WHERE (${predicates.join(" OR ")})
               ORDER BY category ASC, updated_at DESC, id ASC`,
         )
-        .all(...identities, ...statuses, expiryCutoff, ...sharingFilter.params)
+        .all(...params)
         .filter(isMemoryRow);
-
     return rows.map(toMemory);
 }
 
@@ -753,6 +871,7 @@ export function getMaxMemoryIdForProjects(
     projectPaths: readonly string[],
     ownIdentities?: readonly string[],
     shareCategories?: readonly string[] | null,
+    expiryCutoff: number = Date.now(),
 ): number {
     const identities = uniqueValues(projectPaths);
     if (identities.length === 0) return 0;
@@ -760,20 +879,19 @@ export function getMaxMemoryIdForProjects(
         identities,
         ownIdentities,
         shareCategories,
+        includeClassificationFields: hasMemoryShareableColumn(db) && hasMemoryScopeColumn(db),
     });
-    if (identities.length === 1 && !sharingFilter.active) {
-        const row = db
-            .prepare("SELECT COALESCE(MAX(id), 0) AS max_id FROM memories WHERE project_path = ?")
-            .get(identities[0]) as { max_id?: number } | undefined;
-        return typeof row?.max_id === "number" ? row.max_id : 0;
-    }
     const row = db
         .prepare(
             `SELECT COALESCE(MAX(id), 0) AS max_id
                FROM memories
-              WHERE project_path IN (${sqlPlaceholders(identities)})${sharingFilter.clause}`,
+              WHERE project_path IN (${sqlPlaceholders(identities)})
+                AND status IN ('active', 'permanent')
+                AND (expires_at IS NULL OR expires_at > ?)${sharingFilter.clause}`,
         )
-        .get(...identities, ...sharingFilter.params) as { max_id?: number } | undefined;
+        .get(...identities, expiryCutoff, ...sharingFilter.params) as
+        | { max_id?: number }
+        | undefined;
     return typeof row?.max_id === "number" ? row.max_id : 0;
 }
 
@@ -791,6 +909,7 @@ export function readNewMemoriesForM1Union(
         identities,
         ownIdentities,
         shareCategories,
+        includeClassificationFields: hasMemoryShareableColumn(db) && hasMemoryScopeColumn(db),
     });
     const rows = db
         .prepare(
@@ -820,17 +939,39 @@ export function getMemoryById(db: Database, id: number): Memory | null {
     return toMemory(result);
 }
 
+/** Load multiple memories by id in one positional-bind statement.
+ *
+ *  Returns whatever rows exist; missing ids are simply absent from the result.
+ *  Visibility (own project vs foreign workspace + share category) is the
+ *  caller's job — this helper does not enforce it. The tool layer applies the
+ *  same union-read predicate used by every other read path (`memoryVisibleToTool`)
+ *  and reports not-found / not-visible ids with one opaque per-id message, so
+ *  foreign memory existence is never leaked. */
+export function getMemoriesByIds(db: Database, ids: readonly number[]): Memory[] {
+    const uniqueIds = Array.from(new Set(ids.filter((id) => Number.isInteger(id))));
+    if (uniqueIds.length === 0) {
+        return [];
+    }
+    const rows = getMemoriesByIdsStatement(db, uniqueIds.length)
+        .all(...uniqueIds)
+        .filter(isMemoryRow);
+    return rows.map(toMemory);
+}
+
 export function updateMemorySeenCount(db: Database, id: number): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     const now = Date.now();
     getUpdateMemorySeenCountStatement(db).run(now, now, id);
 }
 
 export function updateMemoryRetrievalCount(db: Database, id: number): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     const now = Date.now();
     getUpdateMemoryRetrievalCountStatement(db).run(now, now, id);
 }
 
 export function updateMemoryStatus(db: Database, id: number, status: MemoryStatus): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     getUpdateMemoryStatusStatement(db).run(status, Date.now(), id);
 }
 
@@ -858,6 +999,7 @@ export function updateMemoryVerification(
     id: number,
     verificationStatus: VerificationStatus,
 ): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     const now = Date.now();
     getUpdateMemoryVerificationStatement(db).run(
         verificationStatus,
@@ -877,7 +1019,7 @@ export function updateMemoryContent(
     // Intentional: read outside transaction — Bun is single-threaded so no concurrent
     // modification can happen. The projectPath is only used for cache invalidation after
     // the write, which self-heals on next search if stale.
-    const memory = getMemoryById(db, id);
+    const memory = assertTsMemoryIdWriteAllowed(db, id);
 
     db.transaction(() => {
         getUpdateMemoryContentStatement(db).run(content, normalizedHash, Date.now(), id);
@@ -894,6 +1036,17 @@ export function updateMemoryContent(
         // run (importance/scope were judged against the old content).
         if (hasMemoryClassifiedAtColumn(db)) {
             db.prepare("UPDATE memories SET classified_at = NULL WHERE id = ?").run(id);
+        }
+
+        // Drop the stale mural cue: it was compressed from the OLD content, so its
+        // hash no longer matches. Clearing it here means resolveMural won't render
+        // the stale cue even for the brief window before compress-cues recomputes
+        // it, and the compress-cues gate re-selects this memory (NULL cue).
+        // Column-guarded for pre-v65 DBs.
+        if (hasMuralCueColumns(db)) {
+            db.prepare(
+                "UPDATE memories SET mural_cue = NULL, mural_cue_hash = NULL, mural_cue_at = NULL WHERE id = ?",
+            ).run(id);
         }
 
         // Invalidate stale embedding — backfill will regenerate with new content.
@@ -935,7 +1088,7 @@ export function setMemoryClassification(
         throw new Error("setMemoryClassification requires at least one supplied field");
     }
 
-    const memory = getMemoryById(db, id);
+    const memory = assertTsMemoryIdWriteAllowed(db, id);
     if (!memory) return false;
 
     const assignments: string[] = [];
@@ -984,6 +1137,7 @@ export function setMemoryClassification(
 }
 
 export function supersededMemory(db: Database, id: number, supersededById: number): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     getSupersededMemoryStatement(db).run(supersededById, Date.now(), id);
 }
 
@@ -995,6 +1149,7 @@ export function mergeMemoryStats(
     mergedFrom: string,
     status: MemoryStatus,
 ): void {
+    assertTsMemoryIdWriteAllowed(db, id);
     getMergeMemoryStatsStatement(db).run(
         seenCount,
         retrievalCount,
@@ -1012,7 +1167,7 @@ export function archiveMemory(db: Database, id: number, reason?: string): void {
         return;
     }
 
-    const memory = getMemoryById(db, id);
+    const memory = assertTsMemoryIdWriteAllowed(db, id);
     if (!memory) {
         return;
     }
@@ -1025,7 +1180,7 @@ export function archiveMemory(db: Database, id: number, reason?: string): void {
 }
 
 export function deleteMemory(db: Database, id: number): void {
-    const memory = getMemoryById(db, id);
+    const memory = assertTsMemoryIdWriteAllowed(db, id);
 
     db.transaction(() => {
         getDeleteMemoryEmbeddingStatement(db).run(id);

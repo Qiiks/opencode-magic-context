@@ -247,6 +247,15 @@ describe("recomp message helpers", () => {
         expect(out).toContain("/ctx-session-upgrade");
     });
 
+    it("contextualizeUpgradeReason names historian.model for flat v1 output", () => {
+        const out = contextualizeUpgradeReason(
+            "Historian returned invalid compartment output: compartment 1 is missing the tiered paraphrase structure (p1..p4); re-emit with all four tiers",
+        );
+        expect(out).toContain("`historian.model`");
+        expect(out).toContain("magic-context.jsonc");
+        expect(out).toContain("No compartments were rewritten");
+    });
+
     it("contextualizeUpgradeReason reframes the lease-busy skip as transient", () => {
         const out = contextualizeUpgradeReason(
             "Another process is already mutating compartment state for this session. Wait for it to finish, then try `/ctx-recomp` again.",

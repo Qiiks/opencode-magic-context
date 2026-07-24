@@ -302,12 +302,12 @@ pub fn render_new_compartments(
 }
 
 /// Render the `<memory-updates>` corrections block from the coalesced mutation set.
-/// `rendered_ids` is the baseline manifest — a `superseded` mutation renders as
-/// `<superseded by=>` only when the replacement is ALSO in the baseline (so the model
-/// can resolve it), else as `<removed>`. Empty mutation set → empty string.
+/// `resolvable_ids` contains memories visible in either the m0 baseline or this same m1
+/// delta. A supersede preserves its lineage whenever the replacement is present in one of
+/// those layers; otherwise it degrades to a removal. Empty mutation set → empty string.
 pub fn render_memory_updates(
     mutations: &[StoredMemoryMutation],
-    rendered_ids: &HashSet<i64>,
+    resolvable_ids: &HashSet<i64>,
 ) -> String {
     if mutations.is_empty() {
         return String::new();
@@ -322,7 +322,7 @@ pub fn render_memory_updates(
                 escape_xml_content(m.new_content.as_deref().unwrap_or(""))
             )),
             "superseded" => match m.superseded_by_id {
-                Some(by) if rendered_ids.contains(&by) => lines.push(format!(
+                Some(by) if resolvable_ids.contains(&by) => lines.push(format!(
                     "  <superseded id=\"{}\" by=\"{by}\"/>",
                     m.target_memory_id
                 )),
@@ -555,14 +555,14 @@ mod tests {
 
     #[test]
     fn memory_updates_three_branches() {
-        let rendered: HashSet<i64> = [1, 2, 9].into_iter().collect();
+        let resolvable: HashSet<i64> = [1, 2, 9].into_iter().collect();
         let muts = vec![
             mutation(10, "update", 1, "new content", None),
             mutation(11, "superseded", 2, "", Some(9)), // 9 in baseline → <superseded by>
             mutation(12, "superseded", 3, "", Some(99)), // 99 NOT in baseline → <removed>
             mutation(13, "archive", 4, "", None),
         ];
-        let block = render_memory_updates(&muts, &rendered);
+        let block = render_memory_updates(&muts, &resolvable);
         assert!(block.starts_with("<memory-updates>\nThese memories changed"));
         assert!(block.contains("<updated id=\"1\">new content</updated>"));
         assert!(block.contains("<superseded id=\"2\" by=\"9\"/>"));

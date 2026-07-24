@@ -3,8 +3,8 @@ import type { Database } from "../../../shared/sqlite";
 import { CATEGORY_DEFAULT_TTL, PROMOTABLE_CATEGORIES } from "./constants";
 import { embedTextForProject } from "./embedding";
 import { computeNormalizedHash } from "./normalize-hash";
-import { getMemoryByHash, insertMemory, updateMemorySeenCount } from "./storage-memory";
-import { saveEmbedding } from "./storage-memory-embeddings";
+import { getMemoryById, getMemoryByHash, insertMemory, updateMemorySeenCount } from "./storage-memory";
+import { saveEmbeddingIfHashMatches } from "./storage-memory-embeddings";
 import type { MemoryCategory, MemoryInput } from "./types";
 
 interface SessionFact {
@@ -101,9 +101,27 @@ async function embedAndStoreMemory(
     content: string,
 ): Promise<void> {
     try {
+        // Capture the row's content hash BEFORE the async provider call: the
+        // vector it returns is only valid for the content stored right now. If
+        // the memory is edited while the call is in flight, the row's
+        // normalized_hash changes and the guarded save below discards the stale
+        // vector instead of resurrecting an out-of-date row — the memory then
+        // stays unembedded until the proactive drain re-embeds current content.
+        const hashBeforeEmbed = getMemoryById(db, memoryId)?.normalizedHash;
+        if (!hashBeforeEmbed) {
+            return;
+        }
         const result = await embedTextForProject(projectPath, content);
         if (result) {
-            saveEmbedding(db, memoryId, result.vector, result.modelId);
+            db.transaction(() => {
+                saveEmbeddingIfHashMatches(
+                    db,
+                    memoryId,
+                    result.vector,
+                    result.modelId,
+                    hashBeforeEmbed,
+                );
+            })();
         }
     } catch (error) {
         sessionLog(sessionId, `memory embedding failed for memory ${memoryId}:`, error);

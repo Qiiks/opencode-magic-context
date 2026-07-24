@@ -27,7 +27,9 @@ use subc_protocol::{BindIdentity, RouteTarget};
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const MODULE_ID: &str = "magic-context";
-const START_TIMEOUT: Duration = Duration::from_secs(10);
+// Cold daemon startup takes ~7s on an idle machine (measured); under CI or
+// sibling-build load it can exceed 10s, which failed this suite spuriously.
+const START_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---- process lifecycle ----
 
@@ -111,6 +113,13 @@ async fn mc_transform_spine_through_real_daemon() {
     let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
         .await
         .unwrap();
+
+    // Module registration is asynchronous relative to our first route.open, and the
+    // daemon's unknown_module is a terminal control-plane reject (route_retry only
+    // covers transport failures). Under load the module's debug-build boot can lose
+    // this race by tens of seconds, so poll registration with a bounded probe before
+    // the first real call instead of relying on call-site retries.
+    wait_for_module_registration(&consumer, START_TIMEOUT).await;
 
     // ===== PRODUCTION-PATH cases (session "spine"): m0/m1 composed FROM the seeded store.
     // The seed (seed_store) gave "spine" one compartment covering ordinals 1..=10 (end id
@@ -425,7 +434,7 @@ fn spawn_daemon(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) -> Liv
 }
 
 fn spawn_module(module_bin: &Path, connection_file: &Path, data_home: &Path) -> ModuleProcess {
-    let child = Command::new(module_bin)
+    let mut child = Command::new(module_bin)
         .arg("--subc")
         .arg(connection_file)
         .env(subc_protocol::SUBC_MODULE_ID_ENV, MODULE_ID)
@@ -435,6 +444,19 @@ fn spawn_module(module_bin: &Path, connection_file: &Path, data_home: &Path) -> 
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn module {}: {e}", module_bin.display()));
+    // The module logs to stderr; an undrained pipe fills its 64KB buffer and the module
+    // BLOCKS on a stderr write mid-boot, so it never registers (observed as a spurious
+    // unknown_module reject once boot logging grew past the buffer). Drain continuously
+    // and forward so failures keep the module's log visible.
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            for line in std::io::BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                eprintln!("mc-module: {line}");
+            }
+        });
+    }
     ModuleProcess { child }
 }
 
@@ -450,7 +472,9 @@ fn write_empty_config(config_dir: &Path) {
 fn fast_consumer_options() -> ConsumerOptions {
     ConsumerOptions {
         handshake_timeout: Duration::from_secs(2),
-        call_timeout: Duration::from_secs(10),
+        // Debug-build module cold start under parallel cargo load can push the FIRST
+        // transform (bootstrap HARD) past 10s; this suite gates correctness, not latency.
+        call_timeout: Duration::from_secs(60),
         reconnect_backoff: RetryBackoff {
             base: Duration::from_millis(50),
             cap: Duration::from_millis(250),
@@ -462,13 +486,14 @@ fn fast_consumer_options() -> ConsumerOptions {
 
 fn fast_call_options() -> CallOptions {
     CallOptions {
-        timeout: Duration::from_secs(8),
+        // See fast_consumer_options: first-call cold start under load needs headroom.
+        timeout: Duration::from_secs(60),
         route_retry: RetryBackoff {
             base: Duration::from_millis(50),
             cap: Duration::from_millis(250),
             max_attempts: 60,
         },
-        route_retry_deadline: Duration::from_secs(10),
+        route_retry_deadline: Duration::from_secs(60),
         ..CallOptions::default()
     }
 }
@@ -504,6 +529,37 @@ fn identity_for(session: &str) -> BindIdentity {
             session: session.to_string(),
         })
         .clone()
+}
+
+async fn wait_for_module_registration(consumer: &SubcConsumer, wait: Duration) {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let probe = consumer
+            .call(
+                RouteTarget::ToolProvider {
+                    module_id: MODULE_ID.to_string(),
+                },
+                identity_for("registration-probe"),
+                serde_json::to_vec(&serde_json::json!({ "kind": "status", "v": 1 })).unwrap(),
+                fast_call_options(),
+            )
+            .await;
+        match probe {
+            Ok(_) => return,
+            Err(err) => {
+                let text = format!("{err:?}");
+                if !text.contains("unknown_module") {
+                    // Registered (or a different failure the real calls will surface) —
+                    // registration itself is no longer the blocker.
+                    return;
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("module did not register with the daemon within {wait:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn wait_for_connection_file(path: &Path, wait: Duration) {

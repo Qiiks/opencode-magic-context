@@ -43,13 +43,23 @@ You can set a memory to permanent through the dashboard or the desktop app. The 
 
 ## How memories inject
 
-Active memories render into a `<project-memory>` block that the agent sees every turn. The injection has a token budget (around 6,000 tokens by default, enough for roughly 150 memories). When the budget is tight, lower-priority memories are trimmed.
+Active memories render into a `<project-memory>` block that the agent sees every turn. The injection has a token budget (default: 4,000 tokens, configurable via `memory.injection_budget_tokens`, enough for roughly 150 memories). When the budget is tight, lower-priority memories are trimmed. Memories render as compact `#id: fact` lines grouped under one category tag, so the block stays small even on mature projects with large memory pools. Memory ids stay visible so `ctx_memory` actions keep working unchanged.
 
 Memories are ordered by category priority, then by recency within each category. Memories already visible in the rendered session history are filtered from search results to avoid duplication.
+
+When the text budget trims memories away, the optional experimental [memory mural](/concepts/mural/) can attach a single image of those overflow memories to the cached context baseline (vision models only).
 
 ## Retrieval-count promotion
 
 Each memory tracks how many times the agent has retrieved it via `ctx_search`. Memories with higher retrieval counts are more likely to be kept during dreamer maintenance — they've proven useful. Memories with zero retrievals and low seen counts are candidates for archival.
+
+## Importance classification
+
+The dreamer's **classify-memories** task scores each memory on importance, scope, and shareability. Importance orders which memories survive the injection budget; scope keeps recall focused on what this project actually needs; and shareability controls whether a memory is safe to pool across workspace members. Scoring moves off the wire entirely (it only orders what survives the budget), so background re-classification never busts the prompt cache.
+
+## Workspaces
+
+A **workspace** groups multiple project repos so their project memories pool across member sessions — useful for multi-repo microservice setups where the same constraints and architecture decisions apply across services. Create a workspace in the [dashboard](/reference/dashboard/), add member projects, and choose which memory categories are shared (CONSTRAINTS only, by default). Shared visibility is read-only: member projects can read shared categories from neighbors, but only the owning project can update, archive, or merge its own memories. A malformed `share_categories` list fails closed to sharing nothing rather than accidentally sharing everything.
 
 ## Editing memories
 

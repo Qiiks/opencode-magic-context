@@ -198,6 +198,10 @@ export function stripDroppedPlaceholderMessages(
                 hasContentPart = true;
                 const trimmed = part.text.trim();
                 if (trimmed.length === 0) continue;
+                if (!trimmed.includes("[dropped §")) {
+                    hasNonDroppedContent = true;
+                    break;
+                }
                 const allSegmentsDropped = trimmed
                     .split(/(?=\[dropped §)/)
                     .filter((s) => s.trim().length > 0)
@@ -214,6 +218,10 @@ export function stripDroppedPlaceholderMessages(
                 hasContentPart = true;
                 const trimmed = part.text.trim();
                 if (trimmed.length === 0) continue;
+                if (!trimmed.includes("[dropped §")) {
+                    hasNonDroppedContent = true;
+                    break;
+                }
                 const allSegmentsDropped = trimmed
                     .split(/(?=\[dropped §)/)
                     .filter((s) => s.trim().length > 0)
@@ -295,6 +303,9 @@ export function replayStrippedInlineThinking(
 
         for (const part of message.parts) {
             if (!isRecord(part) || part.type !== "text" || typeof part.text !== "string") continue;
+            // Both supported opening tags (`<think>` and `<thinking>`) share
+            // this prefix, so one native scan can reject clean text before regex.
+            if (!part.text.includes("<think")) continue;
             const cleaned = (part.text as string).replace(INLINE_THINKING_PATTERN, "");
             if (cleaned !== part.text) {
                 part.text = cleaned;

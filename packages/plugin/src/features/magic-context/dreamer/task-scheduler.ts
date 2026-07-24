@@ -140,9 +140,10 @@ export function planDueTasks(
     tasks: readonly DreamTaskRuntimeConfig[],
     now: number,
 ): DueTask[] {
-    // GC retired task rows (e.g. v1 improve/consolidate/archive-stale superseded
-    // by the verify/curate split). `tasks` is always the full canonical config
-    // set, so any stored row outside it is obsolete. Cheap + idempotent.
+    // GC retired task rows: improve, consolidate, and archive-stale were replaced
+    // by verify/curate, while render-mural was removed when the scheduler switched
+    // to its deterministic task set. Since `tasks` contains the full canonical set,
+    // any stored row outside it is obsolete. Cheap and idempotent.
     const pruned = pruneNonCanonicalTaskRows(
         db,
         projectIdentity,
@@ -209,7 +210,10 @@ function readRetrospectiveWatermark(
 }
 
 /** Record a transient failure: keep next_due_at so it hot-retries next tick,
- *  until MAX_TASK_RETRIES is exceeded, then advance to the next cron slot. */
+ *  until MAX_TASK_RETRIES is exceeded, then advance to the next cron slot.
+ *  Incomplete manifest drains use this path too: the retry cap prevents one
+ *  permanently failing unit from starving the slot forever, at the cost of
+ *  leaving its residue for the next scheduled slot after the cap is reached. */
 function recordTransientFailure(
     db: Database,
     projectIdentity: string,

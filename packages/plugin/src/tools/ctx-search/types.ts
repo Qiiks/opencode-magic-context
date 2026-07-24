@@ -1,12 +1,13 @@
 import type { Database } from "../../shared/sqlite";
+import type { ImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 
 /** Sources the agent can narrow ctx_search to. Facts are intentionally NOT a
  *  source — they're always rendered in <session-history> in message[0], so
  *  searching them returns content already visible in context. */
 export type CtxSearchSource = "memory" | "message" | "git_commit" | "primer" | "note";
 
-export interface CtxSearchArgs {
-    query: string;
+export interface CtxSearchArgs extends ImitatedReducedArgs {
+    query?: string;
     limit?: number;
     /** Restrict search to specific sources. Omit to search all; [] searches none. */
     sources?: CtxSearchSource[];
@@ -21,7 +22,7 @@ export interface CtxSearchToolDeps {
      * OpenCode's top-level `ctx.directory` reflects the launch dir, not the
      * session's working directory.
      */
-    resolveProjectPath: (directory: string) => string;
+    resolveProjectPath: (directory: string) => string | undefined;
     memoryEnabled?: boolean;
     embeddingEnabled?: boolean;
     /** When true, ctx_search surfaces indexed git commits as a 3rd source. */

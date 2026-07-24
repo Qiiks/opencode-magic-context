@@ -19,9 +19,10 @@ import {
     getMemoriesByProjects,
     getMemorySelectColumns,
     isMemoryRow,
-    readNewMemoriesForM1Union,
 } from "../../features/magic-context/memory/storage-memory";
 import type { Memory } from "../../features/magic-context/memory/types";
+import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
+import type { MuralWireOptions } from "../../features/magic-context/mural/resolve-mural";
 import {
     computeProjectDocsHash,
     GLOBAL_USER_PROFILE_PROJECT_PATH,
@@ -131,6 +132,7 @@ export function getVisibleMemoryIds(db: Database, sessionId: string): Set<number
 
 export interface CompartmentInjectionResult {
     injected: boolean;
+    prependedMessageCount: number;
     compartmentEndMessage: number;
     compartmentCount: number;
     skippedVisibleMessages: number;
@@ -505,7 +507,9 @@ export function renderCompartmentInjection(
     const historyBlock = `<session-history>\n${prepared.block}\n</session-history>`;
     const firstMessage = messages[0];
     const textPart = firstMessage ? findFirstTextPart(firstMessage.parts) : null;
+    let prependedMessageCount = 0;
     if (!firstMessage || !textPart || isDroppedPlaceholder(textPart.text)) {
+        prependedMessageCount = 1;
         // synthetic: true — injected context, not a real user turn. Keeps it out
         // of OpenCode's auto-title gate (issue #129) while still reaching the
         // model (toModelMessagesEffect filters `ignored`, not `synthetic`).
@@ -532,6 +536,7 @@ export function renderCompartmentInjection(
 
     return {
         injected: true,
+        prependedMessageCount,
         compartmentEndMessage: prepared.compartmentEndMessage,
         compartmentCount: prepared.compartmentCount,
         skippedVisibleMessages: prepared.skippedVisibleMessages,
@@ -574,6 +579,8 @@ export interface M0SnapshotMarkers {
     systemHash: string;
     modelKey: string;
     projectIdentity?: string | null;
+    /** Hash of the image identity folded into this m0 baseline. */
+    muralHash?: string | null;
 }
 
 /**
@@ -619,6 +626,10 @@ export interface M0M1State {
     cachedM0ModelKey: string | null;
     cachedM0ProjectIdentity?: string | null;
     snapshotMarkers?: M0SnapshotMarkers | null;
+    /** Keep the persisted mural image unchanged for the current cached M0 prompt;
+     * replace it only when the next normal hard cache fold rebuilds that prompt. */
+    cachedM0MuralDataUrl?: string | null;
+    cachedM0MuralHash?: string | null;
 }
 
 export interface M0M1RenderOptions {
@@ -634,6 +645,17 @@ export interface M0M1RenderOptions {
     historyBudgetTokens?: number;
     userProfileBudgetTokens?: number;
     temporalAwareness?: boolean;
+    /** Experimental image injection. The caller resolves model capability from
+     * the models.dev metadata; unknown capability means no image is injected.
+     * Normally left undefined: the mural is now rendered ON DEMAND inside the
+     * HARD fold from `muralEnabled` + the fold's model key (see resolveMuralWire),
+     * so the injected data-url only swaps on a natural fold. Tests may still pass
+     * an explicit `mural` to drive the render deterministically. */
+    mural?: { enabled: boolean; supportsVision: boolean; dataUrl?: string; contentHash?: string };
+    /** Experimental mural feature switch (experimental.mural.enabled). When true
+     * and the fold's model accepts images, materializeM0 resolves + renders the
+     * deterministic mural on demand and folds its image into the m[0] baseline. */
+    muralEnabled?: boolean;
     isCacheBustingPass?: boolean;
     /** Provider-side cache-eviction signals for HARD-bust detection. */
     hardSignals?: M0HardSignals;
@@ -657,6 +679,7 @@ export interface MaterializeM0Result {
 
 export interface InjectM0M1Result {
     injected: boolean;
+    prependedMessageCount: number;
     m0RematerializedThisPass: boolean;
     materializationContentionRetryExhausted: boolean;
     decision: MaterializeDecision;
@@ -705,6 +728,7 @@ const DEFAULT_HISTORY_BUDGET_TOKENS = 60_000;
 export const DEFAULT_MEMORY_BUDGET_TOKENS = 8_000;
 
 export const DEFAULT_USER_PROFILE_BUDGET_TOKENS = 4_000;
+const MAX_FORCED_MEMORIES_PER_DELTA = 10;
 const M0_EMPTY_BODY = "<session-history></session-history>";
 const M1_EMPTY_PLACEHOLDER =
     "<session-history-since>(no new content since last materialization)</session-history-since>";
@@ -833,6 +857,8 @@ function memoryRenderOrder(left: Memory, right: Memory): number {
 const maxCompartmentSeqStatements = new WeakMap<Database, PreparedStatement>();
 const maxMemoryIdStatements = new WeakMap<Database, PreparedStatement>();
 const legacyCompartmentCountStatements = new WeakMap<Database, PreparedStatement>();
+const markerChangeProbeStatements = new WeakMap<Database, PreparedStatement>();
+const markerReadCaches = new WeakMap<Database, BoundedSessionMap<MarkerReadCacheEntry>>();
 const m0CompartmentStatements = new WeakMap<Database, PreparedStatement>();
 const newCompartmentStatements = new WeakMap<Database, PreparedStatement>();
 
@@ -869,13 +895,21 @@ function getMaxCompartmentSeq(db: Database, sessionId: string): number {
     return numberFromRow(row, "s");
 }
 
-function getMaxMemoryId(db: Database, projectPath: string | undefined): number {
+function getMaxMemoryId(
+    db: Database,
+    projectPath: string | undefined,
+    expiryCutoff: number = Date.now(),
+): number {
     if (!projectPath) return 0;
     const row = cachedStatement(
         maxMemoryIdStatements,
         db,
-        "SELECT COALESCE(MAX(id), 0) AS max_id FROM memories WHERE project_path = ?",
-    ).get(projectPath);
+        `SELECT COALESCE(MAX(id), 0) AS max_id
+           FROM memories
+          WHERE project_path = ?
+            AND status IN ('active', 'permanent')
+            AND (expires_at IS NULL OR expires_at > ?)`,
+    ).get(projectPath, expiryCutoff);
     return numberFromRow(row, "max_id");
 }
 
@@ -908,7 +942,7 @@ function getGlobalUserProfileVersion(db: Database): number {
     return getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH)?.projectUserProfileVersion ?? 0;
 }
 
-export function readCurrentM0SnapshotMarkers(args: {
+interface M0SnapshotMarkerReadArgs {
     db: Database;
     sessionId: string;
     projectPath?: string;
@@ -916,47 +950,315 @@ export function readCurrentM0SnapshotMarkers(args: {
     injectDocs?: boolean;
     hardSignals?: M0HardSignals;
     workspaceIdentitySet?: WorkspaceIdentitySet;
-}): M0SnapshotMarkers {
+}
+
+interface MarkerChangeProbe {
+    projectMemoryEpoch: number;
+    projectUserProfileVersion: number;
+    maxCompartmentSeq: number;
+    legacyCompartmentCount: number;
+    maxMemoryId: number;
+    maxMutationId: number;
+    maxMemoryMutationId: number;
+    workspaceSignature: string;
+    workspaceEpochSignature: string;
+    aliasSignature: string;
+}
+
+interface MarkerReadCacheEntry {
+    markers: M0SnapshotMarkers;
+    probe: MarkerChangeProbe;
+    workspace: WorkspaceRenderContext;
+    workspaceIdentity: string;
+}
+
+interface MarkerChangeProbeRow {
+    project_memory_epoch: number;
+    project_user_profile_version: number;
+    max_compartment_seq: number;
+    legacy_compartment_count: number;
+    max_memory_id: number;
+    max_mutation_id: number;
+    max_memory_mutation_id: number;
+    workspace_signature: string;
+    workspace_epoch_signature: string;
+    alias_signature: string;
+}
+
+const MARKER_CHANGE_PROBE_SQL = `
+    WITH
+      expanded(project_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?)),
+      own(project_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?)),
+      shared(category) AS (SELECT CAST(value AS TEXT) FROM json_each(?)),
+      canonical(project_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?))
+    SELECT
+      COALESCE((
+        SELECT project_memory_epoch FROM project_state WHERE project_path = ?
+      ), 0) AS project_memory_epoch,
+      COALESCE((
+        SELECT project_user_profile_version FROM project_state WHERE project_path = ?
+      ), 0) AS project_user_profile_version,
+      COALESCE((
+        SELECT MAX(sequence) FROM compartments WHERE session_id = ?
+      ), -1) AS max_compartment_seq,
+      (
+        SELECT COUNT(*) FROM compartments WHERE session_id = ? AND legacy = 1
+      ) AS legacy_compartment_count,
+      COALESCE((
+        SELECT MAX(memory.id)
+          FROM memories AS memory
+         WHERE memory.project_path IN (SELECT project_path FROM expanded)
+           AND memory.status IN ('active', 'permanent')
+           AND (memory.expires_at IS NULL OR memory.expires_at > ?)
+           AND (
+             memory.project_path IN (SELECT project_path FROM own)
+             OR (
+               memory.shareable = 1
+               AND memory.scope IN ('project', 'ecosystem', 'universe')
+               AND memory.category IN (SELECT category FROM shared)
+             )
+           )
+      ), 0) AS max_memory_id,
+      COALESCE((
+        SELECT MAX(id) FROM m0_mutation_log WHERE session_id = ?
+      ), 0) AS max_mutation_id,
+      COALESCE((
+        SELECT MAX(id)
+          FROM memory_mutation_log
+         WHERE project_path IN (SELECT project_path FROM expanded)
+      ), 0) AS max_memory_mutation_id,
+      COALESCE((
+        SELECT GROUP_CONCAT(signature, char(30))
+          FROM (
+            SELECT member.workspace_id || char(31) || member.project_path || char(31) ||
+                   member.display_name || char(31) || member.display_path || char(31) ||
+                   workspace.share_categories AS signature
+              FROM workspace_members AS anchor
+              JOIN workspace_members AS member ON member.workspace_id = anchor.workspace_id
+              JOIN workspaces AS workspace ON workspace.id = member.workspace_id
+             WHERE anchor.project_path = ?
+             ORDER BY member.workspace_id, member.project_path
+          )
+      ), '') AS workspace_signature,
+      COALESCE((
+        SELECT GROUP_CONCAT(signature, char(30))
+          FROM (
+            SELECT canonical.project_path || char(31) ||
+                   COALESCE(state.project_memory_epoch, 0) AS signature
+              FROM canonical
+              LEFT JOIN project_state AS state ON state.project_path = canonical.project_path
+             ORDER BY canonical.project_path
+          )
+      ), '') AS workspace_epoch_signature,
+      COALESCE((
+        SELECT GROUP_CONCAT(signature, char(30))
+          FROM (
+            SELECT alias.old_project_path || char(31) || alias.new_project_path AS signature
+              FROM v22_identity_rekey_map AS alias
+             WHERE alias.new_project_path IN (SELECT project_path FROM canonical)
+             ORDER BY alias.old_project_path, alias.new_project_path
+          )
+      ), '') AS alias_signature`;
+
+function workspaceIdentity(workspace: WorkspaceRenderContext): string {
+    return JSON.stringify({
+        identities: workspace.identities,
+        expandedIdentities: workspace.expandedIdentities,
+        ownIdentities: workspace.ownIdentities,
+        shareCategories: workspace.shareCategories,
+        names: [...workspace.namesByIdentity].sort(([left], [right]) => left.localeCompare(right)),
+    });
+}
+
+function markerReadCacheKey(args: M0SnapshotMarkerReadArgs): string {
+    const suppliedWorkspace = args.workspaceIdentitySet
+        ? JSON.stringify({
+              identities: args.workspaceIdentitySet.identities,
+              names: [...args.workspaceIdentitySet.namesByIdentity].sort(([left], [right]) =>
+                  left.localeCompare(right),
+              ),
+          })
+        : "auto";
+    return `${args.sessionId}\u0000${args.projectPath ?? ""}\u0000${suppliedWorkspace}`;
+}
+
+function getMarkerReadCache(db: Database): BoundedSessionMap<MarkerReadCacheEntry> {
+    let cache = markerReadCaches.get(db);
+    if (!cache) {
+        cache = new BoundedSessionMap<MarkerReadCacheEntry>(100);
+        markerReadCaches.set(db, cache);
+    }
+    return cache;
+}
+
+function readMarkerChangeProbe(
+    args: M0SnapshotMarkerReadArgs,
+    workspace: WorkspaceRenderContext,
+): MarkerChangeProbe {
+    const statement = cachedStatement(
+        markerChangeProbeStatements,
+        args.db,
+        MARKER_CHANGE_PROBE_SQL,
+    );
+    const row = statement.get(
+        JSON.stringify(workspace.expandedIdentities),
+        JSON.stringify(workspace.ownIdentities),
+        JSON.stringify(workspace.shareCategories ?? []),
+        JSON.stringify(workspace.identities),
+        args.projectPath ?? "",
+        GLOBAL_USER_PROFILE_PROJECT_PATH,
+        args.sessionId,
+        args.sessionId,
+        Date.now(),
+        args.sessionId,
+        args.projectPath ?? "",
+    ) as MarkerChangeProbeRow;
+    return {
+        projectMemoryEpoch: row.project_memory_epoch,
+        projectUserProfileVersion: row.project_user_profile_version,
+        maxCompartmentSeq: row.max_compartment_seq,
+        legacyCompartmentCount: row.legacy_compartment_count,
+        maxMemoryId: row.max_memory_id,
+        maxMutationId: row.max_mutation_id,
+        maxMemoryMutationId: row.max_memory_mutation_id,
+        workspaceSignature: row.workspace_signature,
+        workspaceEpochSignature: row.workspace_epoch_signature,
+        aliasSignature: row.alias_signature,
+    };
+}
+
+function markerChangeProbeEquals(left: MarkerChangeProbe, right: MarkerChangeProbe): boolean {
+    return (
+        left.projectMemoryEpoch === right.projectMemoryEpoch &&
+        left.projectUserProfileVersion === right.projectUserProfileVersion &&
+        left.maxCompartmentSeq === right.maxCompartmentSeq &&
+        left.legacyCompartmentCount === right.legacyCompartmentCount &&
+        left.maxMemoryId === right.maxMemoryId &&
+        left.maxMutationId === right.maxMutationId &&
+        left.maxMemoryMutationId === right.maxMemoryMutationId &&
+        left.workspaceSignature === right.workspaceSignature &&
+        left.workspaceEpochSignature === right.workspaceEpochSignature &&
+        left.aliasSignature === right.aliasSignature
+    );
+}
+
+function readCurrentM0SnapshotMarkersUncached(args: M0SnapshotMarkerReadArgs): {
+    markers: M0SnapshotMarkers;
+    workspace: WorkspaceRenderContext;
+} {
     const projectDirectory = args.projectDirectory ?? args.projectPath ?? "";
     const hard = args.hardSignals ?? EMPTY_HARD_SIGNALS;
+    const materializedAt = Date.now();
     const workspace = resolveWorkspaceRenderContext({
         db: args.db,
         projectPath: args.projectPath,
         workspaceIdentitySet: args.workspaceIdentitySet,
     });
     return {
-        projectMemoryEpoch: getProjectMemoryEpoch(args.db, args.projectPath),
-        workspaceFingerprint: workspace.isWorkspaced
-            ? computeWorkspaceEpochFingerprint(args.db, workspace.identities)
-            : null,
-        projectUserProfileVersion: getGlobalUserProfileVersion(args.db),
-        maxCompartmentSeq: getMaxCompartmentSeq(args.db, args.sessionId),
-        maxMemoryId: workspace.isWorkspaced
-            ? getMaxMemoryIdForProjects(
-                  args.db,
-                  workspace.expandedIdentities,
-                  workspace.ownIdentities,
-                  workspace.shareCategories,
-              )
-            : getMaxMemoryId(args.db, args.projectPath),
-        maxMutationId: getMaxM0MutationId(args.db, args.sessionId) ?? 0,
-        maxMemoryMutationId: workspace.isWorkspaced
-            ? (getMaxMemoryMutationIdForProjects(args.db, workspace.expandedIdentities) ?? 0)
-            : args.projectPath
-              ? (getMaxMemoryMutationId(args.db, args.projectPath) ?? 0)
-              : 0,
+        workspace,
+        markers: {
+            projectMemoryEpoch: getProjectMemoryEpoch(args.db, args.projectPath),
+            workspaceFingerprint: workspace.isWorkspaced
+                ? computeWorkspaceEpochFingerprint(args.db, workspace.identities)
+                : null,
+            projectUserProfileVersion: getGlobalUserProfileVersion(args.db),
+            maxCompartmentSeq: getMaxCompartmentSeq(args.db, args.sessionId),
+            maxMemoryId: workspace.isWorkspaced
+                ? getMaxMemoryIdForProjects(
+                      args.db,
+                      workspace.expandedIdentities,
+                      workspace.ownIdentities,
+                      workspace.shareCategories,
+                      materializedAt,
+                  )
+                : getMaxMemoryId(args.db, args.projectPath, materializedAt),
+            maxMutationId: getMaxM0MutationId(args.db, args.sessionId) ?? 0,
+            maxMemoryMutationId: workspace.isWorkspaced
+                ? (getMaxMemoryMutationIdForProjects(args.db, workspace.expandedIdentities) ?? 0)
+                : args.projectPath
+                  ? (getMaxMemoryMutationId(args.db, args.projectPath) ?? 0)
+                  : 0,
+            projectDocsHash:
+                projectDirectory && args.injectDocs !== false
+                    ? computeProjectDocsHash(projectDirectory)
+                    : "",
+            materializedAt,
+            sessionFactsVersion: getSessionFactsVersion(args.db, args.sessionId),
+            upgradeState: getUpgradeState(args.db, args.sessionId),
+            compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
+            systemHash: hard.systemHash,
+            modelKey: hard.modelKey,
+            projectIdentity: args.projectPath ?? null,
+        },
+    };
+}
+
+function refreshVolatileMarkerInputs(
+    markers: M0SnapshotMarkers,
+    args: M0SnapshotMarkerReadArgs,
+): M0SnapshotMarkers {
+    const projectDirectory = args.projectDirectory ?? args.projectPath ?? "";
+    const hard = args.hardSignals ?? EMPTY_HARD_SIGNALS;
+    return {
+        ...markers,
         projectDocsHash:
             projectDirectory && args.injectDocs !== false
                 ? computeProjectDocsHash(projectDirectory)
                 : "",
         materializedAt: Date.now(),
-        sessionFactsVersion: getSessionFactsVersion(args.db, args.sessionId),
-        upgradeState: getUpgradeState(args.db, args.sessionId),
-        compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
         systemHash: hard.systemHash,
         modelKey: hard.modelKey,
         projectIdentity: args.projectPath ?? null,
     };
+}
+
+/**
+ * Read the current marker set while keeping the steady-state decision to one query.
+ *
+ * Completeness is based on the values the full read observes, not writer heuristics:
+ * the probe reads project/global state, compartment sequence and legacy count,
+ * filtered memory and memory-mutation maxima, and the session m0-mutation maximum.
+ * Its workspace signatures include current membership, names, sharing policy,
+ * aliases, and every member epoch. Therefore historian publishes, all memory
+ * additions/mutations/classification changes, m0 mutations, epoch/profile bumps,
+ * membership transitions, alias writes, and legacy upgrades change at least one
+ * probe field. `sessionFactsVersion` is intentionally absent because its getter is
+ * pinned to zero and no longer renders; project docs retain their filesystem probe.
+ * A changed field falls through to the authoritative multi-read implementation.
+ */
+export function readCurrentM0SnapshotMarkers(args: M0SnapshotMarkerReadArgs): M0SnapshotMarkers {
+    const cache = getMarkerReadCache(args.db);
+    const cacheKey = markerReadCacheKey(args);
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        const probe = readMarkerChangeProbe(args, cached.workspace);
+        if (markerChangeProbeEquals(probe, cached.probe)) {
+            return refreshVolatileMarkerInputs(cached.markers, args);
+        }
+
+        const fresh = readCurrentM0SnapshotMarkersUncached(args);
+        const freshWorkspaceIdentity = workspaceIdentity(fresh.workspace);
+        const freshProbe =
+            freshWorkspaceIdentity === cached.workspaceIdentity
+                ? probe
+                : readMarkerChangeProbe(args, fresh.workspace);
+        cache.set(cacheKey, {
+            markers: fresh.markers,
+            probe: freshProbe,
+            workspace: fresh.workspace,
+            workspaceIdentity: freshWorkspaceIdentity,
+        });
+        return fresh.markers;
+    }
+
+    const fresh = readCurrentM0SnapshotMarkersUncached(args);
+    cache.set(cacheKey, {
+        markers: fresh.markers,
+        probe: readMarkerChangeProbe(args, fresh.workspace),
+        workspace: fresh.workspace,
+        workspaceIdentity: workspaceIdentity(fresh.workspace),
+    });
+    return fresh.markers;
 }
 
 function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null {
@@ -985,6 +1287,7 @@ function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null
         systemHash: state.cachedM0SystemHash ?? "",
         modelKey: state.cachedM0ModelKey ?? "",
         projectIdentity: state.cachedM0ProjectIdentity ?? null,
+        muralHash: state.cachedM0MuralHash ?? null,
     };
 }
 
@@ -1339,33 +1642,7 @@ function readNewCompartments(
     return rows.map(rowToM0Compartment);
 }
 
-function readNewMemoriesForM1(
-    db: Database,
-    projectPath: string | undefined,
-    afterId: number,
-    // Expiry cutoff is FROZEN to the m[0] materialization timestamp, NOT live
-    // Date.now(). Defer passes replay the same markers (same materializedAt), so
-    // the set of "not-yet-expired" memories rendered into m[1] stays byte-stable
-    // until the next materialization. Using live Date.now() here would let a
-    // memory crossing its expires_at between two defer passes silently change
-    // m[1] bytes with no DB mutation — a cache-stability (Anthropic prefix) bust.
-    expiryCutoff: number,
-): Memory[] {
-    if (!projectPath) return [];
-    const rows = db
-        .prepare(
-            `SELECT ${getMemorySelectColumns(db)}
-               FROM memories
-              WHERE project_path = ?
-                AND id > ?
-                AND status IN ('active', 'permanent')
-                AND (expires_at IS NULL OR expires_at > ?)
-              ORDER BY ${MEMORY_CATEGORY_ORDER_SQL}, id ASC`,
-        )
-        .all(projectPath, afterId, expiryCutoff)
-        .filter(isMemoryRow);
-    return rows.map((row) => ({ ...row }));
-}
+
 
 /**
  * Incremental token accounting for the grouped memory block. Trimming probes
@@ -1466,12 +1743,25 @@ function renderSessionHistoryWithDecay(args: {
     });
 }
 
+const MEMORY_MURAL_BLOCK =
+    "<memory-mural>\nThe project memory mural image follows.\n</memory-mural>";
+
+/** Remove a stale mural reference when a legacy cached baseline has no paired image payload. */
+export function stripMemoryMuralBlock(m0Text: string): string {
+    return m0Text
+        .split("\n\n")
+        .filter((section) => section !== MEMORY_MURAL_BLOCK)
+        .join("\n\n")
+        .trim();
+}
+
 export function renderM0(args: {
     projectDocs: string;
     userProfileBaseline: UserMemory[];
     compartments: M0Compartment[];
     memories: Memory[];
     facts: SessionFact[];
+    mural?: { enabled: boolean; supportsVision: boolean; dataUrl?: string };
     memoryRenderOptions?: MemoryRenderOptions;
     historyBudgetTokens?: number;
     userProfileBudgetTokens?: number;
@@ -1508,6 +1798,9 @@ export function renderM0(args: {
         args.memoryRenderOptions,
     );
     if (memoriesBlock) sections.push(memoriesBlock);
+    if (args.mural?.enabled && args.mural.supportsVision && args.mural.dataUrl) {
+        sections.push(MEMORY_MURAL_BLOCK);
+    }
     return sections.join("\n\n").trim();
 }
 
@@ -1541,6 +1834,7 @@ function applyMarkersToState(
     state.cachedM0SystemHash = markers.systemHash;
     state.cachedM0ModelKey = markers.modelKey;
     state.cachedM0ProjectIdentity = markers.projectIdentity;
+    state.cachedM0MuralHash = markers.muralHash ?? null;
     state.snapshotMarkers = markers;
 }
 
@@ -1559,6 +1853,22 @@ function applyMarkersToState(
 function historySliceTokens(m0Text: string): number {
     const slice = extractM0Block(m0Text, "session-history");
     return slice ? estimateTokens(slice) : 0;
+}
+
+/**
+ * Resolve the mural wire options for a HARD fold: no image unless the mural
+ * feature is enabled AND this fold's model accepts images. Renders the
+ * deterministic mural on demand (cheap change-detection; PNG only on change).
+ * Returns undefined when the feature is off so renderM0 skips the block cleanly.
+ */
+function resolveMuralForM0(
+    options: M0M1RenderOptions,
+    projectPath: string | undefined,
+    modelKey: string,
+    budgetTokens: number,
+): MuralWireOptions | undefined {
+    if (!options.muralEnabled) return undefined;
+    return resolveMuralWire(options.db, projectPath, modelKey, true, budgetTokens);
 }
 
 export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
@@ -1658,6 +1968,13 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
               memoryRenderOptions,
           )
         : trimMemoriesToBudgetV2(options.sessionId, memories, memoryBudget);
+    // On-demand mural: an explicit test-supplied `mural` wins; otherwise resolve
+    // it from the feature flag + this fold's model key. Runs INSIDE the HARD fold
+    // (not on defers), so the injected image only swaps on a natural fold — the
+    // baked-in cachedM0MuralDataUrl replays on defer passes.
+    const mural =
+        options.mural ??
+        resolveMuralForM0(options, projectPath, snapshotMarkers.modelKey, memoryBudget);
     let decayPressureMultiplier = 1;
     let m0Text = renderM0({
         projectDocs: docs.renderedBlock,
@@ -1669,6 +1986,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         historyBudgetTokens: options.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
         userProfileBudgetTokens: options.userProfileBudgetTokens,
         decayPressureMultiplier,
+        mural,
     });
 
     let attempts = 0;
@@ -1685,12 +2003,18 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             historyBudgetTokens: budget,
             userProfileBudgetTokens: options.userProfileBudgetTokens,
             decayPressureMultiplier,
+            mural,
         });
         attempts += 1;
     }
 
     if (m0Text.length === 0) m0Text = M0_EMPTY_BODY;
     const m0Bytes = Buffer.from(m0Text, "utf8");
+    const frozenMuralDataUrl =
+        mural?.enabled && mural.supportsVision ? (mural.dataUrl ?? null) : null;
+    const frozenMuralHash =
+        mural?.enabled && mural.supportsVision ? (mural.contentHash ?? null) : null;
+    snapshotMarkers.muralHash = frozenMuralHash;
     snapshotMarkers.materializedAt = foldMaterializedAt;
     const renderedMemoryIds = trimmed.renderOrder.map((m) => m.id);
     const phase3ProjectDocsHash = readProjectDocsForM0(
@@ -1722,8 +2046,9 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
                       currentWorkspace.expandedIdentities,
                       currentWorkspace.ownIdentities,
                       currentWorkspace.shareCategories,
-                  )
-                : getMaxMemoryId(options.db, projectPath),
+                      foldMaterializedAt,
+                   )
+                : getMaxMemoryId(options.db, projectPath, foldMaterializedAt),
             maxMutationId: getMaxM0MutationId(options.db, options.sessionId) ?? 0,
             maxMemoryMutationId: currentWorkspace.isWorkspaced
                 ? (getMaxMemoryMutationIdForProjects(
@@ -1781,9 +2106,14 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         );
         m1Text = m1Render.text;
         m1Bytes = Buffer.from(m1Text, "utf8");
+        const visibleMemoryIds = [
+            ...new Set([...renderedMemoryIds, ...m1Render.renderedMemoryIds]),
+        ];
 
         persistCachedM0(options.db, options.sessionId, {
             m0Bytes,
+            muralDataUrl: frozenMuralDataUrl,
+            muralHash: frozenMuralHash,
             projectMemoryEpoch: snapshotMarkers.projectMemoryEpoch,
             workspaceFingerprint: snapshotMarkers.workspaceFingerprint,
             projectUserProfileVersion: snapshotMarkers.projectUserProfileVersion,
@@ -1817,7 +2147,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             .prepare(
                 "UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ? WHERE session_id = ?",
             )
-            .run(renderedMemoryIds.length, JSON.stringify(renderedMemoryIds), options.sessionId);
+            .run(visibleMemoryIds.length, JSON.stringify(visibleMemoryIds), options.sessionId);
 
         // Persist the boundary the freshly-rendered m[0]+m[1] cover (the latest
         // compartment's end message id). A cold post-restart pass reads this to
@@ -1833,6 +2163,8 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             .run(baselineEndMessageId, options.sessionId);
 
         options.db.exec("COMMIT");
+        options.state.cachedM0MuralDataUrl = frozenMuralDataUrl;
+        options.state.cachedM0MuralHash = frozenMuralHash;
     } catch (error) {
         try {
             options.db.exec("ROLLBACK");
@@ -1870,12 +2202,13 @@ function renderMemoryUpdatesBlock(args: {
     workspace: WorkspaceRenderContext;
     afterId: number;
     renderedMemoryIds: readonly number[];
-}): { block: string; count: number } {
-    if (!args.projectPath || args.renderedMemoryIds.length === 0) {
-        return { block: "", count: 0 };
+    eligibleMemoryIds: ReadonlySet<number>;
+}): { block: string; count: number; forcedMemoryIds: number[] } {
+    if (!args.projectPath) {
+        return { block: "", count: 0, forcedMemoryIds: [] };
     }
 
-    const renderedIds = new Set(args.renderedMemoryIds);
+    const baselineIds = new Set(args.renderedMemoryIds);
     const mutations = args.workspace.isWorkspaced
         ? getMemoryMutationsForRenderByProjects(
               args.db,
@@ -1889,38 +2222,69 @@ function renderMemoryUpdatesBlock(args: {
               args.afterId,
               args.renderedMemoryIds,
           );
-    if (mutations.length === 0) return { block: "", count: 0 };
+    if (mutations.length === 0) return { block: "", count: 0, forcedMemoryIds: [] };
 
+    const forcedIds = new Set<number>();
     const lines = ["These memories changed since the snapshot below — trust these:"];
     for (const mutation of mutations) {
-        if (mutation.mutationType === "update") {
-            lines.push(
-                `  <updated id="${mutation.targetMemoryId}">${escapeXmlContent(mutation.newContent ?? "")}</updated>`,
-            );
-            continue;
-        }
         if (mutation.mutationType === "superseded") {
-            if (mutation.supersededById !== null && renderedIds.has(mutation.supersededById)) {
+            const replacementId = mutation.supersededById;
+            if (
+                replacementId !== null &&
+                !baselineIds.has(replacementId) &&
+                args.eligibleMemoryIds.has(replacementId)
+            ) {
+                forcedIds.add(replacementId);
+            }
+            if (!baselineIds.has(mutation.targetMemoryId)) continue;
+            if (replacementId !== null && args.eligibleMemoryIds.has(replacementId)) {
                 lines.push(
-                    `  <superseded id="${mutation.targetMemoryId}" by="${mutation.supersededById}"/>`,
+                    `  <superseded id="${mutation.targetMemoryId}" by="${replacementId}"/>`,
                 );
             } else {
                 lines.push(`  <removed id="${mutation.targetMemoryId}"/>`);
             }
             continue;
         }
+
+        if (!baselineIds.has(mutation.targetMemoryId)) {
+            if (
+                mutation.visibilityChanged &&
+                args.eligibleMemoryIds.has(mutation.targetMemoryId)
+            ) {
+                forcedIds.add(mutation.targetMemoryId);
+            }
+            continue;
+        }
+        if (!args.eligibleMemoryIds.has(mutation.targetMemoryId)) {
+            lines.push(`  <removed id="${mutation.targetMemoryId}"/>`);
+            continue;
+        }
+        if (mutation.visibilityChanged && mutation.newContent === null) continue;
+        if (mutation.mutationType === "update") {
+            lines.push(
+                `  <updated id="${mutation.targetMemoryId}">${escapeXmlContent(mutation.newContent ?? "")}</updated>`,
+            );
+            continue;
+        }
         lines.push(`  <removed id="${mutation.targetMemoryId}"/>`);
     }
 
+    const forcedMemoryIds = [...forcedIds]
+        .sort((left, right) => left - right)
+        .slice(0, MAX_FORCED_MEMORIES_PER_DELTA);
+    if (lines.length === 1) return { block: "", count: 0, forcedMemoryIds };
     return {
         block: `<memory-updates>\n${lines.join("\n")}\n</memory-updates>`,
-        count: mutations.length,
+        count: lines.length - 1,
+        forcedMemoryIds,
     };
 }
 
 interface RenderM1Result {
     text: string;
     memoryUpdateCount: number;
+    renderedMemoryIds: number[];
 }
 
 function renderM1WithMetadata(
@@ -1939,12 +2303,31 @@ function renderM1WithMetadata(
         workspaceIdentitySet: options.workspaceIdentitySet,
     });
 
+    const eligibleMemories = options.projectPath
+        ? workspace.isWorkspaced
+            ? getMemoriesByProjects(
+                  options.db,
+                  workspace.expandedIdentities,
+                  ["active", "permanent"],
+                  markers.materializedAt,
+                  workspace.ownIdentities,
+                  workspace.shareCategories,
+              )
+            : getMemoriesByProject(
+                  options.db,
+                  options.projectPath,
+                  ["active", "permanent"],
+                  markers.materializedAt,
+              )
+        : [];
+    const eligibleMemoryIds = new Set(eligibleMemories.map((memory) => memory.id));
     const memoryUpdates = renderMemoryUpdatesBlock({
         db: options.db,
         projectPath: options.projectPath,
         workspace,
         afterId: markers.maxMemoryMutationId,
         renderedMemoryIds,
+        eligibleMemoryIds,
     });
     if (memoryUpdates.block) blocks.push(memoryUpdates.block);
 
@@ -1961,26 +2344,13 @@ function renderM1WithMetadata(
         );
     }
 
-    const newMemories = workspace.isWorkspaced
-        ? readNewMemoriesForM1Union(
-              options.db,
-              workspace.expandedIdentities,
-              markers.maxMemoryId,
-              // Freeze expiry to the materialization timestamp for defer-pass byte stability.
-              markers.materializedAt,
-              workspace.ownIdentities,
-              workspace.shareCategories,
-          )
-        : readNewMemoriesForM1(
-              options.db,
-              options.projectPath,
-              markers.maxMemoryId,
-              // Freeze expiry to the materialization timestamp for defer-pass byte stability.
-              markers.materializedAt,
-          );
+    const forcedMemoryIds = new Set(memoryUpdates.forcedMemoryIds);
+    const newMemories = eligibleMemories.filter(
+        (memory) => memory.id > markers.maxMemoryId && !forcedMemoryIds.has(memory.id),
+    );
     const newMemoryRenderOptions: MemoryRenderOptions = {
         sourceNameByMemoryId: sourceNamesForMemories({
-            memories: newMemories,
+            memories: eligibleMemories,
             projectPath: options.projectPath,
             workspace,
         }),
@@ -1996,8 +2366,12 @@ function renderM1WithMetadata(
         ),
         newMemoryRenderOptions,
     ).renderOrder;
+    const deltaMemories = [
+        ...trimmedNewMemories,
+        ...eligibleMemories.filter((memory) => forcedMemoryIds.has(memory.id)),
+    ];
     const newMemoriesBlock = renderMemoryBlockV2(
-        trimmedNewMemories,
+        deltaMemories,
         "new-memories",
         newMemoryRenderOptions,
     );
@@ -2025,12 +2399,20 @@ function renderM1WithMetadata(
     // facts reach the agent as promoted memories via the new-memories block
     // above (maxMemoryId watermark), not via a <session_facts> delta here.
 
+    const renderedNewMemoryIds = newMemoriesBlock
+        ? trimmedNewMemories.map((memory) => memory.id)
+        : [];
     if (blocks.length === 0) {
-        return { text: M1_EMPTY_PLACEHOLDER, memoryUpdateCount: memoryUpdates.count };
+        return {
+            text: M1_EMPTY_PLACEHOLDER,
+            memoryUpdateCount: memoryUpdates.count,
+            renderedMemoryIds: renderedNewMemoryIds,
+        };
     }
     return {
         text: `<session-history-since>\n${blocks.join("\n")}\n</session-history-since>`,
         memoryUpdateCount: memoryUpdates.count,
+        renderedMemoryIds: renderedNewMemoryIds,
     };
 }
 
@@ -2049,6 +2431,8 @@ function decodeM0Bytes(bytes: Buffer | Uint8Array | null): string | null {
 
 interface CachedM0M1Row {
     cached_m0_bytes: Buffer | Uint8Array | null;
+    cached_m0_mural_data_url: string | null;
+    cached_m0_mural_hash: string | null;
     cached_m1_bytes: Buffer | Uint8Array | null;
     cached_m0_project_memory_epoch: number | null;
     cached_m0_workspace_fingerprint: string | null;
@@ -2095,7 +2479,8 @@ function parseMemoryBlockIds(raw: string | null): number[] {
 function readCachedM0M1Row(db: Database, sessionId: string): CachedM0M1Row | null {
     return db
         .prepare(
-            `SELECT cached_m0_bytes, cached_m1_bytes,
+            `SELECT cached_m0_bytes, cached_m0_mural_data_url,
+                    cached_m0_mural_hash, cached_m1_bytes,
                     cached_m0_project_memory_epoch,
                     cached_m0_workspace_fingerprint,
                     cached_m0_project_user_profile_version,
@@ -2143,12 +2528,15 @@ function markersFromCachedRow(row: CachedM0M1Row): M0SnapshotMarkers | null {
         systemHash: row.cached_m0_system_hash ?? "",
         modelKey: row.cached_m0_model_key ?? "",
         projectIdentity: row.cached_m0_project_identity ?? null,
+        muralHash: row.cached_m0_mural_hash ?? null,
     };
 }
 
 function cachedRowMatchesState(row: CachedM0M1Row, state: M0M1State): boolean {
     return (
         bufferEqualsNullable(row.cached_m0_bytes, state.cachedM0Bytes) &&
+        (row.cached_m0_mural_data_url ?? null) === (state.cachedM0MuralDataUrl ?? null) &&
+        (row.cached_m0_mural_hash ?? null) === (state.cachedM0MuralHash ?? null) &&
         row.cached_m0_project_memory_epoch === state.cachedM0ProjectMemoryEpoch &&
         (row.cached_m0_workspace_fingerprint ?? null) ===
             (state.cachedM0WorkspaceFingerprint ?? null) &&
@@ -2175,6 +2563,8 @@ function applyCachedRowToState(state: M0M1State, row: CachedM0M1Row): void {
         throw new RenderM1InvalidMarkersError(state.sessionId);
     }
     state.cachedM0Bytes = toBuffer(row.cached_m0_bytes);
+    state.cachedM0MuralDataUrl = row.cached_m0_mural_data_url ?? null;
+    state.cachedM0MuralHash = row.cached_m0_mural_hash ?? null;
     state.cachedM1Bytes = toBuffer(row.cached_m1_bytes);
     state.cachedM0ProjectMemoryEpoch = markers.projectMemoryEpoch;
     state.cachedM0WorkspaceFingerprint = markers.workspaceFingerprint;
@@ -2220,13 +2610,21 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
             const sibling = readCachedM0M1Row(options.db, options.sessionId);
             if (!sibling) throw new RenderM1InvalidMarkersError(options.sessionId);
             applyCachedRowToState(options.state, sibling);
-            return { text: replayCachedM1(options.state), memoryUpdateCount: 0 };
+            return {
+                text: replayCachedM1(options.state),
+                memoryUpdateCount: 0,
+                renderedMemoryIds: [],
+            };
         }
 
         const markers = markersFromCachedRow(row);
         if (!markers) throw new RenderM1InvalidMarkersError(options.sessionId);
-        const renderedMemoryIds = parseMemoryBlockIds(row.memory_block_ids);
-        const rendered = renderM1WithMetadata({ ...options }, markers, renderedMemoryIds);
+        const persistedVisibleIds = parseMemoryBlockIds(row.memory_block_ids);
+        // The snapshot watermark separates m[0] ids from post-snapshot m[1] ids,
+        // allowing each soft refresh to replace (rather than accumulate) m[1].
+        const renderedM0Ids = persistedVisibleIds.filter((id) => id <= markers.maxMemoryId);
+        const rendered = renderM1WithMetadata({ ...options }, markers, renderedM0Ids);
+        const visibleMemoryIds = [...new Set([...renderedM0Ids, ...rendered.renderedMemoryIds])];
         const m1Bytes = Buffer.from(rendered.text, "utf8");
         // Advance the persisted baseline boundary too: soft-refresh re-renders
         // m[1] to cover every compartment up to the latest, so the boundary the
@@ -2235,9 +2633,20 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
         const baselineEndMessageId = getLastCompartmentEndMessageId(options.db, options.sessionId);
         options.db
             .prepare(
-                "UPDATE session_meta SET cached_m1_bytes = ?, cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?",
+                `UPDATE session_meta
+                    SET cached_m1_bytes = ?,
+                        cached_m0_last_baseline_end_message_id = ?,
+                        memory_block_count = ?,
+                        memory_block_ids = ?
+                  WHERE session_id = ?`,
             )
-            .run(m1Bytes, baselineEndMessageId, options.sessionId);
+            .run(
+                m1Bytes,
+                baselineEndMessageId,
+                visibleMemoryIds.length,
+                JSON.stringify(visibleMemoryIds),
+                options.sessionId,
+            );
         options.db.exec("COMMIT");
         options.state.cachedM1Bytes = m1Bytes;
         options.state.snapshotMarkers = markers;
@@ -2257,7 +2666,8 @@ function prependM0M1Messages(
     messages: MessageLike[],
     m0Text: string,
     m1Text: string,
-): void {
+    mural?: { enabled: boolean; supportsVision: boolean; dataUrl?: string },
+): number {
     // `syntheticHead` identifies the injected m0 and m1 message positions for
     // marker placement; `synthetic: true` marks their parts as injected context,
     // not real user turns.
@@ -2270,6 +2680,10 @@ function prependM0M1Messages(
     // session's auto-title (issue #129). Must NOT use `ignored` here — that
     // would strip the history
     // injection from the real model call.
+    const muralImage =
+        mural?.enabled && mural.supportsVision && mural.dataUrl
+            ? { type: "file", mime: "image/png", url: mural.dataUrl, synthetic: true }
+            : null;
     messages.unshift(
         {
             info: { role: "user", sessionID: sessionId, syntheticHead: true },
@@ -2279,6 +2693,7 @@ function prependM0M1Messages(
                     text: m0Text.length > 0 ? m0Text : M0_EMPTY_BODY,
                     synthetic: true,
                 },
+                ...(muralImage ? [muralImage] : []),
             ],
         },
         {
@@ -2286,6 +2701,7 @@ function prependM0M1Messages(
             parts: [{ type: "text", text: m1Text, synthetic: true }],
         },
     );
+    return 2;
 }
 
 /**
@@ -2375,6 +2791,9 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
           )
         : trimMemoriesToBudgetV2(options.sessionId, memories, memoryBudget);
     const budget = options.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
+    const mural =
+        options.mural ??
+        resolveMuralForM0(options, projectPath, snapshotMarkers.modelKey, memoryBudget);
     let decayPressureMultiplier = 1;
     let m0Text = renderM0({
         projectDocs: docs.renderedBlock,
@@ -2386,6 +2805,7 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
         historyBudgetTokens: budget,
         userProfileBudgetTokens: options.userProfileBudgetTokens,
         decayPressureMultiplier,
+        mural,
     });
     let attempts = 0;
     while (budget > 0 && historySliceTokens(m0Text) > budget * 1.05 && attempts < 3) {
@@ -2400,10 +2820,16 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
             historyBudgetTokens: budget,
             userProfileBudgetTokens: options.userProfileBudgetTokens,
             decayPressureMultiplier,
+            mural,
         });
         attempts += 1;
     }
     if (m0Text.length === 0) m0Text = M0_EMPTY_BODY;
+    options.state.cachedM0MuralDataUrl =
+        mural?.enabled && mural.supportsVision ? (mural.dataUrl ?? null) : null;
+    options.state.cachedM0MuralHash =
+        mural?.enabled && mural.supportsVision ? (mural.contentHash ?? null) : null;
+    snapshotMarkers.muralHash = options.state.cachedM0MuralHash;
     return {
         m0Bytes: Buffer.from(m0Text, "utf8"),
         snapshotMarkers,
@@ -2412,6 +2838,16 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
 }
 
 export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
+    // Callers normally pass getOrCreateSessionMeta(), which already contains the
+    // persisted mural payload. Keep compatibility with lean process-local states
+    // by hydrating only from the exact cached row whose m0 bytes they hold.
+    if (options.state.cachedM0Bytes && options.state.cachedM0MuralDataUrl === undefined) {
+        const row = readCachedM0M1Row(options.db, options.sessionId);
+        if (row && bufferEqualsNullable(row.cached_m0_bytes, options.state.cachedM0Bytes)) {
+            options.state.cachedM0MuralDataUrl = row.cached_m0_mural_data_url ?? null;
+            options.state.cachedM0MuralHash = row.cached_m0_mural_hash ?? null;
+        }
+    }
     if (!options.workspaceIdentitySet && options.projectPath) {
         options = {
             ...options,
@@ -2420,6 +2856,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
     }
     const skipped: InjectM0M1Result = {
         injected: false,
+        prependedMessageCount: 0,
         m0RematerializedThisPass: false,
         materializationContentionRetryExhausted: false,
         decision: { value: false, reason: "skipped" },
@@ -2452,7 +2889,11 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
                 materialized.snapshotMarkers,
                 materialized.m1Bytes,
             );
-            m1Render = { text: materialized.m1Text, memoryUpdateCount: 0 };
+            m1Render = {
+                text: materialized.m1Text,
+                memoryUpdateCount: 0,
+                renderedMemoryIds: [],
+            };
             rematerialized = true;
         } catch (error) {
             if (!(error instanceof MaterializeContentionError)) throw error;
@@ -2590,12 +3031,35 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
         }
     }
 
+    // Legacy rows can contain the marker without the new persisted image. Omitting
+    // an image part already changes provider-visible multipart bytes, so also remove
+    // the now-false textual reference rather than claiming an image follows.
+    if (!options.state.cachedM0MuralDataUrl) {
+        m0Text = stripMemoryMuralBlock(m0Text);
+    }
+
+    let prependedMessageCount = 0;
     if (options.messages) {
-        prependM0M1Messages(options.sessionId, options.messages, m0Text, m1Text);
+        const muralForWire = options.state.cachedM0MuralDataUrl
+            ? {
+                  enabled: true,
+                  supportsVision: true,
+                  dataUrl: options.state.cachedM0MuralDataUrl,
+                  contentHash: options.state.cachedM0MuralHash ?? undefined,
+              }
+            : undefined;
+        prependedMessageCount = prependM0M1Messages(
+            options.sessionId,
+            options.messages,
+            m0Text,
+            m1Text,
+            muralForWire,
+        );
     }
 
     return {
         injected: true,
+        prependedMessageCount,
         m0RematerializedThisPass: rematerialized,
         materializationContentionRetryExhausted: contentionExhausted,
         decision,

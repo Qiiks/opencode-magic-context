@@ -38,7 +38,7 @@ const {
     getMemoriesByProject,
     insertMemory,
 } = await import("./storage-memory");
-const { promoteSessionFactsDurable } = await import("./promotion");
+const { embedPromotedFacts, promoteSessionFactsDurable } = await import("./promotion");
 
 let db: Database | null = null;
 
@@ -71,9 +71,10 @@ function makeMemoryDatabase(): Database {
     );
 
     CREATE TABLE IF NOT EXISTS memory_embeddings (
-      memory_id INTEGER PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+      memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
       embedding BLOB NOT NULL,
-      model_id TEXT
+      model_id TEXT NOT NULL,
+      PRIMARY KEY(memory_id, model_id)
     );
 
     CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -397,6 +398,76 @@ describe("promotion", () => {
             expect(getMemoryCount(db, "/repo/project")).toBe(1); // no duplicate insert
             // → the re-observed fact is invisible to active rendering despite recurrence.
             expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
+        });
+    });
+
+    describe("#given best-effort embedding of promoted facts", () => {
+        it("stores the vector under the registered model when the memory is unchanged", async () => {
+            db = makeMemoryDatabase();
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE_DECISIONS",
+                content: "Embed promoted facts eagerly",
+            });
+            mockEmbedText.mockImplementation(async () => ({
+                vector: new Float32Array([1, 2]),
+                modelId: "mock:model",
+                chunkModelId: "mock:chunk",
+                generation: 1,
+            }));
+
+            await embedPromotedFacts(db, "ses-1", "/repo/project", [
+                { memoryId: memory.id, content: memory.content },
+            ]);
+
+            const rows = db.prepare("SELECT model_id FROM memory_embeddings").all() as Array<{
+                model_id: string;
+            }>;
+            expect(rows).toHaveLength(1);
+            expect(rows[0].model_id).toBe("mock:model");
+        });
+
+        it("discards the stale vector when the memory is edited while embedding is in flight", async () => {
+            db = makeMemoryDatabase();
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "ARCHITECTURE_DECISIONS",
+                content: "Original promoted content",
+            });
+            let release: (() => void) | undefined;
+            const started = new Promise<void>((resolve) => {
+                mockEmbedText.mockImplementation(async () => {
+                    resolve();
+                    await new Promise<void>((done) => {
+                        release = done;
+                    });
+                    return {
+                        vector: new Float32Array([1, 2]),
+                        modelId: "mock:model",
+                        chunkModelId: "mock:chunk",
+                        generation: 1,
+                    };
+                });
+            });
+
+            const inFlight = embedPromotedFacts(db, "ses-1", "/repo/project", [
+                { memoryId: memory.id, content: memory.content },
+            ]);
+            await started;
+            // Edit the memory while the provider call is in flight: the vector
+            // about to arrive was computed from the ORIGINAL content.
+            db.prepare(
+                "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
+            ).run("Edited promoted content", "edited-hash", Date.now(), memory.id);
+            release?.();
+            await inFlight;
+
+            const count = (
+                db.prepare("SELECT COUNT(*) AS count FROM memory_embeddings").get() as {
+                    count: number;
+                }
+            ).count;
+            expect(count).toBe(0);
         });
     });
 });

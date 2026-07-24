@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, test } from "bun:test";
+
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
@@ -38,7 +39,7 @@ describe("migration v53: Synapse embedding storage", () => {
                 DROP TABLE embedding_measurement_corpus;
                 DROP TABLE shadow_embedding_registrations;
                 DROP TABLE synapse_batch_ledger;
-                DELETE FROM schema_migrations WHERE version = 53;
+                DELETE FROM schema_migrations WHERE version >= 53;
             `);
             runMigrations(db);
             db.prepare(

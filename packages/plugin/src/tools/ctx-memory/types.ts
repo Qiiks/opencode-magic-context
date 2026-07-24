@@ -1,30 +1,36 @@
 import type { MemorySourceType } from "../../features/magic-context/memory";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { Database } from "../../shared/sqlite";
+import type { ImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 
 // Actions a PRIMARY (non-dreamer) agent may run. Primary agents see active
 // memories — with their ids — in the injected <project-memory> block, so they
 // can target a specific memory to archive/update/merge in-session without
 // waiting for the dreamer. `archive` is the single soft-remove action (sets
 // status='archived'); the former `delete` action was an exact alias of it and
-// was removed. `list` (bulk enumeration) stays dreamer-only. Memory
-// verification (file mapping) and classification (importance/scope/shareable)
-// are no longer tool actions — the verify and classify dreamer tasks apply them
-// host-side from a manifest, so the agent never calls a tool for them.
-export const CTX_MEMORY_ACTIONS = ["write", "archive", "update", "merge"] as const;
+// was removed. `list` (bulk enumeration) stays dreamer-only. `get` is the
+// id-shaped read that the user-facing <project-memory> ids imply but no
+// dreamer-only-free action covered — the agent is given a memory id
+// (dashboard, guidance, this very block) and there is no other way to look
+// it up. Memory verification (file mapping) and classification
+// (importance/scope/shareable) are no longer tool actions — the verify and
+// classify dreamer tasks apply them host-side from a manifest, so the agent
+// never calls a tool for them.
+export const CTX_MEMORY_ACTIONS = ["write", "archive", "update", "merge", "get"] as const;
 
 export const CTX_MEMORY_DREAMER_ACTIONS = [...CTX_MEMORY_ACTIONS, "list"] as const;
 
 export type CtxMemoryAction = (typeof CTX_MEMORY_DREAMER_ACTIONS)[number];
 
-export interface CtxMemoryArgs {
-    action: CtxMemoryAction;
+export interface CtxMemoryArgs extends ImitatedReducedArgs {
+    action?: CtxMemoryAction;
     content?: string;
     category?: string;
     /**
      * Target memory id(s). One unified parameter for all id-taking actions:
      * update requires exactly one, archive one or more (batch), merge two or
-     * more. The former scalar `id` param was folded in here.
+     * more, get one or more (≤20, batch read). The former scalar `id` param
+     * was folded in here.
      */
     ids?: number[];
     limit?: number;
@@ -45,7 +51,7 @@ export interface CtxMemoryToolDeps {
      * `ctx_memory` operates on the session's project, not the launch
      * directory's project.
      */
-    resolveProjectPath: (directory: string) => string;
+    resolveProjectPath: (directory: string) => string | undefined;
     memoryEnabled?: boolean;
     embeddingEnabled?: boolean;
     allowedActions?: CtxMemoryAction[];

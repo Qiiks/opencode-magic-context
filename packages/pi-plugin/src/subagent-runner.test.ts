@@ -1,7 +1,8 @@
-import { describe, expect, it, mock, spyOn } from "bun:test";
+import { beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, join } from "node:path";
 import { PassThrough } from "node:stream";
 import * as loggerModule from "@magic-context/core/shared/logger";
 import type { SubagentRunOptions } from "@magic-context/core/shared/subagent-runner";
@@ -20,6 +21,12 @@ const ISOLATED_RETRY_LOG_MESSAGE =
 	"pi subagent: a loaded Pi extension started an agent turn before the child's prompt could run; retrying with an isolated extension set (user extensions disabled for this run)";
 const ISOLATED_RETRY_MODEL_UNAVAILABLE_LOG_MESSAGE =
 	"model unavailable in isolated retry: it is provided by a disabled extension; configure it through models.json or add a built-in/provider-configured fallback";
+const ISOLATED_RETRY_SILENT_LOG_MESSAGE =
+	"pi subagent: child exited successfully but emitted no protocol output (no agent_end, zero stdout); a loaded Pi extension likely broke print mode; retrying with an isolated extension set (user extensions disabled for this run)";
+
+beforeEach(() => {
+	__test.resetProviderFormCache();
+});
 
 type MockChild = ReturnType<typeof createMockChild>;
 
@@ -110,10 +117,12 @@ function runnerWith(
 		piBinary = "pi-test",
 		platform,
 		extraArgs,
+		subagentExtensions,
 	}: {
 		piBinary?: string;
 		platform?: NodeJS.Platform;
 		extraArgs?: readonly string[];
+		subagentExtensions?: readonly string[];
 	} = {},
 ) {
 	const remainingChildren = Array.isArray(childOrChildren)
@@ -129,6 +138,7 @@ function runnerWith(
 		piBinary,
 		platform,
 		extraArgs,
+		subagentExtensions,
 		spawnImpl: spawnImpl as never,
 	});
 	return { runner, spawnImpl };
@@ -250,6 +260,40 @@ describe("subagent-runner pure helpers", () => {
 				"/tmp/subagent-entry.js",
 			]),
 		);
+	});
+
+	it("uses the configured extension allowlist in order and resolves relative paths from Pi settings", () => {
+		const args = buildArgsForTest(
+			{ ...baseOptions, model: "anthropic/claude-sonnet" },
+			{
+				subagentExtensions: [
+					"provider-package",
+					"./extensions/provider.ts",
+					"../shared/provider.ts",
+				],
+			},
+		);
+
+		const firstExtension = args.indexOf("--extension");
+		expect(args.slice(firstExtension, firstExtension + 6)).toEqual([
+			"--extension",
+			join(homedir(), ".pi/agent/provider-package"),
+			"--extension",
+			join(homedir(), ".pi/agent/extensions/provider.ts"),
+			"--extension",
+			join(homedir(), ".pi/shared/provider.ts"),
+		]);
+		expect(args).toContain("--no-extensions");
+	});
+
+	it("keeps the current all-extension argv shape when no allowlist is configured", () => {
+		const args = buildArgsForTest({
+			...baseOptions,
+			model: "anthropic/claude-sonnet",
+		});
+
+		expect(args).not.toContain("--no-extensions");
+		expect(args).not.toContain("--extension");
 	});
 
 	it("disables project context files so hidden subagents see only our prompt", () => {
@@ -1163,7 +1207,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			reason: "no_assistant",
 			error: "pi agent_end did not include an assistant message",
 			durationMs: expect.any(Number),
-			meta: { stderr: undefined },
+			meta: { stderr: undefined, sawProtocolOutput: true },
 		});
 	});
 
@@ -1188,16 +1232,23 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			reason: "no_assistant",
 			error: "pi assistant produced empty text",
 			durationMs: expect.any(Number),
-			meta: { stderr: undefined },
+			meta: { stderr: undefined, sawProtocolOutput: true },
 		});
 	});
 
 	it("returns no_assistant for empty stdout and successful exit", async () => {
-		const child = createMockChild();
-		const { runner } = runnerWith(child);
+		// Issue #238: an empty-stdout exit-0 primary now fires the one-shot
+		// isolated retry. When the isolated attempt ALSO exits 0 with no output,
+		// the run settles as no_assistant (the retry must not loop forever) and
+		// carries the no-protocol-output marker.
+		const first = createMockChild();
+		const second = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second]);
 
 		const resultPromise = runner.run(baseOptions);
-		child.emitClose(0);
+		first.emitClose(0);
+		await nextTick();
+		second.emitClose(0);
 
 		const result = await resultPromise;
 
@@ -1209,8 +1260,12 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				stderr: undefined,
 				exitCode: 0,
 				signal: null,
+				sawProtocolOutput: false,
 			});
 		}
+		expect(spawnImpl).toHaveBeenCalledTimes(2);
+		expect(spawnImpl.mock.calls[0]?.[1]).not.toContain("--no-extensions");
+		expect(spawnImpl.mock.calls[1]?.[1]).toContain("--no-extensions");
 	});
 
 	it("returns non_zero_exit with stderr and exit metadata", async () => {
@@ -1233,6 +1288,200 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				exitCode: 7,
 				signal: null,
 			});
+		}
+	});
+
+	it("retries a translated provider with the canonical form after a missing-key exit", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second]);
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "openai/gpt-5.5",
+		});
+		first.writeStderr(
+			"No API key found for openai-codex. Use /login to authenticate.",
+		);
+		first.emitClose(1);
+		await nextTick();
+		second.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "direct API success" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		second.emitClose(0);
+
+		expect(await resultPromise).toEqual({
+			ok: true,
+			assistantText: "direct API success",
+			toolCallCount: 0,
+			durationMs: expect.any(Number),
+			meta: { stderr: undefined },
+		});
+		expect(spawnImpl).toHaveBeenCalledTimes(2);
+		expect(spawnImpl.mock.calls[0]?.[1]).toEqual(
+			expect.arrayContaining(["--model", "openai-codex/gpt-5.5"]),
+		);
+		expect(spawnImpl.mock.calls[1]?.[1]).toEqual(
+			expect.arrayContaining(["--model", "openai/gpt-5.5"]),
+		);
+	});
+
+	it("caches the provider form that succeeds for later spawns", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		const third = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second, third]);
+
+		const firstRun = runner.run({ ...baseOptions, model: "openai/gpt-5.5" });
+		first.writeStderr(
+			"No API key found for openai-codex. Use /login to authenticate.",
+		);
+		first.emitClose(1);
+		await nextTick();
+		second.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "first direct success" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		second.emitClose(0);
+		await firstRun;
+
+		const secondRun = runner.run({ ...baseOptions, model: "openai/gpt-5.4" });
+		third.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "cached direct success" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		third.emitClose(0);
+		await secondRun;
+
+		expect(spawnImpl).toHaveBeenCalledTimes(3);
+		expect(spawnImpl.mock.calls[2]?.[1]).toEqual(
+			expect.arrayContaining(["--model", "openai/gpt-5.4"]),
+		);
+	});
+
+	it("does not provider-retry an unrelated stderr failure", async () => {
+		const first = createMockChild();
+		const { runner, spawnImpl } = runnerWith(first);
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "openai/gpt-5.5",
+		});
+		first.writeStderr(
+			"No API key found for another-provider. Check configuration.",
+		);
+		first.emitClose(1);
+
+		const result = await resultPromise;
+		expect(result.ok).toBe(false);
+		expect(spawnImpl).toHaveBeenCalledTimes(1);
+	});
+
+	it("retries google's translated provider with canonical google", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second]);
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "google/gemini-2.5-pro",
+		});
+		first.writeStderr(
+			"No API key found for google-antigravity. Use /login to authenticate.",
+		);
+		first.emitClose(1);
+		await nextTick();
+		second.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "google API success" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		second.emitClose(0);
+		await resultPromise;
+
+		expect(spawnImpl).toHaveBeenCalledTimes(2);
+		expect(spawnImpl.mock.calls[0]?.[1]).toEqual(
+			expect.arrayContaining(["--model", "google-antigravity/gemini-2.5-pro"]),
+		);
+		expect(spawnImpl.mock.calls[1]?.[1]).toEqual(
+			expect.arrayContaining(["--model", "google/gemini-2.5-pro"]),
+		);
+	});
+
+	it("bounds provider and extension retries to three spawns", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		const third = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second, third]);
+		const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
+			() => {},
+		);
+
+		try {
+			const resultPromise = runner.run({
+				...baseOptions,
+				model: "openai/gpt-5.5",
+			});
+			first.writeStderr(
+				"No API key found for openai-codex. Use /login to authenticate.",
+			);
+			first.emitClose(1);
+			await nextTick();
+			second.writeStderr(COLLISION_STDERR);
+			second.emitClose(1);
+			await nextTick();
+			third.writeStdoutLine(
+				agentEnd([
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "bounded success" }],
+						stopReason: "stop",
+					},
+				]),
+			);
+			third.emitClose(0);
+
+			expect(await resultPromise).toEqual({
+				ok: true,
+				assistantText: "bounded success",
+				toolCallCount: 0,
+				durationMs: expect.any(Number),
+				meta: { stderr: undefined },
+			});
+			expect(spawnImpl).toHaveBeenCalledTimes(3);
+			expect(spawnImpl.mock.calls[0]?.[1]).toEqual(
+				expect.arrayContaining(["--model", "openai-codex/gpt-5.5"]),
+			);
+			expect(spawnImpl.mock.calls[1]?.[1]).toEqual(
+				expect.arrayContaining(["--model", "openai/gpt-5.5"]),
+			);
+			expect(spawnImpl.mock.calls[1]?.[1]).not.toContain("--no-extensions");
+			expect(spawnImpl.mock.calls[2]?.[1]).toEqual(
+				expect.arrayContaining(["--model", "openai/gpt-5.5"]),
+			);
+			expect(spawnImpl.mock.calls[2]?.[1]).toContain("--no-extensions");
+		} finally {
+			logSpy.mockRestore();
 		}
 	});
 
@@ -1350,6 +1599,45 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		expect(spawnImpl.mock.calls[1]?.[1]).toEqual(
 			expect.arrayContaining(["--model", "openai-codex/fallback"]),
 		);
+	});
+
+	it("does not start a retry loop when the allowlist already disables discovery", async () => {
+		const first = createMockChild();
+		const { runner, spawnImpl } = runnerWith(first, {
+			subagentExtensions: ["provider-package", "./provider.ts"],
+		});
+		const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
+			() => {},
+		);
+
+		try {
+			const resultPromise = runner.run({
+				...baseOptions,
+				model: "anthropic/primary",
+			});
+			first.writeStderr(COLLISION_STDERR);
+			first.emitClose(1);
+
+			const result = await resultPromise;
+			expect(result.ok).toBe(false);
+			expect(spawnImpl).toHaveBeenCalledTimes(1);
+			const args = spawnImpl.mock.calls[0]?.[1] as string[];
+			expect(args.filter((arg) => arg === "--no-extensions")).toHaveLength(1);
+			const firstExtension = args.indexOf("--extension");
+			expect(args.slice(firstExtension, firstExtension + 4)).toEqual([
+				"--extension",
+				join(homedir(), ".pi/agent/provider-package"),
+				"--extension",
+				join(homedir(), ".pi/agent/provider.ts"),
+			]);
+			expect(
+				logSpy.mock.calls.some(
+					(call) => call[1] === ISOLATED_RETRY_LOG_MESSAGE,
+				),
+			).toBe(false);
+		} finally {
+			logSpy.mockRestore();
+		}
 	});
 
 	it("does not start a retry loop when the spawn already disables extensions", async () => {
@@ -1497,6 +1785,139 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		expect(spawnImpl.mock.calls[2]?.[1]).not.toContain("--no-extensions");
 	});
 
+	it("retries once with --no-extensions after a silent exit-0 primary (no agent_end, zero stdout)", async () => {
+		// Issue #238: certain user extension sets make Pi --print exit 0 with
+		// ZERO stdout (no agent_end). The primary is classified no_assistant
+		// with no protocol output, which must fire the one-shot isolated retry
+		// instead of falling through every fallback model identically.
+		const first = createMockChild();
+		const second = createMockChild();
+		const { runner, spawnImpl } = runnerWith([first, second]);
+		const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
+			() => {},
+		);
+
+		try {
+			const resultPromise = runner.run({
+				...baseOptions,
+				model: "anthropic/claude-sonnet",
+			});
+			// Primary: exit 0, no stdout written at all.
+			first.emitClose(0);
+			await nextTick();
+			second.writeStdoutLine(
+				agentEnd([
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "isolated success" }],
+						stopReason: "stop",
+					},
+				]),
+			);
+			second.emitClose(0);
+
+			expect(await resultPromise).toEqual({
+				ok: true,
+				assistantText: "isolated success",
+				toolCallCount: 0,
+				durationMs: expect.any(Number),
+				meta: { stderr: undefined },
+			});
+			expect(spawnImpl).toHaveBeenCalledTimes(2);
+			expect(spawnImpl.mock.calls[0]?.[1]).not.toContain("--no-extensions");
+			expect(spawnImpl.mock.calls[1]?.[1]).toContain("--no-extensions");
+			expect(
+				logSpy.mock.calls.some(
+					(call) =>
+						call[0] === "pi-subagent" &&
+						call[1] === ISOLATED_RETRY_SILENT_LOG_MESSAGE,
+				),
+			).toBe(true);
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
+	it("does not fire the isolated retry when agent_end arrived with empty assistant text", async () => {
+		// A legitimate empty model response: Pi's machinery worked (agent_end
+		// observed) but the model returned only whitespace. This is no_assistant
+		// WITH protocol output, so it must fall through to fallback models rather
+		// than spend the one-shot isolated retry.
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child);
+		const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
+			() => {},
+		);
+
+		try {
+			const resultPromise = runner.run({
+				...baseOptions,
+				model: "anthropic/claude-sonnet",
+			});
+			child.writeStdoutLine(
+				agentEnd([
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "   " }],
+						stopReason: "stop",
+					},
+				]),
+			);
+			child.emitClose(0);
+
+			const result = await resultPromise;
+			expect(result.ok).toBe(false);
+			if (!result.ok) {
+				expect(result.reason).toBe("no_assistant");
+				expect(result.meta).toEqual({
+					stderr: undefined,
+					sawProtocolOutput: true,
+				});
+			}
+			// No isolated retry: exactly one spawn, discovery left enabled.
+			expect(spawnImpl).toHaveBeenCalledTimes(1);
+			expect(spawnImpl.mock.calls[0]?.[1]).not.toContain("--no-extensions");
+			expect(
+				logSpy.mock.calls.some(
+					(call) => call[1] === ISOLATED_RETRY_SILENT_LOG_MESSAGE,
+				),
+			).toBe(false);
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
+	it("isolated retry argv keeps explicit --extension entries while dropping discovered extensions", () => {
+		// The one-shot isolated retry re-runs buildArgs with
+		// disableDiscoveredExtensions: true. That must add --no-extensions (drop
+		// DISCOVERED user extensions) WITHOUT removing explicit --extension
+		// entries — the subagent-entry extension and any user-tier allowlist
+		// entries — because those supply the models/tools the child needs.
+		const args = buildArgsForTest(
+			{
+				...baseOptions,
+				agent: "sidekick",
+				model: "anthropic/claude-sonnet",
+			},
+			{
+				disableDiscoveredExtensions: true,
+				subagentEntryPath: "/tmp/subagent-entry.js",
+				subagentExtensions: ["provider-package"],
+			},
+		);
+
+		expect(args).toContain("--no-extensions");
+		expect(args).toEqual(
+			expect.arrayContaining(["--extension", "/tmp/subagent-entry.js"]),
+		);
+		expect(args).toEqual(
+			expect.arrayContaining([
+				"--extension",
+				join(homedir(), ".pi/agent/provider-package"),
+			]),
+		);
+	});
+
 	it("returns parse_failed when stdout is missing", async () => {
 		const child = createMockChild({ stdout: false });
 		const { runner } = runnerWith(child);
@@ -1564,6 +1985,36 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			| { env?: NodeJS.ProcessEnv }
 			| undefined;
 		expect(spawnOptions?.env).not.toBe(process.env);
+	});
+
+	it("keeps the Magic Context env guard when the extension allowlist is active", async () => {
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, {
+			subagentExtensions: ["provider-package"],
+		});
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "anthropic/model",
+		});
+		child.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "allowlisted" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		child.emitClose(0);
+		await resultPromise;
+
+		const spawnOptions = spawnImpl.mock.calls[0]?.[2] as
+			| { env?: NodeJS.ProcessEnv }
+			| undefined;
+		expect(spawnOptions?.env).toEqual(
+			expect.objectContaining({ MAGIC_CONTEXT_PI_SUBAGENT: "1" }),
+		);
 	});
 
 	it("does not let a post-terminal child signal override captured success", async () => {

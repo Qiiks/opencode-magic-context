@@ -604,11 +604,13 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages });
 
-        //#then — the large tool output is fully dropped to reclaim headroom.
-        expect(messages).toHaveLength(1);
+        //#then — the newest-window emergency arm keeps a structural skeleton.
+        expect(messages).toHaveLength(2);
         expect(messages[0]?.info.id).toBe("m-user");
+        expect(messages[1]?.info.id).toBe("m-assistant");
         const tags = getTagsBySession(db, "ses-force-materialize");
         expect(tags.find((tag) => tag.type === "tool")?.status).toBe("dropped");
+        expect(tags.find((tag) => tag.type === "tool")?.dropMode).toBe("truncated");
     });
 
     it("strips structural noise even when scheduler defers", async () => {
@@ -2980,7 +2982,7 @@ describe("createTransform historian failure handling", () => {
                                 parts: [
                                     {
                                         type: "text",
-                                        text: `<compartment start="1" end="2" title="Recovered">Summary</compartment>`,
+                                        text: `<compartment start="1" end="2" title="Recovered"><p1>Summary</p1></compartment>`,
                                     },
                                 ],
                             },

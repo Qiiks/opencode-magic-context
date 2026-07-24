@@ -5,13 +5,19 @@ import { ensureSessionMetaRow } from "./storage-meta-shared";
 import type { ContextUsage } from "./types";
 
 const emergencyRecoveryArmedSessions = new Set<string>();
+const providerOverflowReconfirmedSessions = new Set<string>();
 
 export function isEmergencyRecoveryArmed(sessionId: string): boolean {
     return emergencyRecoveryArmedSessions.has(sessionId);
 }
 
+export function isProviderOverflowReconfirmed(sessionId: string): boolean {
+    return providerOverflowReconfirmedSessions.has(sessionId);
+}
+
 export function resetEmergencyRecoveryRegistryForTest(): void {
     emergencyRecoveryArmedSessions.clear();
+    providerOverflowReconfirmedSessions.clear();
 }
 
 interface PersistedUsageRow {
@@ -834,11 +840,9 @@ export function getEmergencyInputSample(db: Database, sessionId: string): number
 }
 
 /**
- * Latch the usage sample after an emergency pass ACTED (plan.shouldDrop), even
- * when zero tags were actually removed (every target out of sync). Latching on
- * any acting pass — not only `droppedTools > 0` — stops a zero-reclaim pass from
- * re-busting the cache every ≥85% pass on the same stale sample; the 95% block
- * remains the backstop for genuine "nothing left to drop".
+ * Latch the usage sample on every emergency acting pass, including when the
+ * selector finds no eligible target. This stops repeated cache busts on the same
+ * stale sample; the 95% block remains the backstop for genuine "nothing left to drop".
  */
 export function setEmergencyDropSample(db: Database, sessionId: string, inputSample: number): void {
     db.transaction(() => {
@@ -1685,7 +1689,8 @@ export function getOverflowState(
 /**
  * Arm emergency recovery with its source. Provider overflow is the default;
  * proactive model-shrink callers must pass that origin explicitly. A parsed
- * provider limit is persisted transactionally with the arm.
+ * provider limit is persisted transactionally with the arm. Repeating a provider
+ * overflow while recovery is already durable records a process-local reconfirmation.
  */
 export function recordOverflowDetected(
     db: Database,
@@ -1698,6 +1703,16 @@ export function recordOverflowDetected(
     emergencyRecoveryArmedSessions.add(sessionId);
     db.transaction(() => {
         ensureSessionMetaRow(db, sessionId);
+        const prior = db
+            .prepare("SELECT needs_emergency_recovery FROM session_meta WHERE session_id = ?")
+            .get(sessionId) as { needs_emergency_recovery?: number } | undefined;
+        if (
+            origin === "provider_overflow" &&
+            typeof prior?.needs_emergency_recovery === "number" &&
+            prior.needs_emergency_recovery > 0
+        ) {
+            providerOverflowReconfirmedSessions.add(sessionId);
+        }
         if (typeof reportedLimit === "number" && reportedLimit > 0) {
             db.prepare(
                 "UPDATE session_meta SET detected_context_limit = ?, detected_context_limit_model_key = ?, needs_emergency_recovery = 1, emergency_recovery_origin = ?, observed_safe_input_tokens = 0, cache_alert_sent = 0 WHERE session_id = ?",
@@ -1747,6 +1762,7 @@ export function clearEmergencyRecovery(db: Database, sessionId: string): void {
     })();
     // Clear only after the durable clear succeeds.
     emergencyRecoveryArmedSessions.delete(sessionId);
+    providerOverflowReconfirmedSessions.delete(sessionId);
 }
 
 /**

@@ -5,13 +5,16 @@
 //! watermark on the next materializing pass (a publish never mutates cached
 //! render state directly).
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
 use mc_store::{
-    FactCandidate, HistorianChunkRange, HistorianDurableState, HistorianPhase,
-    HistorianPublishError, HistorianPublishPredicate, HistorianPublishRequest,
-    HistorianPublishResult, McStore, McStoreError, StoredCompartment,
+    CompartmentSetGeneration, FactCandidate, HistorianChunkRange, HistorianDurableState,
+    HistorianEventCandidate, HistorianPhase, HistorianPrimerCandidate, HistorianPublishError,
+    HistorianPublishPredicate, HistorianPublishRequest, HistorianPublishResult,
+    HistorianSelectedMessageIdentity, HistorianUserMemoryCandidate, McStore, McStoreError,
+    StoredCompartment,
 };
 
 use crate::historian_producer::{
@@ -31,19 +34,21 @@ const AUTH_REQUIRED_PREFIX: &str = "auth-required:";
 const UNKNOWN_ERROR_CLASS_PREFIX: &str = "unknown-error-class:";
 
 /// Project a validated compartment onto the durable store row shape. Validation
-/// resolves the message-id endpoints and tiers; publication only stamps the
-/// creation time and marks the row as v2 (non-legacy). Boundary dates currently
-/// arrive only through OpenCode shadow sync because the native harness does not
-/// provide a canonical message-timestamp source.
-fn to_stored_compartment(c: &ValidatedCompartment, created_at_ms: i64) -> StoredCompartment {
+/// resolves the message-id endpoints and tiers; publication stamps the row and
+/// carries the message-boundary dates captured by the native ingress path.
+fn to_stored_compartment(
+    c: &ValidatedCompartment,
+    created_at_ms: i64,
+    boundary_dates: &BTreeMap<String, String>,
+) -> StoredCompartment {
     StoredCompartment {
         sequence: c.sequence as i64,
         start_message: c.start_message as i64,
         end_message: c.end_message as i64,
         start_message_id: c.start_message_id.clone(),
         end_message_id: c.end_message_id.clone(),
-        start_date: None,
-        end_date: None,
+        start_date: boundary_dates.get(&c.start_message_id).cloned(),
+        end_date: boundary_dates.get(&c.end_message_id).cloned(),
         title: c.title.clone(),
         content: c.content.clone(),
         p1: c.p1.clone(),
@@ -52,7 +57,13 @@ fn to_stored_compartment(c: &ValidatedCompartment, created_at_ms: i64) -> Stored
         p4: c.p4.clone(),
         importance: c.importance.map(|i| i as i32).unwrap_or(50),
         episode_type: c.episode_type.clone(),
-        legacy: 0,
+        // Strict validation makes tierless output unreachable, but derive legacy
+        // from P1 so a future bypass cannot falsely mark a flat row as v2.
+        legacy: if c.p1.as_deref().is_some_and(|p1| !p1.trim().is_empty()) {
+            0
+        } else {
+            1
+        },
         created_at: created_at_ms,
     }
 }
@@ -67,6 +78,76 @@ fn to_store_fact(f: &crate::historian_validate::FactCandidate) -> FactCandidate 
         importance: None,
         expires_at: None,
         source_session_id: None,
+    }
+}
+
+fn source_compartment(
+    compartments: &[crate::historian_validate::ValidatedCompartment],
+    origin: Option<u64>,
+) -> Option<&crate::historian_validate::ValidatedCompartment> {
+    origin
+        .and_then(|index| index.checked_sub(1))
+        .and_then(|index| compartments.get(index as usize))
+}
+
+fn to_store_event(
+    event: &crate::historian_validate::ParsedEvent,
+    compartments: &[crate::historian_validate::ValidatedCompartment],
+    created_at: i64,
+) -> HistorianEventCandidate {
+    HistorianEventCandidate {
+        kind: event.kind.clone(),
+        at_compartment: event.at_compartment,
+        compartment_id: source_compartment(compartments, event.at_compartment)
+            .map(|compartment| compartment.sequence),
+        fields_json: serde_json::to_string(&event.fields).unwrap_or_else(|_| "{}".to_string()),
+        created_at,
+        harness: "module".to_string(),
+    }
+}
+
+fn to_store_primer(
+    candidate: &crate::historian_validate::PrimerCandidate,
+    session_id: &str,
+    project_path: &str,
+    compartments: &[crate::historian_validate::ValidatedCompartment],
+    created_at: i64,
+) -> HistorianPrimerCandidate {
+    let source = source_compartment(compartments, candidate.origin_compartment_index);
+    let start = source.or_else(|| compartments.first());
+    let end = source.or_else(|| compartments.last());
+    HistorianPrimerCandidate {
+        project_path: project_path.to_string(),
+        session_id: session_id.to_string(),
+        question: candidate.question.clone(),
+        source_compartment_start: start.map(|compartment| compartment.start_message),
+        source_compartment_end: end.map(|compartment| compartment.end_message),
+        source_start_message_id: start
+            .map(|compartment| compartment.start_message_id.clone())
+            .unwrap_or_default(),
+        source_end_message_id: end
+            .map(|compartment| compartment.end_message_id.clone())
+            .unwrap_or_default(),
+        source_message_time: created_at,
+        created_at,
+    }
+}
+
+fn to_store_user_observation(
+    observation: &crate::historian_validate::UserObservationCandidate,
+    session_id: &str,
+    compartments: &[crate::historian_validate::ValidatedCompartment],
+    created_at: i64,
+) -> HistorianUserMemoryCandidate {
+    let source = source_compartment(compartments, observation.origin_compartment_index);
+    let start = source.or_else(|| compartments.first());
+    let end = source.or_else(|| compartments.last());
+    HistorianUserMemoryCandidate {
+        content: observation.content.clone(),
+        session_id: session_id.to_string(),
+        source_compartment_start: start.map(|compartment| compartment.start_message),
+        source_compartment_end: end.map(|compartment| compartment.end_message),
+        created_at,
     }
 }
 
@@ -164,12 +245,15 @@ impl From<HistorianPublishError> for HistorianStateError {
 
 /// Try to start a historian firing. Single-flight is enforced here: any
 /// non-idle phase returns `Busy` with the unchanged state.
+#[allow(clippy::too_many_arguments)] // The durable firing snapshot carries each fence explicitly.
 pub fn fire(
     current: &HistorianDurableState,
     from_ordinal: u64,
     to_ordinal: u64,
     chunk_fingerprint: String,
+    selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
     expected_revert_epoch: u64,
+    compartment_set_generation: CompartmentSetGeneration,
     fired_at_ms: i64,
 ) -> Result<FireOutcome, HistorianStateError> {
     if from_ordinal > to_ordinal {
@@ -190,14 +274,17 @@ pub fn fire(
             to_ordinal,
         }),
         chunk_fingerprint,
+        selected_range_identities,
         producer_session_id: None,
         producer_run_id: None,
         fired_at_ms: Some(fired_at_ms),
         expected_revert_epoch,
+        compartment_set_generation,
         failure_backoff_at_ms: current.failure_backoff_at_ms,
         last_failure: current.last_failure.clone(),
         // A fire resolves whatever skip reason preceded it.
         last_no_fire: None,
+        consecutive_publish_failures: current.consecutive_publish_failures,
     }))
 }
 
@@ -241,7 +328,9 @@ pub fn tx_committed(
     current: &HistorianDurableState,
 ) -> Result<HistorianDurableState, HistorianStateError> {
     require_phase(current, HistorianPhase::Publishing, "tx_committed")?;
-    Ok(idle_after_success(current.firing_seq))
+    let mut next = idle_after_success(current.firing_seq);
+    next.consecutive_publish_failures = 0;
+    Ok(next)
 }
 
 pub fn tx_conflict(
@@ -275,6 +364,7 @@ pub fn abandon_with_detail(
         firing_seq: current.firing_seq,
         failure_backoff_at_ms: Some(failure_backoff_at_ms),
         last_failure: detail.or_else(|| current.last_failure.clone()),
+        consecutive_publish_failures: current.consecutive_publish_failures,
         ..HistorianDurableState::default()
     }
 }
@@ -302,6 +392,8 @@ pub fn publish_predicate(
         firing_seq: state.firing_seq,
         producer_run_id,
         chunk_fingerprint: state.chunk_fingerprint.clone(),
+        selected_range_identities: state.selected_range_identities.clone(),
+        compartment_set_generation: state.compartment_set_generation,
     })
 }
 
@@ -335,10 +427,16 @@ pub struct ValidatedPublishRequest<'a> {
     pub predicate: &'a HistorianPublishPredicate,
     pub observed_chunk_fingerprint: &'a str,
     pub validated: &'a ValidatedChunk,
+    /// Facts are dropped when either memory.enabled or memory.auto_promote is off.
+    pub promote_facts: bool,
+    /// User observations are stored only when the privacy collection gate is enabled.
+    pub collect_user_memory_candidates: bool,
     pub publication_floor_ordinal: u64,
     pub chunk_transcript: &'a str,
     /// Creation timestamp stamped on the appended compartment rows.
     pub created_at_ms: i64,
+    /// YYYY-MM-DD dates keyed by native message id; missing entries remain date-less.
+    pub boundary_dates: &'a BTreeMap<String, String>,
     pub failure_backoff_at_ms: i64,
     pub publication_fence: Option<&'a dyn HistorianPublicationFence>,
 }
@@ -374,9 +472,57 @@ pub fn publish_validated_chunk(
         .validated
         .compartments
         .iter()
-        .map(|c| to_stored_compartment(c, request.created_at_ms))
+        .map(|c| to_stored_compartment(c, request.created_at_ms, request.boundary_dates))
         .collect();
-    let facts: Vec<FactCandidate> = request.validated.facts.iter().map(to_store_fact).collect();
+    let facts: Vec<FactCandidate> = if request.promote_facts {
+        request.validated.facts.iter().map(to_store_fact).collect()
+    } else {
+        Vec::new()
+    };
+    let events: Vec<HistorianEventCandidate> = request
+        .validated
+        .events
+        .iter()
+        .map(|event| {
+            to_store_event(
+                event,
+                &request.validated.compartments,
+                request.created_at_ms,
+            )
+        })
+        .collect();
+    let primer_candidates: Vec<HistorianPrimerCandidate> = request
+        .validated
+        .primer_candidates
+        .iter()
+        .map(|candidate| {
+            to_store_primer(
+                candidate,
+                request.session_id,
+                request.project_path,
+                &request.validated.compartments,
+                request.created_at_ms,
+            )
+        })
+        .collect();
+    let user_memory_candidates: Vec<HistorianUserMemoryCandidate> =
+        if request.collect_user_memory_candidates {
+            request
+                .validated
+                .user_observations
+                .iter()
+                .map(|observation| {
+                    to_store_user_observation(
+                        observation,
+                        request.session_id,
+                        &request.validated.compartments,
+                        request.created_at_ms,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
     let publish_request = HistorianPublishRequest {
         session_id: request.session_id,
@@ -386,6 +532,10 @@ pub fn publish_validated_chunk(
         project_path: request.project_path,
         compartments: &compartments,
         facts: &facts,
+        promote_facts: request.promote_facts,
+        events: &events,
+        primer_candidates: &primer_candidates,
+        user_memory_candidates: &user_memory_candidates,
         publication_floor_ordinal: request.publication_floor_ordinal,
         chunk_transcript: Some(request.chunk_transcript),
     };
@@ -409,6 +559,18 @@ pub fn publish_validated_chunk(
             Err(HistorianStateError::Publish(
                 HistorianPublishError::FenceRejected { reason },
             ))
+        }
+        Err(error @ HistorianPublishError::CompartmentOverlap { .. }) => {
+            // The storage backstop found an overlap after the optimistic fence. Treat it
+            // like every other stale local race: make the matching firing immediately
+            // idle so the caller never leaves a durable Publishing wedge behind.
+            abandon_matching_run_without_cooldown(
+                store,
+                request.session_id,
+                request.predicate,
+                Some(format!("publish rejected: {error}")),
+            )?;
+            Err(HistorianStateError::Publish(error))
         }
         Err(HistorianPublishError::CasConflict {
             expected,
@@ -434,7 +596,16 @@ pub fn publish_validated_chunk(
                 },
             ))
         }
-        Err(err) => Err(err.into()),
+        Err(err) => {
+            // The publish error occurs after the producer has completed its work, so
+            // leave the producer run available for the normal recovery path instead of
+            // abandoning it. Record the failure so repeated publication errors remain visible.
+            let _ = store.record_historian_publish_failure_if_matching(
+                request.session_id,
+                request.predicate,
+            );
+            Err(err.into())
+        }
     }
 }
 
@@ -583,19 +754,50 @@ pub trait HistorianProducerDriver: Send {
         prompt: &str,
         model: &str,
     ) -> Result<RunHandle, HistorianProducerError>;
+    async fn start_with_generation(
+        &mut self,
+        session_id: &str,
+        system: &str,
+        prompt: &str,
+        model: &str,
+        _max_output_tokens: u32,
+        _temperature: f64,
+    ) -> Result<RunHandle, HistorianProducerError> {
+        self.start(session_id, system, prompt, model).await
+    }
     async fn await_output(
         &mut self,
         run_id: &str,
     ) -> Result<ProducerOutput, HistorianProducerError>;
+    async fn await_output_with_timeout(
+        &mut self,
+        run_id: &str,
+        _timeout: Duration,
+    ) -> Result<ProducerOutput, HistorianProducerError> {
+        self.await_output(run_id).await
+    }
     async fn redrain_output(
         &mut self,
         run_id: &str,
     ) -> Result<ProducerOutput, HistorianProducerError> {
         self.await_output(run_id).await
     }
+    async fn redrain_output_with_timeout(
+        &mut self,
+        run_id: &str,
+        _timeout: Duration,
+    ) -> Result<ProducerOutput, HistorianProducerError> {
+        self.redrain_output(run_id).await
+    }
     async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError>;
     async fn cancel(&mut self, run_id: &str) -> Result<(), HistorianProducerError>;
     async fn close(&mut self);
+    /// Delete the provider session on every terminal path. The default calls close()
+    /// for compatibility with older test producers, while production producers override
+    /// this method to explicitly delete session data before closing.
+    async fn purge_session(&mut self, _session_id: &str) {
+        self.close().await;
+    }
 }
 
 #[subc_client_rs::async_trait]
@@ -615,6 +817,27 @@ impl HistorianProducerDriver for HistorianProducer {
         HistorianProducer::start(self, session_id, system, prompt, model).await
     }
 
+    async fn start_with_generation(
+        &mut self,
+        session_id: &str,
+        system: &str,
+        prompt: &str,
+        model: &str,
+        max_output_tokens: u32,
+        temperature: f64,
+    ) -> Result<RunHandle, HistorianProducerError> {
+        HistorianProducer::start_with_generation(
+            self,
+            session_id,
+            system,
+            prompt,
+            model,
+            max_output_tokens,
+            temperature,
+        )
+        .await
+    }
+
     async fn await_output(
         &mut self,
         run_id: &str,
@@ -629,6 +852,22 @@ impl HistorianProducerDriver for HistorianProducer {
         HistorianProducer::redrain_output(self, run_id).await
     }
 
+    async fn await_output_with_timeout(
+        &mut self,
+        run_id: &str,
+        timeout: Duration,
+    ) -> Result<ProducerOutput, HistorianProducerError> {
+        HistorianProducer::await_output_with_timeout(self, run_id, timeout).await
+    }
+
+    async fn redrain_output_with_timeout(
+        &mut self,
+        run_id: &str,
+        timeout: Duration,
+    ) -> Result<ProducerOutput, HistorianProducerError> {
+        HistorianProducer::redrain_output_with_timeout(self, run_id, timeout).await
+    }
+
     async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError> {
         HistorianProducer::status(self, run_id).await
     }
@@ -639,6 +878,15 @@ impl HistorianProducerDriver for HistorianProducer {
 
     async fn close(&mut self) {
         HistorianProducer::close(self).await;
+    }
+
+    async fn purge_session(&mut self, session_id: &str) {
+        if HistorianProducer::purge_session(self, session_id)
+            .await
+            .is_err()
+        {
+            HistorianProducer::close(self).await;
+        }
     }
 }
 
@@ -655,10 +903,14 @@ pub struct HistorianFireRequest<'a> {
     pub from_ordinal: u64,
     pub to_ordinal: u64,
     pub chunk_fingerprint: &'a str,
+    pub selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
     pub expected_revert_epoch: u64,
+    pub compartment_set_generation: CompartmentSetGeneration,
     pub observed_chunk_fingerprint: &'a str,
     pub validation_chunk: &'a HistorianChunk,
     pub chunk_transcript: &'a str,
+    /// Message boundary dates captured with the native ingress messages.
+    pub boundary_dates: &'a BTreeMap<String, String>,
     pub prior_compartments: &'a [StoredCompartmentRange],
     pub validate_options: ValidateOptions,
     pub now_ms: i64,
@@ -674,6 +926,8 @@ pub struct HistorianReattachRequest<'a> {
     pub observed_chunk_fingerprint: &'a str,
     pub validation_chunk: &'a HistorianChunk,
     pub chunk_transcript: &'a str,
+    /// Message boundary dates captured with the native ingress messages.
+    pub boundary_dates: &'a BTreeMap<String, String>,
     pub prior_compartments: &'a [StoredCompartmentRange],
     pub validate_options: ValidateOptions,
     pub publication_floor_ordinal: u64,
@@ -966,7 +1220,9 @@ where
             request.from_ordinal,
             request.to_ordinal,
             request.chunk_fingerprint.to_string(),
+            request.selected_range_identities.clone(),
             request.expected_revert_epoch,
+            request.compartment_set_generation,
             request.now_ms,
         )? {
             FireOutcome::Busy(state) => return Ok(HistorianDriveOutcome::Busy(state)),
@@ -1098,6 +1354,7 @@ where
             observed_chunk_fingerprint: request.observed_chunk_fingerprint,
             validation_chunk: request.validation_chunk,
             chunk_transcript: request.chunk_transcript,
+            boundary_dates: request.boundary_dates,
             prior_compartments: request.prior_compartments,
             validate_options: request.validate_options,
             created_at_ms: request.now_ms,
@@ -1247,6 +1504,7 @@ where
         observed_chunk_fingerprint: request.observed_chunk_fingerprint,
         validation_chunk: request.validation_chunk,
         chunk_transcript: request.chunk_transcript,
+        boundary_dates: request.boundary_dates,
         prior_compartments: request.prior_compartments,
         validate_options: request.validate_options,
         created_at_ms: request.now_ms,
@@ -1274,6 +1532,7 @@ struct PublishOutputRequest<'a> {
     observed_chunk_fingerprint: &'a str,
     validation_chunk: &'a HistorianChunk,
     chunk_transcript: &'a str,
+    boundary_dates: &'a BTreeMap<String, String>,
     prior_compartments: &'a [StoredCompartmentRange],
     validate_options: ValidateOptions,
     created_at_ms: i64,
@@ -1295,6 +1554,7 @@ fn publish_output_from_awaiting(
         observed_chunk_fingerprint,
         validation_chunk,
         chunk_transcript,
+        boundary_dates,
         prior_compartments,
         validate_options,
         created_at_ms,
@@ -1347,27 +1607,28 @@ fn publish_output_from_awaiting(
     };
 
     let publishing = validation_ok(&validating)?;
-    persist_historian_state(store, session_id, publishing.clone())?;
+    let publishing_row_version = persist_historian_state(store, session_id, publishing.clone())?;
     let predicate = publish_predicate(&publishing)?;
-    // The commit-point fingerprint re-check lives INSIDE publish_validated_chunk, which
-    // abandons the matching firing (resetting the state to Idle+backoff) before returning
-    // the mismatch error. A separate pre-check here would compare the same fingerprints
-    // WITHOUT that abandon, so a mismatch would return early and strand the state in
-    // Publishing forever — a wedged historian that never refires. Rely on the internal
-    // guard as the single source of the check.
-    let loaded = store.load(session_id)?;
+    // Commit-point freshness checks live INSIDE publish_validated_chunk, which abandons
+    // the matching firing before returning a rejection. A separate pre-check could return
+    // early and strand the state in Publishing. Keep the row version written by the
+    // Publishing transition too: reloading here would adopt a racing sync's version and
+    // erase the CAS conflict that must retire this stale run.
     let published = publish_validated_chunk(
         store,
         ValidatedPublishRequest {
             session_id,
             project_path,
-            expected_row_version: loaded.row_version,
+            expected_row_version: Some(publishing_row_version),
             expected_revert_epoch: publishing.expected_revert_epoch,
             predicate: &predicate,
             observed_chunk_fingerprint,
             validated: &validated,
+            promote_facts: validate_options.memory_enabled && validate_options.auto_promote,
+            collect_user_memory_candidates: validate_options.user_memory_collection_enabled,
             publication_floor_ordinal: validated.unprocessed_from,
             chunk_transcript,
+            boundary_dates,
             created_at_ms,
             failure_backoff_at_ms,
             publication_fence,
@@ -1431,7 +1692,15 @@ fn abandon_matching_run_without_cooldown(
     predicate: &HistorianPublishPredicate,
     detail: Option<String>,
 ) -> Result<Option<u64>, HistorianStateError> {
-    Ok(store.abandon_historian_run_if_matching(session_id, predicate, None, detail.as_deref())?)
+    Ok(
+        store.abandon_historian_run_if_matching_with_publish_failure(
+            session_id,
+            predicate,
+            None,
+            detail.as_deref(),
+            true,
+        )?,
+    )
 }
 
 fn abandon_matching_run_with_detail(
@@ -1441,12 +1710,15 @@ fn abandon_matching_run_with_detail(
     failure_backoff_at_ms: i64,
     detail: Option<String>,
 ) -> Result<Option<u64>, HistorianStateError> {
-    Ok(store.abandon_historian_run_if_matching(
-        session_id,
-        predicate,
-        Some(failure_backoff_at_ms),
-        detail.as_deref(),
-    )?)
+    Ok(
+        store.abandon_historian_run_if_matching_with_publish_failure(
+            session_id,
+            predicate,
+            Some(failure_backoff_at_ms),
+            detail.as_deref(),
+            true,
+        )?,
+    )
 }
 
 #[cfg(test)]
@@ -1498,14 +1770,21 @@ mod tests {
 
     fn req(messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
+            cache_ttl: None,
             kind: "transform".to_string(),
             v: 2,
             serializer_profile: "owned-llmrunner".to_string(),
             session_id: "ses".to_string(),
             render_config: "cfg".to_string(),
+            system_prompt_hash: String::new(),
+            upgrade_state: String::new(),
+            is_subagent: false,
+            protected_tags: 20,
             provider_id: None,
             model_key: None,
             clear_reasoning_age: 50,
+            caveman_enabled: false,
+            caveman_min_chars: 500,
             tool_present: false,
             serve_native: false,
             native_messages: None,
@@ -1517,17 +1796,32 @@ mod tests {
             mid_turn: false,
             prev_response_completed_at_ms: None,
             request_observed_at_ms: None,
+            channel2_nudge_state: String::new(),
+            emergency_recovery_armed: false,
+            emergency_recovery_no_head_escape: false,
+            detected_context_limit: 0,
+            detected_context_limit_model_key: None,
             history_budget_tokens: None,
             declared_trim: None,
         }
     }
 
+    fn empty_boundary_dates() -> &'static BTreeMap<String, String> {
+        static EMPTY: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(BTreeMap::new)
+    }
+
     fn pctx<'a>() -> ProducerContext<'a> {
         ProducerContext {
             project_path: "git:proj",
+            note_project_path: "git:proj",
             project_directory: "/nonexistent-docs",
             history_budget_tokens: 60_000.0,
+            memory_budget_tokens: 8_000.0,
+            user_profile_budget_tokens: 4_000.0,
             memory_enabled: true,
+            inject_docs: true,
+            temporal_awareness: true,
             now_ms: 0,
             execute_threshold_percentage: 65.0,
             smart_drops: false,
@@ -1535,6 +1829,7 @@ mod tests {
             model_key: None,
             observed_last_response_at_ms: None,
             guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
+            historian_active: false,
             injected_reductions: Vec::new(),
         }
     }
@@ -1544,6 +1839,9 @@ mod tests {
             .unwrap()
             .ck_messages
             .unwrap_or_default()
+            .into_iter()
+            .map(crate::transform::ServedMessage::into_message)
+            .collect()
     }
 
     fn comp(seq: i64, start: i64, end: i64, end_id: &str, p1: &str) -> StoredCompartment {
@@ -1558,6 +1856,52 @@ mod tests {
             importance: 50,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn stored_compartment_legacy_flag_tracks_p1_presence() {
+        let tiered = ValidatedCompartment {
+            sequence: 1,
+            start_message: 1,
+            end_message: 2,
+            start_message_id: "m1#0".into(),
+            end_message_id: "m2#0".into(),
+            title: "tiered".into(),
+            content: "full".into(),
+            p1: Some("full".into()),
+            p2: Some("short".into()),
+            p3: Some("brief".into()),
+            p4: Some("".into()),
+            importance: None,
+            episode_type: None,
+        };
+        let flat = ValidatedCompartment {
+            p1: None,
+            p2: None,
+            p3: None,
+            p4: None,
+            ..tiered.clone()
+        };
+
+        assert_eq!(
+            to_stored_compartment(&tiered, 1, empty_boundary_dates()).legacy,
+            0
+        );
+        assert_eq!(
+            to_stored_compartment(&flat, 1, empty_boundary_dates()).legacy,
+            1
+        );
+    }
+
+    fn flat_historian_xml(content: &str) -> String {
+        format!(
+            r#"<output>
+<compartments>
+<compartment start="2" end="3" title="flat">{content}</compartment>
+</compartments>
+<meta><messages_processed>2-3</messages_processed><unprocessed_from>4</unprocessed_from></meta>
+</output>"#
+        )
     }
 
     fn historian_xml(p1: &str) -> String {
@@ -1614,6 +1958,10 @@ mod tests {
         ValidateOptions {
             sequence_offset: 1,
             in_emergency: true,
+            memory_enabled: true,
+            auto_promote: true,
+            user_memory_collection_enabled: false,
+            force_keep_last_compartment: false,
         }
     }
 
@@ -1621,6 +1969,45 @@ mod tests {
         store
             .replace_compartments("ses", &[comp(1, 1, 1, "m1", "C1 summary")])
             .unwrap();
+    }
+
+    fn test_selected_range_identities() -> Vec<HistorianSelectedMessageIdentity> {
+        ["m2", "m3"]
+            .into_iter()
+            .map(|mid| HistorianSelectedMessageIdentity {
+                mid: mid.to_string(),
+                block_identities: vec![mc_store::BlockIdentity {
+                    kind_tag: "text".to_string(),
+                    byte_fingerprint: format!("{mid}-content-a"),
+                }],
+            })
+            .collect()
+    }
+
+    fn test_meta_with_historian(historian: HistorianDurableState) -> ModuleMeta {
+        let mut meta = ModuleMeta {
+            historian,
+            ..Default::default()
+        };
+        for selected in test_selected_range_identities() {
+            meta.block_identity_by_mid
+                .insert(selected.mid, selected.block_identities);
+        }
+        meta
+    }
+
+    fn seed_test_selected_range_identities(store: &McStore) {
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta.clone();
+        for selected in test_selected_range_identities() {
+            meta.block_identity_by_mid
+                .insert(selected.mid, selected.block_identities);
+        }
+        if meta != loaded.meta {
+            store
+                .commit("ses", loaded.row_version, &loaded.core, &meta)
+                .unwrap();
+        }
     }
 
     #[derive(Default)]
@@ -1634,6 +2021,7 @@ mod tests {
         await_run_ids: Vec<String>,
         cancels: Vec<String>,
         closes: usize,
+        on_await_output: Option<Box<dyn FnOnce() + Send>>,
     }
 
     impl ScriptedProducer {
@@ -1649,6 +2037,11 @@ mod tests {
 
         fn with_status(mut self, result: Result<RunState, HistorianProducerError>) -> Self {
             self.statuses.push_back(result);
+            self
+        }
+
+        fn with_await_output_hook(mut self, hook: impl FnOnce() + Send + 'static) -> Self {
+            self.on_await_output = Some(Box::new(hook));
             self
         }
     }
@@ -1681,6 +2074,9 @@ mod tests {
             run_id: &str,
         ) -> Result<ProducerOutput, HistorianProducerError> {
             self.await_run_ids.push(run_id.to_string());
+            if let Some(hook) = self.on_await_output.take() {
+                hook();
+            }
             self.outputs
                 .pop_front()
                 .expect("scripted output result available")
@@ -1760,6 +2156,11 @@ mod tests {
         chunk: &'a HistorianChunk,
         prior: &'a [StoredCompartmentRange],
     ) -> HistorianFireRequest<'a> {
+        seed_test_selected_range_identities(store);
+        let compartment_set_generation = store
+            .load_historian_assembly_snapshot("ses")
+            .unwrap()
+            .compartment_set_generation;
         HistorianFireRequest {
             store,
             session_id: "ses",
@@ -1771,10 +2172,13 @@ mod tests {
             from_ordinal: 2,
             to_ordinal: 4,
             chunk_fingerprint: "fp",
+            selected_range_identities: test_selected_range_identities(),
             expected_revert_epoch: 0,
+            compartment_set_generation,
             observed_chunk_fingerprint: "fp",
             validation_chunk: chunk,
             chunk_transcript: "U: transcript",
+            boundary_dates: empty_boundary_dates(),
             prior_compartments: prior,
             validate_options: validate_options(),
             now_ms: 123,
@@ -1796,6 +2200,7 @@ mod tests {
             observed_chunk_fingerprint: "fp",
             validation_chunk: chunk,
             chunk_transcript: "U: transcript",
+            boundary_dates: empty_boundary_dates(),
             prior_compartments: prior,
             validate_options: validate_options(),
             publication_floor_ordinal: 4,
@@ -1815,13 +2220,16 @@ mod tests {
                 to_ordinal: 4,
             }),
             chunk_fingerprint: "fp".into(),
+            selected_range_identities: test_selected_range_identities(),
             producer_session_id: Some("producer-session".into()),
             producer_run_id: Some("run-3".into()),
             fired_at_ms: Some(10),
             expected_revert_epoch: 0,
+            compartment_set_generation: CompartmentSetGeneration::default(),
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
+            consecutive_publish_failures: 0,
         }
     }
 
@@ -1874,6 +2282,93 @@ mod tests {
         assert_eq!(c2.end_message_id, "m3#0");
         assert_eq!(c2.p1.as_deref(), Some("second arc full and exact"));
         assert_eq!(c2.created_at, 123);
+    }
+
+    #[tokio::test]
+    async fn selected_range_identity_drift_during_await_rejects_without_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(store(dir.path()));
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let hook_store = std::sync::Arc::clone(&store);
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Ok(producer_output(historian_xml("stale summary"))))
+            .with_await_output_hook(move || {
+                let loaded = hook_store.load("ses").unwrap();
+                let mut meta = loaded.meta;
+                meta.block_identity_by_mid.get_mut("m2").unwrap()[0].byte_fingerprint =
+                    "m2-content-b".to_string();
+                hook_store
+                    .commit("ses", loaded.row_version, &loaded.core, &meta)
+                    .unwrap();
+            });
+
+        let error = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            HistorianDriveError::State(HistorianStateError::Publish(
+                HistorianPublishError::FenceRejected { .. }
+            ))
+        ));
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(loaded.meta.historian.state, HistorianPhase::Idle);
+        assert_eq!(loaded.meta.historian.failure_backoff_at_ms, None);
+        assert_eq!(loaded.meta.publication_floor_ordinal, None);
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+        assert!(store
+            .load_chunk_transcripts_for_range("ses", 2, 4)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn tail_identity_extension_during_await_still_publishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(store(dir.path()));
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let hook_store = std::sync::Arc::clone(&store);
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Ok(producer_output(historian_xml("current summary"))))
+            .with_await_output_hook(move || {
+                let loaded = hook_store.load("ses").unwrap();
+                let mut meta = loaded.meta;
+                meta.block_identity_by_mid.insert(
+                    "m5".to_string(),
+                    vec![mc_store::BlockIdentity {
+                        kind_tag: "text".to_string(),
+                        byte_fingerprint: "later-content".to_string(),
+                    }],
+                );
+                hook_store
+                    .commit("ses", loaded.row_version, &loaded.core, &meta)
+                    .unwrap();
+            });
+
+        let outcome = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, HistorianDriveOutcome::Completed(_)));
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(loaded.meta.publication_floor_ordinal, Some(4));
+        assert!(loaded.meta.block_identity_by_mid.contains_key("m5"));
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -2279,7 +2774,20 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 0, 1).unwrap()
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            0,
+            CompartmentSetGeneration {
+                max_sequence: 1,
+                count: 1,
+            },
+            1,
+        )
+        .unwrap()
         {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
@@ -2290,10 +2798,7 @@ mod tests {
                 "ses",
                 None,
                 &CoreState::default(),
-                &ModuleMeta {
-                    historian: awaiting,
-                    ..Default::default()
-                },
+                &test_meta_with_historian(awaiting),
             )
             .unwrap();
         let mut producer = ScriptedProducer::default()
@@ -2318,6 +2823,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reattach_equal_length_identity_drift_rejects_before_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            0,
+            CompartmentSetGeneration {
+                max_sequence: 1,
+                count: 1,
+            },
+            1,
+        )
+        .unwrap()
+        {
+            FireOutcome::Fired(state) => state,
+            FireOutcome::Busy(_) => unreachable!(),
+        };
+        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        store
+            .commit(
+                "ses",
+                None,
+                &CoreState::default(),
+                &test_meta_with_historian(awaiting),
+            )
+            .unwrap();
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta;
+        meta.block_identity_by_mid.get_mut("m2").unwrap()[0].byte_fingerprint =
+            "m2-content-b".to_string();
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let mut producer = ScriptedProducer::default()
+            .with_status(Ok(RunState::Terminal))
+            .with_output(Ok(producer_output(historian_xml("stale replay summary"))));
+
+        let error =
+            reattach_historian_producer(&mut producer, reattach_request(&store, &chunk, &prior))
+                .await
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            HistorianDriveError::State(HistorianStateError::Publish(
+                HistorianPublishError::FenceRejected { .. }
+            ))
+        ));
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(loaded.meta.historian.state, HistorianPhase::Idle);
+        assert_eq!(loaded.meta.historian.failure_backoff_at_ms, None);
+        assert_eq!(loaded.meta.publication_floor_ordinal, None);
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn concurrent_lineages_reattach_and_publish_in_isolated_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -2336,11 +2904,24 @@ mod tests {
             store
                 .replace_compartments(lineage, &[comp(1, 1, 1, "m1", "C1 summary")])
                 .unwrap();
-            let fired =
-                match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 0, 1).unwrap() {
-                    FireOutcome::Fired(state) => state,
-                    FireOutcome::Busy(_) => unreachable!(),
-                };
+            let fired = match fire(
+                &HistorianDurableState::default(),
+                2,
+                4,
+                "fp".into(),
+                test_selected_range_identities(),
+                0,
+                CompartmentSetGeneration {
+                    max_sequence: 1,
+                    count: 1,
+                },
+                1,
+            )
+            .unwrap()
+            {
+                FireOutcome::Fired(state) => state,
+                FireOutcome::Busy(_) => unreachable!(),
+            };
             let awaiting =
                 producer_started(&fired, producer_session.to_string(), run_id.to_string()).unwrap();
             store
@@ -2348,10 +2929,7 @@ mod tests {
                     lineage,
                     None,
                     &CoreState::default(),
-                    &ModuleMeta {
-                        historian: awaiting,
-                        ..Default::default()
-                    },
+                    &test_meta_with_historian(awaiting),
                 )
                 .unwrap();
         }
@@ -2369,6 +2947,7 @@ mod tests {
             observed_chunk_fingerprint: "fp",
             validation_chunk: &chunk,
             chunk_transcript: "U: left transcript",
+            boundary_dates: empty_boundary_dates(),
             prior_compartments: &prior,
             validate_options: validate_options(),
             publication_floor_ordinal: 4,
@@ -2384,6 +2963,7 @@ mod tests {
             observed_chunk_fingerprint: "fp",
             validation_chunk: &chunk,
             chunk_transcript: "U: right transcript",
+            boundary_dates: empty_boundary_dates(),
             prior_compartments: &prior,
             validate_options: validate_options(),
             publication_floor_ordinal: 4,
@@ -2432,7 +3012,20 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 0, 1).unwrap()
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            0,
+            CompartmentSetGeneration {
+                max_sequence: 1,
+                count: 1,
+            },
+            1,
+        )
+        .unwrap()
         {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
@@ -2443,10 +3036,7 @@ mod tests {
                 "ses",
                 None,
                 &CoreState::default(),
-                &ModuleMeta {
-                    historian: awaiting,
-                    ..Default::default()
-                },
+                &test_meta_with_historian(awaiting),
             )
             .unwrap();
         let mut producer = ScriptedProducer::default()
@@ -2472,7 +3062,17 @@ mod tests {
     async fn reattach_missing_abandons_and_releases_single_flight() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 0, 1).unwrap()
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            0,
+            CompartmentSetGeneration::default(),
+            1,
+        )
+        .unwrap()
         {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
@@ -2483,10 +3083,7 @@ mod tests {
                 "ses",
                 None,
                 &CoreState::default(),
-                &ModuleMeta {
-                    historian: awaiting,
-                    ..Default::default()
-                },
+                &test_meta_with_historian(awaiting),
             )
             .unwrap();
         let chunk = historian_chunk();
@@ -2506,7 +3103,17 @@ mod tests {
         let state = store.load("ses").unwrap().meta.historian;
         assert_eq!(state.state, HistorianPhase::Idle);
         assert!(matches!(
-            fire(&state, 2, 4, "fp2".into(), 0, 2).unwrap(),
+            fire(
+                &state,
+                2,
+                4,
+                "fp2".into(),
+                Vec::new(),
+                0,
+                CompartmentSetGeneration::default(),
+                2,
+            )
+            .unwrap(),
             FireOutcome::Fired(_)
         ));
     }
@@ -2764,7 +3371,17 @@ mod tests {
         assert_eq!(state.state, HistorianPhase::Idle);
         assert_eq!(state.failure_backoff_at_ms, Some(999));
         assert!(matches!(
-            fire(&state, 2, 4, "fp2".into(), 0, 124).unwrap(),
+            fire(
+                &state,
+                2,
+                4,
+                "fp2".into(),
+                Vec::new(),
+                0,
+                CompartmentSetGeneration::default(),
+                124,
+            )
+            .unwrap(),
             FireOutcome::Fired(_)
         ));
     }
@@ -2780,7 +3397,20 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 0, 1).unwrap()
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            0,
+            CompartmentSetGeneration {
+                max_sequence: 1,
+                count: 1,
+            },
+            1,
+        )
+        .unwrap()
         {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
@@ -2791,10 +3421,7 @@ mod tests {
                 "ses",
                 None,
                 &CoreState::default(),
-                &ModuleMeta {
-                    historian: awaiting,
-                    ..Default::default()
-                },
+                &test_meta_with_historian(awaiting),
             )
             .unwrap();
         let mut producer = ScriptedProducer::default()
@@ -2811,6 +3438,7 @@ mod tests {
             observed_chunk_fingerprint: "fp-changed",
             validation_chunk: &chunk,
             chunk_transcript: "U: transcript",
+            boundary_dates: empty_boundary_dates(),
             prior_compartments: &prior,
             validate_options: validate_options(),
             publication_floor_ordinal: 4,
@@ -2880,7 +3508,7 @@ mod tests {
         let models = vec!["prov/model-a".to_string(), "other/model-b".to_string()];
         let mut producer = ScriptedProducer::default()
             .with_start(Ok(run_handle("run-invalid")))
-            .with_output(Ok(producer_output("not historian xml".to_string())))
+            .with_output(Ok(producer_output(flat_historian_xml("flat primary"))))
             .with_start(Ok(run_handle("run-valid")))
             .with_output(Ok(producer_output(historian_xml("fallback summary"))));
 
@@ -2920,9 +3548,9 @@ mod tests {
         let models = vec!["prov/model-a".to_string(), "other/model-b".to_string()];
         let mut producer = ScriptedProducer::default()
             .with_start(Ok(run_handle("run-invalid-a")))
-            .with_output(Ok(producer_output("not historian xml".to_string())))
+            .with_output(Ok(producer_output(flat_historian_xml("flat primary"))))
             .with_start(Ok(run_handle("run-invalid-b")))
-            .with_output(Ok(producer_output("<output/>".to_string())));
+            .with_output(Ok(producer_output(flat_historian_xml("flat fallback"))));
         let mut request = fire_request(&store, "placeholder prompt", &models, &chunk, &prior);
         request.now_ms = 0;
         request.failure_backoff_at_ms = HISTORIAN_FAILURE_BACKOFF_MS;
@@ -2937,6 +3565,15 @@ mod tests {
         let state = store.load("ses").unwrap().meta.historian;
 
         assert_eq!(producer.observed_starts.len(), 2);
+        assert_eq!(
+            store
+                .load_historian_assembly_snapshot("ses")
+                .unwrap()
+                .compartments
+                .len(),
+            1,
+            "flat retries must not publish any new compartment rows"
+        );
         assert_eq!(
             state.last_failure.as_deref(),
             Some(format!("validate rejected: {final_error}").as_str()),
@@ -3046,6 +3683,10 @@ mod tests {
 <p4 />
 </compartment>
 </compartments>
+<facts><ARCHITECTURE>* [at_compartment=1] Publish facts in the same flow.</ARCHITECTURE></facts>
+<events><causal_incident at_compartment="1"><summary>event survives</summary></causal_incident></events>
+<primer_candidates><primer at_compartment="1">What did this publish preserve?</primer></primer_candidates>
+<user_observations>* [at_compartment=1] The user prefers durable history.</user_observations>
 <meta><messages_processed>2-3</messages_processed><unprocessed_from>4</unprocessed_from></meta>
 </output>"#;
         let chunk = HistorianChunk {
@@ -3082,6 +3723,10 @@ mod tests {
             ValidateOptions {
                 sequence_offset: 1,
                 in_emergency: true, // skip discard-last so the single compartment persists
+                memory_enabled: true,
+                auto_promote: true,
+                user_memory_collection_enabled: true,
+                force_keep_last_compartment: false,
             },
         )
         .expect("validation succeeds");
@@ -3090,6 +3735,10 @@ mod tests {
 
         // Drive the state machine to a publishing row and publish the validated chunk.
         let mut meta = store.load("ses").unwrap().meta;
+        for selected in test_selected_range_identities() {
+            meta.block_identity_by_mid
+                .insert(selected.mid, selected.block_identities);
+        }
         meta.historian = HistorianDurableState {
             state: HistorianPhase::Publishing,
             firing_seq: 1,
@@ -3098,13 +3747,19 @@ mod tests {
                 to_ordinal: 4,
             }),
             chunk_fingerprint: "fp".into(),
+            selected_range_identities: test_selected_range_identities(),
             producer_session_id: Some("ps".into()),
             producer_run_id: Some("run-1".into()),
             fired_at_ms: Some(1),
             expected_revert_epoch: 0,
+            compartment_set_generation: CompartmentSetGeneration {
+                max_sequence: 1,
+                count: 1,
+            },
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
+            consecutive_publish_failures: 0,
         };
         let rv = store
             .commit(
@@ -3126,8 +3781,11 @@ mod tests {
                 predicate: &predicate,
                 observed_chunk_fingerprint: "fp",
                 validated: &validated,
+                promote_facts: true,
+                collect_user_memory_candidates: true,
                 publication_floor_ordinal: 4,
                 chunk_transcript: "U: transcript",
+                boundary_dates: empty_boundary_dates(),
                 created_at_ms: 123,
                 failure_backoff_at_ms: 0,
                 publication_fence: None,
@@ -3142,11 +3800,90 @@ mod tests {
         assert_eq!(after.meta.publication_floor_ordinal, Some(4));
         let comps = store.load_compartments("ses").unwrap();
         assert_eq!(comps.len(), 2, "C1 preserved, C2 appended");
+        assert_eq!(store.load_compartment_events("ses").unwrap().len(), 1);
+        assert_eq!(store.load_primer_candidates("ses").unwrap().len(), 1);
+        assert_eq!(store.load_user_memory_candidates("ses").unwrap().len(), 1);
         let c2 = comps.last().unwrap();
         assert_eq!(c2.end_message_id, "m3#0");
         assert_eq!(c2.p1.as_deref(), Some("second arc full and exact"));
         assert_eq!(c2.legacy, 0);
         assert_eq!(c2.created_at, 123);
+    }
+
+    #[test]
+    fn publish_gates_facts_when_memory_or_auto_promote_is_off() {
+        use std::collections::BTreeMap;
+
+        for (session_id, memory_enabled, auto_promote) in
+            [("memory-off", false, true), ("auto-off", true, false)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let loaded = store
+                .commit(
+                    session_id,
+                    None,
+                    &mc_core::CoreState::default(),
+                    &test_meta_with_historian(publishing_state()),
+                )
+                .unwrap();
+            let state = store.load(session_id).unwrap();
+            let predicate = publish_predicate(&state.meta.historian).unwrap();
+            let validated = ValidatedChunk {
+                facts: vec![crate::historian_validate::FactCandidate {
+                    category: "ARCHITECTURE".into(),
+                    content: "gated fact".into(),
+                    origin_compartment_index: None,
+                }],
+                events: vec![crate::historian_validate::ParsedEvent {
+                    kind: "causal_incident".into(),
+                    at_compartment: None,
+                    fields: BTreeMap::from([("summary".into(), "event".into())]),
+                }],
+                primer_candidates: vec![crate::historian_validate::PrimerCandidate {
+                    question: "What was preserved?".into(),
+                    origin_compartment_index: None,
+                }],
+                user_observations: vec![crate::historian_validate::UserObservationCandidate {
+                    content: "private observation".into(),
+                    origin_compartment_index: None,
+                }],
+                unprocessed_from: 1,
+                ..Default::default()
+            };
+            publish_validated_chunk(
+                &store,
+                ValidatedPublishRequest {
+                    session_id,
+                    project_path: "git:proj",
+                    expected_row_version: Some(loaded),
+                    expected_revert_epoch: 0,
+                    predicate: &predicate,
+                    observed_chunk_fingerprint: "fp",
+                    validated: &validated,
+                    promote_facts: memory_enabled && auto_promote,
+                    collect_user_memory_candidates: false,
+                    publication_floor_ordinal: 1,
+                    chunk_transcript: "U: transcript",
+                    boundary_dates: empty_boundary_dates(),
+                    created_at_ms: 123,
+                    failure_backoff_at_ms: 0,
+                    publication_fence: None,
+                },
+            )
+            .expect("gated publication succeeds without promoting facts");
+
+            assert!(store
+                .load_active_memories("git:proj", 0)
+                .unwrap()
+                .is_empty());
+            assert_eq!(store.load_compartment_events(session_id).unwrap().len(), 1);
+            assert_eq!(store.load_primer_candidates(session_id).unwrap().len(), 1);
+            assert!(store
+                .load_user_memory_candidates(session_id)
+                .unwrap()
+                .is_empty());
+        }
     }
 
     #[test]
@@ -3182,14 +3919,35 @@ mod tests {
     #[test]
     fn pure_state_machine_happy_path_and_single_flight() {
         let idle = HistorianDurableState::default();
-        let fired = match fire(&idle, 2, 5, "fp".into(), 0, 100).unwrap() {
+        let fired = match fire(
+            &idle,
+            2,
+            5,
+            "fp".into(),
+            Vec::new(),
+            0,
+            CompartmentSetGeneration::default(),
+            100,
+        )
+        .unwrap()
+        {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => panic!("idle state must fire"),
         };
         assert_eq!(fired.state, HistorianPhase::Firing);
         assert_eq!(fired.firing_seq, 1);
         assert!(matches!(
-            fire(&fired, 6, 7, "other".into(), 0, 101).unwrap(),
+            fire(
+                &fired,
+                6,
+                7,
+                "other".into(),
+                Vec::new(),
+                0,
+                CompartmentSetGeneration::default(),
+                101,
+            )
+            .unwrap(),
             FireOutcome::Busy(_)
         ));
 
@@ -3208,7 +3966,18 @@ mod tests {
             last_failure: Some("stale failure".into()),
             ..HistorianDurableState::default()
         };
-        let fired = match fire(&idle, 2, 5, "fp".into(), 0, 100).unwrap() {
+        let fired = match fire(
+            &idle,
+            2,
+            5,
+            "fp".into(),
+            Vec::new(),
+            0,
+            CompartmentSetGeneration::default(),
+            100,
+        )
+        .unwrap()
+        {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => panic!("idle state must fire"),
         };
@@ -3222,10 +3991,7 @@ mod tests {
     fn fingerprint_mismatch_at_publish_abandons_and_releases_single_flight() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        let meta = ModuleMeta {
-            historian: publishing_state(),
-            ..Default::default()
-        };
+        let meta = test_meta_with_historian(publishing_state());
         store
             .commit("ses", None, &CoreState::default(), &meta)
             .unwrap();
@@ -3246,8 +4012,11 @@ mod tests {
                 predicate: &predicate,
                 observed_chunk_fingerprint: "different-fingerprint",
                 validated: &ValidatedChunk::default(),
+                promote_facts: true,
+                collect_user_memory_candidates: false,
                 publication_floor_ordinal: 5,
                 chunk_transcript: "U: transcript",
+                boundary_dates: empty_boundary_dates(),
                 created_at_ms: 0,
                 failure_backoff_at_ms: 999,
                 publication_fence: None,
@@ -3268,7 +4037,17 @@ mod tests {
             "fingerprint cleanup must use the store's fenced abandon primitive"
         );
         assert!(matches!(
-            fire(&after, 6, 7, "new".into(), 0, 1000).unwrap(),
+            fire(
+                &after,
+                6,
+                7,
+                "new".into(),
+                Vec::new(),
+                0,
+                CompartmentSetGeneration::default(),
+                1000,
+            )
+            .unwrap(),
             FireOutcome::Fired(_)
         ));
     }
@@ -3280,7 +4059,9 @@ mod tests {
             2,
             5,
             "fp".into(),
+            Vec::new(),
             42,
+            CompartmentSetGeneration::default(),
             100,
         )
         .unwrap()
@@ -3299,8 +4080,7 @@ mod tests {
         let store = store(dir.path());
         let meta = ModuleMeta {
             revert_epoch: 1,
-            historian: publishing_state(),
-            ..Default::default()
+            ..test_meta_with_historian(publishing_state())
         };
         store
             .commit("ses", None, &CoreState::default(), &meta)
@@ -3318,8 +4098,11 @@ mod tests {
                 predicate: &predicate,
                 observed_chunk_fingerprint: "fp",
                 validated: &ValidatedChunk::default(),
+                promote_facts: true,
+                collect_user_memory_candidates: false,
                 publication_floor_ordinal: 5,
                 chunk_transcript: "U: transcript",
+                boundary_dates: empty_boundary_dates(),
                 created_at_ms: 0,
                 failure_backoff_at_ms: 999,
                 publication_fence: None,
@@ -3341,6 +4124,88 @@ mod tests {
         assert!(store.load_compartments("ses").unwrap().is_empty());
     }
 
+    #[test]
+    fn compartment_generation_fence_releases_overlapped_publish_to_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .commit(
+                "ses",
+                None,
+                &CoreState::default(),
+                &test_meta_with_historian(publishing_state()),
+            )
+            .unwrap();
+        let predicate = publish_predicate(&store.load("ses").unwrap().meta.historian).unwrap();
+
+        // This models a state-sync commit that lands after the wrapup snapshot but before
+        // publication. Passing its fresh row version proves the compartment generation,
+        // not just the cache CAS, rejects the stale overlapping publish.
+        store
+            .append_compartments("ses", &[comp(1, 2, 4, "m4#0", "seeded summary")])
+            .unwrap();
+        let synced = store.load("ses").unwrap();
+        store
+            .commit("ses", synced.row_version, &synced.core, &synced.meta)
+            .unwrap();
+        let fresh = store.load("ses").unwrap();
+
+        let validated = ValidatedChunk {
+            compartments: vec![crate::historian_validate::ValidatedCompartment {
+                sequence: 1,
+                start_message: 2,
+                end_message: 4,
+                start_message_id: "m2#0".to_string(),
+                end_message_id: "m4#0".to_string(),
+                title: "stale summary".to_string(),
+                content: "stale summary".to_string(),
+                p1: Some("stale summary".to_string()),
+                p2: None,
+                p3: None,
+                p4: None,
+                importance: Some(50),
+                episode_type: None,
+            }],
+            unprocessed_from: 5,
+            ..Default::default()
+        };
+        let error = publish_validated_chunk(
+            &store,
+            ValidatedPublishRequest {
+                session_id: "ses",
+                project_path: "git:proj",
+                expected_row_version: fresh.row_version,
+                expected_revert_epoch: 0,
+                predicate: &predicate,
+                observed_chunk_fingerprint: "fp",
+                validated: &validated,
+                promote_facts: false,
+                collect_user_memory_candidates: false,
+                publication_floor_ordinal: 5,
+                chunk_transcript: "U: transcript",
+                boundary_dates: empty_boundary_dates(),
+                created_at_ms: 0,
+                failure_backoff_at_ms: 999,
+                publication_fence: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            HistorianStateError::Publish(HistorianPublishError::FenceRejected { .. })
+        ));
+        let after = store.load("ses").unwrap();
+        assert_eq!(after.meta.historian.state, HistorianPhase::Idle);
+        assert_eq!(after.meta.historian.failure_backoff_at_ms, None);
+        let compartments = store.load_compartments("ses").unwrap();
+        assert_eq!(
+            compartments.len(),
+            1,
+            "the stale publish must not append a second overlapping range"
+        );
+        assert!(crate::compartment_coverage::resolve_coverage(&compartments).is_ok());
+    }
+
     #[tokio::test]
     async fn reattach_carries_durable_revert_epoch_to_publish() {
         let dir = tempfile::tempdir().unwrap();
@@ -3348,7 +4213,17 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let fired = match fire(&HistorianDurableState::default(), 2, 4, "fp".into(), 7, 1).unwrap()
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            7,
+            CompartmentSetGeneration::default(),
+            1,
+        )
+        .unwrap()
         {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
@@ -3361,8 +4236,7 @@ mod tests {
                 &CoreState::default(),
                 &ModuleMeta {
                     revert_epoch: 8,
-                    historian: awaiting,
-                    ..Default::default()
+                    ..test_meta_with_historian(awaiting)
                 },
             )
             .unwrap();
@@ -3394,7 +4268,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let awaiting = producer_started(
-            &match fire(&HistorianDurableState::default(), 1, 3, "fp".into(), 0, 10).unwrap() {
+            &match fire(
+                &HistorianDurableState::default(),
+                1,
+                3,
+                "fp".into(),
+                test_selected_range_identities(),
+                0,
+                CompartmentSetGeneration::default(),
+                10,
+            )
+            .unwrap()
+            {
                 FireOutcome::Fired(state) => state,
                 FireOutcome::Busy(_) => unreachable!(),
             },
@@ -3402,10 +4287,7 @@ mod tests {
             "run-1".into(),
         )
         .unwrap();
-        let meta = ModuleMeta {
-            historian: awaiting,
-            ..Default::default()
-        };
+        let meta = test_meta_with_historian(awaiting);
         store
             .commit("ses", None, &CoreState::default(), &meta)
             .unwrap();
@@ -3431,10 +4313,7 @@ mod tests {
     fn restart_mid_publishing_with_committed_tx_detects_idle() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        let meta = ModuleMeta {
-            historian: publishing_state(),
-            ..Default::default()
-        };
+        let meta = test_meta_with_historian(publishing_state());
         store
             .commit("ses", None, &CoreState::default(), &meta)
             .unwrap();
@@ -3449,6 +4328,10 @@ mod tests {
                 project_path: "git:proj",
                 compartments: &[comp(1, 2, 4, "m4", "summary")],
                 facts: &[],
+                promote_facts: true,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
                 publication_floor_ordinal: 5,
                 chunk_transcript: Some("U: transcript"),
             })
@@ -3478,14 +4361,24 @@ mod tests {
         run_transform(&store, &request);
         let before = run_transform(&store, &request);
 
+        let mut meta = store.load("ses").unwrap().meta;
+        let selected_range_identities = vec![HistorianSelectedMessageIdentity {
+            mid: "t2".to_string(),
+            block_identities: meta.block_identity_by_mid["t2"].clone(),
+        }];
         let mut state = publishing_state();
+        let compartment_set_generation = store
+            .load_historian_assembly_snapshot("ses")
+            .unwrap()
+            .compartment_set_generation;
+        state.compartment_set_generation = compartment_set_generation;
         state.chunk_range = Some(HistorianChunkRange {
             from_ordinal: 2,
             to_ordinal: 2,
         });
         state.chunk_fingerprint = "tail-fp".into();
+        state.selected_range_identities = selected_range_identities.clone();
         state.producer_run_id = Some("run-3".into());
-        let mut meta = store.load("ses").unwrap().meta;
         meta.historian = state;
         let row_version = store
             .commit(
@@ -3499,6 +4392,8 @@ mod tests {
             firing_seq: 3,
             producer_run_id: "run-3".into(),
             chunk_fingerprint: "tail-fp".into(),
+            selected_range_identities,
+            compartment_set_generation,
         };
         store
             .publish_historian_chunk(HistorianPublishRequest {
@@ -3513,6 +4408,10 @@ mod tests {
                     content: "existing fact".into(),
                     ..Default::default()
                 }],
+                promote_facts: true,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
                 publication_floor_ordinal: 3,
                 chunk_transcript: None,
             })

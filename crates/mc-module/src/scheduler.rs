@@ -258,6 +258,9 @@ pub struct SchedulerInputs {
     pub drain_latch: LatchState,
     /// Optional provider error text to scan for context overflow.
     pub overflow_error_text: Option<String>,
+    /// Durable provider-overflow recovery arm from the host. It upgrades a would-be
+    /// defer to the emergency path even when local usage is below the reported limit.
+    pub emergency_recovery_armed: bool,
 }
 
 /// Composed scheduler output returned to the caller.
@@ -265,6 +268,8 @@ pub struct SchedulerInputs {
 pub struct SchedulerOutcome {
     /// Execute/defer/force/emergency pass class.
     pub pass: PassDecision,
+    /// True only when this pass executes because the configured usage threshold was crossed.
+    pub pressure_execute: bool,
     /// True when the hard idle-TTL predicate fired and should be materialized.
     pub idle_ttl_fired: bool,
     /// Updated emergency drain latch state for the caller to persist.
@@ -283,25 +288,36 @@ struct CompiledPattern {
 /// Parse a cache idle TTL string into milliseconds.
 pub fn parse_cache_ttl(ttl: &str) -> Result<u64, CacheTtlParseError> {
     let normalized = ttl.trim();
-    if !normalized.is_empty() && normalized.chars().all(|c| c.is_ascii_digit()) {
-        return normalized.parse().map_err(|_| CacheTtlParseError);
-    }
-
-    let Some(unit) = normalized.chars().last() else {
-        return Err(CacheTtlParseError);
-    };
-    let number = &normalized[..normalized.len().saturating_sub(unit.len_utf8())];
+    let (number, multiplier) =
+        if !normalized.is_empty() && normalized.chars().all(|c| c.is_ascii_digit()) {
+            (normalized, 1.0)
+        } else {
+            let Some(unit) = normalized.chars().last() else {
+                return Err(CacheTtlParseError);
+            };
+            let number = &normalized[..normalized.len().saturating_sub(unit.len_utf8())];
+            let multiplier = match unit {
+                's' => 1_000.0,
+                'm' => 60.0 * 1_000.0,
+                'h' => 60.0 * 60.0 * 1_000.0,
+                _ => return Err(CacheTtlParseError),
+            };
+            (number, multiplier)
+        };
     if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
         return Err(CacheTtlParseError);
     }
-    let value = number.parse::<u64>().map_err(|_| CacheTtlParseError)?;
-    let multiplier = match unit {
-        's' => 1000,
-        'm' => 60 * 1000,
-        'h' => 60 * 60 * 1000,
-        _ => return Err(CacheTtlParseError),
-    };
-    value.checked_mul(multiplier).ok_or(CacheTtlParseError)
+    // JavaScript's Number() accepts the syntactically valid digit sequence and yields
+    // Infinity on overflow. Saturating to u64::MAX preserves that value's practical
+    // scheduler behavior (no finite elapsed time can exceed it) instead of rejecting it.
+    let milliseconds = number.parse::<f64>().map_err(|_| CacheTtlParseError)? * multiplier;
+    Ok(
+        if !milliseconds.is_finite() || milliseconds >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            milliseconds as u64
+        },
+    )
 }
 
 /// Return the scheduler's strict idle predicate (`elapsed > ttl`).
@@ -309,9 +325,10 @@ pub fn ttl_execute_fired(now_ms: u64, last_response_time_ms: u64, ttl_ms: u64) -
     now_ms.saturating_sub(last_response_time_ms) > ttl_ms
 }
 
-/// Return the hard cache-expiry idle predicate (`last_response_time > 0 && elapsed >= ttl`).
+/// Return the hard cache-expiry idle predicate (`last_response_time > 0 && elapsed > ttl`).
+/// The scheduler and TypeScript both defer at the exact TTL boundary.
 pub fn ttl_hard_expired(now_ms: u64, last_response_time_ms: u64, ttl_ms: u64) -> bool {
-    last_response_time_ms > 0 && now_ms.saturating_sub(last_response_time_ms) >= ttl_ms
+    last_response_time_ms > 0 && now_ms.saturating_sub(last_response_time_ms) > ttl_ms
 }
 
 /// Resolve the effective execute threshold percentage for a model and context limit.
@@ -592,6 +609,8 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
         inputs.model_key.as_deref(),
         inputs.context_limit,
     );
+    let pressure_execute_requested =
+        inputs.usage.percentage > 0.0 && inputs.usage.percentage >= threshold;
     let mut pass =
         if base == BaseDecision::Execute || idle_ttl_fired || inputs.deferred_execute.is_some() {
             PassDecision::Execute
@@ -604,6 +623,11 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
         Band::Force85 => PassDecision::Force85,
         Band::Normal => pass,
     };
+    // A provider already rejected this session's wire shape. A low local usage
+    // reading cannot safely defer recovery, so mirror the ≥95% emergency path.
+    if inputs.emergency_recovery_armed && pass == PassDecision::Defer {
+        pass = PassDecision::Emergency95;
+    }
 
     let (pass, deferred_execute) = apply_boundary_deferral(
         pass,
@@ -611,6 +635,7 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
         inputs.deferred_execute.clone(),
         inputs.boundary_bypass,
     );
+    let pressure_execute = pressure_execute_requested && pass != PassDecision::Defer;
     let drain_latch = advance_drain_latch(
         inputs.drain_latch,
         inputs.usage.percentage,
@@ -628,6 +653,7 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
 
     SchedulerOutcome {
         pass,
+        pressure_execute,
         idle_ttl_fired,
         drain_latch,
         deferred_execute,
@@ -874,6 +900,7 @@ mod tests {
             boundary_bypass: BoundaryBypass::default(),
             drain_latch: LatchState::default(),
             overflow_error_text: None,
+            emergency_recovery_armed: false,
         }
     }
 
@@ -1037,6 +1064,19 @@ mod tests {
     }
 
     #[test]
+    fn durable_overflow_arm_upgrades_only_a_would_be_defer_to_emergency() {
+        let mut inputs = base_inputs();
+        inputs.emergency_recovery_armed = true;
+        let forced = decide(&inputs);
+        assert_eq!(forced.pass, PassDecision::Emergency95);
+
+        inputs.usage.percentage = 70.0;
+        inputs.usage.input_tokens = 70_000.0;
+        let natural_execute = decide(&inputs);
+        assert_eq!(natural_execute.pass, PassDecision::Execute);
+    }
+
+    #[test]
     fn boundary_deferral_records_retries_and_respects_bypasses() {
         let tail = TailState { mid_tool_use: true };
         let (decision, pending) =
@@ -1132,10 +1172,11 @@ mod tests {
         let mut inputs = base_inputs();
         inputs.session.last_response_time_ms = 1_000;
         inputs.session.cache_ttl = "5m".to_string();
-        inputs.now_ms = 1_000 + DEFAULT_CACHE_TTL_MS;
+        inputs.now_ms = 1_000 + DEFAULT_CACHE_TTL_MS + 1;
         let boundary = decide(&inputs);
         assert!(boundary.idle_ttl_fired);
         assert_eq!(boundary.pass, PassDecision::Execute);
+        assert!(!boundary.pressure_execute);
 
         inputs.usage.percentage = 0.0;
         inputs.usage.input_tokens = 0.0;

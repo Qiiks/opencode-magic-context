@@ -11,6 +11,7 @@ import {
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import { getErrorMessage } from "../../shared/error-message";
 import type { Database } from "../../shared/sqlite";
+import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_REDUCE_DESCRIPTION } from "./constants";
 import type { CtxReduceArgs } from "./types";
 
@@ -31,6 +32,17 @@ function formatRawDropForAck(rawDrop: string): string {
         })
         .join(", ");
 }
+
+const ctxReduceArgsShape = {
+    drop: tool.schema
+        .string()
+        .optional()
+        .describe("Tag IDs to drop entirely. Ranges: '3-5', '1,2,9'"),
+};
+// The tool definition exposes only the documented argument shape to the model
+// provider, but older callers may still send extra arguments. Parse with
+// passthrough so execute() can receive those fields without advertising them.
+const ctxReduceArgsSchema = tool.schema.object(ctxReduceArgsShape).passthrough();
 
 function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
     let fallbackCommandSequence = 0;
@@ -57,13 +69,11 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
 
     return tool({
         description: CTX_REDUCE_DESCRIPTION,
-        args: {
-            drop: tool.schema
-                .string()
-                .optional()
-                .describe("Tag IDs to drop entirely. Ranges: '3-5', '1,2,9'"),
-        },
-        async execute(args: CtxReduceArgs, toolContext) {
+        args: ctxReduceArgsShape,
+        async execute(rawArgs: CtxReduceArgs, toolContext) {
+            const parsedArgs = ctxReduceArgsSchema.safeParse(rawArgs);
+            let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxReduceArgs;
+            args = unwrapImitatedReducedArgs(args, ["drop"], { drop: "string" });
             const sessionId = toolContext.sessionID;
 
             if (!args.drop) {

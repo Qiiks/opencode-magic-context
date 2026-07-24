@@ -80,6 +80,16 @@ pub fn get_primer_candidates(
 }
 
 #[tauri::command(async)]
+pub fn get_mural(
+    state: State<'_, AppState>,
+    project: Option<String>,
+) -> Result<Option<db::MuralManifest>, String> {
+    let path = state.get_db_path()?;
+    let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;
+    db::get_mural(&conn, project.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
 pub fn workspace_schema_ready(state: State<'_, AppState>) -> Result<bool, String> {
     let path = state.get_db_path()?;
     let conn = db::open_readonly(&path).map_err(|e| e.to_string())?;

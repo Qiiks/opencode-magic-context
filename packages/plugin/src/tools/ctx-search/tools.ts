@@ -4,8 +4,14 @@ import {
     embedTextForProject,
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
-import { type UnifiedSearchResult, unifiedSearch } from "../../features/magic-context/search";
+import {
+    parseIdShapedQuery,
+    resolveMemoriesByIdsForSearch,
+    type UnifiedSearchResult,
+    unifiedSearch,
+} from "../../features/magic-context/search";
 import { getVisibleMemoryIds } from "../../hooks/magic-context/inject-compartments";
+import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import {
     CTX_SEARCH_DESCRIPTION,
     CTX_SEARCH_TOOL_NAME,
@@ -152,27 +158,43 @@ function formatSearchResults(
     return `Found ${results.length} result${results.length === 1 ? "" : "s"} for "${query}":\n\n${body}`;
 }
 
+const ctxSearchArgsShape = {
+    query: tool.schema
+        .string()
+        .optional()
+        .describe(
+            "Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
+        ),
+    limit: tool.schema.number().optional().describe("Maximum results to return (default: 10)"),
+    sources: tool.schema
+        .array(tool.schema.enum(["memory", "message", "git_commit", "primer", "note"]))
+        .optional()
+        .describe(
+            'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources; pass [] to search no sources.',
+        ),
+};
+// The tool definition exposes only the documented argument shape to the model
+// provider, but older callers may still send extra arguments. Parse with
+// passthrough so execute() can receive those fields without advertising them.
+const ctxSearchArgsSchema = tool.schema.object(ctxSearchArgsShape).passthrough();
+
 function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
     return tool({
         description: CTX_SEARCH_DESCRIPTION,
-        args: {
-            query: tool.schema
-                .string()
-                .describe(
-                    "Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
-                ),
-            limit: tool.schema
-                .number()
-                .optional()
-                .describe("Maximum results to return (default: 10)"),
-            sources: tool.schema
-                .array(tool.schema.enum(["memory", "message", "git_commit", "primer", "note"]))
-                .optional()
-                .describe(
-                    'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources; pass [] to search no sources.',
-                ),
-        },
-        async execute(args: CtxSearchArgs, toolContext) {
+        args: ctxSearchArgsShape,
+        async execute(rawArgs: CtxSearchArgs, toolContext) {
+            const parsedArgs = ctxSearchArgsSchema.safeParse(rawArgs);
+            let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxSearchArgs;
+            args = unwrapImitatedReducedArgs(args, ["query"], {
+                query: "string",
+                limit: "number",
+                sources: {
+                    type: "array",
+                    items: "string",
+                    maxItems: 5,
+                    values: ["memory", "message", "git_commit", "primer", "note"],
+                },
+            });
             const query = args.query?.trim();
             if (!query) {
                 return "Error: 'query' is required.";
@@ -199,6 +221,9 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
             // can differ from the session's working directory when the user
             // runs `opencode -s <id>` from outside the project.
             const projectPath = deps.resolveProjectPath(toolContext.directory);
+            if (!projectPath) {
+                return "Error: Could not resolve project identity for search.";
+            }
             await deps.ensureProjectRegistered?.(toolContext.directory, deps.db);
             const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
             const memoryEnabled = embeddingSnapshot?.features.memoryEnabled ?? deps.memoryEnabled;
@@ -207,6 +232,31 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                 : deps.embeddingEnabled;
             const gitCommitsEnabled =
                 embeddingSnapshot?.gitCommitEnabled ?? deps.gitCommitsEnabled ?? false;
+
+            // ID-shaped short-circuit: when the whole query is one or more
+            // memory ids, bypass the lexical+semantic lanes and look the ids
+            // up directly. The agent is given memory ids everywhere
+            // (<project-memory> shows `#id:` lines, dashboard, guidance) and
+            // ctx_search was the only tool that could surface content for
+            // an id but it did so through text matching. Whole-query id list
+            // only — `parseIdShapedQuery` returns null for "fix bug 1234" so
+            // numeric phrases still search text. If no ids resolve (foreign
+            // hidden, missing, hard-deleted) the call falls through to the
+            // normal lanes so a query like "7234" with no such memory still
+            // returns the corpus text matches.
+            const idShape = parseIdShapedQuery(query);
+            if (idShape && memoryEnabled) {
+                const idResults = resolveMemoriesByIdsForSearch({
+                    db: deps.db,
+                    projectPath,
+                    ids: idShape,
+                    limit: Math.max(normalizeLimit(args.limit), idShape.length),
+                    visibleMemoryIds,
+                });
+                if (idResults !== null) {
+                    return formatSearchResults(query, idResults, toolContext.sessionID);
+                }
+            }
 
             const results = await unifiedSearch(
                 deps.db,

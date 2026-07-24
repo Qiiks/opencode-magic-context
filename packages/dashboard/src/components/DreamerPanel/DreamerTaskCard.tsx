@@ -71,6 +71,14 @@ function taskIcon(taskName: string): JSX.Element {
       );
     case "curate":
       return wrap(<path d="M3 6h18M7 12h10M10 18h4" />);
+    case "compress-cues":
+      return wrap(
+        <>
+          <rect x="3" y="4" width="18" height="16" rx="2" />
+          <path d="m3 16 5-5 4 4 3-3 6 6" />
+          <circle cx="16.5" cy="8" r="1.5" />
+        </>,
+      );
     case "classify-memories":
       return wrap(
         <>

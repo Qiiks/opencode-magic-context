@@ -40,6 +40,7 @@ import {
     sweepStaleEmbeddingIdentitiesForProject,
 } from "./project-embedding-registry";
 import { recordSessionProjectIdentity } from "./session-project-storage";
+import { beginSynapseBatchLedger } from "./storage-embedding-measurements";
 import { closeDatabase, openDatabase } from "./storage";
 
 class FakeEmbeddingProvider implements EmbeddingProvider {
@@ -549,6 +550,61 @@ describe("project embedding registry", () => {
         expect(loadAllEmbeddings(db, projectIdentity, currentModelId(projectIdentity)).size).toBe(
             0,
         );
+    });
+
+    it("prunes expired synthetic-session ledger rows on project registration", () => {
+        const db = useTempDb();
+        const projectIdentity = "git:ledger-prune";
+        const fifteenDaysMs = 15 * 24 * 60 * 60 * 1000;
+        const thirteenDaysMs = 13 * 24 * 60 * 60 * 1000;
+        // Both synthetic session keys the embedding lanes use: the primary lane
+        // keys its ledger by the project identity, the shadow lane by
+        // `shadow:<projectIdentity>`. Neither is ever session-deleted.
+        for (const sessionId of [projectIdentity, `shadow:${projectIdentity}`]) {
+            beginSynapseBatchLedger(db, {
+                sessionId,
+                projectPath: projectIdentity,
+                scope: "memory",
+                manifest: [],
+                requestKey: `${sessionId}:old`,
+            });
+            beginSynapseBatchLedger(db, {
+                sessionId,
+                projectPath: projectIdentity,
+                scope: "memory",
+                manifest: [],
+                requestKey: `${sessionId}:fresh`,
+            });
+            db.prepare(
+                "UPDATE synapse_batch_ledger SET updated_at = ? WHERE session_id = ? AND request_key = ?",
+            ).run(Date.now() - fifteenDaysMs, sessionId, `${sessionId}:old`);
+            db.prepare(
+                "UPDATE synapse_batch_ledger SET updated_at = ? WHERE session_id = ? AND request_key = ?",
+            ).run(Date.now() - thirteenDaysMs, sessionId, `${sessionId}:fresh`);
+        }
+
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-a"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/ledger-prune",
+        );
+
+        // Rows older than the 14-day TTL are gone from both synthetic sessions;
+        // rows inside the TTL are kept.
+        expect(
+            countRows(
+                db,
+                "SELECT COUNT(*) AS count FROM synapse_batch_ledger WHERE request_key LIKE '%:old'",
+            ),
+        ).toBe(0);
+        expect(
+            countRows(
+                db,
+                "SELECT COUNT(*) AS count FROM synapse_batch_ledger WHERE request_key LIKE '%:fresh'",
+            ),
+        ).toBe(2);
     });
 
     it("keeps memory, commit, and chunk embeddings coexisting per model", () => {

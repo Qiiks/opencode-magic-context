@@ -267,13 +267,19 @@ jobs:
         env:
           NODE_ENV: ""
         run: |
-          # Match every test file except pi-*.test.ts. The shell glob is
-          # not great at "all .test.ts except pi-*", so list them explicitly.
+          # Match every test file except pi-*.test.ts and rust-*.test.ts. The
+          # shell glob is not great at "all .test.ts except a couple", so list
+          # them explicitly. rust-*.test.ts is the hermetic Rust-mode lane; it
+          # needs the Rust workspace + the sibling subconscious daemon build,
+          # which this runner does not provision, so it is excluded here and run
+          # separately (bun run --cwd packages/e2e-tests test:rust-e2e) on a
+          # runner that can build the Rust workspace. Left out of CI wiring for
+          # now — see packages/e2e-tests/README.md.
           cd packages/e2e-tests
           # OpenCode host behavior tests, plus the cache-bust oracle unit test
           # (src/cache-analysis.test.ts) — the oracle backs the cache-invariant
           # suite, so a regression in it would silently neuter those guards.
-          files=$(ls tests/*.test.ts | grep -v "/pi-" | tr '\n' ' ')
+          files=$(ls tests/*.test.ts | grep -v "/pi-" | grep -v "/rust-" | tr '\n' ' ')
           files="$files src/cache-analysis.test.ts"
           echo "Running OpenCode host tests: $files"
           bun test --timeout 600000 $files

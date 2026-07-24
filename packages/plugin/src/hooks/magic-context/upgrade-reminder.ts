@@ -12,21 +12,22 @@ import type { NotificationDeliveryDisposition } from "./send-session-notificatio
  *
  * When a session still holds pre-v2 (legacy) compartments, those render in a
  * degraded title-only/P4 form until the user runs `/ctx-session-upgrade`. This
- * surfaces a ONE-TIME, model-invisible reminder pointing at the command.
+ * surfaces a bounded, model-invisible reminder pointing at the command.
  *
  * Cache-safety (locked design): the reminder is delivered as an IGNORED message
  * (user-visible, never sent to the model), NOT appended to a user message — so it
  * has zero effect on the cacheable prompt prefix. No anchor/replay machinery needed.
  *
- * Fires at most once per session via two guards (locked decision 47661):
- *  1. Durable `upgrade_reminded_at` stamp — survives restart, prevents re-nudging.
- *  2. Per-process in-memory set — prevents a double-fire within one process before
- *     the durable stamp is read back.
+ * Push reminders are bounded per session. A durable timestamp enforces a 24-hour
+ * cooldown, and a durable count caps deliveries at three. Pull surfaces such as
+ * `/ctx-status` continue to show upgrade-needed compartments after the cap.
  *
- * Skip-forever model: there is no 4-state machine. A session is either "has legacy
- * compartments and not yet reminded" (remind once) or not. Running the upgrade
- * clears the legacy rows, so the condition naturally stops being true.
+ * The in-process set still prevents duplicate delivery before durable metadata is
+ * read back.
  */
+
+export const UPGRADE_REMINDER_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+export const MAX_UPGRADE_REMINDERS_PER_SESSION = 3;
 
 const remindedThisProcess = new Set<string>();
 
@@ -141,28 +142,12 @@ export interface UpgradeReminderDeps {
      *  omitted on harnesses without a dialog system. When `resume` is set, the
      *  dialog shows resume-flavored copy. */
     pushTuiDialogAction?: (sessionId: string, resume?: ResumeInfo) => void;
-    /** Whether the non-TUI `sendIgnoredMessage` delivery PERSISTS in the user's
-     *  scrollback. Default true (OpenCode Desktop ignored messages persist).
-     *
-     *  Pi delivers via `ctx.ui.notify`, a TRANSIENT toast that vanishes and
-     *  leaves no scrollback. Stamping `upgrade_reminded_at` on a transient toast
-     *  permanently suppresses the reminder after a single missed toast (dogfood
-     *  2026-05-31, Pi session 019de471: one 10:36 toast stamped the session and
-     *  it never re-prompted). When false, the durable stamp is neither written
-     *  NOR read as a gate — the per-process guard alone dedups, so the reminder
-     *  re-fires on each process start until the session is actually upgraded
-     *  (legacy compartments cleared) — mirroring the TUI "don't stamp on mere
-     *  display" principle. */
+    /** Whether delivery persists in scrollback. Default true for OpenCode.
+     *  Pi uses transient toasts, so it ignores the old explicit-dismissal stamp;
+     *  both harnesses still persist the shared cooldown and delivery cap. */
     deliveryPersists?: boolean;
 }
 
-/**
- * Send the one-time upgrade reminder if this session needs it. Safe to call on
- * every `chat.message`; it self-gates and is a no-op once reminded or once the
- * session has no legacy compartments.
- *
- * Subagent sessions are skipped — they're short-lived and not user-facing.
- */
 export async function maybeSendUpgradeReminder(
     deps: UpgradeReminderDeps,
     sessionId: string,
@@ -180,20 +165,9 @@ export async function maybeSendUpgradeReminder(
         return;
     }
 
-    // MASTER GATE: a reminder (fresh OR resume) is only warranted when the
-    // session still holds legacy/tierless compartments that need upgrading.
-    // This must gate BOTH paths. Keying the resume prompt off staging-rows
-    // ALONE is wrong: a fully-upgraded session can still carry orphan
-    // `recomp_compartments` rows left by a superseded/interrupted-then-completed
-    // recomp (the "already upgraded" early-return in runManagedUpgrade doesn't
-    // clear staging), which would falsely show "Resume the interrupted upgrade?"
-    // with stale counts on every restart (dogfood 2026-05-31, AFT session:
-    // 443 v2 compartments, 0 legacy, yet 489 orphan staging rows triggered it).
+    // A reminder is warranted only while the session still has legacy/tierless
+    // compartments. Fully upgraded sessions can safely discard orphan staging.
     if (!hasLegacyCompartments(deps.db, sessionId)) {
-        // Fully upgraded → nothing to remind. Garbage-collect any orphan staging
-        // so it can't trigger a false resume prompt later. Do NOT stamp
-        // upgradeRemindedAt: a future pre-v2 session restored into this DB could
-        // still need reminding.
         const orphan = getResumeInfo(deps.db, sessionId);
         if (orphan) {
             try {
@@ -209,57 +183,47 @@ export async function maybeSendUpgradeReminder(
         return;
     }
 
-    // The session genuinely needs upgrade. An INTERRUPTED upgrade (partial recomp
-    // staging present AND legacy compartments remaining) re-prompts even when the
-    // durable stamp is set — otherwise a user who started a long upgrade, closed
-    // mid-run, and reopened would get NO signal to resume. The per-process
-    // `remindedThisProcess` guard still caps this at one prompt per `opencode
-    // serve` lifetime (re-prompts on the next reopen, which is correct).
     const resume = getResumeInfo(deps.db, sessionId);
-
-    // The durable `upgrade_reminded_at` stamp is meaningful only when delivery
-    // persists in scrollback. For transient delivery (Pi toast) the stamp is
-    // never written, so it must not be read as a gate either — otherwise a stale
-    // stamp from a pre-fix build would suppress forever. Pi relies on the
-    // per-process guard, re-prompting each start until the session is upgraded.
-    const durableStampActive = deps.deliveryPersists !== false;
-
-    if (!resume && durableStampActive) {
-        // Fresh-upgrade path: gated by the one-shot durable stamp.
-        if (meta.upgradeRemindedAt !== null) {
-            remindedThisProcess.add(sessionId);
-            return;
-        }
+    const durableDismissalActive = deps.deliveryPersists !== false;
+    // An explicit OpenCode dialog choice remains a permanent dismissal for the
+    // fresh reminder. Pi ignores old stamps because its toast never persisted.
+    if (!resume && durableDismissalActive && meta.upgradeRemindedAt !== null) {
+        remindedThisProcess.add(sessionId);
+        return;
     }
 
-    // In-memory guard prevents same-process re-fire regardless of path.
+    const now = Date.now();
+    if (
+        meta.upgradeReminderCount >= MAX_UPGRADE_REMINDERS_PER_SESSION ||
+        (meta.upgradeReminderLastSentAt !== null &&
+            now - meta.upgradeReminderLastSentAt < UPGRADE_REMINDER_COOLDOWN_MS)
+    ) {
+        remindedThisProcess.add(sessionId);
+        return;
+    }
+
+    // In-memory guard prevents same-process re-fire regardless of delivery path.
     remindedThisProcess.add(sessionId);
-
     const kind = resume ? "resume" : "fresh";
+    const recordDelivery = (): void => {
+        try {
+            updateSessionMeta(deps.db, sessionId, {
+                upgradeReminderLastSentAt: now,
+                upgradeReminderCount: meta.upgradeReminderCount + 1,
+            });
+        } catch {
+            // Best-effort: process-local guard still avoids a same-process loop.
+        }
+    };
 
-    // TUI path: show a persistent, INTERACTIVE dialog with a "Run upgrade now"
-    // action — not a 5-second toast that's trivially missed for a one-time,
-    // actionable notice. Non-TUI (Desktop/headless) path: a persisted ignored
-    // message that stays visible in scrollback.
     try {
         if (deps.isTuiConnected?.(sessionId) && deps.pushTuiDialogAction) {
-            // Do NOT durably stamp on mere display. The durable stamp is set only
-            // when the user makes an EXPLICIT choice (Confirm/Cancel) via the
-            // `dismiss-upgrade-reminder` RPC. Stamping on display would permanently
-            // suppress the dialog if the user closed / ctrl-c'd before acting,
-            // trapping a never-upgraded session with no way to be reminded again
-            // (dogfood 2026-05-30). The per-process guard still prevents spam
-            // within this process; a new process re-shows until the user decides.
+            // A display is not a dismissal: the user may close the dialog without
+            // choosing. It is still a delivered reminder and consumes the cap slot.
             deps.pushTuiDialogAction(sessionId, resume ?? undefined);
+            recordDelivery();
             sessionLog(sessionId, `upgrade-reminder: TUI dialog action enqueued (${kind})`);
         } else {
-            // Non-TUI (Desktop/headless): no interactive buttons, so the persisted
-            // ignored message IS the one-shot delivery. Only stamp after the send
-            // reports an actual post; the title-safety guard can deliberately skip
-            // never-titled sessions, and leaving the stamp unset lets a later
-            // startup retry. Skip the stamp for TRANSIENT delivery (Pi toast) — see
-            // deliveryPersists: stamping a toast that leaves no scrollback would
-            // permanently suppress after one missed toast.
             const delivery = await deps.sendIgnoredMessage(
                 deps.client,
                 sessionId,
@@ -267,13 +231,7 @@ export async function maybeSendUpgradeReminder(
                 deps.getNotificationParams(sessionId),
             );
             if (delivery === "sent") {
-                if (durableStampActive && meta.upgradeRemindedAt === null) {
-                    try {
-                        updateSessionMeta(deps.db, sessionId, { upgradeRemindedAt: Date.now() });
-                    } catch {
-                        // best-effort — still avoid a same-process re-fire (guard set above)
-                    }
-                }
+                recordDelivery();
                 sessionLog(
                     sessionId,
                     `upgrade-reminder: ignored message delivered (${kind}, non-TUI)`,

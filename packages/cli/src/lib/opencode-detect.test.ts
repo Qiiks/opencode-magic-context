@@ -3,6 +3,7 @@ import { join } from "node:path";
 import {
     type DetectDeps,
     detectOpenCode,
+    detectOpenCodeInstallations,
     OPENCODE_DESKTOP_APP_IDS,
     openCodeDesktopSettingsMarkers,
 } from "./opencode-detect";
@@ -89,6 +90,39 @@ describe("detectOpenCode", () => {
     it("does NOT treat ~/.config/opencode (shared core config) as Desktop", () => {
         const coreConfig = join(HOME, ".config", "opencode", "opencode.jsonc");
         expect(detectOpenCode(deps(new Set([coreConfig]))).kind).toBe("none");
+    });
+
+    it("enumerates PATH and home-bin installs in active priority order", () => {
+        const homeBin = join(HOME, ".opencode", "bin", "opencode");
+        const pathBin = "/somewhere/opencode";
+        const installations = detectOpenCodeInstallations(
+            deps(new Set([homeBin, pathBin]), "darwin", () => pathBin),
+        );
+        expect(installations).toEqual([
+            { path: pathBin, source: "PATH", kind: "cli" },
+            { path: homeBin, source: "home-bin", kind: "cli" },
+        ]);
+    });
+
+    it("deduplicates PATH and home-bin symlink aliases by realpath", () => {
+        const homeBin = join(HOME, ".opencode", "bin", "opencode");
+        const pathBin = "/somewhere/opencode";
+        const target = "/opt/opencode/1.18.0/opencode";
+        const installations = detectOpenCodeInstallations({
+            ...deps(new Set([homeBin, pathBin]), "darwin", () => pathBin),
+            realpath: (path) => (path === pathBin || path === homeBin ? target : path),
+        });
+        expect(installations).toEqual([{ path: target, source: "PATH", kind: "cli" }]);
+    });
+
+    it("enumerates Desktop settings and GUI app probes after CLI probes", () => {
+        const d = deps(new Set());
+        const marker = openCodeDesktopSettingsMarkers(d)[0];
+        const appPath = "/Applications/OpenCode.app";
+        expect(detectOpenCodeInstallations(deps(new Set([marker, appPath]), "darwin"))).toEqual([
+            { path: marker, source: "desktop", kind: "desktop" },
+            { path: appPath, source: "app", kind: "desktop" },
+        ]);
     });
 
     it("prefers cli over desktop when both are present", () => {

@@ -6,7 +6,7 @@ import {
 	markMemoryMigrationDone,
 	parseMemoryMigrationOutput,
 } from "@magic-context/core/features/magic-context/memory/memory-migration";
-import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { getAllActiveMemoriesForMigration } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { insertUserMemoryCandidates } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
@@ -59,7 +59,13 @@ export interface PiMemoryMigrationOutcome {
 export async function runPiMemoryMigration(
 	deps: PiMemoryMigrationDeps,
 ): Promise<PiMemoryMigrationOutcome> {
-	const projectPath = resolveProjectIdentity(deps.directory);
+	const projectPath = resolveProjectIdentityForSession(deps.directory);
+	if (!projectPath) {
+		return {
+			ran: false,
+			summary: "No project identity is bound for the home directory.",
+		};
+	}
 
 	if (isMemoryMigrationDone(deps.db, projectPath)) {
 		return {
