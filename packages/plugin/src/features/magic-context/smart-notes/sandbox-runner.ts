@@ -6,12 +6,18 @@
 // emscriptenInclusion=singlefile is "for missing .wasm files when bundling".)
 // We use the ASYNCIFY variant because the capability API (readFile/httpGet/git)
 // is async and the sandbox installs async host functions.
-import singlefileAsyncifyVariant from "@jitl/quickjs-singlefile-cjs-release-asyncify";
-import {
-    newQuickJSAsyncWASMModuleFromVariant,
-    type QuickJSAsyncContext,
-    type QuickJSAsyncWASMModule,
-    type QuickJSHandle,
+//
+// These two modules are imported LAZILY inside getAsyncModule() (below), not at
+// the top of this file. The singlefile variant inlines ~2.6MB of base64 WASM into
+// the bundle; a top-level import forced the JS engine to parse that blob on every
+// plugin load — and on every subagent child spawn — adding hundreds of ms (issue
+// #242). Deferring the import to the first smart-note evaluation splits the variant
+// into its own chunk that stays out of the cold-start parse. The type-only import
+// below is erased at build time and pulls in no runtime code.
+import type {
+    QuickJSAsyncContext,
+    QuickJSAsyncWASMModule,
+    QuickJSHandle,
 } from "quickjs-emscripten";
 
 import type { SmartNoteCapabilityApi, SmartNoteCapabilityFactory } from "./capabilities";
@@ -21,10 +27,21 @@ import { isSmartNoteNetworkError, type SmartNoteCheckResult } from "./types";
  * The WASM module is expensive to instantiate (~1MB compile) but reusable across
  * checks — each check gets its own disposable CONTEXT off the shared module. Cache
  * the module promise process-wide so we compile once, not per check.
+ *
+ * The QuickJS variant + runtime are loaded here on first use via dynamic import so
+ * their (large) modules are parsed only when a smart-note check actually runs,
+ * never at plugin import time. See the file-header note for the cold-start reason.
  */
 let asyncModulePromise: Promise<QuickJSAsyncWASMModule> | null = null;
 function getAsyncModule(): Promise<QuickJSAsyncWASMModule> {
-    asyncModulePromise ??= newQuickJSAsyncWASMModuleFromVariant(singlefileAsyncifyVariant);
+    asyncModulePromise ??= (async () => {
+        const [{ default: singlefileAsyncifyVariant }, { newQuickJSAsyncWASMModuleFromVariant }] =
+            await Promise.all([
+                import("@jitl/quickjs-singlefile-cjs-release-asyncify"),
+                import("quickjs-emscripten"),
+            ]);
+        return newQuickJSAsyncWASMModuleFromVariant(singlefileAsyncifyVariant);
+    })();
     return asyncModulePromise;
 }
 
