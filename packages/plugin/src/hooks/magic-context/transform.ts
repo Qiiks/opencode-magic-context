@@ -68,6 +68,8 @@ import {
 import {
     type CtxReduceAvailabilityVerdict,
     resolveCtxReduceAvailabilityFromMessages,
+    resolveTodowriteAvailabilityFromMessages,
+    type ToolAvailabilityVerdict,
 } from "./ctx-reduce-availability";
 import { computeTailTokenEstimate, shouldTriggerChannel2 } from "./ctx-reduce-nudge";
 import { DEFAULT_HISTORY_BUDGET_TOKENS } from "./decay-render";
@@ -692,6 +694,14 @@ export function createTransform(deps: TransformDeps) {
         const ctxReduceAvailability: CtxReduceAvailabilityVerdict =
             resolveCtxReduceAvailabilityFromMessages(sessionId, messages);
         const ctxReduceCallable = ctxReduceAvailability.callable;
+
+        // Same frozen-per-session verdict for the native `todowrite` tool. When
+        // a session's tools map filters todowrite out, the synthetic todo-pair
+        // injection (postprocess B7 block) must not replay a pair for a tool the
+        // model cannot call. Resolved here from the same first-user-message map
+        // so the verdict is frozen identically and never flaps mid-session.
+        const todowriteAvailability: ToolAvailabilityVerdict =
+            resolveTodowriteAvailabilityFromMessages(sessionId, messages);
 
         // Resolve the *session's* working directory, not the OpenCode launch
         // directory. When the user runs `opencode -s <id>` from outside the
@@ -1913,6 +1923,7 @@ export function createTransform(deps: TransformDeps) {
             messageTagNumbers,
             tagger: deps.tagger,
             ctxReduceAvailability,
+            todowriteAvailability,
             batch,
             contextUsage,
             schedulerDecision,

@@ -3,7 +3,9 @@
 import { describe, expect, it } from "bun:test";
 import {
     clearCtxReduceAvailability,
+    clearTodowriteAvailability,
     resolveCtxReduceAvailabilityFromMessages,
+    resolveTodowriteAvailabilityFromMessages,
 } from "./ctx-reduce-availability";
 
 function userMsg(tools?: Record<string, unknown>) {
@@ -78,5 +80,49 @@ describe("ctx_reduce availability (spawn tools map)", () => {
             userMsg({ "*": false, read: true }),
         ]);
         expect(final).toEqual({ callable: false, frozen: true });
+    });
+});
+
+describe("todowrite availability (generalized resolver)", () => {
+    it("resolves false for an explicit allow-list without todowrite", () => {
+        clearTodowriteAvailability("ses-td-allow");
+        const verdict = resolveTodowriteAvailabilityFromMessages("ses-td-allow", [
+            userMsg({ "*": false, read: true, grep: true }),
+        ]);
+        expect(verdict).toEqual({ callable: false, frozen: true });
+    });
+
+    it("resolves true when todowrite is explicitly allowed", () => {
+        clearTodowriteAvailability("ses-td-explicit");
+        const verdict = resolveTodowriteAvailabilityFromMessages("ses-td-explicit", [
+            userMsg({ "*": false, read: true, todowrite: true }),
+        ]);
+        expect(verdict).toEqual({ callable: true, frozen: true });
+    });
+
+    it("resolves false when todowrite is explicitly denied", () => {
+        clearTodowriteAvailability("ses-td-deny");
+        const verdict = resolveTodowriteAvailabilityFromMessages("ses-td-deny", [
+            userMsg({ todowrite: false }),
+        ]);
+        expect(verdict).toEqual({ callable: false, frozen: true });
+    });
+
+    it("fails open for sessions without a tools map (normal sessions)", () => {
+        clearTodowriteAvailability("ses-td-plain");
+        const verdict = resolveTodowriteAvailabilityFromMessages("ses-td-plain", [userMsg()]);
+        expect(verdict).toEqual({ callable: true, frozen: true });
+    });
+
+    it("resolves ctx_reduce and todowrite independently for the same session", () => {
+        // A tools map can keep ctx_reduce but filter todowrite (or vice versa);
+        // the two verdicts must not bleed into each other through the cache.
+        clearCtxReduceAvailability("ses-td-mixed");
+        clearTodowriteAvailability("ses-td-mixed");
+        const map = userMsg({ "*": false, ctx_reduce: true });
+        const reduce = resolveCtxReduceAvailabilityFromMessages("ses-td-mixed", [map]);
+        const todo = resolveTodowriteAvailabilityFromMessages("ses-td-mixed", [map]);
+        expect(reduce).toEqual({ callable: true, frozen: true });
+        expect(todo).toEqual({ callable: false, frozen: true });
     });
 });

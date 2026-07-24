@@ -49,6 +49,7 @@ import {
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
+import { resolveTodowriteAvailability } from "./ctx-reduce-availability";
 import { MODULE_PAGE_MAX_BYTES, moduleRawBlockMappings, moduleWireBodyBytes } from "./module-wire";
 import {
     readRawSessionMessageOrdinalById,
@@ -314,6 +315,27 @@ function stableHash(value: string): string {
     return createHmac("sha256", "magic-context-shadow-watermark").update(value).digest("hex");
 }
 
+/**
+ * The todo state we report to the Rust module for a session.
+ *
+ * When the session's tools map filters the native todowrite tool out (frozen
+ * "unavailable" verdict), we report an EMPTY state instead of the persisted
+ * one. The module's existing content-change handling then drops the synthetic
+ * todo pair on its next cache-busting render. Reporting empty here (rather than
+ * the stale persisted state) keeps a disabled tool from being replayed into the
+ * module's wire content. The watermark hash is computed from this same value so
+ * the flip to empty registers as a content change and actually triggers a
+ * re-sync. A provisional verdict fails open and reports the real state.
+ */
+function effectiveLastTodoState(
+    sessionId: string,
+    sessionMeta: { lastTodoState?: string | null },
+): string {
+    const verdict = resolveTodowriteAvailability(sessionId);
+    if (verdict.frozen && !verdict.callable) return "";
+    return sessionMeta.lastTodoState ?? "";
+}
+
 function yieldToEventLoop(): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, 0));
 }
@@ -398,7 +420,7 @@ export function loadModuleWatermarks(args: {
         memory_id: memoryId,
         m0_mutation_id: m0Row?.max_id ?? 0,
         memory_mutation_id: memoryMutationId,
-        last_todo_state_hash: stableHash(sessionMeta.lastTodoState ?? ""),
+        last_todo_state_hash: stableHash(effectiveLastTodoState(args.sessionId, sessionMeta)),
         project_memory_epoch: args.projectPath
             ? (getProjectState(args.db, args.projectPath)?.projectMemoryEpoch ?? 0)
             : 0,
@@ -1422,7 +1444,7 @@ export async function buildModuleStateSyncPayload(args: {
         reasoningClearedThroughTag: sessionMeta.clearedReasoningThroughTag,
         userProfile,
         workspace: workspace.workspace,
-        lastTodoState: sessionMeta.lastTodoState ?? "",
+        lastTodoState: effectiveLastTodoState(args.pass.sessionId, sessionMeta),
         watermarks: currentWatermarks,
         omitAuthorityMemorySections,
     };
@@ -1439,7 +1461,7 @@ export async function buildModuleStateSyncPayload(args: {
             ...(omitAuthorityMemorySections ? {} : { memories, memory_mutations: memoryMutations }),
             ...(includeUserProfile ? { user_profile: userProfile } : {}),
             ...(includeWorkspace ? { workspace: workspace.workspace } : {}),
-            last_todo_state: sessionMeta.lastTodoState ?? "",
+            last_todo_state: effectiveLastTodoState(args.pass.sessionId, sessionMeta),
             project_memory_epoch: currentWatermarks.project_memory_epoch,
             user_profile_version: currentWatermarks.project_user_profile_version,
             acked_watermarks: currentWatermarks,

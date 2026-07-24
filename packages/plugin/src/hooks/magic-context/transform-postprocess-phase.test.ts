@@ -23,7 +23,9 @@ import {
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
     getPersistedCompactionMarkerState,
+    getPersistedTodoSyntheticAnchor,
     setPersistedCompactionMarkerState,
+    setPersistedTodoSyntheticAnchor,
 } from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
 import { Database } from "../../shared/sqlite";
@@ -37,7 +39,7 @@ import {
     type ThinkingLikePart,
     tagMessages,
 } from "./tag-messages";
-import { isSyntheticTodoPart } from "./todo-view";
+import { buildSyntheticTodoPart, computeSyntheticCallId, isSyntheticTodoPart } from "./todo-view";
 import {
     createToolDropTarget,
     extractToolCallObservation,
@@ -186,6 +188,9 @@ function basePostTransformArgs(
         messageTagNumbers: new Map(),
         tagger: createTagger(),
         ctxReduceAvailability: { callable: true, frozen: true },
+        // Default to todowrite available so existing tests keep their behavior;
+        // the disabled-tool gate tests override this per case.
+        todowriteAvailability: { callable: true, frozen: true },
         batch: null,
         contextUsage: { percentage: 20, inputTokens: 1000 },
         schedulerDecision: "defer",
@@ -1347,6 +1352,8 @@ describe("postprocess emergency drop accounting", () => {
             batch: { finalize: () => {} },
             contextUsage: { percentage: 90, inputTokens: 7000 },
             schedulerDecision: "execute",
+            ctxReduceAvailability: { callable: true, frozen: true },
+            todowriteAvailability: { callable: true, frozen: true },
             fullFeatureMode: true,
             canRunCompartments: false,
             awaitedCompartmentRun: false,
@@ -2662,5 +2669,185 @@ describe("final message representation", () => {
 
         expect(targetedResult).toEqual(oldResult);
         expect(JSON.stringify(targeted)).toBe(JSON.stringify(fullWalk));
+    });
+});
+
+const TODO_ACTIVE_STATE = JSON.stringify([
+    { content: "Build feature", status: "in_progress", priority: "high" },
+    { content: "Write tests", status: "pending", priority: "medium" },
+]);
+
+/**
+ * Drive the REAL runPostTransformPhase todo-synthesis block (B7) with an
+ * explicit todowrite-availability verdict and scheduler decision, so the
+ * disabled-tool gate is exercised against production code rather than a mirror.
+ * `schedulerDecision: "execute"` is a cache-busting pass; `"defer"` replays.
+ */
+async function runTodoGatePass(args: {
+    sessionId: string;
+    messages: MessageLike[];
+    schedulerDecision: "execute" | "defer";
+    todowriteAvailability: { callable: boolean; frozen: boolean };
+}): Promise<void> {
+    const tagger = createTagger();
+    const tagged = tagMessages(args.sessionId, args.messages, tagger, db);
+    await runPostTransformPhase(
+        basePostTransformArgs(db, args.sessionId, args.messages, {
+            schedulerDecision: args.schedulerDecision,
+            tagger,
+            targets: tagged.targets,
+            reasoningByMessage: tagged.reasoningByMessage,
+            messageTagNumbers: tagged.messageTagNumbers,
+            batch: tagged.batch,
+            todowriteAvailability: args.todowriteAvailability,
+        }),
+    );
+}
+
+function buildTodoGateMessages(sessionId: string): MessageLike[] {
+    return [
+        {
+            info: { id: "u1", role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "please help" }],
+        },
+        {
+            info: { id: "a1", role: "assistant", sessionID: sessionId, finish: "stop" },
+            parts: [{ type: "text", text: "on it" }],
+        },
+    ] as unknown as MessageLike[];
+}
+
+function findTodoPart(messages: MessageLike[]): unknown | null {
+    for (const message of messages) {
+        for (const part of message.parts) {
+            if (isSyntheticTodoPart(part)) return part;
+        }
+    }
+    return null;
+}
+
+describe("todo synthesis — disabled todowrite tool gate", () => {
+    const UNAVAILABLE = { callable: false, frozen: true };
+    const AVAILABLE = { callable: true, frozen: true };
+
+    it("(a) busting pass with todowrite filtered out injects nothing and clears the persisted anchor", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-todo-gate-bust";
+        // Stale state + anchor persisted from before the tool was disabled.
+        updateSessionMeta(db, sessionId, { lastTodoState: TODO_ACTIVE_STATE });
+        setPersistedTodoSyntheticAnchor(
+            db,
+            sessionId,
+            "mc_synthetic_todo_stale",
+            "a1",
+            TODO_ACTIVE_STATE,
+        );
+
+        const messages = buildTodoGateMessages(sessionId);
+        await runTodoGatePass({
+            sessionId,
+            messages,
+            schedulerDecision: "execute",
+            todowriteAvailability: UNAVAILABLE,
+        });
+
+        // No synthetic pair for a tool the session does not have...
+        expect(findTodoPart(messages)).toBeNull();
+        // ...and the anchor is gone so later defers have nothing to replay.
+        expect(getPersistedTodoSyntheticAnchor(db, sessionId)).toBeNull();
+    });
+
+    it("(b) unavailable defer keeps replaying the persisted pair byte-identically, then the next bust removes it", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-todo-gate-defer";
+        updateSessionMeta(db, sessionId, { lastTodoState: TODO_ACTIVE_STATE });
+        const callId = computeSyntheticCallId(TODO_ACTIVE_STATE);
+        setPersistedTodoSyntheticAnchor(db, sessionId, callId, "a1", TODO_ACTIVE_STATE);
+
+        // Defer pass while unavailable: the persisted pair is still replayed
+        // (removal only rides a busting pass, so the cached prefix stays warm).
+        const deferMessages = buildTodoGateMessages(sessionId);
+        await runTodoGatePass({
+            sessionId,
+            messages: deferMessages,
+            schedulerDecision: "defer",
+            todowriteAvailability: UNAVAILABLE,
+        });
+
+        // Exact part bytes: the replayed part equals a fresh build from the
+        // PERSISTED snapshot, anchored at the persisted message.
+        const replayed = findTodoPart(deferMessages);
+        expect(replayed).not.toBeNull();
+        const expectedPart = buildSyntheticTodoPart(TODO_ACTIVE_STATE);
+        expect(JSON.stringify(replayed)).toBe(JSON.stringify(expectedPart));
+        const anchoredMessage = deferMessages.find((message) =>
+            message.parts.some((part) => isSyntheticTodoPart(part)),
+        );
+        expect(anchoredMessage?.info.id).toBe("a1");
+        // Anchor survives the defer pass untouched.
+        expect(getPersistedTodoSyntheticAnchor(db, sessionId)).toEqual({
+            callId,
+            messageId: "a1",
+            stateJson: TODO_ACTIVE_STATE,
+        });
+
+        // Next cache-busting pass detects the unavailable verdict and removes
+        // the pair: nothing injected and the anchor is cleared.
+        const bustMessages = buildTodoGateMessages(sessionId);
+        await runTodoGatePass({
+            sessionId,
+            messages: bustMessages,
+            schedulerDecision: "execute",
+            todowriteAvailability: UNAVAILABLE,
+        });
+        expect(findTodoPart(bustMessages)).toBeNull();
+        expect(getPersistedTodoSyntheticAnchor(db, sessionId)).toBeNull();
+    });
+
+    it("(c) busting pass with todowrite available keeps the existing injection behavior", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-todo-gate-available";
+        updateSessionMeta(db, sessionId, { lastTodoState: TODO_ACTIVE_STATE });
+
+        const messages = buildTodoGateMessages(sessionId);
+        await runTodoGatePass({
+            sessionId,
+            messages,
+            schedulerDecision: "execute",
+            todowriteAvailability: AVAILABLE,
+        });
+
+        const part = findTodoPart(messages);
+        expect(part).not.toBeNull();
+        expect(JSON.stringify(part)).toBe(
+            JSON.stringify(buildSyntheticTodoPart(TODO_ACTIVE_STATE)),
+        );
+        // Anchor persisted for later defer replays, as before.
+        const anchor = getPersistedTodoSyntheticAnchor(db, sessionId);
+        expect(anchor?.messageId).toBe("a1");
+        expect(anchor?.stateJson).toBe(TODO_ACTIVE_STATE);
+    });
+
+    it("(d) a provisional (not yet frozen) verdict fails open and still injects", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-todo-gate-provisional";
+        updateSessionMeta(db, sessionId, { lastTodoState: TODO_ACTIVE_STATE });
+
+        const messages = buildTodoGateMessages(sessionId);
+        await runTodoGatePass({
+            sessionId,
+            messages,
+            schedulerDecision: "execute",
+            // No first user message processed yet → provisional fail-open verdict.
+            todowriteAvailability: { callable: true, frozen: false },
+        });
+
+        // Fail-open: injection proceeds exactly as the available case.
+        expect(findTodoPart(messages)).not.toBeNull();
+        expect(getPersistedTodoSyntheticAnchor(db, sessionId)?.stateJson).toBe(TODO_ACTIVE_STATE);
     });
 });
