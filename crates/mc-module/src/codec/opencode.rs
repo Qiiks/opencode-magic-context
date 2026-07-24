@@ -252,7 +252,6 @@ fn encode_opencode_impl(
     mutation_exempt_mid: Option<&str>,
 ) -> Vec<MessageV2Json> {
     let mut encoded = Vec::with_capacity(messages.len());
-    let mut synthetic_index = 0;
     let mut index = 0;
     while index < messages.len() {
         if let Some(next) = messages.get(index + 1) {
@@ -278,15 +277,10 @@ fn encode_opencode_impl(
             }
         }
         let msg = &messages[index];
-        let meta = meta_for_ck(sidecar, msg, index).or_else(|| {
-            if msg.meta.synthetic {
-                let current = sidecar.synthetic_message_for_index(synthetic_index);
-                synthetic_index += 1;
-                current
-            } else {
-                None
-            }
-        });
+        // Decoded input messages retain their harness id, so metadata can be rebound by
+        // identity. A positional synthetic fallback can instead attach an input nudge's
+        // native envelope to a fresh module-authored m0/m1 message.
+        let meta = meta_for_ck(sidecar, msg, index);
         encoded.push(match meta {
             Some(meta) if mutation_exempt_mid == Some(meta.mid.as_str()) => meta.raw.clone(),
             Some(meta) => encode_with_meta(msg, meta, preserve_compaction),

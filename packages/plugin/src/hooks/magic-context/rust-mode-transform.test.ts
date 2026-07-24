@@ -18,6 +18,7 @@ import {
     getOverflowState,
     recordDetectedContextLimit,
     recordOverflowDetected,
+    resetEmergencyRecoveryRegistryForTest,
 } from "../../features/magic-context/storage-meta-persisted";
 import {
     scheduleOpenCodeTransformDecisionWrite,
@@ -112,6 +113,7 @@ function randomText(random: () => number, length: number): string {
 afterEach(() => {
     closeReadOnlySessionDb();
     transformDecisionTest.reset();
+    resetEmergencyRecoveryRegistryForTest();
     for (const unregister of unregisters.splice(0)) unregister();
     for (const db of databases.splice(0)) closeQuietly(db);
     for (const dataHome of availabilityDataHomes.splice(0)) {
@@ -1512,6 +1514,69 @@ describe("Rust mode authority adapter", () => {
             transform.run(sessionId, input, output, makeMeta(db, sessionId)),
         ).rejects.toBeInstanceOf(EmergencyFailClosedError);
         expect(output.messages).toEqual(input);
+    });
+
+    it("aborts after a fresh repeated provider overflow when the provider reports no limit", async () => {
+        const sessionId = `rust-overflow-unknown-repeat-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordOverflowDetected(db, sessionId, undefined);
+        resetEmergencyRecoveryRegistryForTest();
+        expect(getOverflowState(db, sessionId)).toMatchObject({
+            detectedContextLimit: 0,
+            needsEmergencyRecovery: true,
+            emergencyRecoveryOrigin: "provider_overflow",
+        });
+        // The second observation models a provider overflow event arriving while recovery
+        // from the first rejection is still durably armed.
+        recordOverflowDetected(db, sessionId, undefined);
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method === "transform") throw new Error("adapter validation failed");
+                return { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.contextUsageMap.set(sessionId, {
+            usage: { inputTokens: 95_000, percentage: 95 },
+            updatedAt: Date.now(),
+        });
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = makeMessages(sessionId);
+        const output = { messages: [...input] as unknown[] };
+
+        await expect(
+            transform.run(sessionId, input, output, makeMeta(db, sessionId)),
+        ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        expect(output.messages).toEqual(input);
+    });
+
+    it("does not treat the first unknown-limit overflow arm as repeated provider proof", async () => {
+        const sessionId = `rust-overflow-unknown-first-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordOverflowDetected(db, sessionId, undefined);
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method === "transform") throw new Error("adapter validation failed");
+                return { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.contextUsageMap.set(sessionId, {
+            usage: { inputTokens: 95_000, percentage: 95 },
+            updatedAt: Date.now(),
+        });
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = makeMessages(sessionId);
+        const output = { messages: [...input] as unknown[] };
+
+        await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+
+        expect(output.messages).toEqual(input);
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(1);
     });
 
     it("refuses an LKG prefix plus pristine tail that exceeds the current limit", async () => {

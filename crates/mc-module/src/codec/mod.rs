@@ -124,6 +124,55 @@ mod tests {
     }
 
     #[test]
+    fn fresh_boundary_prefix_does_not_borrow_persisted_synthetic_meta() {
+        let session_id = "ses_persisted_synthetic";
+        let persisted_nudge = json!({
+            "info": {
+                "id": "msg_persisted_nudge",
+                "sessionID": session_id,
+                "role": "user"
+            },
+            "parts": [{
+                "type": "text",
+                "text": "Persisted channel-2 nudge",
+                "synthetic": true
+            }]
+        });
+        let input = vec![
+            json!({
+                "info": { "id": "msg_boundary", "sessionID": session_id, "role": "user" },
+                "parts": [
+                    { "type": "text", "text": "covered" },
+                    { "type": "compaction", "auto": true }
+                ]
+            }),
+            persisted_nudge.clone(),
+            json!({
+                "info": { "id": "msg_tail", "sessionID": session_id, "role": "assistant" },
+                "parts": [{ "type": "text", "text": "tail" }]
+            }),
+        ];
+        let decoded = decode_opencode(&input);
+        assert!(decoded.boundary.is_some());
+        let mut output = vec![
+            CkWireMessage::synthetic_user_text("<session-history>m0</session-history>"),
+            CkWireMessage::synthetic_user_text("m1"),
+        ];
+        output.extend(decoded.messages.iter().map(|message| message.ck.clone()));
+
+        let encoded =
+            encode_opencode_with_session(&output, &decoded.sidecar, Some(session_id), None);
+        let m0 = &encoded[0];
+        assert_eq!(m0["info"]["role"], "user");
+        assert_eq!(m0["info"]["sessionID"], session_id);
+        assert!(m0["parts"]
+            .as_array()
+            .is_some_and(|parts| parts.iter().all(|part| part["synthetic"] == true)));
+        assert_ne!(m0["info"]["id"], "msg_persisted_nudge");
+        assert_eq!(encoded[3], persisted_nudge);
+    }
+
+    #[test]
     fn pi_golden_round_trips_non_compaction_entries_and_is_deterministic() {
         let golden: PiGolden =
             serde_json::from_str(include_str!("../../testdata/codec/pi-golden.json")).unwrap();

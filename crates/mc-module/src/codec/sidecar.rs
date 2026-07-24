@@ -70,14 +70,6 @@ impl DecodeSidecar {
             .and_then(|mid| self.messages.get(mid.as_str()))
     }
 
-    pub fn synthetic_message_for_index(&self, index: usize) -> Option<&HarnessMessageMeta> {
-        self.order
-            .iter()
-            .filter_map(|mid| self.messages.get(mid.as_str()))
-            .filter(|meta| is_synthetic_message(meta))
-            .nth(index)
-    }
-
     pub fn inherit_pin(&self, stable_key: &str) -> Option<String> {
         self.mid_pins.get(stable_key).cloned()
     }
@@ -335,11 +327,4 @@ pub(crate) fn is_synthetic_part(part: &Value) -> bool {
             .get("syntheticTodoMarker")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-}
-
-fn is_synthetic_message(meta: &HarnessMessageMeta) -> bool {
-    let Some(parts) = meta.raw.get("parts").and_then(Value::as_array) else {
-        return false;
-    };
-    !parts.is_empty() && parts.iter().all(is_synthetic_part)
 }
