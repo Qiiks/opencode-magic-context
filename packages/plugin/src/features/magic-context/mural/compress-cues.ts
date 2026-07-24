@@ -48,6 +48,24 @@ import {
  *  partial run leaves little re-work; the daily cadence drains any backlog. */
 export const COMPRESS_CUES_CHUNK_SIZE = 40;
 
+/** Minimum wall-clock budget a single chunk is allowed before we consider it
+ *  doomed. runCompressCues divides the remaining task deadline evenly across the
+ *  chunks still to run; on a large backfill (e.g. a 470-memory pool = 12 chunks)
+ *  that even split can hand a slow thinking model far less than it needs, so
+ *  every chunk times out, contributes 0 cues, and the loop burns the whole
+ *  deadline (and model quota) marching through chunks that can never finish.
+ *  The floor keeps each attempted chunk's slice at least this large, and if the
+ *  remaining budget drops below it we stop the run and bank progress instead of
+ *  starting a chunk we already know cannot complete. */
+export const CHUNK_TIMEOUT_FLOOR_MS = 240_000;
+
+/** How many chunks in a row may fail with a timeout-class error before the run
+ *  stops early. A model that is consistently slower than its time slice will
+ *  time out every chunk; continuing just burns the remaining chunks and quota.
+ *  Two consecutive timeouts is enough to conclude the model cannot keep up
+ *  within its slice, while still tolerating a single flaky/transient timeout. */
+const CONSECUTIVE_TIMEOUT_LIMIT = 2;
+
 export interface CompressCuesArgs {
     db: Database;
     client: PluginContext["client"];
@@ -59,6 +77,25 @@ export interface CompressCuesArgs {
     deadline: number;
     model?: string;
     fallbackModels?: readonly string[];
+}
+
+/** How a chunk failed, used by the run loop to decide whether to keep going.
+ *  "timeout" means the model did not finish within its time slice; "other"
+ *  covers validation failures (bad/missing manifest, length cap) and provider
+ *  errors, which keep the existing per-chunk retry-next-run behavior. */
+type ChunkFailureClass = "timeout" | "other";
+
+interface ChunkOutcome {
+    compressed: number;
+    skipped: number;
+    /** Present only when the chunk failed. Carries the failure class plus the
+     *  measured elapsed time so the run loop can log how long the doomed chunk
+     *  actually ran (helps an operator size chunk vs model). */
+    failure?: {
+        class: ChunkFailureClass;
+        brief: string;
+        elapsedMs: number;
+    };
 }
 
 export interface CompressCuesResult {
@@ -108,6 +145,18 @@ function selectCandidates(db: Database, projectIdentity: string): CueCandidate[]
     return candidates;
 }
 
+/** Compute the wall-clock slice for the next chunk: an even split of the
+ *  remaining budget across the chunks still to run, but never below
+ *  CHUNK_TIMEOUT_FLOOR_MS (a slice smaller than the model needs guarantees a
+ *  timeout) and never more than the budget actually remaining. Exported for
+ *  test; the run loop calls this once per chunk. */
+export function computeChunkSliceMs(remainingMs: number, chunksRemaining: number): number {
+    return Math.min(
+        remainingMs,
+        Math.max(CHUNK_TIMEOUT_FLOOR_MS, Math.floor(remainingMs / chunksRemaining)),
+    );
+}
+
 export async function runCompressCues(args: CompressCuesArgs): Promise<CompressCuesResult> {
     const candidates = selectCandidates(args.db, args.projectIdentity);
     const result: CompressCuesResult = {
@@ -132,20 +181,57 @@ export async function runCompressCues(args: CompressCuesArgs): Promise<CompressC
         abortController.abort(),
     );
     try {
+        let consecutiveTimeouts = 0;
+        // Elapsed time of each chunk in the current consecutive-timeout streak,
+        // logged when the breaker trips so an operator can size chunk vs model.
+        let timeoutStreakElapsedMs: number[] = [];
         for (let i = 0; i < chunks.length; i += 1) {
             const remainingMs = Math.max(0, args.deadline - Date.now());
             if (remainingMs <= 0) break;
-            const sliceMs = Math.max(1, Math.floor(remainingMs / (chunks.length - i)));
-            const counts = await compressOneChunk(
+            // Not enough budget left to give this chunk a fair (>= floor) slice.
+            // Starting it would just produce another timeout, so stop here and
+            // bank progress: cues already written are durable per memory, and the
+            // incomplete result keeps this task transient so cron retries it.
+            if (remainingMs < CHUNK_TIMEOUT_FLOOR_MS) {
+                log(
+                    `[dreamer] compress-cues: stopping before chunk ${i + 1}/${chunks.length} — remaining budget ${remainingMs}ms is below the ${CHUNK_TIMEOUT_FLOOR_MS}ms chunk floor; banking ${result.compressed} compressed cue(s)`,
+                );
+                break;
+            }
+            // Even-split the remaining budget across the chunks still to run, but
+            // never hand a chunk less than the floor (a slice too small for the
+            // model guarantees a timeout).
+            const sliceMs = computeChunkSliceMs(remainingMs, chunks.length - i);
+            const outcome = await compressOneChunk(
                 args,
                 chunks[i]!,
                 sliceMs,
                 abortController.signal,
             );
-            result.compressed += counts.compressed;
-            result.skipped += counts.skipped;
-            result.remaining -= counts.compressed;
+            result.compressed += outcome.compressed;
+            result.skipped += outcome.skipped;
+            result.remaining -= outcome.compressed;
             result.chunks += 1;
+
+            if (outcome.failure?.class === "timeout") {
+                consecutiveTimeouts += 1;
+                timeoutStreakElapsedMs.push(outcome.failure.elapsedMs);
+                if (consecutiveTimeouts >= CONSECUTIVE_TIMEOUT_LIMIT) {
+                    // Circuit breaker: the model is consistently slower than its
+                    // time slice. Stop now instead of burning the remaining chunks
+                    // (and model quota) on attempts that will also time out.
+                    log(
+                        `[dreamer] compress-cues: circuit breaker tripped — ${consecutiveTimeouts} consecutive chunk timeouts (model too slow for its time slice); per-chunk elapsed [${timeoutStreakElapsedMs.join("ms, ")}ms] vs ${sliceMs}ms slice; stopping run incomplete with ${chunks.length - i - 1} chunk(s) unattempted`,
+                    );
+                    break;
+                }
+            } else {
+                // A success or a non-timeout failure (validation/provider) breaks
+                // the streak: those keep the existing retry-next-run behavior and
+                // must not trip the timeout breaker.
+                consecutiveTimeouts = 0;
+                timeoutStreakElapsedMs = [];
+            }
         }
         result.complete = result.remaining === 0;
         log(
@@ -157,13 +243,24 @@ export async function runCompressCues(args: CompressCuesArgs): Promise<CompressC
     }
 }
 
+/** True when a chunk failed because the model did not finish within its time
+ *  slice — the "prompt timed out after Nms" error thrown by promptWithTimeout in
+ *  shared/model-suggestion-retry. Validation failures (bad/missing manifest,
+ *  length-capped output) and provider errors are deliberately NOT timeout-class:
+ *  those keep the existing per-chunk retry-next-run behavior and must not trip
+ *  the consecutive-timeout circuit breaker. */
+function isTimeoutClassError(error: unknown): boolean {
+    return error instanceof Error && /^prompt timed out after \d+ms$/.test(error.message);
+}
+
 async function compressOneChunk(
     args: CompressCuesArgs,
     chunk: CueCandidate[],
     sliceMs: number,
     signal: AbortSignal,
-): Promise<{ compressed: number; skipped: number }> {
+): Promise<ChunkOutcome> {
     let agentSessionId: string | null = null;
+    const startedAt = Date.now();
     try {
         const prompt = buildCompressCuesPrompt({
             projectPath: args.projectIdentity,
@@ -238,7 +335,18 @@ async function compressOneChunk(
         // and this chunk's memories stay NULL and are retried next run. Rethrow
         // only on abort (lease lost / deadline) so the scheduler records it.
         if (signal.aborted) throw error;
-        return { compressed: 0, skipped: 0 };
+        // Classify the failure so the run loop can drive the consecutive-timeout
+        // circuit breaker. The measured elapsed time lets the operator compare
+        // how long the model actually ran against the slice it was given.
+        return {
+            compressed: 0,
+            skipped: 0,
+            failure: {
+                class: isTimeoutClassError(error) ? "timeout" : "other",
+                brief: desc.brief,
+                elapsedMs: Date.now() - startedAt,
+            },
+        };
     } finally {
         if (agentSessionId && !shouldKeepSubagents()) {
             await args.client.session
