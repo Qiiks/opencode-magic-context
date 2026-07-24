@@ -62,7 +62,9 @@ function printUsage(): void {
     console.log("    doctor --check-v22-backfill       Show v22 memory backfill status");
     console.log("    doctor --retry-v22-backfill       Retry failed v22 memory backfill rows");
     console.log("    doctor --rekey-v22-dir-identity <path>  Re-key legacy dir identity rows");
-    console.log("    doctor drain-authority <project>  Drain module memory/note authority back to TypeScript");
+    console.log(
+        "    doctor drain-authority <project>  Drain module memory/note authority back to TypeScript",
+    );
     console.log("    doctor migrate   Migrate OpenCode session to Pi JSONL");
     console.log("    doctor migrate-session   Re-home an OpenCode session to another directory");
     console.log(

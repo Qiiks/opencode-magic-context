@@ -53,8 +53,8 @@ import {
     sanitizePathString,
 } from "../lib/redaction";
 import { runV22BackfillCommands, type V22BackfillCommandArgs } from "../lib/v22-backfill-commands";
-import { clearPluginCache } from "./doctor-opencode-cache";
 import { reportAuthorityMarkers } from "./doctor-authority";
+import { clearPluginCache } from "./doctor-opencode-cache";
 
 const CLI_PACKAGE_NAME = "@cortexkit/magic-context";
 
@@ -639,7 +639,9 @@ export async function runDoctor(
             log.info("Authority: no context database found");
         }
     } catch (error) {
-        warn(`Authority check unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        warn(
+            `Authority check unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        );
     } finally {
         authorityDb?.close();
     }

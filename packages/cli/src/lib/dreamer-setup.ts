@@ -28,7 +28,8 @@ const TASK_DESCRIPTIONS: Record<DreamTaskName, string> = {
     verify: "Checks changed-file memories against code and fixes/removes stale ones",
     "verify-broad": "Periodic full re-check of the whole memory pool (catches drift)",
     curate: "Deduplicates, tightens, and prunes the memory pool",
-    "compress-cues": "Compresses each overflow memory into a mural cue (mural renders deterministically)",
+    "compress-cues":
+        "Compresses each overflow memory into a mural cue (mural renders deterministically)",
     "classify-memories": "Scores memory importance, scope, and shareability",
     retrospective: "Learns from moments you had to correct or re-explain, and records the lesson",
     "maintain-docs": "Keep ARCHITECTURE.md / STRUCTURE.md in sync",

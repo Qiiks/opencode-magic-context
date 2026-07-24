@@ -1,10 +1,10 @@
 import {
+    type AuthorityModuleClient,
     checksumAuthoritySeedRows,
     drainAuthority,
     ensureContextStoreUuid,
     getAuthorityManagedMarker,
     listAuthorityManagedMarkers,
-    type AuthorityModuleClient,
 } from "@magic-context/core/features/magic-context/context-authority";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { bumpProjectMemoryEpoch } from "@magic-context/core/features/magic-context/storage-project-state";
@@ -15,7 +15,10 @@ import { openExistingContextDatabaseForMutation } from "../lib/database-access";
 
 const DOMAINS = ["memories", "notes"] as const;
 
-function authorityClient(transport: SubcModuleTransport, projectRoot: string): AuthorityModuleClient {
+function authorityClient(
+    transport: SubcModuleTransport,
+    projectRoot: string,
+): AuthorityModuleClient {
     return {
         authorityStatus: (request) => transport.authorityStatus({ ...request, projectRoot }),
         authorityPrepare: (request) => transport.authorityPrepare({ ...request, projectRoot }),
@@ -83,7 +86,10 @@ export async function reportAuthorityMarkers(args: {
     }
 }
 
-export async function runDoctorDrainAuthority(projectRoot: string, dbPath: string): Promise<number> {
+export async function runDoctorDrainAuthority(
+    projectRoot: string,
+    dbPath: string,
+): Promise<number> {
     const db = openExistingContextDatabaseForMutation(dbPath);
     if (!db) {
         console.error("No Magic Context database found.");
@@ -105,7 +111,9 @@ export async function runDoctorDrainAuthority(projectRoot: string, dbPath: strin
             });
             if (!status.authority || status.authority.state === "TS") continue;
             if (status.authority.state !== "MODULE" && status.authority.state !== "DRAINING") {
-                console.error(`Authority ${domain} is ${status.authority.state}; retry after it settles.`);
+                console.error(
+                    `Authority ${domain} is ${status.authority.state}; retry after it settles.`,
+                );
                 return 1;
             }
             let result: Awaited<ReturnType<typeof drainAuthority>> | undefined;
@@ -120,7 +128,9 @@ export async function runDoctorDrainAuthority(projectRoot: string, dbPath: strin
                 if (!("code" in result)) break;
             }
             if (!result || "code" in result) {
-                console.error("Authority drain is contended and remains retryable; try again shortly.");
+                console.error(
+                    "Authority drain is contended and remains retryable; try again shortly.",
+                );
                 return 1;
             }
             drainedAny = true;
