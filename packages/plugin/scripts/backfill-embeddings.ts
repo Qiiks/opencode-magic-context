@@ -15,6 +15,7 @@
  *                it drives the same bounded enqueue path the plugin runs, but to
  *                completion with progress output.
  */
+import { getMagicContextStorageDir } from '../src/shared/data-path';
 import { Database } from "../src/shared/sqlite";
 import { loadPluginConfig, loadPluginConfigDetailed } from "../src/config";
 import {
@@ -30,7 +31,11 @@ import { saveEmbedding } from "../src/features/magic-context/memory/storage-memo
 import { isConfigLoadUntrusted } from "../src/plugin/embedding-bootstrap-helpers";
 import { resolveEmbeddingRouting } from "../src/plugin/embedding-routing";
 
-const DB_PATH = `${process.env.HOME}/.local/share/opencode/storage/plugin/magic-context/context.db`;
+// Shared CortexKit database (OpenCode + Pi). The pre-v0.16 per-harness path
+// (~/.local/share/opencode/storage/plugin/magic-context/) is a dead fossil on
+// migrated installs — opening it silently operates on stale data with an
+// ancient schema, so resolve through the same helper the plugin uses.
+const DB_PATH = `${getMagicContextStorageDir()}/context.db`;
 function getArg(name: string): string | null {
     const index = process.argv.indexOf(name);
     return index >= 0 ? (process.argv[index + 1] ?? null) : null;
