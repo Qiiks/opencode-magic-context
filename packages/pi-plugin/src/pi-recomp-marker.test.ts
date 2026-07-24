@@ -123,7 +123,11 @@ describe("queueAndApplyPiRecompMarker (eager path coverage precondition)", () =>
 				},
 			]);
 
-			queueAndApplyPiRecompMarker({ db, sessionId, ctx: { sessionManager: {} } });
+			queueAndApplyPiRecompMarker({
+				db,
+				sessionId,
+				ctx: { sessionManager: {} },
+			});
 
 			expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
 		} finally {
