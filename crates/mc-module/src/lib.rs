@@ -9150,6 +9150,12 @@ fn replay_dream_task_response(response_json: &str) -> HandlerOutcome {
 // scoped to transform responses only: respond_transform is the sole transform-response
 // serializer, and facade tools and status/wrapup ops never route through it.
 //
+// Additionally, the fault self-disarms after MC_DRIVE_FAULT_COUNT firings (default 1)
+// via a fetch_sub claim on DRIVE_FAULT_REMAINING. This prevents the fault from
+// corrupting a recovery pass in the fence+recover drive arc — the only other disarm
+// would be a restart, which injects a variable the arc must not contain. Total WARN
+// lines in logs will equal exactly N, so miscounts are visible.
+//
 // Maintenance rule: never add another fault arm without the same absence-proof note in
 // Cargo.toml and the fault-shape tests that pin the existing arms.
 #[cfg(feature = "drive-fault")]
@@ -9172,13 +9178,46 @@ fn parse_drive_fault(raw: Option<&str>) -> Option<DriveFault> {
     }
 }
 
+/// Parse MC_DRIVE_FAULT_COUNT: how many transform responses may fire the fault before
+/// the mechanism self-disarms. Pure (no env access) so unit-testable without touching
+/// process-global env or the process-wide OnceLock/AtomicUsize below.
+///
+/// Defaults to 1 when unset, empty, or unparseable. A value of 0 is treated as
+/// unset (defaults to 1) since 0 would mean "never fire" which is indistinguishable
+/// from not setting MC_DRIVE_FAULT at all.
+#[cfg(feature = "drive-fault")]
+fn parse_drive_fault_count(raw: Option<&str>) -> usize {
+    match raw.and_then(|s| s.parse::<usize>().ok()) {
+        Some(n) if n > 0 => n,
+        _ => 1,
+    }
+}
+
+/// Remaining fault-firings before the mechanism self-disarms permanently.
+/// Initialized alongside the arm selection in `drive_fault()`.
+#[cfg(feature = "drive-fault")]
+static DRIVE_FAULT_REMAINING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// The active fault arm, read from MC_DRIVE_FAULT once per process (first call wins via
-/// OnceLock — no per-request getenv on the transform hot path).
+/// OnceLock — no per-request getenv on the transform hot path). Also initializes
+/// DRIVE_FAULT_REMAINING from MC_DRIVE_FAULT_COUNT so the count is set before any
+/// respond_transform call can read it.
 #[cfg(feature = "drive-fault")]
 fn drive_fault() -> Option<DriveFault> {
     use std::sync::OnceLock;
     static FAULT: OnceLock<Option<DriveFault>> = OnceLock::new();
-    *FAULT.get_or_init(|| parse_drive_fault(std::env::var("MC_DRIVE_FAULT").ok().as_deref()))
+    *FAULT.get_or_init(|| {
+        let fault = parse_drive_fault(std::env::var("MC_DRIVE_FAULT").ok().as_deref());
+        // Initialize the remaining fault count alongside the arm selection.
+        // This runs exactly once per process (OnceLock), so DRIVE_FAULT_REMAINING
+        // is set before any respond_transform call can read it.
+        let count = parse_drive_fault_count(
+            std::env::var("MC_DRIVE_FAULT_COUNT").ok().as_deref(),
+        );
+        DRIVE_FAULT_REMAINING.store(count, std::sync::atomic::Ordering::Relaxed);
+        fault
+    })
 }
 
 /// Corrupt a transform response per the selected fault arm and log one loud WARN per
@@ -9218,9 +9257,25 @@ fn respond_transform(
     // drive-fault: corrupt the response before it is serialized (see the SAFETY note
     // above the fault helpers). No-op unless the feature is compiled in AND MC_DRIVE_FAULT
     // selects an arm; must run before ck_messages is taken for the streaming placeholder.
+    //
+    // The fault fires at most N times (MC_DRIVE_FAULT_COUNT, default 1) then self-disarms
+    // permanently via a fetch_update claim on DRIVE_FAULT_REMAINING. This is critical for the
+    // fence+recover drive arc: a recovery pass must NOT be corrupted, and the only other
+    // disarm is a restart (which injects a variable the arc must not contain). The claim
+    // uses checked_sub so concurrent responses cannot underflow or double-fire past N —
+    // total WARN lines in logs will equal exactly N.
     #[cfg(feature = "drive-fault")]
     if let Some(fault) = drive_fault() {
-        apply_drive_fault(&mut response, fault);
+        // Claim one firing: fetch_update atomically decrements only if the count is > 0.
+        // If the count was already 0, checked_sub returns None and we skip — no underflow.
+        // If the count was > 0, the previous value is returned as Ok(prev) and we fire.
+        use std::sync::atomic::Ordering;
+        match DRIVE_FAULT_REMAINING.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            n.checked_sub(1)
+        }) {
+            Ok(prev) if prev > 0 => apply_drive_fault(&mut response, fault),
+            _ => {} // exhausted — response passes through cleanly
+        }
     }
     let response_encode_started_at = Instant::now();
     let pass_timings = response.timings.clone();
@@ -12811,6 +12866,124 @@ mod tests {
             "ck_messages must be absent from the serialized response"
         );
         assert_eq!(value["status"], json!("ok"));
+    }
+
+    #[test]
+    #[cfg(feature = "drive-fault")]
+    fn drive_fault_count_parse_defaults_to_one() {
+        // Unset, empty, unparseable, and zero all default to 1.
+        assert_eq!(parse_drive_fault_count(None), 1);
+        assert_eq!(parse_drive_fault_count(Some("")), 1);
+        assert_eq!(parse_drive_fault_count(Some("not_a_number")), 1);
+        assert_eq!(parse_drive_fault_count(Some("0")), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "drive-fault")]
+    fn drive_fault_count_parse_accepts_positive_values() {
+        assert_eq!(parse_drive_fault_count(Some("1")), 1);
+        assert_eq!(parse_drive_fault_count(Some("3")), 3);
+        assert_eq!(parse_drive_fault_count(Some("100")), 100);
+    }
+
+    #[test]
+    #[cfg(feature = "drive-fault")]
+    fn drive_fault_count_one_fires_once_then_clean() {
+        // Simulate count=1: claim one firing, then verify subsequent claims are no-ops.
+        // We test the claim logic directly by manipulating DRIVE_FAULT_REMAINING and
+        // checking the fetch_update guard condition.
+        DRIVE_FAULT_REMAINING.store(1, std::sync::atomic::Ordering::Relaxed);
+
+        // First claim: should fire (Ok(1) with prev=1 > 0).
+        let result = DRIVE_FAULT_REMAINING.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |n| n.checked_sub(1),
+        );
+        assert_eq!(result, Ok(1), "first claim should fire (prev=1)");
+        assert_eq!(
+            DRIVE_FAULT_REMAINING.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "count exhausted after one claim"
+        );
+
+        // Second claim: should NOT fire (Err(0) — checked_sub returns None).
+        let result = DRIVE_FAULT_REMAINING.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |n| n.checked_sub(1),
+        );
+        assert_eq!(result, Err(0), "second claim should be clean (no firing)");
+        // Must not underflow: stays at 0.
+        assert_eq!(
+            DRIVE_FAULT_REMAINING.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "count must not underflow past 0"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "drive-fault")]
+    fn drive_fault_count_three_fires_exactly_three_then_clean() {
+        DRIVE_FAULT_REMAINING.store(3, std::sync::atomic::Ordering::Relaxed);
+
+        for i in 1..=3 {
+            let result = DRIVE_FAULT_REMAINING.fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| n.checked_sub(1),
+            );
+            // fetch_update returns Ok(prev) where prev is the value BEFORE the update.
+            // With count=3, calls return Ok(3), Ok(2), Ok(1) — all > 0.
+            assert!(
+                result.is_ok() && result.unwrap() > 0,
+                "claim {i} should fire (result={result:?})"
+            );
+        }
+
+        // Fourth claim: exhausted.
+        let result = DRIVE_FAULT_REMAINING.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |n| n.checked_sub(1),
+        );
+        assert_eq!(result, Err(0), "fourth claim should be clean");
+        assert_eq!(
+            DRIVE_FAULT_REMAINING.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "count must not underflow past 0"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "drive-fault")]
+    fn drive_fault_count_concurrent_claim_safety() {
+        // Simulate N concurrent claims by iterating a loop that mimics the atomic claim
+        // pattern. With N=5 and 7 claims, exactly 5 should succeed (Ok(prev) with prev > 0)
+        // and 2 should be clean (Err(0)). This validates the checked_sub semantics without
+        // requiring real threads.
+        DRIVE_FAULT_REMAINING.store(5, std::sync::atomic::Ordering::Relaxed);
+
+        let mut fired = 0usize;
+        let mut clean = 0usize;
+        for _ in 0..7 {
+            match DRIVE_FAULT_REMAINING.fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| n.checked_sub(1),
+            ) {
+                Ok(prev) if prev > 0 => fired += 1,
+                _ => clean += 1,
+            }
+        }
+
+        assert_eq!(fired, 5, "exactly 5 claims should fire");
+        assert_eq!(clean, 2, "remaining 2 claims should be clean");
+        assert_eq!(
+            DRIVE_FAULT_REMAINING.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "count must not underflow past 0"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
