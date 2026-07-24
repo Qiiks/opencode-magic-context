@@ -120,6 +120,21 @@ export function getLastIndexedOrdinal(db: Database, sessionId: string): number {
     return typeof row?.last_indexed_ordinal === "number" ? row.last_indexed_ordinal : 0;
 }
 
+/**
+ * Cheap IDF-lite denominator derived from the session's primary-keyed index
+ * tracker. Message ordinals are contiguous through the watermark, so the small
+ * approximation error from non-indexable rows is preferable to scanning the
+ * global FTS row store for an exact count.
+ */
+export function getIndexedMessageCorpusSize(
+    db: Database,
+    sessionId: string,
+    maxOrdinal: number | null,
+): number {
+    const watermark = getLastIndexedOrdinal(db, sessionId);
+    return maxOrdinal === null ? watermark : Math.min(watermark, Math.max(0, maxOrdinal));
+}
+
 export function getDirtyIndexFloor(db: Database, sessionId: string): number | null {
     const row = getLastIndexedStatement(db).get(sessionId) as MessageHistoryIndexRow | null;
     return typeof row?.dirty_floor_ordinal === "number" && row.dirty_floor_ordinal > 0

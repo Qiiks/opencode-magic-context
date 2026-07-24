@@ -14,6 +14,7 @@ import {
     setMemoryClassification,
 } from "../../features/magic-context/memory/storage-memory";
 import type { Memory } from "../../features/magic-context/memory/types";
+import { unifiedSearch } from "../../features/magic-context/search";
 import {
     bumpSessionFactsVersion,
     getOrCreateSessionMeta,
@@ -27,6 +28,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { COMPARTMENT_RENDER_EPOCH } from "./compartment-render-epoch";
 import {
     clearInjectionCache,
+    getVisibleMemoryIds,
     injectM0M1,
     MaterializeContentionError,
     materializeM0,
@@ -1717,6 +1719,50 @@ describe("m[0]/m[1] materialization", () => {
         expect(new Set(ids)).toEqual(new Set([id1, id2]));
     });
 
+    it("filters a memory rendered only in m[1] while returning a memory rendered in neither", async () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        let m1OnlyId = 0;
+        const materialized = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state: readStateFromMeta(),
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            beforePhase3ForTest: () => {
+                m1OnlyId = insertMemory(db, {
+                    projectPath: PROJECT_PATH,
+                    category: "ARCHITECTURE",
+                    content: "RecallFilterToken rendered only in the incremental block",
+                }).id;
+            },
+        });
+        expect(materialized.m1Text).toContain("RecallFilterToken");
+
+        const hiddenId = insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "ARCHITECTURE",
+            content: "RecallFilterToken created after both cached blocks",
+        }).id;
+        const visibleMemoryIds = getVisibleMemoryIds(db, SESSION_ID);
+        expect(visibleMemoryIds?.has(m1OnlyId)).toBe(true);
+        expect(visibleMemoryIds?.has(hiddenId)).toBe(false);
+
+        const results = await unifiedSearch(db, SESSION_ID, PROJECT_PATH, "RecallFilterToken", {
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            sources: ["memory"],
+            visibleMemoryIds: visibleMemoryIds ?? undefined,
+            countRetrievals: false,
+            measurementDisabled: true,
+        });
+        const resultIds = results
+            .filter((result) => result.source === "memory")
+            .map((result) => result.memoryId);
+        expect(resultIds).not.toContain(m1OnlyId);
+        expect(resultIds).toContain(hiddenId);
+    });
+
     it("materializeM0 sizes session-history to the HISTORY budget, not budget minus project-docs", () => {
         // Regression: the over-budget tightening loop measured the WHOLE m[0]
         // (which includes <project-docs>/<user-profile>/<project-memory>) against
@@ -2276,11 +2322,11 @@ describe("m[0]/m[1] materialization", () => {
         });
         const initialM1 = renderedText(first[1]);
 
-        insertMemory(db, {
+        const m1MemoryId = insertMemory(db, {
             projectPath: PROJECT_PATH,
             category: "ARCHITECTURE",
             content: "New additive memory appears only after a bust.",
-        });
+        }).id;
 
         const deferOne = [userMessage("m2", "defer one")];
         injectM0M1({
@@ -2319,6 +2365,7 @@ describe("m[0]/m[1] materialization", () => {
         });
         expect(renderedText(bust[1])).toContain("<new-memories>");
         expect(renderedText(bust[1])).toContain("New additive memory appears only after a bust.");
+        expect(getVisibleMemoryIds(db, SESSION_ID)?.has(m1MemoryId)).toBe(true);
     });
 
     it("renders memory mutation removals on cache-busting pass and replays them on defer", () => {
