@@ -29,6 +29,7 @@ import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import { getSlot } from "./lkg-slot";
+import { MODULE_PAGE_MAX_BYTES } from "./module-wire";
 import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
 import {
@@ -377,7 +378,7 @@ describe("Rust mode authority adapter", () => {
                 moduleElapsedMs: 8.765,
             }),
         ).toBe(
-            "rust pass: decision=HARD reason=first_render served_from=transform in=4 out=3 applied=true elapsed=12.3 ms module=8.8 ms stages=prefix_guard:0.0 ordinal_resolve:0.0 state_sync:0.0 clone:0.0 wire_build:0.0 transport:0.0 transport_pages:0 apply:0.0 lkg_snapshot:0.0 other:12.3",
+            "rust pass: decision=HARD reason=first_render served_from=transform in=4 out=3 applied=true elapsed=12.3 ms module=8.8 ms stages=prefix_guard:0.0 ordinal_resolve:0.0 state_sync:0.0 clone:0.0 wire_build:0.0 wire_messages:0 transport:0.0 transport_pages:0 transport_bytes:0 apply:0.0 lkg_snapshot:0.0 other:12.3",
         );
     });
 
@@ -385,17 +386,18 @@ describe("Rust mode authority adapter", () => {
         const sessionId = `rust-overflow-recovery-${Date.now()}`;
         const db = makeDb();
         installRawProvider(sessionId);
-        recordOverflowDetected(db, sessionId, 100_000, "test/model");
         const transformBodies: Record<string, unknown>[] = [];
         const moduleClient: RustModeModuleClient = {
             call: async ({ method, body }) => {
                 if (method !== "transform") return { ok: true };
                 transformBodies.push(body);
-                return {
-                    native_messages: makeMessages(sessionId),
-                    decision: "HARD",
-                    materialize_reason: "overflow_recovery_fold",
-                };
+                return transformBodies.length === 1
+                    ? { native_messages: makeMessages(sessionId), decision: "PASSTHROUGH" }
+                    : {
+                          native_messages: makeMessages(sessionId),
+                          decision: "HARD",
+                          materialize_reason: "overflow_recovery_fold",
+                      };
             },
         };
         const deps = makeDeps(db, moduleClient);
@@ -405,11 +407,20 @@ describe("Rust mode authority adapter", () => {
         });
         const runner = createRustModeTransform(deps, { moduleClient });
         const messages = makeMessages(sessionId);
-
         await runner.run(sessionId, messages, { messages }, makeMeta(db, sessionId));
 
-        expect(transformBodies).toHaveLength(1);
-        expect(transformBodies[0]?.emergency_recovery_armed).toBe(true);
+        recordOverflowDetected(db, sessionId, 100_000, "test/model");
+        const recoveryMessages = makeMessages(sessionId);
+        await runner.run(
+            sessionId,
+            recoveryMessages,
+            { messages: recoveryMessages },
+            makeMeta(db, sessionId),
+        );
+
+        expect(transformBodies).toHaveLength(2);
+        expect(transformBodies[1]?.emergency_recovery_armed).toBe(true);
+        expect(transformBodies[1]?.tail_delta).toBeUndefined();
         expect(getOverflowState(db, sessionId).needsEmergencyRecovery).toBe(false);
     });
 
@@ -1143,10 +1154,10 @@ describe("Rust mode authority adapter", () => {
         expect(transform.getState(sessionId).passCount).toBe(1);
     });
 
-    it("keeps an 800-message steady-state pass on the incremental wire path", async () => {
+    it("keeps a 1,000-message steady-state pass under the adapter budget", async () => {
         const sessionId = `rust-wire-delta-${Date.now()}`;
         sessions.push(sessionId);
-        const rows = Array.from({ length: 800 }, (_, index) => ({
+        const rows = Array.from({ length: 1_000 }, (_, index) => ({
             id: `m-${index + 1}`,
             timeCreated: index + 1,
             contributesOrdinal: true,
@@ -1196,15 +1207,107 @@ describe("Rust mode authority adapter", () => {
         const steadyElapsed = performance.now() - steadyStartedAt;
 
         expect(requestBodies).toHaveLength(2);
-        expect(requestBodies[0]?.messages).toHaveLength(800);
+        expect(requestBodies[0]?.messages).toHaveLength(1_000);
         expect(requestBodies[1]?.messages).toHaveLength(0);
         expect(requestBodies[1]?.native_messages).toHaveLength(0);
         expect(requestBodies[1]?.tail_delta).toEqual({
             after: expect.any(String),
-            replace_from: 800,
-            native_replace_from: 800,
+            replace_from: 1_000,
+            native_replace_from: 1_000,
         });
-        expect(steadyElapsed).toBeLessThan(200);
+        expect(Buffer.byteLength(JSON.stringify(requestBodies[1]))).toBeLessThan(
+            MODULE_PAGE_MAX_BYTES,
+        );
+        expect(steadyElapsed).toBeLessThan(100);
+    });
+
+    it("keeps a multi-frame tail delta paged instead of rebuilding the full wire", async () => {
+        const sessionId = `rust-wire-paged-delta-${Date.now()}`;
+        sessions.push(sessionId);
+        const rows = Array.from({ length: 3 }, (_, index) => ({
+            id: `m-${index + 1}`,
+            timeCreated: index + 1,
+            contributesOrdinal: true,
+            hasValidInfo: true,
+        }));
+        unregisters.push(
+            setRawMessageProvider(sessionId, {
+                readMessages: () => rows,
+                readMessageOrdinalPage: (after, limit) =>
+                    rows
+                        .filter(
+                            (row) =>
+                                !after ||
+                                row.timeCreated > after.timeCreated ||
+                                (row.timeCreated === after.timeCreated && row.id > after.id),
+                        )
+                        .slice(0, limit),
+                getStoredMessageCount: () => rows.length,
+            }),
+        );
+        const db = makeDb();
+        const requestBodies: Array<Record<string, unknown>> = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                requestBodies.push(body as Record<string, unknown>);
+                return { decision: "PASSTHROUGH", native_messages: [] };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const buildMessages = () =>
+            rows.map((row, index) => ({
+                info: { id: row.id, role: "user", sessionID: sessionId },
+                parts: [
+                    {
+                        type: "text",
+                        text:
+                            index === rows.length - 1 && rows.length === 4
+                                ? `large delta ${"x".repeat(350 * 1024)}`
+                                : `message ${row.id}`,
+                    },
+                ],
+            }));
+
+        const initial = buildMessages();
+        await transform.run(
+            sessionId,
+            initial,
+            { messages: [...initial] },
+            makeMeta(db, sessionId),
+        );
+        rows.push({
+            id: "m-4",
+            timeCreated: 4,
+            contributesOrdinal: true,
+            hasValidInfo: true,
+        });
+        const appended = buildMessages();
+        await transform.run(
+            sessionId,
+            appended,
+            { messages: [...appended] },
+            makeMeta(db, sessionId),
+        );
+
+        const deltaPages = requestBodies.filter((body) => "transform_page_id" in body);
+        expect(deltaPages.length).toBeGreaterThan(1);
+        expect(
+            deltaPages.every(
+                (page) => Buffer.byteLength(JSON.stringify(page)) <= MODULE_PAGE_MAX_BYTES,
+            ),
+        ).toBe(true);
+        const finalPage = deltaPages.at(-1)!;
+        expect(finalPage.tail_delta).toEqual({
+            after: requestBodies[0]?.full_array_fingerprint,
+            replace_from: 2,
+            native_replace_from: 2,
+        });
+        const pagedWire = JSON.stringify(deltaPages);
+        expect(pagedWire).not.toContain("message m-1");
+        expect(pagedWire).not.toContain("message m-2");
+        expect(pagedWire).toContain("message m-3");
+        expect(pagedWire).toContain("large delta");
     });
 
     it("serves raw instead of stale LKG after a stable-id content mutation", async () => {

@@ -394,8 +394,10 @@ interface RustPassTimings {
     stateSync: number;
     clone: number;
     wireBuild: number;
+    wireMessages: number;
     transport: number;
     transportPages: number;
+    transportBytes: number;
     apply: number;
     lkgSnapshot: number;
 }
@@ -407,8 +409,10 @@ function emptyRustPassTimings(): RustPassTimings {
         stateSync: 0,
         clone: 0,
         wireBuild: 0,
+        wireMessages: 0,
         transport: 0,
         transportPages: 0,
+        transportBytes: 0,
         apply: 0,
         lkgSnapshot: 0,
     };
@@ -436,7 +440,7 @@ function formatRustPassLog(args: {
         timings.apply +
         timings.lkgSnapshot;
     const unattributed = Math.max(0, args.elapsedMs - measured);
-    return `rust pass: decision=${args.decision} reason=${args.reason} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} other:${unattributed.toFixed(1)}`;
+    return `rust pass: decision=${args.decision} reason=${args.reason} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} other:${unattributed.toFixed(1)}`;
 }
 
 function isSyntheticUserMessage(message: MessageLike | undefined): boolean {
@@ -1346,6 +1350,7 @@ export function createRustModeTransform(
                 | undefined;
             if (
                 !state.forceFullWire &&
+                passInputs.emergency_recovery_armed !== true &&
                 previousWireCache &&
                 messages.length >= previousWireCache.rawCount
             ) {
@@ -1395,7 +1400,7 @@ export function createRustModeTransform(
                         wireStart,
                         ckAfter,
                         nativeAfter,
-                        after: `${ckAfter}|${nativeAfter}`,
+                        after: previousWireCache.fingerprint,
                     };
                 }
             }
@@ -1531,6 +1536,9 @@ export function createRustModeTransform(
             }
             const wireBuildStartedAt = performance.now();
             const encodedInput = encodeOpenCodeMessagesToCk(resolved.annotatedInput);
+            timings.wireMessages = wireDelta
+                ? messages.length - wireDelta.rawStart
+                : messages.length;
             let pendingWireCache: RustWireCache = (() => {
                 const rawLast = messages.at(-1);
                 if (!wireDelta || !previousWireCache) {
@@ -1635,91 +1643,7 @@ export function createRustModeTransform(
                 channel2NudgeState: String(passInputs.channel2_nudge_state ?? ""),
                 emergencyRecoveryArmed: passInputs.emergency_recovery_armed === true,
             });
-            let pages = buildPagedModuleTransformPayloads(body);
-            if (wireDelta && pages.length > 1) {
-                // A delta that needs paging has lost its reason to exist — and page
-                // frames carrying tail_delta as a scalar field can hit the module's
-                // delta-expansion gate before page reassembly completes, poisoning
-                // the page coordinator and looping need_full_sync forever (the SUBC
-                // incident). Fall back to a plain full send instead.
-                wireDelta = undefined;
-                // The delta-path ordinal resolve annotated only the tail slice;
-                // the full send must re-resolve the whole array.
-                let fullResolved = await resolveOrdinalsForModule({
-                    sessionId,
-                    messages,
-                    generation: state.moduleGeneration,
-                    memoGeneration: state.idOrdinalMemoGeneration,
-                    memo: state.idOrdinalMemo,
-                    memoAnchor: state.ordinalMemoAnchor,
-                    memoStoredCount: state.ordinalMemoStoredCount,
-                    memoCanonicalCount: state.ordinalMemoCanonicalCount,
-                });
-                if (!fullResolved.ok) {
-                    resetOrdinalMemo(state);
-                    fullResolved = await resolveOrdinalsForModule({
-                        sessionId,
-                        messages,
-                        generation: state.moduleGeneration,
-                        memoGeneration: state.idOrdinalMemoGeneration,
-                        memo: state.idOrdinalMemo,
-                        memoAnchor: state.ordinalMemoAnchor,
-                        memoStoredCount: state.ordinalMemoStoredCount,
-                        memoCanonicalCount: state.ordinalMemoCanonicalCount,
-                    });
-                }
-                if (!fullResolved.ok) {
-                    throw new Error(
-                        `rust ordinal ${fullResolved.reason} during delta-page full fallback`,
-                    );
-                }
-                state.idOrdinalMemoGeneration = fullResolved.memoGeneration;
-                state.ordinalMemoAnchor = fullResolved.memoAnchor;
-                state.ordinalMemoStoredCount = fullResolved.memoStoredCount;
-                state.ordinalMemoCanonicalCount = fullResolved.memoCanonicalCount;
-                const fullEncoded = encodeOpenCodeMessagesToCk(fullResolved.annotatedInput);
-                const fullCk = buildWireFingerprint(fullEncoded);
-                const fullNative = buildWireFingerprint(messages);
-                const fullRawLast = messages.at(-1);
-                pendingWireCache = {
-                    rawCount: messages.length,
-                    wireCount: fullEncoded.length,
-                    rawLastId: fullRawLast ? messageIdOf(fullRawLast) : null,
-                    rawLastSignature: fullRawLast ? messageCacheSignature(fullRawLast) : null,
-                    rawLastVisible:
-                        fullRawLast !== undefined &&
-                        fullEncoded.some((entry) => entry.mid === messageIdOf(fullRawLast)),
-                    ckFingerprint: fullCk.fingerprint,
-                    ckPrefixFingerprintBeforeLast: fullCk.prefixFingerprintBeforeLast,
-                    nativeFingerprint: fullNative.fingerprint,
-                    nativePrefixFingerprintBeforeLast: fullNative.prefixFingerprintBeforeLast,
-                    rawContentSnapshots: contentSnapshotsFor(messages),
-                    fingerprint: `${fullCk.fingerprint}|${fullNative.fingerprint}`,
-                };
-                body = buildTransformBody({
-                    sessionId,
-                    input: fullEncoded,
-                    nativeMessages: messages,
-                    fullArrayFingerprint: pendingWireCache.fingerprint,
-                    passInputs,
-                    usage: {
-                        ...passUsage(usage, contextLimit),
-                        final_wire_input_tokens: finalWireEstimate?.tokens ?? 0,
-                        final_wire_trusted: finalWireEstimate?.trusted === true,
-                    },
-                    modelKey: modelKey ?? null,
-                    providerId: model?.providerID ?? null,
-                    systemPromptHash: sessionMeta.systemPromptHash ?? "",
-                    upgradeState: String(passInputs.upgrade_state ?? ""),
-                    midTurn,
-                    prevResponseCompletedAtMs:
-                        sessionMeta.lastResponseTime > 0 ? sessionMeta.lastResponseTime : undefined,
-                    requestObservedAtMs,
-                    channel2NudgeState: String(passInputs.channel2_nudge_state ?? ""),
-                    emergencyRecoveryArmed: passInputs.emergency_recovery_armed === true,
-                });
-                pages = buildPagedModuleTransformPayloads(body);
-            }
+            const pages = buildPagedModuleTransformPayloads(body);
             logStage(
                 sessionId,
                 "wireBuild",
@@ -1729,6 +1653,7 @@ export function createRustModeTransform(
             );
             let response: Record<string, unknown> | undefined;
             for (const [index, page] of pages.entries()) {
+                timings.transportBytes += Buffer.byteLength(JSON.stringify(page));
                 const transportStartedAt = performance.now();
                 response = responseValue(
                     await callModule({
@@ -1800,6 +1725,7 @@ export function createRustModeTransform(
                     const retryEncodedInput = encodeOpenCodeMessagesToCk(
                         retryResolved.annotatedInput,
                     );
+                    timings.wireMessages = messages.length;
                     const retryCkFingerprint = buildWireFingerprint(retryEncodedInput);
                     const retryNativeFingerprint = buildWireFingerprint(messages);
                     const retryRawLast = messages.at(-1);
@@ -1860,6 +1786,7 @@ export function createRustModeTransform(
                 const retryPages = buildPagedModuleTransformPayloads(body);
                 logStage(sessionId, "wireBuild", retryWireBuildStartedAt, timings, "retry=full");
                 for (const [index, page] of retryPages.entries()) {
+                    timings.transportBytes += Buffer.byteLength(JSON.stringify(page));
                     const transportStartedAt = performance.now();
                     response = responseValue(
                         await callModule({

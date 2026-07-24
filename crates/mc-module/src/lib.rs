@@ -20520,6 +20520,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paged_authority_tail_delta_reassembles_before_full_sync_gate() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(state, default_test_config());
+        let mut initial = request(vec![ck("m0", 0, "acknowledged prefix")]);
+        initial["full_array_fingerprint"] = json!("fp-prefix");
+        initial["native_messages"] = json!([]);
+        let initial_response = call_transform_request(&handler, initial).await;
+        assert_eq!(initial_response["status"], "ok");
+
+        let mut first = paged_transform_page(
+            "transform",
+            "ses",
+            "paged-tail-delta",
+            0,
+            0,
+            2,
+            false,
+            vec![serde_json::to_value(ck("m1", 1, "delta first")).unwrap()],
+        );
+        first["native_messages"] = json!([{ "text": "a".repeat(280 * 1024) }]);
+        first["transform_page_digest"] = json!(transform_page_content_digest(&first));
+
+        let mut final_page = paged_transform_page(
+            "transform",
+            "ses",
+            "paged-tail-delta",
+            0,
+            1,
+            2,
+            true,
+            vec![serde_json::to_value(ck("m2", 2, "delta final")).unwrap()],
+        );
+        final_page["native_messages"] = json!([{ "text": "b".repeat(280 * 1024) }]);
+        final_page["full_array_fingerprint"] = json!("fp-delta");
+        final_page["tail_delta"] = json!({
+            "after": "fp-prefix",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        });
+        final_page["transform_page_digest"] = json!(transform_page_content_digest(&final_page));
+        assert!(
+            serde_json::to_vec(&first).unwrap().len()
+                + serde_json::to_vec(&final_page).unwrap().len()
+                > TRANSFORM_PAGE_MAX_BYTES
+        );
+
+        let first_ack = handler.dispatch_value(7, first).await;
+        let HandlerOutcome::Response(first_ack) = first_ack else {
+            panic!("first delta page should stage: {first_ack:?}");
+        };
+        let first_ack: Value = serde_json::from_slice(&first_ack).unwrap();
+        assert_eq!(first_ack["staged"], true);
+        assert_eq!(first_ack["next_expected_index"], 1);
+
+        let response = handler.dispatch_value(7, final_page).await;
+        let HandlerOutcome::Response(response) = response else {
+            panic!("reassembled tail delta should execute: {response:?}");
+        };
+        let response: Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_eq!(response["full_array_fingerprint"], "fp-delta");
+        assert!(response["ck_messages"].is_array());
+        let reconstructed = handler
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .ready_request_clone("ses")
+            .expect("reassembled delta snapshot");
+        assert_eq!(reconstructed.messages.len(), 3);
+        assert!(reconstructed.tail_delta.is_none());
+    }
+
+    #[tokio::test]
     async fn paged_authority_transform_rejections_discard_partial_assembly() {
         let state = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(state, default_test_config());

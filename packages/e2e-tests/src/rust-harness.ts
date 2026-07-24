@@ -100,6 +100,16 @@ export interface RustPassLine {
     inputCount: number;
     outputCount: number;
     applied: boolean;
+    elapsedMs: number;
+    moduleElapsedMs: number;
+    adapterElapsedMs: number;
+    prefixGuardMs: number;
+    stateSyncMs: number;
+    wireBuildMs: number;
+    wireMessages: number;
+    transportMs: number;
+    transportPages: number;
+    transportBytes: number;
     raw: string;
 }
 
@@ -306,6 +316,105 @@ export class RustTestHarness {
         return parts.join(" ");
     }
 
+    /**
+     * Append persisted messages through OpenCode's production database shape. This keeps
+     * large-session transport tests fast while the next prompt still traverses the real
+     * OpenCode → plugin → subc → module path.
+     */
+    appendSyntheticHistory(
+        sessionId: string,
+        options: { count: number; textBytes: number },
+    ): void {
+        const dbPath = join(this.env.dataDir, "opencode", "opencode.db");
+        const db = new Database(dbPath);
+        try {
+            db.exec("PRAGMA busy_timeout = 30000");
+            const row = db
+                .prepare(
+                    "SELECT COALESCE(MAX(time_created), 0) AS latest FROM message WHERE session_id = ?",
+                )
+                .get(sessionId) as { latest: number };
+            const templateRow = db
+                .prepare(
+                    "SELECT m.data AS message_data, p.data AS part_data FROM message m JOIN part p ON p.message_id = m.id WHERE m.session_id = ? AND json_extract(m.data, '$.role') = 'user' AND json_extract(p.data, '$.type') = 'text' ORDER BY m.time_created DESC LIMIT 1",
+                )
+                .get(sessionId) as { message_data: string; part_data: string } | undefined;
+            if (!templateRow) {
+                throw new Error("synthetic history requires an existing user text message");
+            }
+            const messageTemplate = JSON.parse(templateRow.message_data) as Record<
+                string,
+                unknown
+            >;
+            const partTemplate = JSON.parse(templateRow.part_data) as Record<string, unknown>;
+            const insertMessage = db.prepare(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+            );
+            const insertPart = db.prepare(
+                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+            );
+            // OpenCode orders message IDs generated from descending timestamps. Place the
+            // fixture immediately before the live seed messages so a later prompt remains
+            // newest while both OpenCode and the raw ordinal reader agree on history order.
+            const firstTimestamp = Math.max(1, row.latest - options.count - 1);
+            const descendingId = (
+                prefix: "msg" | "prt",
+                timestamp: number,
+                counter: number,
+            ): string => {
+                const encoded = ~(BigInt(timestamp) * 0x1000n + BigInt(counter));
+                const timeBytes = Buffer.alloc(6);
+                for (let byte = 0; byte < timeBytes.length; byte += 1) {
+                    timeBytes[byte] = Number((encoded >> BigInt(40 - 8 * byte)) & 0xffn);
+                }
+                return `${prefix}_${timeBytes.toString("hex")}${counter.toString(36).padStart(14, "0")}`;
+            };
+            const append = db.transaction(() => {
+                for (let index = 0; index < options.count; index += 1) {
+                    const suffix = index.toString().padStart(4, "0");
+                    const timestamp = firstTimestamp + index;
+                    const messageId = descendingId("msg", timestamp, 1);
+                    const partId = descendingId("prt", timestamp, 2);
+                    const prefix = `synthetic history message ${suffix}: `;
+                    const text = `${prefix}${"x".repeat(Math.max(0, options.textBytes - prefix.length))}`;
+                    insertMessage.run(
+                        messageId,
+                        sessionId,
+                        timestamp,
+                        timestamp,
+                        JSON.stringify({
+                            ...messageTemplate,
+                            id: messageId,
+                            sessionID: sessionId,
+                            time: {
+                                ...((messageTemplate.time as Record<string, unknown> | undefined) ??
+                                    {}),
+                                created: timestamp,
+                            },
+                        }),
+                    );
+                    insertPart.run(
+                        partId,
+                        messageId,
+                        sessionId,
+                        timestamp,
+                        timestamp,
+                        JSON.stringify({
+                            ...partTemplate,
+                            id: partId,
+                            messageID: messageId,
+                            sessionID: sessionId,
+                            text,
+                        }),
+                    );
+                }
+            });
+            append();
+        } finally {
+            db.close();
+        }
+    }
+
     async sendPrompt(
         sessionId: string,
         text: string,
@@ -412,6 +521,8 @@ export class RustTestHarness {
             const idx = line.indexOf("rust pass: ");
             if (idx < 0) continue;
             const body = line.slice(idx + "rust pass: ".length);
+            const elapsedMs = Number(field(body, "elapsed") || "0");
+            const moduleElapsedMs = Number(field(body, "module") || "0");
             parsed.push({
                 decision: field(body, "decision"),
                 reason: field(body, "reason"),
@@ -419,6 +530,16 @@ export class RustTestHarness {
                 inputCount: Number(field(body, "in") || "0"),
                 outputCount: Number(field(body, "out") || "0"),
                 applied: field(body, "applied") === "true",
+                elapsedMs,
+                moduleElapsedMs,
+                adapterElapsedMs: Math.max(0, elapsedMs - moduleElapsedMs),
+                prefixGuardMs: Number(stageField(body, "prefix_guard") || "0"),
+                stateSyncMs: Number(stageField(body, "state_sync") || "0"),
+                wireBuildMs: Number(stageField(body, "wire_build") || "0"),
+                wireMessages: Number(stageField(body, "wire_messages") || "0"),
+                transportMs: Number(stageField(body, "transport") || "0"),
+                transportPages: Number(stageField(body, "transport_pages") || "0"),
+                transportBytes: Number(stageField(body, "transport_bytes") || "0"),
                 raw: line,
             });
         }
@@ -545,6 +666,11 @@ export class RustTestHarness {
 /** Extract `key=value` (value = up to the next space) from a rust-pass log body. */
 function field(body: string, key: string): string {
     const match = body.match(new RegExp(`(?:^|\\s)${key}=([^\\s]+)`));
+    return match ? match[1]! : "";
+}
+
+function stageField(body: string, key: string): string {
+    const match = body.match(new RegExp(`(?:^|\\s)${key}:([^\\s]+)`));
     return match ? match[1]! : "";
 }
 
