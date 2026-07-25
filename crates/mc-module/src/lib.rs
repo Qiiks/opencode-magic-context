@@ -11008,12 +11008,22 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
                         "Acknowledge a tagged reduction request for asynchronous delivery".to_string(),
                     ),
                     execution_mode: ExecutionMode::Pure,
+                    // The ADVERTISED schema must stay byte-canonical: Thalamus's
+                    // authorizer (authorized_ctx_reduce_tool) exact-matches this shape
+                    // and fails closed on ANY deviation, silently disabling the whole
+                    // tagging surface (tool_present=false → no tags, no reclaim). The
+                    // accept-don't-advertise posture for imitated args (reduced/summary)
+                    // lives in the EXECUTION unwrap, never here — loosening this schema
+                    // to "tolerate unknown args" killed CC-leg ctx_reduce fleet-wide for
+                    // two days (drift authored 2026-07-23, caught on first rig traffic
+                    // 2026-07-25 because prod CC was dark the whole window).
                     schema: json!({
                         "type": "object",
                         "properties": {
                             "drop": { "type": "string" }
                         },
-                        "additionalProperties": true
+                        "required": ["drop"],
+                        "additionalProperties": false
                     }),
                 },
                 Tool {
@@ -14885,15 +14895,33 @@ mod tests {
             ),
         ];
 
+        // ctx_reduce is the one AUTHORIZER-PINNED schema: Thalamus exact-matches
+        // the canonical closed shape and fails closed on any deviation, silently
+        // disabling the tagging surface. Its imitated-args tolerance lives in the
+        // execution unwrap, not the advertised schema. Every other ctx_ tool keeps
+        // the open accept-unknown-args posture.
+        assert_eq!(
+            by_name["ctx_reduce"].schema,
+            json!({
+                "type": "object",
+                "properties": { "drop": { "type": "string" } },
+                "required": ["drop"],
+                "additionalProperties": false
+            }),
+            "ctx_reduce advertised schema must stay byte-canonical (authorizer contract)"
+        );
+
         for (name, expected) in expected_fields {
             let tool = by_name
                 .get(name)
                 .unwrap_or_else(|| panic!("missing {name} manifest entry"));
-            assert_ne!(
-                tool.schema.get("additionalProperties"),
-                Some(&json!(false)),
-                "{name} must preserve compatibility arguments"
-            );
+            if name != "ctx_reduce" {
+                assert_ne!(
+                    tool.schema.get("additionalProperties"),
+                    Some(&json!(false)),
+                    "{name} must preserve compatibility arguments"
+                );
+            }
             let properties = tool.schema["properties"]
                 .as_object()
                 .unwrap_or_else(|| panic!("{name} schema properties"));
