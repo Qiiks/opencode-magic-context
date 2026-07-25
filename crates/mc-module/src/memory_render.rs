@@ -367,6 +367,38 @@ mod tests {
         }
     }
 
+    /// CONSUMER CONTRACT (Thalamus marker planner, ck_map.rs last_cacheable_ck_block):
+    /// the m0 message must ALWAYS carry at least one non-empty text block. Their
+    /// cache-marker placement skips Media/Reasoning/Opaque blocks and EMPTY text
+    /// blocks; an m0 whose text came out empty (or media-only, once the mural image
+    /// part ships) would silently lose its cache breakpoint — no error, just a dead
+    /// prefix cache on the CC leg. render_m0 guarantees this structurally via the
+    /// unconditional session-history section (M0_EMPTY_BODY when no compartments),
+    /// so even the emptiest possible inputs produce non-empty bytes. This test pins
+    /// that floor; if someone makes the session-history section conditional, this
+    /// fails before the marker planner goes quiet in production.
+    #[test]
+    fn render_m0_never_empty_even_with_all_inputs_empty() {
+        let rendered = render_m0(
+            &M0Inputs {
+                project_docs: "",
+                user_profile: &[],
+                covered_system_messages: &[],
+                compartments: &[],
+                memories: &[],
+                source_name_by_id: &Default::default(),
+                history_budget_tokens: 0.0,
+                decay_pressure_multiplier: 1.0,
+            },
+            |_| 0,
+        );
+        assert!(
+            !rendered.trim().is_empty(),
+            "m0 must never render empty: the marker planner needs a non-empty text block"
+        );
+        assert_eq!(rendered, M0_EMPTY_BODY);
+    }
+
     #[test]
     fn workspace_sources_attribute_only_foreign_memories() {
         let mut own = mem(1, "ARCHITECTURE", "own", Some(80));
