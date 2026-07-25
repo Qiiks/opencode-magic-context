@@ -169,22 +169,3 @@ export function countEmbeddedCommits(db: Database, projectPath: string, modelId:
         | undefined;
     return row?.count ?? 0;
 }
-
-export function clearProjectCommitEmbeddings(
-    db: Database,
-    projectPath: string,
-    modelId?: string,
-): number {
-    if (modelId) {
-        return getClearProjectModelStatement(db).run(modelId, projectPath).changes;
-    }
-    return getClearProjectStatement(db).run(projectPath).changes;
-}
-
-export function getDistinctCommitEmbeddingModelIds(
-    db: Database,
-    projectPath: string,
-): Set<string | null> {
-    const rows = getDistinctModelIdStatement(db).all(projectPath) as StoredCommitModelIdRow[];
-    return new Set(rows.map((row) => (typeof row.modelId === "string" ? row.modelId : null)));
-}

@@ -208,14 +208,3 @@ export function getEmbeddingModelId(): string {
 }
 
 export { cosineSimilarity };
-
-export async function disposeEmbeddingModel(): Promise<void> {
-    const currentProvider = provider;
-    provider = null;
-
-    if (!currentProvider) {
-        return;
-    }
-
-    await currentProvider.dispose();
-}

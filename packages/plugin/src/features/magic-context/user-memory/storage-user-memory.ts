@@ -143,23 +143,6 @@ export function getActiveUserMemories(db: Database): UserMemory[] {
     return rows.map(parseUserMemoryRow);
 }
 
-export function getAllUserMemories(db: Database): UserMemory[] {
-    const rows = db
-        .prepare(
-            "SELECT id, content, status, promoted_at, source_candidate_ids, created_at, updated_at FROM user_memories ORDER BY created_at ASC",
-        )
-        .all() as Array<{
-        id: number;
-        content: string;
-        status: string;
-        promoted_at: number;
-        source_candidate_ids: string;
-        created_at: number;
-        updated_at: number;
-    }>;
-    return rows.map(parseUserMemoryRow);
-}
-
 export function updateUserMemoryContent(db: Database, id: number, content: string): void {
     db.prepare("UPDATE user_memories SET content = ?, updated_at = ? WHERE id = ?").run(
         content,
@@ -173,10 +156,6 @@ export function dismissUserMemory(db: Database, id: number): void {
         Date.now(),
         id,
     );
-}
-
-export function deleteUserMemory(db: Database, id: number): void {
-    db.prepare("DELETE FROM user_memories WHERE id = ?").run(id);
 }
 
 function parseUserMemoryRow(row: {

@@ -1185,20 +1185,6 @@ export function setPersistedNoteNudgeTriggerMessageId(
     })();
 }
 
-export function setPersistedDeliveredNoteNudge(
-    db: Database,
-    sessionId: string,
-    text: string,
-    messageId = "",
-): void {
-    db.transaction(() => {
-        ensureSessionMetaRow(db, sessionId);
-        db.prepare(
-            "UPDATE session_meta SET note_nudge_trigger_pending = 0, note_nudge_trigger_message_id = '', note_nudge_sticky_text = ?, note_nudge_sticky_message_id = ? WHERE session_id = ?",
-        ).run(text, messageId, sessionId);
-    })();
-}
-
 export function clearPersistedNoteNudge(db: Database, sessionId: string): void {
     db.prepare(
         "UPDATE session_meta SET note_nudge_trigger_pending = 0, note_nudge_trigger_message_id = '', note_nudge_sticky_text = '', note_nudge_sticky_message_id = '' WHERE session_id = ?",

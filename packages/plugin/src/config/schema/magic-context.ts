@@ -27,8 +27,6 @@ export const DEFAULT_LOCAL_EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
 // scheduler share ONE source of truth for task names. DreamingTask remains the
 // agentic tasks (those driven by buildDreamTaskPrompt); CANONICAL_DREAM_TASKS
 // is the full task set used for per-task scheduling config.
-export const DREAMER_TASKS = AGENTIC_DREAM_TASKS;
-export const DreamingTaskSchema = z.enum(AGENTIC_DREAM_TASKS);
 export type DreamingTask = (typeof AGENTIC_DREAM_TASKS)[number];
 
 /** Valid thinking levels for Pi subagents. Maps to Pi's --thinking CLI flag.

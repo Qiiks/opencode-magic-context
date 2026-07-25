@@ -36,8 +36,6 @@ export type DreamTaskName = (typeof CANONICAL_DREAM_TASKS)[number];
  */
 export const AGENTIC_DREAM_TASKS = ["curate", "maintain-docs"] as const;
 
-export type AgenticDreamTask = (typeof AGENTIC_DREAM_TASKS)[number];
-
 /**
  * Tasks that read-modify-write the project `memories` table (+ epoch +
  * supersede-delta rows). They SHARE one per-project "memory" lease so they

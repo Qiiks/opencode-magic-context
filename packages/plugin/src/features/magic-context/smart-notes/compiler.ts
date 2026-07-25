@@ -372,7 +372,3 @@ function uniqueStrings(
 function boundedError(error: string): string {
     return error.slice(0, MAX_COMPILER_ERROR_CHARS);
 }
-
-export function logSmartNoteCompilerFailure(noteId: number, error: string): void {
-    log(`[dreamer] smart note #${noteId}: compiler failed — ${boundedError(error)}`);
-}

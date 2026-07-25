@@ -21,23 +21,6 @@ export interface SmartNoteCheckManifest {
     summary?: string;
 }
 
-export interface SmartNoteCheckRow {
-    compiled_check: string | null;
-    manifest_json: string | null;
-    check_hash: string | null;
-    check_cron: string | null;
-    check_version: number | null;
-    check_status: string | null;
-    check_failure_count: number | null;
-    check_network_failure_count: number | null;
-    check_quarantined_until: number | null;
-    check_next_due_at: number | null;
-    check_compiled_at: number | null;
-    check_false_since_at: number | null;
-    check_last_liveness_at: number | null;
-    policy_version: number | null;
-}
-
 export interface SmartNoteCheckNote extends Note {
     compiledCheck: string | null;
     manifestJson: string | null;
