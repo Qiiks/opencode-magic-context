@@ -28,6 +28,7 @@ export {
     getPrimaryEmbeddingMeasurementCohort,
     getProjectEmbeddingSnapshot,
     getShadowBackfillRemaining,
+    getShadowBackfillStopReason,
     getShadowEmbeddingMeasurementCohort,
     markProjectLoadUntrusted,
     registerProjectEmbedding,
