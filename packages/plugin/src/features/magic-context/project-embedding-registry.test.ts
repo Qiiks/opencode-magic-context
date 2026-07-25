@@ -32,10 +32,13 @@ import {
     embedTextForProject,
     embedUnembeddedCompartmentChunksForProject,
     embedUnembeddedMemoriesForProject,
+    flushShadowEmbeddingBacklog,
     getProjectEmbeddingSnapshot,
+    getShadowBackfillStopReason,
     markProjectLoadUntrusted,
     registerProjectEmbedding,
     registerProjectInObservationMode,
+    registerProjectShadowEmbedding,
     sweepAllRegisteredProjects,
     sweepStaleEmbeddingIdentitiesForProject,
 } from "./project-embedding-registry";
@@ -1433,5 +1436,88 @@ describe("project embedding registry", () => {
         expect(outcome.status).toBe("aborted");
         expect(outcome.embedded).toBeGreaterThanOrEqual(2);
         expect(outcome.embedded).toBeLessThan(4);
+    });
+
+    it("getShadowBackfillStopReason returns drained after a successful shadow backfill", async () => {
+        _setTestProviderFactoryForProject(
+            (config) =>
+                new FakeEmbeddingProvider(config.provider === "local" ? config.model : "shadow"),
+        );
+        const db = useTempDb();
+        const projectIdentity = "git:stop-drained";
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-primary"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/stop-drained",
+        );
+        // Seed a few primary memories so the shadow backfill has work to do.
+        for (let i = 0; i < 3; i++) {
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "CONSTRAINTS",
+                content: `drained memory ${i}`,
+            });
+            saveEmbedding(db, memory.id, new Float32Array([i, 1]), currentModelId(projectIdentity));
+        }
+
+        registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            {
+                provider: "synapse",
+                model: "synapse-model",
+                synapse_fingerprint: "fp-drained",
+            } as unknown as EmbeddingConfig,
+            "/tmp/stop-drained",
+        );
+        await flushShadowEmbeddingBacklog(projectIdentity);
+
+        expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("drained");
+    });
+
+    it("getShadowBackfillStopReason returns stalled_no_progress when the provider cannot embed", async () => {
+        // Provider that yields null for every text → nothing persists → the
+        // pump sees the same missing ids twice and retires the scope as stalled.
+        _setTestProviderFactoryForProject(
+            (config) =>
+                new (class extends FakeEmbeddingProvider {
+                    override async embedBatch(texts: string[]): Promise<Float32Array[]> {
+                        return texts.map(() => null as unknown as Float32Array);
+                    }
+                })(config.provider === "local" ? config.model : "shadow"),
+        );
+        const db = useTempDb();
+        const projectIdentity = "git:stop-stalled";
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-primary"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/stop-stalled",
+        );
+        for (let i = 0; i < 3; i++) {
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "CONSTRAINTS",
+                content: `stalled memory ${i}`,
+            });
+            saveEmbedding(db, memory.id, new Float32Array([i, 1]), currentModelId(projectIdentity));
+        }
+
+        registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            {
+                provider: "synapse",
+                model: "synapse-model",
+                synapse_fingerprint: "fp-stalled",
+            } as unknown as EmbeddingConfig,
+            "/tmp/stop-stalled",
+        );
+        await flushShadowEmbeddingBacklog(projectIdentity);
+
+        expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("stalled_no_progress");
     });
 });
