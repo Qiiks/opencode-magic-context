@@ -199,19 +199,3 @@ function readHistorianState(
 		failureCount: row?.historian_failure_count ?? 0,
 	};
 }
-
-export function formatCtxStatusSummary(details: CtxStatusDetails): string {
-	return [
-		"## Magic Status",
-		"",
-		`**Session:** ${details.sessionId}`,
-		`**Project:** ${details.projectIdentity}`,
-		`**Tags:** ${details.activeTags} active (${formatBytes(details.totalBytes)}), ${details.droppedTags} dropped`,
-		`**Pending ops:** ${details.pendingOps}`,
-		`**Compartments:** ${details.compartmentCount}${details.lastCompartmentRange ? ` (last ${details.lastCompartmentRange})` : ""}`,
-		`**Memories:** ${details.memoryCount}`,
-		`**Notes:** ${details.noteCount}`,
-		`**Dreamer:** ${details.dreamer.enabled ? `enabled (${details.dreamer.scheduleSummary?.trim() ? details.dreamer.scheduleSummary : "manual-only"})` : "disabled"}`,
-		`**Historian:** ${details.historian.inProgress ? "running" : "idle"}, failures=${details.historian.failureCount}`,
-	].join("\n");
-}

@@ -245,16 +245,6 @@ export function applyMemoryMigration(
     return { removed, inserted };
 }
 
-/** Resolve the project's memory list for the migration prompt.
- *  Shows ALL `active` memories (expired included — see
- *  getAllActiveMemoriesForMigration) so the LLM re-evaluates the exact set that
- *  applyMemoryMigration will delete; `permanent` (user-curated) memories are
- *  never re-evaluated, so they're excluded. */
-export function loadMemoriesForMigration(db: Database, directory: string): Memory[] {
-    const projectPath = resolveProjectIdentity(directory);
-    return getAllActiveMemoriesForMigration(db, projectPath);
-}
-
 export const MIGRATION_SYSTEM_PROMPT =
     "You re-organize a software project's long-term memory for the magic-context system into a stricter taxonomy. " +
     "Follow the user instructions exactly. Output ONLY the requested XML blocks, nothing else.";

@@ -267,7 +267,3 @@ async function runGit(projectRoot: string, args: string[], signal: AbortSignal):
 function throwIfAborted(signal: AbortSignal): void {
     if (signal.aborted) throw new SmartNoteNetworkError("SMART_NOTE_NETWORK: aborted");
 }
-
-export function capabilitySecurityError(message: string): SmartNoteSecurityError {
-    return new SmartNoteSecurityError(message);
-}

@@ -842,30 +842,6 @@ export function replaceCompartmentChunkEmbeddings(
     );
 }
 
-export function getDistinctChunkEmbeddingModelIds(
-    db: Database,
-    projectPath: string,
-): Set<string | null> {
-    const rows = getDistinctModelStatement(db).all(projectPath) as StoredModelIdRow[];
-    return new Set(rows.map((row) => (typeof row.modelId === "string" ? row.modelId : null)));
-}
-
-export function clearChunkEmbeddingsForProject(
-    db: Database,
-    projectPath: string,
-    modelId?: string,
-): number {
-    const changes = modelId
-        ? getClearProjectModelStatement(db).run(projectPath, modelId).changes
-        : getClearProjectStatement(db).run(projectPath).changes;
-    invalidateDecodedSearchPools(
-        db,
-        ([, cachedProjectPath, cachedModelId]) =>
-            cachedProjectPath === projectPath && (!modelId || cachedModelId === modelId),
-    );
-    return changes;
-}
-
 export function loadCompartmentChunkEmbeddingsForSearch(
     db: Database,
     sessionId: string,

@@ -13,7 +13,6 @@ export {
     searchGitCommitsSync,
 } from "./search-git-commits";
 export {
-    clearProjectCommitEmbeddings,
     countEmbeddedCommits,
     loadProjectCommitEmbeddings,
     loadUnembeddedCommits,
@@ -21,12 +20,9 @@ export {
 } from "./storage-git-commit-embeddings";
 export {
     enforceProjectCap,
-    evictOldestCommits,
-    getCommitBySha,
     getCommitCount,
     getLatestIndexedCommitTimeMs,
     type StoredGitCommit,
-    upsertCommit,
     upsertCommits,
 } from "./storage-git-commits";
 export {

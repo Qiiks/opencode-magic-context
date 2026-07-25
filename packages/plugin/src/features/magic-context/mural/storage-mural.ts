@@ -71,7 +71,3 @@ export function upsertMural(
         input.height,
     );
 }
-
-export function muralDataUrl(row: MuralManifestRow): string {
-    return `data:image/png;base64,${row.image.toString("base64")}`;
-}

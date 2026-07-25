@@ -1659,14 +1659,6 @@ async function runShadowWorker(): Promise<void> {
     }
 }
 
-export function attachShadowQueueDatabase(projectIdentity: string, db: Database): void {
-    dbForShadowQueue.set(projectIdentity, db);
-}
-
-export function detachShadowQueueDatabase(projectIdentity: string): void {
-    dbForShadowQueue.delete(projectIdentity);
-}
-
 export function registerProjectInObservationMode(
     db: Database,
     projectIdentity: string,

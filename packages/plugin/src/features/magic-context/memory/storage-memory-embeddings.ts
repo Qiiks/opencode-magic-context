@@ -203,11 +203,6 @@ export function clearEmbeddingsForProject(
     return getClearAllEmbeddingsStatement(db).run(projectPath).changes;
 }
 
-export function getDistinctStoredModelIds(db: Database, projectPath: string): Set<string | null> {
-    const rows = getDistinctStoredModelIdsStatement(db).all(projectPath) as StoredModelIdRow[];
-    return new Set(rows.map((row) => (typeof row.modelId === "string" ? row.modelId : null)));
-}
-
 /** Active memories for a project, and how many are embedded under `modelId`.
  *  Drives the `/ctx-embed` status `embedded / total` memory line. */
 export function getMemoryEmbedCoverage(

@@ -81,12 +81,6 @@ export async function readGitHead(cwd: string): Promise<string | null> {
     return head && /^[0-9a-f]{40}$/i.test(head) ? head : null;
 }
 
-export async function gitCommitExists(cwd: string, revision: string): Promise<boolean> {
-    if (!/^[0-9a-f]{7,40}$/i.test(revision)) return false;
-    const stdout = await runGit(cwd, ["cat-file", "-e", `${revision}^{commit}`]);
-    return stdout !== null;
-}
-
 export async function readGitChangedFilesSince(
     cwd: string,
     revision: string,

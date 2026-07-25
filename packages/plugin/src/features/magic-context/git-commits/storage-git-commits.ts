@@ -122,19 +122,6 @@ function getEvictOverflowStatement(db: Database): PreparedStatement {
     return stmt;
 }
 
-/** Insert or update a single commit. Use upsertCommits() for batch writes. */
-export function upsertCommit(db: Database, projectPath: string, commit: GitCommit): void {
-    getInsertStatement(db).run(
-        commit.sha,
-        projectPath,
-        commit.shortSha,
-        commit.message,
-        commit.author,
-        commit.committedAtMs,
-        Date.now(),
-    );
-}
-
 /** Batch upsert in a single transaction. Returns the count actually inserted
  *  or updated (skipped unchanged rows don't count). */
 export function upsertCommits(
@@ -194,21 +181,6 @@ export function getLatestIndexedCommitTimeMs(db: Database, projectPath: string):
     return row?.latest ?? null;
 }
 
-/** Delete the oldest `excess` commits for a project. ON DELETE CASCADE cleans
- *  embedding rows; FTS triggers clean FTS rows. Returns rows deleted.
- *
- *  We compute the deletion count by diffing count-before and count-after because
- *  `stmt.run().changes` can be inflated by FTS5 trigger propagation (each
- *  `INSERT INTO ..._fts(_fts, ...) VALUES('delete', ...)` inside an AFTER DELETE
- *  trigger can add to the reported change count). */
-export function evictOldestCommits(db: Database, projectPath: string, excess: number): number {
-    if (excess <= 0) return 0;
-    const before = getCommitCount(db, projectPath);
-    getEvictStatement(db).run(projectPath, excess);
-    const after = getCommitCount(db, projectPath);
-    return Math.max(0, before - after);
-}
-
 /** Keep at most `maxCommits` rows for this project, evicting oldest overflow.
  *  Returns number of rows evicted. */
 export function enforceProjectCap(db: Database, projectPath: string, maxCommits: number): number {
@@ -228,15 +200,6 @@ export function enforceProjectCap(db: Database, projectPath: string, maxCommits:
         );
     }
     return evicted;
-}
-
-/** Return a commit by SHA (any project). For single-project reads, prefer the
- *  project-scoped variants. */
-export function getCommitBySha(db: Database, sha: string): StoredGitCommit | null {
-    const row = db.prepare("SELECT * FROM git_commits WHERE sha = ?").get(sha) as
-        | GitCommitRow
-        | undefined;
-    return row ? rowToStoredCommit(row) : null;
 }
 
 function rowToStoredCommit(row: GitCommitRow): StoredGitCommit {

@@ -715,12 +715,6 @@ function uniqueValues(values: readonly string[]): string[] {
     return [...new Set(values.filter((value) => value.length > 0))];
 }
 
-export interface WorkspaceMemorySharingFilter {
-    ownIdentities?: readonly string[];
-    /** null/undefined means no workspace filter is active; pass [] to share no foreign categories. */
-    shareCategories?: readonly string[] | null;
-}
-
 export interface WorkspaceMemorySqlFilter {
     clause: string;
     params: string[];

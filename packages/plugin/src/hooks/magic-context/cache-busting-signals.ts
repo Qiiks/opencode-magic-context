@@ -27,11 +27,3 @@ export interface MaterializationPassSignals {
     /** True when postprocess observed newer m0_mutation_log ids than cached m[0]. */
     m0MutationDriftDetected: boolean;
 }
-
-export function createMaterializationPassSignals(): MaterializationPassSignals {
-    return {
-        m0RematerializedThisPass: false,
-        materializationContentionRetryExhausted: false,
-        m0MutationDriftDetected: false,
-    };
-}
