@@ -158,7 +158,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/features/magic-context/storage-schema-helpers.ts`: Implement schema-mutation and NULL-healing helpers to avoid dependency cycles between database creation and migrations.
 - `src/features/magic-context/storage-meta-persisted.ts`: Read and write per-session persisted scalars and JSON blobs.
 - `src/features/magic-context/fail-closed-block.ts`: Implement loud fail-closed blocking when Magic Context cannot operate on a session.
-- `src/features/magic-context/migrations.ts`: Versioned schema migrations v1–v67 (`LATEST_SUPPORTED_VERSION` in `storage-db.ts` must track the highest; `schema-version-fence.test.ts` asserts they stay in lockstep).
+- `src/features/magic-context/migrations.ts`: Versioned schema migrations v1–v70 (`LATEST_SUPPORTED_VERSION` in `storage-db.ts` must track the highest; `schema-version-fence.test.ts` asserts they stay in lockstep).
 - `src/features/magic-context/message-index.ts`: FTS-backed raw-message index for `ctx_search`.
 - `src/features/magic-context/search.ts`: Unified retrieval over memories, raw messages, git commits, and session/smart notes.
 - `src/features/magic-context/session-project-storage.ts`: Persist session-to-project bindings and repair mis-scoped compartment chunk embeddings.
