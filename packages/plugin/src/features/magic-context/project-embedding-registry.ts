@@ -196,6 +196,17 @@ const pendingShadowBackfills = new Map<string, Set<ShadowScope>>();
  * that cannot succeed. Any real progress changes the set and clears the stall.
  */
 const shadowBackfillLastIds = new Map<string, string>();
+/** Why a (project:scope) backfill stopped: "drained" or "stalled_no_progress". */
+const shadowBackfillStopReasons = new Map<string, ShadowBackfillStopReason>();
+export type ShadowBackfillStopReason = "drained" | "stalled_no_progress";
+
+/** Stop reason for a scope's last backfill retirement, for status surfaces. */
+export function getShadowBackfillStopReason(
+    projectIdentity: string,
+    scope: "memory" | "commit" | "chunk",
+): ShadowBackfillStopReason | undefined {
+    return shadowBackfillStopReasons.get(`${projectIdentity}:${scope}`);
+}
 
 const loadUnembeddedMemoriesStatements = new WeakMap<Database, PreparedStatement>();
 const upsertActiveIdentityStatements = new WeakMap<Database, PreparedStatement>();
@@ -1301,6 +1312,7 @@ function pumpShadowBackfill(): void {
                 SHADOW_MAX_ITEMS_PER_TICK,
             );
             if (ids.length === 0) {
+                shadowBackfillStopReasons.set(stallKey, "drained");
                 scopes.delete(scope);
                 shadowBackfillLastIds.delete(stallKey);
                 continue;
@@ -1308,6 +1320,17 @@ function pumpShadowBackfill(): void {
             const signature = ids.join(",");
             if (shadowBackfillLastIds.get(stallKey) === signature) {
                 // No progress since the last pump for this scope; stop retrying.
+                // Record WHY so status surfaces can distinguish "honest backlog,
+                // provider was failing" from "nothing left" — a bare remaining
+                // count after a silent stop reads as an unembeddable-item bug and
+                // costs a diagnosis cycle (2026-07-24: 437 chunks, transient
+                // provider timeouts under load, zero recorded reason).
+                shadowBackfillStopReasons.set(stallKey, "stalled_no_progress");
+                log(
+                    `[shadow] backfill scope ${scope} for ${projectIdentity} retired without progress — ` +
+                        `the last batch produced no writes (provider failure or timeout is the usual cause); ` +
+                        `${ids.length}+ items remain and retry on the next registration or manual --shadow run`,
+                );
                 scopes.delete(scope);
                 shadowBackfillLastIds.delete(stallKey);
                 continue;

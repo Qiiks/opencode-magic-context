@@ -23,6 +23,7 @@ import {
     flushShadowEmbeddingBacklog,
     getProjectEmbeddingSnapshot,
     getShadowBackfillRemaining,
+    getShadowBackfillStopReason,
     registerProjectEmbedding,
     registerProjectShadowEmbedding,
 } from "../src/features/magic-context/memory/embedding";
@@ -104,6 +105,17 @@ async function runShadowBackfill(
         `Done. Embedded ${before.memory - after.memory} memories, ${before.commit - after.commit} commits, ${before.chunk - after.chunk} chunks. ` +
             `Remaining: ${after.memory} memories, ${after.commit} commits, ${after.chunk} chunks.`,
     );
+    // A nonzero remaining count with a stalled stop reason is honest backlog the
+    // provider failed to serve this run, not an unembeddable class — say so, and
+    // say what to do, instead of leaving a bare number that reads like a bug.
+    for (const scope of ["memory", "commit", "chunk"] as const) {
+        if (after[scope] > 0 && getShadowBackfillStopReason(projectIdentity, scope) === "stalled_no_progress") {
+            console.log(
+                `  note: ${scope} stopped early after a no-progress batch (provider failure/timeout). ` +
+                    `Re-run --shadow to resume; progress is banked per item.`,
+            );
+        }
+    }
 }
 
 async function main() {
