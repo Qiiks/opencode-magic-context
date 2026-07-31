@@ -13,7 +13,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { createEventHook, createToolExecuteAfterHook } from "./hook-handlers";
+import { createChatMessageHook, createEventHook, createToolExecuteAfterHook } from "./hook-handlers";
 
 function createTestDb(): Database {
     const db = new Database(":memory:");
@@ -304,6 +304,192 @@ describe("createEventHook mid-session model switch clears overflow state", () =>
             const overflow = getOverflowState(db, sessionId);
             expect(overflow.detectedContextLimit).toBe(120_000);
             expect(overflow.needsEmergencyRecovery).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+// Variant-change flush must be provider-aware (#257). On providers whose wire
+// renders the thinking config into the prompt (Anthropic family), the
+// provider itself invalidates message blocks on a variant flip, so our flush
+// rides a bust that happens regardless. On implicit-prefix-caching providers
+// (OpenAI-compatible et al.), reasoning_effort/budget is a request parameter
+// outside the cache key, so a variant flip is a full cache HIT and our flush
+// would be the ONLY bust — a gratuitous one that drains queued ops for no
+// provider-side reason. The gate defers the flush on the latter.
+describe("createChatMessageHook variant-change flush is provider-aware", () => {
+    type Sets = {
+        historyRefreshSessions: Set<string>;
+        systemPromptRefreshSessions: Set<string>;
+        pendingMaterializationSessions: Set<string>;
+        lastHeuristicsTurnId: Map<string, string>;
+    };
+
+    function makeHook(sets: Sets, liveModelBySession = new Map<string, { providerID: string; modelID: string }>()) {
+        const db = createTestDb();
+        const hook = createChatMessageHook({
+            db,
+            liveModelBySession,
+            variantBySession: new Map<string, string | undefined>(),
+            agentBySession: new Map<string, string>(),
+            historyRefreshSessions: sets.historyRefreshSessions,
+            systemPromptRefreshSessions: sets.systemPromptRefreshSessions,
+            pendingMaterializationSessions: sets.pendingMaterializationSessions,
+            lastHeuristicsTurnId: sets.lastHeuristicsTurnId,
+        });
+        return { hook, db };
+    }
+
+    function freshSets(): Sets {
+        return {
+            historyRefreshSessions: new Set<string>(),
+            systemPromptRefreshSessions: new Set<string>(),
+            pendingMaterializationSessions: new Set<string>(),
+            lastHeuristicsTurnId: new Map<string, string>(),
+        };
+    }
+
+    // Pins current behavior on the Anthropic family. Deleting the predicate
+    // call (so the gate always takes the TRUE arm) must leave this test green.
+    test("anthropic provider: variant flip signals all three sets + clears lastHeuristicsTurnId", async () => {
+        const sets = freshSets();
+        sets.lastHeuristicsTurnId.set("ses", "turn-1");
+        const { hook, db } = makeHook(sets);
+        try {
+            await hook({ sessionID: "ses", variant: "low", model: { providerID: "anthropic", modelID: "claude" } });
+            await hook({ sessionID: "ses", variant: "high", model: { providerID: "anthropic", modelID: "claude" } });
+
+            expect(sets.historyRefreshSessions.has("ses")).toBe(true);
+            expect(sets.systemPromptRefreshSessions.has("ses")).toBe(true);
+            expect(sets.pendingMaterializationSessions.has("ses")).toBe(true);
+            expect(sets.lastHeuristicsTurnId.has("ses")).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("bedrock provider: variant flip signals all three sets (thinking config rendered into prompt)", async () => {
+        const sets = freshSets();
+        const { hook, db } = makeHook(sets);
+        try {
+            await hook({ sessionID: "ses", variant: "low", model: { providerID: "bedrock", modelID: "claude" } });
+            await hook({ sessionID: "ses", variant: "high", model: { providerID: "bedrock", modelID: "claude" } });
+
+            expect(sets.historyRefreshSessions.has("ses")).toBe(true);
+            expect(sets.systemPromptRefreshSessions.has("ses")).toBe(true);
+            expect(sets.pendingMaterializationSessions.has("ses")).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("google-vertex-anthropic provider: variant flip signals all three sets", async () => {
+        const sets = freshSets();
+        const { hook, db } = makeHook(sets);
+        try {
+            await hook({
+                sessionID: "ses",
+                variant: "low",
+                model: { providerID: "google-vertex-anthropic", modelID: "claude" },
+            });
+            await hook({
+                sessionID: "ses",
+                variant: "high",
+                model: { providerID: "google-vertex-anthropic", modelID: "claude" },
+            });
+
+            expect(sets.historyRefreshSessions.has("ses")).toBe(true);
+            expect(sets.systemPromptRefreshSessions.has("ses")).toBe(true);
+            expect(sets.pendingMaterializationSessions.has("ses")).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    // Mutation-sensitive: this test MUST FAIL if the predicate is hardcoded
+    // true or the gate is removed. We assert the sets are EMPTY (not merely
+    // "not containing extra members") to kill the deleted-effect mutant.
+    test("openai provider: variant flip signals NOTHING and leaves lastHeuristicsTurnId untouched", async () => {
+        const sets = freshSets();
+        sets.lastHeuristicsTurnId.set("ses", "turn-1");
+        const { hook, db } = makeHook(sets);
+        try {
+            await hook({ sessionID: "ses", variant: "low", model: { providerID: "openai", modelID: "gpt-4o" } });
+            await hook({ sessionID: "ses", variant: "high", model: { providerID: "openai", modelID: "gpt-4o" } });
+
+            expect(sets.historyRefreshSessions.size).toBe(0);
+            expect(sets.systemPromptRefreshSessions.size).toBe(0);
+            expect(sets.pendingMaterializationSessions.size).toBe(0);
+            expect(sets.lastHeuristicsTurnId.get("ses")).toBe("turn-1");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("fireworks provider: variant flip signals NOTHING (implicit-prefix cache, request param outside cache key)", async () => {
+        const sets = freshSets();
+        const { hook, db } = makeHook(sets);
+        try {
+            await hook({ sessionID: "ses", variant: "low", model: { providerID: "fireworks", modelID: "fwm" } });
+            await hook({ sessionID: "ses", variant: "high", model: { providerID: "fireworks", modelID: "fwm" } });
+
+            expect(sets.historyRefreshSessions.size).toBe(0);
+            expect(sets.systemPromptRefreshSessions.size).toBe(0);
+            expect(sets.pendingMaterializationSessions.size).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    // Unknown provider (no model info on the hook input) takes the
+    // conservative TRUE arm = today's behavior.
+    test("unknown provider (no model info): variant flip takes the TRUE arm (all three sets signaled)", async () => {
+        const sets = freshSets();
+        const { hook, db } = makeHook(sets);
+        try {
+            await hook({ sessionID: "ses", variant: "low" });
+            await hook({ sessionID: "ses", variant: "high" });
+
+            expect(sets.historyRefreshSessions.has("ses")).toBe(true);
+            expect(sets.systemPromptRefreshSessions.has("ses")).toBe(true);
+            expect(sets.pendingMaterializationSessions.has("ses")).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    // The liveModelBySession fallback: when the hook input has no model but a
+    // prior event recorded the provider, the fallback providerID governs the
+    // gate. An OpenAI-compatible provider recorded earlier must still defer.
+    test("liveModelBySession fallback: openai recorded earlier, no model on input → defer (FALSE arm)", async () => {
+        const sets = freshSets();
+        const liveModelBySession = new Map<string, { providerID: string; modelID: string }>([
+            ["ses", { providerID: "openai", modelID: "gpt-4o" }],
+        ]);
+        const { hook, db } = makeHook(sets, liveModelBySession);
+        try {
+            await hook({ sessionID: "ses", variant: "low" });
+            await hook({ sessionID: "ses", variant: "high" });
+
+            expect(sets.historyRefreshSessions.size).toBe(0);
+            expect(sets.systemPromptRefreshSessions.size).toBe(0);
+            expect(sets.pendingMaterializationSessions.size).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("no variant change: no sets signaled regardless of provider", async () => {
+        const sets = freshSets();
+        const { hook, db } = makeHook(sets);
+        try {
+            await hook({ sessionID: "ses", variant: "high", model: { providerID: "openai", modelID: "gpt-4o" } });
+            await hook({ sessionID: "ses", variant: "high", model: { providerID: "openai", modelID: "gpt-4o" } });
+
+            expect(sets.historyRefreshSessions.size).toBe(0);
+            expect(sets.systemPromptRefreshSessions.size).toBe(0);
+            expect(sets.pendingMaterializationSessions.size).toBe(0);
         } finally {
             closeQuietly(db);
         }
