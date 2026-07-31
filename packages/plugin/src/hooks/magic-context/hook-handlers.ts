@@ -45,6 +45,7 @@ import {
     resetNoteNudgeCooldownOnly,
 } from "./note-nudger";
 import { readRawSessionMessageById, readRawSessionMessages } from "./read-session-chunk";
+import { variantChangeBustsProviderCache } from "./sentinel";
 import { normalizeTodoStateJson } from "./todo-view";
 
 export type LiveModelBySession = Map<string, { providerID: string; modelID: string }>;
@@ -203,14 +204,49 @@ export function createChatMessageHook(args: {
             input.variant !== undefined &&
             previousVariant !== input.variant
         ) {
-            sessionLog(
-                sessionId,
-                `variant changed (${previousVariant} -> ${input.variant}), triggering flush`,
-            );
-            args.historyRefreshSessions.add(sessionId);
-            args.systemPromptRefreshSessions.add(sessionId);
-            args.pendingMaterializationSessions.add(sessionId);
-            args.lastHeuristicsTurnId.delete(sessionId);
+            // A reasoning-variant change maps to a thinking-config change
+            // (effort / budget_tokens / toggle — see OpenCode's
+            // `reasoningVariants`). Whether that busts the provider's prompt
+            // cache on its own depends on the provider's cache model: the
+            // Anthropic family renders the thinking config into the prompt
+            // (so the provider itself invalidates message blocks on a change
+            // and our queued ops drain on that natural bust), while
+            // OpenAI-compatible providers carry reasoning_effort / budget as
+            // a request parameter outside the cache key, so a variant flip
+            // is a full cache HIT and our flush would be the ONLY bust — a
+            // gratuitous one. See `variantChangeBustsProviderCache` for the
+            // full rationale and the safety asymmetry.
+            //
+            // providerID comes from the hook input (the live request's
+            // model) with `liveModelBySession` as a fallback for sessions
+            // whose first chat.message predates a model-bearing event. When
+            // no provider is known yet we take the conservative TRUE arm
+            // (today's behavior) so we never silently drop a needed drain.
+            const providerID =
+                input.model?.providerID ??
+                args.liveModelBySession.get(sessionId)?.providerID;
+            if (variantChangeBustsProviderCache(providerID)) {
+                sessionLog(
+                    sessionId,
+                    `variant changed (${previousVariant} -> ${input.variant}), triggering flush`,
+                );
+                args.historyRefreshSessions.add(sessionId);
+                args.systemPromptRefreshSessions.add(sessionId);
+                args.pendingMaterializationSessions.add(sessionId);
+                args.lastHeuristicsTurnId.delete(sessionId);
+            } else {
+                // The provider's cache ignores request params, so a variant
+                // flip is a cache HIT. Defer the queued ops to the next
+                // natural bust (fold / threshold / TTL / flush) exactly as
+                // historian publications do — do NOT manufacture a bust here.
+                // This log line also answers the dashboard-mislabeling
+                // complaint at the log level: the variant change was observed
+                // but the flush was deferred, not triggered.
+                sessionLog(
+                    sessionId,
+                    `variant changed (${previousVariant} -> ${input.variant}) on provider ${providerID} whose cache ignores request params; deferring flush to next natural bust`,
+                );
+            }
         }
     };
 }
