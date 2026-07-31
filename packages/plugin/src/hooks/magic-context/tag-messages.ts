@@ -26,6 +26,7 @@ import {
 import {
     createToolDropTarget,
     extractToolCallObservation,
+    partHasCompletedResult,
     type ToolCallIndex,
     type ToolDropResult,
     ToolMutationBatch,
@@ -488,7 +489,13 @@ export function tagMessages(
                     hasResult: false,
                 };
                 entry.occurrences.push({ message, part, kind: toolObservation.kind });
-                if (toolObservation.kind === "result") entry.hasResult = true;
+                // An OpenCode `{ type: "tool" }` part is observed as a "result" by
+                // its TYPE even while the call is still pending/running, so gate
+                // hasResult on an ACTUAL completed result (state.output present).
+                // This keeps open arcs out of every drop/clamp selector — a live
+                // task part's input must never become a reclaim target.
+                if (toolObservation.kind === "result" && partHasCompletedResult(part))
+                    entry.hasResult = true;
                 toolCallIndex.set(compositeKey, entry);
 
                 const _tGetTool = performance.now();
