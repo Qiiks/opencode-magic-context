@@ -270,15 +270,22 @@ function clearThinkingParts(thinkingParts: ThinkingLikePart[]): void {
  *
  * OpenCode's single-part `{ type: "tool" }` representation is classified as a
  * "result" observation by its TYPE even while the call is still pending/running
- * (no output written yet), so the arc is only truly closed once `state.output`
- * is a string. Anthropic's separate `tool_result` part only exists after the
- * call finished, so it always counts. Invocation-shaped parts (`tool-invocation`
- * / `tool_use`) never carry a result and are excluded here.
+ * (no output written yet). The arc is closed in either of two arms: a completed
+ * result (`state.output` is a string) OR an errored call (`state.status ===
+ * "error"`, carrying `state.error`). OpenCode serializes an errored part as an
+ * `output-error` block built from `state.error` and never reads its input again
+ * (opencode message-v2.ts error arm), so it is just as safe to reclaim as a
+ * completed one — excluding it would leak bulky inputs (e.g. a failed write with
+ * a large content arg). Pending/running parts have neither an output nor an
+ * error status and stay excluded. Anthropic's separate `tool_result` part only
+ * exists after the call finished, so it always counts. Invocation-shaped parts
+ * (`tool-invocation` / `tool_use`) never carry a result and are excluded here.
  */
 export function partHasCompletedResult(part: unknown): boolean {
     if (!isRecord(part)) return false;
     if (part.type === "tool") {
-        return isRecord(part.state) && typeof part.state.output === "string";
+        if (!isRecord(part.state)) return false;
+        return typeof part.state.output === "string" || part.state.status === "error";
     }
     return part.type === "tool_result";
 }
