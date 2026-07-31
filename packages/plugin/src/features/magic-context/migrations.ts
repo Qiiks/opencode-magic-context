@@ -121,14 +121,23 @@ function assertForeignKeyIntegrity(db: Database, table?: string): void {
     }
 }
 
-function authorityPrivilegeCheck(db: Database): string {
-    const native = db as unknown as {
-        function?: unknown;
-        createFunction?: unknown;
-    };
-    return typeof native.function === "function" || typeof native.createFunction === "function"
-        ? "mc_privileged_writer() = 0"
-        : "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0";
+/**
+ * SQL predicate that guards managed-write triggers fire only for UNPRIVILEGED
+ * writers.
+ *
+ * This must ALWAYS be the durable `context_privilege_state` table check, never a
+ * connection-local scalar UDF. Triggers are DURABLE database artifacts: their SQL
+ * is stored in the file and re-evaluated on EVERY connection that opens context.db.
+ * A UDF such as the former `mc_privileged_writer()` only exists on connections that
+ * registered it, so a trigger baked with that reference fails with `no such function`
+ * on any connection that did not (older Bun without scalar-UDF support, node:sqlite,
+ * the dashboard's rusqlite). The state table is ordinary schema every connection can
+ * read, so the guard works identically everywhere. Privileged writers flip
+ * `context_privilege_state.enabled` inside their own BEGIN IMMEDIATE transaction
+ * (see withPrivilegedWriter), which no second connection can observe.
+ */
+function authorityPrivilegeCheck(): string {
+    return "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0";
 }
 
 function managedAuthorityNoteRow(row: "OLD" | "NEW"): string {
@@ -150,7 +159,7 @@ function managedAuthorityNoteRow(row: "OLD" | "NEW"): string {
 
 /** Install the latest authority fences after historical/recovery migration batches. */
 function installLatestAuthorityTriggers(db: Database): void {
-    const privilegeCheck = authorityPrivilegeCheck(db);
+    const privilegeCheck = authorityPrivilegeCheck();
     if (tableExists(db, "memories")) {
         db.exec(`
             DROP TRIGGER IF EXISTS memories_authority_guard_insert;
@@ -2667,6 +2676,23 @@ const MIGRATIONS: Migration[] = [
         up(db: Database): void {
             healMismatchedTierClose(db, "compartments", true);
             healMismatchedTierClose(db, "recomp_compartments", false);
+        },
+    },
+    {
+        version: 71,
+        description:
+            "rebuild authority guard triggers to the durable state-table form (issue #253)",
+        up(db: Database): void {
+            // Earlier migrations baked a connection-local UDF reference
+            // (mc_privileged_writer()) into these triggers when the MIGRATING runtime
+            // supported scalar UDFs. That reference is only evaluable on connections
+            // that registered the UDF, so every other connection opening context.db
+            // failed each guarded write with `no such function`. Rebuild all six guards
+            // to the durable context_privilege_state predicate. DROP + CREATE is safe on
+            // both existing variants (UDF-form and state-form triggers) and on fresh
+            // databases. installLatestAuthorityTriggers now emits the state-table form
+            // unconditionally.
+            installLatestAuthorityTriggers(db);
         },
     },
 ];

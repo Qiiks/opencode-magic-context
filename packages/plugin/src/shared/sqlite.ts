@@ -201,30 +201,6 @@ export type Database = BetterSqlite3.Database;
 export type Statement = BetterSqlite3.Statement<unknown[], unknown>;
 
 const privilegeDepth = new WeakMap<Database, number>();
-const registeredPrivilegeFunctions = new WeakSet<Database>();
-const privilegeUdfAvailable = new WeakSet<Database>();
-
-/** Register the connection-local privilege predicate used by managed-write guards. */
-export function registerPrivilegedWriter(db: Database): void {
-    if (registeredPrivilegeFunctions.has(db)) return;
-    const native = db as unknown as {
-        function?: (name: string, implementation: () => number) => void;
-        createFunction?: (name: string, implementation: () => number) => void;
-    };
-    const implementation = (): number => ((privilegeDepth.get(db) ?? 0) > 0 ? 1 : 0);
-    if (typeof native.function === "function") {
-        native.function("mc_privileged_writer", implementation);
-    } else if (typeof native.createFunction === "function") {
-        native.createFunction("mc_privileged_writer", implementation);
-    } else {
-        // Older Bun releases do not expose scalar UDF registration. Migration 55
-        // retains the pre-UDF state-table trigger on those runtimes.
-        registeredPrivilegeFunctions.add(db);
-        return;
-    }
-    privilegeUdfAvailable.add(db);
-    registeredPrivilegeFunctions.add(db);
-}
 
 function isInTransaction(db: Database): boolean {
     const candidate = db as unknown as { inTransaction?: unknown; isTransaction?: unknown };
@@ -232,11 +208,17 @@ function isInTransaction(db: Database): boolean {
 }
 
 /**
- * Run a storage operation while the connection-local privilege predicate is enabled.
- * The depth lives outside SQLite, so a second connection can never observe or inherit it.
+ * Run a storage operation with the managed-write privilege enabled.
+ *
+ * The privilege is recorded in the durable `context_privilege_state` table (row
+ * id=1, enabled=1) so the guard triggers — which reference that table, never a
+ * connection-local UDF — stand down for this connection's writes. The write happens
+ * inside a BEGIN IMMEDIATE transaction (single writer), and enabled is cleared back
+ * to 0 before commit, so no second connection can ever observe enabled=1. Nesting is
+ * tracked by privilegeDepth (outside SQLite): only the outermost scope clears the
+ * flag, so an inner scope releasing does not drop permission out from under its caller.
  */
 export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
-    registerPrivilegedWriter(db);
     const previousDepth = privilegeDepth.get(db) ?? 0;
     const nested = isInTransaction(db);
     const savepoint = "mc_privilege_scope";
@@ -247,13 +229,11 @@ export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
     }
     privilegeDepth.set(db, previousDepth + 1);
     try {
-        if (!privilegeUdfAvailable.has(db)) {
-            db.prepare(
-                "INSERT INTO context_privilege_state(id, enabled) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET enabled = 1",
-            ).run();
-        }
+        db.prepare(
+            "INSERT INTO context_privilege_state(id, enabled) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET enabled = 1",
+        ).run();
         const result = operation();
-        if (!privilegeUdfAvailable.has(db) && previousDepth === 0) {
+        if (previousDepth === 0) {
             db.prepare("UPDATE context_privilege_state SET enabled = 0 WHERE id = 1").run();
         }
         if (nested) {

@@ -1,8 +1,4 @@
-import {
-    type Database,
-    type Statement as PreparedStatement,
-    registerPrivilegedWriter,
-} from "../../../shared/sqlite";
+import type { Database, Statement as PreparedStatement } from "../../../shared/sqlite";
 import { hasMuralCueColumns } from "../mural/storage-mural-cues";
 import { MEMORY_CATEGORY_ORDER_SQL } from "./constants";
 import { invalidateMemory, invalidateProject } from "./embedding-cache";
@@ -594,7 +590,6 @@ export class ModuleMemoryAuthorityError extends Error {
 }
 
 function assertTsMemoryWriteAllowed(db: Database, projectPath: string): void {
-    registerPrivilegedWriter(db);
     try {
         const managed = db
             .prepare(
