@@ -14,9 +14,11 @@ import { join } from "node:path";
  * The two gates that previously excluded subagents were:
  *   1. transform.ts: `channel2MetricsKnown = fullFeatureMode && …` (trigger)
  *   2. event-handler.ts: `if (meta.isSubagent) return;` (delivery wrapper)
- * Both are removed. The ONLY gate now is ctx_reduce being effective (the
- * enclosing Channel-1 block) so we never nudge toward an uncallable tool.
- * This guard pins that against a silent revert.
+ * Both are removed. Channel 2 remains armed for subagents when ctx_reduce is
+ * callable, while delivery additionally requires the subagent's run to still be
+ * active so a terminal report cannot be followed by a synthetic turn. This
+ * guard pins the subagent-enabled trigger and delivery wiring against a silent
+ * revert.
  */
 
 function codeWithoutComments(path: string): string {

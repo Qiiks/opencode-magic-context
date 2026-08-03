@@ -1,33 +1,63 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
+import { join } from "node:path";
+
 import {
     closeDatabase,
     getChannel2NudgeClaimedAt,
     getChannel2NudgeState,
     openDatabase,
     setChannel2NudgeState,
+    updateSessionMeta,
 } from "../../features/magic-context/storage";
+import { Database } from "../../shared/sqlite";
 import { maybeDeliverChannel2 } from "./channel2-delivery";
+import { closeReadOnlySessionDb } from "./read-session-db";
+
+const openCodeDbs: Database[] = [];
 
 function useTempDataHome(prefix: string): void {
     const { mkdtempSync } = require("node:fs");
     const { tmpdir } = require("node:os");
-    const { join } = require("node:path");
     process.env.XDG_DATA_HOME = mkdtempSync(join(tmpdir(), prefix));
 }
+
+function createOpenCodeAssistantTail(sessionId: string, finish: string): Database {
+    const { mkdirSync } = require("node:fs");
+    mkdirSync(join(process.env.XDG_DATA_HOME!, "opencode"), { recursive: true });
+    const db = new Database(join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"));
+    db.exec(
+        "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+    );
+    db.exec(
+        "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+    );
+    db.prepare(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+    ).run("assistant-report", sessionId, 100, 100, JSON.stringify({ role: "assistant", finish }));
+    openCodeDbs.push(db);
+    return db;
+}
+
+afterEach(() => {
+    for (const db of openCodeDbs.splice(0)) {
+        db.close();
+    }
+    closeReadOnlySessionDb();
+    closeDatabase();
+    mock.restore();
+});
 
 /**
  * A minimal stand-in for the in-process client OpenCode hands the plugin
  * (`input.client`). `promptAsync` is the delivery primitive; `messages` backs
  * resolvePromptContext (empty by default).
  */
-function fakeClient(promptAsync: (input: unknown) => Promise<unknown>) {
-    return { session: { promptAsync, messages: async () => ({ data: [] }) } };
+function fakeClient(
+    promptAsync: (input: unknown) => Promise<unknown>,
+    messages: () => Promise<unknown> = async () => ({ data: [] }),
+) {
+    return { session: { promptAsync, messages } };
 }
-
-afterEach(() => {
-    closeDatabase();
-    mock.restore();
-});
 
 describe("maybeDeliverChannel2", () => {
     it("no-ops when no pending intent exists", async () => {
@@ -120,6 +150,82 @@ describe("maybeDeliverChannel2", () => {
         expect(cached).toBe(db);
         expect(getChannel2NudgeState(db, "ses-cache-heal")).toBe("pending");
         expect(getChannel2NudgeClaimedAt(db, "ses-cache-heal")).toBe(0);
+    });
+
+    it("delivers to a subagent while its run is still active", async () => {
+        useTempDataHome("ch2-subagent-active-");
+        const db = openDatabase()!;
+        const sessionId = "ses-subagent-active";
+        createOpenCodeAssistantTail(sessionId, "tool-calls");
+        updateSessionMeta(db, sessionId, { isSubagent: true });
+        setChannel2NudgeState(db, sessionId, "pending");
+        const promptAsync = mock(async () => ({}));
+
+        const delivered = await maybeDeliverChannel2(sessionId, {
+            db,
+            client: fakeClient(promptAsync),
+            reclaimableTokens: 30_000,
+            usableTokens: 60_000,
+        });
+
+        expect(delivered).toBe(true);
+        expect(promptAsync).toHaveBeenCalledTimes(1);
+        expect(getChannel2NudgeState(db, sessionId)).toBe("delivered");
+    });
+
+    it("does not wake a completed subagent or replace its final report", async () => {
+        useTempDataHome("ch2-subagent-completed-");
+        const db = openDatabase()!;
+        const sessionId = "ses-subagent-completed";
+        createOpenCodeAssistantTail(sessionId, "stop");
+        updateSessionMeta(db, sessionId, { isSubagent: true });
+        setChannel2NudgeState(db, sessionId, "pending");
+        const messages = ["subagent report"];
+        const promptAsync = mock(async () => {
+            messages.push("unexpected synthetic turn");
+        });
+
+        const delivered = await maybeDeliverChannel2(sessionId, {
+            db,
+            client: fakeClient(promptAsync),
+            reclaimableTokens: 30_000,
+            usableTokens: 60_000,
+        });
+
+        expect(delivered).toBe(false);
+        expect(promptAsync).not.toHaveBeenCalled();
+        expect(messages).toEqual(["subagent report"]);
+        expect(getChannel2NudgeState(db, sessionId)).toBe("");
+    });
+
+    it("releases a claim when a subagent completes before the queued delivery", async () => {
+        useTempDataHome("ch2-subagent-race-");
+        const db = openDatabase()!;
+        const sessionId = "ses-subagent-race";
+        const openCodeDb = createOpenCodeAssistantTail(sessionId, "tool-calls");
+        updateSessionMeta(db, sessionId, { isSubagent: true });
+        setChannel2NudgeState(db, sessionId, "pending");
+        const promptAsync = mock(async () => ({}));
+        const client = fakeClient(promptAsync, async () => {
+            // resolvePromptContext yields between claim and promptAsync. This
+            // models the child writing its terminal report during that window.
+            expect(getChannel2NudgeState(db, sessionId)).toBe("claimed");
+            openCodeDb
+                .prepare("UPDATE message SET data = ? WHERE id = ?")
+                .run(JSON.stringify({ role: "assistant", finish: "stop" }), "assistant-report");
+            return { data: [] };
+        });
+
+        const delivered = await maybeDeliverChannel2(sessionId, {
+            db,
+            client,
+            reclaimableTokens: 30_000,
+            usableTokens: 60_000,
+        });
+
+        expect(delivered).toBe(false);
+        expect(promptAsync).not.toHaveBeenCalled();
+        expect(getChannel2NudgeState(db, sessionId)).toBe("");
     });
 
     it("delivers via the in-process client and consumes the one-shot cap", async () => {
