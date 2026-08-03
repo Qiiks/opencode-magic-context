@@ -25,9 +25,7 @@ export function getOpenCodeCommandInvocation(
     // binary through the child environment so percent signs in a valid path are
     // not treated as another variable expansion. Current callers only supply the
     // fixed `--version` and `models` arguments.
-    const commandLine = [`%${OPENCODE_BINARY_ENV}%`, ...args]
-        .map((part) => `"${part}"`)
-        .join(" ");
+    const commandLine = [`%${OPENCODE_BINARY_ENV}%`, ...args].map((part) => `"${part}"`).join(" ");
     return {
         command,
         args: ["/d", "/s", "/v:off", "/c", `"${commandLine}"`],

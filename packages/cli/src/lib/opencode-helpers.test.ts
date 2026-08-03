@@ -83,25 +83,13 @@ describe("OpenCode command execution", () => {
 
         expect(getOpenCodeCommandInvocation("C:\\npm\\opencode.CMD", ["--version"])).toEqual({
             command: "custom-cmd.exe",
-            args: [
-                "/d",
-                "/s",
-                "/v:off",
-                "/c",
-                '""%MAGIC_CONTEXT_OPENCODE_BINARY%" "--version""',
-            ],
+            args: ["/d", "/s", "/v:off", "/c", '""%MAGIC_CONTEXT_OPENCODE_BINARY%" "--version""'],
             env: { MAGIC_CONTEXT_OPENCODE_BINARY: "C:\\npm\\opencode.CMD" },
             windowsVerbatimArguments: true,
         });
         expect(getOpenCodeCommandInvocation("C:\\npm\\opencode.bat", ["models"])).toEqual({
             command: "custom-cmd.exe",
-            args: [
-                "/d",
-                "/s",
-                "/v:off",
-                "/c",
-                '""%MAGIC_CONTEXT_OPENCODE_BINARY%" "models""',
-            ],
+            args: ["/d", "/s", "/v:off", "/c", '""%MAGIC_CONTEXT_OPENCODE_BINARY%" "models""'],
             env: { MAGIC_CONTEXT_OPENCODE_BINARY: "C:\\npm\\opencode.bat" },
             windowsVerbatimArguments: true,
         });
@@ -119,10 +107,7 @@ describe("OpenCode command execution", () => {
         const shim = fakeOpenCodeCommandShim();
 
         expect(getOpenCodeVersion(shim)).toBe("1.18.7");
-        expect(getAvailableModels(shim)).toEqual([
-            "anthropic/claude-opus-4-8",
-            "openai/gpt-5.5",
-        ]);
+        expect(getAvailableModels(shim)).toEqual(["anthropic/claude-opus-4-8", "openai/gpt-5.5"]);
     });
 });
 
