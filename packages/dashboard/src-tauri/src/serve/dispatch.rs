@@ -651,7 +651,8 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
         }
         "get_project_configs" => {
             parse_args::<NoArgs>(args)?;
-            json(config::discover_project_configs())
+            let db_path = state.db_path.lock().ok().and_then(|guard| guard.clone());
+            json(config::discover_project_configs_with_db(db_path.as_ref()))
         }
         "save_project_config" => {
             let a: SaveProjectConfigArgs = parse_args(args)?;

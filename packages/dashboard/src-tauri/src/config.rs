@@ -308,81 +308,116 @@ pub struct ProjectConfigEntry {
     pub alt_exists: Option<bool>,
 }
 
-/// Discover projects with magic-context config files by scanning OpenCode project worktrees.
+/// Discover projects with magic-context config files.
+///
+/// Uses the Magic Context DB (`context.db`) as the primary source of project
+/// enumeration — the same authority as the Projects tab — so OpenCode Desktop
+/// (which does not create `opencode.db`) discovers project configs correctly.
+/// The OpenCode CLI DB (`opencode.db`) is consulted as a secondary source to
+/// enrich display names and pick up projects that have CLI sessions but no
+/// Magic Context data yet. Results are deduplicated by worktree path.
 pub fn discover_project_configs() -> Vec<ProjectConfigEntry> {
-    let opencode_db = {
-        let data_dir = if cfg!(target_os = "windows") {
-            match dirs::data_dir() {
-                Some(d) => d,
-                None => return vec![],
-            }
-        } else {
-            std::env::var("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| {
-                    dirs::home_dir()
-                        .unwrap_or_default()
-                        .join(".local")
-                        .join("share")
-                })
-        };
-        data_dir.join("opencode").join("opencode.db")
-    };
+    discover_project_configs_with_db(crate::db::resolve_db_path().as_ref())
+}
 
-    if !opencode_db.exists() {
-        return vec![];
+/// Internal entry point that accepts an explicit context DB path (for testing
+/// and for the serve path which already resolves the path).
+pub fn discover_project_configs_with_db(
+    context_db_path: Option<&PathBuf>,
+) -> Vec<ProjectConfigEntry> {
+    // ── 1. Collect project worktrees from context.db ──────────────
+    // The Projects tab uses `get_projects` which queries context.db for project
+    // identities and resolves filesystem paths. We use the same source so
+    // Desktop users (no opencode.db) see their projects.
+    let mut worktree_map: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new(); // worktree_path → display_name
+
+    if let Some(db_path) = context_db_path {
+        if let Ok(conn) = crate::db::open_readonly(db_path) {
+            if let Ok(projects) = crate::db::get_projects(&conn) {
+                for p in &projects {
+                    if let Some(path) = &p.path {
+                        if !path.is_empty() {
+                            worktree_map
+                                .entry(path.clone())
+                                .or_insert(p.label.clone());
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    let conn = match rusqlite::Connection::open_with_flags(
-        &opencode_db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
+    // ── 2. Enrich from opencode.db (names + extra projects) ──────
+    let opencode_db = crate::db::resolve_opencode_db_path();
+    if let Some(ref opencode_path) = opencode_db {
+        if let Ok(conn) = rusqlite::Connection::open_with_flags(
+            opencode_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            collect_opencode_db_projects(&conn, &mut worktree_map);
+        }
+    }
 
-    let mut stmt = match conn.prepare("SELECT name, worktree FROM project") {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-
-    let rows: Vec<(String, String)> = match stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-            row.get::<_, String>(1)?,
-        ))
-    }) {
-        Ok(mapped) => mapped.flatten().collect(),
-        Err(_) => return vec![],
-    };
-
+    // ── 3. Build entries, checking for config files ───────────────
     let mut entries = Vec::new();
-    for (name, worktree) in rows {
-        let config_path = resolve_project_config_path(&worktree);
-        if !config_path.exists() {
+    for (worktree, display_name) in &worktree_map {
+        // Skip dead/deleted roots silently
+        let Ok(metadata) = std::fs::symlink_metadata(worktree) else {
+            continue;
+        };
+        if !metadata.is_dir() {
             continue;
         }
 
-        let display_name = if name.is_empty() {
-            std::path::Path::new(&worktree)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| worktree.clone())
-        } else {
-            name
-        };
+        let config_path = resolve_project_config_path(worktree);
+        let exists = config_path.exists();
 
         entries.push(ProjectConfigEntry {
-            project_name: display_name,
+            project_name: display_name.clone(),
             worktree: worktree.clone(),
             config_path: config_path.to_string_lossy().to_string(),
-            exists: true,
+            exists,
             alt_config_path: None,
             alt_exists: None,
         });
     }
 
     entries
+}
+
+/// Query the OpenCode CLI DB for project worktrees and names.
+/// Adds entries not yet present in `worktree_map` (i.e. projects that have
+/// CLI sessions but no Magic Context data yet).
+fn collect_opencode_db_projects(
+    conn: &rusqlite::Connection,
+    worktree_map: &mut std::collections::BTreeMap<String, String>,
+) {
+    let Ok(mut stmt) = conn.prepare("SELECT name, worktree FROM project") else {
+        return;
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            row.get::<_, String>(1)?,
+        ))
+    }) else {
+        return;
+    };
+
+    for row in rows.flatten() {
+        let (name, worktree) = row;
+        let display_name = if name.is_empty() {
+            Path::new(&worktree)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| worktree.clone())
+        } else {
+            name
+        };
+        worktree_map.entry(worktree).or_insert(display_name);
+    }
 }
 
 #[cfg(test)]
@@ -519,5 +554,218 @@ mod tests {
         let err = write_project_config(canonical_project.to_str().unwrap(), &config_path, "{}\n")
             .expect_err("directory target must be refused");
         assert!(err.contains("regular file"), "unexpected error: {err}");
+    }
+
+    // ── discover_project_configs_with_db tests ─────────────────────
+
+    /// Create a minimal opencode.db with a project table.
+    fn create_test_opencode_db(
+        db_path: &Path,
+        projects: &[(&str, &str)], // (name, worktree)
+    ) -> rusqlite::Connection {
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE project (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                worktree TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        for (i, (name, worktree)) in projects.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO project (id, name, worktree) VALUES (?1, ?2, ?3)",
+                rusqlite::params![format!("p-{}", i), name, worktree],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn discover_project_configs_with_none_returns_no_crash() {
+        // Passing None for context DB still works (falls back to opencode.db
+        // if available). On a machine with a real opencode.db this returns
+        // project entries; without one it returns empty. Either way it must
+        // not panic.
+        let entries = discover_project_configs_with_db(None);
+        // No assertion on count since it depends on the machine state;
+        // the important thing is it didn't panic.
+        let _ = entries;
+    }
+
+    #[test]
+    fn discover_project_configs_finds_projects_from_opencode_db() {
+        // When opencode.db exists with project worktrees, the config editor
+        // should discover those projects even without context.db data.
+        let temp = tempfile::tempdir().unwrap();
+        let data_home = temp.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+
+        // Create a project directory with a config file
+        let proj = temp.path().join("my-project");
+        std::fs::create_dir_all(proj.join(".cortexkit")).unwrap();
+        std::fs::write(
+            proj.join(".cortexkit").join("magic-context.jsonc"),
+            "{\"enabled\": true}",
+        )
+        .unwrap();
+        let proj_str = proj.to_string_lossy().to_string();
+
+        // Set up opencode.db with the project
+        let oc_path = data_home.join("opencode").join("opencode.db");
+        let oc = create_test_opencode_db(
+            &oc_path,
+            &[("My Project", proj_str.as_str())],
+        );
+        drop(oc);
+
+        // No context.db — simulate Desktop scenario
+        let old_xdg = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", &data_home);
+
+        // discover_project_configs_with_db(None) means no context.db,
+        // but opencode.db should still be found via resolve_opencode_db_path
+        let entries = discover_project_configs_with_db(None);
+
+        // Should find the project with config
+        let found = entries.iter().find(|e| e.worktree.contains("my-project"));
+        assert!(
+            found.is_some(),
+            "expected to find project with my-project, got: {:?}",
+            entries
+        );
+        assert!(found.unwrap().exists, "project config should exist");
+
+        if let Some(old) = old_xdg {
+            std::env::set_var("XDG_DATA_HOME", old);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[test]
+    fn discover_project_configs_finds_projects_from_context_db() {
+        // When only context.db exists (no opencode.db), the Config Editor
+        // should discover projects via get_projects. This is the Desktop scenario
+        // that was broken before the fix: opencode.db doesn't exist on Desktop,
+        // so the old discover_project_configs() returned empty.
+        let temp = tempfile::tempdir().unwrap();
+        let data_home = temp.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+
+        // Create a project directory with a config file
+        let proj = temp.path().join("my-project");
+        std::fs::create_dir_all(proj.join(".cortexkit")).unwrap();
+        std::fs::write(
+            proj.join(".cortexkit").join("magic-context.jsonc"),
+            "{\"enabled\": true}",
+        )
+        .unwrap();
+        let proj_str = proj.to_string_lossy().to_string();
+
+        // Set up opencode.db with the project (so enumerate_projects can
+        // resolve the identity → path mapping)
+        let oc_path = data_home.join("opencode").join("opencode.db");
+        let oc = create_test_opencode_db(
+            &oc_path,
+            &[("My Project", proj_str.as_str())],
+        );
+        drop(oc);
+
+        // Set up context.db with a memory row for the same project
+        let ctx_path = data_home.join("cortexkit").join("magic-context").join("context.db");
+        std::fs::create_dir_all(ctx_path.parent().unwrap()).unwrap();
+        let ctx_conn = rusqlite::Connection::open(&ctx_path).unwrap();
+        ctx_conn
+            .execute_batch(
+                "CREATE TABLE memories (
+                    project_path TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active'
+                );",
+            )
+            .unwrap();
+        ctx_conn
+            .execute(
+                "INSERT INTO memories (project_path, status) VALUES (?1, 'active')",
+                rusqlite::params![proj_str],
+            )
+            .unwrap();
+        drop(ctx_conn);
+
+        let old_xdg = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", &data_home);
+
+        // Pass context.db — this should discover the project
+        let entries = discover_project_configs_with_db(Some(&ctx_path));
+
+        // Should find the project with config
+        let found = entries.iter().find(|e| e.worktree.contains("my-project"));
+        assert!(
+            found.is_some(),
+            "expected to find project with my-project via context.db, got: {:?}",
+            entries
+        );
+        assert!(found.unwrap().exists, "project config should exist");
+
+        if let Some(old) = old_xdg {
+            std::env::set_var("XDG_DATA_HOME", old);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[test]
+    fn discover_project_configs_skips_dead_roots() {
+        // Dead/deleted project roots should be silently skipped.
+        let temp = tempfile::tempdir().unwrap();
+        let data_home = temp.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+
+        // Create one real project and one nonexistent path
+        let proj_real = temp.path().join("real-project");
+        std::fs::create_dir_all(proj_real.join(".cortexkit")).unwrap();
+        std::fs::write(
+            proj_real.join(".cortexkit").join("magic-context.jsonc"),
+            "{\"enabled\": true}",
+        )
+        .unwrap();
+        let proj_dead = temp.path().join("deleted-project"); // does NOT exist on disk
+
+        let proj_real_str = proj_real.to_string_lossy().to_string();
+        let proj_dead_str = proj_dead.to_string_lossy().to_string();
+
+        // Set up opencode.db with both projects (real + dead path)
+        let oc_path = data_home.join("opencode").join("opencode.db");
+        let oc = create_test_opencode_db(
+            &oc_path,
+            &[
+                ("Real Project", proj_real_str.as_str()),
+                ("Dead Project", proj_dead_str.as_str()),
+            ],
+        );
+        drop(oc);
+
+        let old_xdg = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", &data_home);
+
+        let entries = discover_project_configs_with_db(None);
+
+        // Should only contain the real project (dead root skipped)
+        assert_eq!(
+            entries.len(),
+            1,
+            "should skip dead root, got: {:?}",
+            entries
+        );
+        assert!(entries[0].worktree.contains("real-project"));
+        assert!(entries[0].exists, "real project config should exist");
+
+        if let Some(old) = old_xdg {
+            std::env::set_var("XDG_DATA_HOME", old);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
     }
 }
