@@ -208,7 +208,7 @@
           "type": "boolean"
         },
         "thinking_level": {
-          "description": "Pi only: explicit thinking level passed as --thinking <level> to Pi historian subagent invocations. Required when using reasoning models (e.g. github-copilot/gpt-5.4) because Pi's default thinking-level resolution can pick a value the provider rejects. OpenCode users set variant instead. Valid: off | minimal | low | medium | high | xhigh",
+          "description": "Pi only: explicit thinking level passed as --thinking <level> to Pi historian subagent invocations. Required when using reasoning models (e.g. github-copilot/gpt-5.4) because Pi's default thinking-level resolution can pick a value the provider rejects. OpenCode users set variant instead. Valid: off | minimal | low | medium | high | xhigh | max",
           "type": "string",
           "enum": [
             "off",
@@ -216,7 +216,8 @@
             "low",
             "medium",
             "high",
-            "xhigh"
+            "xhigh",
+            "max"
           ]
         },
         "disallowed_tools": {
@@ -476,7 +477,8 @@
                     "low",
                     "medium",
                     "high",
-                    "xhigh"
+                    "xhigh",
+                    "max"
                   ]
                 },
                 "timeout_minutes": {
@@ -526,7 +528,8 @@
                     "low",
                     "medium",
                     "high",
-                    "xhigh"
+                    "xhigh",
+                    "max"
                   ]
                 },
                 "timeout_minutes": {
@@ -576,7 +579,8 @@
                     "low",
                     "medium",
                     "high",
-                    "xhigh"
+                    "xhigh",
+                    "max"
                   ]
                 },
                 "timeout_minutes": {
@@ -626,7 +630,8 @@
                     "low",
                     "medium",
                     "high",
-                    "xhigh"
+                    "xhigh",
+                    "max"
                   ]
                 },
                 "timeout_minutes": {
@@ -676,7 +681,8 @@
                     "low",
                     "medium",
                     "high",
-                    "xhigh"
+                    "xhigh",
+                    "max"
                   ]
                 },
                 "timeout_minutes": {
@@ -726,7 +732,8 @@
                     "low",
                     "medium",
                     "high",
-                    "xhigh"
+                    "xhigh",
+                    "max"
                   ]
                 },
                 "timeout_minutes": {
@@ -776,7 +783,8 @@
                     "low",
                     "medium",
                     "high",
-                    "xhigh"
+                    "xhigh",
+                    "max"
                   ]
                 },
                 "timeout_minutes": {
@@ -826,7 +834,8 @@
                     "low",
                     "medium",
                     "high",
-                    "xhigh"
+                    "xhigh",
+                    "max"
                   ]
                 },
                 "timeout_minutes": {
@@ -876,7 +885,8 @@
                     "low",
                     "medium",
                     "high",
-                    "xhigh"
+                    "xhigh",
+                    "max"
                   ]
                 },
                 "timeout_minutes": {
@@ -927,7 +937,8 @@
                     "low",
                     "medium",
                     "high",
-                    "xhigh"
+                    "xhigh",
+                    "max"
                   ]
                 },
                 "timeout_minutes": {
@@ -984,7 +995,8 @@
                     "low",
                     "medium",
                     "high",
-                    "xhigh"
+                    "xhigh",
+                    "max"
                   ]
                 },
                 "timeout_minutes": {
@@ -1040,7 +1052,8 @@
                     "low",
                     "medium",
                     "high",
-                    "xhigh"
+                    "xhigh",
+                    "max"
                   ]
                 },
                 "timeout_minutes": {
@@ -1068,7 +1081,8 @@
             "low",
             "medium",
             "high",
-            "xhigh"
+            "xhigh",
+            "max"
           ]
         }
       }
@@ -1674,7 +1688,8 @@
             "low",
             "medium",
             "high",
-            "xhigh"
+            "xhigh",
+            "max"
           ]
         }
       }

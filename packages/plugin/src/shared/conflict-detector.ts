@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { readJsoncFile } from "./jsonc-parser";
 import { getOpenCodeConfigPaths } from "./opencode-config-dir";
@@ -13,6 +14,14 @@ interface OpenCodeConfig {
 
 interface OmoConfig {
     disabled_hooks?: string[];
+}
+
+/** Shape of the new unified omo.jsonc (oh-my-openagent >= 4.19.0).
+ *  Hook config lives inside the `[opencode]` harness block. */
+interface OmoV2Config {
+    "[opencode]"?: {
+        disabled_hooks?: string[];
+    };
 }
 
 export interface ConflictResult {
@@ -318,7 +327,7 @@ function checkOmoHooks(directory: string): {
 function readOmoDisabledHooks(directory: string): Set<string> {
     const disabled = new Set<string>();
 
-    // Check both old and new OMO config names
+    // Check both old and new OMO config names in the OpenCode config dir
     const configNames = [
         "oh-my-opencode.jsonc",
         "oh-my-opencode.json",
@@ -341,11 +350,34 @@ function readOmoDisabledHooks(directory: string): Set<string> {
         // best-effort
     }
 
-    // Also check project-level OMO configs
+    // Also check project-level OMO configs (old format)
     for (const name of configNames) {
         const config = readJsoncFile<OmoConfig>(join(directory, name));
         if (config?.disabled_hooks) {
             for (const hook of config.disabled_hooks) {
+                disabled.add(hook);
+            }
+        }
+    }
+
+    // --- New unified omo.jsonc (oh-my-openagent >= 4.19.0) ---
+    // User-level: ~/.omo/omo.jsonc (fallback ~/.omo/omo.json)
+    const homeDir = process.env.HOME || homedir();
+    const omoHomeDir = join(homeDir, ".omo");
+    for (const name of ["omo.jsonc", "omo.json"]) {
+        const config = readJsoncFile<OmoV2Config>(join(omoHomeDir, name));
+        if (config?.["[opencode]"]?.disabled_hooks) {
+            for (const hook of config["[opencode]"].disabled_hooks) {
+                disabled.add(hook);
+            }
+        }
+    }
+
+    // Project-level: .omo/omo.jsonc (fallback .omo/omo.json)
+    for (const name of ["omo.jsonc", "omo.json"]) {
+        const config = readJsoncFile<OmoV2Config>(join(directory, ".omo", name));
+        if (config?.["[opencode]"]?.disabled_hooks) {
+            for (const hook of config["[opencode]"].disabled_hooks) {
                 disabled.add(hook);
             }
         }
