@@ -355,7 +355,9 @@ describe("tool-drop-target", () => {
                     expect(messages).toHaveLength(3);
 
                     // The wire copies now in the message array carry the sentinel...
-                    const wireToolPart = messages[1]?.parts[0] as { state: Record<string, unknown> };
+                    const wireToolPart = messages[1]?.parts[0] as {
+                        state: Record<string, unknown>;
+                    };
                     expect(wireToolPart.state).toEqual({
                         input: {
                             query: "abcdef",
@@ -422,7 +424,9 @@ describe("tool-drop-target", () => {
                     expect(target.truncate()).toBe("truncated");
 
                     // The wire copy now in the message array carries the clamp...
-                    const wireToolPart = messages[1]?.parts[0] as { state: Record<string, unknown> };
+                    const wireToolPart = messages[1]?.parts[0] as {
+                        state: Record<string, unknown>;
+                    };
                     expect(wireToolPart.state).toEqual({
                         input: {
                             query: "xxxxx...[truncated]",

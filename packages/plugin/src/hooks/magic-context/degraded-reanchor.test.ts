@@ -24,25 +24,22 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { listSessionCompactionMarkers } from "../../features/magic-context/compaction-marker";
 import { replaceAllCompartmentState } from "../../features/magic-context/compartment-storage";
-import {
-    setPersistedCompactionMarkerState,
-    type PersistedCompactionMarkerState,
-} from "../../features/magic-context/storage-meta-persisted";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
+import { initializeDatabase } from "../../features/magic-context/storage-db";
+import {
+    type PersistedCompactionMarkerState,
+    setPersistedCompactionMarkerState,
+} from "../../features/magic-context/storage-meta-persisted";
 import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
-    reconcileForkOrphanedCompactionMarkers,
     closeCompactionMarkerConnection,
+    reconcileForkOrphanedCompactionMarkers,
 } from "./compaction-marker-manager";
-import { listSessionCompactionMarkers } from "../../features/magic-context/compaction-marker";
-import {
-    clearInjectionCache,
-    prepareCompartmentInjection,
-} from "./inject-compartments";
+import { clearInjectionCache, prepareCompartmentInjection } from "./inject-compartments";
 import type { MessageLike } from "./tag-messages";
 
 const SESSION_ID = "ses_degraded_reanchor";
@@ -105,7 +102,13 @@ function insertOcPart(
 function insertMagicContextMarker(
     ocDb: Database,
     sessionId: string,
-    opts: { boundaryId: string; summaryId: string; partId: string; summaryPartId: string; time: number },
+    opts: {
+        boundaryId: string;
+        summaryId: string;
+        partId: string;
+        summaryPartId: string;
+        time: number;
+    },
 ): void {
     insertOcMessage(ocDb, opts.boundaryId, sessionId, opts.time, { role: "user" });
     insertOcPart(ocDb, opts.partId, opts.boundaryId, sessionId, opts.time, {

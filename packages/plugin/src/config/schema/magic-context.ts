@@ -3,9 +3,9 @@ import { z } from "zod";
 import { isValidLanguageCode } from "../../agents/language-directive";
 import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
 import { isValidCron } from "../../features/magic-context/dreamer/cron";
-import {
+import type {
     AGENTIC_DREAM_TASKS,
-    type DreamTaskName,
+    DreamTaskName,
 } from "../../features/magic-context/dreamer/task-registry";
 import { AgentOverrideConfigSchema } from "./agent-overrides";
 

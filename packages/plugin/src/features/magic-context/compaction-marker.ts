@@ -642,9 +642,7 @@ export function removeForeignCompactionMarker(
             const deletePartsOfMessage = db.prepare(
                 "DELETE FROM part WHERE session_id = ? AND message_id = ?",
             );
-            const deleteMessage = db.prepare(
-                "DELETE FROM message WHERE session_id = ? AND id = ?",
-            );
+            const deleteMessage = db.prepare("DELETE FROM message WHERE session_id = ? AND id = ?");
             for (const summaryMessageId of marker.summaryMessageIds) {
                 if (summaryMessageId === protectedSummaryMessageId) continue;
                 deletePartsOfMessage.run(sessionId, summaryMessageId);

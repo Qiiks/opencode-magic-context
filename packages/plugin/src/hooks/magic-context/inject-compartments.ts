@@ -51,18 +51,17 @@ import {
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { sessionLog } from "../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import { reconcileForkOrphanedCompactionMarkers } from "./compaction-marker-manager";
 import {
     COMPARTMENT_RENDER_EPOCH,
     decodeCachedM0UpgradeIdentity,
     encodeCachedM0UpgradeIdentity,
 } from "./compartment-render-epoch";
 import { extractM0Block, renderCompartmentAtTier, renderDecayedCompartments } from "./decay-render";
-
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
 import { formatDate } from "./temporal-awareness";
-import { reconcileForkOrphanedCompactionMarkers } from "./compaction-marker-manager";
 
 export interface PreparedCompartmentInjection {
     block: string;
@@ -183,7 +182,11 @@ function findVisibleReanchorIndex(
 ): number {
     for (let index = compartments.length - 1; index >= 0; index -= 1) {
         const endMessageId = compartments[index]?.endMessageId;
-        if (typeof endMessageId === "string" && endMessageId.length > 0 && visibleMessageIds.has(endMessageId)) {
+        if (
+            typeof endMessageId === "string" &&
+            endMessageId.length > 0 &&
+            visibleMessageIds.has(endMessageId)
+        ) {
             return index;
         }
     }

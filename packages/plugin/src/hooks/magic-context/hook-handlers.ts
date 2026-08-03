@@ -223,8 +223,7 @@ export function createChatMessageHook(args: {
             // no provider is known yet we take the conservative TRUE arm
             // (today's behavior) so we never silently drop a needed drain.
             const providerID =
-                input.model?.providerID ??
-                args.liveModelBySession.get(sessionId)?.providerID;
+                input.model?.providerID ?? args.liveModelBySession.get(sessionId)?.providerID;
             if (variantChangeBustsProviderCache(providerID)) {
                 sessionLog(
                     sessionId,

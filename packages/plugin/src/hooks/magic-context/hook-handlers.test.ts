@@ -13,7 +13,11 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { createChatMessageHook, createEventHook, createToolExecuteAfterHook } from "./hook-handlers";
+import {
+    createChatMessageHook,
+    createEventHook,
+    createToolExecuteAfterHook,
+} from "./hook-handlers";
 
 function createTestDb(): Database {
     const db = new Database(":memory:");
@@ -326,7 +330,10 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
         lastHeuristicsTurnId: Map<string, string>;
     };
 
-    function makeHook(sets: Sets, liveModelBySession = new Map<string, { providerID: string; modelID: string }>()) {
+    function makeHook(
+        sets: Sets,
+        liveModelBySession = new Map<string, { providerID: string; modelID: string }>(),
+    ) {
         const db = createTestDb();
         const hook = createChatMessageHook({
             db,
@@ -357,8 +364,16 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
         sets.lastHeuristicsTurnId.set("ses", "turn-1");
         const { hook, db } = makeHook(sets);
         try {
-            await hook({ sessionID: "ses", variant: "low", model: { providerID: "anthropic", modelID: "claude" } });
-            await hook({ sessionID: "ses", variant: "high", model: { providerID: "anthropic", modelID: "claude" } });
+            await hook({
+                sessionID: "ses",
+                variant: "low",
+                model: { providerID: "anthropic", modelID: "claude" },
+            });
+            await hook({
+                sessionID: "ses",
+                variant: "high",
+                model: { providerID: "anthropic", modelID: "claude" },
+            });
 
             expect(sets.historyRefreshSessions.has("ses")).toBe(true);
             expect(sets.systemPromptRefreshSessions.has("ses")).toBe(true);
@@ -373,8 +388,16 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
         const sets = freshSets();
         const { hook, db } = makeHook(sets);
         try {
-            await hook({ sessionID: "ses", variant: "low", model: { providerID: "bedrock", modelID: "claude" } });
-            await hook({ sessionID: "ses", variant: "high", model: { providerID: "bedrock", modelID: "claude" } });
+            await hook({
+                sessionID: "ses",
+                variant: "low",
+                model: { providerID: "bedrock", modelID: "claude" },
+            });
+            await hook({
+                sessionID: "ses",
+                variant: "high",
+                model: { providerID: "bedrock", modelID: "claude" },
+            });
 
             expect(sets.historyRefreshSessions.has("ses")).toBe(true);
             expect(sets.systemPromptRefreshSessions.has("ses")).toBe(true);
@@ -415,8 +438,16 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
         sets.lastHeuristicsTurnId.set("ses", "turn-1");
         const { hook, db } = makeHook(sets);
         try {
-            await hook({ sessionID: "ses", variant: "low", model: { providerID: "openai", modelID: "gpt-4o" } });
-            await hook({ sessionID: "ses", variant: "high", model: { providerID: "openai", modelID: "gpt-4o" } });
+            await hook({
+                sessionID: "ses",
+                variant: "low",
+                model: { providerID: "openai", modelID: "gpt-4o" },
+            });
+            await hook({
+                sessionID: "ses",
+                variant: "high",
+                model: { providerID: "openai", modelID: "gpt-4o" },
+            });
 
             expect(sets.historyRefreshSessions.size).toBe(0);
             expect(sets.systemPromptRefreshSessions.size).toBe(0);
@@ -431,8 +462,16 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
         const sets = freshSets();
         const { hook, db } = makeHook(sets);
         try {
-            await hook({ sessionID: "ses", variant: "low", model: { providerID: "fireworks", modelID: "fwm" } });
-            await hook({ sessionID: "ses", variant: "high", model: { providerID: "fireworks", modelID: "fwm" } });
+            await hook({
+                sessionID: "ses",
+                variant: "low",
+                model: { providerID: "fireworks", modelID: "fwm" },
+            });
+            await hook({
+                sessionID: "ses",
+                variant: "high",
+                model: { providerID: "fireworks", modelID: "fwm" },
+            });
 
             expect(sets.historyRefreshSessions.size).toBe(0);
             expect(sets.systemPromptRefreshSessions.size).toBe(0);
@@ -484,8 +523,16 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
         const sets = freshSets();
         const { hook, db } = makeHook(sets);
         try {
-            await hook({ sessionID: "ses", variant: "high", model: { providerID: "openai", modelID: "gpt-4o" } });
-            await hook({ sessionID: "ses", variant: "high", model: { providerID: "openai", modelID: "gpt-4o" } });
+            await hook({
+                sessionID: "ses",
+                variant: "high",
+                model: { providerID: "openai", modelID: "gpt-4o" },
+            });
+            await hook({
+                sessionID: "ses",
+                variant: "high",
+                model: { providerID: "openai", modelID: "gpt-4o" },
+            });
 
             expect(sets.historyRefreshSessions.size).toBe(0);
             expect(sets.systemPromptRefreshSessions.size).toBe(0);
