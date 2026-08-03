@@ -127,16 +127,19 @@ function evictExpiredUsageEntries(contextUsageMap: Map<string, ContextUsageEntry
 }
 
 /**
- * Fire-and-forget Channel 2 ceiling-nudge delivery for a final-stop assistant
- * turn. No-ops unless a `pending` intent exists; reads the undropped-token count
- * from the Channel 1 baseline for the nudge wording.
+ * Fire-and-forget Channel 2 ceiling-nudge delivery for an assistant step-boundary
+ * event. Primary sessions keep their existing final-stop fallback; subagents are
+ * delivered only while their run is still active. No-ops unless a `pending`
+ * intent exists; reads the undropped-token count from the Channel 1 baseline for
+ * the nudge wording.
  */
 async function deliverChannel2IfPending(deps: EventHandlerDeps, sessionId: string): Promise<void> {
     try {
         // Channel 2 fires for primaries AND subagents. Delivery routes through the
         // in-process client (input.client), which on OpenCode >= 1.17.7 coalesces
         // the synthetic-user nudge into the in-flight runner; it no-ops unless a
-        // `pending` intent exists and a client is wired.
+        // `pending` intent exists, a client is wired, and a subagent run is still
+        // active.
         const baseline = deps.channel1StateBySession?.get(sessionId);
         // If the agent already called ctx_reduce since the last transform refreshed
         // the baseline, the tailToolTokens/turnToolTokens here are STALE-HIGH (they
@@ -601,7 +604,8 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
 
             // Channel 2 ceiling nudge delivery. Fire on STEP boundaries — both
-            // mid-turn ("tool-calls") and turn-end ("stop") assistant events.
+            // mid-turn ("tool-calls") and turn-end ("stop") assistant events for
+            // primaries; the delivery helper rejects terminal subagent runs.
             // Mid-turn delivery is the point of the channel: the reclaimable
             // pile grows WHILE the agent works, and a queued user message is
             // picked up by OpenCode's run loop at the next step boundary
@@ -611,7 +615,8 @@ export function createEventHandler(deps: EventHandlerDeps) {
             // happened. promptAsync is mid-turn-safe: the in-process client
             // (input.client) coalesces into the in-flight run on OpenCode
             // >= 1.17.7, never splicing mid-prefix. Fires for primaries and
-            // subagents alike; no-ops unless a `pending` intent exists.
+            // subagents alike, but a subagent must still have an active run; it
+            // no-ops unless a `pending` intent exists.
             // Fire-and-forget, never blocking the event loop.
             if (
                 (info.finish === "stop" || info.finish === "tool-calls") &&

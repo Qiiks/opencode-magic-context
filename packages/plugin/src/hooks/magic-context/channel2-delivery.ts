@@ -5,7 +5,9 @@
 // large pile of reclaimable tool output remains. This module DELIVERS that
 // intent from the event handler (`message.updated`, both mid-turn
 // "tool-calls" and final "stop" events), because `promptAsync` must run on an
-// event boundary, not mid-transform. Mid-turn delivery is deliberate: the
+// event boundary, not mid-transform. Primary sessions keep both delivery
+// points; subagents are gated to a live run so a final "stop" cannot start a
+// follow-up turn. Mid-turn delivery is deliberate: the
 // queued user message is picked up by OpenCode's run loop at the next step
 // boundary, warning the agent WHILE the reclaimable pile is growing instead
 // of after the turn already ballooned.
@@ -34,6 +36,7 @@
 // avoid it; that's fixed upstream now, so the separate client + probe are gone.
 
 import { randomUUID } from "node:crypto";
+import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import {
     casChannel2NudgeClaim,
     casChannel2NudgeState,
@@ -49,6 +52,7 @@ import {
     shouldTriggerChannel2,
     type ToolReclaimHint,
 } from "./ctx-reduce-nudge";
+import { isMidTurn } from "./read-session-db";
 
 export interface Channel2DeliveryDeps {
     db: Database;
@@ -72,6 +76,62 @@ export interface Channel2DeliveryDeps {
 }
 
 /**
+ * Return whether a pending nudge may be delivered to this session.
+ *
+ * Primary sessions retain the existing behavior: their Channel-2 message is
+ * delivered at the event boundary even when the assistant has just stopped.
+ * OpenCode subagents are different because the same prompt API starts a new
+ * turn once their run is terminal. Their live-run test therefore fails closed
+ * when the terminal assistant message is visible, and it is repeated after
+ * claiming so a completion racing the claim cannot turn into a new run.
+ */
+function subagentRunIsActive(deps: Channel2DeliveryDeps, sessionId: string): boolean {
+    try {
+        const meta = getOrCreateSessionMeta(deps.db, sessionId);
+        if (!meta.isSubagent) return true;
+        return isMidTurn(deps, sessionId);
+    } catch (error) {
+        sessionLog(
+            sessionId,
+            "channel2 subagent run-state check failed; refusing delivery:",
+            error,
+        );
+        return false;
+    }
+}
+
+function clearPendingChannel2Intent(db: Database, sessionId: string): void {
+    try {
+        if (casChannel2NudgeState(db, sessionId, "pending", "")) {
+            sessionLog(sessionId, "channel2 intent cleared because the subagent run is terminal");
+        }
+    } catch (error) {
+        sessionLog(
+            sessionId,
+            "channel2 terminal-run intent clear failed; leaving lease to heal:",
+            error,
+        );
+    }
+}
+
+function releaseClaimWithoutDelivery(db: Database, sessionId: string, claimToken: string): void {
+    try {
+        if (casChannel2NudgeClaim(db, sessionId, "", claimToken)) {
+            sessionLog(
+                sessionId,
+                "channel2 claim released because the subagent run completed before delivery",
+            );
+        }
+    } catch (error) {
+        sessionLog(
+            sessionId,
+            "channel2 terminal-run claim release failed; lease will heal:",
+            error,
+        );
+    }
+}
+
+/**
  * Attempt to deliver a pending Channel 2 ceiling nudge for `sessionId`. Safe to
  * call on every step-boundary `message.updated`: it no-ops unless a `pending`
  * intent exists and a client is wired. Returns true only when a delivery was
@@ -89,6 +149,13 @@ export async function maybeDeliverChannel2(
         return false;
     }
     if (state !== "pending") return false;
+
+    // A terminal subagent must never be re-awakened by a stale pending intent.
+    // Primary sessions intentionally keep their existing step-boundary behavior.
+    if (!subagentRunIsActive(deps, sessionId)) {
+        clearPendingChannel2Intent(deps.db, sessionId);
+        return false;
+    }
 
     // Revalidate before delivering. The `pending` intent was recorded at high
     // pressure during a transform pass; between then and this terminal
@@ -143,6 +210,14 @@ export async function maybeDeliverChannel2(
         return false;
     }
 
+    // The assistant can finish after the pre-check but before this delivery
+    // attempt acquires its claim. Release the claim without sending if that
+    // happens; the token prevents a concurrent lease from being changed.
+    if (!subagentRunIsActive(deps, sessionId)) {
+        releaseClaimWithoutDelivery(deps.db, sessionId, claimToken);
+        return false;
+    }
+
     try {
         const promptContext = await resolvePromptContext(client, sessionId);
         // Module directives carry their own validated wording; host-triggered
@@ -184,6 +259,13 @@ export async function maybeDeliverChannel2(
                 sessionId,
                 `channel2 ceiling nudge delivery skipped: claim no longer owned before send (state=${claim.state || "empty"})`,
             );
+            return false;
+        }
+        // resolvePromptContext yielded to the host. Re-check immediately before
+        // promptAsync: a child that completed while the claim was queued must
+        // leave its report as the last message, not start a follow-up turn.
+        if (!subagentRunIsActive(deps, sessionId)) {
+            releaseClaimWithoutDelivery(deps.db, sessionId, claimToken);
             return false;
         }
         await session.promptAsync({ path: { id: sessionId }, body });
