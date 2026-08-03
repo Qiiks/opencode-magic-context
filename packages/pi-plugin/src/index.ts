@@ -169,6 +169,57 @@ import {
 
 const PREFIX = "[magic-context][pi]";
 
+// ---------------------------------------------------------------------------
+// Process-global init latch (issue #247)
+//
+// `@gotgenes/pi-subagents` runs child agent sessions IN-PROCESS inside the
+// parent Pi process. Each child inherits the parent's user packages, so Pi
+// re-imports and re-runs this extension factory for every child session. The
+// existing recursion guard (`MAGIC_CONTEXT_PI_SUBAGENT=1`) only covers
+// SPAWNED subprocess children because in-process children share the parent's
+// env without that variable. Without a process-wide signal, every in-process
+// child re-ran the full Magic Context init — opening the DB, wiring timers /
+// watchers / event handlers, and scheduling background session scans. Four
+// parallel children fanned out concurrent `SessionManager.listAll` scans over
+// ~392 JSONL sessions and crashed the parent with heap OOM.
+//
+// The latch below is a `Symbol.for` key on `globalThis` so it survives the
+// duplicate module instances Pi's jiti loader creates per session
+// (`moduleCache: false` resets module-level state on every re-import, but a
+// Symbol.for key is process-global). The first init in this process sets it;
+// every later init in the same process (in-process child, or a second factory
+// call from any source) sees it set and no-ops with the SAME contract as a
+// spawned subagent child — no watchers, no timers, no background scans. The
+// parent's already-registered extension instance keeps serving its session.
+//
+// Dispose / re-arm: Pi fires `session_shutdown` (reason "reload") before a
+// `/reload` re-imports extensions, and (reason "shutdown") when the user
+// leaves the session. Each AgentSession owns its own ExtensionRunner, so a
+// child session's `session_shutdown` only fires handlers the CHILD registered
+// (none, because the child no-op'd) — it cannot clear the parent's latch.
+// We clear the latch in the parent's `session_shutdown` handler so a `/reload`
+// legitimately re-initializes, while ephemeral in-process children never touch
+// it.
+// ---------------------------------------------------------------------------
+const PI_ACTIVE_LATCH = Symbol.for("magic-context.pi.active");
+
+function isPiMagicContextActiveInProcess(): boolean {
+	return (globalThis as Record<symbol, unknown>)[PI_ACTIVE_LATCH] === true;
+}
+
+function markPiMagicContextActive(): void {
+	(globalThis as Record<symbol, unknown>)[PI_ACTIVE_LATCH] = true;
+}
+
+function clearPiMagicContextActive(): void {
+	try {
+		delete (globalThis as Record<symbol, unknown>)[PI_ACTIVE_LATCH];
+	} catch {
+		// Some runtimes disallow delete on globalThis; fall back to overwrite.
+		(globalThis as Record<symbol, unknown>)[PI_ACTIVE_LATCH] = undefined;
+	}
+}
+
 function resolveCurrentProject(ctx: { cwd: string }): {
 	projectDir: string;
 	projectIdentity: string;
@@ -364,6 +415,9 @@ export const __test = {
 	resetLoggedPiConfigDirs(): void {
 		loggedPiConfigDirs.clear();
 	},
+	isPiMagicContextActiveInProcess,
+	markPiMagicContextActive,
+	clearPiMagicContextActive,
 };
 
 function formatTokens(value: number): string {
@@ -618,6 +672,21 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		);
 		return;
 	}
+	// In-process child guard (issue #247): `@gotgenes/pi-subagents` runs child
+	// agent sessions in the SAME process as the parent. They share the parent's
+	// env (so the spawned-child env guard above never fires) and re-trigger this
+	// factory for every child session. The process-global latch marks that the
+	// full Magic Context runtime is already active in this process; a second
+	// init no-ops with the same contract as a spawned subagent (no watchers, no
+	// timers, no background scans). The parent's registered instance keeps
+	// serving. See the latch block above for the dispose / `/reload` re-arm path.
+	if (isPiMagicContextActiveInProcess()) {
+		log(
+			`${PREFIX} in-process re-init detected (Magic Context already active in this process); skipping full extension registration`,
+		);
+		return;
+	}
+	markPiMagicContextActive();
 	beginBootQuietPeriod();
 
 	const storageDir = getMagicContextStorageDir();
@@ -2098,6 +2167,16 @@ async function startPiMagicContextRuntime(
 		} catch {
 			// best-effort cleanup
 		}
+		// Re-arm the process-global init latch (issue #247). Pi fires
+		// `session_shutdown` (reason "reload") before a `/reload` re-imports
+		// extensions, and (reason "shutdown") when the user leaves the
+		// session. Each AgentSession owns its own ExtensionRunner, so an
+		// in-process child's `session_shutdown` only fires handlers the
+		// CHILD registered — and a child that no-op'd via the latch
+		// registered none, so it cannot clear the parent's latch. Clearing
+		// here lets a `/reload` legitimately re-initialize the full runtime,
+		// while ephemeral in-process children never touch it.
+		clearPiMagicContextActive();
 	});
 
 	// Pi has no `session_deleted` event, but `session_before_switch`
