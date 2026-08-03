@@ -1859,6 +1859,15 @@ export function createTransform(deps: TransformDeps) {
         sessionMeta = { ...sessionMeta, compartmentInProgress };
         logTransformTiming(sessionId, "compartmentPhase", tCompartmentPhase);
 
+        // Layer-B fallback (#264): the injection stayed degraded and no durable
+        // compartment boundary is visible, so there was no safe re-anchor splice.
+        // Queue a fresh materialization so the baseline is re-cut on the next
+        // bust instead of the session silently looping in degraded mode.
+        if (pendingCompartmentInjection?.needsFreshMaterialization) {
+            deps.pendingMaterializationSessions.add(sessionId);
+            deferredMaterializationSessions.add(sessionId);
+        }
+
         // HARD-bust signals for the m[0]/m[1] materialization decision. These
         // capture provider-side cache-eviction events (model switch, system-block
         // change, tools-block change) plus the TTL idle window. A change in any

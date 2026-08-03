@@ -62,6 +62,7 @@ import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
 import { formatDate } from "./temporal-awareness";
+import { reconcileForkOrphanedCompactionMarkers } from "./compaction-marker-manager";
 
 export interface PreparedCompartmentInjection {
     block: string;
@@ -72,6 +73,14 @@ export interface PreparedCompartmentInjection {
     factCount: number;
     memoryCount: number;
     rebuiltFromDb: boolean;
+    /**
+     * Set when the injection stayed degraded (boundary not in the visible
+     * window) AND no durable compartment boundary is visible either, so no
+     * safe re-anchor splice exists. The transform queues a fresh
+     * materialization so the baseline is re-cut instead of silently looping
+     * (#264 layer-B fallback).
+     */
+    needsFreshMaterialization?: boolean;
 }
 
 /**
@@ -97,6 +106,88 @@ const injectionCache = new BoundedSessionMap<InjectionCacheEntry>(INJECTION_CACH
 
 export function clearInjectionCache(sessionId: string): void {
     injectionCache.delete(sessionId);
+    // A cache clear means compartment state changed (historian publish / recomp /
+    // flush), so any in-flight degraded-mode bookkeeping for the OLD boundary is
+    // stale. Reset it so the re-anchor countdown restarts against the new state.
+    resetDegradedReanchorState(sessionId);
+}
+
+// ── Degraded-mode re-anchor (#263/#264) ─────────────────────────
+//
+// When the compartment boundary message is not in the visible window, the
+// splice is a no-op and zero drops are queued. If a NEWER compaction marker
+// (typically a fork-orphan, #263) cuts the window above our boundary, that
+// state repeats on every pass with no recovery path (#264). Two layers fix
+// it:
+//   - Layer A (root cause): on the first degraded detection we run the
+//     fork-orphan marker hygiene pass, which removes the foreign marker that
+//     outranks ours so filterCompacted stops at our marker again.
+//   - Layer B (resilience): if the boundary stays invisible for
+//     REANCHOR_MIN_DEGRADED_PASSES consecutive rebuilds, we re-anchor the
+//     splice to the newest durable compartment boundary that IS visible (or,
+//     if none is visible, surface a fresh-materialization request) instead of
+//     looping. The re-anchor changes bytes, so it only ever applies on a
+//     cache-busting pass — never first-applied on a defer pass (invariant 2).
+
+/**
+ * Consecutive rebuilds during which the natural compartment boundary was not
+ * present in the visible window. Reset to 0 the moment a rebuild finds the
+ * boundary again. Defer-pass cache replays deliberately do NOT touch this —
+ * they splice at the cached (possibly re-anchored) boundary and say nothing
+ * about the natural boundary's visibility.
+ */
+const degradedRebuildCountBySession = new BoundedSessionMap<number>(INJECTION_CACHE_MAX);
+/** Log-once latch so the re-anchor is announced loudly once, not per pass. */
+const reAnchorLoggedBySession = new BoundedSessionMap<boolean>(INJECTION_CACHE_MAX);
+
+/**
+ * Number of consecutive degraded rebuilds before layer-B re-anchors. A small
+ * threshold recovers fast; requiring more than one avoids reacting to a
+ * single-pass transient (e.g. a marker-drain lag that heals next pass).
+ */
+const REANCHOR_MIN_DEGRADED_PASSES = 2;
+
+export function resetDegradedReanchorState(sessionId: string): void {
+    degradedRebuildCountBySession.delete(sessionId);
+    reAnchorLoggedBySession.delete(sessionId);
+}
+
+function noteDegradedRebuild(sessionId: string): number {
+    const next = (degradedRebuildCountBySession.get(sessionId) ?? 0) + 1;
+    degradedRebuildCountBySession.set(sessionId, next);
+    return next;
+}
+
+function clearDegradedRebuild(sessionId: string): void {
+    degradedRebuildCountBySession.delete(sessionId);
+    reAnchorLoggedBySession.delete(sessionId);
+}
+
+/** Announce a re-anchor loudly once per degraded episode, not per pass. */
+function logReanchorOnce(sessionId: string, message: string): void {
+    if (reAnchorLoggedBySession.get(sessionId)) return;
+    reAnchorLoggedBySession.set(sessionId, true);
+    sessionLog(sessionId, message);
+}
+
+/**
+ * Find the newest durable compartment whose end message IS present in the
+ * visible window, scanning newest→oldest. Returns its index into
+ * `compartments` or -1. This is the layer-B re-anchor target: splicing there
+ * removes only messages covered by compartments that are actually in view, so
+ * no history is lost even though a newer marker cut the window above us.
+ */
+function findVisibleReanchorIndex(
+    compartments: readonly Compartment[],
+    visibleMessageIds: ReadonlySet<string>,
+): number {
+    for (let index = compartments.length - 1; index >= 0; index -= 1) {
+        const endMessageId = compartments[index]?.endMessageId;
+        if (typeof endMessageId === "string" && endMessageId.length > 0 && visibleMessageIds.has(endMessageId)) {
+            return index;
+        }
+    }
+    return -1;
 }
 
 /**
@@ -443,28 +534,88 @@ export function prepareCompartmentInjection(
     }
 
     let skippedVisibleMessages = 0;
+    let needsFreshMaterialization = false;
+    let resultEndMessage: number = lastEnd;
+    let resultEndMessageId: string | null = null;
     const cutoffIndex = messages.findIndex((message) => message.info.id === trimEndMessageId);
     if (cutoffIndex >= 0) {
+        // Natural boundary is visible — normal splice, and any degraded-mode
+        // bookkeeping from earlier passes is cleared.
+        clearDegradedRebuild(sessionId);
         skippedVisibleMessages = cutoffIndex + 1;
         const remaining = messages.slice(cutoffIndex + 1);
         messages.splice(0, messages.length, ...remaining);
+        resultEndMessageId = trimEndMessageId;
     } else {
-        sessionLog(
-            sessionId,
-            `compartment injection entering degraded mode: boundary ${trimEndMessageId} not in visible messages`,
-        );
+        // Degraded: the natural boundary message is not in the visible window.
+        const degradedCount = noteDegradedRebuild(sessionId);
+        // Layer A (#263): on the FIRST degraded detection of an episode, run the
+        // fork-orphan marker hygiene pass. If a foreign marker outranks ours this
+        // removes it, so the next pass's window stops at our marker and we
+        // recover. Gated to the degraded trigger so steady state pays nothing.
+        if (degradedCount === 1) {
+            reconcileForkOrphanedCompactionMarkers(db, sessionId);
+        }
+
+        let reAnchored = false;
+        if (degradedCount >= REANCHOR_MIN_DEGRADED_PASSES && isCacheBusting) {
+            // Layer B (#264): the boundary has stayed invisible for long enough;
+            // stop looping and re-anchor. This changes bytes, so it only runs on a
+            // cache-busting pass (never first-applied on a defer pass).
+            const visibleMessageIds = new Set<string>();
+            for (const message of messages) {
+                if (typeof message.info.id === "string") visibleMessageIds.add(message.info.id);
+            }
+            const reAnchorIndex = findVisibleReanchorIndex(compartments, visibleMessageIds);
+            if (reAnchorIndex >= 0) {
+                const reAnchorCompartment = compartments[reAnchorIndex];
+                const reAnchorCutoff = messages.findIndex(
+                    (message) => message.info.id === reAnchorCompartment.endMessageId,
+                );
+                if (reAnchorCutoff >= 0) {
+                    skippedVisibleMessages = reAnchorCutoff + 1;
+                    const remaining = messages.slice(reAnchorCutoff + 1);
+                    messages.splice(0, messages.length, ...remaining);
+                    resultEndMessage = reAnchorCompartment.endMessage;
+                    resultEndMessageId = reAnchorCompartment.endMessageId;
+                    reAnchored = true;
+                    logReanchorOnce(
+                        sessionId,
+                        `compartment injection re-anchored: natural boundary ${trimEndMessageId} not visible for ${degradedCount} passes; splicing at visible compartment boundary ${resultEndMessageId} (ordinal ${resultEndMessage})`,
+                    );
+                }
+            }
+            if (!reAnchored) {
+                // No durable compartment boundary is visible either, so there is no
+                // safe splice target. Surface the state and request a fresh
+                // materialization to re-cut the baseline instead of silently looping.
+                needsFreshMaterialization = true;
+                logReanchorOnce(
+                    sessionId,
+                    `compartment injection degraded: boundary ${trimEndMessageId} not visible for ${degradedCount} passes and no compartment boundary is visible; requesting fresh materialization to re-cut the baseline`,
+                );
+            }
+        } else {
+            sessionLog(
+                sessionId,
+                `compartment injection entering degraded mode: boundary ${trimEndMessageId} not in visible messages (consecutive degraded passes: ${degradedCount})`,
+            );
+        }
     }
 
     const result: PreparedCompartmentInjection = {
         block,
-        compartmentEndMessage: lastEnd,
-        compartmentEndMessageId: cutoffIndex >= 0 ? trimEndMessageId : null,
+        compartmentEndMessage: resultEndMessage,
+        compartmentEndMessageId: resultEndMessageId,
         compartmentCount: compartments.length,
         skippedVisibleMessages,
         factCount: facts.length,
         memoryCount,
         rebuiltFromDb: true,
     };
+    if (needsFreshMaterialization) {
+        result.needsFreshMaterialization = true;
+    }
     injectionCache.set(sessionId, { kind: "populated", injection: result });
     return result;
 }

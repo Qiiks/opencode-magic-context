@@ -545,6 +545,125 @@ export function injectCompactionMarker(
     }
 }
 
+// ── Foreign-marker scan (fork-orphan hygiene, #263) ─────────────
+
+/**
+ * One compaction marker row-set found in opencode.db for a session.
+ *
+ * `summaryMessageIds` lists the completed summary assistant messages
+ * (summary=true, finish="stop") parented to the boundary user message and
+ * carrying magic-context's provider identity — i.e. the summaries THIS plugin
+ * injected. OpenCode-native /compact summaries carry the real provider id and
+ * are deliberately NOT listed, so callers can never delete a native compaction.
+ */
+export interface SessionCompactionMarkerRows {
+    /** id of the `type:"compaction"` part on the boundary user message */
+    compactionPartId: string;
+    /** the user message id the compaction part is attached to */
+    boundaryMessageId: string;
+    /** magic-context-injected summary messages parented to the boundary */
+    summaryMessageIds: string[];
+}
+
+/**
+ * List every compaction marker present in opencode.db for a session.
+ *
+ * Used by the fork-orphan hygiene pass (#263): OpenCode's `/fork` copies the
+ * parent session's message rows — including this plugin's compaction marker
+ * rows — into the fork, while magic-context's durable marker state (context.db)
+ * is NOT inherited (PARITY.md gap #25). The fork then owns marker rows its
+ * state knows nothing about. This scan enumerates all markers so the caller can
+ * diff them against the persisted state and repair the ones it does not own.
+ *
+ * Errors propagate to the caller (the hygiene pass treats any failure as
+ * "skip this pass and retry later" — never as a fatal transform error).
+ */
+export function listSessionCompactionMarkers(sessionId: string): SessionCompactionMarkerRows[] {
+    const db = getWritableOpenCodeDb();
+    const partRows = db
+        .prepare(
+            `SELECT id, message_id
+             FROM part
+             WHERE session_id = ?
+               AND COALESCE(json_extract(data, '$.type'), '') = 'compaction'`,
+        )
+        .all(sessionId) as Array<{ id?: unknown; message_id?: unknown }>;
+
+    const markers: SessionCompactionMarkerRows[] = [];
+    const summaryStmt = db.prepare(
+        `SELECT id
+         FROM message
+         WHERE session_id = ?
+           AND COALESCE(json_extract(data, '$.parentID'), '') = ?
+           AND COALESCE(json_extract(data, '$.summary'), 0) = 1
+           AND COALESCE(json_extract(data, '$.finish'), '') = 'stop'
+           AND COALESCE(json_extract(data, '$.providerID'), '') = 'magic-context'`,
+    );
+    for (const row of partRows) {
+        if (typeof row.id !== "string" || typeof row.message_id !== "string") continue;
+        const summaryRows = summaryStmt.all(sessionId, row.message_id) as Array<{ id?: unknown }>;
+        const summaryMessageIds = summaryRows.flatMap((summaryRow) =>
+            typeof summaryRow.id === "string" ? [summaryRow.id] : [],
+        );
+        markers.push({
+            compactionPartId: row.id,
+            boundaryMessageId: row.message_id,
+            summaryMessageIds,
+        });
+    }
+    return markers;
+}
+
+/**
+ * Remove one foreign (not owned by this session's durable state) compaction
+ * marker from opencode.db: its compaction part, plus the magic-context summary
+ * lineage parented to its boundary message.
+ *
+ * Deleting the compaction part alone is sufficient to make `filterCompacted`
+ * stop ignoring our marker (it requires a compaction part to break), but the
+ * summary rows are removed too so no stale "[Compacted by magic-context]"
+ * message lingers in the fork's history.
+ *
+ * `protectedSummaryMessageId` is the caller's OWN summary message id; it is
+ * never deleted even if it happened to share the boundary (defensive — a
+ * foreign boundary newer than ours should always differ).
+ *
+ * Returns false (without throwing) when the DELETE transaction fails, e.g.
+ * SQLITE_BUSY; the caller retries on a later pass.
+ */
+export function removeForeignCompactionMarker(
+    sessionId: string,
+    marker: SessionCompactionMarkerRows,
+    protectedSummaryMessageId: string | null,
+): boolean {
+    try {
+        const db = getWritableOpenCodeDb();
+        db.transaction(() => {
+            const deletePartsOfMessage = db.prepare(
+                "DELETE FROM part WHERE session_id = ? AND message_id = ?",
+            );
+            const deleteMessage = db.prepare(
+                "DELETE FROM message WHERE session_id = ? AND id = ?",
+            );
+            for (const summaryMessageId of marker.summaryMessageIds) {
+                if (summaryMessageId === protectedSummaryMessageId) continue;
+                deletePartsOfMessage.run(sessionId, summaryMessageId);
+                deleteMessage.run(sessionId, summaryMessageId);
+            }
+            db.prepare("DELETE FROM part WHERE session_id = ? AND id = ?").run(
+                sessionId,
+                marker.compactionPartId,
+            );
+        })();
+        return true;
+    } catch (error) {
+        log(
+            `[magic-context] compaction-marker: foreign-marker removal failed (${sessionId}, part ${marker.compactionPartId}): ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return false;
+    }
+}
+
 // ── Removal ──────────────────────────────────────────────────────
 
 /**
