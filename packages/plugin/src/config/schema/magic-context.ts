@@ -30,10 +30,11 @@ export const DEFAULT_LOCAL_EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
 export type DreamingTask = (typeof AGENTIC_DREAM_TASKS)[number];
 
 /** Valid thinking levels for Pi subagents. Maps to Pi's --thinking CLI flag.
- *  Off: disable reasoning. Minimal/low/medium/high/xhigh: increasing reasoning depth.
+ *  Off: disable reasoning. Minimal/low/medium/high/xhigh/max: increasing reasoning depth.
+ *  `max` was added in Pi 0.83.0.
  *  Pi-only — OpenCode uses `variant` in agent config instead. */
 export const PiThinkingLevelSchema = z
-    .enum(["off", "minimal", "low", "medium", "high", "xhigh"])
+    .enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"])
     .optional();
 export type PiThinkingLevel = z.infer<typeof PiThinkingLevelSchema>;
 
@@ -222,7 +223,7 @@ export const HistorianConfigSchema = AgentOverrideConfigSchema.extend({
             "Run a second editor pass over historian output to clean low-signal U: lines and cross-compartment duplicates. Adds ~1 extra API call and ~1.3x cost per historian run. Useful for models without extended thinking support. (default: false)",
         ),
     thinking_level: PiThinkingLevelSchema.describe(
-        "Pi only: explicit thinking level passed as --thinking <level> to Pi historian subagent invocations. Required when using reasoning models (e.g. github-copilot/gpt-5.4) because Pi's default thinking-level resolution can pick a value the provider rejects. OpenCode users set variant instead. Valid: off | minimal | low | medium | high | xhigh",
+        "Pi only: explicit thinking level passed as --thinking <level> to Pi historian subagent invocations. Required when using reasoning models (e.g. github-copilot/gpt-5.4) because Pi's default thinking-level resolution can pick a value the provider rejects. OpenCode users set variant instead. Valid: off | minimal | low | medium | high | xhigh | max",
     ),
     disallowed_tools: z
         .array(z.enum(["*", "read", "aft_outline", "aft_zoom", "aft_search"]))
