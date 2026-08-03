@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import magicContextPiExtension from "./index";
+import { __test } from "./index";
 import { MAGIC_CONTEXT_PI_SUBAGENT_ENV } from "./subagent-runner";
 
 const originalEnv = {
@@ -57,6 +58,9 @@ function createCountingPi() {
 
 afterEach(() => {
 	restoreEnv();
+	// Clear the process-global init latch so one test's full init does not
+	// leak into the next (the latch lives on globalThis, not module state).
+	__test.clearPiMagicContextActive();
 });
 
 describe("Pi full extension subagent env guard", () => {
