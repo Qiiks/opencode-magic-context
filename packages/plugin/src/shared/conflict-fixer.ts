@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { parse, stringify } from "comment-json";
 
@@ -24,6 +25,9 @@ const OMO_CONFIG_NAMES = [
     "oh-my-opencode.jsonc",
     "oh-my-opencode.json",
 ] as const;
+
+/** Unified OMO config names (oh-my-openagent >= 4.19.0) */
+const OMO_UNIFIED_NAMES = ["omo.jsonc", "omo.json"] as const;
 
 function isRecord(value: unknown): value is JsonObject {
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -84,6 +88,7 @@ function collectOmoConfigPaths(directory: string): string[] {
     const paths = new Set<string>();
     const configDir = getOpenCodeConfigPaths({ binary: "opencode" }).configDir;
 
+    // Legacy OMO config names in the OpenCode config dir and project dir
     for (const fileName of OMO_CONFIG_NAMES) {
         const userPath = join(configDir, fileName);
         const projectPath = join(directory, fileName);
@@ -97,7 +102,46 @@ function collectOmoConfigPaths(directory: string): string[] {
         }
     }
 
+    // New unified omo.jsonc (oh-my-openagent >= 4.19.0)
+    // User-level: ~/.omo/omo.jsonc (fallback ~/.omo/omo.json)
+    const homeDir = process.env.HOME || homedir();
+    const omoHomeDir = join(homeDir, ".omo");
+    for (const name of OMO_UNIFIED_NAMES) {
+        const userPath = join(omoHomeDir, name);
+        if (existsSync(userPath)) {
+            paths.add(userPath);
+        }
+    }
+
+    // Project-level: .omo/omo.jsonc (fallback .omo/omo.json)
+    for (const name of OMO_UNIFIED_NAMES) {
+        const projectPath = join(directory, ".omo", name);
+        if (existsSync(projectPath)) {
+            paths.add(projectPath);
+        }
+    }
+
     return [...paths];
+}
+
+/** Check if a config path is a unified omo.json(c) path (not legacy). */
+function isUnifiedOmoPath(configPath: string): boolean {
+    const basename = configPath.split("/").pop() ?? "";
+    return basename === "omo.jsonc" || basename === "omo.json";
+}
+
+/**
+ * Get or create the `[opencode]` block inside a unified omo.json(c) config.
+ * Returns the block itself so callers can read/write `disabled_hooks` on it.
+ */
+function getOrCreateOmoV2Block(config: JsonObject): JsonObject {
+    const block = config["[opencode]"];
+    if (isRecord(block)) {
+        return block;
+    }
+    const newBlock: JsonObject = {};
+    config["[opencode]"] = newBlock;
+    return newBlock;
 }
 
 function filterDcpPluginEntries(entries: unknown[]): { plugins: unknown[]; removed: boolean } {
@@ -180,7 +224,12 @@ export function fixConflicts(directory: string, conflicts: ConflictResult["confl
                 continue;
             }
 
-            const disabledHooks = new Set(asStringArray(config.disabled_hooks));
+            // Unified paths nest hooks under the [opencode] block; legacy paths use top-level
+            const target = isUnifiedOmoPath(configPath)
+                ? getOrCreateOmoV2Block(config)
+                : config;
+
+            const disabledHooks = new Set(asStringArray(target.disabled_hooks));
             let changed = false;
 
             for (const hook of hooksToDisable) {
@@ -192,7 +241,7 @@ export function fixConflicts(directory: string, conflicts: ConflictResult["confl
             }
 
             if (changed) {
-                config.disabled_hooks = [
+                target.disabled_hooks = [
                     ...CONFLICTING_OMO_HOOKS.filter((hook) => disabledHooks.has(hook)),
                     ...[...disabledHooks].filter(
                         (hook) =>
