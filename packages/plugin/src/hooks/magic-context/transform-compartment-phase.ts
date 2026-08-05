@@ -29,6 +29,9 @@ import type { MessageLike } from "./transform-operations";
 interface RunCompartmentPhaseArgs {
     canRunCompartments: boolean;
     fullFeatureMode: boolean;
+    /** Compaction-off mode (issue #266): no historian start, no 95% block,
+     *  no boundary resolution — the phase degrades to a stale-flag cleanup. */
+    compactionOff?: boolean;
     /** False when historian.disable=true, blocking historian-backed child agents. */
     historianRunnable?: boolean;
     sessionMeta: { compartmentInProgress: boolean };
@@ -129,6 +132,7 @@ export function runCompartmentPhase(
     const historianRunnable = args.historianRunnable !== false;
     const willReadRawHistory =
         historianRunnable &&
+        !args.compactionOff &&
         args.canRunCompartments &&
         getActiveCompartmentRun(args.sessionId) === undefined &&
         (args.sessionMeta.compartmentInProgress ||
@@ -170,6 +174,29 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
     let justAwaitedPublication = false;
     let rebuiltHistoryThisPass = false;
     const historianRunnable = args.historianRunnable !== false;
+
+    // Compaction-off mode (issue #266): the historian/compartment phase is
+    // fully gated off — no fires, no boundary resolution, no await. A stale
+    // compartmentInProgress flag (a run interrupted before the flip) is
+    // cleared so the session state is honest and flip-back starts clean.
+    if (args.compactionOff) {
+        if (args.sessionMeta.compartmentInProgress) {
+            sessionLog(
+                args.sessionId,
+                "transform: compaction off; clearing stale compartmentInProgress flag",
+            );
+            updateSessionMeta(args.db, args.sessionId, { compartmentInProgress: false });
+            compartmentInProgress = false;
+        }
+        return {
+            pendingCompartmentInjection,
+            awaitedCompartmentRun: false,
+            compartmentInProgress,
+            published,
+            justAwaitedPublication,
+            rebuiltHistoryThisPass,
+        };
+    }
     let rawEligibility: ReturnType<typeof getRawHistoryEligibility> | null = null;
     let lastObservedCompartmentEnd = -1;
     let cachedBoundarySnapshot: ProtectedTailBoundarySnapshot | null = null;

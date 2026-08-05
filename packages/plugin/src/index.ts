@@ -546,6 +546,10 @@ const server: Plugin = async (ctx) => {
             getMagicContext: () => magicContextRuntime.magicContext,
             failClosed,
             failClosedBlockingEnabled,
+            // Compaction-off mode (issue #266): fail_closed_blocking is inert
+            // BY DESIGN in this mode — a failed transform degrades to
+            // passthrough of the input messages instead of blocking the turn.
+            compactionOff: !isCompactionEnabled(pluginConfig),
             internalChildSessions: liveSessionState.internalChildSessions,
             tryReopenStorage,
         }) as unknown as NonNullable<Hooks["experimental.chat.messages.transform"]>,

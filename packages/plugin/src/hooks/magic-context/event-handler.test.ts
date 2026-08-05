@@ -1100,3 +1100,89 @@ describe("createEventHandler", () => {
         expect(countSessionMetaRows("ses-noop")).toBe(0);
     });
 });
+
+describe("createEventHandler — compaction-off overflow gating (issue #266 S3)", () => {
+    const OVERFLOW_ERROR =
+        "This model's maximum context length is 120000 tokens. Please reduce the length of the messages.";
+
+    function readOverflowState(sessionId: string): {
+        needsEmergencyRecovery: number;
+        detectedContextLimit: number;
+    } {
+        const row = openDatabase()
+            .prepare(
+                "SELECT needs_emergency_recovery, detected_context_limit FROM session_meta WHERE session_id = ?",
+            )
+            .get(sessionId) as
+            | { needs_emergency_recovery: number | null; detected_context_limit: number | null }
+            | undefined;
+        return {
+            needsEmergencyRecovery: row?.needs_emergency_recovery ?? 0,
+            detectedContextLimit: row?.detected_context_limit ?? 0,
+        };
+    }
+
+    it("compaction ON: a provider overflow arms emergency recovery (regression baseline)", async () => {
+        useTempDataHome("context-event-overflow-on-");
+        const deps = createDeps(new Map());
+        const handler = createEventHandler(deps);
+
+        await handler({
+            event: {
+                type: "session.error",
+                properties: { sessionID: "ses-on", error: OVERFLOW_ERROR },
+            },
+        });
+
+        const state = readOverflowState("ses-on");
+        expect(state.needsEmergencyRecovery).toBe(1);
+        expect(state.detectedContextLimit).toBe(120000);
+    });
+
+    it("compaction OFF: overflow never arms recovery, but the provider limit is still recorded for raw-usage math", async () => {
+        useTempDataHome("context-event-overflow-off-");
+        const deps = { ...createDeps(new Map()), compactionOff: true };
+        const handler = createEventHandler(deps);
+
+        await handler({
+            event: {
+                type: "session.error",
+                properties: { sessionID: "ses-off", error: OVERFLOW_ERROR },
+            },
+        });
+
+        const state = readOverflowState("ses-off");
+        // The latch machinery is gated off — native compaction owns recovery.
+        expect(state.needsEmergencyRecovery).toBe(0);
+        // The provider-reported limit stays useful for the raw-usage % the
+        // sidebar renders in this mode.
+        expect(state.detectedContextLimit).toBe(120000);
+    });
+
+    it("compaction OFF: message.updated overflow also records limit only, never arms", async () => {
+        useTempDataHome("context-event-overflow-off-mu-");
+        const deps = { ...createDeps(new Map()), compactionOff: true };
+        const handler = createEventHandler(deps);
+
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "msg-1",
+                        sessionID: "ses-off-mu",
+                        role: "assistant",
+                        error: OVERFLOW_ERROR,
+                        finish: "stop",
+                        tokens: { input: 100, cache: { read: 0, write: 0 } },
+                        time: { completed: Date.now() },
+                    },
+                },
+            },
+        });
+
+        const state = readOverflowState("ses-off-mu");
+        expect(state.needsEmergencyRecovery).toBe(0);
+        expect(state.detectedContextLimit).toBe(120000);
+    });
+});

@@ -1,4 +1,5 @@
 import {
+    isCompactionEnabled,
     isDreamerRunnable,
     isHistorianRunnable,
     isSidekickRunnable,
@@ -164,6 +165,10 @@ export interface MagicContextDeps {
             min_chars: number;
         };
         transform_mode?: ResolvedTransformMode;
+        /** Compaction-off mode gate (issue #266). Resolved ONCE here at the
+         *  session-hook construction boundary via isCompactionEnabled; the
+         *  resolved boolean is threaded to the transform phases. */
+        compaction?: { enabled?: boolean };
         experimental?: {
             mural?: { enabled: boolean; model?: string };
         };
@@ -385,6 +390,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const dreamerRunnable = isDreamerRunnable(deps.config);
     const dreamerConfig = dreamerRunnable ? deps.config.dreamer : undefined;
     const historianRunnable = isHistorianRunnable(deps.config);
+    // Compaction-off mode (issue #266), resolved once at this construction
+    // boundary and threaded to every phase as a boolean — internal phases
+    // never re-read the config path.
+    const compactionOff = !isCompactionEnabled(deps.config);
 
     // Shared context for the recomp/upgrade orchestrator. Both `/ctx-recomp` and
     // `/ctx-session-upgrade` (command paths) build this so they run through the
@@ -930,6 +939,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         },
         projectPath,
         historianRunnable,
+        compactionOff,
         experimentalUserMemories: userMemoryCollectionEnabled(dreamerConfig),
         experimentalTemporalAwareness: deps.config.temporal_awareness === true,
         experimentalMuralEnabled: deps.config.experimental?.mural?.enabled === true,
@@ -948,13 +958,15 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // Age-tier caveman text compression is an opt-in primary-session pass.
         // Subagents are excluded in transform.ts because their context is curated
         // by the parent and they have no ctx_expand recovery path.
-        cavemanTextCompression:
-            deps.config.caveman_text_compression?.enabled === true
-                ? {
-                      enabled: true,
-                      minChars: deps.config.caveman_text_compression.min_chars ?? 500,
-                  }
-                : undefined,
+        // Compaction-off: caveman is compaction machinery — never forwarded.
+        cavemanTextCompression: compactionOff
+            ? undefined
+            : deps.config.caveman_text_compression?.enabled === true
+              ? {
+                    enabled: true,
+                    minChars: deps.config.caveman_text_compression.min_chars ?? 500,
+                }
+              : undefined,
         maybeAutoEmbedSession,
         transformMode: deps.config.transform_mode,
         rustModeModuleClient,
@@ -967,6 +979,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         contextUsageMap,
         compactionHandler: deps.compactionHandler,
         config: deps.config,
+        compactionOff,
         tagger: deps.tagger,
         db,
         client: deps.client,

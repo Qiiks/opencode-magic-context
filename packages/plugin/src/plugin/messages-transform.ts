@@ -89,6 +89,16 @@ export function createMessagesTransformHandler(args: {
     getMagicContext?: () => MagicContextTransformHooks;
     failClosed?: FailClosedController | null;
     failClosedBlockingEnabled?: boolean;
+    /**
+     * Compaction-off mode (issue #266): the fail-closed BLOCKING wrapper is
+     * inert BY DESIGN — MC inoperability no longer risks unbounded growth
+     * because native compaction (or nothing) owns the window. A thrown or
+     * failed transform degrades to passthrough of the input messages: no
+     * blocking message, no cancelled request, one diagnostic. The enforce
+     * call still runs (its re-probe can heal storage mid-process), but any
+     * error it raises is converted to passthrough here.
+     */
+    compactionOff?: boolean;
     internalChildSessions?: Set<string>;
     tryReopenStorage?: () => boolean | Promise<boolean>;
 }): (input: Record<string, never>, output: MessagesTransformOutput) => Promise<MessageWithParts[]> {
@@ -99,16 +109,48 @@ export function createMessagesTransformHandler(args: {
             typeof sessionId === "string" &&
             sessionId.length > 0 &&
             args.internalChildSessions?.has(sessionId) === true;
+        // Compaction-off passthrough guarantee: snapshot the input array so
+        // ANY failure path (fail-closed throw, transient SQLITE_BUSY,
+        // unexpected error mid-pass) restores the exact input shape — the
+        // inner transform mutates `output.messages` in place as it goes, so
+        // without this a mid-pass throw could leak a partially-mutated array.
+        const compactionOffInputSnapshot = args.compactionOff ? [...output.messages] : null;
+        const restoreCompactionOffInput = (): void => {
+            if (compactionOffInputSnapshot && output.messages !== compactionOffInputSnapshot) {
+                output.messages.splice(
+                    0,
+                    output.messages.length,
+                    ...compactionOffInputSnapshot,
+                );
+            }
+        };
 
         if (args.failClosed) {
-            await args.failClosed.enforce({
-                blockingEnabled: args.failClosedBlockingEnabled !== false,
-                exempt: shouldBypassFailClosedBlock({
-                    agent,
-                    isInternalChildSession: isInternalChild,
-                }),
-                tryReopen: args.tryReopenStorage,
-            });
+            try {
+                await args.failClosed.enforce({
+                    blockingEnabled: args.failClosedBlockingEnabled !== false,
+                    exempt: shouldBypassFailClosedBlock({
+                        agent,
+                        isInternalChildSession: isInternalChild,
+                    }),
+                    tryReopen: args.tryReopenStorage,
+                });
+            } catch (error) {
+                // Compaction-off: fail_closed_blocking is inert BY DESIGN. A
+                // storage-unavailable gate that would otherwise throw (blocking
+                // the turn) degrades to passthrough of the input messages: no
+                // blocking message, no cancelled request, one diagnostic. The
+                // inner transform is skipped because storage is unavailable;
+                // the harness proceeds on the unmodified input.
+                if (args.compactionOff && isFailClosedBlockingError(error)) {
+                    log(
+                        `[magic-context] compaction-off: fail-closed inert, passing through: ${error.message}`,
+                    );
+                    restoreCompactionOffInput();
+                    return output.messages;
+                }
+                throw error;
+            }
         }
 
         const magicContext = args.getMagicContext ? args.getMagicContext() : args.magicContext;
@@ -132,9 +174,21 @@ export function createMessagesTransformHandler(args: {
             return output.messages;
         } catch (error) {
             if (error instanceof EmergencyFailClosedError || isFailClosedBlockingError(error)) {
-                throw error;
+                if (!args.compactionOff) throw error;
+                // Inert by design: log a diagnostic and hand the harness back its
+                // own messages unchanged.
+                log(
+                    `[magic-context] compaction-off: fail-closed inert, passing through: ${error instanceof Error ? error.message : String(error)}`,
+                );
+                restoreCompactionOffInput();
+                return output.messages;
             }
-            if (sessionId && slotAtEntry && !entry) {
+            if (args.compactionOff) {
+                // Skip the LKG replay entirely: the contract for this mode is
+                // "return the input messages unmodified", never a cached
+                // transformed array.
+                restoreCompactionOffInput();
+            } else if (sessionId && slotAtEntry && !entry) {
                 dropSlot(sessionId, "lkg_invalidated_reshape");
                 sessionLog(sessionId, "lkg_invalidated_reshape");
             } else if (sessionId && entry) {
@@ -186,6 +240,7 @@ export function createMessagesTransformHandler(args: {
                 log(
                     `[magic-context] transform skipped this pass — ${code} (transient; retrying next pass): ${message}`,
                 );
+                restoreCompactionOffInput();
                 return output.messages;
             }
 
@@ -228,6 +283,7 @@ export function createMessagesTransformHandler(args: {
                 }
             }
         }
+        restoreCompactionOffInput();
         return output.messages;
     };
 }
