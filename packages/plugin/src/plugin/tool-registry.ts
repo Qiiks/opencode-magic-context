@@ -1,6 +1,6 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { MagicContextPluginConfig } from "../config";
-import { isDreamerRunnable } from "../config/agent-disable";
+import { isCompactionEnabled, isDreamerRunnable } from "../config/agent-disable";
 import { DEFAULT_PROTECTED_TAGS } from "../features/magic-context/defaults";
 import { resolveProjectIdentityForSession } from "../features/magic-context/memory/project-identity";
 import {
@@ -8,6 +8,7 @@ import {
     isDatabasePersisted,
     openDatabase,
 } from "../features/magic-context/storage";
+import { setCtxReduceRegisteredGlobally } from "../hooks/magic-context/ctx-reduce-availability";
 import { getErrorMessage } from "../shared/error-message";
 import { log } from "../shared/logger";
 import type { Database } from "../shared/sqlite";
@@ -21,6 +22,32 @@ import { normalizeToolArgSchemas } from "./normalize-tool-arg-schemas";
 import type { RustToolBackends } from "./rust-tool-backends";
 import type { PluginContext } from "./types";
 
+/**
+ * The exact tool IDs emitted by `createCtxReduceTools`. In compaction-off mode
+ * (the `compaction` config block's `enabled` field set to false) the registry
+ * skips registering this factory entirely, so this enumeration is the
+ * removed-set diffed against the mode-on tool list in the acceptance test.
+ * The factory is plural (it returns a record keyed by tool name), so the test
+ * must distinguish "factory skipped" from "one ID filtered" — listing the IDs
+ * by name makes a future tool the factory grows fail the diff rather than
+ * silently vanishing in compaction-off mode.
+ *
+ * Spec #266 decision #3: only ctx_reduce unregisters; ctx_expand/ctx_note/
+ * ctx_search/ctx_memory stay (subject to their existing gates).
+ */
+const COMPACTION_OFF_REMOVED_TOOL_IDS = ["ctx_reduce"] as const;
+
+/**
+ * The enumerated tool IDs removed in compaction-off mode (today exactly
+ * `["ctx_reduce"]`). Exported so the acceptance test diffs the mode-off tool
+ * set against the mode-on set and asserts the difference equals exactly this
+ * list — a future tool the reduce factory grows appears here and fails the
+ * diff rather than silently vanishing in compaction-off mode.
+ */
+export function getCompactionOffRemovedToolIds(): readonly string[] {
+    return COMPACTION_OFF_REMOVED_TOOL_IDS;
+}
+
 export function createToolRegistry(args: {
     ctx: PluginContext;
     pluginConfig: MagicContextPluginConfig;
@@ -31,6 +58,19 @@ export function createToolRegistry(args: {
     if (pluginConfig.enabled !== true) {
         return {};
     }
+
+    // Compaction-off mode is boot-resolved and process-stable (the mode is
+    // determined once at startup from config and does not change during the
+    // process). The mode removes exactly the tool IDs emitted by
+    // createCtxReduceTools (enumerated in COMPACTION_OFF_REMOVED_TOOL_IDS)
+    // and nothing else. All other ctx_* tools register normally. The
+    // process-global registration override in ctx-reduce-availability.ts is
+    // set from this same resolution so the no-reduce guidance variant,
+    // Channel-1/Channel-2 nudges, and §N§ prefix injection all flow false
+    // naturally for every session (the per-session tools map would otherwise
+    // fail-open to "callable" for normal sessions).
+    const compactionOff = !isCompactionEnabled(pluginConfig);
+    setCtxReduceRegisteredGlobally(!compactionOff);
 
     // Storage failure (binary ABI mismatch, unwritable path, etc.) must
     // disable Magic Context cleanly instead of silently degrading. We never
@@ -79,11 +119,19 @@ export function createToolRegistry(args: {
     // stays: it still recalls conversation + git commits, just not memories.
     const memoryEnabled = pluginConfig.memory?.enabled !== false;
     const allTools: Record<string, ToolDefinition> = {
-        ...createCtxReduceTools({
-            db,
-            protectedTags: pluginConfig.protected_tags ?? DEFAULT_PROTECTED_TAGS,
-            rustToolBackends,
-        }),
+        // In compaction-off mode the ctx_reduce factory is skipped entirely
+        // (COMPACTION_OFF_REMOVED_TOOL_IDS enumerates its emitted IDs). The
+        // spread is conditional rather than filtering after the fact so the
+        // factory never runs — the acceptance test diffs the mode-off tool
+        // set against the mode-on set and asserts the difference equals
+        // exactly the removed-set, catching any future ID the factory grows.
+        ...(compactionOff
+            ? {}
+            : createCtxReduceTools({
+                  db,
+                  protectedTags: pluginConfig.protected_tags ?? DEFAULT_PROTECTED_TAGS,
+                  rustToolBackends,
+              })),
         ...createCtxExpandTools({ db }),
         ...createCtxNoteTools({
             db,

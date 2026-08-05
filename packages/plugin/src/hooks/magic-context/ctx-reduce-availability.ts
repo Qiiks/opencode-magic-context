@@ -34,8 +34,38 @@ export interface ToolAvailabilityVerdict {
     frozen: boolean;
 }
 
+// `ctx_reduce` is registered process-globally by the tool registry at boot.
+// In compaction-off mode (the `compaction` config block's `enabled` field set
+// to false) the registry skips registering it, so no session can ever call
+// the tool — regardless of the per-session spawn tools map (a normal session
+// with no tools map would otherwise fail-open to "callable"). This
+// process-global override makes unregistration flow naturally to every
+// ctx_reduce-availability consumer: the no-reduce guidance variant
+// (system-prompt-hash.ts), Channel-1/Channel-2 nudges, and §N§ prefix
+// injection (transform.ts). Default true (registered) preserves today's
+// behavior for tests/legacy callers that never call the setter. The
+// compaction-off mode reuses the existing no-reduce guidance variant
+// machinery rather than minting a third template.
+let ctxReduceRegisteredGlobally = true;
+
 /**
- * Historical alias. ctx_reduce was the first consumer of this resolver; the
+ * Set whether `ctx_reduce` is registered process-globally. Called once at
+ * plugin boot from the tool registry resolution. When false, every
+ * `resolveCtxReduceAvailability*` call returns a frozen `callable: false`
+ * verdict without consulting the per-session tools map or the OpenCode DB.
+ */
+export function setCtxReduceRegisteredGlobally(registered: boolean): void {
+    ctxReduceRegisteredGlobally = registered;
+}
+
+/** Test-only reset so the availability suite's default-true baseline is
+ *  unaffected by a prior test that flipped the override. Production code
+ *  never needs to re-enable mid-process (boot-resolved, process-stable). */
+export function resetCtxReduceRegisteredGloballyForTest(): void {
+    ctxReduceRegisteredGlobally = true;
+}
+
+/** Historical alias. ctx_reduce was the first consumer of this resolver; the
  * verdict shape is identical for every tool, so the name is kept so existing
  * ctx_reduce call sites stay untouched.
  */
@@ -76,6 +106,13 @@ export function resolveToolAvailabilityFromMessages(
     toolName: string,
     messages: ReadonlyArray<{ info?: { role?: string; tools?: unknown } }>,
 ): ToolAvailabilityVerdict {
+    // Process-global registration override: when ctx_reduce is not registered
+    // (compaction-off mode) the tool is uncallable for every session, full
+    // stop. Frozen so the system-prompt hash persists this verdict as the
+    // session baseline (no provisional-then-flip cache bust).
+    if (toolName === CTX_REDUCE_TOOL && !ctxReduceRegisteredGlobally) {
+        return { callable: false, frozen: true };
+    }
     const key = cacheKey(toolName, sessionId);
     const cached = availabilityBySession.get(key);
     if (cached !== undefined) return { callable: cached, frozen: true };
@@ -105,6 +142,10 @@ export function resolveToolAvailability(
     sessionId: string,
     toolName: string,
 ): ToolAvailabilityVerdict {
+    // Process-global registration override (see resolveToolAvailabilityFromMessages).
+    if (toolName === CTX_REDUCE_TOOL && !ctxReduceRegisteredGlobally) {
+        return { callable: false, frozen: true };
+    }
     const key = cacheKey(toolName, sessionId);
     const cached = availabilityBySession.get(key);
     if (cached !== undefined) return { callable: cached, frozen: true };
