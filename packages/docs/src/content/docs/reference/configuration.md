@@ -117,6 +117,7 @@ Durable project memory, semantic search, and recall features.
 | `embedding.query_input_type` | string | — | Optional input_type for query (search) embeddings on asymmetric models (e.g. NVIDIA NIM 'query'). When unset, query embeddings use embedding.input_type. Passage/stored content always uses embedding.input_type. |
 | `embedding.truncate` | string | — | Optional truncate mode sent in the embedding request body (e.g. NVIDIA NIM accepts 'NONE' \| 'START' \| 'END'). Omitted from the request when unset. |
 | `embedding.max_input_tokens` | integer (–9007199254740991) | — | Optional maximum input tokens for chunk embeddings. Defaults conservatively to 512 when omitted. |
+| `embedding.local_dtype` | `"auto"` \\| `"fp32"` \\| `"fp16"` \\| `"q8"` \\| `"int8"` \\| `"uint8"` \\| `"q4"` \\| `"bnb4"` \\| `"q4f16"` \\| `"q2"` \\| `"q2f16"` \\| `"q1"` \\| `"q1f16"` | — | Local provider only: ONNX model dtype passed to the transformers.js feature-extraction pipeline. Accepts the @huggingface/transformers DataType strings (auto, fp32, fp16, q8, int8, uint8, q4, bnb4, q4f16, q2, q2f16, q1, q1f16). Omitted keeps today's behavior (fp32). A non-default value changes the produced vectors and folds into the embedding model identity, so switching dtype re-embeds rather than mixing vector spaces. Useful for selecting a quantized variant (e.g. q8) of a larger multilingual model to cut memory and CPU cost; see issue #259. |
 
 ## Background agents
 

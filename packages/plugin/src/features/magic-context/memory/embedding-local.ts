@@ -8,6 +8,25 @@ import { log } from "../../../shared/logger";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./embedding-provider";
 
+/** The dtype enum values accepted by @huggingface/transformers' feature-extraction
+ *  pipeline (keyof typeof DATA_TYPES in transformers/types/utils/dtypes.d.ts).
+ *  Kept as a literal union so the config schema, identity fold, and pipeline
+ *  call share one source of truth. See issue #259. */
+export type LocalEmbeddingDtype =
+    | "auto"
+    | "fp32"
+    | "fp16"
+    | "q8"
+    | "int8"
+    | "uint8"
+    | "q4"
+    | "bnb4"
+    | "q4f16"
+    | "q2"
+    | "q2f16"
+    | "q1"
+    | "q1f16";
+
 /**
  * Cross-process mutex for embedding-model load. When two OpenCode processes
  * spawn simultaneously (typical Desktop sidecar + TUI + dashboard setup), they
@@ -235,6 +254,13 @@ type CreateEmbeddingPipeline = (
     options: { dtype: string; device?: string },
 ) => Promise<EmbeddingPipeline>;
 
+/** The dtype the local provider passes to the transformers.js pipeline when the
+ *  user does not configure one. This MUST stay "fp32" to preserve today's
+ *  behavior exactly — existing installs see zero change on upgrade, and the
+ *  default identity string stays byte-identical (local_dtype is only folded
+ *  into identity when the user actually sets it). See issue #259. */
+const DEFAULT_LOCAL_DTYPE: LocalEmbeddingDtype = "fp32";
+
 /**
  * Temporarily redirects console.warn and console.error to the file logger
  * so that @huggingface/transformers and ONNX runtime never leak to the TUI.
@@ -385,6 +411,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     readonly maxInputTokens: number;
 
     private readonly model: string;
+    private readonly dtype: LocalEmbeddingDtype;
     private pipeline: EmbeddingPipeline | null = null;
     private initPromise: Promise<void> | null = null;
     private inFlight = 0;
@@ -392,10 +419,22 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     private disposePromise: Promise<void> | null = null;
     private readonly inFlightWaiters: Array<() => void> = [];
 
-    constructor(model = DEFAULT_LOCAL_EMBEDDING_MODEL, maxInputTokens = 512) {
+    constructor(
+        model = DEFAULT_LOCAL_EMBEDDING_MODEL,
+        maxInputTokens = 512,
+        dtype: LocalEmbeddingDtype = DEFAULT_LOCAL_DTYPE,
+    ) {
         this.model = model;
         this.maxInputTokens = maxInputTokens;
-        this.modelId = getEmbeddingProviderIdentity({ provider: "local", model });
+        this.dtype = dtype || DEFAULT_LOCAL_DTYPE;
+        this.modelId = getEmbeddingProviderIdentity({
+            provider: "local",
+            model,
+            // Only fold non-default dtype into identity so the default config
+            // produces the byte-identical identity string as before this field
+            // existed (no forced re-embed on upgrade). See issue #259.
+            ...(dtype && dtype !== DEFAULT_LOCAL_DTYPE ? { local_dtype: dtype } : {}),
+        });
     }
 
     async initialize(): Promise<boolean> {
@@ -496,9 +535,10 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                         try {
                             // NOTE: transformers v4 deprecated the `quantized: boolean`
                             // flag in favor of `dtype` as the canonical precision option.
-                            // Passing `dtype: "fp32"` selects the full-precision ONNX
-                            // model; the model file on disk is unchanged (~90MB for
-                            // all-MiniLM-L6-v2).
+                            // `this.dtype` defaults to "fp32" to preserve the prior
+                            // behavior exactly; a user-configured `embedding.local_dtype`
+                            // (e.g. "q8" for a quantized multilingual model) flows through
+                            // here. See issue #259.
                             //
                             // device: "auto" is REQUIRED when we injected our own ORT
                             // via Symbol.for("onnxruntime") (the Electron WASM path):
@@ -512,7 +552,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                             // the default selection (no device option). See issue #195.
                             const pipeline = await withQuietConsole(() =>
                                 createPipeline("feature-extraction", this.model, {
-                                    dtype: "fp32",
+                                    dtype: this.dtype,
                                     ...(injectedWasmOrt ? { device: "auto" } : {}),
                                 }),
                             );
