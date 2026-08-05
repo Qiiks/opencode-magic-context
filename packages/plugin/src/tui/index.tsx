@@ -2,7 +2,11 @@
 // @ts-nocheck
 import { createMemo } from "solid-js"
 import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
-import { createSidebarContentSlot, kickRecompProgressRefresh } from "./slots/sidebar-content"
+import {
+    createSidebarContentSlot,
+    kickRecompProgressRefresh,
+    refreshSidebarSnapshot,
+} from "./slots/sidebar-content"
 import packageJson from "../../package.json"
 import { closeRpc, dismissUpgradeReminder, getAnnouncement, getCompartmentCount, getRpcGeneration, initRpcClient, loadEmbedDetail, loadStatusDetail, loadToastDurationMs, markAnnounced, requestRecomp, requestUpgrade, type EmbedDetail, type StatusDetail } from "./data/context-db"
 import { startNotificationSocket, stopNotificationSocket, type SocketNotification } from "./data/notification-socket"
@@ -1038,6 +1042,11 @@ const tui: TuiPlugin = async (api, _options, meta) => {
         }
         if (action === "show-embed-dialog") {
             return stillActive() && (await showEmbedDialog(api, requestedSessionId))
+        }
+        if (action === "refresh-sidebar") {
+            if (!stillActive()) return false
+            refreshSidebarSnapshot()
+            return true
         }
         if (action === "wrapup-progress-kick") {
             // /ctx-wrapup blocks its command turn and fires no message events, so

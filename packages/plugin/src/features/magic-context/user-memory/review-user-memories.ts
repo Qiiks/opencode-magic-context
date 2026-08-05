@@ -1,5 +1,6 @@
 import { DREAMER_REVIEWER_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
+import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
@@ -161,12 +162,12 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
     });
 
     try {
-        const createResponse = await args.client.session.create({
-            body: {
-                ...(args.parentSessionId ? { parentID: args.parentSessionId } : {}),
-                title: "magic-context-dream-user-memories",
-            },
-            query: { directory: args.sessionDirectory },
+        const createResponse = await createChildSessionWithFence({
+            client: args.client,
+            db: args.db,
+            parentSessionId: args.parentSessionId,
+            title: "magic-context-dream-user-memories",
+            directory: args.sessionDirectory,
         });
         const created = shared.normalizeSDKResponse(
             createResponse,

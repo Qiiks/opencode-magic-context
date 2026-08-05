@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
+import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import { isRustAuthorityDrainingError } from "../../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
@@ -329,12 +330,12 @@ async function classifyOneChunk(
             return run;
         }
 
-        const createResponse = await args.client.session.create({
-            body: {
-                ...(args.parentSessionId ? { parentID: args.parentSessionId } : {}),
-                title: "magic-context-dream-classify",
-            },
-            query: { directory: args.sessionDirectory },
+        const createResponse = await createChildSessionWithFence({
+            client: args.client,
+            db: args.db,
+            parentSessionId: args.parentSessionId,
+            title: "magic-context-dream-classify",
+            directory: args.sessionDirectory,
         });
         const created = shared.normalizeSDKResponse(
             createResponse,

@@ -21,6 +21,44 @@ export interface StorageVersions {
     plugin_supported_version: number;
 }
 
+export interface StorageVersionFenceCheck {
+    alarm: boolean;
+    message: string;
+}
+
+export const STALE_BUILD_RESTART_INSTRUCTION =
+    "Magic Context: plugin build is older than its database — restart OpenCode";
+
+/**
+ * Classify storage_versions for doctor. A database below this build's fence only
+ * means migrations are pending; only a database above the fence strands a stale
+ * long-running server and is therefore an alarm.
+ */
+export function checkStorageVersionFence(versions: StorageVersions): StorageVersionFenceCheck {
+    const {
+        context_db_schema_version: databaseVersion,
+        plugin_supported_version: supportedVersion,
+    } = versions;
+    if (databaseVersion > supportedVersion) {
+        return {
+            alarm: true,
+            message:
+                `Storage schema fence alarm: context.db is v${databaseVersion}, but this build supports through v${supportedVersion}. ` +
+                `${STALE_BUILD_RESTART_INSTRUCTION}.`,
+        };
+    }
+    if (databaseVersion < supportedVersion) {
+        return {
+            alarm: false,
+            message: `Storage schema migrations pending: context.db is v${databaseVersion}; this build supports through v${supportedVersion}.`,
+        };
+    }
+    return {
+        alarm: false,
+        message: `Storage schema fence: context.db and this build are both v${supportedVersion}.`,
+    };
+}
+
 /** Read both probe values from an already-open context.db. Read-only. */
 export function readStorageVersions(db: DatabaseType): StorageVersions {
     return {

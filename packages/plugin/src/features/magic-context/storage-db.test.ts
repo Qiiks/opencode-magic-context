@@ -16,7 +16,9 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     closeDatabase,
+    getMigrationOnOpenRefusal,
     isDatabasePersisted,
+    LATEST_SUPPORTED_VERSION,
     openDatabase,
     resolveDatabasePath,
 } from "./storage-db";
@@ -211,6 +213,41 @@ describe("storage-db", () => {
             const db2 = openDatabase();
 
             expect(db1).toBe(db2);
+        });
+
+        it("#when a live OpenCode server advertises a port #then refuses a pending migration", () => {
+            const dataHome = useTempDataHome("storage-db-live-server-migration-");
+            const dbPath = resolveDbPath(dataHome);
+            mkdirSync(dirname(dbPath), { recursive: true });
+            const legacy = new Database(dbPath);
+            legacy.exec(`
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations(version) VALUES (${LATEST_SUPPORTED_VERSION - 1});
+            `);
+            legacy.close();
+
+            const portDir = join(dirname(dbPath), "rpc", "test-project");
+            mkdirSync(portDir, { recursive: true });
+            writeFileSync(
+                join(portDir, `port-${process.pid}.json`),
+                JSON.stringify({ port: 43123, pid: process.pid, started_at: Date.now() }),
+            );
+
+            // The port file makes this test prove the pre-migration refusal. If the
+            // guard is removed, openDatabase migrates this fixture and this assertion
+            // goes red because the DB is no longer left at the previous version.
+            expect(openDatabase()).toBeNull();
+            expect(getMigrationOnOpenRefusal()).toEqual({
+                persistedVersion: LATEST_SUPPORTED_VERSION - 1,
+                supportedVersion: LATEST_SUPPORTED_VERSION,
+                serverPids: [process.pid],
+            });
+            const unchanged = new Database(dbPath);
+            const row = unchanged
+                .prepare("SELECT MAX(version) AS version FROM schema_migrations")
+                .get() as { version: number };
+            unchanged.close();
+            expect(row.version).toBe(LATEST_SUPPORTED_VERSION - 1);
         });
 
         it("#when file path setup fails #then throws so callers fail closed (no in-memory fallback)", () => {

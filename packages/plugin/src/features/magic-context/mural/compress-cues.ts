@@ -1,4 +1,5 @@
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
+import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import {
@@ -267,12 +268,12 @@ async function compressOneChunk(
             memories: chunk.map(toPromptMemory),
         });
 
-        const createResponse = await args.client.session.create({
-            body: {
-                ...(args.parentSessionId ? { parentID: args.parentSessionId } : {}),
-                title: "magic-context-dream-compress-cues",
-            },
-            query: { directory: args.sessionDirectory },
+        const createResponse = await createChildSessionWithFence({
+            client: args.client,
+            db: args.db,
+            parentSessionId: args.parentSessionId,
+            title: "magic-context-dream-compress-cues",
+            directory: args.sessionDirectory,
         });
         const created = shared.normalizeSDKResponse(
             createResponse,
