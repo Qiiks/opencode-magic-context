@@ -7,9 +7,11 @@ import {
     mkdtempSync,
     readdirSync,
     readFileSync,
+    unlinkSync,
+    type Dirent,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import {
     getLegacyOpenCodeMagicContextStorageDir,
@@ -57,6 +59,7 @@ let lastMigrationOnOpenRefusal: {
     persistedVersion: number;
     supportedVersion: number;
     serverPids: number[];
+    unreadableFile?: string;
 } | null = null;
 
 export function getSchemaFenceRejection(): {
@@ -70,6 +73,7 @@ export function getMigrationOnOpenRefusal(): {
     persistedVersion: number;
     supportedVersion: number;
     serverPids: number[];
+    unreadableFile?: string;
 } | null {
     return lastMigrationOnOpenRefusal;
 }
@@ -351,30 +355,93 @@ export function enforceSchemaFence(
     return false;
 }
 
+export interface RpcServerDiscovery {
+    state: "absent" | "stale" | "live" | "unreadable";
+    serverPids: number[];
+    staleFiles: string[];
+    unreadableFile?: string;
+}
+
+function unreadableDiscovery(path: string): RpcServerDiscovery {
+    return {
+        state: "unreadable",
+        serverPids: [],
+        staleFiles: [],
+        unreadableFile: path,
+    };
+}
+
 /**
- * Return live OpenCode server PIDs advertised by the shared RPC discovery tree.
- * A port file belongs to a running server only when its PID is alive; stale files
- * are deliberately ignored so a crashed server never blocks a safe migration.
+ * Inspect the shared RPC discovery tree without treating partial evidence as
+ * proof that no server is running. A missing/empty tree is a clean machine;
+ * dead-PID files are removed; malformed or unreadable evidence is fail-closed.
  */
-export function findLiveRpcServerPids(storageDir: string): number[] {
-    const pids = new Set<number>();
+export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscovery {
     const rpcRoot = join(storageDir, "rpc");
+    let projectEntries: Dirent[];
     try {
-        for (const projectEntry of readdirSync(rpcRoot, { withFileTypes: true })) {
-            if (!projectEntry.isDirectory()) continue;
-            const projectDir = join(rpcRoot, projectEntry.name);
-            for (const entry of readdirSync(projectDir)) {
-                if (!entry.startsWith("port-") || !entry.endsWith(".json")) continue;
-                const record = parseRpcPortFile(readFileSync(join(projectDir, entry), "utf8"));
-                if (!record || !isPidAlive(record.pid)) continue;
-                pids.add(record.pid);
+        projectEntries = readdirSync(rpcRoot, { withFileTypes: true });
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            return { state: "absent", serverPids: [], staleFiles: [] };
+        }
+        return unreadableDiscovery(rpcRoot);
+    }
+
+    const portFiles: string[] = [];
+    for (const projectEntry of projectEntries) {
+        if (!projectEntry.isDirectory()) continue;
+        const projectDir = join(rpcRoot, projectEntry.name);
+        let entries: string[];
+        try {
+            entries = readdirSync(projectDir);
+        } catch {
+            return unreadableDiscovery(projectDir);
+        }
+        for (const entry of entries) {
+            if (entry === "port" || (entry.startsWith("port-") && entry.endsWith(".json"))) {
+                portFiles.push(join(projectDir, entry));
             }
         }
-    } catch {
-        // Missing/unreadable discovery files mean no reliable live-server signal.
     }
-    return [...pids].sort((a, b) => a - b);
+    if (portFiles.length === 0) {
+        return { state: "absent", serverPids: [], staleFiles: [] };
+    }
+
+    const pids = new Set<number>();
+    const staleFiles: string[] = [];
+    for (const portFile of portFiles) {
+        let raw: string;
+        try {
+            raw = readFileSync(portFile, "utf8");
+        } catch {
+            return unreadableDiscovery(portFile);
+        }
+        const filename = basename(portFile);
+        const pidFromName = /^port-(\d+)/.exec(filename)?.[1];
+        const record = parseRpcPortFile(raw, pidFromName ? Number(pidFromName) : 0);
+        if (!record || !Number.isInteger(record.pid) || record.pid <= 0) {
+            return unreadableDiscovery(portFile);
+        }
+        if (isPidAlive(record.pid)) pids.add(record.pid);
+        else staleFiles.push(portFile);
+    }
+
+    const serverPids = [...pids].sort((a, b) => a - b);
+    if (serverPids.length > 0) {
+        return { state: "live", serverPids, staleFiles };
+    }
+
+    for (const staleFile of staleFiles) {
+        try {
+            unlinkSync(staleFile);
+        } catch {
+            return unreadableDiscovery(staleFile);
+        }
+    }
+    return { state: "stale", serverPids: [], staleFiles };
 }
+
 
 /**
  * Refuse an on-open migration when another live OpenCode server still has this
@@ -392,19 +459,26 @@ function enforceMigrationOnOpenGuard(
         lastMigrationOnOpenRefusal = null;
         return true;
     }
-    const serverPids = findLiveRpcServerPids(dbDir);
-    if (serverPids.length === 0) {
+    const discovery = inspectRpcServerDiscovery(dbDir);
+    if (discovery.state === "absent" || discovery.state === "stale") {
         lastMigrationOnOpenRefusal = null;
         return true;
     }
     lastMigrationOnOpenRefusal = {
         persistedVersion,
         supportedVersion: latestSupportedVersion,
-        serverPids,
+        serverPids: discovery.serverPids,
+        ...(discovery.unreadableFile ? { unreadableFile: discovery.unreadableFile } : {}),
     };
-    log(
-        `[magic-context] storage fatal: refusing to migrate ${dbPath} from schema v${persistedVersion} to v${latestSupportedVersion} while live OpenCode server PID(s) ${serverPids.join(", ")} may still use the old plugin build. Restart OpenCode, then retry this process.`,
-    );
+    if (discovery.state === "unreadable") {
+        log(
+            `[magic-context] storage fatal: refusing to migrate ${dbPath} from schema v${persistedVersion} to v${latestSupportedVersion} because RPC discovery file ${discovery.unreadableFile ?? "<unknown>"} is unreadable or invalid, so the absence of a live OpenCode server cannot be proven. Restart OpenCode, remove or repair the named discovery file, then retry this process.`,
+        );
+    } else {
+        log(
+            `[magic-context] storage fatal: refusing to migrate ${dbPath} from schema v${persistedVersion} to v${latestSupportedVersion} while live OpenCode server PID(s) ${discovery.serverPids.join(", ")} may still use the old plugin build. Restart OpenCode, then retry this process.`,
+        );
+    }
     return false;
 }
 

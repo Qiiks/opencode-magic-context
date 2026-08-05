@@ -16,6 +16,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+    closeCompactionMarkerDb,
     getOpenCodeDbPath,
     removeMcOwnedCompactionMarkers,
 } from "../../features/magic-context/compaction-marker";
@@ -52,6 +53,7 @@ const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 afterEach(() => {
+    closeCompactionMarkerDb();
     closeDatabase();
     if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = originalXdgDataHome;
@@ -247,6 +249,7 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
 
             const result = removeMcOwnedCompactionMarkers("ses-1", MARKER_SUMMARY_TEXT);
 
+            expect(result.verified).toBe(true);
             expect(result.removedLineages).toBe(1);
             expect(result.removedRows).toBe(3);
             expect(result.retainedLineages).toBe(0);
@@ -349,6 +352,78 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
             // Native rows untouched.
             expect(
                 db.prepare("SELECT id FROM message WHERE id = 'msg-native-summary'").get(),
+            ).not.toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("retains a lineage when a surviving native tail points at the MC compaction PART id", () => {
+        useTempDataHome("mc-marker-dangling-part-tail-");
+        const db = createOpenCodeDb("ses-1");
+        try {
+            insertMessage(db, "ses-1", { id: "msg-user-1", role: "user" });
+            insertCanonicalMcMarker(db, "ses-1", {
+                boundaryMessageId: "msg-user-1",
+                summaryId: "msg-mc-summary",
+                partId: "prt-mc-compaction",
+                summaryPartId: "prt-mc-summary-text",
+            });
+            insertMessage(db, "ses-1", { id: "msg-user-2", role: "user", timeCreated: 5 });
+            insertNativeMarker(db, "ses-1", {
+                boundaryMessageId: "msg-user-2",
+                summaryId: "msg-native-summary",
+                partId: "prt-native-compaction",
+                summaryPartId: "prt-native-summary-text",
+                tailStartId: "prt-mc-compaction",
+            });
+
+            const result = removeMcOwnedCompactionMarkers("ses-1", MARKER_SUMMARY_TEXT);
+
+            // Mutation direction: omitting deleted compaction-part IDs from the
+            // preflight makes this lineage disappear and leaves a dangling tail.
+            expect(result.verified).toBe(false);
+            expect(result.retainedLineages).toBe(1);
+            expect(result.removedRows).toBe(0);
+            expect(
+                db.prepare("SELECT id FROM part WHERE id = 'prt-mc-compaction'").get(),
+            ).not.toBeNull();
+            expect(
+                db.prepare("SELECT id FROM part WHERE id = 'prt-native-compaction'").get(),
+            ).not.toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("preserves a hand-written compaction part without an exact MC payload signature", () => {
+        useTempDataHome("mc-marker-foreign-part-");
+        const db = createOpenCodeDb("ses-1");
+        try {
+            insertMessage(db, "ses-1", { id: "msg-user-1", role: "user" });
+            insertCanonicalMcMarker(db, "ses-1", {
+                boundaryMessageId: "msg-user-1",
+                summaryId: "msg-mc-summary",
+                partId: "prt-mc-compaction",
+                summaryPartId: "prt-mc-summary-text",
+            });
+            insertPart(db, "ses-1", {
+                id: "prt-hand-written-compaction",
+                messageId: "msg-user-1",
+                data: { type: "compaction", auto: true, source: "hand-written" },
+            });
+
+            const result = removeMcOwnedCompactionMarkers("ses-1", MARKER_SUMMARY_TEXT);
+
+            expect(result.verified).toBe(true);
+            expect(result.removedLineages).toBe(1);
+            expect(
+                db.prepare("SELECT id FROM part WHERE id = 'prt-mc-compaction'").get(),
+            ).toBeNull();
+            // Mutation direction: classifying by missing tail_start_id alone
+            // deletes this foreign part and makes the assertion go red.
+            expect(
+                db.prepare("SELECT id FROM part WHERE id = 'prt-hand-written-compaction'").get(),
             ).not.toBeNull();
         } finally {
             closeQuietly(db);
@@ -495,6 +570,57 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
 // ── Mode-record algebra ──────────────────────────────────────────
 
 describe("reconcileCompactionMode — transition algebra", () => {
+    it("leaves the record absent and retries cleanup after an incompatible schema becomes verifiable", () => {
+        useTempDataHome("mc-mode-schema-retry-");
+        const ocDb = createOpenCodeDb("ses-1");
+        insertMessage(ocDb, "ses-1", { id: "msg-user-1", role: "user" });
+        insertCanonicalMcMarker(ocDb, "ses-1", {
+            boundaryMessageId: "msg-user-1",
+            summaryId: "msg-mc-summary",
+            partId: "prt-mc-compaction",
+            summaryPartId: "prt-mc-summary-text",
+        });
+        ocDb.exec("ALTER TABLE part DROP COLUMN time_updated");
+
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, "ses-1");
+        const first = reconcileCompactionMode({
+            db,
+            sessionId: "ses-1",
+            compactionOff: true,
+            historianRunnable: true,
+            compartmentInProgress: false,
+        });
+
+        expect(first.markerCleanup.verified).toBe(false);
+        expect(first.recordToWrite).toBeNull();
+        expect(getCompactionModeRecord(db, "ses-1")).toBeNull();
+        expect(
+            ocDb.prepare("SELECT id FROM part WHERE id = 'prt-mc-compaction'").get(),
+        ).not.toBeNull();
+
+        // Simulate the next process/pass after OpenCode restores a compatible
+        // schema. Resetting the probe cache is the process-boundary equivalent.
+        closeCompactionMarkerDb();
+        ocDb.exec("ALTER TABLE part ADD COLUMN time_updated INTEGER NOT NULL DEFAULT 0");
+        const second = reconcileCompactionMode({
+            db,
+            sessionId: "ses-1",
+            compactionOff: true,
+            historianRunnable: true,
+            compartmentInProgress: false,
+        });
+
+        expect(second.markerCleanup.verified).toBe(true);
+        expect(second.markerCleanup.removedLineages).toBe(1);
+        expect(second.recordToWrite).toBe("off");
+        commitCompactionModeRecord(db, "ses-1", second.recordToWrite!);
+        expect(getCompactionModeRecord(db, "ses-1")).toBe("off");
+        expect(
+            ocDb.prepare("SELECT id FROM part WHERE id = 'prt-mc-compaction'").get(),
+        ).toBeNull();
+        closeQuietly(ocDb);
+    });
     it("no record + on → writes 'on', no transition work, no notice", () => {
         useTempDataHome("mc-mode-norecord-on-");
         const db = openDatabase();

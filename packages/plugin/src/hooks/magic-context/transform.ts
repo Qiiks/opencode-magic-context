@@ -628,6 +628,10 @@ export function createTransform(deps: TransformDeps) {
     const deferredHistoryRefreshSessions = deps.deferredHistoryRefreshSessions ?? new Set<string>();
     const deferredMaterializationSessions =
         deps.deferredMaterializationSessions ?? new Set<string>();
+    // A failed awaited delivery leaves the durable mode record uncommitted. Keep
+    // the notice text in-process so the next transform pass retries delivery
+    // even though the idempotent cleanup no longer reports rows cleared.
+    const pendingCompactionModeNotices = new BoundedSessionMap<string>(100);
 
     const transform = async (
         _input: Record<string, never>,
@@ -739,20 +743,38 @@ export function createTransform(deps: TransformDeps) {
                 if (transition.historianCatchUpSignaled) {
                     sessionMeta = { ...sessionMeta, compartmentInProgress: true };
                 }
-                if (transition.notice && deps.client) {
-                    // Out-of-band only — never the message array, never the
-                    // nudge channels. Fire-and-forget like every other
-                    // transform-time notice; the record commit below lands
-                    // after emission so a crash in between repeats the notice
-                    // (the permitted at-least-once window) instead of losing it.
-                    void sendIgnoredMessage(
-                        deps.client,
+                const notice =
+                    transition.notice ?? pendingCompactionModeNotices.get(sessionId) ?? null;
+                if (transition.notice) {
+                    pendingCompactionModeNotices.set(sessionId, transition.notice);
+                }
+                // A missing client is the existing no-notification test/headless
+                // seam. Production OpenCode transforms always provide one; when
+                // present, its delivery result controls whether the record commits.
+                let noticeDelivered = notice === null || deps.client === undefined;
+                if (notice && deps.client) {
+                    // Out-of-band only — never the message array or nudge
+                    // channels. Delivery must finish before the durable record
+                    // commits; a failed delivery leaves the transition
+                    // retryable, accepting a duplicate after a crash rather
+                    // than permanently losing the notice.
+                    noticeDelivered =
+                        (await sendIgnoredMessage(
+                            deps.client,
+                            sessionId,
+                            notice,
+                            deps.getNotificationParams?.(sessionId) ?? {},
+                        )) === "sent";
+                }
+                if (noticeDelivered) {
+                    commitCompactionModeRecord(db, sessionId, transition.recordToWrite);
+                    pendingCompactionModeNotices.delete(sessionId);
+                } else {
+                    sessionLog(
                         sessionId,
-                        transition.notice,
-                        deps.getNotificationParams?.(sessionId) ?? {},
+                        "compaction mode notice was not delivered; leaving mode record uncommitted for next-pass retry",
                     );
                 }
-                commitCompactionModeRecord(db, sessionId, transition.recordToWrite);
             }
         } catch (error) {
             passOutcome.record("compaction-mode-transition-failure");

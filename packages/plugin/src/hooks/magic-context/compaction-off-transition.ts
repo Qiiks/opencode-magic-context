@@ -60,6 +60,8 @@ import {
 import { sessionLog } from "../../shared/logger";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 
+let loggedUnverifiedMarkerCleanupRetry = false;
+
 /**
  * Flip-off unfold notice. Delivered out of band on the transition pass that
  * actually cleared something. The one-cycle warning wording is contractual
@@ -119,7 +121,12 @@ const NO_TRANSITION: CompactionModeTransitionResult = {
     historianCatchUpSignaled: false,
     clearedCompartmentInProgress: false,
     clearedSomething: false,
-    markerCleanup: { removedLineages: 0, removedRows: 0, retainedLineages: 0 },
+    markerCleanup: {
+        verified: true,
+        removedLineages: 0,
+        removedRows: 0,
+        retainedLineages: 0,
+    },
 };
 
 /**
@@ -201,6 +208,7 @@ export function reconcileCompactionMode(args: {
     // 1. Delete MC-owned marker lineages from opencode.db (canonical +
     //    supported legacy). No opencode.db means no markers — not an error.
     let markerCleanup: McOwnedMarkerCleanupResult = {
+        verified: true,
         removedLineages: 0,
         removedRows: 0,
         retainedLineages: 0,
@@ -265,11 +273,18 @@ export function reconcileCompactionMode(args: {
 
     sessionLog(
         sessionId,
-        `compaction-off transition: markers removed=${markerCleanup.removedLineages} lineage(s)/${markerCleanup.removedRows} row(s), retained=${markerCleanup.retainedLineages}, clearedSomething=${clearedSomething}`,
+        `compaction-off transition: marker cleanup verified=${markerCleanup.verified}, removed=${markerCleanup.removedLineages} lineage(s)/${markerCleanup.removedRows} row(s), retained=${markerCleanup.retainedLineages}, clearedSomething=${clearedSomething}`,
     );
+    if (!markerCleanup.verified && !loggedUnverifiedMarkerCleanupRetry) {
+        loggedUnverifiedMarkerCleanupRetry = true;
+        sessionLog(
+            sessionId,
+            "compaction-off transition could not verify complete marker cleanup; the mode record remains uncommitted and cleanup will retry on the next pass",
+        );
+    }
 
     return {
-        recordToWrite: "off",
+        recordToWrite: markerCleanup.verified ? "off" : null,
         notice: clearedSomething ? COMPACTION_OFF_FLIP_NOTICE : null,
         invalidatedM0Baseline,
         historianCatchUpSignaled: false,

@@ -1405,7 +1405,7 @@ export async function runPostTransformPhase(
     // Sticky-injection replay (§2.4): every pass replays every persisted anchor
     // so cached user-message bytes remain identical until that message leaves
     // the visible window. Prune happens later, only on cache-busting passes.
-    if (args.fullFeatureMode) {
+    if (args.fullFeatureMode && !compactionOff) {
         for (const anchor of getNoteNudgeAnchors(args.db, args.sessionId)) {
             appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
         }

@@ -44,6 +44,28 @@ function resolveDbPath(dataHome: string): string {
     return join(dataHome, "cortexkit", "magic-context", "context.db");
 }
 
+function seedPendingMigration(dataHome: string): string {
+    openDatabase();
+    closeDatabase();
+    const dbPath = resolveDbPath(dataHome);
+    const db = new Database(dbPath);
+    db.prepare("DELETE FROM schema_migrations WHERE version = ?").run(LATEST_SUPPORTED_VERSION);
+    closeQuietly(db);
+    return dbPath;
+}
+
+function readPersistedVersion(dbPath: string): number {
+    const db = new Database(dbPath);
+    try {
+        const row = db
+            .prepare("SELECT MAX(version) AS version FROM schema_migrations")
+            .get() as { version: number };
+        return row.version;
+    } finally {
+        closeQuietly(db);
+    }
+}
+
 afterEach(() => {
     closeDatabase();
     process.env.XDG_DATA_HOME = originalXdgDataHome;
@@ -213,6 +235,75 @@ describe("storage-db", () => {
             const db2 = openDatabase();
 
             expect(db1).toBe(db2);
+        });
+
+        it("#when the RPC port tree is empty #then allows a pending migration", () => {
+            const dataHome = useTempDataHome("storage-db-empty-rpc-migration-");
+            const dbPath = seedPendingMigration(dataHome);
+            mkdirSync(join(dirname(dbPath), "rpc"), { recursive: true });
+
+            expect(openDatabase()).not.toBeNull();
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+            expect(getMigrationOnOpenRefusal()).toBeNull();
+        });
+
+        it("#when every advertised PID is stale #then deletes stale files and allows migration", () => {
+            const dataHome = useTempDataHome("storage-db-stale-rpc-migration-");
+            const dbPath = seedPendingMigration(dataHome);
+            const portDir = join(dirname(dbPath), "rpc", "test-project");
+            mkdirSync(portDir, { recursive: true });
+            const portFile = join(portDir, "port-2147483647.json");
+            writeFileSync(
+                portFile,
+                JSON.stringify({ port: 43123, pid: 2_147_483_647, started_at: 1 }),
+            );
+
+            expect(openDatabase()).not.toBeNull();
+            expect(existsSync(portFile)).toBe(false);
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+        });
+
+        it("#when a port file is unparseable #then refuses migration and names the partial signal", () => {
+            const dataHome = useTempDataHome("storage-db-invalid-rpc-migration-");
+            const dbPath = seedPendingMigration(dataHome);
+            const portDir = join(dirname(dbPath), "rpc", "test-project");
+            mkdirSync(portDir, { recursive: true });
+            const portFile = join(portDir, "port-12345.json");
+            writeFileSync(portFile, "{not-json");
+
+            // Mutation direction: treating malformed discovery as "no servers"
+            // migrates this fixture and changes the version below.
+            expect(openDatabase()).toBeNull();
+            expect(getMigrationOnOpenRefusal()).toEqual({
+                persistedVersion: LATEST_SUPPORTED_VERSION - 1,
+                supportedVersion: LATEST_SUPPORTED_VERSION,
+                serverPids: [],
+                unreadableFile: portFile,
+            });
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
+        });
+
+        it("#when a port path cannot be read as a file #then refuses migration and names it", () => {
+            const dataHome = useTempDataHome("storage-db-unreadable-rpc-migration-");
+            const dbPath = seedPendingMigration(dataHome);
+            const portDir = join(dirname(dbPath), "rpc", "test-project");
+            const unreadableFile = join(portDir, "port-12345.json");
+            mkdirSync(unreadableFile, { recursive: true });
+
+            expect(openDatabase()).toBeNull();
+            expect(getMigrationOnOpenRefusal()?.unreadableFile).toBe(unreadableFile);
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
+        });
+
+        it("#when the RPC directory cannot be enumerated #then refuses migration", () => {
+            const dataHome = useTempDataHome("storage-db-unreadable-rpc-dir-migration-");
+            const dbPath = seedPendingMigration(dataHome);
+            const rpcPath = join(dirname(dbPath), "rpc");
+            writeFileSync(rpcPath, "not-a-directory");
+
+            expect(openDatabase()).toBeNull();
+            expect(getMigrationOnOpenRefusal()?.unreadableFile).toBe(rpcPath);
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
         });
 
         it("#when a live OpenCode server advertises a port #then refuses a pending migration", () => {
