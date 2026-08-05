@@ -53,6 +53,7 @@ import {
     sanitizeDiagnosticText,
     sanitizePathString,
 } from "../lib/redaction";
+import { formatStorageVersions, readStorageVersions } from "../lib/storage-versions";
 import { runV22BackfillCommands, type V22BackfillCommandArgs } from "../lib/v22-backfill-commands";
 import { reportAuthorityMarkers } from "./doctor-authority";
 import { clearPluginCache } from "./doctor-opencode-cache";
@@ -1254,6 +1255,8 @@ export async function runDoctor(
             }
             try {
                 pass("Opened the shared DB with a supported schema");
+                // Stable storage-version probe: live DB schema vs this binary's fence.
+                log.info(formatStorageVersions(readStorageVersions(db)));
                 try {
                     const integrity = db.prepare("PRAGMA integrity_check").get() as
                         | { integrity_check?: string }

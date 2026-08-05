@@ -135,6 +135,20 @@ export interface StatusDetail extends SidebarSnapshot {
     toastDurationMs: number;
     /** One-line status data for the experimental memory mural. */
     mural?: { present: boolean; ageMs: number | null };
+    /**
+     * Stable storage-version probe: "which schema is the DB at, which fence does
+     * this binary carry". Field names are deliberately snake_case, mirroring the
+     * `storage_versions` block of the mc-module status envelope, so fleet probes
+     * parse one shape across both surfaces. The module cannot read context.db
+     * (the plugin owns it), so this surface supplies the live DB value; the module
+     * surface supplies the module-store value instead.
+     */
+    storage_versions: {
+        /** Persisted schema version of context.db (MAX of schema_migrations). */
+        context_db_schema_version: number;
+        /** Highest context.db schema version this plugin build supports. */
+        plugin_supported_version: number;
+    };
 }
 
 /** Embedding coverage for `/ctx-embed` status (mirrors getEmbeddingCoverageStatus). */

@@ -56,6 +56,7 @@ import {
 } from "../lib/pi-package-entry";
 import { type PromptIO, promptIO } from "../lib/prompts";
 import { sanitizeDiagnosticEndpoint, sanitizeDiagnosticText } from "../lib/redaction";
+import { formatStorageVersions, readStorageVersions } from "../lib/storage-versions";
 import { runV22BackfillCommands, type V22BackfillCommandArgs } from "../lib/v22-backfill-commands";
 import { writePiSettingsPackage } from "./setup-pi";
 
@@ -586,6 +587,8 @@ async function runHealthChecks(options: {
                 add(results, "fail", `Shared context DB no longer exists at ${dbPath}`);
             } else {
                 add(results, "pass", "Opened the shared DB read-only with a supported schema");
+                // Stable storage-version probe: live DB schema vs this binary's fence.
+                add(results, "info", formatStorageVersions(readStorageVersions(db)));
 
                 const integrity = db.prepare("PRAGMA integrity_check").get() as {
                     integrity_check?: unknown;
