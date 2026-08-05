@@ -8,8 +8,21 @@ export interface SidebarSnapshot {
     usagePercentage: number;
     inputTokens: number;
     contextLimit: number;
+    /**
+     * Raw wire-input pressure against the resolved model window. This is separate
+     * from Magic Context's execute threshold so native-compaction UI never shows
+     * a threshold-relative fill percentage.
+     */
+    native_context_usage_percentage?: number;
+    /**
+     * Magic Context compaction mode is resolved at startup and sent in the
+     * status-detail wire payload; snake_case matches that payload's field naming.
+     */
+    compaction_enabled?: boolean;
     systemPromptTokens: number;
     compartmentCount: number;
+    /** Historical compartment rows retained while native compaction owns the window. */
+    archivedCompartmentCount?: number;
     memoryCount: number;
     memoryBlockCount: number;
     pendingOpsCount: number;

@@ -270,6 +270,84 @@ describe("buildSidebarSnapshot — Rust module status merge", () => {
     });
 });
 
+describe("compaction-off sidebar RPC data", () => {
+    test("reports the resolved mode and raw native usage independently of threshold fill", () => {
+        const db = createTestDb();
+        try {
+            const sessionId = "ses-native-sidebar";
+            db.prepare(
+                `INSERT INTO session_meta (
+                    session_id, last_input_tokens, last_context_percentage,
+                    system_prompt_tokens, memory_block_count
+                ) VALUES (?, 63077, 97, 0, 0)`,
+            ).run(sessionId);
+            replaceAllCompartmentState(
+                db,
+                sessionId,
+                [
+                    {
+                        sequence: 0,
+                        startMessage: 1,
+                        endMessage: 4,
+                        startMessageId: "msg-1",
+                        endMessageId: "msg-4",
+                        title: "Archived",
+                        content: "Historical context retained for later expansion.",
+                    },
+                ],
+                [],
+            );
+
+            const snapshot = buildSidebarSnapshot(
+                db,
+                sessionId,
+                process.cwd(),
+                undefined,
+                4000,
+                { execute_threshold_percentage: 65 },
+                {
+                    usage: {
+                        current_total_input_tokens: 41_000,
+                        context_limit_tokens: 100_000,
+                    },
+                },
+                false,
+            );
+            const detail = buildStatusDetail(
+                db,
+                sessionId,
+                process.cwd(),
+                undefined,
+                { execute_threshold_percentage: 65 },
+                undefined,
+                4000,
+                {
+                    usage: {
+                        current_total_input_tokens: 41_000,
+                        context_limit_tokens: 100_000,
+                    },
+                },
+                false,
+            );
+            const thresholdFillPercentage = (41_000 / (100_000 * 0.65)) * 100;
+
+            expect(snapshot.compaction_enabled).toBe(false);
+            expect(detail.compaction_enabled).toBe(false);
+            expect(snapshot.native_context_usage_percentage).toBe(41);
+            expect(detail.native_context_usage_percentage).toBe(41);
+            expect(snapshot.native_context_usage_percentage).not.toBeCloseTo(
+                thresholdFillPercentage,
+            );
+            expect(snapshot.archivedCompartmentCount).toBe(1);
+
+            const enabledDetail = buildStatusDetail(db, "ses-native-sidebar-on", process.cwd());
+            expect(enabledDetail.compaction_enabled).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
 describe("buildStatusDetail — history token reuse (council audit bg_51106601 #1)", () => {
     test("sets historyBlockTokens from compartmentTokens only (facts retired in v2)", () => {
         const db = createTestDb();

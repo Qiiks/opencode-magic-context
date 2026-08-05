@@ -2,6 +2,7 @@
  * Server-side RPC handlers. Queries the server's own SQLite DB
  * and returns typed responses for TUI consumption.
  */
+import { isCompactionEnabled } from "../config/agent-disable";
 import type { MagicContextConfig } from "../config/schema/magic-context";
 import { getMostRecentTaskRunAt } from "../features/magic-context/dreamer/storage-task-schedule";
 import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
@@ -200,6 +201,7 @@ export function buildSidebarSnapshot(
     // callers), the snapshot falls back to the runtime default of 65%.
     config?: Record<string, unknown>,
     moduleStatus?: RustSessionStatus,
+    compactionEnabled = true,
 ): SidebarSnapshot {
     try {
         const projectIdentity = resolveProjectIdentity(directory);
@@ -257,10 +259,11 @@ export function buildSidebarSnapshot(
                 "SELECT COUNT(*) as count FROM compartments WHERE session_id = ?",
             )
             .get(sessionId);
+        const archivedCompartmentCount = compartmentRow?.count ?? 0;
         const compartmentCount =
             typeof moduleStatus?.compartment_count === "number"
                 ? moduleStatus.compartment_count
-                : (compartmentRow?.count ?? 0);
+                : archivedCompartmentCount;
 
         let memoryCount = 0;
         if (projectIdentity) {
@@ -447,6 +450,12 @@ export function buildSidebarSnapshot(
             executeThresholdClamped = thresholdDetail.clamped === true;
         }
 
+        // Native compaction watches the model's full window, not Magic Context's
+        // execute threshold. Keep this measurement independent of persisted
+        // threshold-relative state so the TUI cannot relabel a threshold fill.
+        const nativeContextUsagePercentage =
+            contextLimit > 0 ? (effectiveInputTokens / contextLimit) * 100 : undefined;
+
         const calibration = resolveModelCalibration(activeProviderID, activeModelID);
         const calibrated = calibrateBuckets({
             inputTokens: effectiveInputTokens,
@@ -467,8 +476,11 @@ export function buildSidebarSnapshot(
             usagePercentage: effectiveUsagePercentage,
             inputTokens: effectiveInputTokens,
             contextLimit,
+            native_context_usage_percentage: nativeContextUsagePercentage,
+            compaction_enabled: compactionEnabled,
             systemPromptTokens: calibrated.systemTokens,
             compartmentCount,
+            archivedCompartmentCount,
             memoryCount,
             memoryBlockCount,
             pendingOpsCount,
@@ -529,6 +541,7 @@ export function buildSidebarSnapshotRpcResponse(
     injectionBudgetTokens?: number,
     config?: Record<string, unknown>,
     moduleStatus?: RustSessionStatus,
+    compactionEnabled = true,
 ): Record<string, unknown> {
     try {
         return buildSidebarSnapshot(
@@ -539,6 +552,7 @@ export function buildSidebarSnapshotRpcResponse(
             injectionBudgetTokens,
             config,
             moduleStatus,
+            compactionEnabled,
         ) as unknown as Record<string, unknown>;
     } catch {
         return { error: "sidebar snapshot unavailable" };
@@ -554,6 +568,7 @@ export function buildStatusDetail(
     liveSessionState?: LiveSessionState,
     injectionBudgetTokens?: number,
     moduleStatus?: RustSessionStatus,
+    compactionEnabled = true,
 ): StatusDetail {
     const base = buildSidebarSnapshot(
         db,
@@ -563,6 +578,7 @@ export function buildStatusDetail(
         injectionBudgetTokens,
         config,
         moduleStatus,
+        compactionEnabled,
     );
     const detail: StatusDetail = {
         ...base,
@@ -793,6 +809,9 @@ export function registerRpcHandlers(
     },
 ): void {
     const { directory, config, liveSessionState, rustModeModuleClient } = args;
+    // Resolve mode once at the RPC boundary. The TUI receives this data and
+    // never reads the config itself.
+    const compactionEnabled = isCompactionEnabled(config);
 
     // Read config as raw object for per-model resolution
     const rawConfig = config as unknown as Record<string, unknown>;
@@ -824,6 +843,7 @@ export function registerRpcHandlers(
             injectionBudgetTokens,
             rawConfig,
             moduleStatus,
+            compactionEnabled,
         );
     });
 
@@ -846,6 +866,7 @@ export function registerRpcHandlers(
             liveSessionState,
             injectionBudgetTokens,
             moduleStatus,
+            compactionEnabled,
         ) as unknown as Record<string, unknown>;
     });
 

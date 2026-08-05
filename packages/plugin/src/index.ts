@@ -618,7 +618,7 @@ const server: Plugin = async (ctx) => {
                 // for permission precedence and hard `steps`/`maxSteps` cap semantics.
                 const commandConfig = {
                     ...(config.command ?? {}),
-                    ...getMagicContextBuiltinCommands(),
+                    ...getMagicContextBuiltinCommands(isCompactionEnabled(pluginConfig)),
                     ...(pluginConfig.command ?? {}),
                 };
 

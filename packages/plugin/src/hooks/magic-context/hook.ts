@@ -1090,6 +1090,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const commandHandler = createMagicContextCommandHandler({
         db,
         protectedTags: deps.config.protected_tags,
+        compactionOff,
         toastDurationMs: deps.config.toast_duration_ms,
         executeThresholdPercentage: deps.config.execute_threshold_percentage ?? 65,
         executeThresholdTokens: deps.config.execute_threshold_tokens,
