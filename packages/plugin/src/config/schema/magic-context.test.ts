@@ -277,5 +277,39 @@ describe("MagicContextConfigSchema", () => {
                 }),
             ).toThrow();
         });
+
+        it("accepts a configured local embedding dtype", () => {
+            const result = MagicContextConfigSchema.parse({
+                embedding: {
+                    provider: "local",
+                    model: "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+                    local_dtype: "q8",
+                },
+            });
+            expect(result.embedding).toEqual({
+                provider: "local",
+                model: "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+                local_dtype: "q8",
+            });
+        });
+
+        it("omits local_dtype from the resolved config when unset (preserves default identity)", () => {
+            const result = MagicContextConfigSchema.parse({
+                embedding: { provider: "local" },
+            });
+            expect(result.embedding).toEqual({
+                provider: "local",
+                model: DEFAULT_LOCAL_EMBEDDING_MODEL,
+            });
+            expect("local_dtype" in result.embedding).toBe(false);
+        });
+
+        it("rejects an unsupported local embedding dtype", () => {
+            expect(() =>
+                MagicContextConfigSchema.parse({
+                    embedding: { provider: "local", local_dtype: "fp64" },
+                }),
+            ).toThrow();
+        });
     });
 });

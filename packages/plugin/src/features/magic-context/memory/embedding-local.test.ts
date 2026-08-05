@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { getEmbeddingProviderIdentity } from "./embedding-identity";
+import { LocalEmbeddingProvider, type LocalEmbeddingDtype } from "./embedding-local";
 import { isNativeRuntimeMissingError } from "./embedding-local";
 
 // Part A of issue #128: classify the PERMANENT "native runtime not installed"
@@ -82,5 +84,61 @@ describe("isNativeRuntimeMissingError", () => {
             code: "ERR_DLOPEN_FAILED",
         });
         expect(isNativeRuntimeMissingError(err)).toBe(false);
+    });
+});
+
+// Issue #259: the local embedding provider must thread a configured dtype into
+// the transformers.js pipeline AND fold it into the model identity so switching
+// dtype re-embeds rather than mixing vector spaces. The default (no dtype) must
+// produce the byte-identical identity as before this field existed.
+describe("LocalEmbeddingProvider dtype threading (#259)", () => {
+    test("default constructor (no dtype) keeps the golden identity", () => {
+        const provider = new LocalEmbeddingProvider();
+        const expected = getEmbeddingProviderIdentity({
+            provider: "local",
+            model: "Xenova/all-MiniLM-L6-v2",
+        });
+        expect(provider.modelId).toBe(expected);
+    });
+
+    test("explicit fp32 dtype matches the default identity (fp32 is the default)", () => {
+        const noDtype = new LocalEmbeddingProvider("Xenova/all-MiniLM-L6-v2", 512);
+        const fp32 = new LocalEmbeddingProvider(
+            "Xenova/all-MiniLM-L6-v2",
+            512,
+            "fp32" as LocalEmbeddingDtype,
+        );
+        expect(fp32.modelId).toBe(noDtype.modelId);
+    });
+
+    test("a non-default dtype produces a different identity than the default", () => {
+        const noDtype = new LocalEmbeddingProvider("Xenova/paraphrase-multilingual-MiniLM-L12-v2");
+        const q8 = new LocalEmbeddingProvider(
+            "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+            512,
+            "q8" as LocalEmbeddingDtype,
+        );
+        expect(q8.modelId).not.toBe(noDtype.modelId);
+        // And it must equal the identity computed with local_dtype folded in.
+        const expected = getEmbeddingProviderIdentity({
+            provider: "local",
+            model: "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+            local_dtype: "q8",
+        });
+        expect(q8.modelId).toBe(expected);
+    });
+
+    test("different non-default dtypes produce different identities", () => {
+        const q8 = new LocalEmbeddingProvider(
+            "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+            512,
+            "q8" as LocalEmbeddingDtype,
+        );
+        const int8 = new LocalEmbeddingProvider(
+            "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+            512,
+            "int8" as LocalEmbeddingDtype,
+        );
+        expect(q8.modelId).not.toBe(int8.modelId);
     });
 });

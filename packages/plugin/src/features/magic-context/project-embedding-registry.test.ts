@@ -283,6 +283,68 @@ describe("project embedding registry", () => {
         });
     });
 
+    it("default local config (no local_dtype) keeps the golden identity — no re-embed on upgrade (#259)", () => {
+        const db = useTempDb();
+        const features = { memoryEnabled: true, gitCommitEnabled: true };
+        const noDtype = registerProjectEmbedding(
+            db,
+            "golden-local-nodtype",
+            { provider: "local", model: "Xenova/all-MiniLM-L6-v2" },
+            features,
+            "/repo",
+        );
+        // Must match the golden local identity from the test above — adding
+        // the local_dtype field must NOT change the default identity string.
+        expect(noDtype.providerIdentity).toBe(
+            "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357",
+        );
+    });
+
+    it("a non-default local_dtype folds into the identity and differs from the default (#259)", () => {
+        const db = useTempDb();
+        const features = { memoryEnabled: true, gitCommitEnabled: true };
+        const withDtype = registerProjectEmbedding(
+            db,
+            "golden-local-q8",
+            {
+                provider: "local",
+                model: "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+                local_dtype: "q8",
+            },
+            features,
+            "/repo",
+        );
+        const sameModelNoDtype = registerProjectEmbedding(
+            db,
+            "golden-local-multilingual-nodtype",
+            {
+                provider: "local",
+                model: "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+            },
+            features,
+            "/repo",
+        );
+        // A non-default dtype must produce a DIFFERENT identity than the same
+        // model without a dtype — otherwise switching dtype would mix vector
+        // spaces instead of re-embedding.
+        expect(withDtype.providerIdentity).not.toBe(sameModelNoDtype.providerIdentity);
+        // And the dtype must actually participate (identity changes with dtype).
+        const withFp32 = registerProjectEmbedding(
+            db,
+            "golden-local-multilingual-fp32",
+            {
+                provider: "local",
+                model: "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+                local_dtype: "fp32",
+            },
+            features,
+            "/repo",
+        );
+        // fp32 is the default, so an explicit fp32 must match the no-dtype
+        // identity (default behavior preserved exactly).
+        expect(withFp32.providerIdentity).toBe(sameModelNoDtype.providerIdentity);
+    });
+
     it("takes a BEGIN IMMEDIATE write lock while registering a project", () => {
         const db = useTempDb();
         const calls: string[] = [];

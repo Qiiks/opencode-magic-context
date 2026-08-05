@@ -384,6 +384,11 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
                       ),
                   }
                 : {}),
+            // local_dtype is spread CONDITIONALLY to preserve the byte-identical
+            // default identity when unset (mirrors the schema transform). Only
+            // a user-configured dtype survives normalization and reaches the
+            // provider + identity hash. See issue #259.
+            ...(config?.local_dtype ? { local_dtype: config.local_dtype } : {}),
         };
     }
 
@@ -483,7 +488,11 @@ function createProvider(
     }
 
     if (config.provider === "local") {
-        return new LocalEmbeddingProvider(config.model, config.max_input_tokens);
+        return new LocalEmbeddingProvider(
+            config.model,
+            config.max_input_tokens,
+            config.local_dtype,
+        );
     }
 
     if (config.provider === "synapse") {
