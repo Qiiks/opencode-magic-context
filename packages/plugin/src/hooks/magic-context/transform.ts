@@ -59,6 +59,10 @@ import { getSdkContextLimit } from "../../shared/models-dev-cache";
 import { applyMidTurnDeferral, detectMidTurnBypassReason } from "./boundary-execution";
 import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 import { replayCavemanCompression } from "./caveman-cleanup";
+import {
+    commitCompactionModeRecord,
+    reconcileCompactionMode,
+} from "./compaction-off-transition";
 import { getActiveCompartmentRun, startCompartmentAgent } from "./compartment-runner";
 import {
     buildTriggerInMemoryTail,
@@ -516,6 +520,19 @@ export interface TransformDeps {
     fallbackModels?: readonly string[];
     /** False when historian.disable=true, blocking historian-backed child agents. */
     historianRunnable?: boolean;
+    /**
+     * Compaction-off mode (issue #266), boot-resolved and process-stable.
+     * When true the transform runs additive-only: m[0]/m[1] memory/docs
+     * injection, measurement and identity recording stay; every mutating
+     * compaction gate (historian, drops, strips, nudges, emergency, markers,
+     * tag writes) is off. Precedence: every mutating gate becomes
+     * `existingGate && !compactionOff` — the mode wins over both the primary
+     * and the subagent path. It does NOT alias fullFeatureMode=false: the
+     * m[0]/m[1] injection gate is re-expressed as identity-present AND
+     * (fullFeatureMode || compactionOff) so the mode cannot swallow memory
+     * delivery.
+     */
+    compactionOff?: boolean;
     getNotificationParams?: (
         sessionId: string,
     ) => import("./send-session-notification").NotificationParams;
@@ -680,6 +697,71 @@ export function createTransform(deps: TransformDeps) {
 
         const reducedMode = sessionMeta.isSubagent;
         const fullFeatureMode = !reducedMode;
+        // Compaction-off mode (issue #266) is a THIRD flag, orthogonal to the
+        // subagent split above: every mutating gate below becomes
+        // `existingGate && !compactionOff`, and the m[0]/m[1] injection gate
+        // is re-expressed as identity-present AND (fullFeatureMode ||
+        // compactionOff) so the mode cannot swallow memory delivery.
+        const compactionOff = deps.compactionOff === true;
+
+        // Mode-transition reconciliation runs on every pass and is a no-op
+        // once the session's durable record matches the boot-resolved mode —
+        // so the transition work (marker cleanup, latch/intent/pending-op
+        // clears, catch-up signal) happens exactly once per session, on the
+        // first pass after a restart that changed the resolved value. The
+        // record commits AFTER the work and the notice emission (delete-
+        // then-record + at-least-once notice contract); a failure here skips
+        // the commit so the next pass retries the same logical transition.
+        try {
+            const transition = reconcileCompactionMode({
+                db,
+                sessionId,
+                compactionOff,
+                historianRunnable: deps.historianRunnable !== false,
+                compartmentInProgress: sessionMeta.compartmentInProgress,
+            });
+            if (transition.recordToWrite !== null) {
+                if (transition.invalidatedM0Baseline) {
+                    // The persisted baseline bytes were nulled; drop the
+                    // pass-local copies too so this pass re-materializes
+                    // instead of replaying the pre-flip render.
+                    sessionMeta = {
+                        ...sessionMeta,
+                        cachedM0Bytes: null,
+                        cachedM1Bytes: null,
+                        cachedM0MuralDataUrl: null,
+                        cachedM0MuralHash: null,
+                    };
+                }
+                if (transition.clearedCompartmentInProgress) {
+                    sessionMeta = { ...sessionMeta, compartmentInProgress: false };
+                }
+                if (transition.historianCatchUpSignaled) {
+                    sessionMeta = { ...sessionMeta, compartmentInProgress: true };
+                }
+                if (transition.notice && deps.client) {
+                    // Out-of-band only — never the message array, never the
+                    // nudge channels. Fire-and-forget like every other
+                    // transform-time notice; the record commit below lands
+                    // after emission so a crash in between repeats the notice
+                    // (the permitted at-least-once window) instead of losing it.
+                    void sendIgnoredMessage(
+                        deps.client,
+                        sessionId,
+                        transition.notice,
+                        deps.getNotificationParams?.(sessionId) ?? {},
+                    );
+                }
+                commitCompactionModeRecord(db, sessionId, transition.recordToWrite);
+            }
+        } catch (error) {
+            passOutcome.record("compaction-mode-transition-failure");
+            sessionLog(
+                sessionId,
+                "compaction mode transition failed (retrying next pass):",
+                error,
+            );
+        }
         // §N§ prefix + ctx_reduce + Channel 1 are gated on this single signal,
         // NOT on subagent status. `ctx_reduce` is registered process-globally
         // (tool-registry.ts), so subagents may have the tool — they just need
@@ -762,6 +844,7 @@ export function createTransform(deps: TransformDeps) {
         const historianRunnable = deps.historianRunnable !== false;
         const canRunCompartments =
             fullFeatureMode &&
+            !compactionOff &&
             historianRunnable &&
             deps.client !== undefined &&
             compartmentDirectory.length > 0;
@@ -914,7 +997,13 @@ export function createTransform(deps: TransformDeps) {
         // pressure math says. Without this, an overflow on a session whose
         // limit resolver over-reported the real limit would never enter the
         // emergency path — we'd just keep hitting the same overflow error.
-        if (fullFeatureMode) {
+        //
+        // Compaction-off mode: the whole overflow/emergency machinery is
+        // gated off — no proactive arming, no synthetic 95% bump, no
+        // no-head escape notice. A persisted latch is cleared by the
+        // off-transition, never consumed; overflow propagates to native
+        // compaction instead.
+        if (fullFeatureMode && !compactionOff) {
             try {
                 // Proactive arm for a shrinking model switch (large->small
                 // context). After switching to a smaller-context model, the
@@ -1119,14 +1208,20 @@ export function createTransform(deps: TransformDeps) {
                               100),
                   )
                 : undefined;
-        const schedulerDecisionEarly = resolveSchedulerDecision(
-            deps.scheduler,
-            sessionMeta,
-            contextUsageEarly,
-            sessionId,
-            deps.getModelKey?.(sessionId),
-            resolvedContextLimit,
-        );
+        // Compaction-off: drop scheduling is gated off — the scheduler never
+        // approves an execute pass, so no pending-op drain, heuristic cleanup,
+        // age sweep or smart drop can fire, and the execute-only
+        // lastResponseTime watermark write below stays quiet too.
+        const schedulerDecisionEarly = compactionOff
+            ? ("defer" as const)
+            : resolveSchedulerDecision(
+                deps.scheduler,
+                sessionMeta,
+                contextUsageEarly,
+                sessionId,
+                deps.getModelKey?.(sessionId),
+                resolvedContextLimit,
+            );
         const midTurn = isMidTurn(deps, resolvedSessionId);
         const bypassReason = detectMidTurnBypassReason({
             contextUsage: contextUsageEarly,
@@ -1299,6 +1394,7 @@ export function createTransform(deps: TransformDeps) {
 
         if (
             fullFeatureMode &&
+            !compactionOff &&
             historianFailureState.failureCount > 0 &&
             contextUsageEarly.percentage >= 95 &&
             !recoveryNoHeadEscapeActive
@@ -1330,6 +1426,7 @@ export function createTransform(deps: TransformDeps) {
             );
         } else if (
             fullFeatureMode &&
+            !compactionOff &&
             isFirstTransformPassForSession &&
             historianFailureState.failureCount > 0 &&
             getEligibleHistoryForCompartment() &&
@@ -1442,13 +1539,13 @@ export function createTransform(deps: TransformDeps) {
         // the floor only needs the leading wire ids, which are always present, so
         // deriving it here keeps both tag scans scoped on every pass (those
         // anchor-miss passes were the residual ~90ms full-scan regression).
-        const taggerFloor = deriveTaggerLoadFloor(messages, sessionId, db);
+        const taggerFloor = compactionOff ? 0 : deriveTaggerLoadFloor(messages, sessionId, db);
         // floor 0 = no leading wire message resolved to a tag → BOTH tag scans
         // (tagger initFromDb + the trigger's token scans) fall back to the full
         // ~O(session) load. On a large session that's the ~70ms compartmentTrigger
         // we are trying to avoid, so surface it as a one-line health signal rather
         // than letting it hide as silent latency.
-        if (taggerFloor === 0 && messages.length > 0) {
+        if (!compactionOff && taggerFloor === 0 && messages.length > 0) {
             sessionLog(
                 sessionId,
                 `tag floor: 0 (full-scan fallback) — no leading wire message resolved a tag across ${messages.length} msgs`,
@@ -1456,7 +1553,12 @@ export function createTransform(deps: TransformDeps) {
         }
 
         let triggerBoundarySnapshot: ProtectedTailBoundarySnapshot | undefined;
-        if (fullFeatureMode && historianRunnable && !sessionMeta.compartmentInProgress) {
+        if (
+            fullFeatureMode &&
+            !compactionOff &&
+            historianRunnable &&
+            !sessionMeta.compartmentInProgress
+        ) {
             const tTrigger = performance.now();
             try {
                 const inMemoryTail = buildTriggerInMemoryTail(
@@ -1497,7 +1599,12 @@ export function createTransform(deps: TransformDeps) {
 
         let pendingCompartmentInjection: PreparedCompartmentInjection | null = null;
         let rebuiltHistoryFromInitialPrepare = false;
-        if (fullFeatureMode) {
+        // Compaction-off bypasses compartment-history preparation entirely,
+        // even when historical compartment rows exist: no <session-history>
+        // render, no raw-tail trim, no boundary splice, no marker write.
+        // Memory/docs surfaces materialize independently through the
+        // zero-compartment m[0]/m[1] path in postprocess.
+        if (fullFeatureMode && !compactionOff) {
             const tInj = performance.now();
             pendingCompartmentInjection = prepareCompartmentInjection(
                 db,
@@ -1572,7 +1679,10 @@ export function createTransform(deps: TransformDeps) {
         // The retroactive-on-flag-flip behavior is the same mechanism — when
         // the flag turns on, the first pass marks every eligible user message
         // and subsequent passes just observe the already-marked content.
-        if (deps.experimentalTemporalAwareness) {
+        // Compaction-off: temporal markers/overlays are part of the gated
+        // compaction surface (additive but mode-owned), so the wire stays
+        // untouched in this mode.
+        if (deps.experimentalTemporalAwareness && !compactionOff) {
             const tTemporal = performance.now();
             const injected = injectTemporalMarkers(messages);
             if (injected > 0) {
@@ -1582,6 +1692,14 @@ export function createTransform(deps: TransformDeps) {
         }
 
         let taggingSucceeded = false;
+        // Compaction-off mode: the tagger writes ZERO tag rows and emits no
+        // §N§ prefixes (spec #266 decision #6). Every consumer of the tag
+        // walk's outputs (drops, heuristics, nudges, caveman, flushed-status
+        // replay) is itself gated off in this mode, so the whole walk is
+        // skipped — no rows, no prefixes, no commit scan. Flip-back
+        // self-heals: the tagger lazily mints on first observation of
+        // untagged wire content once this gate reopens.
+        if (!compactionOff) {
         try {
             const t0 = performance.now();
             const tInitFromDb = performance.now();
@@ -1641,6 +1759,7 @@ export function createTransform(deps: TransformDeps) {
                 sessionLog(sessionId, "tagger cleanup after failure threw:", cleanupError);
             }
         }
+        }
 
         // P0 perf: replace single SELECT-everything load with three
         // targeted queries. The hot transform path used to load every
@@ -1664,12 +1783,14 @@ export function createTransform(deps: TransformDeps) {
         // and caveman replay both filter to targets.has(tagNumber), so
         // pre-filtering by tag_number is a no-op for correctness.
         const t1 = performance.now();
-        const activeTags = getActiveTagsBySession(db, sessionId);
+        const activeTags = compactionOff ? [] : getActiveTagsBySession(db, sessionId);
         logTransformTiming(sessionId, "getActiveTagsBySession", t1, `count=${activeTags.length}`);
 
         const t1b = performance.now();
         const targetTagNumbers = [...targets.keys()];
-        const targetsSliceTags = getTagsByNumbers(db, sessionId, targetTagNumbers);
+        const targetsSliceTags = compactionOff
+            ? []
+            : getTagsByNumbers(db, sessionId, targetTagNumbers);
         logTransformTiming(
             sessionId,
             "getTagsByNumbers",
@@ -1707,7 +1828,8 @@ export function createTransform(deps: TransformDeps) {
         // Empty text part sentinels are safe only for canonical Anthropic, where
         // OpenCode filters them before the wire. Other providers keep native
         // structural parts so an empty text block cannot break tool adjacency.
-        const strippedStructuralNoise = canUseEmptySentinels ? stripStructuralNoise(messages) : 0;
+        const strippedStructuralNoise =
+            canUseEmptySentinels && !compactionOff ? stripStructuralNoise(messages) : 0;
         logTransformTiming(
             sessionId,
             "stripStructuralNoise",
@@ -1719,7 +1841,7 @@ export function createTransform(deps: TransformDeps) {
         // This ensures reasoning cleared on a previous cache-busting pass stays cleared
         // even when OpenCode rebuilds messages fresh from its own DB.
         const persistedReasoningWatermark = sessionMeta?.clearedReasoningThroughTag ?? 0;
-        if (persistedReasoningWatermark > 0) {
+        if (persistedReasoningWatermark > 0 && !compactionOff) {
             const tReplay = performance.now();
             // Typed reasoning replay is canonical-Anthropic-only, matching the
             // clearOldReasoning WRITE gate (transform-postprocess-phase.ts). The
@@ -1763,7 +1885,7 @@ export function createTransform(deps: TransformDeps) {
         // applyFlushedStatuses) — replay only acts on tags whose
         // tag_number is in `targets` anyway, so passing the wider list
         // would just give it more rows to filter and discard.
-        if (!reducedMode && deps.cavemanTextCompression?.enabled) {
+        if (!reducedMode && !compactionOff && deps.cavemanTextCompression?.enabled) {
             const tCavemanReplay = performance.now();
             const replayedCaveman = replayCavemanCompression(
                 sessionId,
@@ -1781,7 +1903,8 @@ export function createTransform(deps: TransformDeps) {
         // `clearOldReasoning` replays `[cleared]` as native reasoning text for all
         // providers. Only Anthropic may replace those shells with empty text
         // sentinels; other providers can forward the empty part to the wire.
-        const strippedClearedReasoning = canUseEmptySentinels ? stripClearedReasoning(messages) : 0;
+        const strippedClearedReasoning =
+            canUseEmptySentinels && !compactionOff ? stripClearedReasoning(messages) : 0;
         logTransformTiming(
             sessionId,
             "stripClearedReasoning",
@@ -1803,6 +1926,7 @@ export function createTransform(deps: TransformDeps) {
         const compartmentPhase = await runCompartmentPhase({
             canRunCompartments,
             fullFeatureMode,
+            compactionOff,
             historianRunnable,
             sessionMeta,
             contextUsage,
@@ -1937,6 +2061,7 @@ export function createTransform(deps: TransformDeps) {
             contextUsage,
             schedulerDecision,
             fullFeatureMode,
+            compactionOff,
             canRunCompartments,
             awaitedCompartmentRun,
             phaseJustAwaitedPublication: compartmentPhase.justAwaitedPublication,
@@ -2001,6 +2126,11 @@ export function createTransform(deps: TransformDeps) {
             },
         });
         passOutcome.markFinalized();
+        // Compaction-off: the emergency/overflow machinery is fully disarmed
+        // (≥85% tiered drop, 95% fail-closed block, overflow-recovery latch).
+        // A persisted latch is cleared by the off-transition, never consumed
+        // here; overflow propagates to native compaction instead of blocking.
+        if (!compactionOff) {
         // Fresh-tokenize only in the emergency band. This estimate is telemetry,
         // never an abort gate: provider-accurate accounting is deferred to the
         // module-side implementation.
@@ -2102,6 +2232,7 @@ export function createTransform(deps: TransformDeps) {
                 `EMERGENCY: fail-closed (reason=${emergencyFailClosed.reason}, recoveryOrigin=${emergencyRecoveryOrigin ?? "unknown"}, finalEstimate=${finalWireEstimate?.tokens ?? "unavailable"}, estimateTrusted=${finalWireEstimate?.trusted ?? false}, syntheticUsage=${usagePercentageSynthetic})`,
             );
             return;
+        }
         }
 
         if (passOutcome.captureEligible) {
@@ -2251,7 +2382,7 @@ export function createTransform(deps: TransformDeps) {
         // bloat). It must NOT fire when the session's tool allow-list denies
         // ctx_reduce. Channel 2 (the synthetic-user ceiling) rides the same gate
         // — it fires for any ctx_reduce-effective session, subagents included.
-        if (ctxReduceCallable && deps.channel1StateBySession) {
+        if (ctxReduceCallable && !compactionOff && deps.channel1StateBySession) {
             try {
                 // Always resolve through resolveExecuteThreshold — even when the
                 // percentage config is a bare number — so an execute_threshold_tokens

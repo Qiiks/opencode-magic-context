@@ -378,6 +378,14 @@ interface RunPostTransformPhaseArgs {
     contextUsage: { percentage: number; inputTokens: number };
     schedulerDecision: "execute" | "defer";
     fullFeatureMode: boolean;
+    /**
+     * Compaction-off mode (issue #266), boot-resolved. Every mutating gate in
+     * this phase becomes `existingGate && !compactionOff`; the m[0]/m[1]
+     * injection gate is re-expressed as identity-present AND (fullFeatureMode
+     * || compactionOff) so the mode keeps additive memory/docs delivery (and
+     * extends it to subagent sessions, which gain the knowledge surface).
+     */
+    compactionOff?: boolean;
     canRunCompartments: boolean;
     awaitedCompartmentRun: boolean;
     phaseJustAwaitedPublication: boolean;
@@ -592,6 +600,7 @@ export function finalizeMessageRepresentation(
 export async function runPostTransformPhase(
     args: RunPostTransformPhaseArgs,
 ): Promise<PostTransformPhaseResult> {
+    const compactionOff = args.compactionOff === true;
     // `isExplicitFlush` reads pendingMaterializationSessions — the persistent
     // "user wants pending ops + heuristics to run" signal. Survives across
     // blocked defer passes (compartmentRunning) so /ctx-flush intent is not
@@ -608,7 +617,9 @@ export async function runPostTransformPhase(
         args.currentTurnId !== null &&
         args.lastHeuristicsTurnId.get(args.sessionId) === args.currentTurnId;
     const forceMaterialization =
-        args.fullFeatureMode && args.contextUsage.percentage >= args.forceMaterializationPercentage;
+        args.fullFeatureMode &&
+        !compactionOff &&
+        args.contextUsage.percentage >= args.forceMaterializationPercentage;
     // Tiered emergency drop eligibility (Phase 2). Unlike `forceMaterialization`
     // (primary-only — it also forces m[0] materialization), the emergency tool
     // floor fires at ≥85% for BOTH primary AND subagent: it's the only tool
@@ -617,7 +628,7 @@ export async function runPostTransformPhase(
     // so it only runs when heuristics run (see shouldRunHeuristics) AND usage is
     // ≥ the force-materialize threshold.
     const emergencyDropEligible =
-        args.contextUsage.percentage >= args.forceMaterializationPercentage;
+        !compactionOff && args.contextUsage.percentage >= args.forceMaterializationPercentage;
     const activeCompartmentRun = args.canRunCompartments
         ? getActiveCompartmentRun(args.sessionId)
         : undefined;
@@ -640,10 +651,15 @@ export async function runPostTransformPhase(
     // Kept a SEPARATE boolean — NEVER folded into materializationRequested, which
     // drives the lastResponseTime TTL reset and pendingMaterialization cleanup;
     // folding in would suppress those and oscillate.
+    // Re-gated for compaction-off mode (issue #266): injection runs when the
+    // memory/docs identity is present AND (fullFeatureMode || compactionOff),
+    // so the mode cannot swallow m[0]/m[1] delivery — and a compaction-off
+    // SUBAGENT session receives the additive blocks too (injectM0M1's
+    // isSubagent skip is lifted by the same flag).
     const m0M1EnabledForFold =
-        args.fullFeatureMode &&
         args.m0M1 !== undefined &&
-        (!!args.m0M1.projectPath || !!args.m0M1.projectDirectory);
+        (!!args.m0M1.projectPath || !!args.m0M1.projectDirectory) &&
+        (args.fullFeatureMode || compactionOff);
     const m0HardFoldThisPass =
         m0M1EnabledForFold && args.m0M1
             ? mustMaterialize({
@@ -675,11 +691,12 @@ export async function runPostTransformPhase(
     //     drain/publish ordering is benign.
     const bypassCompartmentGate = forceMaterialization || m0HardFoldThisPass;
     const shouldReadPendingOps =
-        materializationRequested ||
-        args.schedulerDecision === "execute" ||
-        forceMaterialization ||
-        m0HardFoldThisPass ||
-        compartmentRunning;
+        !compactionOff &&
+        (materializationRequested ||
+            args.schedulerDecision === "execute" ||
+            forceMaterialization ||
+            m0HardFoldThisPass ||
+            compartmentRunning);
     const pendingOps = shouldReadPendingOps ? getPendingOps(args.db, args.sessionId) : [];
     const hasPendingUserOps = pendingOps.length > 0;
     // Finding #3: include `forceMaterialization` so the emergency bypass is
@@ -688,6 +705,7 @@ export async function runPostTransformPhase(
     // cleanup would still fire (it gates on forceMaterialization directly),
     // causing unguarded cache busts while pending ops stop materializing.
     const shouldApplyPendingOps =
+        !compactionOff &&
         (args.schedulerDecision === "execute" ||
             materializationRequested ||
             forceMaterialization ||
@@ -718,6 +736,7 @@ export async function runPostTransformPhase(
     // prevents per-defer-pass thrash; only passes the scheduler explicitly
     // approves for execution can fire heuristics.
     const shouldRunHeuristics =
+        !compactionOff &&
         (!compartmentRunning || bypassCompartmentGate) &&
         (materializationRequested ||
             forceMaterialization ||
@@ -1010,7 +1029,7 @@ export async function runPostTransformPhase(
             updateSessionMeta(args.db, args.sessionId, { lastResponseTime: Date.now() });
         }
 
-        const toolReclaimExecutePass = args.schedulerDecision === "execute";
+        const toolReclaimExecutePass = !compactionOff && args.schedulerDecision === "execute";
         const alreadyMutatingThisPass = pendingOpsDidMutate || heuristicOrReasoningDidMutate;
         let autoReclaimTargetCount = 0;
         let autoReclaimDidMutate = false;
@@ -1132,7 +1151,7 @@ export async function runPostTransformPhase(
     // moving boundary entirely. Empty reduce sentinels are Anthropic-only: on
     // other providers even a previously frozen id must stay native so no empty
     // text block can reach the wire.
-    if (canUseEmptySentinels) {
+    if (canUseEmptySentinels && !compactionOff) {
         try {
             const t8 = performance.now();
             const frozenStaleReduceIds = getStaleReduceStrippedIds(args.db, args.sessionId);
@@ -1160,7 +1179,7 @@ export async function runPostTransformPhase(
     // that first strip on the live watermark let a DEFER pass cross an older
     // image message and remove its images mid-prefix, busting the cache.
     // Freeze the id set on cache-busting passes; replay it every pass.
-    if (canUseEmptySentinels) {
+    if (canUseEmptySentinels && !compactionOff) {
         try {
             const tImg = performance.now();
             const frozenImageIds = getProcessedImageStrippedIds(args.db, args.sessionId);
@@ -1198,6 +1217,10 @@ export async function runPostTransformPhase(
                 isCacheBustingPass,
                 hardSignals: args.m0M1.hardSignals,
                 muralEnabled: args.m0M1.muralEnabled,
+                // Compaction-off materializes through the zero-compartment
+                // path: memory/docs/user-profile render, but historical
+                // compartment rows never reach <session-history>.
+                compactionOff,
             });
             if (result.injected) {
                 m0M1InjectedThisPass = true;
@@ -1266,7 +1289,7 @@ export async function runPostTransformPhase(
             clearInjectionCache(args.sessionId);
         }
         logTransformTiming(args.sessionId, "pp.injectM0M1", tInjectM0M1);
-    } else if (args.fullFeatureMode && args.pendingCompartmentInjection) {
+    } else if (args.fullFeatureMode && !compactionOff && args.pendingCompartmentInjection) {
         const compartmentResult = renderCompartmentInjection(
             args.sessionId,
             args.messages,
@@ -1303,7 +1326,10 @@ export async function runPostTransformPhase(
     // Cache-safe: replay previously-neutralized IDs on every pass, only detect new
     // matches on cache-busting passes. Persist the merged set (placeholder + system-
     // injected) so defer passes produce the same message shape as the bust pass.
-    {
+    //
+    // Compaction-off: placeholder/system-injected neutralization is strip
+    // machinery — gated off; the wire keeps its original shape.
+    if (!compactionOff) {
         const tPlaceholder = performance.now();
         const persistedIds = getStrippedPlaceholderIds(args.db, args.sessionId);
 
@@ -1460,16 +1486,23 @@ export async function runPostTransformPhase(
         }
     }
 
-    reconcileMarkerRepresentation(
-        args.messages,
-        getPersistedCompactionMarkerState(args.db, args.sessionId),
-        {
-            db: args.db,
-            sessionId: args.sessionId,
-            tagger: args.tagger,
-            ctxReduceAvailability: args.ctxReduceAvailability,
-        },
-    );
+    // Compaction-off: the marker reconciler and the deferred marker drain are
+    // compaction machinery — gated off. The off-transition deletes the MC
+    // marker rows and clears the persisted/pending marker state, so nothing
+    // here has state to replay; leaving it live would re-insert a synthetic
+    // summary into the wire of a mode that must stay additive-only.
+    if (!compactionOff) {
+        reconcileMarkerRepresentation(
+            args.messages,
+            getPersistedCompactionMarkerState(args.db, args.sessionId),
+            {
+                db: args.db,
+                sessionId: args.sessionId,
+                tagger: args.tagger,
+                ctxReduceAvailability: args.ctxReduceAvailability,
+            },
+        );
+    }
 
     const deferredHistoryDrainEligible =
         historyWasConsumedThisPass &&
@@ -1536,7 +1569,9 @@ export async function runPostTransformPhase(
     //   - Defer passes only replay an already-persisted (callID, anchor) pair
     //     via `injectToolPartIntoAssistantById`, which is idempotent on
     //     callID — repeated defer-pass calls produce byte-identical output.
-    if (args.fullFeatureMode) {
+    // Compaction-off: synthetic todowrite context-management injection (B7)
+    // is gated off with the rest of the compaction surface.
+    if (args.fullFeatureMode && !compactionOff) {
         const persistedAnchor = getPersistedTodoSyntheticAnchor(args.db, args.sessionId);
         // A FROZEN "unavailable" verdict means the session's tools map filters
         // the native todowrite tool out (user/agent config disabled it). Such a

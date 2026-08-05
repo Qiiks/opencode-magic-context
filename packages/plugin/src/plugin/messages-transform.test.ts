@@ -211,3 +211,101 @@ describe("createMessagesTransformHandler — fail-closed blocking (note #906)", 
         await expect(handler({}, makeOutput())).resolves.toBeDefined();
     });
 });
+
+describe("createMessagesTransformHandler — compaction-off fail-closed inertness (issue #266 S3)", () => {
+    it("storage-unavailable (armed fail-closed) degrades to passthrough: no throw, input messages unchanged", async () => {
+        const failClosed = createFailClosedController();
+        failClosed.arm({
+            kind: "schema_fence",
+            persistedVersion: 65,
+            supportedVersion: 64,
+        });
+        let innerCalled = false;
+        const handler = createMessagesTransformHandler({
+            magicContext: {
+                "experimental.chat.messages.transform": async () => {
+                    innerCalled = true;
+                },
+            },
+            failClosed,
+            failClosedBlockingEnabled: true,
+            compactionOff: true,
+        });
+
+        const output = makeOutput();
+        // In compaction-off mode fail_closed_blocking is inert BY DESIGN: no
+        // blocking error, no cancelled request — the input comes back as-is.
+        await expect(handler({}, output)).resolves.toBeDefined();
+        expect(innerCalled).toBe(false);
+        expect(output.messages).toHaveLength(1);
+        expect(output.messages[0].info.id).toBe("m1");
+        expect((output.messages[0].parts[0] as { text: string }).text).toBe("hello");
+    });
+
+    it("an unexpected throw mid-pass restores the exact input messages (no partial mutation leaks)", async () => {
+        const handler = createMessagesTransformHandler({
+            magicContext: {
+                "experimental.chat.messages.transform": async (_input, out) => {
+                    // Mutate the array in place (as the real transform does),
+                    // then blow up — the wrapper must hand back the INPUT.
+                    (out.messages as unknown[]).unshift({
+                        info: { id: "injected", role: "user", sessionID: "ses_test" },
+                        parts: [{ type: "text", text: "injected head" }],
+                    });
+                    throw new TypeError("unexpected failure after partial mutation");
+                },
+            },
+            compactionOff: true,
+        });
+
+        const output = makeOutput();
+        await expect(handler({}, output)).resolves.toBeDefined();
+        expect(output.messages).toHaveLength(1);
+        expect(output.messages[0].info.id).toBe("m1");
+    });
+
+    it("SQLITE_BUSY also restores the input shape in compaction-off mode", async () => {
+        const handler = createMessagesTransformHandler({
+            magicContext: {
+                "experimental.chat.messages.transform": async (_input, out) => {
+                    (out.messages as unknown[]).push({
+                        info: { id: "extra", role: "user", sessionID: "ses_test" },
+                        parts: [{ type: "text", text: "extra" }],
+                    });
+                    const err = new Error("database is locked") as Error & { code: string };
+                    err.code = "SQLITE_BUSY";
+                    throw err;
+                },
+            },
+            compactionOff: true,
+        });
+
+        const output = makeOutput();
+        await expect(handler({}, output)).resolves.toBeDefined();
+        expect(output.messages).toHaveLength(1);
+        expect(output.messages[0].info.id).toBe("m1");
+    });
+
+    it("REGRESSION: with compaction ON the same armed fail-closed state still blocks loudly", async () => {
+        const failClosed = createFailClosedController();
+        failClosed.arm({
+            kind: "schema_fence",
+            persistedVersion: 65,
+            supportedVersion: 64,
+        });
+        const handler = createMessagesTransformHandler({
+            magicContext: null,
+            failClosed,
+            failClosedBlockingEnabled: true,
+            compactionOff: false,
+        });
+
+        let thrown: unknown;
+        try {
+            await handler({}, makeOutput());
+        } catch (error) {
+            thrown = error;
+        }
+        expect(isFailClosedBlockingError(thrown)).toBe(true);
+    });
+});

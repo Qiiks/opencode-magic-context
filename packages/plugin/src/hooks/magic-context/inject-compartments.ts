@@ -811,6 +811,15 @@ export interface M0M1RenderOptions {
      * deterministic mural on demand and folds its image into the m[0] baseline. */
     muralEnabled?: boolean;
     isCacheBustingPass?: boolean;
+    /**
+     * Compaction-off mode (issue #266): materialize through the
+     * zero-compartment path — memory/docs/user-profile render into m[0], but
+     * historical compartment rows never reach `<session-history>` (no render,
+     * no raw-tail trim, no boundary splice, no marker write), and the
+     * isSubagent skip in injectM0M1 is lifted so subagent sessions receive
+     * the additive knowledge blocks too.
+     */
+    compactionOff?: boolean;
     /** Provider-side cache-eviction signals for HARD-bust detection. */
     hardSignals?: M0HardSignals;
     workspaceIdentitySet?: WorkspaceIdentitySet;
@@ -2067,7 +2076,11 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         });
         docs = readProjectDocsForM0(projectDirectory, options.injectDocs);
         snapshotMarkers.projectDocsHash = docs.canonicalHash;
-        compartments = readM0Compartments(options.db, options.sessionId);
+        // Compaction-off: the zero-compartment path — historical compartment
+        // rows exist but never render into <session-history>. The snapshot
+        // markers still read the real maxCompartmentSeq so the staleness
+        // check stays accurate; only the render input is emptied.
+        compartments = options.compactionOff ? [] : readM0Compartments(options.db, options.sessionId);
         // v2 faithful facts: session_facts is retired as a render source (facts
         // promote to project memory, rendered below via `memories`). Keep `facts`
         // empty so renderSessionHistoryWithDecay never emits a <session_facts>
@@ -2894,11 +2907,14 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
     // cleared this pass), use 0 (stable: renders all memories with no expiry
     // filtering, deterministic across passes — matches Pi fallback).
     snapshotMarkers.materializedAt = options.state.cachedM0MaterializedAt ?? 0;
-    const compartments = withCompartmentDates(
-        options.sessionId,
-        readM0Compartments(options.db, options.sessionId),
-        options.temporalAwareness,
-    );
+    // Compaction-off renders through the zero-compartment path here too.
+    const compartments = options.compactionOff
+        ? []
+        : withCompartmentDates(
+              options.sessionId,
+              readM0Compartments(options.db, options.sessionId),
+              options.temporalAwareness,
+          );
     // Use the SAME frozen cutoff for the baseline memory read as m[1] does, so a
     // memory crossing expires_at between two fallback passes can't shift the m[0]
     // baseline bytes either (live Date.now() default would reintroduce drift).
@@ -3010,7 +3026,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
         m0Bytes: options.state.cachedM0Bytes,
         m1Text: null,
     };
-    if (options.state.isSubagent) return skipped;
+    if (options.state.isSubagent && !options.compactionOff) return skipped;
 
     const decision = mustMaterialize({
         db: options.db,

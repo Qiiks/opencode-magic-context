@@ -78,6 +78,13 @@ interface MessageRemovedCleanupResult {
 export interface EventHandlerDeps {
     contextUsageMap: Map<string, ContextUsageEntry>;
     compactionHandler: ReturnType<typeof createCompactionHandler>;
+    /**
+     * Compaction-off mode (issue #266), boot-resolved. Overflow recovery is
+     * never armed in this mode (record the provider-reported limit only, so
+     * raw-usage math stays accurate) and Channel-2 delivery stays silent;
+     * the off-transition clears any persisted intent.
+     */
+    compactionOff?: boolean;
     onSessionCacheInvalidated?: (sessionId: string) => void;
     onRustWireInvalidated?: (sessionId: string) => void;
     onSessionDeleted?: (sessionId: string) => void;
@@ -329,6 +336,29 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     return;
                 }
                 const existing = getOverflowState(deps.db, errInfo.sessionID);
+                if (deps.compactionOff) {
+                    // Compaction-off: never arm MC emergency recovery — the
+                    // latch machinery is gated off and the off-transition
+                    // clears any persisted latch. The provider-reported limit
+                    // is still useful for raw-usage math (the sidebar's only
+                    // numeric source in this mode), so record it without
+                    // arming, exactly like the subagent path above.
+                    if (
+                        typeof detection.reportedLimit === "number" &&
+                        detection.reportedLimit > 0
+                    ) {
+                        recordDetectedContextLimit(
+                            deps.db,
+                            errInfo.sessionID,
+                            detection.reportedLimit,
+                        );
+                    }
+                    sessionLog(
+                        errInfo.sessionID,
+                        `overflow detected in compaction-off mode: reportedLimit=${detection.reportedLimit ?? "unknown"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only (recovery disarmed; native compaction owns the window)`,
+                    );
+                    return;
+                }
                 dropSlot(errInfo.sessionID, "overflow-recovery-arm");
                 recordOverflowDetected(deps.db, errInfo.sessionID, detection.reportedLimit);
                 sessionLog(
@@ -412,6 +442,24 @@ export function createEventHandler(deps: EventHandlerDeps) {
                             sessionLog(
                                 info.sessionID,
                                 `overflow detected on subagent via message.updated: reportedLimit=${detection.reportedLimit ?? "unknown"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only`,
+                            );
+                        } else if (deps.compactionOff) {
+                            // Compaction-off: record the limit only, never arm
+                            // recovery (mirrors the session.error path above).
+                            if (
+                                typeof detection.reportedLimit === "number" &&
+                                detection.reportedLimit > 0
+                            ) {
+                                recordDetectedContextLimit(
+                                    deps.db,
+                                    info.sessionID,
+                                    detection.reportedLimit,
+                                    overflowModelKey,
+                                );
+                            }
+                            sessionLog(
+                                info.sessionID,
+                                `overflow detected in compaction-off mode via message.updated: reportedLimit=${detection.reportedLimit ?? "unknown"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only`,
                             );
                         } else {
                             dropSlot(info.sessionID, "overflow-recovery-arm");
@@ -621,7 +669,8 @@ export function createEventHandler(deps: EventHandlerDeps) {
             if (
                 (info.finish === "stop" || info.finish === "tool-calls") &&
                 deps.client &&
-                deps.channel1StateBySession
+                deps.channel1StateBySession &&
+                !deps.compactionOff
             ) {
                 void deliverChannel2IfPending(deps, info.sessionID);
             }
