@@ -2088,6 +2088,25 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
+/// The highest `mc_cache` schema migration this binary ships.
+///
+/// The store has no separate fence constant: `McStore::open` applies every bundled
+/// migration on open, so the newest bundled migration IS the binary's supported
+/// ceiling. Status surfaces report this value to answer "which schema does this
+/// binary support" without a second source of truth that could drift from the
+/// migration list.
+pub const LATEST_MIGRATION_VERSION: u32 = {
+    let mut latest = 0;
+    let mut index = 0;
+    while index < MIGRATIONS.len() {
+        if MIGRATIONS[index].version > latest {
+            latest = MIGRATIONS[index].version;
+        }
+        index += 1;
+    }
+    latest
+};
+
 /// Apply the route-to-identity vocabulary law inside the caller's fenced transaction.
 /// Deletes only content twins, then rekeys remaining route rows and their mutation/note
 /// companions. The authority predicate is repeated on every statement so a binding is
@@ -5863,6 +5882,21 @@ impl McStore {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = previous;
                 result
+            })
+            .map_err(Into::into)
+    }
+
+    /// The applied schema version of this store's `mc_cache` migration chain:
+    /// MAX(version) recorded in the shared `cortexkit_schema_version` table for this
+    /// namespace. Read-only probe for status surfaces; it never writes.
+    pub fn module_store_schema_version(&self) -> Result<u32, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM cortexkit_schema_version WHERE namespace = ?1",
+                    params![NS],
+                    |row| row.get::<_, u32>(0),
+                )
             })
             .map_err(Into::into)
     }
@@ -16394,6 +16428,26 @@ mod tests {
             })
             .unwrap();
         assert_eq!(remaining_classes, vec!["byte-mismatch"]);
+    }
+
+    #[test]
+    fn schema_version_probe_reads_the_live_store_and_matches_the_shipped_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        // The live probe must read the namespace this store actually migrates, and the
+        // compile-time ceiling must equal the newest migration the binary ships; a
+        // drift between either pair is exactly the skew the status surface exists to
+        // expose.
+        let shipped_max = MIGRATIONS
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .unwrap();
+        assert_eq!(LATEST_MIGRATION_VERSION, shipped_max);
+        assert_eq!(
+            store.module_store_schema_version().unwrap(),
+            LATEST_MIGRATION_VERSION
+        );
     }
 
     #[test]

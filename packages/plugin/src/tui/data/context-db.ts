@@ -202,6 +202,10 @@ export async function loadStatusDetail(
         compressionBudget: null,
         compressionUsage: null,
         toastDurationMs: 5000,
+        storage_versions: {
+            context_db_schema_version: 0,
+            plugin_supported_version: 0,
+        },
     };
 
     if (!rpcClient) return emptyDetail;

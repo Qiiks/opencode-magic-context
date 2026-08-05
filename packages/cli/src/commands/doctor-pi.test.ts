@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { LATEST_SUPPORTED_VERSION } from "@magic-context/core/features/magic-context/storage-db";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { parse as parseJsonc } from "comment-json";
 import { openExistingContextDatabase } from "../lib/database-access";
@@ -270,6 +271,11 @@ describe("Pi doctor", () => {
         expect(prompts.messages.join("\n")).toContain(
             "PASS Opened the shared DB read-only with a supported schema",
         );
+        // The stable storage-version probe reports the live DB schema (50) against
+        // this binary's fence, matching the values the RPC status surface carries.
+        const output = prompts.messages.join("\n");
+        expect(output).toContain("context_db_schema_version=50");
+        expect(output).toContain(`plugin_supported_version=${LATEST_SUPPORTED_VERSION}`);
     });
 
     it("warns when the local onnxruntime native binding is absent", async () => {

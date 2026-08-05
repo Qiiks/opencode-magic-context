@@ -12,6 +12,10 @@ import {
     openDatabase,
     setSessionWorkMetrics,
 } from "../features/magic-context/storage";
+import {
+    getPersistedSchemaVersion,
+    LATEST_SUPPORTED_VERSION,
+} from "../features/magic-context/storage-db";
 import { getMeasuredToolDefinitionTokens } from "../features/magic-context/tool-definition-tokens";
 import {
     computeOpenCodeWorkMetricsIncremental,
@@ -585,9 +589,21 @@ export function buildStatusDetail(
         compressionUsage: null,
         toastDurationMs: 5000,
         mural: undefined,
+        // Safe defaults; the live context.db value is filled in the try block below.
+        storage_versions: {
+            context_db_schema_version: 0,
+            plugin_supported_version: LATEST_SUPPORTED_VERSION,
+        },
     };
 
     try {
+        // Storage-version probe: live DB schema vs this binary's fence. Fills the
+        // safe default from above; getPersistedSchemaVersion itself returns 0 when
+        // the migrations table is absent.
+        detail.storage_versions = {
+            context_db_schema_version: getPersistedSchemaVersion(db),
+            plugin_supported_version: LATEST_SUPPORTED_VERSION,
+        };
         const muralConfig = (config?.experimental as { mural?: { enabled?: boolean } } | undefined)
             ?.mural;
         if (muralConfig?.enabled && base.projectIdentity) {

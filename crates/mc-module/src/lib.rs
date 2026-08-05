@@ -67,6 +67,7 @@ use mc_store::{
     RecordWrapupCommandOutcome, StateImportError, StateImportPreflight, StateImportValidationError,
     StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
     TodoStateSetOutcome, UserHintSeedRow, VerificationUpdate, WrapupCommandRecord,
+    LATEST_MIGRATION_VERSION,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -5678,6 +5679,7 @@ impl McHandler {
                         "tagger_epoch": TAGGER_FEATURE_EPOCH,
                         "state_sync_deltas": true,
                     },
+                    "storage_versions": storage_versions_block(&store),
                 })),
                 Err(e) => HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
@@ -5741,6 +5743,7 @@ impl McHandler {
                 "tagger_epoch": TAGGER_FEATURE_EPOCH,
                 "state_sync_deltas": true,
             },
+            "storage_versions": storage_versions_block(&store),
         }))
     }
 
@@ -10568,6 +10571,23 @@ fn sanitize_status_text(text: &str, limit: usize) -> String {
 
 fn compact_status_detail(detail: &str) -> String {
     sanitize_status_text(detail, 120)
+}
+
+/// Storage-version probe block for the status envelope. Answers "which schema is the
+/// store at, which ceiling does this binary carry" in one stable shape so fleet
+/// probes stop re-deriving it from raw SQL.
+///
+/// The module never opens or attaches the host's context.db — the TypeScript plugin
+/// owns that file exclusively — so `context_db_schema_version` is null on this
+/// surface and the plugin's RPC/doctor surface reports the live value instead. The
+/// module store version is read live from the store's migration table; the ceiling
+/// is the newest mc-store migration this binary ships.
+fn storage_versions_block(store: &McStore) -> Value {
+    json!({
+        "context_db_schema_version": null,
+        "module_store_schema_version": store.module_store_schema_version().ok(),
+        "binary_supported_version": LATEST_MIGRATION_VERSION,
+    })
 }
 
 fn historian_status_summary(state: &mc_store::HistorianDurableState) -> String {
@@ -16492,6 +16512,40 @@ mod tests {
         assert!(session_status["pass_trace"]["first_divergence"].is_null());
         assert!(session_status["pass_trace"]["last_divergence"].is_string());
         assert_eq!(session_status["epochs"]["state_sync_deltas"], json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_reports_storage_versions_with_live_store_version() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let live_version = store.module_store_schema_version().unwrap();
+
+        let decode = |outcome: HandlerOutcome| match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("expected status response, got {other:?}"),
+        };
+
+        // Both the health probe (no session_id) and the per-session status carry the
+        // block, so a fleet probe gets the same shape whichever way it calls status.
+        let health = decode(handler.handle_status_value(&json!({ "kind": "status" })));
+        let session =
+            decode(handler.handle_status_value(&json!({ "kind": "status", "session_id": "ses" })));
+        for status in [&health, &session] {
+            let versions = &status["storage_versions"];
+            // The module does not read the host's context.db; the TS surface owns it.
+            assert!(versions["context_db_schema_version"].is_null());
+            assert_eq!(versions["module_store_schema_version"], json!(live_version));
+            assert_eq!(
+                versions["binary_supported_version"],
+                json!(mc_store::LATEST_MIGRATION_VERSION)
+            );
+            // A freshly opened store is fully migrated, so the live version and the
+            // binary's shipped ceiling agree.
+            assert_eq!(
+                versions["module_store_schema_version"],
+                versions["binary_supported_version"]
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

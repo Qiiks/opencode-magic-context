@@ -5,7 +5,11 @@ import { replaceAllCompartmentState } from "../features/magic-context/compartmen
 import { insertMemory } from "../features/magic-context/memory";
 import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
 import { runMigrations } from "../features/magic-context/migrations";
-import { initializeDatabase } from "../features/magic-context/storage-db";
+import {
+    getPersistedSchemaVersion,
+    initializeDatabase,
+    LATEST_SUPPORTED_VERSION,
+} from "../features/magic-context/storage-db";
 import { createLiveSessionState } from "../hooks/magic-context/live-session-state";
 import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../shared/models-dev-cache";
@@ -316,6 +320,44 @@ describe("buildStatusDetail — history token reuse (council audit bg_51106601 #
             expect(detail.compartmentTokens).toBeGreaterThan(0);
             expect(detail.factTokens).toBe(0);
             expect(detail.historyBlockTokens).toBe(detail.compartmentTokens);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("buildStatusDetail — storage versions probe", () => {
+    test("reports the live context.db schema version and the plugin fence", () => {
+        const db = createTestDb();
+        try {
+            const detail = buildStatusDetail(db, "ses-storage-versions", process.cwd());
+
+            // The probe must carry the live MAX(schema_migrations) value, not a
+            // hardcoded one, plus this build's fence. A fully migrated test DB sits
+            // exactly at the fence.
+            expect(detail.storage_versions.context_db_schema_version).toBe(
+                getPersistedSchemaVersion(db),
+            );
+            expect(detail.storage_versions.plugin_supported_version).toBe(LATEST_SUPPORTED_VERSION);
+            expect(detail.storage_versions.context_db_schema_version).toBe(
+                LATEST_SUPPORTED_VERSION,
+            );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("follows an older live DB version while the fence stays put", () => {
+        const db = createTestDb();
+        try {
+            // Simulate a DB migrated by an older plugin: drop the recorded versions
+            // above 50. The probe must follow the live value down.
+            db.prepare("DELETE FROM schema_migrations WHERE version > ?").run(50);
+
+            const detail = buildStatusDetail(db, "ses-storage-versions-old", process.cwd());
+
+            expect(detail.storage_versions.context_db_schema_version).toBe(50);
+            expect(detail.storage_versions.plugin_supported_version).toBe(LATEST_SUPPORTED_VERSION);
         } finally {
             closeQuietly(db);
         }
