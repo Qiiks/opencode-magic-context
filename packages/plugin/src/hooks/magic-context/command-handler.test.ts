@@ -306,6 +306,200 @@ describe("createMagicContextCommandHandler", () => {
         );
     });
 
+    for (const command of ["ctx-wrapup", "ctx-recomp", "ctx-flush"] as const) {
+        it(`refuses /${command} without side effects when compaction is off`, async () => {
+            insertTag(db, "ses-compaction-off", 1, 500);
+            insertPendingOp(db, "ses-compaction-off", 1);
+            const sendNotification = mock(async () => {});
+            const executeWrapup = mock(async () => "should not run");
+            const executeRecomp = mock(async () => "should not run");
+            const onFlush = mock(() => {});
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                compactionOff: true,
+                executeWrapup,
+                executeRecomp,
+                onFlush,
+                sendNotification,
+            });
+
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command, sessionID: "ses-compaction-off", arguments: "" },
+                    makeOutput(""),
+                    {},
+                ),
+                `__CONTEXT_MANAGEMENT_${command.toUpperCase()}_HANDLED__`,
+            );
+
+            expect(sendNotification).toHaveBeenCalledWith(
+                "ses-compaction-off",
+                `Magic Context compaction is disabled (compaction.enabled: false) — /${command} manages compacted history and has no effect in this mode.`,
+                {},
+            );
+            expect(executeWrapup).not.toHaveBeenCalled();
+            expect(executeRecomp).not.toHaveBeenCalled();
+            expect(onFlush).not.toHaveBeenCalled();
+            expect(getPendingOpsCount(db, "ses-compaction-off")).toBe(1);
+            expect(getTagStatus(db, "ses-compaction-off", 1)).toBe("active");
+        });
+    }
+
+    it("keeps compaction commands functional when compaction is on", async () => {
+        for (const command of ["ctx-wrapup", "ctx-recomp", "ctx-flush"] as const) {
+            const sendNotification = mock(async () => {});
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                compactionOff: false,
+                executeWrapup: async () => "wrapup ran",
+                executeRecomp: async () => "recomp ran",
+                sendNotification,
+            });
+
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command, sessionID: `ses-compaction-on-${command}`, arguments: "" },
+                    makeOutput(""),
+                    {},
+                ),
+                `__CONTEXT_MANAGEMENT_${command.toUpperCase()}_HANDLED__`,
+            );
+
+            const notifications = (sendNotification.mock.calls as Array<[string, string]>).map(
+                ([, text]) => text,
+            );
+            expect(notifications.join("\n")).not.toContain("Magic Context compaction is disabled");
+        }
+    });
+
+    describe("knowledge-layer commands in compaction-off mode", () => {
+        it("keeps /ctx-status functional and labels the mode", async () => {
+            const sendNotification = mock(async () => {});
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                compactionOff: true,
+                sendNotification,
+            });
+
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command: "ctx-status", sessionID: "ses-status-off", arguments: "" },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-STATUS_HANDLED__",
+            );
+
+            expect(sendNotification).toHaveBeenCalledWith(
+                "ses-status-off",
+                expect.stringContaining(
+                    "**Compaction:** disabled (compaction.enabled: false) — native compaction owns the context window.",
+                ),
+                {},
+            );
+        });
+
+        it("keeps /ctx-embed functional", async () => {
+            const sendNotification = mock(async () => {});
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                compactionOff: true,
+                getEmbedStatusText: () => "embedding is ready",
+                sendNotification,
+            });
+
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command: "ctx-embed", sessionID: "ses-embed-off", arguments: "" },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-EMBED_HANDLED__",
+            );
+
+            expect(sendNotification).toHaveBeenCalledWith(
+                "ses-embed-off",
+                "## Embedding Status\n\nembedding is ready",
+                {},
+            );
+        });
+
+        it("keeps /ctx-dream functional", async () => {
+            const sendNotification = mock(async () => {});
+            const runManual = mock(async () => ({
+                ran: ["verify"],
+                skippedNoWork: [],
+                deferredBusy: [],
+                failed: [],
+            }));
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                compactionOff: true,
+                sendNotification,
+                dreamer: { config: {} as never, projectPath: "/repo", runManual },
+            });
+
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command: "ctx-dream", sessionID: "ses-dream-off", arguments: "" },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-DREAM_HANDLED__",
+            );
+
+            expect(runManual).toHaveBeenCalledWith(undefined);
+        });
+
+        it("keeps /ctx-aug functional", async () => {
+            const sendNotification = mock(async () => {});
+            const client = {
+                session: {
+                    create: mock(async () => ({ data: { id: "sidekick-child" } })),
+                    promptAsync: mock(async () => undefined),
+                    messages: mock(async () => ({
+                        data: [
+                            {
+                                info: { role: "assistant", time: { created: Date.now() } },
+                                parts: [{ type: "text", text: "Use Bun" }],
+                            },
+                        ],
+                    })),
+                    delete: mock(async () => ({ data: undefined })),
+                },
+            };
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                compactionOff: true,
+                sendNotification,
+                sidekick: {
+                    config: { timeout_ms: 5_000 },
+                    projectPath: "/repo",
+                    sessionDirectory: "/repo",
+                    client: client as never,
+                },
+            });
+
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command: "ctx-aug", sessionID: "ses-aug-off", arguments: "Check this" },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-AUG_HANDLED__",
+            );
+
+            expect(client.session.create).toHaveBeenCalledTimes(1);
+            expect(client.session.promptAsync).toHaveBeenCalledTimes(1);
+        });
+    });
+
     describe("ctx-flush", () => {
         it("reports an empty queue", async () => {
             const sendNotification = mock(async () => {});

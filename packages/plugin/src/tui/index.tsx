@@ -7,6 +7,7 @@ import packageJson from "../../package.json"
 import { closeRpc, dismissUpgradeReminder, getAnnouncement, getCompartmentCount, getRpcGeneration, initRpcClient, loadEmbedDetail, loadStatusDetail, loadToastDurationMs, markAnnounced, requestRecomp, requestUpgrade, type EmbedDetail, type StatusDetail } from "./data/context-db"
 import { startNotificationSocket, stopNotificationSocket, type SocketNotification } from "./data/notification-socket"
 import { formatThresholdPercent } from "../shared/format-threshold"
+import { compactionOffSidebarRows, nativeCompactionContextLabel } from "./compaction-off"
 import { isCompactionEnabled } from "../config/agent-disable"
 import { loadPluginConfig } from "../config"
 import { detectConflicts } from "../shared/conflict-detector"
@@ -132,6 +133,7 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
     const theme = createMemo(() => (props.api as any).theme.current)
     const t = () => theme()
     const s = () => props.s
+    const compactionOff = () => s().compaction_enabled === false
 
     // Prefer the RPC-provided model context limit (what the sidebar shows) so the
     // two surfaces never disagree. Fall back to deriving from usage% only when the
@@ -171,7 +173,7 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
             segs.push({ label: "System", tokens: d.systemPromptTokens, color: COLORS.system })
         if (d.docsTokens > 0)
             segs.push({ label: "Docs", tokens: d.docsTokens, color: COLORS.docs })
-        if (d.compartmentTokens > 0)
+        if (!compactionOff() && d.compartmentTokens > 0)
             segs.push({
                 label: "Compartments",
                 tokens: d.compartmentTokens,
@@ -219,15 +221,17 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                 <text fg={t().textMuted}>v{packageJson.version}</text>
             </box>
 
-            {/* Context summary line. Mirrors the sidebar header layout
-                ("47.5% / 65%   475K / 1.0M") so users can recognize the
-                same shape in the status dialog. The execute threshold tells
-                them how close they are to compaction triggering. */}
             <box flexDirection="row" justifyContent="space-between" width="100%">
-                <text fg={s().usagePercentage >= 80 ? t().error : s().usagePercentage >= 65 ? t().warning : t().accent}>
-                    <b>{s().usagePercentage.toFixed(1)}%</b> / {formatThresholdPercent(s().executeThreshold)}%{s().executeThresholdClamped ? "*" : ""}
-                </text>
-                <text fg={s().usagePercentage >= 80 ? t().error : s().usagePercentage >= 65 ? t().warning : t().accent}>
+                {compactionOff() ? (
+                    <text fg={t().accent}>
+                        <b>{nativeCompactionContextLabel(s())}</b>
+                    </text>
+                ) : (
+                    <text fg={s().usagePercentage >= 80 ? t().error : s().usagePercentage >= 65 ? t().warning : t().accent}>
+                        <b>{s().usagePercentage.toFixed(1)}%</b> / {formatThresholdPercent(s().executeThreshold)}%{s().executeThresholdClamped ? "*" : ""}
+                    </text>
+                )}
+                <text fg={compactionOff() ? t().accent : s().usagePercentage >= 80 ? t().error : s().usagePercentage >= 65 ? t().warning : t().accent}>
                     {fmt(s().inputTokens)} / {contextLimit() > 0 ? fmt(contextLimit()) : "?"} tokens
                 </text>
             </box>
@@ -261,7 +265,7 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
 
             {/* Recomp / session-upgrade live progress (full width, only while
                 running or just finished — dogfood 2026-05-30). */}
-            {s().recompProgress && (() => {
+            {!compactionOff() && s().recompProgress && (() => {
                 const p = s().recompProgress!
                 // Label follows the flow that started the run, so a plain
                 // /ctx-recomp never reads as an "Upgrade" (dogfood 2026-06-04).
@@ -297,61 +301,80 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                 )
             })()}
 
-            {/* 2-column layout */}
             <box flexDirection="row" width="100%" marginTop={1} gap={4}>
-                {/* Left column */}
-                <box flexDirection="column" flexGrow={1} flexBasis={0}>
-                    <text fg={t().text}><b>Tags</b></text>
-                    <R t={t()} l="Active" v={`${s().activeTags} (~${fmtBytes(s().activeBytes)})`} />
-                    <R t={t()} l="Dropped" v={String(s().droppedTags)} />
-                    <R t={t()} l="Total" v={String(s().totalTags)} fg={t().textMuted} />
-                    <box marginTop={1}>
-                        <text fg={t().text}><b>Pending Queue</b></text>
+                {compactionOff() ? (
+                    <box flexDirection="column" flexGrow={1} flexBasis={0}>
+                        <text fg={t().text}><b>Knowledge</b></text>
+                        {compactionOffSidebarRows(s()).map((row) => (
+                            <R
+                                t={t()}
+                                l={row.label}
+                                v={row.value}
+                                fg={row.label === "Memories" ? t().accent : t().textMuted}
+                            />
+                        ))}
+                        {s().readySmartNoteCount > 0 && (
+                            <R t={t()} l="Smart Notes" v={`${s().readySmartNoteCount} ready`} fg={t().accent} />
+                        )}
+                        {s().lastDreamerRunAt && (
+                            <R t={t()} l="Dreamer" v={`last ${relTime(s().lastDreamerRunAt!)}`} fg={t().textMuted} />
+                        )}
                     </box>
-                    <R t={t()} l="Drops" v={String(s().pendingOpsCount)} fg={s().pendingOpsCount > 0 ? t().warning : t().textMuted} />
-                    <box marginTop={1}>
-                        <text fg={t().text}><b>Cache TTL</b></text>
-                    </box>
-                    <R t={t()} l="Configured" v={s().cacheTtl} />
-                    <R t={t()} l="Last response" v={s().lastResponseTime > 0 ? `${Math.round(elapsed() / 1000)}s ago` : "never"} />
-                    <R t={t()} l="Remaining" v={s().cacheExpired ? "expired" : `${Math.round(s().cacheRemainingMs / 1000)}s`} fg={s().cacheExpired ? t().warning : t().textMuted} />
-                    <R t={t()} l="Auto-execute" v={s().cacheExpired ? "yes (expired)" : `at TTL or ≥${formatThresholdPercent(s().executeThreshold)}%`} fg={t().textMuted} />
-                    <box marginTop={1}>
-                        <text fg={t().text}><b>Memory</b></text>
-                    </box>
-                    <R t={t()} l="Active" v={String(s().memoryCount)} fg={t().accent} />
-                    <R t={t()} l="Injected" v={String(s().memoryBlockCount)} fg={t().textMuted} />
-                </box>
-                {/* Right column */}
-                <box flexDirection="column" flexGrow={1} flexBasis={0}>
-                    <text fg={t().text}><b>Reductions</b></text>
-                    <R t={t()} l="Execute threshold" v={`${formatThresholdPercent(s().executeThreshold)}%${s().executeThresholdClamped ? "*" : ""}`} />
-                    <R t={t()} l="Last reduce anchor" v={`${fmt(s().lastNudgeTokens)} tok`} />
-                    <box marginTop={1}>
-                        <text fg={t().text}><b>Context Details</b></text>
-                    </box>
-                    <R t={t()} l="Protected tags" v={String(s().protectedTagCount)} fg={t().textMuted} />
-                    <R t={t()} l="Subagent" v={s().isSubagent ? "yes" : "no"} fg={t().textMuted} />
-                    <box marginTop={1}>
-                        <text fg={t().text}><b>History Compression</b></text>
-                    </box>
-                    {typeof s().boundaryPresent === "boolean" && (
-                        <R t={t()} l="Boundary" v={s().boundaryPresent ? "present" : "absent"} />
-                    )}
-                    {s().coverageOrdinal !== undefined && (
-                        <R t={t()} l="Coverage ordinal" v={s().coverageOrdinal == null ? "none" : String(s().coverageOrdinal)} />
-                    )}
-                    {typeof s().boundaryPresent === "boolean" && (
-                        <R t={t()} l="Compartments" v={String(s().compartmentCount)} />
-                    )}
-                    <R t={t()} l="History block" v={`~${fmt(s().historyBlockTokens)} tok`} />
-                    {s().compressionBudget != null && (
-                        <R t={t()} l="Budget" v={`~${fmt(s().compressionBudget!)} tok (${s().compressionUsage} used)`} />
-                    )}
-                    {s().lastDreamerRunAt && (
-                        <R t={t()} l="Dreamer" v={`last ${relTime(s().lastDreamerRunAt!)}`} fg={t().textMuted} />
-                    )}
-                </box>
+                ) : (
+                    <>
+                        <box flexDirection="column" flexGrow={1} flexBasis={0}>
+                            <text fg={t().text}><b>Tags</b></text>
+                            <R t={t()} l="Active" v={`${s().activeTags} (~${fmtBytes(s().activeBytes)})`} />
+                            <R t={t()} l="Dropped" v={String(s().droppedTags)} />
+                            <R t={t()} l="Total" v={String(s().totalTags)} fg={t().textMuted} />
+                            <box marginTop={1}>
+                                <text fg={t().text}><b>Pending Queue</b></text>
+                            </box>
+                            <R t={t()} l="Drops" v={String(s().pendingOpsCount)} fg={s().pendingOpsCount > 0 ? t().warning : t().textMuted} />
+                            <box marginTop={1}>
+                                <text fg={t().text}><b>Cache TTL</b></text>
+                            </box>
+                            <R t={t()} l="Configured" v={s().cacheTtl} />
+                            <R t={t()} l="Last response" v={s().lastResponseTime > 0 ? `${Math.round(elapsed() / 1000)}s ago` : "never"} />
+                            <R t={t()} l="Remaining" v={s().cacheExpired ? "expired" : `${Math.round(s().cacheRemainingMs / 1000)}s`} fg={s().cacheExpired ? t().warning : t().textMuted} />
+                            <R t={t()} l="Auto-execute" v={s().cacheExpired ? "yes (expired)" : `at TTL or ≥${formatThresholdPercent(s().executeThreshold)}%`} fg={t().textMuted} />
+                            <box marginTop={1}>
+                                <text fg={t().text}><b>Memory</b></text>
+                            </box>
+                            <R t={t()} l="Active" v={String(s().memoryCount)} fg={t().accent} />
+                            <R t={t()} l="Injected" v={String(s().memoryBlockCount)} fg={t().textMuted} />
+                        </box>
+                        <box flexDirection="column" flexGrow={1} flexBasis={0}>
+                            <text fg={t().text}><b>Reductions</b></text>
+                            <R t={t()} l="Execute threshold" v={`${formatThresholdPercent(s().executeThreshold)}%${s().executeThresholdClamped ? "*" : ""}`} />
+                            <R t={t()} l="Last reduce anchor" v={`${fmt(s().lastNudgeTokens)} tok`} />
+                            <box marginTop={1}>
+                                <text fg={t().text}><b>Context Details</b></text>
+                            </box>
+                            <R t={t()} l="Protected tags" v={String(s().protectedTagCount)} fg={t().textMuted} />
+                            <R t={t()} l="Subagent" v={s().isSubagent ? "yes" : "no"} fg={t().textMuted} />
+                            <box marginTop={1}>
+                                <text fg={t().text}><b>History Compression</b></text>
+                            </box>
+                            {typeof s().boundaryPresent === "boolean" && (
+                                <R t={t()} l="Boundary" v={s().boundaryPresent ? "present" : "absent"} />
+                            )}
+                            {s().coverageOrdinal !== undefined && (
+                                <R t={t()} l="Coverage ordinal" v={s().coverageOrdinal == null ? "none" : String(s().coverageOrdinal)} />
+                            )}
+                            {typeof s().boundaryPresent === "boolean" && (
+                                <R t={t()} l="Compartments" v={String(s().compartmentCount)} />
+                            )}
+                            <R t={t()} l="History block" v={`~${fmt(s().historyBlockTokens)} tok`} />
+                            {s().compressionBudget != null && (
+                                <R t={t()} l="Budget" v={`~${fmt(s().compressionBudget!)} tok (${s().compressionUsage} used)`} />
+                            )}
+                            {s().lastDreamerRunAt && (
+                                <R t={t()} l="Dreamer" v={`last ${relTime(s().lastDreamerRunAt!)}`} fg={t().textMuted} />
+                            )}
+                        </box>
+                    </>
+                )}
             </box>
 
             {/* Error (full width, conditional) */}

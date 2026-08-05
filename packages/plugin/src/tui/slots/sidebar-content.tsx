@@ -5,6 +5,7 @@ import packageJson from "../../../package.json"
 import { badgeTextColor } from '../badge-contrast';
 import { loadSidebarSnapshot, type SidebarSnapshot } from "../data/context-db"
 import { formatThresholdPercent } from "../../shared/format-threshold"
+import { compactionOffSidebarRows, nativeCompactionContextLabel } from "../compaction-off"
 import {
     computeEffectiveOrder,
     DEFAULT_SLOT_ORDER,
@@ -708,7 +709,9 @@ const SidebarContent = (props: {
     )
 
     const s = createMemo(() => snapshot())
+    const compactionOff = () => s()?.compaction_enabled === false
     const contextSummaryColor = createMemo(() => {
+        if (compactionOff()) return props.theme.accent
         const usage = s()?.usagePercentage ?? 0
         if (usage >= 80) return props.theme.error
         if (usage >= 65) return props.theme.warning
@@ -750,16 +753,15 @@ const SidebarContent = (props: {
                 <box marginTop={collapsed() ? 0 : 1} flexDirection="column">
                     {(s()?.contextLimit ?? 0) > 0 && (
                         <box width="100%" flexDirection="row" justifyContent="space-between">
-                            {/* Left: current usage vs the per-model execute
-                                threshold (the value Magic Context compares
-                                against when scheduling historian / drops).
-                                "47.5% / 65%" tells the user how close they
-                                are to the next compaction trigger. A trailing
-                                "*" marks a threshold that was clamped down from
-                                a higher configured value (issue #241). */}
-                            <text fg={contextSummaryColor()}>
-                                <b>{s()!.usagePercentage.toFixed(1)}%</b> / {formatThresholdPercent(s()!.executeThreshold)}%{s()!.executeThresholdClamped ? "*" : ""}
-                            </text>
+                            {compactionOff() ? (
+                                <text fg={contextSummaryColor()}>
+                                    <b>{nativeCompactionContextLabel(s()!)}</b>
+                                </text>
+                            ) : (
+                                <text fg={contextSummaryColor()}>
+                                    <b>{s()!.usagePercentage.toFixed(1)}%</b> / {formatThresholdPercent(s()!.executeThreshold)}%{s()!.executeThresholdClamped ? "*" : ""}
+                                </text>
+                            )}
                             {/* Right: absolute token usage vs the model's
                                 full context window (separate from the
                                 execute threshold so users still know how
@@ -778,36 +780,47 @@ const SidebarContent = (props: {
                 Status (Q=queued ops, N=session notes). */}
             {collapsed() && (
                 <box width="100%" flexDirection="column">
-                    {/* Collapsed rows are intentionally uniform faded-grey, not
-                        bold/accent — they're a glanceable summary, so the label
-                        and value share the muted tone (matches Memories row). */}
-                    <box width="100%" flexDirection="row" justifyContent="space-between">
-                        <text fg={props.theme.textMuted}>Historian</text>
-                        {s()?.historianRunning ? (
-                            <text fg={props.theme.warning}>comparting ⟳</text>
-                        ) : (
-                            <text fg={props.theme.textMuted}>idle</text>
-                        )}
-                    </box>
-                    <box width="100%" flexDirection="row" justifyContent="space-between">
-                        <text fg={props.theme.textMuted}>Memories</text>
-                        <text fg={props.theme.textMuted}>
-                            {(s()?.memoryBlockCount ?? 0) > 0
-                                ? `${s()!.memoryBlockCount}/${s()?.memoryCount ?? 0}`
-                                : String(s()?.memoryCount ?? 0)}
-                        </text>
-                    </box>
-                    <box width="100%" flexDirection="row" justifyContent="space-between">
-                        <text fg={props.theme.textMuted}>Status</text>
-                        <text fg={props.theme.textMuted}>
-                            C:{s()?.compartmentCount ?? 0} Q:{s()?.pendingOpsCount ?? 0} N:{s()?.sessionNoteCount ?? 0}
-                        </text>
-                    </box>
-                    <Show when={s()?.recompProgress}>
-                        {(progress) => (
-                            <RecompProgressSection theme={props.theme} progress={progress()} />
-                        )}
-                    </Show>
+                    {compactionOff() ? (
+                        compactionOffSidebarRows(s()!).map((row) => (
+                            <StatRow
+                                theme={props.theme}
+                                label={row.label}
+                                value={row.value}
+                                accent={row.label === "Memories"}
+                                dim={row.label !== "Memories"}
+                            />
+                        ))
+                    ) : (
+                        <>
+                            <box width="100%" flexDirection="row" justifyContent="space-between">
+                                <text fg={props.theme.textMuted}>Historian</text>
+                                {s()?.historianRunning ? (
+                                    <text fg={props.theme.warning}>comparting ⟳</text>
+                                ) : (
+                                    <text fg={props.theme.textMuted}>idle</text>
+                                )}
+                            </box>
+                            <box width="100%" flexDirection="row" justifyContent="space-between">
+                                <text fg={props.theme.textMuted}>Memories</text>
+                                <text fg={props.theme.textMuted}>
+                                    {(s()?.memoryBlockCount ?? 0) > 0
+                                        ? `${s()!.memoryBlockCount}/${s()?.memoryCount ?? 0}`
+                                        : String(s()?.memoryCount ?? 0)}
+                                </text>
+                            </box>
+                            <box width="100%" flexDirection="row" justifyContent="space-between">
+                                <text fg={props.theme.textMuted}>Status</text>
+                                <text fg={props.theme.textMuted}>
+                                    C:{s()?.compartmentCount ?? 0} Q:{s()?.pendingOpsCount ?? 0} N:{s()?.sessionNoteCount ?? 0}
+                                </text>
+                            </box>
+                            <Show when={s()?.recompProgress}>
+                                {(progress) => (
+                                    <RecompProgressSection theme={props.theme} progress={progress()} />
+                                )}
+                            </Show>
+                        </>
+                    )}
                 </box>
             )}
 
@@ -815,7 +828,7 @@ const SidebarContent = (props: {
             {!collapsed() && (
                 <>
             {/* Historian section */}
-            {sections().historian && (
+            {!compactionOff() && sections().historian && (
                 <>
             <box width="100%" marginTop={1} flexDirection="row" justifyContent="space-between">
                 <text fg={props.theme.text}>
@@ -846,55 +859,81 @@ const SidebarContent = (props: {
             {sections().memory && (
                 <>
             <SectionHeader theme={props.theme} title="Memory" />
-            <StatRow
-                theme={props.theme}
-                label="Memories"
-                value={String(s()?.memoryCount ?? 0)}
-                accent
-            />
-            {(s()?.memoryBlockCount ?? 0) > 0 && (
-                <StatRow
-                    theme={props.theme}
-                    label="Injected"
-                    value={String(s()!.memoryBlockCount)}
-                    dim
-                />
+            {compactionOff() ? (
+                compactionOffSidebarRows(s()!)
+                    .filter((row) => row.label === "Memories")
+                    .map((row) => (
+                        <StatRow theme={props.theme} label={row.label} value={row.value} accent />
+                    ))
+            ) : (
+                <>
+                    <StatRow
+                        theme={props.theme}
+                        label="Memories"
+                        value={String(s()?.memoryCount ?? 0)}
+                        accent
+                    />
+                    {(s()?.memoryBlockCount ?? 0) > 0 && (
+                        <StatRow
+                            theme={props.theme}
+                            label="Injected"
+                            value={String(s()!.memoryBlockCount)}
+                            dim
+                        />
+                    )}
+                </>
             )}
                 </>
             )}
 
             {/* Queue & Status */}
             {sections().status &&
-                ((s()?.pendingOpsCount ?? 0) > 0 ||
-                (s()?.sessionNoteCount ?? 0) > 0 ||
-                (s()?.readySmartNoteCount ?? 0) > 0) && (
-                <>
-                    <SectionHeader theme={props.theme} title="Status" />
-                    {(s()?.pendingOpsCount ?? 0) > 0 && (
-                        <StatRow
-                            theme={props.theme}
-                            label="Queue"
-                            value={`${s()!.pendingOpsCount} pending`}
-                            warning
-                        />
-                    )}
-                    {(s()?.sessionNoteCount ?? 0) > 0 && (
-                        <StatRow
-                            theme={props.theme}
-                            label="Notes"
-                            value={String(s()!.sessionNoteCount)}
-                        />
-                    )}
-                    {(s()?.readySmartNoteCount ?? 0) > 0 && (
-                        <StatRow
-                            theme={props.theme}
-                            label="Smart Notes"
-                            value={`${s()!.readySmartNoteCount} ready`}
-                            accent
-                        />
-                    )}
-                </>
-            )}
+                (compactionOff() ||
+                    (s()?.pendingOpsCount ?? 0) > 0 ||
+                    (s()?.sessionNoteCount ?? 0) > 0 ||
+                    (s()?.readySmartNoteCount ?? 0) > 0) && (
+                    <>
+                        <SectionHeader theme={props.theme} title="Status" />
+                        {compactionOff() ? (
+                            compactionOffSidebarRows(s()!)
+                                .filter((row) => row.label !== "Memories")
+                                .map((row) => (
+                                    <StatRow
+                                        theme={props.theme}
+                                        label={row.label}
+                                        value={row.value}
+                                        dim
+                                    />
+                                ))
+                        ) : (
+                            <>
+                                {(s()?.pendingOpsCount ?? 0) > 0 && (
+                                    <StatRow
+                                        theme={props.theme}
+                                        label="Queue"
+                                        value={`${s()!.pendingOpsCount} pending`}
+                                        warning
+                                    />
+                                )}
+                                {(s()?.sessionNoteCount ?? 0) > 0 && (
+                                    <StatRow
+                                        theme={props.theme}
+                                        label="Notes"
+                                        value={String(s()!.sessionNoteCount)}
+                                    />
+                                )}
+                                {(s()?.readySmartNoteCount ?? 0) > 0 && (
+                                    <StatRow
+                                        theme={props.theme}
+                                        label="Smart Notes"
+                                        value={`${s()!.readySmartNoteCount} ready`}
+                                        accent
+                                    />
+                                )}
+                            </>
+                        )}
+                    </>
+                )}
 
             {/* Dreamer */}
             {sections().dreamer && s()?.lastDreamerRunAt && (

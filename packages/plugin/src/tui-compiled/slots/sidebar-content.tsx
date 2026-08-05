@@ -12,6 +12,7 @@ import packageJson from "../../../package.json";
 import { badgeTextColor } from "../badge-contrast";
 import { loadSidebarSnapshot } from "../data/context-db";
 import { formatThresholdPercent } from "../../shared/format-threshold";
+import { compactionOffSidebarRows, nativeCompactionContextLabel } from "../compaction-off";
 import { computeEffectiveOrder, DEFAULT_SLOT_ORDER, PLUGIN_KEY, queueTuiPreferenceUpdate, readTuiPreferencesFile, readTuiPreferencesFileSync, resolveMagicContextPrefs, watchTuiPreferences } from "../../shared/tui-preferences";
 
 // Module-level hook so the upgrade/recomp dialog can kick the sidebar into its
@@ -704,7 +705,9 @@ const SidebarContent = props => {
     defer: false
   }));
   const s = createMemo(() => snapshot());
+  const compactionOff = () => s()?.compaction_enabled === false;
   const contextSummaryColor = createMemo(() => {
+    if (compactionOff()) return props.theme.accent;
     const usage = s()?.usagePercentage ?? 0;
     if (usage >= 80) return props.theme.error;
     if (usage >= 65) return props.theme.warning;
@@ -750,37 +753,41 @@ const SidebarContent = props => {
           return () => _c$5() && (() => {
             var _el$33 = _$createElement("box"),
               _el$34 = _$createElement("text"),
-              _el$35 = _$createElement("b"),
-              _el$36 = _$createTextNode(`%`),
-              _el$37 = _$createTextNode(` / `),
-              _el$38 = _$createTextNode(`%`),
-              _el$39 = _$createElement("text"),
-              _el$40 = _$createTextNode(` / `);
+              _el$35 = _$createTextNode(` / `);
             _$insertNode(_el$33, _el$34);
-            _$insertNode(_el$33, _el$39);
             _$setProp(_el$33, "width", "100%");
             _$setProp(_el$33, "flexDirection", "row");
             _$setProp(_el$33, "justifyContent", "space-between");
+            _$insert(_el$33, (() => {
+              var _c$6 = _$memo(() => !!compactionOff());
+              return () => _c$6() ? (() => {
+                var _el$36 = _$createElement("text"),
+                  _el$37 = _$createElement("b");
+                _$insertNode(_el$36, _el$37);
+                _$insert(_el$37, () => nativeCompactionContextLabel(s()));
+                _$effect(_$p => _$setProp(_el$36, "fg", contextSummaryColor(), _$p));
+                return _el$36;
+              })() : (() => {
+                var _el$38 = _$createElement("text"),
+                  _el$39 = _$createElement("b"),
+                  _el$40 = _$createTextNode(`%`),
+                  _el$41 = _$createTextNode(` / `),
+                  _el$42 = _$createTextNode(`%`);
+                _$insertNode(_el$38, _el$39);
+                _$insertNode(_el$38, _el$41);
+                _$insertNode(_el$38, _el$42);
+                _$insertNode(_el$39, _el$40);
+                _$insert(_el$39, () => s().usagePercentage.toFixed(1), _el$40);
+                _$insert(_el$38, () => formatThresholdPercent(s().executeThreshold), _el$42);
+                _$insert(_el$38, () => s().executeThresholdClamped ? "*" : "", null);
+                _$effect(_$p => _$setProp(_el$38, "fg", contextSummaryColor(), _$p));
+                return _el$38;
+              })();
+            })(), _el$34);
             _$insertNode(_el$34, _el$35);
-            _$insertNode(_el$34, _el$37);
-            _$insertNode(_el$34, _el$38);
-            _$insertNode(_el$35, _el$36);
-            _$insert(_el$35, () => s().usagePercentage.toFixed(1), _el$36);
-            _$insert(_el$34, () => formatThresholdPercent(s().executeThreshold), _el$38);
-            _$insert(_el$34, () => s().executeThresholdClamped ? "*" : "", null);
-            _$insertNode(_el$39, _el$40);
-            _$insert(_el$39, () => compactTokens(s().inputTokens), _el$40);
-            _$insert(_el$39, () => compactTokens(s().contextLimit), null);
-            _$effect(_p$ => {
-              var _v$15 = contextSummaryColor(),
-                _v$16 = contextSummaryColor();
-              _v$15 !== _p$.e && (_p$.e = _$setProp(_el$34, "fg", _v$15, _p$.e));
-              _v$16 !== _p$.t && (_p$.t = _$setProp(_el$39, "fg", _v$16, _p$.t));
-              return _p$;
-            }, {
-              e: undefined,
-              t: undefined
-            });
+            _$insert(_el$34, () => compactTokens(s().inputTokens), _el$35);
+            _$insert(_el$34, () => compactTokens(s().contextLimit), null);
+            _$effect(_$p => _$setProp(_el$34, "fg", contextSummaryColor(), _$p));
             return _el$33;
           })();
         })(), null);
@@ -802,128 +809,152 @@ const SidebarContent = props => {
     _$insert(_el$25, (() => {
       var _c$3 = _$memo(() => !!collapsed());
       return () => _c$3() && (() => {
-        var _el$41 = _$createElement("box"),
-          _el$42 = _$createElement("box"),
-          _el$43 = _$createElement("text"),
-          _el$45 = _$createElement("box"),
-          _el$46 = _$createElement("text"),
-          _el$48 = _$createElement("text"),
-          _el$49 = _$createElement("box"),
-          _el$50 = _$createElement("text"),
-          _el$52 = _$createElement("text"),
-          _el$53 = _$createTextNode(`C:`),
-          _el$54 = _$createTextNode(` Q:`),
-          _el$55 = _$createTextNode(` N:`);
-        _$insertNode(_el$41, _el$42);
-        _$insertNode(_el$41, _el$45);
-        _$insertNode(_el$41, _el$49);
-        _$setProp(_el$41, "width", "100%");
-        _$setProp(_el$41, "flexDirection", "column");
-        _$insertNode(_el$42, _el$43);
-        _$setProp(_el$42, "width", "100%");
-        _$setProp(_el$42, "flexDirection", "row");
-        _$setProp(_el$42, "justifyContent", "space-between");
-        _$insertNode(_el$43, _$createTextNode(`Historian`));
-        _$insert(_el$42, (() => {
-          var _c$6 = _$memo(() => !!s()?.historianRunning);
-          return () => _c$6() ? (() => {
-            var _el$56 = _$createElement("text");
-            _$insertNode(_el$56, _$createTextNode(`comparting ⟳`));
-            _$effect(_$p => _$setProp(_el$56, "fg", props.theme.warning, _$p));
-            return _el$56;
-          })() : (() => {
-            var _el$58 = _$createElement("text");
-            _$insertNode(_el$58, _$createTextNode(`idle`));
-            _$effect(_$p => _$setProp(_el$58, "fg", props.theme.textMuted, _$p));
-            return _el$58;
-          })();
-        })(), null);
-        _$insertNode(_el$45, _el$46);
-        _$insertNode(_el$45, _el$48);
-        _$setProp(_el$45, "width", "100%");
-        _$setProp(_el$45, "flexDirection", "row");
-        _$setProp(_el$45, "justifyContent", "space-between");
-        _$insertNode(_el$46, _$createTextNode(`Memories`));
-        _$insert(_el$48, (() => {
-          var _c$7 = _$memo(() => (s()?.memoryBlockCount ?? 0) > 0);
-          return () => _c$7() ? `${s().memoryBlockCount}/${s()?.memoryCount ?? 0}` : String(s()?.memoryCount ?? 0);
-        })());
-        _$insertNode(_el$49, _el$50);
-        _$insertNode(_el$49, _el$52);
-        _$setProp(_el$49, "width", "100%");
-        _$setProp(_el$49, "flexDirection", "row");
-        _$setProp(_el$49, "justifyContent", "space-between");
-        _$insertNode(_el$50, _$createTextNode(`Status`));
-        _$insertNode(_el$52, _el$53);
-        _$insertNode(_el$52, _el$54);
-        _$insertNode(_el$52, _el$55);
-        _$insert(_el$52, () => s()?.compartmentCount ?? 0, _el$54);
-        _$insert(_el$52, () => s()?.pendingOpsCount ?? 0, _el$55);
-        _$insert(_el$52, () => s()?.sessionNoteCount ?? 0, null);
-        _$insert(_el$41, _$createComponent(Show, {
-          get when() {
-            return s()?.recompProgress;
-          },
-          children: progress => _$createComponent(RecompProgressSection, {
+        var _el$43 = _$createElement("box");
+        _$setProp(_el$43, "width", "100%");
+        _$setProp(_el$43, "flexDirection", "column");
+        _$insert(_el$43, (() => {
+          var _c$7 = _$memo(() => !!compactionOff());
+          return () => _c$7() ? compactionOffSidebarRows(s()).map(row => _$createComponent(StatRow, {
             get theme() {
               return props.theme;
             },
-            get progress() {
-              return progress();
+            get label() {
+              return row.label;
+            },
+            get value() {
+              return row.value;
+            },
+            get accent() {
+              return row.label === "Memories";
+            },
+            get dim() {
+              return row.label !== "Memories";
             }
-          })
-        }), null);
-        _$effect(_p$ => {
-          var _v$17 = props.theme.textMuted,
-            _v$18 = props.theme.textMuted,
-            _v$19 = props.theme.textMuted,
-            _v$20 = props.theme.textMuted,
-            _v$21 = props.theme.textMuted;
-          _v$17 !== _p$.e && (_p$.e = _$setProp(_el$43, "fg", _v$17, _p$.e));
-          _v$18 !== _p$.t && (_p$.t = _$setProp(_el$46, "fg", _v$18, _p$.t));
-          _v$19 !== _p$.a && (_p$.a = _$setProp(_el$48, "fg", _v$19, _p$.a));
-          _v$20 !== _p$.o && (_p$.o = _$setProp(_el$50, "fg", _v$20, _p$.o));
-          _v$21 !== _p$.i && (_p$.i = _$setProp(_el$52, "fg", _v$21, _p$.i));
-          return _p$;
-        }, {
-          e: undefined,
-          t: undefined,
-          a: undefined,
-          o: undefined,
-          i: undefined
-        });
-        return _el$41;
+          })) : [(() => {
+            var _el$44 = _$createElement("box"),
+              _el$45 = _$createElement("text");
+            _$insertNode(_el$44, _el$45);
+            _$setProp(_el$44, "width", "100%");
+            _$setProp(_el$44, "flexDirection", "row");
+            _$setProp(_el$44, "justifyContent", "space-between");
+            _$insertNode(_el$45, _$createTextNode(`Historian`));
+            _$insert(_el$44, (() => {
+              var _c$8 = _$memo(() => !!s()?.historianRunning);
+              return () => _c$8() ? (() => {
+                var _el$58 = _$createElement("text");
+                _$insertNode(_el$58, _$createTextNode(`comparting ⟳`));
+                _$effect(_$p => _$setProp(_el$58, "fg", props.theme.warning, _$p));
+                return _el$58;
+              })() : (() => {
+                var _el$60 = _$createElement("text");
+                _$insertNode(_el$60, _$createTextNode(`idle`));
+                _$effect(_$p => _$setProp(_el$60, "fg", props.theme.textMuted, _$p));
+                return _el$60;
+              })();
+            })(), null);
+            _$effect(_$p => _$setProp(_el$45, "fg", props.theme.textMuted, _$p));
+            return _el$44;
+          })(), (() => {
+            var _el$47 = _$createElement("box"),
+              _el$48 = _$createElement("text"),
+              _el$50 = _$createElement("text");
+            _$insertNode(_el$47, _el$48);
+            _$insertNode(_el$47, _el$50);
+            _$setProp(_el$47, "width", "100%");
+            _$setProp(_el$47, "flexDirection", "row");
+            _$setProp(_el$47, "justifyContent", "space-between");
+            _$insertNode(_el$48, _$createTextNode(`Memories`));
+            _$insert(_el$50, (() => {
+              var _c$9 = _$memo(() => (s()?.memoryBlockCount ?? 0) > 0);
+              return () => _c$9() ? `${s().memoryBlockCount}/${s()?.memoryCount ?? 0}` : String(s()?.memoryCount ?? 0);
+            })());
+            _$effect(_p$ => {
+              var _v$15 = props.theme.textMuted,
+                _v$16 = props.theme.textMuted;
+              _v$15 !== _p$.e && (_p$.e = _$setProp(_el$48, "fg", _v$15, _p$.e));
+              _v$16 !== _p$.t && (_p$.t = _$setProp(_el$50, "fg", _v$16, _p$.t));
+              return _p$;
+            }, {
+              e: undefined,
+              t: undefined
+            });
+            return _el$47;
+          })(), (() => {
+            var _el$51 = _$createElement("box"),
+              _el$52 = _$createElement("text"),
+              _el$54 = _$createElement("text"),
+              _el$55 = _$createTextNode(`C:`),
+              _el$56 = _$createTextNode(` Q:`),
+              _el$57 = _$createTextNode(` N:`);
+            _$insertNode(_el$51, _el$52);
+            _$insertNode(_el$51, _el$54);
+            _$setProp(_el$51, "width", "100%");
+            _$setProp(_el$51, "flexDirection", "row");
+            _$setProp(_el$51, "justifyContent", "space-between");
+            _$insertNode(_el$52, _$createTextNode(`Status`));
+            _$insertNode(_el$54, _el$55);
+            _$insertNode(_el$54, _el$56);
+            _$insertNode(_el$54, _el$57);
+            _$insert(_el$54, () => s()?.compartmentCount ?? 0, _el$56);
+            _$insert(_el$54, () => s()?.pendingOpsCount ?? 0, _el$57);
+            _$insert(_el$54, () => s()?.sessionNoteCount ?? 0, null);
+            _$effect(_p$ => {
+              var _v$17 = props.theme.textMuted,
+                _v$18 = props.theme.textMuted;
+              _v$17 !== _p$.e && (_p$.e = _$setProp(_el$52, "fg", _v$17, _p$.e));
+              _v$18 !== _p$.t && (_p$.t = _$setProp(_el$54, "fg", _v$18, _p$.t));
+              return _p$;
+            }, {
+              e: undefined,
+              t: undefined
+            });
+            return _el$51;
+          })(), _$createComponent(Show, {
+            get when() {
+              return s()?.recompProgress;
+            },
+            children: progress => _$createComponent(RecompProgressSection, {
+              get theme() {
+                return props.theme;
+              },
+              get progress() {
+                return progress();
+              }
+            })
+          })];
+        })());
+        return _el$43;
       })();
     })(), null);
     _$insert(_el$25, (() => {
       var _c$4 = _$memo(() => !!!collapsed());
-      return () => _c$4() && [_$memo(() => _$memo(() => !!sections().historian)() && [(() => {
-        var _el$60 = _$createElement("box"),
-          _el$61 = _$createElement("text"),
-          _el$62 = _$createElement("b");
-        _$insertNode(_el$60, _el$61);
-        _$setProp(_el$60, "width", "100%");
-        _$setProp(_el$60, "marginTop", 1);
-        _$setProp(_el$60, "flexDirection", "row");
-        _$setProp(_el$60, "justifyContent", "space-between");
-        _$insertNode(_el$61, _el$62);
-        _$insertNode(_el$62, _$createTextNode(`Historian`));
-        _$insert(_el$60, (() => {
-          var _c$8 = _$memo(() => !!s()?.historianRunning);
-          return () => _c$8() ? (() => {
-            var _el$64 = _$createElement("text");
-            _$insertNode(_el$64, _$createTextNode(`comparting ⟳`));
-            _$effect(_$p => _$setProp(_el$64, "fg", props.theme.warning, _$p));
-            return _el$64;
-          })() : (() => {
+      return () => _c$4() && [_$memo(() => _$memo(() => !!(!compactionOff() && sections().historian))() && [(() => {
+        var _el$62 = _$createElement("box"),
+          _el$63 = _$createElement("text"),
+          _el$64 = _$createElement("b");
+        _$insertNode(_el$62, _el$63);
+        _$setProp(_el$62, "width", "100%");
+        _$setProp(_el$62, "marginTop", 1);
+        _$setProp(_el$62, "flexDirection", "row");
+        _$setProp(_el$62, "justifyContent", "space-between");
+        _$insertNode(_el$63, _el$64);
+        _$insertNode(_el$64, _$createTextNode(`Historian`));
+        _$insert(_el$62, (() => {
+          var _c$0 = _$memo(() => !!s()?.historianRunning);
+          return () => _c$0() ? (() => {
             var _el$66 = _$createElement("text");
-            _$insertNode(_el$66, _$createTextNode(`idle`));
-            _$effect(_$p => _$setProp(_el$66, "fg", props.theme.textMuted, _$p));
+            _$insertNode(_el$66, _$createTextNode(`comparting ⟳`));
+            _$effect(_$p => _$setProp(_el$66, "fg", props.theme.warning, _$p));
             return _el$66;
+          })() : (() => {
+            var _el$68 = _$createElement("text");
+            _$insertNode(_el$68, _$createTextNode(`idle`));
+            _$effect(_$p => _$setProp(_el$68, "fg", props.theme.textMuted, _$p));
+            return _el$68;
           })();
         })(), null);
-        _$effect(_$p => _$setProp(_el$61, "fg", props.theme.text, _$p));
-        return _el$60;
+        _$effect(_$p => _$setProp(_el$63, "fg", props.theme.text, _$p));
+        return _el$62;
       })(), _$createComponent(StatRow, {
         get theme() {
           return props.theme;
@@ -949,7 +980,18 @@ const SidebarContent = props => {
           return props.theme;
         },
         title: "Memory"
-      }), _$createComponent(StatRow, {
+      }), _$memo(() => _$memo(() => !!compactionOff())() ? compactionOffSidebarRows(s()).filter(row => row.label === "Memories").map(row => _$createComponent(StatRow, {
+        get theme() {
+          return props.theme;
+        },
+        get label() {
+          return row.label;
+        },
+        get value() {
+          return row.value;
+        },
+        accent: true
+      })) : [_$createComponent(StatRow, {
         get theme() {
           return props.theme;
         },
@@ -967,12 +1009,23 @@ const SidebarContent = props => {
           return String(s().memoryBlockCount);
         },
         dim: true
-      }))]), _$memo(() => _$memo(() => !!(sections().status && ((s()?.pendingOpsCount ?? 0) > 0 || (s()?.sessionNoteCount ?? 0) > 0 || (s()?.readySmartNoteCount ?? 0) > 0)))() && [_$createComponent(SectionHeader, {
+      }))])]), _$memo(() => _$memo(() => !!(sections().status && (compactionOff() || (s()?.pendingOpsCount ?? 0) > 0 || (s()?.sessionNoteCount ?? 0) > 0 || (s()?.readySmartNoteCount ?? 0) > 0)))() && [_$createComponent(SectionHeader, {
         get theme() {
           return props.theme;
         },
         title: "Status"
-      }), _$memo(() => _$memo(() => (s()?.pendingOpsCount ?? 0) > 0)() && _$createComponent(StatRow, {
+      }), _$memo(() => _$memo(() => !!compactionOff())() ? compactionOffSidebarRows(s()).filter(row => row.label !== "Memories").map(row => _$createComponent(StatRow, {
+        get theme() {
+          return props.theme;
+        },
+        get label() {
+          return row.label;
+        },
+        get value() {
+          return row.value;
+        },
+        dim: true
+      })) : [_$memo(() => _$memo(() => (s()?.pendingOpsCount ?? 0) > 0)() && _$createComponent(StatRow, {
         get theme() {
           return props.theme;
         },
@@ -998,7 +1051,7 @@ const SidebarContent = props => {
           return `${s().readySmartNoteCount} ready`;
         },
         accent: true
-      }))]), _$memo(() => _$memo(() => !!(sections().dreamer && s()?.lastDreamerRunAt))() && [_$createComponent(SectionHeader, {
+      }))])]), _$memo(() => _$memo(() => !!(sections().dreamer && s()?.lastDreamerRunAt))() && [_$createComponent(SectionHeader, {
         get theme() {
           return props.theme;
         },

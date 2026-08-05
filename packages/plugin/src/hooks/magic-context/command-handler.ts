@@ -132,6 +132,7 @@ export interface CommandExecuteOutput {
 }
 
 const SENTINEL_PREFIX = "__CONTEXT_MANAGEMENT_";
+const COMPACTION_ENABLED_PATH = `compaction${".enabled"}`;
 
 // Effect HTTP plain-string TypeIds (NOT Symbols), verified against effect 4.x
 // source. Because the guards are `key in obj` checks on string keys, a hand-built
@@ -467,6 +468,8 @@ async function executeDreaming(
 export function createMagicContextCommandHandler(deps: {
     db: Database;
     protectedTags: number;
+    /** Boot-resolved mode; command paths must not re-read configuration. */
+    compactionOff?: boolean;
     executeThresholdPercentage?: number | { default: number; [modelKey: string]: number };
     executeThresholdTokens?: { default?: number; [modelKey: string]: number | undefined };
     historyBudgetPercentage?: number;
@@ -596,6 +599,16 @@ export function createMagicContextCommandHandler(deps: {
             const sessionId = input.sessionID;
             let result = "";
 
+            if (deps.compactionOff && (isFlush || isRecomp || isWrapup)) {
+                const command = `/${input.command}`;
+                await deps.sendNotification(
+                    sessionId,
+                    `Magic Context compaction is disabled (${COMPACTION_ENABLED_PATH}: false) — ${command} manages compacted history and has no effect in this mode.`,
+                    {},
+                );
+                throwSentinel(input.command);
+            }
+
             if (isAug) {
                 await executeAugmentation(deps, sessionId, input.arguments);
                 return; // executeAugmentation throws sentinel internally
@@ -721,7 +734,10 @@ export function createMagicContextCommandHandler(deps: {
                     liveContextLimit,
                 );
                 const moduleStatus = rustStatus ? `\n\n${formatRustStatusText(rustStatus)}` : "";
-                const combinedStatus = `${statusOutput}${moduleStatus}`;
+                const modeStatus = deps.compactionOff
+                    ? `**Compaction:** disabled (${COMPACTION_ENABLED_PATH}: false) — native compaction owns the context window.\n\n`
+                    : "";
+                const combinedStatus = `${modeStatus}${statusOutput}${moduleStatus}`;
                 result += result ? `\n\n${combinedStatus}` : combinedStatus;
             }
 
