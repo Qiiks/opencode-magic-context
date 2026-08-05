@@ -228,6 +228,19 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         );
     }
 
+    // compaction.enabled is USER-tier only: a cloned repo must never silently
+    // disable the user's context management (it changes how the window is
+    // owned and interacts with native compaction state). Field-scoped, not
+    // block-scoped: a sibling key in a project `compaction` block survives the
+    // strip, so a future project-tier compaction knob can still land.
+    const compaction = projectRaw.compaction;
+    if (isPlainObject(compaction) && "enabled" in compaction) {
+        delete compaction.enabled;
+        warnings.push(
+            "Ignoring compaction.enabled from project config (security: only user-level config may disable Magic Context's context-window management; a cloned repo cannot change how the user's window is owned).",
+        );
+    }
+
     if ("language" in projectRaw) {
         delete projectRaw.language;
         warnings.push(

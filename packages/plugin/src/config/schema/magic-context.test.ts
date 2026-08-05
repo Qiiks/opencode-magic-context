@@ -119,6 +119,9 @@ describe("MagicContextConfigSchema", () => {
                     timeout_ms: 12_000,
                     system_prompt: "Custom prompt",
                 },
+                compaction: {
+                    enabled: true,
+                },
             } satisfies MagicContextConfig;
 
             const result = MagicContextConfigSchema.parse(input);

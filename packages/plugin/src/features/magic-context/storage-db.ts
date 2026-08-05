@@ -46,7 +46,7 @@ export function getSchemaFenceRejection(): {
     return lastSchemaFenceRejection;
 }
 
-export const LATEST_SUPPORTED_VERSION = 71;
+export const LATEST_SUPPORTED_VERSION = 72;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -1070,6 +1070,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       emergency_drain_active INTEGER NOT NULL DEFAULT 0,
       historian_drain_failure_at INTEGER NOT NULL DEFAULT 0,
       wrapup_in_progress_state TEXT,
+      compaction_mode_record TEXT,
       cached_m0_materialized_at INTEGER,
       cached_m0_session_facts_version INTEGER,
       cached_m0_upgrade_state TEXT,
@@ -1473,6 +1474,11 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "emergency_drain_active", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "historian_drain_failure_at", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "wrapup_in_progress_state", "TEXT");
+    // v72: per-session compaction mode record. NULL means no record (treated
+    // as "on" by the transition logic); "on"/"off" are the recorded values.
+    // Helpers live in storage-meta-persisted.ts; no transition logic reads or
+    // writes this column yet.
+    ensureColumn(db, "session_meta", "compaction_mode_record", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_materialized_at", "INTEGER");
     ensureColumn(db, "session_meta", "cached_m0_session_facts_version", "INTEGER");
     ensureColumn(db, "session_meta", "cached_m0_upgrade_state", "TEXT");

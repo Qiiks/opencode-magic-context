@@ -10,6 +10,20 @@ export function isHistorianRunnable(config: { historian?: { disable?: boolean } 
     return config.historian?.disable !== true;
 }
 
+/**
+ * The ONLY non-schema reader of the `compaction.enabled` config path.
+ * Resolves the compaction-off mode gate from a parsed Magic Context config.
+ * Lives beside the other subsystem toggles (isDreamerRunnable /
+ * isHistorianRunnable) and is IMPORTED — never re-derived — by every gate
+ * site (pi-plugin, cli, plugin boot, session hooks). Returns true (compaction
+ * ON / default behavior) when the block or field is absent.
+ */
+export function isCompactionEnabled(config: {
+    compaction?: { enabled?: boolean } | null;
+}): boolean {
+    return config.compaction?.enabled !== false;
+}
+
 function clonePlainObject(value: unknown): Record<string, unknown> | undefined {
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
         return undefined;

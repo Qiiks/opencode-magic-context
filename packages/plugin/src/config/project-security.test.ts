@@ -157,6 +157,41 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(warnings.some((w) => w.includes("sidekick.system_prompt"))).toBe(true);
     });
 
+    it("strips compaction.enabled from project config (only-key case)", () => {
+        const raw: Record<string, unknown> = {
+            compaction: { enabled: false },
+            dreamer: { model: "x" },
+        };
+        const warnings = stripUnsafeProjectConfigFields(raw);
+        const compaction = raw.compaction as Record<string, unknown>;
+        expect("enabled" in compaction).toBe(false);
+        // Block not deleted wholesale — an empty object remains.
+        expect(raw.compaction).toEqual({});
+        expect(raw.dreamer).toEqual({ model: "x" });
+        expect(warnings.some((w) => w.includes("compaction.enabled"))).toBe(true);
+    });
+
+    it("strips compaction.enabled but keeps a sibling key (field-scoped, not block-scoped)", () => {
+        const raw: Record<string, unknown> = {
+            compaction: { enabled: false, futureSibling: 1 },
+            dreamer: { model: "x" },
+        };
+        const warnings = stripUnsafeProjectConfigFields(raw);
+        const compaction = raw.compaction as Record<string, unknown>;
+        expect("enabled" in compaction).toBe(false);
+        expect(compaction.futureSibling).toBe(1);
+        expect(warnings.some((w) => w.includes("compaction.enabled"))).toBe(true);
+    });
+
+    it("does not touch a compaction block that has no enabled key", () => {
+        const raw: Record<string, unknown> = {
+            compaction: { futureSibling: 1 },
+        };
+        const warnings = stripUnsafeProjectConfigFields(raw);
+        expect(raw.compaction).toEqual({ futureSibling: 1 });
+        expect(warnings.some((w) => w.includes("compaction"))).toBe(false);
+    });
+
     it("is a no-op for a clean project config", () => {
         const raw: Record<string, unknown> = { dreamer: { model: "x" }, memory: { enabled: true } };
         const warnings = stripUnsafeProjectConfigFields(raw);
