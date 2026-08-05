@@ -14,6 +14,8 @@ import {
 } from "../../shared/data-path";
 import { describeError, getErrorMessage } from "../../shared/error-message";
 import { shouldKeepSubagents } from "../../shared/keep-subagents";
+import type { Database } from "../../shared/sqlite";
+import { createChildSessionWithFence } from "./child-session-spawn";
 import { buildHistorianEditorPrompt } from "./compartment-prompt";
 import type {
     HistorianProgressCallbacks,
@@ -45,6 +47,7 @@ interface HistorianModelOverride {
 
 export async function runValidatedHistorianPass(args: {
     client: PluginContext["client"];
+    db: Database;
     parentSessionId: string;
     sessionDirectory: string;
     prompt: string;
@@ -182,6 +185,7 @@ export async function runValidatedHistorianPass(args: {
  */
 async function runEditorPassOrFallback(args: {
     client: PluginContext["client"];
+    db: Database;
     parentSessionId: string;
     sessionDirectory: string;
     chunk: {
@@ -202,6 +206,7 @@ async function runEditorPassOrFallback(args: {
     shared.sessionLog(args.parentSessionId, "historian two-pass: running editor on draft");
     const editorRun = await runHistorianPrompt({
         client: args.client,
+        db: args.db,
         parentSessionId: args.parentSessionId,
         sessionDirectory: args.sessionDirectory,
         prompt: buildHistorianEditorPrompt(args.draftXml),
@@ -243,6 +248,7 @@ async function runEditorPassOrFallback(args: {
 
 async function runHistorianPrompt(args: {
     client: PluginContext["client"];
+    db: Database;
     parentSessionId: string;
     sessionDirectory: string;
     prompt: string;
@@ -259,6 +265,7 @@ async function runHistorianPrompt(args: {
 }): Promise<HistorianRunResult> {
     const {
         client,
+        db,
         parentSessionId,
         sessionDirectory,
         prompt,
@@ -307,12 +314,12 @@ async function runHistorianPrompt(args: {
             parentSessionId,
             `historian: creating child session (agent=${agentId}, model=${modelOverride ? `${modelOverride.providerID}/${modelOverride.modelID}` : `agent:${agentId}`})`,
         );
-        const createResponse = await client.session.create({
-            body: {
-                parentID: parentSessionId,
-                title: "magic-context-compartment",
-            },
-            query: { directory: sessionDirectory },
+        const createResponse = await createChildSessionWithFence({
+            client,
+            db,
+            parentSessionId,
+            title: "magic-context-compartment",
+            directory: sessionDirectory,
         });
 
         const createdSession = shared.normalizeSDKResponse(
@@ -449,6 +456,7 @@ async function runHistorianPrompt(args: {
 
 async function runFallbackHistorianPass(args: {
     client: PluginContext["client"];
+    db: Database;
     parentSessionId: string;
     sessionDirectory: string;
     prompt: string;
@@ -517,6 +525,7 @@ async function runFallbackHistorianPass(args: {
 
         const fallbackRun = await runHistorianPrompt({
             client: args.client,
+            db: args.db,
             parentSessionId: args.parentSessionId,
             sessionDirectory: args.sessionDirectory,
             prompt: args.prompt,

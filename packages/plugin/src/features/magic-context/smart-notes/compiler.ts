@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { SMART_NOTE_COMPILER_AGENT } from "../../../agents/smart-note-compiler";
+import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
@@ -103,12 +104,12 @@ Remember: output only the JSON object described by the system prompt.`;
         });
     };
     try {
-        const createResponse = await args.client.session.create({
-            body: {
-                ...(args.parentSessionId ? { parentID: args.parentSessionId } : {}),
-                title: `magic-context-smart-note-compile-${args.note.id}`,
-            },
-            query: { directory: args.sessionDirectory ?? args.projectIdentity },
+        const createResponse = await createChildSessionWithFence({
+            client: args.client,
+            db: args.db ?? null,
+            parentSessionId: args.parentSessionId,
+            title: `magic-context-smart-note-compile-${args.note.id}`,
+            directory: args.sessionDirectory ?? args.projectIdentity,
         });
         const created = shared.normalizeSDKResponse(
             createResponse,

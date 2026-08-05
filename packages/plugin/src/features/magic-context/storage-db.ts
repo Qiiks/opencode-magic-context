@@ -1,4 +1,13 @@
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync } from "node:fs";
+import {
+    chmodSync,
+    copyFileSync,
+    cpSync,
+    existsSync,
+    mkdirSync,
+    mkdtempSync,
+    readdirSync,
+    readFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
@@ -8,6 +17,7 @@ import {
 } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
+import { isPidAlive, parseRpcPortFile } from "../../shared/rpc-utils";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { ensureContextStoreUuid } from "./context-authority";
@@ -39,11 +49,35 @@ const pathByDatabase = new WeakMap<Database, string>();
 // a module global the plugin entrypoint reads after a failed/empty open.
 let lastSchemaFenceRejection: { persistedVersion: number; supportedVersion: number } | null = null;
 
+// A fresh CLI/Pi/OpenCode process must not be the process that advances the
+// shared schema while a live OpenCode server still holds the old build in memory.
+// The port files are the server's durable liveness signal; this latch lets callers
+// distinguish that intentional refusal from ordinary storage failures.
+let lastMigrationOnOpenRefusal: {
+    persistedVersion: number;
+    supportedVersion: number;
+    serverPids: number[];
+} | null = null;
+
 export function getSchemaFenceRejection(): {
     persistedVersion: number;
     supportedVersion: number;
 } | null {
     return lastSchemaFenceRejection;
+}
+
+export function getMigrationOnOpenRefusal(): {
+    persistedVersion: number;
+    supportedVersion: number;
+    serverPids: number[];
+} | null {
+    return lastMigrationOnOpenRefusal;
+}
+
+/** Test seam for isolated schema-fence and migration-guard scenarios. */
+export function __resetSchemaFenceStateForTests(): void {
+    lastSchemaFenceRejection = null;
+    lastMigrationOnOpenRefusal = null;
 }
 
 export const LATEST_SUPPORTED_VERSION = 72;
@@ -279,6 +313,14 @@ export function schemaVersionIsSupported(
     return getPersistedSchemaVersion(db) <= latestSupportedVersion;
 }
 
+/** Log both versions at boot so operators can compare the database to this build's fence. */
+export function formatSchemaFenceBootLog(
+    persistedVersion: number,
+    supportedVersion: number,
+): string {
+    return `[magic-context] storage schema at boot: database=v${persistedVersion}, supported_fence=v${supportedVersion}`;
+}
+
 function getRuntimeLatestSupportedVersion(options?: OpenDatabaseOptions): number {
     if (options?.latestSupportedVersion !== undefined) {
         return options.latestSupportedVersion;
@@ -305,6 +347,63 @@ export function enforceSchemaFence(
     lastSchemaFenceRejection = { persistedVersion, supportedVersion: latestSupportedVersion };
     log(
         `[magic-context] storage fatal: refusing to open ${dbPath}; database schema v${persistedVersion} is newer than this binary supports (max v${latestSupportedVersion}). A pinned or stale plugin is likely sharing this database with a newer instance; update or unpin Magic Context with 'npx @cortexkit/magic-context@latest doctor --force', then restart.`,
+    );
+    return false;
+}
+
+/**
+ * Return live OpenCode server PIDs advertised by the shared RPC discovery tree.
+ * A port file belongs to a running server only when its PID is alive; stale files
+ * are deliberately ignored so a crashed server never blocks a safe migration.
+ */
+export function findLiveRpcServerPids(storageDir: string): number[] {
+    const pids = new Set<number>();
+    const rpcRoot = join(storageDir, "rpc");
+    try {
+        for (const projectEntry of readdirSync(rpcRoot, { withFileTypes: true })) {
+            if (!projectEntry.isDirectory()) continue;
+            const projectDir = join(rpcRoot, projectEntry.name);
+            for (const entry of readdirSync(projectDir)) {
+                if (!entry.startsWith("port-") || !entry.endsWith(".json")) continue;
+                const record = parseRpcPortFile(readFileSync(join(projectDir, entry), "utf8"));
+                if (!record || !isPidAlive(record.pid)) continue;
+                pids.add(record.pid);
+            }
+        }
+    } catch {
+        // Missing/unreadable discovery files mean no reliable live-server signal.
+    }
+    return [...pids].sort((a, b) => a - b);
+}
+
+/**
+ * Refuse an on-open migration when another live OpenCode server still has this
+ * shared DB open. That server loaded its plugin dist at boot and cannot observe
+ * the new fence, so migrating here would strand every session it creates later.
+ */
+function enforceMigrationOnOpenGuard(
+    db: Database,
+    dbPath: string,
+    dbDir: string,
+    latestSupportedVersion: number,
+): boolean {
+    const persistedVersion = getPersistedSchemaVersion(db);
+    if (persistedVersion >= latestSupportedVersion) {
+        lastMigrationOnOpenRefusal = null;
+        return true;
+    }
+    const serverPids = findLiveRpcServerPids(dbDir);
+    if (serverPids.length === 0) {
+        lastMigrationOnOpenRefusal = null;
+        return true;
+    }
+    lastMigrationOnOpenRefusal = {
+        persistedVersion,
+        supportedVersion: latestSupportedVersion,
+        serverPids,
+    };
+    log(
+        `[magic-context] storage fatal: refusing to migrate ${dbPath} from schema v${persistedVersion} to v${latestSupportedVersion} while live OpenCode server PID(s) ${serverPids.join(", ")} may still use the old plugin build. Restart OpenCode, then retry this process.`,
     );
     return false;
 }
@@ -402,6 +501,9 @@ function finishDatabaseOpen(
     pathByDatabase.set(db, dbPath);
     persistenceByDatabase.set(db, true);
     persistenceErrorByDatabase.delete(db);
+    if (!explicitDbPath) {
+        log(formatSchemaFenceBootLog(getPersistedSchemaVersion(db), latestSupportedVersion));
+    }
     return db;
 }
 
@@ -1729,6 +1831,10 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
             closeQuietly(db);
             return null;
         }
+        if (!enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion)) {
+            closeQuietly(db);
+            return null;
+        }
         initializeDatabase(db);
         runMigrations(db);
         ensureContextStoreUuid(db);
@@ -1776,6 +1882,10 @@ export async function openDatabaseAsync(
 
             db = new Database(dbPath);
             if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
+                closeQuietly(db);
+                return null;
+            }
+            if (!enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion)) {
                 closeQuietly(db);
                 return null;
             }

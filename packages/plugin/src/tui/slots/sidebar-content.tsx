@@ -23,8 +23,14 @@ import {
 // parent-session message event (the RPC upgrade/recomp call fires none). The
 // mounted SidebarContent registers its refresh here.
 let activeRecompPollKick: (() => void) | null = null
+let activeSidebarRefresh: (() => void) | null = null
 export function kickRecompProgressRefresh(): void {
     activeRecompPollKick?.()
+}
+
+/** Ask the mounted sidebar to fetch an out-of-band status update now. */
+export function refreshSidebarSnapshot(): void {
+    activeSidebarRefresh?.()
 }
 
 const SINGLE_BORDER = { type: "single" } as any
@@ -664,11 +670,13 @@ const SidebarContent = (props: {
     }
 
     activeRecompPollKick = kickRecompPoll
+    activeSidebarRefresh = refresh
 
     onCleanup(() => {
         if (refreshTimer) clearTimeout(refreshTimer)
         stopRecompPoll()
         if (activeRecompPollKick === kickRecompPoll) activeRecompPollKick = null
+        if (activeSidebarRefresh === refresh) activeSidebarRefresh = null
     })
 
     // Refresh on session change
@@ -745,6 +753,15 @@ const SidebarContent = (props: {
                 </box>
                 <text fg={props.theme.textMuted}>v{packageJson.version}</text>
             </box>
+
+            {/* The fence probe writes the failure into the server-owned snapshot,
+                so this survives sidebar refreshes and is visible independently of
+                the one-shot toast. */}
+            {s()?.lastTransformError && (
+                <box marginTop={1} width="100%">
+                    <text fg={props.theme.error}>⚠ {s()!.lastTransformError}</text>
+                </box>
+            )}
 
             {/* Token breakdown bar. In collapsed mode the header, bar and the
                 3 summary rows stack with no vertical padding for a compact look;

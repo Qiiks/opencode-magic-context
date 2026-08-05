@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { DREAMER_MEMORY_MAPPER_AGENT } from "../../../agents/dreamer";
+import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import {
@@ -163,12 +164,12 @@ async function mapOneBatch(
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     try {
-        const createResponse = await args.client.session.create({
-            body: {
-                ...(args.parentSessionId ? { parentID: args.parentSessionId } : {}),
-                title: "magic-context-dream-map-memories",
-            },
-            query: { directory: args.sessionDirectory },
+        const createResponse = await createChildSessionWithFence({
+            client: args.client,
+            db: args.db,
+            parentSessionId: args.parentSessionId,
+            title: "magic-context-dream-map-memories",
+            directory: args.sessionDirectory,
         });
         const created = shared.normalizeSDKResponse(
             createResponse,

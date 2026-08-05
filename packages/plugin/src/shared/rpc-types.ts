@@ -31,6 +31,8 @@ export interface SidebarSnapshot {
     sessionNoteCount: number;
     readySmartNoteCount: number;
     cacheTtl: string;
+    /** Persistent runtime failure shown directly in the sidebar when non-null. */
+    lastTransformError: string | null;
     lastDreamerRunAt: number | null;
     projectIdentity: string | null;
     compartmentTokens: number;

@@ -8,6 +8,7 @@ import {
 } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import type { DreamingTask } from "../../../config/schema/magic-context";
+import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import type { RawMessageProvider } from "../../../hooks/magic-context/read-session-chunk";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
@@ -787,12 +788,12 @@ async function runRetrospectiveTask(
 
     let childSessionId: string | null = null;
     try {
-        const createResponse = await deps.client.session.create({
-            body: {
-                ...(parent ? { parentID: parent } : {}),
-                title: "magic-context-dream-retrospective",
-            },
-            query: { directory: deps.sessionDirectory },
+        const createResponse = await createChildSessionWithFence({
+            client: deps.client,
+            db,
+            parentSessionId: parent ?? undefined,
+            title: "magic-context-dream-retrospective",
+            directory: deps.sessionDirectory,
         });
         const created = shared.normalizeSDKResponse(
             createResponse,
@@ -1083,12 +1084,12 @@ async function runAgenticTask(
 
     let childSessionId: string | null = null;
     try {
-        const createResponse = await deps.client.session.create({
-            body: {
-                ...(parent ? { parentID: parent } : {}),
-                title: `magic-context-dream-${task}`,
-            },
-            query: { directory: docsDir },
+        const createResponse = await createChildSessionWithFence({
+            client: deps.client,
+            db,
+            parentSessionId: parent ?? undefined,
+            title: `magic-context-dream-${task}`,
+            directory: docsDir,
         });
         const created = shared.normalizeSDKResponse(
             createResponse,

@@ -1,5 +1,6 @@
 import { DREAMER_PRIMER_INVESTIGATOR_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
+import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import {
     type RawMessageProvider,
     setRawMessageProvider,
@@ -227,12 +228,12 @@ async function refreshOnePrimer(
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     try {
-        const createResponse = await args.client.session.create({
-            body: {
-                ...(args.parentSessionId ? { parentID: args.parentSessionId } : {}),
-                title: "magic-context-dream-refresh-primers",
-            },
-            query: { directory: args.sessionDirectory },
+        const createResponse = await createChildSessionWithFence({
+            client: args.client,
+            db: args.db,
+            parentSessionId: args.parentSessionId,
+            title: "magic-context-dream-refresh-primers",
+            directory: args.sessionDirectory,
         });
         const created = shared.normalizeSDKResponse(
             createResponse,

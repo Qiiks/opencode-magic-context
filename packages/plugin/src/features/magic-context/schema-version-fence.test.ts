@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from "bun:test";
 import { LATEST_MIGRATION_VERSION } from "./migrations";
-import { LATEST_SUPPORTED_VERSION } from "./storage-db";
+import { formatSchemaFenceBootLog, LATEST_SUPPORTED_VERSION } from "./storage-db";
 
 // Guards the #1 bug class the project already hit during v2 work: adding a
 // migration but forgetting to bump LATEST_SUPPORTED_VERSION (the schema-fence
@@ -12,5 +12,11 @@ import { LATEST_SUPPORTED_VERSION } from "./storage-db";
 describe("schema version fence", () => {
     it("LATEST_SUPPORTED_VERSION equals the highest migration version", () => {
         expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
+    });
+
+    it("logs the live database version and supported fence at boot", () => {
+        expect(formatSchemaFenceBootLog(71, 72)).toBe(
+            "[magic-context] storage schema at boot: database=v71, supported_fence=v72",
+        );
     });
 });

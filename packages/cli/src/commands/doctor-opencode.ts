@@ -26,6 +26,7 @@ import { migrateConfigLocationsForCli } from "../lib/config-location-migration";
 import {
     openExistingContextDatabase,
     openExistingContextDatabaseForMutation,
+    UnsupportedSchemaVersionError,
 } from "../lib/database-access";
 import { collectDiagnostics } from "../lib/diagnostics-opencode";
 import {
@@ -53,7 +54,11 @@ import {
     sanitizeDiagnosticText,
     sanitizePathString,
 } from "../lib/redaction";
-import { formatStorageVersions, readStorageVersions } from "../lib/storage-versions";
+import {
+    checkStorageVersionFence,
+    formatStorageVersions,
+    readStorageVersions,
+} from "../lib/storage-versions";
 import { runV22BackfillCommands, type V22BackfillCommandArgs } from "../lib/v22-backfill-commands";
 import { reportAuthorityMarkers } from "./doctor-authority";
 import { clearPluginCache } from "./doctor-opencode-cache";
@@ -1256,7 +1261,11 @@ export async function runDoctor(
             try {
                 pass("Opened the shared DB with a supported schema");
                 // Stable storage-version probe: live DB schema vs this binary's fence.
-                log.info(formatStorageVersions(readStorageVersions(db)));
+                const storageVersions = readStorageVersions(db);
+                log.info(formatStorageVersions(storageVersions));
+                const fenceCheck = checkStorageVersionFence(storageVersions);
+                if (fenceCheck.alarm) fail(fenceCheck.message);
+                else log.info(fenceCheck.message);
                 try {
                     const integrity = db.prepare("PRAGMA integrity_check").get() as
                         | { integrity_check?: string }
@@ -1301,7 +1310,18 @@ export async function runDoctor(
                 db.close();
             }
         } catch (err) {
-            fail(`Could not open shared DB: ${err instanceof Error ? err.message : String(err)}`);
+            if (err instanceof UnsupportedSchemaVersionError) {
+                fail(
+                    checkStorageVersionFence({
+                        context_db_schema_version: err.persistedVersion,
+                        plugin_supported_version: err.supportedVersion,
+                    }).message,
+                );
+            } else {
+                fail(
+                    `Could not open shared DB: ${err instanceof Error ? err.message : String(err)}`,
+                );
+            }
         }
     }
 

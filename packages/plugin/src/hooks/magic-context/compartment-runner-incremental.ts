@@ -458,6 +458,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         retainDrainReservationForRetryThrottle = true;
         const validatedPass = await runValidatedHistorianPass({
             client,
+            db,
             parentSessionId: sessionId,
             sessionDirectory,
             prompt,

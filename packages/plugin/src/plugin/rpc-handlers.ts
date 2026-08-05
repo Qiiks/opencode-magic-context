@@ -489,6 +489,9 @@ export function buildSidebarSnapshot(
             sessionNoteCount,
             readySmartNoteCount,
             cacheTtl,
+            lastTransformError: meta?.last_transform_error
+                ? String(meta.last_transform_error)
+                : null,
             lastDreamerRunAt,
             projectIdentity,
             compartmentTokens: calibrated.compartmentTokens,

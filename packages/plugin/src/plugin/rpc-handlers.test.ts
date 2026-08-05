@@ -50,6 +50,29 @@ describe("sidebar snapshot RPC failures", () => {
     });
 });
 
+describe("buildSidebarSnapshot — stale build error state", () => {
+    test("surfaces the persisted stale-build failure in the sidebar snapshot", () => {
+        const db = createTestDb();
+        try {
+            const sessionId = "ses-stale-build";
+            db.prepare(
+                "INSERT INTO session_meta (session_id, last_transform_error) VALUES (?, ?)",
+            ).run(
+                sessionId,
+                "Magic Context: plugin build is older than its database — restart OpenCode",
+            );
+
+            const snapshot = buildSidebarSnapshot(db, sessionId, process.cwd());
+
+            expect(snapshot.lastTransformError).toBe(
+                "Magic Context: plugin build is older than its database — restart OpenCode",
+            );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
 describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
     test("computes memoryTokens on-demand when memory_block_cache is empty but memory_block_count > 0", () => {
         const db = createTestDb();

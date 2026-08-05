@@ -1,3 +1,5 @@
+/// <reference types="bun-types" />
+
 import { describe, expect, it } from "bun:test";
 import {
     initializeDatabase,
@@ -5,7 +7,12 @@ import {
     runMigrations,
 } from "@magic-context/core/features/magic-context/storage";
 import { Database } from "@magic-context/core/shared/sqlite";
-import { formatStorageVersions, readStorageVersions } from "./storage-versions";
+import {
+    checkStorageVersionFence,
+    formatStorageVersions,
+    readStorageVersions,
+    STALE_BUILD_RESTART_INSTRUCTION,
+} from "./storage-versions";
 
 describe("storage versions probe", () => {
     it("reads the live schema version and the binary fence from a fully migrated DB", () => {
@@ -58,5 +65,30 @@ describe("storage versions probe", () => {
         } finally {
             db.close();
         }
+    });
+});
+
+describe("checkStorageVersionFence", () => {
+    it("alarms only when the database is newer than the build", () => {
+        const result = checkStorageVersionFence({
+            context_db_schema_version: 73,
+            plugin_supported_version: 72,
+        });
+
+        expect(result.alarm).toBe(true);
+        expect(result.message).toContain(STALE_BUILD_RESTART_INSTRUCTION);
+    });
+
+    it("reports migrations pending without alarming when the database is older", () => {
+        const result = checkStorageVersionFence({
+            context_db_schema_version: 71,
+            plugin_supported_version: 72,
+        });
+
+        expect(result).toEqual({
+            alarm: false,
+            message:
+                "Storage schema migrations pending: context.db is v71; this build supports through v72.",
+        });
     });
 });

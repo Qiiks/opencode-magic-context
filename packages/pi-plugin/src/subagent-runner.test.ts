@@ -1,9 +1,25 @@
-import { beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import { EventEmitter } from "node:events";
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { PassThrough } from "node:stream";
+import {
+	closeDatabase,
+	openDatabase,
+} from "@magic-context/core/features/magic-context/storage";
+import {
+	__resetSchemaFenceStateForTests,
+	LATEST_SUPPORTED_VERSION,
+} from "@magic-context/core/features/magic-context/storage-db";
 import * as loggerModule from "@magic-context/core/shared/logger";
 import type { SubagentRunOptions } from "@magic-context/core/shared/subagent-runner";
 
@@ -26,6 +42,11 @@ const ISOLATED_RETRY_SILENT_LOG_MESSAGE =
 
 beforeEach(() => {
 	__test.resetProviderFormCache();
+});
+
+afterEach(() => {
+	closeDatabase();
+	__resetSchemaFenceStateForTests();
 });
 
 type MockChild = ReturnType<typeof createMockChild>;
@@ -166,6 +187,8 @@ function agentEnd(messages: unknown[]) {
 function nextTick() {
 	return new Promise((resolve) => setTimeout(resolve, 0));
 }
+
+const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 describe("subagent-runner pure helpers", () => {
 	it("extracts the last assistant text and status from mixed messages", () => {
@@ -2225,5 +2248,42 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		await new Promise((resolve) => setTimeout(resolve, 2100));
 
 		expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+	});
+});
+
+describe("Pi subagent schema-fence probe", () => {
+	it("does not spawn a Pi child when the shared database is newer than this build", async () => {
+		const dataHome = mkdtempSync(join(tmpdir(), "mc-pi-fence-probe-"));
+		try {
+			process.env.XDG_DATA_HOME = dataHome;
+			closeDatabase();
+			__resetSchemaFenceStateForTests();
+			const db = openDatabase();
+			if (!db) throw new Error("expected a fresh test database");
+			db.prepare(
+				"INSERT INTO schema_migrations(version, description, applied_at) VALUES (?, ?, ?)",
+			).run(LATEST_SUPPORTED_VERSION + 1, "future schema", Date.now());
+
+			const { runner, spawnImpl } = runnerWith(createMockChild());
+			const result = await runner.run(baseOptions);
+
+			// Removing the pre-spawn probe makes this fake process launch, so the
+			// assertion proves Pi shares the stale-build fence rather than merely
+			// returning a matching failure from a later path.
+			expect(spawnImpl).not.toHaveBeenCalled();
+			expect(result).toMatchObject({
+				ok: false,
+				reason: "spawn_failed",
+				error: expect.stringContaining(
+					"plugin build is older than its database",
+				),
+			});
+		} finally {
+			closeDatabase();
+			__resetSchemaFenceStateForTests();
+			if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+			else process.env.XDG_DATA_HOME = originalXdgDataHome;
+			rmSync(dataHome, { recursive: true, force: true });
+		}
 	});
 });

@@ -27,6 +27,7 @@ import {
 import {
     openExistingContextDatabase,
     openExistingContextDatabaseForMutation,
+    UnsupportedSchemaVersionError,
 } from "../lib/database-access";
 import { collectDiagnostics } from "../lib/diagnostics-pi";
 import {
@@ -56,7 +57,11 @@ import {
 } from "../lib/pi-package-entry";
 import { type PromptIO, promptIO } from "../lib/prompts";
 import { sanitizeDiagnosticEndpoint, sanitizeDiagnosticText } from "../lib/redaction";
-import { formatStorageVersions, readStorageVersions } from "../lib/storage-versions";
+import {
+    checkStorageVersionFence,
+    formatStorageVersions,
+    readStorageVersions,
+} from "../lib/storage-versions";
 import { runV22BackfillCommands, type V22BackfillCommandArgs } from "../lib/v22-backfill-commands";
 import { writePiSettingsPackage } from "./setup-pi";
 
@@ -588,7 +593,10 @@ async function runHealthChecks(options: {
             } else {
                 add(results, "pass", "Opened the shared DB read-only with a supported schema");
                 // Stable storage-version probe: live DB schema vs this binary's fence.
-                add(results, "info", formatStorageVersions(readStorageVersions(db)));
+                const storageVersions = readStorageVersions(db);
+                add(results, "info", formatStorageVersions(storageVersions));
+                const fenceCheck = checkStorageVersionFence(storageVersions);
+                add(results, fenceCheck.alarm ? "fail" : "info", fenceCheck.message);
 
                 const integrity = db.prepare("PRAGMA integrity_check").get() as {
                     integrity_check?: unknown;
@@ -608,11 +616,22 @@ async function runHealthChecks(options: {
                 add(results, "info", `Shared DB row counts: ${counts}`);
             }
         } catch (error) {
-            add(
-                results,
-                "fail",
-                `Could not open shared context DB: ${error instanceof Error ? error.message : String(error)}`,
-            );
+            if (error instanceof UnsupportedSchemaVersionError) {
+                add(
+                    results,
+                    "fail",
+                    checkStorageVersionFence({
+                        context_db_schema_version: error.persistedVersion,
+                        plugin_supported_version: error.supportedVersion,
+                    }).message,
+                );
+            } else {
+                add(
+                    results,
+                    "fail",
+                    `Could not open shared context DB: ${error instanceof Error ? error.message : String(error)}`,
+                );
+            }
         } finally {
             db?.close();
         }

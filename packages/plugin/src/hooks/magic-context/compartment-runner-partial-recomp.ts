@@ -431,6 +431,7 @@ export async function executePartialRecompInternal(
 
             const validatedPass = await runValidatedHistorianPass({
                 client,
+                db,
                 parentSessionId: sessionId,
                 sessionDirectory,
                 prompt,

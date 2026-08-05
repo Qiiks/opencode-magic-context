@@ -404,6 +404,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
 
             const validatedPass = await runValidatedHistorianPass({
                 client,
+                db,
                 parentSessionId: sessionId,
                 sessionDirectory,
                 prompt,

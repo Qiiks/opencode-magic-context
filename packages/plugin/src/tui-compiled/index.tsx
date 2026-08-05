@@ -9,7 +9,7 @@ import { createComponent as _$createComponent } from "opentui:runtime-module:%40
 /** @jsxImportSource @opentui/solid */
 // @ts-nocheck
 import { createMemo } from "opentui:runtime-module:solid-js";
-import { createSidebarContentSlot, kickRecompProgressRefresh } from "./slots/sidebar-content";
+import { createSidebarContentSlot, kickRecompProgressRefresh, refreshSidebarSnapshot } from "./slots/sidebar-content";
 import packageJson from "../../package.json";
 import { closeRpc, dismissUpgradeReminder, getAnnouncement, getCompartmentCount, getRpcGeneration, initRpcClient, loadEmbedDetail, loadStatusDetail, loadToastDurationMs, markAnnounced, requestRecomp, requestUpgrade } from "./data/context-db";
 import { startNotificationSocket, stopNotificationSocket } from "./data/notification-socket";
@@ -1478,6 +1478,11 @@ const tui = async (api, _options, meta) => {
     }
     if (action === "show-embed-dialog") {
       return stillActive() && (await showEmbedDialog(api, requestedSessionId));
+    }
+    if (action === "refresh-sidebar") {
+      if (!stillActive()) return false;
+      refreshSidebarSnapshot();
+      return true;
     }
     if (action === "wrapup-progress-kick") {
       // /ctx-wrapup blocks its command turn and fires no message events, so
