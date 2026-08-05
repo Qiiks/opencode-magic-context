@@ -591,7 +591,11 @@ export function buildStatusDetail(
         mural: undefined,
         // Safe defaults; the live context.db value is filled in the try block below.
         storage_versions: {
-            context_db_schema_version: 0,
+            // null = the probe FAILED (read threw); 0 = probe succeeded on a fresh DB
+            // with no migrations table; N = live schema version. Distinct values so a
+            // reader never has to guess whether a falsy version means broken or empty
+            // (fleet Q1 discrimination — SUBC status-surface contract).
+            context_db_schema_version: null as number | null,
             plugin_supported_version: LATEST_SUPPORTED_VERSION,
         },
     };

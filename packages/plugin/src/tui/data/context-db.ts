@@ -203,7 +203,7 @@ export async function loadStatusDetail(
         compressionUsage: null,
         toastDurationMs: 5000,
         storage_versions: {
-            context_db_schema_version: 0,
+            context_db_schema_version: null,
             plugin_supported_version: 0,
         },
     };

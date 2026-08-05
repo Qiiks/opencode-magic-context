@@ -144,8 +144,13 @@ export interface StatusDetail extends SidebarSnapshot {
      * surface supplies the module-store value instead.
      */
     storage_versions: {
-        /** Persisted schema version of context.db (MAX of schema_migrations). */
-        context_db_schema_version: number;
+        /**
+         * Persisted schema version of context.db (MAX of schema_migrations).
+         * null = the version probe FAILED (read threw — broken/unreachable store);
+         * 0 = probe succeeded on a fresh DB without a migrations table. Distinct so
+         * readers never conflate broken-with-empty (fleet status-surface contract).
+         */
+        context_db_schema_version: number | null;
         /** Highest context.db schema version this plugin build supports. */
         plugin_supported_version: number;
     };
