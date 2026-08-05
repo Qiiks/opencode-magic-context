@@ -60,6 +60,8 @@ export interface RegisterToolsOptions {
 	todowriteEnabled?: boolean;
 	/** Main Pi entry registers /todos; lean subagent entries keep commands off. */
 	todowriteCommandEnabled?: boolean;
+	/** In compaction-off mode, omit ctx_reduce and keep the other Pi tools available. */
+	compactionOff?: boolean;
 }
 
 export function registerMagicContextTools(
@@ -121,7 +123,7 @@ export function registerMagicContextTools(
 	// ctx_reduce is session-scoped just like ctx_note/ctx_expand: it resolves the
 	// CURRENT session id at call time. Omit it for `--no-session` children where
 	// that id points at a hidden ephemeral child session.
-	if (!opts.sessionScopedToolsDisabled) {
+	if (!opts.sessionScopedToolsDisabled && !opts.compactionOff) {
 		pi.registerTool(
 			createCtxReduceTool({
 				db: opts.db,

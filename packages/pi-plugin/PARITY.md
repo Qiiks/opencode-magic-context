@@ -843,6 +843,33 @@ for the compress-cues dreamer task). No intentional per-provider image-part
 blacklist today — every Pi serializer path that accepts user image content takes
 raw base64 the same way.
 
+## 27. Compaction-off mode: additive Pi transform and native Pi compaction
+
+Both harnesses keep m[0]/m[1] memory, docs, user-profile, raw-message indexing,
+search, notes, and dreamer live when `compaction.enabled=false`; both disable
+historian work, history rendering/trimming, tag writes, drops, strips, caveman
+replay, synthetic todowrite injection, nudge delivery, emergency recovery, and
+MC marker work. Pi makes that reduced path in `context-handler.ts` before its
+transcript/tag pipeline, so it writes zero new Pi tag rows and returns only the
+m[0]/m[1] additive injection.
+
+Pi's native compact hook is the host-specific part: normal mode returns
+`{ cancel: true }` because Magic Context owns the compacted view; compaction-off
+returns nothing, allowing Pi's threshold and overflow compaction to proceed.
+Pi has no OpenCode marker rows. Its MC-owned equivalent is the durable
+`pending_pi_compaction_marker_state` JSONL-drain payload plus the in-process
+deferred history/materialization signals. The off transition clears both, along
+with pending operations, the emergency latch, pending/claimed Channel-2 intent,
+and cached m[0]/m[1] bytes. The on transition invalidates the same baseline and
+signals historian catch-up when a historian is configured. This is full parity,
+not an intentional divergence; only the host marker representation differs.
+
+Pi's todowrite overlay/state capture remains registered in compaction-off mode:
+it is UI state and does not write to the model wire. The synthetic todowrite
+context pair that would consume that captured state is gated off.
+
+---
+
 ## Pending parity
 
 - Last-known-good transform capture and replay for OpenCode and rust-mode sessions is pending for Pi.

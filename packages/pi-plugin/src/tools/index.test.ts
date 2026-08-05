@@ -36,6 +36,31 @@ describe("registerMagicContextTools", () => {
 		}
 	});
 
+	it("removes only ctx_reduce in compaction-off mode", () => {
+		const db = createTestDb();
+		try {
+			const registered: string[] = [];
+			const pi = {
+				registerTool: (tool: { name: string }) => registered.push(tool.name),
+				registerCommand: () => undefined,
+			} as never;
+			registerMagicContextTools(pi, { db, compactionOff: true });
+
+			expect(registered).not.toContain("ctx_reduce");
+			expect(registered).toEqual(
+				expect.arrayContaining([
+					"ctx_search",
+					"ctx_memory",
+					"ctx_note",
+					"ctx_expand",
+					"todowrite",
+				]),
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("advertises only real ctx_* fields and allows additional properties", () => {
 		const db = createTestDb();
 		try {

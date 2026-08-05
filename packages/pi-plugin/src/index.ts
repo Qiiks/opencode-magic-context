@@ -23,7 +23,10 @@
 import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { isDreamerRunnable } from "@magic-context/core/config/agent-disable";
+import {
+	isCompactionEnabled,
+	isDreamerRunnable,
+} from "@magic-context/core/config/agent-disable";
 import { migrateMagicContextConfigLocations } from "@magic-context/core/config/migrate-config-location";
 import type {
 	DreamerConfig,
@@ -61,6 +64,7 @@ import {
 	recordOverflowDetected,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { runDeferredV22Backfill } from "@magic-context/core/features/magic-context/v22-deferred-backfill";
+import { setCtxReduceRegisteredGlobally } from "@magic-context/core/hooks/magic-context/ctx-reduce-availability";
 import {
 	deriveHistorianChunkTokens,
 	resolveHistorianContextLimit,
@@ -232,6 +236,34 @@ function resolveCurrentProject(ctx: { cwd: string }): {
 export function signalPiDeferredCompactionMarkerDrain(sessionId: string): void {
 	signalPiDeferredHistoryRefresh(sessionId);
 	signalPiDeferredMaterialization(sessionId);
+}
+
+/**
+ * Pi native compaction invalidates MC's cached m[0]/m[1] bytes. In normal mode
+ * MC still owns compaction and cancels this event; compaction-off mode clears
+ * only that cache and deliberately returns no cancellation result.
+ */
+export async function handlePiSessionBeforeCompact(args: {
+	db: ContextDatabase;
+	compactionOff: boolean;
+	ctx: { sessionManager?: { getSessionId?: () => string | undefined } };
+}): Promise<{ cancel: true } | undefined> {
+	try {
+		const sessionId = args.ctx.sessionManager?.getSessionId?.();
+		if (typeof sessionId === "string" && sessionId.length > 0) {
+			clearPiM0Cache(args.db, sessionId, "session_before_compact");
+		}
+	} catch {
+		// Cache invalidation is best-effort; it must not suppress Pi's native path.
+	}
+	if (args.compactionOff) {
+		info(
+			"session_before_compact: native Pi compaction proceeds (compaction-off mode)",
+		);
+		return;
+	}
+	info("session_before_compact: cancelling — magic-context owns compaction");
+	return { cancel: true };
 }
 
 export function persistPiMessageEndModelMeta(args: {
@@ -728,7 +760,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 						openFailureCause ??
 						`storage unavailable at ${dbPath} (cache schema newer than this binary, or open failed)`,
 				};
-		if (early.config.fail_closed_blocking === false) {
+		if (
+			early.config.fail_closed_blocking === false ||
+			!isCompactionEnabled(early.config)
+		) {
 			warn(
 				`Magic Context (pi) storage unavailable at ${dbPath}: ${formatFailClosedBlockingMessage(reason)}. ` +
 					"fail_closed_blocking=false — degrading silently (hooks not registered).",
@@ -810,22 +845,6 @@ async function startPiMagicContextRuntime(
 	const seenDreamerProjectIdentities = new Set<string>();
 	if (projectIdentity) seenDreamerProjectIdentities.add(projectIdentity);
 
-	try {
-		const pendingPiMarkerSessions = getSessionsWithPendingPiMarker(db);
-		for (const sid of pendingPiMarkerSessions) {
-			signalPiDeferredCompactionMarkerDrain(sid);
-		}
-		if (pendingPiMarkerSessions.length > 0) {
-			log(
-				`${PREFIX} rehydrated ${pendingPiMarkerSessions.length} Pi deferred compaction marker session(s)`,
-			);
-		}
-	} catch (err) {
-		warn(
-			`Magic Context (pi) failed to rehydrate deferred Pi compaction markers: ${err instanceof Error ? err.message : String(err)}`,
-		);
-	}
-
 	info(
 		`loaded v${PLUGIN_VERSION} | harness=pi | db=${dbPath} | ` +
 			`project=${projectIdentity} | dir=${projectDir}`,
@@ -844,6 +863,27 @@ async function startPiMagicContextRuntime(
 	const { config, warnings, loadedFromPaths } = loadPiConfig({
 		cwd: projectDir,
 	});
+	// Pi tools are registered once per process, so this mode is intentionally
+	// boot-resolved rather than following later /cd project config changes.
+	const compactionOff = !isCompactionEnabled(config);
+	setCtxReduceRegisteredGlobally(!compactionOff);
+	if (!compactionOff) {
+		try {
+			const pendingPiMarkerSessions = getSessionsWithPendingPiMarker(db);
+			for (const sid of pendingPiMarkerSessions) {
+				signalPiDeferredCompactionMarkerDrain(sid);
+			}
+			if (pendingPiMarkerSessions.length > 0) {
+				log(
+					`${PREFIX} rehydrated ${pendingPiMarkerSessions.length} Pi deferred compaction marker session(s)`,
+				);
+			}
+		} catch (err) {
+			warn(
+				`Magic Context (pi) failed to rehydrate deferred Pi compaction markers: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+	}
 	// The allowlist is user-tier only, so configure all child runners once at
 	// boot. Project config is stripped before this merged config is returned.
 	configurePiSubagentExtensions(config.pi?.subagent_extensions);
@@ -930,6 +970,7 @@ async function startPiMagicContextRuntime(
 		language: cfg.language,
 		autoSearch: auto,
 		resolveForProject: resolveContextOptionsForProject,
+		compactionOff,
 		maybeAutoEmbedSession: (sessionId, dir, identity) => {
 			maybeAutoEmbedPiSession(
 				{
@@ -1062,11 +1103,16 @@ async function startPiMagicContextRuntime(
 		resolveDreamerEnabled: (ctx) =>
 			resolveCurrentProjectDeps(ctx).dreamerEnabled,
 		todowriteEnabled,
+		compactionOff,
 	});
 	info(
-		todowriteEnabled
-			? "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, todowrite, ctx_reduce; registered /todos"
-			: "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce (todowrite disabled)",
+		compactionOff
+			? todowriteEnabled
+				? "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, todowrite; registered /todos (ctx_reduce unavailable in compaction-off mode)"
+				: "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand (ctx_reduce unavailable in compaction-off mode; todowrite disabled)"
+			: todowriteEnabled
+				? "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, todowrite, ctx_reduce; registered /todos"
+				: "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce (todowrite disabled)",
 	);
 
 	pi.on("session_start", async (event, ctx) => {
@@ -1173,7 +1219,7 @@ async function startPiMagicContextRuntime(
 	registerStatusLine(pi, { db, projectIdentity });
 	info("registered magic-context status line");
 
-	registerCtxFlushCommand(pi, { db });
+	registerCtxFlushCommand(pi, { db, compactionOff });
 	info("registered /ctx-flush");
 
 	// /ctx-recomp uses its own PiSubagentRunner instance — recomp can run
@@ -1192,6 +1238,7 @@ async function startPiMagicContextRuntime(
 		language: bootProjectDeps.config.language,
 		memoryEnabled: bootProjectDeps.config.memory.enabled,
 		autoPromote: bootProjectDeps.config.memory.auto_promote,
+		compactionOff,
 		resolveRuntimeDeps: (ctx) => {
 			const current = resolveCurrentProjectDeps(ctx);
 			return {
@@ -1207,6 +1254,7 @@ async function startPiMagicContextRuntime(
 				language: current.config.language,
 				memoryEnabled: current.config.memory.enabled,
 				autoPromote: current.config.memory.auto_promote,
+				compactionOff,
 			};
 		},
 	});
@@ -1225,6 +1273,7 @@ async function startPiMagicContextRuntime(
 		language: bootProjectDeps.config.language,
 		memoryEnabled: bootProjectDeps.config.memory.enabled,
 		autoPromote: bootProjectDeps.config.memory.auto_promote,
+		compactionOff,
 		userMemoriesEnabled: userMemoryCollectionEnabled(
 			bootProjectDeps.config.dreamer,
 		),
@@ -1246,6 +1295,7 @@ async function startPiMagicContextRuntime(
 				language: current.config.language,
 				memoryEnabled: current.config.memory.enabled,
 				autoPromote: current.config.memory.auto_promote,
+				compactionOff,
 				userMemoriesEnabled: userMemoryCollectionEnabled(
 					current.config.dreamer,
 				),
@@ -1272,6 +1322,7 @@ async function startPiMagicContextRuntime(
 		language: bootProjectDeps.config.language,
 		memoryEnabled: bootProjectDeps.config.memory.enabled,
 		autoPromote: bootProjectDeps.config.memory.auto_promote,
+		compactionOff,
 		userMemoriesEnabled: userMemoryCollectionEnabled(
 			bootProjectDeps.config.dreamer,
 		),
@@ -1290,6 +1341,7 @@ async function startPiMagicContextRuntime(
 				language: current.config.language,
 				memoryEnabled: current.config.memory.enabled,
 				autoPromote: current.config.memory.auto_promote,
+				compactionOff,
 				userMemoriesEnabled: userMemoryCollectionEnabled(
 					current.config.dreamer,
 				),
@@ -1500,7 +1552,11 @@ async function startPiMagicContextRuntime(
 					const canDrain =
 						typeof smForDrain.appendCompaction === "function" &&
 						typeof smForDrain.getBranch === "function";
-					if (canDrain && getPendingPiCompactionMarkerState(db, sessionId)) {
+					if (
+						!compactionOff &&
+						canDrain &&
+						getPendingPiCompactionMarkerState(db, sessionId)
+					) {
 						signalPiDeferredCompactionMarkerDrain(sessionId);
 					}
 				} catch {
@@ -1511,7 +1567,11 @@ async function startPiMagicContextRuntime(
 				// compartments. Model-invisible (ctx.ui.notify), self-gating via the
 				// durable + per-process guards in the shared helper. Only when the
 				// historian can run (so /ctx-session-upgrade is actionable).
-				if (ctx.hasUI && effectiveProjectDeps.historianConfig?.model) {
+				if (
+					!compactionOff &&
+					ctx.hasUI &&
+					effectiveProjectDeps.historianConfig?.model
+				) {
 					void maybeSendUpgradeReminder(
 						{
 							client: null,
@@ -1576,7 +1636,7 @@ async function startPiMagicContextRuntime(
 				memoryEnabled: effectiveConfig.memory.enabled,
 				includeGuidance: true,
 				protectedTags: effectiveConfig.protected_tags,
-				ctxReduceCallable: true,
+				ctxReduceCallable: !compactionOff,
 				dreamerEnabled: effectiveProjectDeps.dreamerEnabled,
 				temporalAwarenessEnabled: effectiveConfig.temporal_awareness ?? false,
 				cavemanTextCompressionEnabled:
@@ -1718,7 +1778,8 @@ async function startPiMagicContextRuntime(
 				: undefined;
 			if (lastAssistant?.stopReason === "stop") {
 				const sessionId = ctx.sessionManager?.getSessionId?.();
-				if (sessionId && db) maybeDeliverChannel2Pi(pi, db, sessionId);
+				if (sessionId && db && !compactionOff)
+					maybeDeliverChannel2Pi(pi, db, sessionId);
 			}
 		} catch (err) {
 			log(`agent_end: channel2 delivery skipped: ${String(err)}`);
@@ -1793,7 +1854,7 @@ async function startPiMagicContextRuntime(
 						(t) => t.status === "completed" || t.status === "cancelled",
 					)
 				) {
-					if (sessionMeta && !sessionMeta.isSubagent) {
+					if (!compactionOff && sessionMeta && !sessionMeta.isSubagent) {
 						onNoteTrigger(db, sessionId, "todos_complete");
 					}
 				}
@@ -1813,7 +1874,7 @@ async function startPiMagicContextRuntime(
 		try {
 			const sessionId = ctx.sessionManager.getSessionId();
 			if (typeof sessionId !== "string" || sessionId.length === 0) return;
-			if (event.toolName === "ctx_reduce") {
+			if (!compactionOff && event.toolName === "ctx_reduce") {
 				markPiChannel1Reduced(sessionId, db);
 			}
 		} catch (err) {
@@ -1839,6 +1900,7 @@ async function startPiMagicContextRuntime(
 			// queued user message into the NEXT STEP of the in-flight turn so
 			// the agent is warned while the pile is still growing (agent_end
 			// stays as the idle fallback). No-ops unless pending + revalidated.
+			if (compactionOff) return;
 			if (db) maybeDeliverChannel2Pi(pi, db, sessionId, "steer");
 			const block = maybeChannel1ReminderForToolResult({
 				db,
@@ -1855,46 +1917,12 @@ async function startPiMagicContextRuntime(
 		}
 	});
 
-	// Cancel Pi's native context compaction. Magic Context owns the
-	// compacted view of conversation history through its own historian
-	// pipeline (compartments + facts + memories rendered as
-	// `<session-history>` in `pi.on("context")`). If Pi's auto-compaction
-	// were to run, it would:
-	//   1. Pack the full conversation into a single plain-text user
-	//      message and ask the LLM to summarize it. For sessions with a
-	//      lot of accumulated history (especially after `doctor migrate`)
-	//      that summarization request itself overflows the model's
-	//      context window — the failure mode that surfaced as
-	//      "Context overflow recovery failed" on migrated sessions.
-	//   2. Replace history with that flat summary and lose the structured
-	//      compartment / fact / memory state we depend on.
-	//
-	// Returning `{ cancel: true }` aborts both the threshold-driven
-	// auto-compact and the post-overflow recovery compact. Pi treats
-	// the abort as a no-op and proceeds with the unmodified branch on
-	// the next turn — at which point our `pi.on("context")` transform
-	// shrinks the prompt via tag drops, caveman compression, and
-	// `<session-history>` injection over the much smaller live tail.
-	//
-	// Steady-state sessions normally don't hit this path because our
-	// historian writes a Pi compaction marker at the boundary
-	// (`sessionManager.appendCompaction()`), so `getBranch()` already
-	// trims the prefix before Pi ever evaluates `shouldCompact`. The
-	// hook is the safety net for everything else: migrated sessions
-	// without a compaction marker, sessions where historian failed,
-	// or any future flow where Pi's heuristic decides to compact.
-	pi.on("session_before_compact", async (_event, ctx) => {
-		try {
-			const sessionId = ctx.sessionManager?.getSessionId?.();
-			if (typeof sessionId === "string" && sessionId.length > 0) {
-				clearPiM0Cache(db, sessionId, "session_before_compact");
-			}
-		} catch {
-			// best-effort; still cancel Pi native compaction below
-		}
-		info("session_before_compact: cancelling — magic-context owns compaction");
-		return { cancel: true };
-	});
+	// In normal mode MC owns compaction and cancels Pi's native hook. In
+	// compaction-off mode the same hook must return nothing: native Pi compaction
+	// is the selected context manager and cancelling it would leave no manager.
+	pi.on("session_before_compact", async (_event, ctx) =>
+		handlePiSessionBeforeCompact({ db, compactionOff, ctx }),
+	);
 
 	// Strip injected `§N§` tag prefix from assistant text BEFORE Pi
 	// persists the message to disk and renders it to the UI. Mirrors
@@ -1917,7 +1945,7 @@ async function startPiMagicContextRuntime(
 	pi.on("message_end", async (event, ctx) => {
 		try {
 			const msg = event.message as unknown;
-			if (msg !== null && typeof msg === "object") {
+			if (!compactionOff && msg !== null && typeof msg === "object") {
 				stripTagPrefixFromAssistantMessage(
 					msg as { role: string; content: unknown },
 				);
@@ -2051,6 +2079,7 @@ async function startPiMagicContextRuntime(
 		// Cerebras, GitHub Copilot, OpenRouter, Ollama, vLLM, Mistral,
 		// MiniMax, Kimi, Gemini, and a generic fallback.
 		try {
+			if (compactionOff) return;
 			const sm = ctx.sessionManager as
 				| { getSessionId?: () => string | undefined }
 				| undefined;

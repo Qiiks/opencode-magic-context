@@ -534,14 +534,23 @@ export interface PiM0M1State {
 	 *  cached baseline. Defer passes replay the baked-in bytes without re-render. */
 	muralEnabled?: boolean;
 	/** Explicit mural wire options for tests. When set, skips on-demand resolve
-	 *  during HARD materialization (mirrors OpenCode `M0M1RenderOptions.mural`). */
+	 * during HARD materialization (mirrors OpenCode `M0M1RenderOptions.mural`). */
 	mural?: MuralWireOptions;
+	/** Keeps memory/docs injection while suppressing compartment history rendering and trimming. */
+	compactionOff?: boolean;
 }
 
 const EMPTY_PI_PROJECT_DOCS: PiProjectDocsRender = {
 	renderedBlock: "",
 	canonicalHash: "",
 };
+
+function getRenderableCompartmentsPi(
+	db: ContextDatabase,
+	state: PiM0M1State,
+): PiCompartment[] {
+	return state.compactionOff ? [] : getCompartments(db, state.sessionId);
+}
 
 function readProjectDocsForPiM0(state: PiM0M1State): PiProjectDocsRender {
 	return state.injectDocs !== false
@@ -930,7 +939,7 @@ function getCachedMarkers(
 		return null;
 	}
 	const compartments =
-		compartmentsForNormalization ?? getCompartments(db, state.sessionId);
+		compartmentsForNormalization ?? getRenderableCompartmentsPi(db, state);
 	const cachedUpgradeIdentity = decodeCachedM0UpgradeIdentity(
 		meta.cachedM0UpgradeState,
 	);
@@ -995,7 +1004,7 @@ function readCurrentMarkers(
 	return readCurrentMarkersFromCompartments(
 		db,
 		state,
-		getCompartments(db, state.sessionId),
+		getRenderableCompartmentsPi(db, state),
 		projectDocsHash,
 	);
 }
@@ -1080,7 +1089,7 @@ export function mustMaterializePi(
 	// TOCTOU where a count change between the decision and the reload could flip
 	// markers to null and escape to the unguarded re-materialize path.
 	const currentCompartments =
-		currentCompartmentsOverride ?? getCompartments(db, state.sessionId);
+		currentCompartmentsOverride ?? getRenderableCompartmentsPi(db, state);
 	const current = readCurrentMarkersFromCompartments(
 		db,
 		state,
@@ -1281,7 +1290,8 @@ export function renderM0Pi(
 	const baseHistoryBudget =
 		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
 	const decayed = renderDecayedCompartments({
-		compartments: compartmentsOverride ?? getCompartments(db, state.sessionId),
+		compartments:
+			compartmentsOverride ?? getRenderableCompartmentsPi(db, state),
 		// v2: use the HISTORY budget (~60K), not the memory injection budget (~4K).
 		// Falling back to the memory budget would over-demote every compartment.
 		historyBudgetTokens:
@@ -1312,11 +1322,13 @@ export function renderM0Pi(
 		trimmedProfile,
 	);
 	if (userProfile.length > 0) sections.push(userProfile);
-	sections.push(
-		decayed.length > 0
-			? `<session-history>\n${decayed}\n</session-history>`
-			: "<session-history></session-history>",
-	);
+	if (!state.compactionOff) {
+		sections.push(
+			decayed.length > 0
+				? `<session-history>\n${decayed}\n</session-history>`
+				: "<session-history></session-history>",
+		);
+	}
 	if (memoryBlock) sections.push(memoryBlock);
 	// Sibling layout parity with OpenCode renderM0: mural marker after memories.
 	if (mural?.enabled && mural.supportsVision && mural.dataUrl) {
@@ -1401,7 +1413,7 @@ function readFrozenM0InputsPi(
 	const memPath = memoryProjectPath(state);
 	const read = db.transaction(() => {
 		const workspace = resolveWorkspaceRenderContextPi(state, db);
-		const compartments = getCompartments(db, state.sessionId);
+		const compartments = getRenderableCompartmentsPi(db, state);
 		const memories = memPath
 			? workspace.isWorkspaced
 				? getMemoriesByProjects(
@@ -1862,7 +1874,7 @@ function renderM1PiWithMetadata(
 	if (memoryUpdates.block) sections.push(memoryUpdates.block);
 
 	const newCompartments = (
-		compartmentsOverride ?? getCompartments(db, state.sessionId)
+		compartmentsOverride ?? getRenderableCompartmentsPi(db, state)
 	).filter((compartment) => compartment.sequence > markers.maxCompartmentSeq);
 	if (newCompartments.length > 0) {
 		// New compartments are newest deltas → always render at P1 (full fidelity).
@@ -1957,7 +1969,9 @@ function renderM1PiWithMetadata(
 	// Join with "\n" (single newline) to match OpenCode renderM1 exactly — the
 	// m[1] delta bytes must be identical across harnesses.
 	return {
-		text: `<session-history-since>\n${sections.join("\n")}\n</session-history-since>`,
+		text: state.compactionOff
+			? `<knowledge-updates>\n${sections.join("\n")}\n</knowledge-updates>`
+			: `<session-history-since>\n${sections.join("\n")}\n</session-history-since>`,
 		memoryUpdateCount: memoryUpdates.count,
 	};
 }
@@ -2229,9 +2243,9 @@ function softRefreshCachedM1Pi(args: {
 					`missing sibling cached m[0]/m[1] for ${args.state.sessionId}`,
 				);
 			}
-			const siblingCompartments = getCompartments(
+			const siblingCompartments = getRenderableCompartmentsPi(
 				args.db,
-				args.state.sessionId,
+				args.state,
 			);
 			return {
 				...applyCachedPiRow({
@@ -2370,7 +2384,7 @@ export function injectM0M1Pi(
 	// and every cached-marker reload below normalize against this same set, so a
 	// concurrent count change can't flip markers to null mid-decision and escape
 	// the guarded fallback (TOCTOU).
-	const currentCompartments = getCompartments(db, state.sessionId);
+	const currentCompartments = getRenderableCompartmentsPi(db, state);
 	let decision = mustMaterializePi(state, db, currentCompartments);
 	let m0 = "";
 	let m1 = PI_M1_PLACEHOLDER;
@@ -2623,7 +2637,7 @@ export function injectM0M1Pi(
 		: 0;
 	return {
 		injected: true,
-		compartmentCount: getCompartments(db, state.sessionId).length,
+		compartmentCount: currentCompartments.length,
 		factCount: 0, // v2: facts retired as a render source (facts = promoted memories)
 		memoryCount,
 		skippedVisibleMessages,

@@ -29,6 +29,7 @@ import {
 } from "@magic-context/core/hooks/magic-context/protected-tail-boundary";
 import { setRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
+import { COMPACTION_OFF_COMMAND_UNAVAILABLE } from "../compaction-off-pi";
 import {
 	signalPiDeferredHistoryRefresh,
 	signalPiDeferredMaterialization,
@@ -62,6 +63,7 @@ export interface RegisterCtxWrapupDeps {
 	runPiHistorianForWrapup?: typeof runPiHistorian;
 	wrapupLeaseWaitTimeoutMs?: number;
 	resolveRuntimeDeps?: (ctx: { cwd: string }) => CtxWrapupRuntimeDeps;
+	compactionOff?: boolean;
 }
 
 export type CtxWrapupRuntimeDeps = Omit<
@@ -125,6 +127,14 @@ export function registerCtxWrapupCommand(
 				return;
 			}
 			const currentDeps = deps.resolveRuntimeDeps?.(ctx) ?? deps;
+			if (currentDeps.compactionOff) {
+				sendCtxStatusMessage(pi, {
+					title: "/ctx-wrapup",
+					text: COMPACTION_OFF_COMMAND_UNAVAILABLE,
+					level: "warning",
+				});
+				return;
+			}
 
 			const sessionMeta = getOrCreateSessionMeta(currentDeps.db, sessionId);
 			if (sessionMeta.isSubagent) {
