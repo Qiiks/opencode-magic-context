@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { COMPACTION_ENABLED_PATH } from '../../config/agent-disable';
 import type { DreamerConfig, SidekickConfig } from "../../config/schema/magic-context";
 import type { ResolvedTransformMode } from "../../config/transform-mode";
 import {
@@ -132,7 +133,6 @@ export interface CommandExecuteOutput {
 }
 
 const SENTINEL_PREFIX = "__CONTEXT_MANAGEMENT_";
-const COMPACTION_ENABLED_PATH = `compaction${".enabled"}`;
 
 // Effect HTTP plain-string TypeIds (NOT Symbols), verified against effect 4.x
 // source. Because the guards are `key in obj` checks on string keys, a hand-built

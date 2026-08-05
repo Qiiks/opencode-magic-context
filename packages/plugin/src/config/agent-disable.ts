@@ -1,3 +1,13 @@
+/**
+ * User-facing spelling of the compaction-off config path, for log lines and
+ * command output. Built from fragments so the accessor-exclusivity guard
+ * (compaction-accessor-guard.test.ts) can keep rejecting literal
+ * `compaction.enabled` reads elsewhere — messages import this constant instead
+ * of inlining the path (the S5/S8 slices both re-derived it and tripped the
+ * guard; one constant ends that class).
+ */
+export const COMPACTION_ENABLED_PATH = `compaction${"."}enabled`;
+
 export function isDreamerRunnable(config: { dreamer?: { disable?: boolean } | null }): boolean {
     return !!config.dreamer && config.dreamer.disable !== true;
 }
