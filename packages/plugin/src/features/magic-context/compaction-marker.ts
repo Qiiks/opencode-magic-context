@@ -671,6 +671,12 @@ export function removeForeignCompactionMarker(
  * reports zero removed rows).
  */
 export interface McOwnedMarkerCleanupResult {
+    /**
+     * True only when cleanup completed without skipping an MC-owned lineage.
+     * False keeps the mode transition retryable instead of recording a
+     * successful flip while a marker can still hide history.
+     */
+    verified: boolean;
     /** MC-owned marker lineages fully removed (compaction part + summary rows together). */
     removedLineages: number;
     /** Message + part rows deleted in total. */
@@ -699,6 +705,20 @@ function dataReferencesTailStart(data: unknown): string | null {
         if (typeof nestedTail === "string" && nestedTail.length > 0) return nestedTail;
     }
     return null;
+}
+
+/** Match the exact payload written by injectCompactionMarker, not a missing native field. */
+function isMcCanonicalCompactionPartData(data: unknown): boolean {
+    if (typeof data !== "object" || data === null || Array.isArray(data)) return false;
+    const record = data as Record<string, unknown>;
+    const keys = Object.keys(record).sort();
+    return (
+        keys.length === 2 &&
+        keys[0] === "auto" &&
+        keys[1] === "type" &&
+        record.type === "compaction" &&
+        record.auto === true
+    );
 }
 
 /**
@@ -739,7 +759,12 @@ export function removeMcOwnedCompactionMarkers(
         // Schema drift: we cannot prove our DELETEs match the live schema, so
         // leave every row in place. The marker stays inert-but-present; the
         // next process (after an OpenCode/MC update) retries.
-        return { removedLineages: 0, removedRows: 0, retainedLineages: 0 };
+        return {
+            verified: false,
+            removedLineages: 0,
+            removedRows: 0,
+            retainedLineages: 0,
+        };
     }
 
     // MC-owned summary assistant messages: canonical lineage carries the MC
@@ -875,11 +900,13 @@ export function removeMcOwnedCompactionMarkers(
         // compaction and is never deleted.
         const boundaryParts = parsedParts.filter((part) => part.messageId === boundaryMessageId);
         const mcPartIds = boundaryParts
-            .filter((part) => part.tailStartId === null)
+            .filter((part) => isMcCanonicalCompactionPartData(part.data))
             .map((part) => part.id);
 
-        // Preflight (deletion caveat 2): rows this lineage would delete.
-        const rowsToDelete = new Set<string>([...summaryIds]);
+        // Preflight (deletion caveat 2): rows this lineage would delete. Parts
+        // are first-class tail targets too, so omitting them can strand a
+        // surviving native marker even when every deleted message is covered.
+        const rowsToDelete = new Set<string>([...summaryIds, ...mcPartIds]);
         const survivingPartsReferenceDeletion = parsedParts.some(
             (part) =>
                 !mcPartIds.includes(part.id) &&
@@ -936,7 +963,12 @@ export function removeMcOwnedCompactionMarkers(
             `[magic-context] compaction-marker: flip-off cleanup for ${sessionId} removed ${removedLineages} lineage(s) (${removedRows} rows), retained ${retainedLineages}`,
         );
     }
-    return { removedLineages, removedRows, retainedLineages };
+    return {
+        verified: retainedLineages === 0,
+        removedLineages,
+        removedRows,
+        retainedLineages,
+    };
 }
 
 /**

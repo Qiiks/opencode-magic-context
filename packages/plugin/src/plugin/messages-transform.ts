@@ -109,11 +109,12 @@ export function createMessagesTransformHandler(args: {
             typeof sessionId === "string" &&
             sessionId.length > 0 &&
             args.internalChildSessions?.has(sessionId) === true;
-        // Compaction-off passthrough guarantee: snapshot the input array so
-        // ANY failure path (fail-closed throw, transient SQLITE_BUSY,
-        // unexpected error mid-pass) restores the exact input shape — the
-        // inner transform mutates `output.messages` in place as it goes, so
-        // without this a mid-pass throw could leak a partially-mutated array.
+        // Snapshot only the array, never nested messages: compaction-off gates
+        // every stage that writes retained message internals, and its additive
+        // path only prepends new synthetic message objects. A shallow snapshot
+        // can therefore restore the exact input without a hot-path deep clone.
+        // Proxy-guarded success and failure tests enforce that retained inputs
+        // stay read-only.
         const compactionOffInputSnapshot = args.compactionOff ? [...output.messages] : null;
         const restoreCompactionOffInput = (): void => {
             if (compactionOffInputSnapshot && output.messages !== compactionOffInputSnapshot) {

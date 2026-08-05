@@ -36,6 +36,8 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import {
+    appendAutoSearchHintDecision,
+    appendNoteNudgeAnchor,
     getChannel2NudgeState,
     getCompactionModeRecord,
     getOverflowState,
@@ -43,11 +45,11 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
 import type { ContextUsage } from "../../features/magic-context/types";
+import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import type { PluginContext } from "../../plugin/types";
 import { clearModelsDevCache } from "../../shared/models-dev-cache";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { COMPACTION_OFF_FLIP_NOTICE } from "./compaction-off-transition";
 import { createTransform } from "./transform";
 
 type TestMessage = {
@@ -134,6 +136,7 @@ function makeOffTransform(args: {
     percentage?: number;
     client?: PluginContext["client"];
     isSubagent?: boolean;
+    maybeAutoEmbedSession?: (sessionId: string) => void;
 }) {
     const scheduler: Scheduler = {
         shouldExecute: mock(() => (args.schedulerDecision ?? "defer") as "execute" | "defer"),
@@ -167,6 +170,7 @@ function makeOffTransform(args: {
         memoryConfig: { enabled: true, injectionBudgetTokens: 500, autoPromote: true },
         compactionOff: args.compactionOff ?? true,
         client: args.client,
+        maybeAutoEmbedSession: args.maybeAutoEmbedSession,
     });
     return { db, transform };
 }
@@ -208,6 +212,38 @@ function allText(messages: TestMessage[]): string {
                 .join("\n"),
         )
         .join("\n");
+}
+
+function guardDeepMutations<T extends object>(
+    value: T,
+    mutations: string[],
+    path = "message",
+    seen = new WeakMap<object, object>(),
+): T {
+    const existing = seen.get(value);
+    if (existing) return existing as T;
+    const proxy = new Proxy(value, {
+        get(target, key, receiver) {
+            const child = Reflect.get(target, key, receiver);
+            return typeof child === "object" && child !== null
+                ? guardDeepMutations(child, mutations, `${path}.${String(key)}`, seen)
+                : child;
+        },
+        set(target, key, next, receiver) {
+            mutations.push(`set ${path}.${String(key)}`);
+            return Reflect.set(target, key, next, receiver);
+        },
+        defineProperty(target, key, descriptor) {
+            mutations.push(`define ${path}.${String(key)}`);
+            return Reflect.defineProperty(target, key, descriptor);
+        },
+        deleteProperty(target, key) {
+            mutations.push(`delete ${path}.${String(key)}`);
+            return Reflect.deleteProperty(target, key);
+        },
+    });
+    seen.set(value, proxy);
+    return proxy;
 }
 
 describe("compaction-off transform — additive-only proof (issue #266 S3)", () => {
@@ -469,6 +505,79 @@ describe("compaction-off transform — additive-only proof (issue #266 S3)", () 
         expect(getOverflowState(dbAfter, "ses-sub").needsEmergencyRecovery).toBe(false);
     });
 
+    it("does not replay persisted note or auto-search anchors into off-mode user messages", async () => {
+        useTempDataHome("co-persisted-anchor-gate-");
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, "ses-1");
+        setCompactionModeRecord(db, "ses-1", "off");
+        appendNoteNudgeAnchor(db, "ses-1", "m-user-2", "persisted note reminder");
+        appendAutoSearchHintDecision(db, "ses-1", {
+            messageId: "m-user-1",
+            decision: "hint",
+            text: "persisted search hint",
+        });
+        closeDatabase();
+
+        const source = makeMessages("ses-1");
+        const beforeById = new Map(
+            source.map((message) => [message.info.id, JSON.stringify(message)] as const),
+        );
+        const mutations: string[] = [];
+        const guarded = source.map((message, index) =>
+            guardDeepMutations(message, mutations, `messages[${index}]`),
+        );
+        const { transform } = makeOffTransform({ sessionId: "ses-1" });
+
+        await transform({}, { messages: guarded });
+
+        // Mutation direction: removing the compactionOff conjunct appends both
+        // persisted reminders and trips these byte/proxy assertions.
+        expect(mutations).toEqual([]);
+        for (const message of guarded.filter((item) => beforeById.has(item.info.id))) {
+            expect(JSON.stringify(message)).toBe(beforeById.get(message.info.id));
+        }
+        expect(allText(guarded)).not.toContain("persisted note reminder");
+        expect(allText(guarded)).not.toContain("persisted search hint");
+    });
+
+    it("keeps retained inputs read-only and shallow-restores them after a full-pass exception", async () => {
+        useTempDataHome("co-proxy-failure-guard-");
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, "ses-1");
+        setCompactionModeRecord(db, "ses-1", "off");
+        closeDatabase();
+
+        const source = makeMessages("ses-1");
+        const before = JSON.stringify(source);
+        const identities = [...source];
+        const mutations: string[] = [];
+        const guarded = source.map((message, index) =>
+            guardDeepMutations(message, mutations, `messages[${index}]`),
+        );
+        const { transform } = makeOffTransform({
+            sessionId: "ses-1",
+            maybeAutoEmbedSession: () => {
+                throw new Error("injected failure after the production pass");
+            },
+        });
+        const handler = createMessagesTransformHandler({
+            magicContext: { "experimental.chat.messages.transform": transform },
+            compactionOff: true,
+        });
+        const output = { messages: guarded };
+
+        await expect(handler({}, output)).resolves.toBeDefined();
+
+        // The production transform prepended two synthetic messages before
+        // the injected failure. Array restoration removes those additions,
+        // but any nested write to a retained message would survive and trip
+        // either the proxy log or the JSON comparison.
+        expect(mutations).toEqual([]);
+        expect(output.messages).toHaveLength(identities.length);
+        expect(output.messages.map((message) => message)).toEqual(guarded);
+        expect(JSON.stringify(output.messages)).toBe(before);
+    });
+
     it("transition pass: flip notice goes OUT OF BAND and the message array is indistinguishable from a steady-state off pass", async () => {
         useTempDataHome("co-transition-notice-");
         createOpenCodeDbForSession("ses-1");
@@ -492,8 +601,6 @@ describe("compaction-off transform — additive-only proof (issue #266 S3)", () 
         const { transform } = makeOffTransform({ sessionId: "ses-1", client });
         const transitionMessages = makeMessages("ses-1");
         await transform({}, { messages: transitionMessages });
-        // Let the fire-and-forget notice settle.
-        await new Promise((resolve) => setTimeout(resolve, 80));
 
         // The notice was delivered out of band with the contractual wording.
         expect(promptMock).toHaveBeenCalledTimes(1);
@@ -517,6 +624,39 @@ describe("compaction-off transform — additive-only proof (issue #266 S3)", () 
         expect(getCompactionModeRecord(dbAfter, "ses-1")).toBe("off");
     });
 
+    it("awaits transition notice delivery and retries notice plus record after rejection", async () => {
+        useTempDataHome("co-transition-notice-retry-");
+        createOpenCodeDbForSession("ses-1");
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, "ses-1");
+        queuePendingOp(db, "ses-1", 9, "drop");
+        closeDatabase();
+
+        let attempts = 0;
+        const promptMock = mock(async () => {
+            attempts += 1;
+            if (attempts === 1) throw new Error("notice transport rejected");
+            return { data: {} };
+        });
+        const client = { session: { prompt: promptMock } } as unknown as PluginContext["client"];
+        const { transform } = makeOffTransform({ sessionId: "ses-1", client });
+
+        const firstMessages = makeMessages("ses-1");
+        await transform({}, { messages: firstMessages });
+        expect(attempts).toBe(1);
+        expect(getCompactionModeRecord(openDatabase(), "ses-1")).toBeNull();
+
+        const secondMessages = makeMessages("ses-1");
+        await transform({}, { messages: secondMessages });
+        expect(attempts).toBe(2);
+        expect(getCompactionModeRecord(openDatabase(), "ses-1")).toBe("off");
+        const notices = promptMock.mock.calls.map((call) =>
+            JSON.stringify((call[0] as { body?: unknown }).body),
+        );
+        expect(notices[0]).toContain("compaction-off mode is now active");
+        expect(notices[1]).toBe(notices[0]);
+    });
+
     it("clean fresh session booting off-mode: record written, NO notice emitted", async () => {
         useTempDataHome("co-clean-boot-");
         createOpenCodeDbForSession("ses-1");
@@ -536,7 +676,6 @@ describe("compaction-off transform — additive-only proof (issue #266 S3)", () 
         const { transform } = makeOffTransform({ sessionId: "ses-1", client });
         const messages = makeMessages("ses-1");
         await transform({}, { messages: messages });
-        await new Promise((resolve) => setTimeout(resolve, 80));
 
         expect(promptMock).not.toHaveBeenCalled();
         const dbAfter = openDatabase();
