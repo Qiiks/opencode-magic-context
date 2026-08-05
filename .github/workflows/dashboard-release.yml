@@ -202,6 +202,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Publish the draft BEFORE deploying the updater manifest. A draft's asset
+      # URLs 404 for anonymous clients, so deploying latest.json while the
+      # release is still draft points every Desktop auto-updater at dead links
+      # (dashboard-v0.11.1 shipped that way and needed a manual publish). Once
+      # all build legs succeeded there is nothing left to gate on — publish,
+      # then deploy the manifest that references the now-public assets.
+      - name: Publish release (undraft)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --repo "${{ github.repository }}" --draft=false
+
       - name: Download latest.json from release (with retry)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
