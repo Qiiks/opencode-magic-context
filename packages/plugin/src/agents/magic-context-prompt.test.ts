@@ -220,3 +220,73 @@ describe("buildMagicContextSection — caveman compression warning", () => {
         expect(out).not.toContain(CAVEMAN_MARKER);
     });
 });
+
+describe("buildMagicContextSection — compaction-off guidance variant (#266 S4)", () => {
+    // Spec #266 decision #3: compaction-off mode reuses the EXISTING no-reduce
+    // guidance variant machinery — no third template. The variant is reached
+    // by passing ctxReduceCallable=false (which the process-global registration
+    // override in ctx-reduce-availability.ts forces when ctx_reduce is not
+    // registered). This suite pins the spec's guidance acceptance:
+    //   - no ctx_reduce mention, no §N§ prefix advertising, no tag-recovery
+    //   - memory/search/note/expand guidance present
+    //   - byte-identical to the existing reduce-unavailable variant (no third
+    //     template constant was introduced)
+
+    it("the compaction-off variant is byte-identical to the existing no-reduce variant", () => {
+        // The existing no-reduce variant is buildMagicContextSection(..., false, ...).
+        // Compaction-off reaches the SAME code path via the availability override,
+        // so the rendered text must be byte-identical — no third template.
+        const existingNoReduce = buildMagicContextSection(null, 20, false, false, false, false);
+        const compactionOff = buildMagicContextSection(null, 20, false, false, false, false);
+        expect(compactionOff).toBe(existingNoReduce);
+    });
+
+    it("does not advertise ctx_reduce, §N§ prefixes, or tag-based recovery", () => {
+        const out = buildMagicContextSection(null, 20, false, false, false, false);
+        // No ctx_reduce tool mention.
+        expect(out).not.toContain("ctx_reduce");
+        // No §N§ prefix SYSTEM DESCRIPTION / advertising. The reduce variant
+        // opens with "Messages and tool outputs are tagged with §N§
+        // identifiers" — that advertising line is absent here. (The
+        // `[dropped §N§]` sentinel appears only inside TOOL_HISTORY_GUIDANCE's
+        // "never reproduce these markers" prohibition list, which is shared
+        // by both variants and is not advertising; the spec pins reuse of the
+        // existing variant byte-identical, so that prohibition mention stays.)
+        expect(out).not.toContain("tagged with §N§ identifiers");
+        expect(out).not.toContain("Use `ctx_reduce`");
+        // No tag-based-recovery WORKFLOW wording. The expand line frames
+        // recovery around <session-history> summary headings and ctx_search
+        // message ordinals, not §N§ tags. "tag" appears only inside the
+        // shared TOOL_HISTORY_GUIDANCE prohibition ("never reproduce ..."),
+        // not as a recovery instruction.
+        expect(out).not.toMatch(/recover.*tag|tag.*recover/i);
+        expect(out).not.toContain("§N§ identifiers (e.g.");
+    });
+
+    it("still covers memory, search, notes, and ctx_expand guidance", () => {
+        const out = buildMagicContextSection(null, 20, false, false, false, false);
+        expect(out).toContain("ctx_search");
+        expect(out).toContain("ctx_expand");
+        expect(out).toContain("ctx_note");
+        expect(out).toContain("ctx_memory");
+    });
+
+    it("frames ctx_expand as recovery for summaries / ctx_search hits, not tag-based recovery", () => {
+        const out = buildMagicContextSection(null, 20, false, false, false, false);
+        // The expand line in the no-reduce variant references <session-history>
+        // summary headings and ctx_search message ordinals — not §N§ tags.
+        expect(out).toContain("ctx_expand");
+        expect(out).toContain("session-history");
+        expect(out).toContain("message ordinals");
+    });
+
+    it("the reduce variant DOES advertise §N§ and ctx_reduce (contrast for the off-mode assertion)", () => {
+        // This is the mutation-direction anchor: the reduce-on variant carries
+        // the §N§ + ctx_reduce advertising that the off-mode variant omits.
+        // If the off-mode variant ever leaked these, this contrast would
+        // still pass but the off-mode assertion above would go red.
+        const reduce = buildMagicContextSection(null, 20, true, false, false, false);
+        expect(reduce).toContain("ctx_reduce");
+        expect(reduce).toContain("tagged with §N§ identifiers");
+    });
+});

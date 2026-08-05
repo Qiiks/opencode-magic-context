@@ -7,8 +7,9 @@ import { join } from "node:path";
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import type { MagicContextPluginConfig } from "../config";
 import { closeDatabase, openDatabase } from "../features/magic-context/storage";
+import { resetCtxReduceRegisteredGloballyForTest } from "../hooks/magic-context/ctx-reduce-availability";
 import type { RustToolBackends } from "./rust-tool-backends";
-import { createToolRegistry } from "./tool-registry";
+import { createToolRegistry, getCompactionOffRemovedToolIds } from "./tool-registry";
 import type { PluginContext } from "./types";
 
 const tempDirs: string[] = [];
@@ -25,6 +26,10 @@ afterEach(() => {
         }
     }
     tempDirs.length = 0;
+    // The compaction-off override is process-global and boot-resolved; reset
+    // to the default-true baseline so a compaction-off test cannot leak a
+    // false verdict into a later test in the same bun process.
+    resetCtxReduceRegisteredGloballyForTest();
 });
 
 function isolateDb(): void {
@@ -125,5 +130,64 @@ describe("createToolRegistry — memory gating", () => {
         // ctx_note / ctx_expand are unaffected by the memory gate.
         expect(Object.keys(tools)).toContain("ctx_note");
         expect(Object.keys(tools)).toContain("ctx_expand");
+    });
+});
+
+describe("createToolRegistry — compaction-off mode (#266 S4)", () => {
+    // The canonical enumerated removed-set, imported from the registry source
+    // so a future tool the reduce factory grows appears here and fails the
+    // diff rather than silently vanishing in compaction-off mode. The factory
+    // is plural (returns a record keyed by tool name), so the test must
+    // distinguish "factory skipped" from "one ID filtered" — this enumeration
+    // is the removed-set the acceptance test diffs against the mode-on tool
+    // list.
+    const COMPACTION_OFF_REMOVED_TOOL_IDS = getCompactionOffRemovedToolIds();
+
+    it("compaction-off tool set = mode-on tool set minus exactly the reduce factory's IDs", () => {
+        isolateDb();
+        const modeOn = buildRegistry({});
+        isolateDb();
+        const modeOff = buildRegistry({ compaction: { enabled: false } as never });
+
+        const onIds = new Set(Object.keys(modeOn));
+        const offIds = new Set(Object.keys(modeOff));
+
+        // The diff is EXACTLY the enumerated removed-set and nothing else.
+        const removed = [...onIds].filter((id) => !offIds.has(id));
+        const added = [...offIds].filter((id) => !onIds.has(id));
+        expect(removed.sort()).toEqual([...COMPACTION_OFF_REMOVED_TOOL_IDS].sort());
+        expect(added).toEqual([]);
+
+        // Every other ctx_* tool stays registered (subject to its own gates).
+        for (const id of ["ctx_expand", "ctx_search", "ctx_note", "ctx_memory"]) {
+            expect(offIds.has(id)).toBe(true);
+        }
+    });
+
+    it("compaction-on (default) registers ctx_reduce", () => {
+        isolateDb();
+        const tools = buildRegistry({});
+        expect(Object.keys(tools)).toContain("ctx_reduce");
+    });
+
+    it("compaction { enabled: true } is identical to default (back-compat)", () => {
+        isolateDb();
+        const implicit = buildRegistry({});
+        isolateDb();
+        const explicit = buildRegistry({ compaction: { enabled: true } as never });
+        expect(Object.keys(explicit).sort()).toEqual(Object.keys(implicit).sort());
+        expect(Object.keys(explicit)).toContain("ctx_reduce");
+    });
+
+    it("compaction-off does not advertise ctx_reduce's `drop` arg field", () => {
+        isolateDb();
+        const tools = buildRegistry({ compaction: { enabled: false } as never });
+        expect(tools.ctx_reduce).toBeUndefined();
+        // ctx_expand still advertises its fields — the reduce factory was
+        // skipped, not the expand factory.
+        const expandSchema = tool.schema.toJSONSchema(
+            tool.schema.object(tools.ctx_expand?.args ?? {}),
+        ) as { properties?: Record<string, unknown> };
+        expect(Object.keys(expandSchema.properties ?? {})).toContain("start");
     });
 });
