@@ -2695,6 +2695,23 @@ const MIGRATIONS: Migration[] = [
             installLatestAuthorityTriggers(db);
         },
     },
+    {
+        version: 72,
+        description: "add per-session compaction mode record column (issue #266)",
+        up(db: Database): void {
+            // This column is added in three places to stay consistent across
+            // fresh and migrated databases: (a) this migration, (b) the
+            // CREATE TABLE in storage-db.ts, and (c) a boot-time ensureColumn
+            // backfill in storage-db.ts. NULL means no record, which the
+            // transition logic treats as "on" (compaction enabled) — so
+            // pre-existing rows are unambiguously no-record. "on"/"off" are
+            // the recorded mode values. This migration only adds the column;
+            // no code reads or writes it yet.
+            if (tableExists(db, "session_meta")) {
+                ensureColumn(db, "session_meta", "compaction_mode_record", "TEXT");
+            }
+        },
+    },
 ];
 
 /**

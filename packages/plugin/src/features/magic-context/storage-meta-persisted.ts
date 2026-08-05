@@ -594,6 +594,70 @@ export function releaseWrapupInProgress(db: Database, sessionId: string, holderI
     }
 }
 
+/**
+ * Per-session compaction mode record. Stored in the `compaction_mode_record`
+ * column added by migration v72. Value domain:
+ *   - NULL  → no record (treated as "on" by the transition logic, so a
+ *             pre-existing row is unambiguously no-record; a session with no
+ *             record that boots into compaction-off mode runs the off cleanup)
+ *   - "on"  → compaction enabled for this session
+ *   - "off" → compaction-off mode for this session
+ *
+ * Helpers use a simple UPDATE under the session row (no compare-and-swap)
+ * because there is a single writer per session on the transform path. The
+ * record is written AFTER all transition work, so a crash before the write
+ * reruns idempotent cleanup. clearSession() needs no change (the column is
+ * row-scoped). This slice adds helpers only — no transition logic reads or
+ * writes the column yet.
+ */
+export type CompactionModeRecord = "on" | "off";
+
+const COMPACTION_MODE_RECORD_VALUES: ReadonlySet<string> = new Set(["on", "off"]);
+
+function normalizeCompactionModeRecord(value: unknown): CompactionModeRecord | null {
+    if (value === null || value === undefined) return null;
+    if (typeof value === "string" && COMPACTION_MODE_RECORD_VALUES.has(value)) {
+        return value as CompactionModeRecord;
+    }
+    return null;
+}
+
+/** Reads the persisted compaction mode record for a session. NULL → no record. */
+export function getCompactionModeRecord(
+    db: Database,
+    sessionId: string,
+): CompactionModeRecord | null {
+    const row = db
+        .prepare<[string], { compaction_mode_record: string | null }>(
+            "SELECT compaction_mode_record FROM session_meta WHERE session_id = ?",
+        )
+        .get(sessionId);
+    return normalizeCompactionModeRecord(row?.compaction_mode_record);
+}
+
+/**
+ * Writes the compaction mode record for a session. Ensures the session_meta row
+ * exists first. Pass `null` to clear the record (no record). Only "on", "off",
+ * or null are accepted; any other value throws (defensive — callers should
+ * pass a typed CompactionModeRecord).
+ */
+export function setCompactionModeRecord(
+    db: Database,
+    sessionId: string,
+    value: CompactionModeRecord | null,
+): void {
+    if (value !== null && !COMPACTION_MODE_RECORD_VALUES.has(value)) {
+        throw new Error(
+            `Invalid compaction_mode_record value: ${String(value)} (expected "on", "off", or null)`,
+        );
+    }
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET compaction_mode_record = ? WHERE session_id = ?").run(
+        value,
+        sessionId,
+    );
+}
+
 export function protectedTailWindowBudget(
     usagePercentage: number,
     usable: number,

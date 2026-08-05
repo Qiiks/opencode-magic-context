@@ -478,6 +478,16 @@ export interface MagicContextConfig {
      * USER config only — project tier cannot set this. Not recommended to disable.
      */
     fail_closed_blocking: boolean;
+    /**
+     * Compaction-off mode gate. When `enabled` is false Magic Context stops
+     * managing the context window and keeps only its knowledge layer, letting
+     * the harness's native compaction (or nothing) own the window. USER config
+     * only — project tier `compaction.enabled` is stripped for security.
+     * Boot-resolved: changing it requires a process restart.
+     */
+    compaction: {
+        enabled: boolean;
+    };
     /** Pi-only controls for Magic Context's OpenCode-parity todowrite surface. */
     todowrite: {
         enabled: boolean;
@@ -786,6 +796,19 @@ export const MagicContextConfigSchema = z
             .default(true)
             .describe(
                 "When Magic Context cannot operate (schema fence mismatch, storage open/migration failure), block the primary-session prompt with a loud recovery error instead of silently degrading to native compaction. Default true. Set false only to restore the old degrade-silently behavior (not recommended). USER-LEVEL ONLY — ignored in project config for security. Requires a restart.",
+            ),
+        compaction: z
+            .object({
+                enabled: z
+                    .boolean()
+                    .default(true)
+                    .describe(
+                        "When false, Magic Context stops managing the context window and keeps only its knowledge layer: memory injection (m[0]/m[1]), dreamer, ctx_search, notes, raw-message FTS indexing, and additive docs/user-profile/key-files injection all stay live. It disables every MC pruning/folding/dropping/splicing/nudging/blocking mechanism and the historian/compartment pipeline, and makes fail_closed_blocking inert (a transform failure degrades to passthrough of the input messages, never a block). It does NOT itself enable native compaction — the harness's own compaction.auto / compaction.prune (OpenCode) or equivalent (Pi) owns the window, or nothing does. Requires a process restart to take effect (boot-resolved). USER-LEVEL ONLY: a project-tier compaction.enabled is stripped for security, so a cloned repo can never disable the user's context management. Naming note: this is Magic Context's compaction.enabled in magic-context.jsonc, distinct from OpenCode's compaction.auto / compaction.prune in opencode.jsonc (different files, different owners).",
+                    ),
+            })
+            .default({ enabled: true })
+            .describe(
+                "Compaction-off mode gate. Default true (MC manages the context window as today). Set compaction.enabled=false to keep the knowledge layer while letting native compaction (or nothing) own the window. Boot-resolved; requires a restart to change.",
             ),
         todowrite: z
             .object({
