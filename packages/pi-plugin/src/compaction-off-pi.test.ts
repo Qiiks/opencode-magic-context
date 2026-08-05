@@ -69,6 +69,9 @@ describe("Pi compaction-off mode", () => {
 				historianRunnable: true,
 			});
 			expect(transition.recordToWrite).toBe("off");
+			expect(getCompactionModeRecord(db, sessionId)).toBe(
+				"off_notice_pending",
+			);
 			expect(transition.clearDeferredMarkerState).toBe(true);
 			expect(getPendingOps(db, sessionId)).toEqual([]);
 			expect(getOverflowState(db, sessionId).needsEmergencyRecovery).toBe(
@@ -123,8 +126,44 @@ describe("Pi compaction-off mode", () => {
 				historianRunnable: true,
 			});
 			expect(resumed.recordToWrite).toBe("on");
+			expect(getCompactionModeRecord(db, sessionId)).toBe(
+				"on_notice_pending",
+			);
 			expect(resumed.historianCatchUpSignaled).toBe(true);
 			expect(resumed.notice).toContain("/ctx-wrapup");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("retries a durable flip-off notice after a fresh reconciliation", () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-notice-restart";
+		try {
+			queuePendingOp(db, sessionId, 9, "drop");
+			const first = reconcilePiCompactionMode({
+				db,
+				sessionId,
+				compactionOff: true,
+				historianRunnable: true,
+			});
+			expect(first.notice).toContain("compaction-off mode");
+			expect(getCompactionModeRecord(db, sessionId)).toBe(
+				"off_notice_pending",
+			);
+
+			// Simulate restart after the clears committed but before the caller
+			// reached Pi's UI. The pending record, not process memory, requests
+			// the same notice again.
+			const restarted = reconcilePiCompactionMode({
+				db,
+				sessionId,
+				compactionOff: true,
+				historianRunnable: true,
+			});
+			expect(restarted.notice).toBe(first.notice);
+			commitPiCompactionModeRecord(db, sessionId, restarted.recordToWrite!);
+			expect(getCompactionModeRecord(db, sessionId)).toBe("off");
 		} finally {
 			closeQuietly(db);
 		}

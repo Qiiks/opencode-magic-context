@@ -34,6 +34,7 @@ import {
     getOverflowState,
     getPendingCompactionMarkerState,
     getPersistedCompactionMarkerState,
+    resolveCompactionModeRecord,
     setChannel2NudgeState,
     setCompactionModeRecord,
     setPendingCompactionMarkerState,
@@ -570,7 +571,7 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
 // ── Mode-record algebra ──────────────────────────────────────────
 
 describe("reconcileCompactionMode — transition algebra", () => {
-    it("leaves the record absent and retries cleanup after an incompatible schema becomes verifiable", () => {
+    it("keeps an unverified cleanup retry durable until the schema becomes verifiable", () => {
         useTempDataHome("mc-mode-schema-retry-");
         const ocDb = createOpenCodeDb("ses-1");
         insertMessage(ocDb, "ses-1", { id: "msg-user-1", role: "user" });
@@ -594,7 +595,9 @@ describe("reconcileCompactionMode — transition algebra", () => {
 
         expect(first.markerCleanup.verified).toBe(false);
         expect(first.recordToWrite).toBeNull();
-        expect(getCompactionModeRecord(db, "ses-1")).toBeNull();
+        // A failed verification remains durable even when nothing else was
+        // cleared, so a later pass does not depend on record absence to retry.
+        expect(getCompactionModeRecord(db, "ses-1")).toBe("off_cleanup_pending");
         expect(
             ocDb.prepare("SELECT id FROM part WHERE id = 'prt-mc-compaction'").get(),
         ).not.toBeNull();
@@ -621,6 +624,87 @@ describe("reconcileCompactionMode — transition algebra", () => {
         ).toBeNull();
         closeQuietly(ocDb);
     });
+
+    it("keeps notice delivery and unverified marker cleanup independently durable", () => {
+        useTempDataHome("mc-mode-unverified-notice-retry-");
+        const ocDb = createOpenCodeDb("ses-1");
+        insertMessage(ocDb, "ses-1", { id: "msg-user-1", role: "user" });
+        insertCanonicalMcMarker(ocDb, "ses-1", {
+            boundaryMessageId: "msg-user-1",
+            summaryId: "msg-mc-summary",
+            partId: "prt-mc-compaction",
+            summaryPartId: "prt-mc-summary-text",
+        });
+        ocDb.exec("ALTER TABLE part DROP COLUMN time_updated");
+
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, "ses-1");
+        queuePendingOp(db, "ses-1", 9, "drop");
+        const first = reconcileCompactionMode({
+            db,
+            sessionId: "ses-1",
+            compactionOff: true,
+            historianRunnable: true,
+            compartmentInProgress: false,
+        });
+
+        expect(first.markerCleanup.verified).toBe(false);
+        expect(first.notice).toBe(COMPACTION_OFF_FLIP_NOTICE);
+        // Mutation direction: replacing this durable record with null lets a
+        // verified no-op retry commit without ever delivering the flip notice.
+        expect(getCompactionModeRecord(db, "ses-1")).toBe("off_notice_pending");
+        expect(getPendingOps(db, "ses-1")).toEqual([]);
+
+        // Simulate successful notice delivery while marker verification still
+        // fails. The cleanup-only state prevents redelivery from hiding its
+        // independent retry obligation.
+        commitCompactionModeRecord(db, "ses-1", first.recordToWrite!);
+        expect(getCompactionModeRecord(db, "ses-1")).toBe("off_cleanup_pending");
+
+        closeCompactionMarkerDb();
+        ocDb.exec("ALTER TABLE part ADD COLUMN time_updated INTEGER NOT NULL DEFAULT 0");
+        const second = reconcileCompactionMode({
+            db,
+            sessionId: "ses-1",
+            compactionOff: true,
+            historianRunnable: true,
+            compartmentInProgress: false,
+        });
+
+        expect(second.markerCleanup.verified).toBe(true);
+        expect(second.notice).toBeNull();
+        expect(second.recordToWrite).toBe("off");
+        commitCompactionModeRecord(db, "ses-1", second.recordToWrite!);
+        expect(getCompactionModeRecord(db, "ses-1")).toBe("off");
+        closeQuietly(ocDb);
+    });
+
+    it("parses settled and pending records while preserving legacy no-record behavior", () => {
+        useTempDataHome("mc-mode-record-domain-");
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, "ses-1");
+        const cases = [
+            [null, null],
+            ["on", "on"],
+            ["off", "off"],
+            ["on_notice_pending", "on"],
+            ["off_notice_pending", "off"],
+            ["off_cleanup_pending", "off"],
+        ] as const;
+
+        for (const [stored, resolved] of cases) {
+            setCompactionModeRecord(db, "ses-1", stored);
+            const record = getCompactionModeRecord(db, "ses-1");
+            expect(resolveCompactionModeRecord(record)).toBe(resolved);
+        }
+        // Existing unknown values remain fail-closed as no record rather than
+        // becoming a new mode or widening the old value domain implicitly.
+        db.prepare("UPDATE session_meta SET compaction_mode_record = 'legacy' WHERE session_id = ?").run(
+            "ses-1",
+        );
+        expect(getCompactionModeRecord(db, "ses-1")).toBeNull();
+    });
+
     it("no record + on → writes 'on', no transition work, no notice", () => {
         useTempDataHome("mc-mode-norecord-on-");
         const db = openDatabase();
@@ -754,6 +838,7 @@ describe("reconcileCompactionMode — transition algebra", () => {
         });
 
         expect(result.recordToWrite).toBe("on");
+        expect(getCompactionModeRecord(db, "ses-1")).toBe("on_notice_pending");
         expect(result.historianCatchUpSignaled).toBe(true);
         expect(result.notice).toBe(COMPACTION_ON_WRAPUP_SUGGESTION);
         expect(result.notice).toContain("/ctx-wrapup");
@@ -820,15 +905,15 @@ describe("reconcileCompactionMode — transition algebra", () => {
         expect(offOff.notice).toBeNull();
     });
 
-    it("crash retry: an uncommitted off-transition re-runs idempotently and commits the mode exactly once", () => {
+    it("crash retry: a durable pending off notice re-runs cleanup idempotently and settles the mode", () => {
         useTempDataHome("mc-mode-crash-retry-");
         const db = openDatabase();
         getOrCreateSessionMeta(db, "ses-1");
         queuePendingOp(db, "ses-1", 5, "drop");
         recordOverflowDetected(db, "ses-1", 120000);
 
-        // First attempt: work succeeds but the process crashes BEFORE the
-        // record commit (simulated by not committing).
+        // First attempt: work succeeds and stages its notice record, then the
+        // process crashes before the caller can deliver or settle it.
         const first = reconcileCompactionMode({
             db,
             sessionId: "ses-1",
@@ -838,10 +923,11 @@ describe("reconcileCompactionMode — transition algebra", () => {
         });
         expect(first.recordToWrite).toBe("off");
         expect(first.clearedSomething).toBe(true);
-        expect(getCompactionModeRecord(db, "ses-1")).toBeNull();
+        expect(getCompactionModeRecord(db, "ses-1")).toBe("off_notice_pending");
 
         // Retry: same logical transition. Cleanup is idempotent — no duplicated
-        // side effect (pending ops stay empty, the latch stays cleared).
+        // side effect (pending ops stay empty, the latch stays cleared), while
+        // the durable record still asks the caller to deliver the same notice.
         const second = reconcileCompactionMode({
             db,
             sessionId: "ses-1",
@@ -850,6 +936,7 @@ describe("reconcileCompactionMode — transition algebra", () => {
             compartmentInProgress: false,
         });
         expect(second.recordToWrite).toBe("off");
+        expect(second.notice).toBe(COMPACTION_OFF_FLIP_NOTICE);
         expect(getPendingOps(db, "ses-1")).toHaveLength(0);
         expect(getOverflowState(db, "ses-1").needsEmergencyRecovery).toBe(false);
         commitCompactionModeRecord(db, "ses-1", second.recordToWrite!);

@@ -441,6 +441,33 @@ describe("compaction-off transform — additive-only proof (issue #266 S3)", () 
         expect(wire).not.toContain("[dropped");
     });
 
+    it("treats off_notice_pending exactly like off for reduced-mode gates", async () => {
+        useTempDataHome("co-pending-resolution-");
+        for (const record of ["off", "off_notice_pending"] as const) {
+            const sessionId = `ses-${record}`;
+            const db = openDatabase();
+            getOrCreateSessionMeta(db, sessionId);
+            setCompactionModeRecord(db, sessionId, record);
+            queuePendingOp(db, sessionId, 9, "drop");
+            closeDatabase();
+
+            const { transform } = makeOffTransform({
+                sessionId,
+                schedulerDecision: "execute",
+            });
+            const messages = makeMessages(sessionId);
+            await transform({}, { messages });
+
+            // Both record values resolve to off before normal transform gates.
+            // Removing pending-record parsing makes this look like a fresh flip
+            // and clears the queued state, which trips this assertion.
+            expect(getPendingOps(openDatabase(), sessionId)).toHaveLength(1);
+            expect(allText(messages)).toContain("tool output body");
+            expect(allText(messages)).not.toContain("[dropped");
+            closeDatabase();
+        }
+    });
+
     it("flip-back lazy mint: untagged wire content gets tag rows once the mode flips back on", async () => {
         useTempDataHome("co-flip-back-mint-");
         const db = openDatabase();
@@ -644,7 +671,7 @@ describe("compaction-off transform — additive-only proof (issue #266 S3)", () 
         const firstMessages = makeMessages("ses-1");
         await transform({}, { messages: firstMessages });
         expect(attempts).toBe(1);
-        expect(getCompactionModeRecord(openDatabase(), "ses-1")).toBeNull();
+        expect(getCompactionModeRecord(openDatabase(), "ses-1")).toBe("off_notice_pending");
 
         const secondMessages = makeMessages("ses-1");
         await transform({}, { messages: secondMessages });
@@ -655,6 +682,29 @@ describe("compaction-off transform — additive-only proof (issue #266 S3)", () 
         );
         expect(notices[0]).toContain("compaction-off mode is now active");
         expect(notices[1]).toBe(notices[0]);
+    });
+
+    it("restarts from a durable off notice record and delivers before settling", async () => {
+        useTempDataHome("co-transition-notice-restart-");
+        createOpenCodeDbForSession("ses-1");
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, "ses-1");
+        // Simulate the exact crash window: durable clears already committed and
+        // the process-local transform state is gone, but the notice intent is
+        // still in session_meta.
+        setCompactionModeRecord(db, "ses-1", "off_notice_pending");
+        closeDatabase();
+
+        const promptMock = mock(async () => ({ data: {} }));
+        const client = { session: { prompt: promptMock } } as unknown as PluginContext["client"];
+        // A freshly created transform has no prior in-memory notice map to rely on.
+        const { transform } = makeOffTransform({ sessionId: "ses-1", client });
+        await transform({}, { messages: makeMessages("ses-1") });
+
+        // Mutation direction: removing the durable pending record changes this
+        // restart into a no-op and the notice is never delivered.
+        expect(promptMock).toHaveBeenCalledTimes(1);
+        expect(getCompactionModeRecord(openDatabase(), "ses-1")).toBe("off");
     });
 
     it("clean fresh session booting off-mode: record written, NO notice emitted", async () => {

@@ -15,6 +15,7 @@ import {
 	getChannel2NudgeState,
 	getCompactionModeRecord,
 	getOverflowState,
+	resolveCompactionModeRecord,
 	setCompactionModeRecord,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { COMPACTION_ENABLED_PATH } from "@magic-context/core/config/agent-disable";
@@ -50,11 +51,6 @@ const PI_COMPACTION_OFF_NOTICE =
 const PI_COMPACTION_ON_NOTICE =
 	"Magic Context context-window management resumed. Run /ctx-wrapup to digest history accumulated while compaction was off.";
 
-/**
- * Reconcile Pi's durable mode record. Work is idempotent and the caller commits
- * `recordToWrite` only after delivering the out-of-band notice, preserving the
- * retry semantics used by the OpenCode transition path.
- */
 export function reconcilePiCompactionMode(args: {
 	db: ContextDatabase;
 	sessionId: string;
@@ -62,26 +58,56 @@ export function reconcilePiCompactionMode(args: {
 	historianRunnable: boolean;
 }): PiCompactionModeTransition {
 	const stored = getCompactionModeRecord(args.db, args.sessionId);
+
+	// A prior transition's notice remains due even if the process restarts with
+	// a different resolved mode. Finish this at-least-once delivery before
+	// reconciling the next flip.
+	if (stored === "on_notice_pending") {
+		return {
+			...NO_TRANSITION,
+			recordToWrite: "on",
+			notice: PI_COMPACTION_ON_NOTICE,
+		};
+	}
+	if (stored === "off_notice_pending") {
+		return {
+			...NO_TRANSITION,
+			recordToWrite: "off",
+			notice: PI_COMPACTION_OFF_NOTICE,
+		};
+	}
+
 	if (!args.compactionOff) {
-		if (stored === "on") return NO_TRANSITION;
-		if (stored === null) return { ...NO_TRANSITION, recordToWrite: "on" };
+		if (stored === null || resolveCompactionModeRecord(stored) === "on") {
+			return stored === null
+				? { ...NO_TRANSITION, recordToWrite: "on" }
+				: NO_TRANSITION;
+		}
 
 		clearCachedM0M1(args.db, args.sessionId);
-		if (args.historianRunnable) {
-			updateSessionMeta(args.db, args.sessionId, {
-				compartmentInProgress: true,
-			});
+		if (!args.historianRunnable) {
+			return {
+				...NO_TRANSITION,
+				recordToWrite: "on",
+				invalidatedBaseline: true,
+			};
 		}
+		updateSessionMeta(args.db, args.sessionId, {
+			compartmentInProgress: true,
+		});
+		// Stage notice delivery before the context handler reaches the UI. This
+		// record is shared with OpenCode and survives a process restart.
+		setCompactionModeRecord(args.db, args.sessionId, "on_notice_pending");
 		return {
 			recordToWrite: "on",
 			invalidatedBaseline: true,
 			clearDeferredMarkerState: false,
-			historianCatchUpSignaled: args.historianRunnable,
-			notice: args.historianRunnable ? PI_COMPACTION_ON_NOTICE : null,
+			historianCatchUpSignaled: true,
+			notice: PI_COMPACTION_ON_NOTICE,
 		};
 	}
 
-	if (stored === "off") return NO_TRANSITION;
+	if (resolveCompactionModeRecord(stored) === "off") return NO_TRANSITION;
 
 	let clearedSomething = false;
 	if (getPendingPiCompactionMarkerState(args.db, args.sessionId) !== null) {
@@ -112,12 +138,17 @@ export function reconcilePiCompactionMode(args: {
 		args.sessionId,
 		`Pi compaction-off transition: clearedPendingMarker=${clearedSomething}`,
 	);
+	const notice = clearedSomething ? PI_COMPACTION_OFF_NOTICE : null;
+	if (notice) {
+		// Persist the notice intent before returning to the caller for delivery.
+		setCompactionModeRecord(args.db, args.sessionId, "off_notice_pending");
+	}
 	return {
 		recordToWrite: "off",
 		invalidatedBaseline: true,
 		clearDeferredMarkerState: true,
 		historianCatchUpSignaled: false,
-		notice: clearedSomething ? PI_COMPACTION_OFF_NOTICE : null,
+		notice,
 	};
 }
 
