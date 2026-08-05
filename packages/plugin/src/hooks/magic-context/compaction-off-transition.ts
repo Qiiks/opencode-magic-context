@@ -4,8 +4,9 @@
  * The mode is boot-resolved and process-stable, so a transition is only ever
  * observed on a session's first transform pass after a restart that changed
  * the resolved value. Each session reconciles its durable per-session mode
- * record (`session_meta.compaction_mode_record`: NULL = no record, "on",
- * "off") against the resolved mode:
+ * record (`session_meta.compaction_mode_record`: NULL = no record, settled
+ * "on"/"off", or durable pending-delivery/cleanup variants) against the
+ * resolved mode:
  *
  *   - NULL resolves to "on" (every pre-feature session ran with compaction
  *     enabled), so `no record + configured-off` IS the off-transition — the
@@ -24,12 +25,11 @@
  *       catch-up signal (compartmentInProgress, conditioned on the historian
  *       being runnable) and offer the `/ctx-wrapup` suggestion out of band.
  *
- * Crash safety: every cleanup operation is idempotent and the record is
- * written only AFTER all transition work completes, so a crash before the
- * write re-executes the same logical transition without duplicating mutating
- * side effects. Notices are at-least-once: emitted after the work and before
- * the record commit, so the only permitted repeat is inside that crash
- * window.
+ * Crash safety: every cleanup operation is idempotent. A transition that
+ * emits a notice stages a durable `*_notice_pending` record before returning
+ * to the caller for delivery; a restart therefore retries that notice rather
+ * than inferring it from already-cleared state. Duplicate delivery after a
+ * crash remains the accepted at-least-once cost.
  *
  * Notices are delivered OUT OF BAND by the caller (the boot-warning /
  * command-output surface) — never into the message array, never through the
@@ -49,6 +49,7 @@ import {
     clearPendingCompactionMarkerStateIf,
     type CompactionModeRecord,
     getChannel2NudgeState,
+    resolveCompactionModeRecord,
     getCompactionModeRecord,
     getOverflowState,
     getPendingCompactionMarkerState,
@@ -91,9 +92,10 @@ export const COMPACTION_ON_WRAPUP_SUGGESTION = [
 
 export interface CompactionModeTransitionResult {
     /**
-     * The record value the caller must commit AFTER emitting `notice` (the
-     * at-least-once ordering). null = stored and configured values match; no
-     * transition work ran and nothing must be written.
+     * The settled record value the caller commits AFTER emitting `notice`.
+     * `*_notice_pending` is staged durably by this reconciler before it returns;
+     * null means either the stored mode already matches or a durable cleanup
+     * retry remains pending.
      */
     recordToWrite: CompactionModeRecord | null;
     /** Out-of-band notice text; null when the transition emits nothing. */
@@ -148,13 +150,13 @@ function clearCachedM0Baseline(
     return (result.changes ?? 0) > 0;
 }
 
-/**
- * Reconcile one session's durable compaction-mode record against the
- * boot-resolved mode, running the transition work for a flip. Idempotent and
- * crash-safe: work first, record commit last (performed by the caller after
- * the notice is emitted). Errors propagate — the caller must skip the record
- * commit on failure so the next pass retries the same logical transition.
- */
+function cleanupOffMarkers(sessionId: string): McOwnedMarkerCleanupResult {
+    if (!existsSync(getOpenCodeDbPath())) {
+        return { verified: true, removedLineages: 0, removedRows: 0, retainedLineages: 0 };
+    }
+    return removeMcOwnedCompactionMarkers(sessionId, MARKER_SUMMARY_TEXT);
+}
+
 export function reconcileCompactionMode(args: {
     db: import("../../shared/sqlite").Database;
     sessionId: string;
@@ -168,19 +170,38 @@ export function reconcileCompactionMode(args: {
     const { db, sessionId } = args;
     const stored = getCompactionModeRecord(db, sessionId);
 
+    // A pending notice wins over a newly resolved configuration: this process
+    // may be the first one after a crash, so it must finish the prior
+    // transition's at-least-once delivery before reconciling another flip.
+    if (stored === "on_notice_pending") {
+        return {
+            ...NO_TRANSITION,
+            recordToWrite: "on",
+            notice: COMPACTION_ON_WRAPUP_SUGGESTION,
+        };
+    }
+    if (stored === "off_notice_pending") {
+        const markerCleanup = cleanupOffMarkers(sessionId);
+        return {
+            ...NO_TRANSITION,
+            recordToWrite: markerCleanup.verified ? "off" : "off_cleanup_pending",
+            notice: COMPACTION_OFF_FLIP_NOTICE,
+            markerCleanup,
+        };
+    }
+
     if (!args.compactionOff) {
-        if (stored === "on") return NO_TRANSITION;
-        if (stored === null) {
-            return { ...NO_TRANSITION, recordToWrite: "on" };
+        if (stored === null || resolveCompactionModeRecord(stored) === "on") {
+            return stored === null ? { ...NO_TRANSITION, recordToWrite: "on" } : NO_TRANSITION;
         }
-        // stored === "off" → the on-transition.
-        //
+
+        // The only remaining resolved state is off (settled or an unfinished
+        // marker-cleanup retry), so restart normal compaction work first.
         // Invalidate the cached baseline FIRST: the off-mode baseline carries
         // no <session-history>, and raw-tail trimming resumes on flip-back.
-        // Without a fresh fold the first busting pass would trim to the
-        // latest dormant boundary while nothing renders the dormant range —
-        // silent history loss. first_render re-cut makes the trim and the
-        // rendered history agree again.
+        // Rebuild the baseline before the first compaction pass so trimming
+        // uses the same history range that the renderer will display; otherwise
+        // the dormant range could be trimmed without being rendered.
         const invalidatedM0Baseline = clearCachedM0Baseline(db, sessionId);
         let historianCatchUpSignaled = false;
         if (args.historianRunnable) {
@@ -191,10 +212,22 @@ export function reconcileCompactionMode(args: {
             updateSessionMeta(db, sessionId, { compartmentInProgress: true });
             historianCatchUpSignaled = true;
         }
+        if (!historianCatchUpSignaled) {
+            return {
+                ...NO_TRANSITION,
+                recordToWrite: "on",
+                invalidatedM0Baseline,
+            };
+        }
+
+        // Persist delivery intent before returning to the caller. The caller
+        // may crash or lose its transport after this point; the next process
+        // observes this record and retries the exact wrapup suggestion.
+        setCompactionModeRecord(db, sessionId, "on_notice_pending");
         return {
             ...NO_TRANSITION,
             recordToWrite: "on",
-            notice: historianCatchUpSignaled ? COMPACTION_ON_WRAPUP_SUGGESTION : null,
+            notice: COMPACTION_ON_WRAPUP_SUGGESTION,
             invalidatedM0Baseline,
             historianCatchUpSignaled,
         };
@@ -202,21 +235,25 @@ export function reconcileCompactionMode(args: {
 
     if (stored === "off") return NO_TRANSITION;
 
+    if (stored === "off_cleanup_pending") {
+        // This separate durable state means a successful notice delivery never
+        // suppresses a retry after marker verification failed. It resolves as
+        // off for all normal gates while retrying only the unverified cleanup.
+        const markerCleanup = cleanupOffMarkers(sessionId);
+        return {
+            ...NO_TRANSITION,
+            recordToWrite: markerCleanup.verified ? "off" : null,
+            markerCleanup,
+        };
+    }
+
     // stored === null | "on" → the off-transition (exactly once per session).
     let clearedSomething = false;
 
     // 1. Delete MC-owned marker lineages from opencode.db (canonical +
     //    supported legacy). No opencode.db means no markers — not an error.
-    let markerCleanup: McOwnedMarkerCleanupResult = {
-        verified: true,
-        removedLineages: 0,
-        removedRows: 0,
-        retainedLineages: 0,
-    };
-    if (existsSync(getOpenCodeDbPath())) {
-        markerCleanup = removeMcOwnedCompactionMarkers(sessionId, MARKER_SUMMARY_TEXT);
-        if (markerCleanup.removedRows > 0) clearedSomething = true;
-    }
+    const markerCleanup = cleanupOffMarkers(sessionId);
+    if (markerCleanup.removedRows > 0) clearedSomething = true;
 
     // 2. Clear the context.db marker bookkeeping that references the deleted
     //    rows. Leaving it would dangle: the reconciler would replay a summary
@@ -279,13 +316,24 @@ export function reconcileCompactionMode(args: {
         loggedUnverifiedMarkerCleanupRetry = true;
         sessionLog(
             sessionId,
-            "compaction-off transition could not verify complete marker cleanup; the mode record remains uncommitted and cleanup will retry on the next pass",
+            "compaction-off transition could not verify complete marker cleanup; durable cleanup retry will run on the next pass",
         );
     }
 
+    const notice = clearedSomething ? COMPACTION_OFF_FLIP_NOTICE : null;
+    if (notice) {
+        // Store the notice intent with the completed durable clears. Unlike the
+        // old process-local map, this survives a restart after those clears.
+        setCompactionModeRecord(db, sessionId, "off_notice_pending");
+    } else if (!markerCleanup.verified) {
+        // No notice is warranted, but verification must still be retried even
+        // though the mode record is now present and resolves to off.
+        setCompactionModeRecord(db, sessionId, "off_cleanup_pending");
+    }
+
     return {
-        recordToWrite: markerCleanup.verified ? "off" : null,
-        notice: clearedSomething ? COMPACTION_OFF_FLIP_NOTICE : null,
+        recordToWrite: notice ? (markerCleanup.verified ? "off" : "off_cleanup_pending") : markerCleanup.verified ? "off" : null,
+        notice,
         invalidatedM0Baseline,
         historianCatchUpSignaled: false,
         clearedCompartmentInProgress,

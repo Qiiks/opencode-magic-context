@@ -2212,14 +2212,18 @@ export function registerPiContextHandler(
 					sessionMetaForUsage.cachedM0Bytes = null;
 					sessionMetaForUsage.cachedM1Bytes = null;
 				}
+				let noticeDelivered = compactionTransition.notice === null;
 				if (compactionTransition.notice && ctx.ui?.notify) {
 					ctx.ui.notify(compactionTransition.notice, "info");
+					noticeDelivered = true;
 				}
-				commitPiCompactionModeRecord(
-					options.db,
-					sessionId,
-					compactionTransition.recordToWrite,
-				);
+				if (noticeDelivered) {
+					commitPiCompactionModeRecord(
+						options.db,
+						sessionId,
+						compactionTransition.recordToWrite,
+					);
+				}
 			}
 			// Model change invalidates the safe-token baseline + alert state too
 			// (new model, new limits), so it clears all four pressure fields.

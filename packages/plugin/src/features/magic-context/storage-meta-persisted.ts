@@ -600,27 +600,60 @@ export function releaseWrapupInProgress(db: Database, sessionId: string, holderI
  *   - NULL  → no record (treated as "on" by the transition logic, so a
  *             pre-existing row is unambiguously no-record; a session with no
  *             record that boots into compaction-off mode runs the off cleanup)
- *   - "on"  → compaction enabled for this session
- *   - "off" → compaction-off mode for this session
+ *   - "on" / "off" → settled mode for this session
+ *   - "on_notice_pending" / "off_notice_pending" → the matching mode is
+ *     already active, but its out-of-band transition notice must be retried
+ *     after a restart until delivery succeeds
+ *   - "off_cleanup_pending" → off mode is active while marker cleanup awaits
+ *     a later verification pass; this keeps cleanup retry durable after its
+ *     notice has already been delivered
  *
  * Helpers use a simple UPDATE under the session row (no compare-and-swap)
- * because there is a single writer per session on the transform path. The
- * record is written AFTER all transition work, so a crash before the write
- * reruns idempotent cleanup. clearSession() needs no change (the column is
- * row-scoped). This slice adds helpers only — no transition logic reads or
- * writes the column yet.
+ * because there is a single writer per session on the transform path.
+ * clearSession() needs no change (the column is row-scoped).
  */
-export type CompactionModeRecord = "on" | "off";
+export type CompactionModeRecord =
+    | "on"
+    | "off"
+    | "on_notice_pending"
+    | "off_notice_pending"
+    | "off_cleanup_pending";
 
-const COMPACTION_MODE_RECORD_VALUES: ReadonlySet<string> = new Set(["on", "off"]);
+export type ResolvedCompactionModeRecord = "on" | "off";
+
+const COMPACTION_MODE_RECORD_VALUES: ReadonlySet<CompactionModeRecord> = new Set([
+    "on",
+    "off",
+    "on_notice_pending",
+    "off_notice_pending",
+    "off_cleanup_pending",
+]);
 
 function normalizeCompactionModeRecord(value: unknown): CompactionModeRecord | null {
     if (value === null || value === undefined) return null;
-    if (typeof value === "string" && COMPACTION_MODE_RECORD_VALUES.has(value)) {
+    if (typeof value === "string" && COMPACTION_MODE_RECORD_VALUES.has(value as CompactionModeRecord)) {
         return value as CompactionModeRecord;
     }
     return null;
 }
+
+/** Resolves transient delivery/cleanup records to the mode their gates must use. */
+export function resolveCompactionModeRecord(
+    record: CompactionModeRecord | null,
+): ResolvedCompactionModeRecord | null {
+    switch (record) {
+        case "on":
+        case "on_notice_pending":
+            return "on";
+        case "off":
+        case "off_notice_pending":
+        case "off_cleanup_pending":
+            return "off";
+        default:
+            return null;
+    }
+}
+
 
 /** Reads the persisted compaction mode record for a session. NULL → no record. */
 export function getCompactionModeRecord(
@@ -637,9 +670,9 @@ export function getCompactionModeRecord(
 
 /**
  * Writes the compaction mode record for a session. Ensures the session_meta row
- * exists first. Pass `null` to clear the record (no record). Only "on", "off",
- * or null are accepted; any other value throws (defensive — callers should
- * pass a typed CompactionModeRecord).
+ * exists first. Pass `null` to clear the record (no record). Only supported
+ * settled or transient `CompactionModeRecord` values (or null) are accepted;
+ * any other value throws (defensive — callers should pass a typed record).
  */
 export function setCompactionModeRecord(
     db: Database,
@@ -648,7 +681,7 @@ export function setCompactionModeRecord(
 ): void {
     if (value !== null && !COMPACTION_MODE_RECORD_VALUES.has(value)) {
         throw new Error(
-            `Invalid compaction_mode_record value: ${String(value)} (expected "on", "off", or null)`,
+            `Invalid compaction_mode_record value: ${String(value)} (expected a supported compaction mode record or null)`,
         );
     }
     ensureSessionMetaRow(db, sessionId);

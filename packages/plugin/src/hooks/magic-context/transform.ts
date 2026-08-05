@@ -628,10 +628,6 @@ export function createTransform(deps: TransformDeps) {
     const deferredHistoryRefreshSessions = deps.deferredHistoryRefreshSessions ?? new Set<string>();
     const deferredMaterializationSessions =
         deps.deferredMaterializationSessions ?? new Set<string>();
-    // A failed awaited delivery leaves the durable mode record uncommitted. Keep
-    // the notice text in-process so the next transform pass retries delivery
-    // even though the idempotent cleanup no longer reports rows cleared.
-    const pendingCompactionModeNotices = new BoundedSessionMap<string>(100);
 
     const transform = async (
         _input: Record<string, never>,
@@ -712,10 +708,10 @@ export function createTransform(deps: TransformDeps) {
         // once the session's durable record matches the boot-resolved mode —
         // so the transition work (marker cleanup, latch/intent/pending-op
         // clears, catch-up signal) happens exactly once per session, on the
-        // first pass after a restart that changed the resolved value. The
-        // record commits AFTER the work and the notice emission (delete-
-        // then-record + at-least-once notice contract); a failure here skips
-        // the commit so the next pass retries the same logical transition.
+        // first pass after a restart that changed the resolved value. A notice
+        // transition first stages a durable pending record, then commits its
+        // settled value only after delivery; a failure therefore retries the
+        // same logical transition across process restarts.
         try {
             const transition = reconcileCompactionMode({
                 db,
@@ -724,7 +720,13 @@ export function createTransform(deps: TransformDeps) {
                 historianRunnable: deps.historianRunnable !== false,
                 compartmentInProgress: sessionMeta.compartmentInProgress,
             });
-            if (transition.recordToWrite !== null) {
+            const hasTransitionEffects =
+                transition.recordToWrite !== null ||
+                transition.notice !== null ||
+                transition.invalidatedM0Baseline ||
+                transition.clearedCompartmentInProgress ||
+                transition.historianCatchUpSignaled;
+            if (hasTransitionEffects) {
                 if (transition.invalidatedM0Baseline) {
                     // The persisted baseline bytes were nulled; drop the
                     // pass-local copies too so this pass re-materializes
@@ -743,21 +745,18 @@ export function createTransform(deps: TransformDeps) {
                 if (transition.historianCatchUpSignaled) {
                     sessionMeta = { ...sessionMeta, compartmentInProgress: true };
                 }
-                const notice =
-                    transition.notice ?? pendingCompactionModeNotices.get(sessionId) ?? null;
-                if (transition.notice) {
-                    pendingCompactionModeNotices.set(sessionId, transition.notice);
-                }
+                const notice = transition.notice;
                 // A missing client is the existing no-notification test/headless
                 // seam. Production OpenCode transforms always provide one; when
-                // present, its delivery result controls whether the record commits.
+                // present, its delivery result controls whether the settled record
+                // commits. The reconciler has already persisted a pending notice
+                // record, so a restart retries instead of losing this delivery.
                 let noticeDelivered = notice === null || deps.client === undefined;
                 if (notice && deps.client) {
                     // Out-of-band only — never the message array or nudge
-                    // channels. Delivery must finish before the durable record
-                    // commits; a failed delivery leaves the transition
-                    // retryable, accepting a duplicate after a crash rather
-                    // than permanently losing the notice.
+                    // channels. A failed delivery leaves the durable pending
+                    // record in place, accepting a duplicate after a crash
+                    // rather than permanently losing the notice.
                     noticeDelivered =
                         (await sendIgnoredMessage(
                             deps.client,
@@ -766,13 +765,12 @@ export function createTransform(deps: TransformDeps) {
                             deps.getNotificationParams?.(sessionId) ?? {},
                         )) === "sent";
                 }
-                if (noticeDelivered) {
+                if (noticeDelivered && transition.recordToWrite !== null) {
                     commitCompactionModeRecord(db, sessionId, transition.recordToWrite);
-                    pendingCompactionModeNotices.delete(sessionId);
-                } else {
+                } else if (!noticeDelivered) {
                     sessionLog(
                         sessionId,
-                        "compaction mode notice was not delivered; leaving mode record uncommitted for next-pass retry",
+                        "compaction mode notice was not delivered; durable pending record will retry on the next pass",
                     );
                 }
             }
