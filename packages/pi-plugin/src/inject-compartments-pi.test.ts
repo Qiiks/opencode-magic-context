@@ -407,6 +407,55 @@ describe("injectM0M1Pi memory feature gate", () => {
 });
 
 describe("injectM0M1Pi", () => {
+	it("keeps project memory but removes compartment rendering and trim in compaction-off mode", () => {
+		const db = createTestDb();
+		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-compaction-off-"));
+		try {
+			const offState = {
+				...piState("ses-pi-compaction-off", cwd),
+				compactionOff: true,
+			};
+			appendCompartments(db, offState.sessionId, [
+				{
+					sequence: 1,
+					startMessage: 1,
+					endMessage: 1,
+					startMessageId: "old-entry",
+					endMessageId: "old-entry",
+					title: "old history",
+					content: "compartment-only history must stay off the wire",
+				},
+			]);
+			insertMemory(db, {
+				projectPath: offState.projectIdentity,
+				category: "ARCHITECTURE",
+				content: "compaction-off memory survives",
+				sourceType: "historian",
+			});
+			const messages = [
+				userMessage("raw history stays visible", 10),
+				userMessage("live tail", 11),
+			];
+			const result = injectM0M1Pi(offState, db, messages as never, [
+				"old-entry",
+				"live-entry",
+			]);
+
+			expect(textOf(messages[0] as never)).toContain(
+				"compaction-off memory survives",
+			);
+			expect(textOf(messages[0] as never)).not.toContain("<session-history>");
+			expect(textOf(messages[0] as never)).not.toContain(
+				"compartment-only history must stay off the wire",
+			);
+			expect(result.skippedVisibleMessages).toBe(0);
+			expect(textOf(messages.at(-1) as never)).toBe("live tail");
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+			closeQuietly(db);
+		}
+	});
+
 	it("renders first-pass m[0] with no inner content and m[1] placeholder", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-empty-"));

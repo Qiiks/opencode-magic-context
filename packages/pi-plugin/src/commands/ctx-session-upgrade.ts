@@ -17,6 +17,7 @@ import {
 import { describeError } from "@magic-context/core/shared/error-message";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
+import { COMPACTION_OFF_COMMAND_UNAVAILABLE } from "../compaction-off-pi";
 import {
 	signalPiDeferredHistoryRefresh,
 	signalPiDeferredMaterialization,
@@ -42,6 +43,7 @@ export interface CtxSessionUpgradeRuntimeDeps {
 	memoryEnabled: boolean;
 	autoPromote: boolean;
 	userMemoriesEnabled?: boolean;
+	compactionOff?: boolean;
 }
 
 export interface RegisterCtxSessionUpgradeDeps
@@ -79,6 +81,14 @@ export function registerCtxSessionUpgradeCommand(
 				return;
 			}
 			const currentDeps = deps.resolveRuntimeDeps?.(ctx) ?? deps;
+			if (currentDeps.compactionOff) {
+				sendCtxStatusMessage(pi, {
+					title: "/ctx-session-upgrade",
+					text: COMPACTION_OFF_COMMAND_UNAVAILABLE,
+					level: "warning",
+				});
+				return;
+			}
 			if (!currentDeps.historianModel) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-session-upgrade",

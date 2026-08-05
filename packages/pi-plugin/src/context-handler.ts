@@ -174,6 +174,10 @@ import {
 	applyDeferredPiCompactionMarker,
 } from "./compaction-marker-manager-pi";
 import {
+	commitPiCompactionModeRecord,
+	reconcilePiCompactionMode,
+} from "./compaction-off-pi";
+import {
 	hasPiTransformTimingObserver,
 	recordPiTransformTiming,
 } from "./context-perf-hooks";
@@ -1032,6 +1036,8 @@ export interface PiContextHandlerOptions {
 	 * cwd. Tests omit it (the static options are used directly).
 	 */
 	resolveForProject?: (projectDir: string) => PiContextHandlerOptions;
+	/** Boot-resolved compaction-off flag. It remains fixed for this Pi process. */
+	compactionOff?: boolean;
 	maybeAutoEmbedSession?: (
 		sessionId: string,
 		projectDir: string,
@@ -2053,7 +2059,7 @@ export function registerPiContextHandler(
 								branchEntries,
 							);
 			const strictEntryIds = resolvedEntryIds ? [...resolvedEntryIds] : null;
-			if (strictEntryIds && options.injection) {
+			if (strictEntryIds && options.injection && !options.compactionOff) {
 				const removed = trimPiMessagesToCachedBoundary(
 					options.db,
 					sessionId,
@@ -2186,6 +2192,35 @@ export function registerPiContextHandler(
 			const tMeta = performance.now();
 			const sessionMetaForUsage = getOrCreateSessionMeta(options.db, sessionId);
 			logTransformTiming(sessionId, "getOrCreateSessionMeta", tMeta);
+
+			// The Pi equivalent of OpenCode marker cleanup is durable
+			// pending_pi_compaction_marker_state plus these deferred-drain sets.
+			// Reconcile before any transform phase so an off pass cannot drain or
+			// render stale MC compaction state.
+			const compactionTransition = reconcilePiCompactionMode({
+				db: options.db,
+				sessionId,
+				compactionOff: options.compactionOff === true,
+				historianRunnable: options.historian !== undefined,
+			});
+			if (compactionTransition.recordToWrite) {
+				if (compactionTransition.clearDeferredMarkerState) {
+					clearPiCompactionOffInMemoryState(sessionId);
+				}
+				if (compactionTransition.invalidatedBaseline) {
+					clearPiInjectionTokenCountCache(sessionId);
+					sessionMetaForUsage.cachedM0Bytes = null;
+					sessionMetaForUsage.cachedM1Bytes = null;
+				}
+				if (compactionTransition.notice && ctx.ui?.notify) {
+					ctx.ui.notify(compactionTransition.notice, "info");
+				}
+				commitPiCompactionModeRecord(
+					options.db,
+					sessionId,
+					compactionTransition.recordToWrite,
+				);
+			}
 			// Model change invalidates the safe-token baseline + alert state too
 			// (new model, new limits), so it clears all four pressure fields.
 			const usageReset = {
@@ -2295,7 +2330,9 @@ export function registerPiContextHandler(
 			let needsEmergencyBump = false;
 			let emergencyRecoveryArmed = false;
 			try {
-				const overflowState = getOverflowState(options.db, sessionId);
+				const overflowState = options.compactionOff
+					? { detectedContextLimit: 0, needsEmergencyRecovery: false }
+					: getOverflowState(options.db, sessionId);
 				if (overflowState.detectedContextLimit > 0) {
 					// Always prefer detected limit over reported window
 					// when one exists — the reported window came from
@@ -2406,7 +2443,7 @@ export function registerPiContextHandler(
 				usagePercentage === 0 &&
 				sessionMeta.lastResponseTime === 0 &&
 				piMessageCount >= 50;
-			if (looksLikeImportedSession) {
+			if (looksLikeImportedSession && !options.compactionOff) {
 				schedulerDecision = "execute";
 				sessionLog(
 					sessionId,
@@ -2450,7 +2487,7 @@ export function registerPiContextHandler(
 					`stable-id scheme cutover deferred: real SessionEntry ids unavailable this pass (branch resolution failed) — will retry when getBranch() succeeds`,
 				);
 			}
-			if (stableIdSchemeCutover) {
+			if (stableIdSchemeCutover && !options.compactionOff) {
 				schedulerDecision = "execute";
 				signalPiPendingMaterialization(sessionId);
 				// Re-keying of stripped_placeholder_ids from pi-msg-* to real ids is
@@ -2478,13 +2515,18 @@ export function registerPiContextHandler(
 			});
 
 			const { midTurnAdjustedSchedulerDecision, sideEffect } =
-				applyMidTurnDeferral({
-					base: schedulerDecisionEarly,
-					bypassReason,
-					midTurn,
-				});
+				options.compactionOff
+					? {
+							midTurnAdjustedSchedulerDecision: "defer" as const,
+							sideEffect: "none" as const,
+						}
+					: applyMidTurnDeferral({
+							base: schedulerDecisionEarly,
+							bypassReason,
+							midTurn,
+						});
 
-			if (sideEffect === "set-flag") {
+			if (sideEffect === "set-flag" && !options.compactionOff) {
 				const flagPayload = {
 					id: crypto.randomUUID(),
 					reason: `${schedulerDecisionEarly}-${bypassReason}`,
@@ -2514,6 +2556,7 @@ export function registerPiContextHandler(
 			// Force-materialization @ 85%+: aggressive drop-all-tools mode.
 			// Mirrors OpenCode transform-postprocess-phase.ts:145-146.
 			const forceMaterialization =
+				!options.compactionOff &&
 				usagePercentage >= FORCE_MATERIALIZATION_PERCENTAGE;
 
 			// 95% emergency block: usage is dangerous enough that we
@@ -2535,7 +2578,8 @@ export function registerPiContextHandler(
 			//     turn forever if historian hangs. After 30s we fall
 			//     through to the normal pipeline (with drop-all-tools
 			//     still active via the 85%+ branch).
-			const isEmergency = usagePercentage >= EMERGENCY_BLOCK_PERCENTAGE;
+			const isEmergency =
+				!options.compactionOff && usagePercentage >= EMERGENCY_BLOCK_PERCENTAGE;
 			if (isEmergency) {
 				const lastNotifiedAt =
 					lastEmergencyNotificationAtMs.get(sessionId) ?? 0;
@@ -2723,6 +2767,7 @@ export function registerPiContextHandler(
 				appendCompaction: resolvePiAppendCompaction(ctx),
 				readBranchEntries: resolvePiReadBranchEntries(ctx),
 				isSubagent: sessionMeta.isSubagent,
+				compactionOff: options.compactionOff === true,
 			});
 			logTransformTiming(sessionId, "runPipeline", tRunPipeline);
 			const postPipelineStart = performance.now();
@@ -2768,7 +2813,7 @@ export function registerPiContextHandler(
 			// behavior is the Step 4b.2 contract, and historian is
 			// fire-and-forget so we never block the LLM call on it.
 			const tHistorianScheduling = performance.now();
-			if (options.historian) {
+			if (options.historian && !options.compactionOff) {
 				maybeFireHistorian({
 					pi,
 					ctx,
@@ -2797,23 +2842,24 @@ export function registerPiContextHandler(
 
 			const tNoteNudges = performance.now();
 			try {
-				outputMessages = applyNoteNudges({
-					sessionId,
-					db: options.db,
-					messages: outputMessages,
-					projectIdentity,
-					entryIds: strictEntryIds,
-					// Post-commit/post-splice ref-map (see sticky reminder above).
-					entryIdByRef: result.postCommitEntryIdByRef,
-					// Same signal OpenCode uses to gate sticky-anchor GC
-					// (isCacheBustingPass = history-refresh OR work executed).
-					isCacheBusting: isCacheBusting || result.executedWorkThisPass,
-					// Id-less synthetic injections present in outputMessages: the
-					// m[0]/m[1] prepends. (The rolling-nudge synthetic was removed in
-					// the ctx_reduce nudge redesign.) Excluded from the anchor-GC
-					// denominator.
-					syntheticLeadingCount: result.syntheticLeadingCount,
-				});
+				if (!options.compactionOff) {
+					outputMessages = applyNoteNudges({
+						sessionId,
+						db: options.db,
+						messages: outputMessages,
+						projectIdentity,
+						entryIds: strictEntryIds,
+						// Use the map produced after commits and splices because those operations
+						// can change the final message-reference to entry-ID mapping.
+						entryIdByRef: result.postCommitEntryIdByRef,
+						// Same signal OpenCode uses to gate sticky-anchor GC
+						// (isCacheBustingPass = history-refresh OR work executed).
+						isCacheBusting: isCacheBusting || result.executedWorkThisPass,
+						// These leading synthetic messages have no persisted entry IDs, so
+						// exclude them from the sticky-anchor GC denominator.
+						syntheticLeadingCount: result.syntheticLeadingCount,
+					});
+				}
 			} catch (err) {
 				sessionLog(
 					sessionId,
@@ -2823,14 +2869,15 @@ export function registerPiContextHandler(
 			logTransformTiming(sessionId, "noteNudges", tNoteNudges);
 
 			const tAutoSearch = performance.now();
-			if (options.autoSearch?.enabled) {
+			if (options.autoSearch?.enabled && !options.compactionOff) {
 				try {
 					outputMessages = await runAutoSearchHintForPi({
 						sessionId,
 						db: options.db,
 						messages: outputMessages,
 						entryIds: strictEntryIds,
-						// Post-commit/post-splice ref-map (see sticky reminder above).
+						// Use the map produced after commits and splices because those operations
+						// can change the final message-reference to entry-ID mapping.
 						entryIdByRef: result.postCommitEntryIdByRef,
 						ensureProjectRegistered: () =>
 							ensureProjectRegisteredFromPiDirectory(
@@ -2882,6 +2929,7 @@ export function registerPiContextHandler(
 					sessionId,
 				);
 				if (
+					!options.compactionOff &&
 					!sessionMetaForTodo.isSubagent &&
 					sessionMetaForTodo.lastTodoState !== ""
 				) {
@@ -2919,7 +2967,7 @@ export function registerPiContextHandler(
 				// tool; subagents do not, so a baseline/nudge there would point at a
 				// missing session-scoped tool. A missing baseline is also how Channel 1
 				// stays off.
-				if (!sessionMetaForCh1.isSubagent) {
+				if (!options.compactionOff && !sessionMetaForCh1.isSubagent) {
 					// Resolve through the SCHEDULER config (the real execute
 					// threshold), not options.historian — when historian is disabled
 					// the historian threshold falls back to 65 and ignores the user's
@@ -3070,7 +3118,7 @@ export function registerPiContextHandler(
 			logTransformTiming(sessionId, "workMetrics", tWorkMetrics);
 
 			const tStableIdSchemePersist = performance.now();
-			if (stableIdSchemeCutover) {
+			if (stableIdSchemeCutover && !options.compactionOff) {
 				// Scheme stamps only after the cutover pass completed. If this write
 				// fails, the outer fail-open path ships the original messages and the
 				// next pass repeats forced placeholder discovery.
@@ -3122,7 +3170,8 @@ export function registerPiContextHandler(
 		} catch (err) {
 			// Loud fail-closed / emergency aborts must reach the user — do not
 			// swallow into native-compaction fallthrough.
-			if (isFailClosedBlockingError(err)) throw err;
+			if (isFailClosedBlockingError(err) && !baseOptions.compactionOff)
+				throw err;
 			const message = err instanceof Error ? err.message : String(err);
 			const stack = err instanceof Error ? err.stack : undefined;
 			log(
@@ -3916,6 +3965,8 @@ interface RunPipelineArgs {
 		caveman?: { enabled: boolean; minChars: number };
 	};
 	isSubagent?: boolean;
+	/** Additive-only transform mode: no tags, drops, history trim, markers, or nudges. */
+	compactionOff?: boolean;
 	/** ceiling = contextLimit × executeThreshold% for the tiered emergency drop. */
 	emergencyCeilingTokens?: number;
 	/** Memory-injection config — when omitted, no <session-history> injection runs. */
@@ -4127,7 +4178,52 @@ function captureReasoningMutationRollback(
 	};
 }
 
+async function runCompactionOffPipeline(
+	args: RunPipelineArgs,
+): Promise<RunPipelineResult> {
+	let injectionResult: PiInjectionResult | null = null;
+	if (args.injection) {
+		injectionResult = injectM0M1Pi(
+			{
+				sessionId: args.sessionId,
+				projectIdentity: args.projectIdentity,
+				projectDirectory: args.projectDirectory,
+				memoryEnabled: args.injection.memoryEnabled,
+				injectDocs: args.injection.injectDocs,
+				injectionBudgetTokens: args.injection.injectionBudgetTokens,
+				historyBudgetTokens: args.injection.historyBudgetTokens,
+				muralEnabled: args.injection.muralEnabled === true,
+				compactionOff: true,
+			},
+			args.db,
+			args.messages as Parameters<typeof injectM0M1Pi>[2],
+			args.entryIds,
+			false,
+		);
+	}
+	return {
+		messages: args.messages as unknown[],
+		heuristicsExecuted: false,
+		executedWorkThisPass: false,
+		historyInjected: false,
+		syntheticLeadingCount: injectionResult?.syntheticLeadingCount ?? 0,
+		heuristicsResult: null,
+		injectionResult,
+		materialized: injectionResult?.m0Materialized === true,
+		materializeReason: injectionResult?.m0Reason ?? null,
+		droppedTokens: 0,
+		droppedCount: 0,
+		emergency: false,
+		bustedThisPass: injectionResult?.m0Materialized === true,
+		targetCount: 0,
+		reasoningWatermark: args.sessionMeta.clearedReasoningThroughTag ?? 0,
+		activeTags: [],
+		postCommitEntryIdByRef: new Map(),
+	};
+}
+
 async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
+	if (args.compactionOff) return runCompactionOffPipeline(args);
 	let executedWorkThisPass = false;
 	let historyWasConsumedThisPass = false;
 	let materializationSatisfiedThisPass = false;
@@ -5724,6 +5820,14 @@ function appendReminderToPiUserMessage(
 	// Image-only or empty array — push a new text block. Trim leading
 	// `\n\n` because there's nothing to separate from.
 	contentArr.push({ type: "text", text: reminder.trimStart() });
+}
+
+function clearPiCompactionOffInMemoryState(sessionId: string): void {
+	historyRefreshSessions.delete(sessionId);
+	deferredHistoryRefreshSessions.delete(sessionId);
+	pendingMaterializationSessions.delete(sessionId);
+	deferredMaterializationSessions.delete(sessionId);
+	clearPiChannel1State(sessionId);
 }
 
 /**

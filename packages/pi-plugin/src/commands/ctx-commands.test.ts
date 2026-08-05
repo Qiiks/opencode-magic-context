@@ -1,16 +1,18 @@
 import { describe, expect, it } from "bun:test";
 import { replaceAllCompartmentState } from "@magic-context/core/features/magic-context/compartment-storage";
-
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { queuePendingOp } from "@magic-context/core/features/magic-context/storage-ops";
 import { insertTag } from "@magic-context/core/features/magic-context/storage-tags";
 import { Database } from "@magic-context/core/shared/sqlite";
+
 import { awaitInFlightRecomps } from "../pi-recomp-runner";
 import { registerCtxDreamCommand } from "./ctx-dream";
 import { registerCtxFlushCommand } from "./ctx-flush";
 import { registerCtxRecompCommand } from "./ctx-recomp";
+import { registerCtxSessionUpgradeCommand } from "./ctx-session-upgrade";
 import { registerCtxStatusCommand } from "./ctx-status";
+import { registerCtxWrapupCommand } from "./ctx-wrapup";
 
 type Handler = (args: string, ctx: MockCommandContext) => Promise<void>;
 
@@ -143,6 +145,48 @@ describe("Pi Magic Context commands", () => {
 		expect(sent).toHaveLength(1);
 		expect(sent[0]?.customType).toBe("ctx-status");
 		expect(sent[0]?.data.text).toContain("## Magic Status");
+	});
+
+	it("refuses every context-management command in compaction-off mode without mutations", async () => {
+		const db = createDb();
+		const { pi, handlers, sent } = createMockPi();
+		const sessionId = "ses-compaction-off-command";
+		const tagId = insertTag(db, sessionId, "message-1", "message", 20, 1);
+		queuePendingOp(db, sessionId, tagId, "drop");
+		const common = {
+			db,
+			runner: {} as never,
+			historianModel: "test/model",
+			historianChunkTokens: 1000,
+			memoryEnabled: true,
+			autoPromote: false,
+			compactionOff: true,
+		};
+		registerCtxFlushCommand(pi as never, { db, compactionOff: true });
+		registerCtxRecompCommand(pi as never, common);
+		registerCtxWrapupCommand(pi as never, common);
+		registerCtxSessionUpgradeCommand(pi as never, common);
+
+		for (const name of [
+			"ctx-flush",
+			"ctx-recomp",
+			"ctx-wrapup",
+			"ctx-session-upgrade",
+		]) {
+			await handlers.get(name)?.("", createCtx(sessionId));
+		}
+
+		expect(sent.map((entry) => entry.data.text)).toEqual([
+			"Unavailable: magic-context is in compaction-off mode (compaction.enabled=false).",
+			"Unavailable: magic-context is in compaction-off mode (compaction.enabled=false).",
+			"Unavailable: magic-context is in compaction-off mode (compaction.enabled=false).",
+			"Unavailable: magic-context is in compaction-off mode (compaction.enabled=false).",
+		]);
+		expect(
+			db
+				.prepare("SELECT COUNT(*) AS n FROM pending_ops WHERE session_id = ?")
+				.get(sessionId),
+		).toMatchObject({ n: 1 });
 	});
 
 	it("registers /ctx-flush and materializes queued pending ops", async () => {

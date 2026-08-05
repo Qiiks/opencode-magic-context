@@ -16,6 +16,7 @@ import type { RawMessageProvider } from "@magic-context/core/hooks/magic-context
 import { describeError } from "@magic-context/core/shared/error-message";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
+import { COMPACTION_OFF_COMMAND_UNAVAILABLE } from "../compaction-off-pi";
 import {
 	signalPiDeferredHistoryRefresh,
 	signalPiDeferredMaterialization,
@@ -53,6 +54,7 @@ export interface CtxRecompRuntimeDeps {
 	language?: string;
 	memoryEnabled: boolean;
 	autoPromote: boolean;
+	compactionOff?: boolean;
 }
 
 export interface RegisterCtxRecompDeps extends CtxRecompRuntimeDeps {
@@ -77,6 +79,14 @@ export function registerCtxRecompCommand(
 				return;
 			}
 			const currentDeps = deps.resolveRuntimeDeps?.(ctx) ?? deps;
+			if (currentDeps.compactionOff) {
+				sendCtxStatusMessage(pi, {
+					title: "/ctx-recomp",
+					text: COMPACTION_OFF_COMMAND_UNAVAILABLE,
+					level: "warning",
+				});
+				return;
+			}
 
 			const parsed = parseRecompArgs(args);
 			if (parsed.kind === "error") {
