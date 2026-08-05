@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 
 import { detectConfigFile, parseJsonc } from "../shared/jsonc-parser";
-import { migrateLegacyAgentEnabledInMemory } from "./agent-disable";
+import { isCompactionEnabled, migrateLegacyAgentEnabledInMemory } from "./agent-disable";
 import {
     cortexKitProjectConfigBasePath,
     cortexKitUserConfigBasePath,
@@ -565,6 +565,7 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
     const resolvedTransformMode = resolveTransformMode({
         configured: config.transform_mode,
         userTierHasSubc: hasUserTierSubcConfig(userLoaded?.config),
+        compactionEnabled: isCompactionEnabled(config),
     });
     config.transform_mode = resolvedTransformMode.mode;
     allWarnings.push(...resolvedTransformMode.warnings.map((warning) => `[config] ${warning}`));

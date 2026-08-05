@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { loadPluginConfig, loadPluginConfigDetailed } from "./index";
+import { RUST_COMPACTION_OFF_WARNING } from "./transform-mode";
 
 /**
  * Writes a magic-context.jsonc file inside a fresh temp XDG_CONFIG_HOME tree
@@ -107,6 +108,38 @@ function loadWithUserAndProjectConfig(
         }
     }
 }
+
+describe("loadPluginConfig — transform mode resolution", () => {
+    it("downgrades rust when compaction is off and emits one boot warning", () => {
+        const result = loadWithUserConfig(
+            JSON.stringify({
+                compaction: { enabled: false },
+                transform_mode: "rust",
+                subc: { connection_file: "/tmp/subc.sock" },
+            }),
+        );
+
+        expect(result.transform_mode).toBe("ts");
+        expect(result.configWarnings?.filter((warning) => warning.includes("rust"))).toEqual([
+            `[config] ${RUST_COMPACTION_OFF_WARNING}`,
+        ]);
+    });
+
+    it("keeps rust when compaction is on", () => {
+        const result = loadWithUserConfig(
+            JSON.stringify({
+                compaction: { enabled: true },
+                transform_mode: "rust",
+                subc: { connection_file: "/tmp/subc.sock" },
+            }),
+        );
+
+        expect(result.transform_mode).toBe("rust");
+        expect(result.configWarnings ?? []).not.toContain(
+            expect.stringContaining(RUST_COMPACTION_OFF_WARNING),
+        );
+    });
+});
 
 describe("loadPluginConfig — secret redaction", () => {
     it("reads an unmigrated legacy project config instead of falling to defaults", () => {

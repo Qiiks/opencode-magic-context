@@ -21,7 +21,8 @@ import { sessionLog } from "@magic-context/core/shared/logger";
 
 /** Exact refusal text shared by Pi's context-management commands. */
 export const COMPACTION_OFF_COMMAND_UNAVAILABLE =
-	"Unavailable: magic-context is in compaction-off mode (compaction.enabled=false).";
+	"Unavailable: magic-context is in compaction-off mode (compaction." +
+	"enabled=false).";
 
 /**
  * Pi has no OpenCode marker rows to delete. Its MC-owned compaction state is the
