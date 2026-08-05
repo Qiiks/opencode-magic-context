@@ -108,6 +108,7 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | `clear_reasoning_age` | `number` | `50` | Clear thinking/reasoning blocks older than N tags. |
 | `historian_timeout_ms` | `number` | `300000` | Timeout per historian call (ms). |
 | `history_budget_percentage` | `number` (0.05–0.5) | `0.15` | Fraction of usable context (`context_limit × execute_threshold`) reserved for the history block. Triggers compression when exceeded. |
+| `compaction.enabled` | `boolean` | `true` | When `false`, use compaction-off mode: keep Magic Context's knowledge layer and let native compaction (or nothing) own the context window. Boot-resolved; restart after changing it. See below. |
 | `commit_cluster_trigger` | `object` | See below | Controls the commit-cluster historian trigger. |
 | `system_prompt_injection` | `object` | See below | Controls whether and where Magic Context augments the system prompt; lets you opt specific agents out. |
 | `keep_subagents` | `boolean` | `false` | Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success, so their full transcript stays in the host session store for inspection. Kept sessions accumulate until cleared manually — leave `false` for normal use. |
@@ -289,6 +290,40 @@ Example — restricting historian to read-only tools and denying bash:
 ```
 
 ---
+
+## Compaction-off mode
+
+Set this in the user configuration when Magic Context should provide knowledge without managing the context window:
+
+```jsonc
+{
+  "compaction": {
+    "enabled": false
+  }
+}
+```
+
+The setting is resolved at process boot. Restart OpenCode or Pi after changing it. A project-tier `compaction.enabled` is stripped, so a cloned repository cannot disable the user's context management.
+
+### What stays on
+
+- Memory, docs, user-profile, and key-file injection stays additive through m[0]/m[1]. The messages transform remains registered so knowledge still reaches the model.
+- Raw-message FTS indexing, `ctx_search`, `ctx_expand`, `ctx_memory`, `ctx_note`, `/ctx-embed`, notes, and dreamer maintenance remain available. Historian-dependent dreamer tasks simply find no candidates.
+- Native OpenCode or Pi compaction is allowed to run. Magic Context does not enable native compaction. If native compaction is also disabled, boot and doctor report `no active compaction`; the sidebar uses `Context: <pct>% · native compaction` or `Context: <pct>% · no active compaction` and never renders MC's execute-threshold fill.
+
+### What stops
+
+Magic Context does not tag new messages or write tags, create or inject compartments, write its compaction markers, fold, prune, drop, strip, splice, apply pending drops, run heuristic or emergency reclaim, add synthetic context-management todos, add temporal markers, nudge, or block on a failed transform. `ctx_reduce` is unavailable; `ctx_expand` remains available. `/ctx-wrapup`, `/ctx-recomp`, `/ctx-flush`, and `/ctx-session-upgrade` refuse with `Unavailable: magic-context is in compaction-off mode (compaction.enabled=false).` and make no context-management changes; `/ctx-embed` remains functional. `fail_closed_blocking` is inert in this mode: a transform failure passes the input messages through without blocking or cancelling the request.
+
+Magic Context's `compaction.enabled` in `magic-context.jsonc` is not OpenCode's `compaction.auto` or `compaction.prune` in `opencode.jsonc`. These are different files and different owners. The coexistence guarantee covers OpenCode and Pi native compaction; DCP and OMO context-transforming hooks keep their existing conflict policy.
+
+### Transitions and long sessions
+
+Disabling the mode removes Magic Context's own marker boundary lazily when a session is next resumed. History hidden solely by Magic Context becomes visible; a surviving native boundary still hides older history. The first turn after disabling may trigger one native compaction cycle on long sessions. Magic Context does not pre-trim or otherwise mitigate that spike. An unresumed session is not swept in the background.
+
+When turning compaction back on, run `/ctx-wrapup` if the historian is runnable so Magic Context can catch up. If the historian is disabled, no `/ctx-wrapup` suggestion is emitted. Native compaction covers child sessions (verified against OpenCode v1.18.4): subagents receive additive memory/docs injection but no Magic Context reclaim in this mode. Keep subagent tasks small, or keep `compaction.enabled` on for projects that rely on long subagent runs. Raw content hidden by a native boundary before Magic Context's first pass is not retroactively indexed; later passes index new and observed raw messages.
+
+If `transform_mode: "rust"` is also configured, compaction-off mode resolves to the TypeScript transform and emits one frozen boot warning. There is no Rust reduced-mode contract in this cycle.
 
 ## `historian`
 

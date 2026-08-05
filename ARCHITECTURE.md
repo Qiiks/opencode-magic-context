@@ -148,21 +148,24 @@ Background maintenance (V2: per-task cron scheduling). A process-wide 15-min tim
 
 ## Session modes
 
-Two effective modes; the heavier features (historian, nudges, adjunct injection) are gated, while tag/drop plumbing stays on everywhere. The primary reduce surface is additionally gated by the session's actual `ctx_reduce` tool availability, so agents that deny the tool also lose `§N§` prefixes and reduce nudges.
+There are three effective runtime surfaces. Primary sessions and subagents use the normal context-management pipeline with different feature sets. Compaction-off mode keeps additive knowledge surfaces but removes Magic Context's context-window management. The primary reduce surface is additionally gated by the session's actual `ctx_reduce` tool availability.
 
-| Feature | Primary sessions | Subagents |
-|---|---|---|
-| Tag DB records | ✓ | ✓ |
-| `§N§` prefix injection + `ctx_reduce` tool | ✓ when `ctx_reduce` is available | ✓ when `ctx_reduce` is available |
-| Historian / compartments / decay / m[0]m[1] | ✓ | ✗ |
-| Channel 1 nudge | ✓ when `ctx_reduce` is available | ✓ when `ctx_reduce` is available |
-| Channel 2 nudge | ✓ when `ctx_reduce` is available | ✓ when `ctx_reduce` is available |
-| Synthetic-todowrite / auto-search | ✓ | ✗ |
-| Heuristic tool drops at execute | ✓ once/turn | ✓ every execute pass |
-| 85% force-materialize / 95% block | ✓ | ✗ (overflow path only) |
-| Caveman text compression | opt-in | ✗ |
+| Feature | Primary sessions | Subagents | Compaction-off |
+|---|---|---|---|
+| Tag DB records | ✓ | ✓ | Existing rows inert; no new rows |
+| `§N§` prefix injection + `ctx_reduce` tool | ✓ when `ctx_reduce` is available | ✓ when `ctx_reduce` is available | ✗ |
+| Historian / compartments / decay / m[0]/m[1] | ✓ | ✗ | Additive m[0]/m[1] only; no history |
+| `ctx_expand` knowledge tool | ✓ | ✓ | ✓ |
+| Channel 1 nudge | ✓ when `ctx_reduce` is available | ✓ when `ctx_reduce` is available | ✗ |
+| Channel 2 nudge | ✓ when `ctx_reduce` is available | ✓ when `ctx_reduce` is available | ✗ |
+| Synthetic-todowrite / auto-search | ✓ | ✗ | Auto-search ✓; synthetic todo ✗ |
+| Heuristic tool drops at execute | ✓ once/turn | ✓ every execute pass | ✗ |
+| 85% force-materialize / 95% block | ✓ | ✗ (overflow path only) | ✗; fail-closed blocking is inert |
+| Caveman text compression | opt-in | ✗ | ✗ |
 
-Subagents run heuristic drops on every execute pass (no once-per-turn guard) because a long subagent run is effectively one parent turn and would otherwise starve; they have no provider-cache reuse to protect.
+Subagents run heuristic drops on every execute pass (no once-per-turn guard) because a long subagent run is effectively one parent turn and would otherwise starve; they have no provider-cache reuse to protect. In compaction-off mode, native compaction covers child sessions (verified against OpenCode v1.18.4), so subagents receive additive memory/docs injection but no Magic Context reclaim.
+
+Compaction-off mode is boot-resolved from the user-level `compaction.enabled` setting and requires a restart. OpenCode's `compaction.auto` / `compaction.prune` are separate native settings in `opencode.jsonc`, not aliases for Magic Context's `compaction.enabled` in `magic-context.jsonc`. Disabling MC can expose history hidden solely by MC; the first turn after disabling may trigger one native compaction cycle on a long session. Marker cleanup is lazy per session. When turning the mode back on, `/ctx-wrapup` is the suggested catch-up path only when the historian is runnable.
 
 ## Error handling
 
