@@ -38,13 +38,55 @@ export interface ConflictResult {
         omoContextWindowMonitor: boolean;
         omoAnthropicRecovery: boolean;
     };
+    /**
+     * Resolved native compaction state observed during detection, for honest
+     * reporting in both MC modes. `auto`/`prune` reflect the OpenCode
+     * `compaction` block as resolved by the detector (env override, project
+     * then user, default-on). They are populated even when MC compaction is
+     * OFF (in which case they are NOT flagged as conflicts).
+     */
+    nativeCompaction: {
+        auto: boolean;
+        prune: boolean;
+    };
+}
+
+/**
+ * Options for {@link detectConflicts}.
+ *
+ * `compactionEnabled` is the boot-resolved Magic Context compaction mode
+ * (the result of {@link isCompactionEnabled} on the resolved user-tier
+ * config). It MUST be threaded through every production call site — plugin
+ * boot, setup, doctor, conflict-fixer — so the MC-mode decision is never
+ * re-derived at a call site. A call site that genuinely cannot supply it
+ * (e.g. a low-level native-config reader with no MC config handle) MUST
+ * omit it and accept the default `true` (mode-on) behavior, which preserves
+ * today's conflict semantics; it must never silently skip the check.
+ *
+ * When `compactionEnabled` is `false` (compaction-off mode), OpenCode
+ * `compaction.auto=true` / `compaction.prune=true` are NOT plugin-disabling
+ * conflicts — native compaction is the user's chosen window manager. DCP
+ * and the three OMO conflict classes keep their existing policy in BOTH
+ * modes.
+ */
+export interface DetectConflictsOptions {
+    compactionEnabled?: boolean;
 }
 
 /**
  * Detect all conflicts that would prevent magic-context from working correctly.
  * Checks: OpenCode compaction, DCP plugin, OMO conflicting hooks.
+ *
+ * `compactionEnabled` (default `true`) is the resolved MC compaction mode.
+ * When `false` (compaction-off mode), native `compaction.auto`/`prune` are
+ * reported in {@link ConflictResult.nativeCompaction} but are NOT flagged as
+ * conflicts — native compaction is the intended window manager in that mode.
  */
-export function detectConflicts(directory: string): ConflictResult {
+export function detectConflicts(
+    directory: string,
+    options?: DetectConflictsOptions,
+): ConflictResult {
+    const compactionEnabled = options?.compactionEnabled ?? true;
     const conflicts: ConflictResult["conflicts"] = {
         compactionAuto: false,
         compactionPrune: false,
@@ -57,11 +99,15 @@ export function detectConflicts(directory: string): ConflictResult {
 
     // --- Check OpenCode compaction config ---
     const compactionResult = checkCompaction(directory);
-    if (compactionResult.auto) {
+    // Native compaction is a conflict ONLY when MC compaction is ON. In
+    // compaction-off mode the user has explicitly handed the window to native
+    // compaction (or nothing), so compaction.auto=true / prune=true are the
+    // intended state, not a plugin-disabling conflict.
+    if (compactionEnabled && compactionResult.auto) {
         conflicts.compactionAuto = true;
         reasons.push("OpenCode auto-compaction is enabled (compaction.auto=true)");
     }
-    if (compactionResult.prune) {
+    if (compactionEnabled && compactionResult.prune) {
         conflicts.compactionPrune = true;
         reasons.push("OpenCode prune is enabled (compaction.prune=true)");
     }
@@ -100,6 +146,7 @@ export function detectConflicts(directory: string): ConflictResult {
         hasConflict: reasons.length > 0,
         reasons,
         conflicts,
+        nativeCompaction: { auto: compactionResult.auto, prune: compactionResult.prune },
     };
 }
 

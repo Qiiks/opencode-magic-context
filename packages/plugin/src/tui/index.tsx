@@ -7,6 +7,8 @@ import packageJson from "../../package.json"
 import { closeRpc, dismissUpgradeReminder, getAnnouncement, getCompartmentCount, getRpcGeneration, initRpcClient, loadEmbedDetail, loadStatusDetail, loadToastDurationMs, markAnnounced, requestRecomp, requestUpgrade, type EmbedDetail, type StatusDetail } from "./data/context-db"
 import { startNotificationSocket, stopNotificationSocket, type SocketNotification } from "./data/notification-socket"
 import { formatThresholdPercent } from "../shared/format-threshold"
+import { isCompactionEnabled } from "../config/agent-disable"
+import { loadPluginConfig } from "../config"
 import { detectConflicts } from "../shared/conflict-detector"
 import { fixConflicts } from "../shared/conflict-fixer"
 
@@ -945,7 +947,21 @@ const tui: TuiPlugin = async (api, _options, meta) => {
     const directory = api.state.path.directory ?? ""
     // A conflicted installation intentionally has no server. Gate before RPC
     // discovery or socket startup so disabled installs perform no idle work.
-    const conflictResult = detectConflicts(directory)
+    // The resolved MC compaction mode is threaded in explicitly via the same
+    // loader + accessor the plugin boot uses, so the TUI never re-derives the
+    // compaction decision from directory alone. On config load failure the
+    // accessor resolves default-on (mode-on), preserving today's conflict
+    // gate rather than silently skipping the check.
+    let pluginConfig: ReturnType<typeof loadPluginConfig> | undefined
+    try {
+        pluginConfig = loadPluginConfig(directory)
+    } catch {
+        // Config load failure: fail toward mode-on (today's behavior) by
+        // leaving pluginConfig undefined so isCompactionEnabled defaults true.
+    }
+    const conflictResult = detectConflicts(directory, {
+        compactionEnabled: isCompactionEnabled(pluginConfig ?? {}),
+    })
     if (conflictResult.hasConflict) {
         showConflictDialog(api, directory, conflictResult.reasons, conflictResult.conflicts)
         return

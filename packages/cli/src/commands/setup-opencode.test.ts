@@ -103,3 +103,68 @@ describe("setup-opencode DCP preflight", () => {
         expect(findDcpPluginIndexes(plugins)).toEqual([2]);
     });
 });
+
+// --- Compaction-off mode writer (issue #266 S2) ---
+// In compaction-off mode the setup writer MUST NOT write
+// compaction.auto=false / compaction.prune=false into opencode.jsonc —
+// native compaction (or nothing) is the user's chosen window manager, so
+// pre-existing native compaction fields are left byte-for-byte as found.
+describe("setup-opencode compaction-off writer (issue #266)", () => {
+    it("skips the compaction.auto=false write when compactionEnabled=false", () => {
+        const root = tempDir();
+        const configPath = join(root, "opencode.jsonc");
+        writeFileSync(configPath, JSON.stringify({ compaction: { auto: true, prune: true } }));
+
+        addPluginToOpenCodeConfig(configPath, "jsonc", false, false);
+
+        const merged = parseJsonc(readFileSync(configPath, "utf-8")) as {
+            compaction?: { auto?: boolean; prune?: boolean };
+        };
+        // Pre-existing native compaction values preserved byte-for-byte.
+        expect(merged.compaction).toEqual({ auto: true, prune: true });
+    });
+
+    it("writes compaction.auto=false when compactionEnabled=true (default mode-on)", () => {
+        const root = tempDir();
+        const configPath = join(root, "opencode.jsonc");
+        writeFileSync(configPath, JSON.stringify({ compaction: { auto: true, prune: true } }));
+
+        addPluginToOpenCodeConfig(configPath, "jsonc", false, true);
+
+        const merged = parseJsonc(readFileSync(configPath, "utf-8")) as {
+            compaction?: { auto?: boolean; prune?: boolean };
+        };
+        expect(merged.compaction).toEqual({ auto: false, prune: false });
+    });
+
+    it("does not create a compaction block when compactionEnabled=false and none exists", () => {
+        const root = tempDir();
+        const configPath = join(root, "opencode.jsonc");
+        addPluginToOpenCodeConfig(configPath, "jsonc", false, false);
+
+        const merged = parseJsonc(readFileSync(configPath, "utf-8")) as {
+            compaction?: unknown;
+        };
+        expect(merged.compaction).toBeUndefined();
+    });
+
+    // Mutation direction: with mode ON, the write DOES happen. Proves the
+    // off-gate isn't just always-skip.
+    it("mutation direction: same config gets auto=false when mode forced on", () => {
+        const root = tempDir();
+        const configPath = join(root, "opencode.jsonc");
+        writeFileSync(configPath, JSON.stringify({ compaction: { auto: true } }));
+
+        addPluginToOpenCodeConfig(configPath, "jsonc", false, false);
+        const afterOff = parseJsonc(readFileSync(configPath, "utf-8")) as {
+            compaction?: { auto?: boolean };
+        };
+        expect(afterOff.compaction?.auto).toBe(true);
+
+        addPluginToOpenCodeConfig(configPath, "jsonc", false, true);
+        const afterOn = parseJsonc(readFileSync(configPath, "utf-8")) as {
+            compaction?: { auto?: boolean };
+        };
+        expect(afterOn.compaction?.auto).toBe(false);
+    });
+});

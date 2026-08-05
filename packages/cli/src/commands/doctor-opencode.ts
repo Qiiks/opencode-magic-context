@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadPluginConfig } from "@magic-context/core/config";
+import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import {
     type EmbeddingProbeOutcome,
@@ -57,6 +58,31 @@ import { reportAuthorityMarkers } from "./doctor-authority";
 import { clearPluginCache } from "./doctor-opencode-cache";
 
 const CLI_PACKAGE_NAME = "@cortexkit/magic-context";
+
+/**
+ * Resolve the MC compaction mode for the doctor using the SAME loader the
+ * plugin uses and the SAME accessor. On load failure the helper takes the
+ * preserve-existing-native-fields branch: it returns `false` so doctor never
+ * repairs native compaction fields when it cannot read the MC config, and
+ * emits a diagnostic. This is distinct from the boot/TUI path, which fails
+ * toward mode-on when it cannot supply the resolved value.
+ */
+function resolveCompactionEnabledForDoctor(): boolean {
+    try {
+        const config = loadPluginConfig(process.cwd());
+        return isCompactionEnabled(config);
+    } catch (error) {
+        // Preserve-existing-native-fields: do not assume either mode. Doctor
+        // reports the load failure and treats native compaction fields as
+        // off-limits for repair (same as compaction-off mode).
+        console.warn(
+            `[magic-context] Could not load Magic Context config to resolve compaction mode; ` +
+                `preserving existing native compaction fields. ` +
+                `(${error instanceof Error ? error.message : String(error)})`,
+        );
+        return false;
+    }
+}
 
 export interface DoctorMigrationLogSink {
     success(message: string): void;
@@ -1065,15 +1091,23 @@ export async function runDoctor(
     }
 
     // 5. Check for conflicts
+    // The resolved MC compaction mode is threaded in explicitly via the same
+    // loader + accessor the plugin boot uses. On load failure the helper takes
+    // the preserve-existing-native-fields branch (returns false) and emits a
+    // diagnostic, so doctor never assumes either mode.
     const cwd = process.cwd();
-    const conflictResult = detectConflicts(cwd);
+    const compactionEnabled = resolveCompactionEnabledForDoctor();
+    const conflictResult = detectConflicts(cwd, { compactionEnabled });
 
     if (conflictResult.hasConflict) {
         for (const reason of conflictResult.reasons) {
             fail(`Conflict: ${reason}`);
         }
-        // Auto-fix conflicts
-        const actions = fixConflicts(cwd, conflictResult.conflicts);
+        // Auto-fix conflicts. In compaction-off mode the fixer skips native
+        // compaction fields (compaction.auto/prune) — it may report, never
+        // repair, native compaction fields in that mode. DCP and OMO hook
+        // fixes keep their existing policy in BOTH modes.
+        const actions = fixConflicts(cwd, conflictResult.conflicts, { compactionEnabled });
         for (const action of actions) {
             pass(`Fixed: ${action}`);
             fixed++;
@@ -1082,7 +1116,23 @@ export async function runDoctor(
             warn("Restart OpenCode for conflict fixes to take effect");
         }
     } else {
-        pass("No conflicts detected (compaction, DCP, OMO hooks)");
+        // Honest compaction state label in both modes. When MC compaction is
+        // OFF, native compaction.auto=true is the intended state (native
+        // compaction active), not a conflict; when auto=false as well, nothing
+        // manages the window (no-manager configuration) — report it plainly.
+        if (!compactionEnabled) {
+            if (conflictResult.nativeCompaction.auto || conflictResult.nativeCompaction.prune) {
+                pass(
+                    "No conflicts detected (compaction, DCP, OMO hooks) — native compaction active (compaction-off mode)",
+                );
+            } else {
+                warn(
+                    "No compaction manager is active: Magic Context compaction is off and OpenCode auto-compaction is disabled",
+                );
+            }
+        } else {
+            pass("No conflicts detected (compaction, DCP, OMO hooks)");
+        }
     }
 
     // 6. Check tui.json

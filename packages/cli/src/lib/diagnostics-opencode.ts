@@ -11,7 +11,8 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
-
+import { loadPluginConfig } from "@magic-context/core/config";
+import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
 import { parseCompartmentOutput } from "@magic-context/core/hooks/magic-context/compartment-parser";
 import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import { getProjectMagicContextHistorianDir } from "@magic-context/core/shared/data-path";
@@ -64,6 +65,13 @@ export interface DiagnosticReport {
     conflicts: {
         hasConflict: boolean;
         reasons: string[];
+        /** Resolved MC compaction mode used by the writer/fixer. */
+        compactionEnabled: boolean;
+        /** Resolved native OpenCode compaction state (auto/prune). */
+        nativeCompaction: {
+            auto: boolean;
+            prune: boolean;
+        };
     };
     logFile: {
         path: string;
@@ -730,7 +738,21 @@ export async function collectDiagnostics(): Promise<DiagnosticReport> {
     const logPath = getMagicContextLogPath("opencode");
     const logFileSize = existsSync(logPath) ? statSync(logPath).size : 0;
 
-    const conflictResult = detectConflicts(process.cwd());
+    // Resolve the MC compaction mode via the same loader + accessor the
+    // plugin uses, so diagnostics never re-derives the compaction decision.
+    // On load failure take the preserve-existing-native-fields branch (false)
+    // and emit a diagnostic, never assuming either mode.
+    let compactionEnabled = false;
+    try {
+        compactionEnabled = isCompactionEnabled(loadPluginConfig(process.cwd()));
+    } catch (error) {
+        console.warn(
+            `[magic-context] Could not load Magic Context config to resolve compaction mode; ` +
+                `preserving existing native compaction fields. ` +
+                `(${error instanceof Error ? error.message : String(error)})`,
+        );
+    }
+    const conflictResult = detectConflicts(process.cwd(), { compactionEnabled });
     const recentSessions = await collectRecentSessions();
     const opencodeInstallations = describeOpenCodeInstallations(detectOpenCodeInstallations());
     const activeInstallation = opencodeInstallations[0];
@@ -767,6 +789,8 @@ export async function collectDiagnostics(): Promise<DiagnosticReport> {
         conflicts: {
             hasConflict: conflictResult.hasConflict,
             reasons: conflictResult.reasons,
+            compactionEnabled,
+            nativeCompaction: conflictResult.nativeCompaction,
         },
         logFile: {
             path: logPath,
@@ -859,6 +883,8 @@ export function renderDiagnosticsMarkdown(report: DiagnosticReport): string {
         `- Plugin registered in tui config: ${report.tuiConfigHasPlugin}`,
         `- magic-context.jsonc parse error: ${report.magicContextConfig.parseError ?? "none"}`,
         `- Conflicts detected: ${report.conflicts.hasConflict ? report.conflicts.reasons.join("; ") : "none"}`,
+        `- MC compaction mode: ${report.conflicts.compactionEnabled ? "on" : "off"}`,
+        `- Native compaction: auto=${report.conflicts.nativeCompaction?.auto ?? "unknown"}, prune=${report.conflicts.nativeCompaction?.prune ?? "unknown"}`,
         ...openCodeInstallationTable,
         "",
         "### Config paths",

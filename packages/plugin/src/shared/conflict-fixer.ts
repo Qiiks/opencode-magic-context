@@ -152,13 +152,43 @@ function filterDcpPluginEntries(entries: unknown[]): { plugins: unknown[]; remov
     return { plugins, removed: plugins.length !== entries.length };
 }
 
-export function fixConflicts(directory: string, conflicts: ConflictResult["conflicts"]): string[] {
+/**
+ * Options for {@link fixConflicts}.
+ *
+ * `compactionEnabled` is the boot-resolved MC compaction mode (the result of
+ * {@link isCompactionEnabled} on the resolved user-tier config). When `false`
+ * (compaction-off mode), the fixer MUST NOT flip `compaction.auto`/`prune` to
+ * `false` — native compaction fields are left byte-for-byte as found, because
+ * native compaction (or nothing) is the user's chosen window manager. DCP and
+ * OMO hook fixes keep their existing policy in BOTH modes.
+ *
+ * Default `true` (mode-on) preserves today's fix behavior for call sites that
+ * cannot supply the resolved mode; they fail toward mode-on, never silently
+ * skipping the fix.
+ */
+export interface FixConflictsOptions {
+    compactionEnabled?: boolean;
+}
+
+export function fixConflicts(
+    directory: string,
+    conflicts: ConflictResult["conflicts"],
+    options?: FixConflictsOptions,
+): string[] {
+    const compactionEnabled = options?.compactionEnabled ?? true;
     const actions: string[] = [];
     let updatedCompaction = false;
     let removedDcpPlugin = false;
     let disabledOmoHooks = false;
 
-    if (conflicts.compactionAuto || conflicts.compactionPrune || conflicts.dcpPlugin) {
+    // Native compaction fields are repaired ONLY when MC compaction is ON. In
+    // compaction-off mode the fixer must not rewrite compaction.auto/prune —
+    // native compaction is the intended manager and pre-existing values are
+    // left byte-for-byte as found.
+    const repairCompaction =
+        compactionEnabled && (conflicts.compactionAuto || conflicts.compactionPrune);
+
+    if (repairCompaction || conflicts.dcpPlugin) {
         for (const configPath of collectOpenCodeConfigPaths(directory)) {
             const config = readConfig(configPath);
             if (!config) {
@@ -167,7 +197,7 @@ export function fixConflicts(directory: string, conflicts: ConflictResult["confl
 
             let changed = false;
 
-            if (conflicts.compactionAuto || conflicts.compactionPrune) {
+            if (repairCompaction) {
                 const compaction = isRecord(config.compaction) ? config.compaction : {};
 
                 if (compaction.auto !== false) {
@@ -225,9 +255,7 @@ export function fixConflicts(directory: string, conflicts: ConflictResult["confl
             }
 
             // Unified paths nest hooks under the [opencode] block; legacy paths use top-level
-            const target = isUnifiedOmoPath(configPath)
-                ? getOrCreateOmoV2Block(config)
-                : config;
+            const target = isUnifiedOmoPath(configPath) ? getOrCreateOmoV2Block(config) : config;
 
             const disabledHooks = new Set(asStringArray(target.disabled_hooks));
             let changed = false;

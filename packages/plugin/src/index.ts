@@ -6,7 +6,7 @@ import {
 } from "./agents/hidden-agent-registrations";
 import { withContentLanguageDirective } from "./agents/language-directive";
 import { loadPluginConfig } from "./config";
-import { isDreamerRunnable } from "./config/agent-disable";
+import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
@@ -142,10 +142,16 @@ const server: Plugin = async (ctx) => {
         }, 3000);
     }
 
-    // Detect conflicts that prevent magic-context from operating correctly
+    // Detect conflicts that prevent magic-context from operating correctly.
+    // The resolved MC compaction mode is threaded in explicitly — the detector
+    // never re-derives it from the config path. In compaction-off mode,
+    // native compaction.auto=true is NOT a conflict (native compaction is the
+    // user's chosen window manager), so the plugin stays enabled.
     let conflictResult: ConflictResult | null = null;
     if (pluginConfig.enabled) {
-        conflictResult = detectConflicts(ctx.directory);
+        conflictResult = detectConflicts(ctx.directory, {
+            compactionEnabled: isCompactionEnabled(pluginConfig),
+        });
         if (conflictResult.hasConflict) {
             pluginConfig.enabled = false;
             log(`[magic-context] disabled due to conflicts: ${conflictResult.reasons.join("; ")}`);

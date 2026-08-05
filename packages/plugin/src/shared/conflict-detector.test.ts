@@ -371,4 +371,125 @@ describe("detectConflicts", () => {
             expect(result.hasConflict).toBe(false);
         });
     });
+
+    // --- Compaction-off mode matrix (issue #266 S2) ---
+    // The detector must NOT flag OpenCode compaction.auto=true / prune=true as
+    // a plugin-disabling conflict when MC compaction is OFF (compaction-off
+    // mode), or compaction-off users get a DISABLED plugin — the exact inverse
+    // of intent. With MC compaction ON, today's conflict behavior is unchanged.
+    //
+    // The 2x2 matrix: MC mode (on/off) x native compaction.auto (true/false).
+    // Each case asserts BOTH the conflict verdict AND the plugin-enabled
+    // outcome (the boot path disables the plugin when hasConflict).
+    describe("compaction-off mode matrix (issue #266)", () => {
+        // The suite beforeEach sets OPENCODE_DISABLE_AUTOCOMPACT=1 to isolate
+        // plugin detection from compaction detection. These matrix tests
+        // exercise compaction detection directly, so they clear that env var
+        // and write an explicit compaction block to control the native state.
+        function writeCompactionConfig(auto: boolean, prune = false): void {
+            const prev = process.env.OPENCODE_DISABLE_AUTOCOMPACT;
+            delete process.env.OPENCODE_DISABLE_AUTOCOMPACT;
+            writeFileSync(
+                join(projectDir, "opencode.json"),
+                JSON.stringify({ compaction: { auto, prune } }),
+            );
+            if (prev !== undefined) process.env.OPENCODE_DISABLE_AUTOCOMPACT = prev;
+        }
+
+        function detectWithMode(compactionEnabled: boolean) {
+            const prev = process.env.OPENCODE_DISABLE_AUTOCOMPACT;
+            delete process.env.OPENCODE_DISABLE_AUTOCOMPACT;
+            try {
+                return detectConflicts(projectDir, { compactionEnabled });
+            } finally {
+                if (prev !== undefined) process.env.OPENCODE_DISABLE_AUTOCOMPACT = prev;
+            }
+        }
+
+        it("MC ON + auto=true → conflict fires, plugin would be disabled", () => {
+            writeCompactionConfig(true);
+            const result = detectWithMode(true);
+            expect(result.hasConflict).toBe(true);
+            expect(result.conflicts.compactionAuto).toBe(true);
+        });
+
+        it("MC ON + auto=false → no compaction conflict, plugin stays enabled", () => {
+            writeCompactionConfig(false);
+            const result = detectWithMode(true);
+            expect(result.conflicts.compactionAuto).toBe(false);
+            expect(result.hasConflict).toBe(false);
+        });
+
+        it("MC OFF + auto=true → NO conflict, plugin stays enabled (native compaction active)", () => {
+            writeCompactionConfig(true);
+            const result = detectWithMode(false);
+            expect(result.conflicts.compactionAuto).toBe(false);
+            expect(result.conflicts.compactionPrune).toBe(false);
+            expect(result.hasConflict).toBe(false);
+            // Native compaction state is still reported honestly.
+            expect(result.nativeCompaction.auto).toBe(true);
+        });
+
+        it("MC OFF + auto=false → NO conflict, no-manager configuration reported honestly", () => {
+            writeCompactionConfig(false);
+            const result = detectWithMode(false);
+            expect(result.conflicts.compactionAuto).toBe(false);
+            expect(result.hasConflict).toBe(false);
+            // No-manager: neither MC nor native compaction owns the window.
+            expect(result.nativeCompaction.auto).toBe(false);
+            expect(result.nativeCompaction.prune).toBe(false);
+        });
+
+        // Mutation direction: force mode-on in the detector with auto=true →
+        // conflict fires. This proves the off-gate isn't just always-pass —
+        // the same native config that was NOT a conflict in the off case
+        // becomes a conflict when the mode is forced on.
+        it("mutation direction: same auto=true config DOES conflict when mode forced on", () => {
+            writeCompactionConfig(true);
+            const offResult = detectWithMode(false);
+            const onResult = detectWithMode(true);
+            expect(offResult.hasConflict).toBe(false);
+            expect(onResult.hasConflict).toBe(true);
+            expect(onResult.conflicts.compactionAuto).toBe(true);
+        });
+
+        // prune=true follows the same gate as auto=true.
+        it("MC OFF + prune=true → NO conflict (prune is not a conflict in compaction-off mode)", () => {
+            writeCompactionConfig(false, true);
+            const result = detectWithMode(false);
+            expect(result.conflicts.compactionPrune).toBe(false);
+            expect(result.hasConflict).toBe(false);
+            expect(result.nativeCompaction.prune).toBe(true);
+        });
+
+        // DCP and OMO conflicts keep their existing policy in BOTH modes.
+        it("MC OFF + DCP plugin → DCP conflict still fires (compaction-off does not broaden compatibility)", () => {
+            writeProjectConfig(["@tarquinen/opencode-dcp"]);
+            const result = detectWithMode(false);
+            expect(result.conflicts.dcpPlugin).toBe(true);
+            expect(result.hasConflict).toBe(true);
+        });
+
+        it("MC OFF + OMO hooks → OMO conflicts still fire in both modes", () => {
+            writeProjectConfig(["oh-my-opencode"]);
+            const result = detectWithMode(false);
+            expect(result.conflicts.omoPreemptiveCompaction).toBe(true);
+            expect(result.hasConflict).toBe(true);
+        });
+
+        // Default (no options) preserves today's mode-on behavior — a call
+        // site that cannot supply the resolved mode fails toward mode-on.
+        it("default (no options) treats compaction.auto=true as a conflict (fail toward mode-on)", () => {
+            writeCompactionConfig(true);
+            const prev = process.env.OPENCODE_DISABLE_AUTOCOMPACT;
+            delete process.env.OPENCODE_DISABLE_AUTOCOMPACT;
+            try {
+                const result = detectConflicts(projectDir);
+                expect(result.conflicts.compactionAuto).toBe(true);
+                expect(result.hasConflict).toBe(true);
+            } finally {
+                if (prev !== undefined) process.env.OPENCODE_DISABLE_AUTOCOMPACT = prev;
+            }
+        });
+    });
 });

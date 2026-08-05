@@ -370,7 +370,12 @@ describe("bundleIssueReport secret redaction", () => {
                 },
                 pluginCache: { path: join(root, "cache") },
                 storageDir: { path: join(root, "storage"), exists: true, contextDbSizeBytes: 0 },
-                conflicts: { hasConflict: false, reasons: [] },
+                conflicts: {
+                    hasConflict: false,
+                    reasons: [],
+                    compactionEnabled: true,
+                    nativeCompaction: { auto: false, prune: false },
+                },
                 logFile: { path: join(root, "missing.log"), exists: false, sizeKb: 0 },
                 recentSessions: [],
                 historianDumps: {
@@ -455,7 +460,12 @@ describe("bundleIssueReport secret redaction", () => {
                 },
                 pluginCache: { path: join(root, "cache") },
                 storageDir: { path: join(root, "storage"), exists: true, contextDbSizeBytes: 0 },
-                conflicts: { hasConflict: false, reasons: [] },
+                conflicts: {
+                    hasConflict: false,
+                    reasons: [],
+                    compactionEnabled: true,
+                    nativeCompaction: { auto: false, prune: false },
+                },
                 logFile: { path: join(root, "missing.log"), exists: false, sizeKb: 0 },
                 recentSessions: [
                     {

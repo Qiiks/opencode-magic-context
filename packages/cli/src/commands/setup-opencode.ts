@@ -1,5 +1,7 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { basename, dirname } from "node:path";
+import { loadPluginConfig } from "@magic-context/core/config";
+import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
 import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import { fixConflicts } from "@magic-context/core/shared/conflict-fixer";
 import { stringify as stringifyJsonc } from "comment-json";
@@ -27,6 +29,28 @@ import { confirm, intro, log, note, outro, promptIO, spinner } from "../lib/prom
 
 const DCP_PLUGIN_NAME = "@tarquinen/opencode-dcp";
 
+/**
+ * Resolve the MC compaction mode for CLI writers (setup/doctor/fixer) using
+ * the SAME loader the plugin uses and the SAME accessor. On load failure the
+ * writer takes the preserve-existing-native-fields branch: it returns `false`
+ * so the writer/fixer skip any native compaction write/flip (never assuming
+ * either mode) and emits a diagnostic. This is distinct from the boot/TUI
+ * path, which fails toward mode-on when it cannot supply the resolved value.
+ */
+function resolveCompactionEnabledForWriter(): boolean {
+    try {
+        const config = loadPluginConfig(process.cwd());
+        return isCompactionEnabled(config);
+    } catch (error) {
+        log.warn(
+            `Could not load Magic Context config to resolve compaction mode; ` +
+                `preserving existing native compaction fields. ` +
+                `(${error instanceof Error ? error.message : String(error)})`,
+        );
+        return false;
+    }
+}
+
 // ─── Helpers ──────────────────────────────────────────────
 
 function ensureDir(dir: string): void {
@@ -41,6 +65,15 @@ export function addPluginToOpenCodeConfig(
     configPath: string,
     _format: "json" | "jsonc" | "none",
     removeDcp = false,
+    /**
+     * The resolved MC compaction mode. When `false` (compaction-off mode), the
+     * writer MUST NOT write `compaction.auto=false` / `compaction.prune=false`
+     * into opencode.jsonc — native compaction (or nothing) is the user's chosen
+     * window manager, so pre-existing native compaction fields are left
+     * byte-for-byte as found. Default `true` (mode-on) preserves today's write
+     * behavior for call sites that cannot supply the resolved mode.
+     */
+    compactionEnabled = true,
 ): void {
     // The detection result predates interactive prompts. Re-read at commit time so
     // a config created while the wizard was open is merged instead of overwritten.
@@ -81,11 +114,17 @@ export function addPluginToOpenCodeConfig(
     }
     existing.plugin = rawPlugins;
 
-    // Set compaction fields without replacing other compaction settings
-    const compaction = (existing.compaction as Record<string, unknown>) ?? {};
-    compaction.auto = false;
-    compaction.prune = false;
-    existing.compaction = compaction;
+    // Set compaction fields without replacing other compaction settings.
+    // In compaction-off mode this write is SKIPPED: native compaction is the
+    // user's chosen window manager (or nothing is), so MC must not force
+    // `compaction.auto=false` / `prune=false` onto the native config. Pre-existing
+    // native compaction values are left byte-for-byte as found.
+    if (compactionEnabled) {
+        const compaction = (existing.compaction as Record<string, unknown>) ?? {};
+        compaction.auto = false;
+        compaction.prune = false;
+        existing.compaction = compaction;
+    }
 
     writeFileAtomic(configPath, `${stringifyJsonc(existing, null, 2)}\n`);
 }
@@ -317,17 +356,28 @@ export async function runSetup(dryRun = false): Promise<number> {
         ? false
         : await resolveDcpConflictBeforeSetup(paths.opencodeConfig, paths.opencodeConfigFormat);
 
+    // Resolve the MC compaction mode once for all writer/fixer/summary calls.
+    // CLI writers load user-tier config through the same loader the plugin uses
+    // and read through the same accessor; on load failure the helper takes the
+    // preserve-existing-native-fields branch (returns false) and emits a
+    // diagnostic, never assuming either mode.
+    const compactionEnabled = resolveCompactionEnabledForWriter();
+
     // Collect every interactive choice before applying setup writes. A cancelled
     // wizard can then unwind without leaving only some target files updated.
     if (dryRun) {
         log.message(
-            `[dry-run] would add the plugin to ${paths.opencodeConfig} and disable compaction`,
+            compactionEnabled
+                ? `[dry-run] would add the plugin to ${paths.opencodeConfig} and disable compaction`
+                : `[dry-run] would add the plugin to ${paths.opencodeConfig} (compaction-off mode — native compaction fields left untouched)`,
         );
     }
 
     let conflictFix: Parameters<typeof fixConflicts>[1] | null = null;
     if (hadExistingSetup) {
-        const conflicts = detectConflicts(process.cwd());
+        const conflicts = detectConflicts(process.cwd(), {
+            compactionEnabled,
+        });
         if (conflicts.hasConflict) {
             log.warn("Found conflicting configuration that can disable Magic Context:");
             for (const reason of conflicts.reasons) {
@@ -428,16 +478,27 @@ export async function runSetup(dryRun = false): Promise<number> {
     }
 
     if (!dryRun) {
-        addPluginToOpenCodeConfig(paths.opencodeConfig, paths.opencodeConfigFormat, removeDcp);
+        addPluginToOpenCodeConfig(
+            paths.opencodeConfig,
+            paths.opencodeConfigFormat,
+            removeDcp,
+            compactionEnabled,
+        );
         log.success(`Plugin added to ${paths.opencodeConfig}`);
         if (removeDcp) log.success("Removed opencode-dcp from plugin list");
-        log.info("Disabled built-in compaction (auto=false, prune=false)");
-        log.message(
-            "Magic Context handles context management — built-in compaction would interfere",
-        );
+        if (compactionEnabled) {
+            log.info("Disabled built-in compaction (auto=false, prune=false)");
+            log.message(
+                "Magic Context handles context management — built-in compaction would interfere",
+            );
+        } else {
+            log.info("Compaction-off mode active — leaving native compaction config untouched");
+        }
 
         if (conflictFix) {
-            const actions = fixConflicts(process.cwd(), conflictFix);
+            const actions = fixConflicts(process.cwd(), conflictFix, {
+                compactionEnabled,
+            });
             if (actions.length > 0) {
                 for (const action of actions) log.success(action);
             } else {
@@ -459,14 +520,20 @@ export async function runSetup(dryRun = false): Promise<number> {
         log.success(`TUI sidebar plugin added to ${basename(paths.tuiConfig)}`);
 
         if (disableOmoHooks) {
-            const actions = fixConflicts(process.cwd(), {
-                compactionAuto: false,
-                compactionPrune: false,
-                dcpPlugin: false,
-                omoPreemptiveCompaction: true,
-                omoContextWindowMonitor: true,
-                omoAnthropicRecovery: true,
-            });
+            const actions = fixConflicts(
+                process.cwd(),
+                {
+                    compactionAuto: false,
+                    compactionPrune: false,
+                    dcpPlugin: false,
+                    omoPreemptiveCompaction: true,
+                    omoContextWindowMonitor: true,
+                    omoAnthropicRecovery: true,
+                },
+                {
+                    compactionEnabled,
+                },
+            );
             if (actions.includes("Disabled conflicting oh-my-opencode hooks")) {
                 log.success("Hooks disabled in oh-my-opencode config");
             }
@@ -476,7 +543,9 @@ export async function runSetup(dryRun = false): Promise<number> {
     // ─── Summary ────────────────────────────────────────
     const summary = [
         `Plugin: ${PLUGIN_NAME}`,
-        "Compaction: disabled",
+        compactionEnabled
+            ? "Compaction: disabled (Magic Context manages the window)"
+            : "Compaction: off (native compaction owns the window)",
         historianModel ? `Historian: ${historianModel}` : "Historian: fallback chain",
         dreamerEnabled
             ? `Dreamer: enabled${dreamerModel ? ` (${dreamerModel})` : ""}`
