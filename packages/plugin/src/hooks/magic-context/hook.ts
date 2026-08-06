@@ -50,6 +50,7 @@ import {
     openDatabase,
 } from "../../features/magic-context/storage";
 import {
+    getMigrationOnOpenRefusal,
     getSchemaFenceRejection,
     openDatabaseAsync,
 } from "../../features/magic-context/storage-db";
@@ -234,16 +235,32 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 reason,
             );
             notifyMagicContextDisabled(deps.client, reason);
+            const migration = getMigrationOnOpenRefusal();
+            const blockingProcesses =
+                migration?.serverPids.map((pid) => ({ harness: "OpenCode server", pid })) ?? [];
             const fence = getSchemaFenceRejection();
             recordHookInitFailure({
                 type: "storage",
-                reason: fence
-                    ? {
-                          kind: "schema_fence",
-                          persistedVersion: fence.persistedVersion,
-                          supportedVersion: fence.supportedVersion,
-                      }
-                    : { kind: "storage_failure", cause: reason },
+                reason:
+                    migration && blockingProcesses.length > 0
+                        ? {
+                              kind: "migration_guard",
+                              persistedVersion: migration.persistedVersion,
+                              supportedVersion: migration.supportedVersion,
+                              blockingProcesses,
+                          }
+                        : fence
+                          ? {
+                                kind: "schema_fence",
+                                persistedVersion: fence.persistedVersion,
+                                supportedVersion: fence.supportedVersion,
+                            }
+                          : {
+                                kind: "storage_failure",
+                                cause: migration?.unreadableFile
+                                    ? `migration guard could not read RPC discovery file ${migration.unreadableFile}`
+                                    : reason,
+                            },
             });
             return null;
         }

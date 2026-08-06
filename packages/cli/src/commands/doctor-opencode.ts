@@ -10,6 +10,7 @@ import {
     type EmbeddingProbeOutcome,
     probeEmbeddingEndpoint,
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
+import { getLiveMigrationBlockingProcesses } from "@magic-context/core/features/magic-context/storage-db";
 import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import { fixConflicts } from "@magic-context/core/shared/conflict-fixer";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
@@ -1263,7 +1264,11 @@ export async function runDoctor(
                 // Stable storage-version probe: live DB schema vs this binary's fence.
                 const storageVersions = readStorageVersions(db);
                 log.info(formatStorageVersions(storageVersions));
-                const fenceCheck = checkStorageVersionFence(storageVersions);
+                const fenceCheck = checkStorageVersionFence(storageVersions, {
+                    blockingProcesses: getLiveMigrationBlockingProcesses(
+                        getMagicContextStorageDir(),
+                    ),
+                });
                 if (fenceCheck.alarm) fail(fenceCheck.message);
                 else log.info(fenceCheck.message);
                 try {

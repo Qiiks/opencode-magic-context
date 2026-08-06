@@ -15,6 +15,7 @@ import {
     probeEmbeddingEndpoint,
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
+import { getLiveMigrationBlockingProcesses } from "@magic-context/core/features/magic-context/storage-db";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { loadPiConfig } from "@magic-context/pi-core/config";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
@@ -595,7 +596,9 @@ async function runHealthChecks(options: {
                 // Stable storage-version probe: live DB schema vs this binary's fence.
                 const storageVersions = readStorageVersions(db);
                 add(results, "info", formatStorageVersions(storageVersions));
-                const fenceCheck = checkStorageVersionFence(storageVersions);
+                const fenceCheck = checkStorageVersionFence(storageVersions, {
+                    blockingProcesses: getLiveMigrationBlockingProcesses(storageDir),
+                });
                 add(results, fenceCheck.alarm ? "fail" : "info", fenceCheck.message);
 
                 const integrity = db.prepare("PRAGMA integrity_check").get() as {

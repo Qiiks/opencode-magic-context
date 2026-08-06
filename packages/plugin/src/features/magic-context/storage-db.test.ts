@@ -23,6 +23,7 @@ import {
     __resetStoragePermissionFsForTests,
     __setStoragePermissionFsForTests,
     closeDatabase,
+    getLiveMigrationBlockingProcesses,
     getMigrationOnOpenRefusal,
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
@@ -380,6 +381,9 @@ describe("storage-db", () => {
                 supportedVersion: LATEST_SUPPORTED_VERSION,
                 serverPids: [process.pid],
             });
+            expect(getLiveMigrationBlockingProcesses(dirname(dbPath))).toEqual([
+                { harness: "OpenCode server", pid: process.pid },
+            ]);
             const unchanged = new Database(dbPath);
             const row = unchanged
                 .prepare("SELECT MAX(version) AS version FROM schema_migrations")

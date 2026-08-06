@@ -16,7 +16,18 @@ export const FAIL_CLOSED_DOCTOR_COMMAND = "npx @cortexkit/magic-context@latest d
 /** How often a blocked transform pass re-attempts storage open (1 = every pass). */
 export const FAIL_CLOSED_REPROBE_EVERY_N = 5;
 
+export interface FailClosedBlockingProcess {
+    harness: string;
+    pid: number;
+}
+
 export type FailClosedReason =
+    | {
+          kind: "migration_guard";
+          persistedVersion: number;
+          supportedVersion: number;
+          blockingProcesses: readonly FailClosedBlockingProcess[];
+      }
     | {
           kind: "schema_fence";
           persistedVersion: number;
@@ -59,14 +70,41 @@ function isMagicContextHiddenAgentName(agent: string): boolean {
     return false;
 }
 
+const MAX_FORMATTED_BLOCKING_PROCESSES = 8;
+
+export function formatFailClosedBlockingProcesses(
+    processes: readonly FailClosedBlockingProcess[],
+): string {
+    const uniqueProcesses = new Map<string, FailClosedBlockingProcess>();
+    for (const process of processes) {
+        if (!process.harness.trim() || !Number.isInteger(process.pid) || process.pid <= 0) continue;
+        uniqueProcesses.set(`${process.harness}\u0000${process.pid}`, {
+            harness: process.harness.trim(),
+            pid: process.pid,
+        });
+    }
+    const entries = [...uniqueProcesses.values()];
+    const visible = entries.slice(0, MAX_FORMATTED_BLOCKING_PROCESSES);
+    const rendered = visible.map(({ harness, pid }) => `${harness} (PID ${pid})`);
+    const omitted = entries.length - visible.length;
+    if (omitted > 0) rendered.push(`${omitted} more blocking process(es)`);
+    if (rendered.length === 0) return "a live harness process";
+    if (rendered.length === 1) return rendered[0];
+    const last = rendered.pop();
+    return `${rendered.join(", ")}, and ${last}`;
+}
+
 export function formatFailClosedBlockingMessage(reason: FailClosedReason): string {
+    if (reason.kind === "migration_guard") {
+        return [
+            `Magic Context cannot migrate the shared database because ${formatFailClosedBlockingProcesses(reason.blockingProcesses)} may be running an older Magic Context build that would fail against the migrated database.`,
+            "Restart the blocking process (it will pick up the new build and migrate on start), or shut it down and retry.",
+            `Recovery: ${FAIL_CLOSED_DOCTOR_COMMAND}`,
+        ].join(" ");
+    }
     if (reason.kind === "schema_fence") {
         return [
-            `Magic Context cannot operate: shared database schema v${reason.persistedVersion}`,
-            `is newer than this build supports (max v${reason.supportedVersion}).`,
-            "A newer OpenCode/Pi instance upgraded the database; this build fail-closed",
-            "so it cannot corrupt the cache or silently fall back to native compaction.",
-            `Update or unpin Magic Context on this harness, then restart.`,
+            `Magic Context cannot operate: this Magic Context build is older than the database; upgrade/restart this harness (database schema v${reason.persistedVersion}, build supports through v${reason.supportedVersion}).`,
             `Recovery: ${FAIL_CLOSED_DOCTOR_COMMAND}`,
         ].join(" ");
     }

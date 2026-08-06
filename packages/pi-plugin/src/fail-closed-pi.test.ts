@@ -62,6 +62,36 @@ describe("registerPiFailClosedSurface", () => {
 		expect(message).toContain(FAIL_CLOSED_DOCTOR_COMMAND);
 	});
 
+	it("threads migration guard process details into the blocking error", async () => {
+		const fake = createFakePi();
+		registerPiFailClosedSurface(fake.pi as never, {
+			reason: {
+				kind: "migration_guard",
+				persistedVersion: 73,
+				supportedVersion: 74,
+				blockingProcesses: [
+					{ harness: "OpenCode server", pid: 5736 },
+					{ harness: "OpenCode server", pid: 5737 },
+				],
+			},
+			tryReopen: async () => null,
+			onRecovered: async () => {},
+		});
+
+		let thrown: unknown;
+		try {
+			await fake.emit("context", { messages: [] }, {});
+		} catch (error) {
+			thrown = error;
+		}
+		expect(isFailClosedBlockingError(thrown)).toBe(true);
+		const message = thrown instanceof Error ? thrown.message : String(thrown);
+		expect(message).toContain("OpenCode server (PID 5736)");
+		expect(message).toContain("OpenCode server (PID 5737)");
+		expect(message).toContain("an older Magic Context build");
+		expect(message).toContain(FAIL_CLOSED_DOCTOR_COMMAND);
+	});
+
 	it("re-probe heals and invokes onRecovered without restart", async () => {
 		const fake = createFakePi();
 		let opens = 0;

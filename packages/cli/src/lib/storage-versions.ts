@@ -9,6 +9,10 @@
  * both surfaces.
  */
 import {
+    type FailClosedBlockingProcess,
+    formatFailClosedBlockingMessage,
+} from "@magic-context/core/features/magic-context/fail-closed-block";
+import {
     getPersistedSchemaVersion,
     LATEST_SUPPORTED_VERSION,
 } from "@magic-context/core/features/magic-context/storage-db";
@@ -34,7 +38,10 @@ export const STALE_BUILD_RESTART_INSTRUCTION =
  * means migrations are pending; only a database above the fence strands a stale
  * long-running server and is therefore an alarm.
  */
-export function checkStorageVersionFence(versions: StorageVersions): StorageVersionFenceCheck {
+export function checkStorageVersionFence(
+    versions: StorageVersions,
+    options: { blockingProcesses?: readonly FailClosedBlockingProcess[] } = {},
+): StorageVersionFenceCheck {
     const {
         context_db_schema_version: databaseVersion,
         plugin_supported_version: supportedVersion,
@@ -48,6 +55,17 @@ export function checkStorageVersionFence(versions: StorageVersions): StorageVers
         };
     }
     if (databaseVersion < supportedVersion) {
+        if (options.blockingProcesses && options.blockingProcesses.length > 0) {
+            return {
+                alarm: true,
+                message: formatFailClosedBlockingMessage({
+                    kind: "migration_guard",
+                    persistedVersion: databaseVersion,
+                    supportedVersion,
+                    blockingProcesses: options.blockingProcesses,
+                }),
+            };
+        }
         return {
             alarm: false,
             message: `Storage schema migrations pending: context.db is v${databaseVersion}; this build supports through v${supportedVersion}.`,

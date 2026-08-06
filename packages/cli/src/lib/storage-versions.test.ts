@@ -84,11 +84,30 @@ describe("checkStorageVersionFence", () => {
             context_db_schema_version: 71,
             plugin_supported_version: 72,
         });
-
         expect(result).toEqual({
             alarm: false,
             message:
                 "Storage schema migrations pending: context.db is v71; this build supports through v72.",
         });
+    });
+
+    it("prints the actionable migration guard when live OpenCode servers block it", () => {
+        const result = checkStorageVersionFence(
+            {
+                context_db_schema_version: 73,
+                plugin_supported_version: 74,
+            },
+            {
+                blockingProcesses: [
+                    { harness: "OpenCode server", pid: 5736 },
+                    { harness: "OpenCode server", pid: 5736 },
+                ],
+            },
+        );
+
+        expect(result.alarm).toBe(true);
+        expect(result.message).toContain("OpenCode server (PID 5736)");
+        expect(result.message).toContain("an older Magic Context build");
+        expect(result.message).toContain("shut it down and retry");
     });
 });
