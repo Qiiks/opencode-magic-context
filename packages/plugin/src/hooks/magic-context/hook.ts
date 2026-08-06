@@ -65,6 +65,7 @@ import { resolveFallbackChain } from "../../shared/resolve-fallbacks";
 import { isTuiConnected, pushNotification } from "../../shared/rpc-notifications";
 import type { Database } from "../../shared/sqlite";
 import { createMagicContextCommandHandler } from "./command-handler";
+import { clearToolPermissionDenied } from "./ctx-reduce-availability";
 import { deriveHistorianChunkTokens, resolveHistorianContextLimit } from "./derive-budgets";
 import {
     autoEmbedAttemptedBySession,
@@ -1034,6 +1035,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             // maps are shared via liveSessionState — clearing on the terminal
             // session.deleted event is correct since the session is gone.
             lastHeuristicsTurnId.delete(sessionId);
+            clearToolPermissionDenied(sessionId);
             commitSeenLastPass.delete(sessionId);
             variantBySession.delete(sessionId);
             liveModelBySession.delete(sessionId);
@@ -1333,6 +1335,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         "tool.execute.after": createToolExecuteAfterHook({
             db,
             channel1StateBySession,
+            client: deps.client,
             transformMode: deps.config.transform_mode,
             todoStateSet:
                 deps.config.transform_mode === "rust" && rustModeModuleClient

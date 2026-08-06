@@ -33,6 +33,7 @@ import {
 } from "../../features/magic-context/storage-tags";
 import type { Tagger } from "../../features/magic-context/tagger";
 import type { SessionMeta, TagEntry } from "../../features/magic-context/types";
+import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
@@ -43,6 +44,13 @@ import { getActiveCompartmentRun } from "./compartment-runner";
 import type {
     CtxReduceAvailabilityVerdict,
     ToolAvailabilityVerdict,
+} from "./ctx-reduce-availability";
+import {
+    cachedToolPermissionDenied,
+    hasLoggedCtxReducePermissionDeny,
+    markCtxReducePermissionDenyLogged,
+    resolveToolPermissionDenied,
+    todowritePermissionDenied,
 } from "./ctx-reduce-availability";
 import { dropStaleReduceCalls } from "./drop-stale-reduce-calls";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
@@ -71,7 +79,11 @@ import {
 } from "./strip-content";
 import { buildEditSupersessionReclaim, buildSupersessionReclaimOps } from "./supersession-reclaim";
 import { byteSize, prependTag } from "./tag-content-primitives";
-import { buildSyntheticTodoPart, type SyntheticTodoPart } from "./todo-view";
+import {
+    buildSyntheticTodoPart,
+    isSyntheticTodoPart,
+    type SyntheticTodoPart,
+} from "./todo-view";
 import {
     advanceToolReclaimWatermarkToCurrentMax,
     buildSyntheticToolReclaimOps,
@@ -173,6 +185,141 @@ function injectPersistedTodoAnchor(
         return { injected: false, messageId, prependedMessageCount: 0 };
     }
     return injectSyntheticTodoAtHead(messages, sessionId, part);
+}
+
+function removeSyntheticTodoParts(messages: MessageLike[]): void {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (!message) continue;
+        const retainedParts = message.parts.filter((part) => !isSyntheticTodoPart(part));
+        if (retainedParts.length === message.parts.length) continue;
+        message.parts = retainedParts;
+        if (message.info.id === TODO_HEAD_ANCHOR_ID && retainedParts.length === 0) {
+            messages.splice(index, 1);
+        }
+    }
+}
+
+/**
+ * Apply the synthetic todowrite pair with cache-safe live permission checks.
+ * Permission is refreshed only on a cache-busting pass; defer passes replay
+ * the cached verdict and frozen bytes without consulting the SDK.
+ */
+export async function applyTodoSynthesis(args: {
+    db: ContextDatabase;
+    sessionId: string;
+    messages: MessageLike[];
+    fullFeatureMode: boolean;
+    compactionOff?: boolean;
+    isCacheBustingPass: boolean;
+    sessionMeta: SessionMeta;
+    todowriteAvailability: ToolAvailabilityVerdict;
+    client?: PluginContext["client"];
+    activeAgent?: string;
+}): Promise<number> {
+    if (!args.fullFeatureMode || args.compactionOff) return 0;
+
+    const persistedAnchor = getPersistedTodoSyntheticAnchor(args.db, args.sessionId);
+    let permissionDenied = cachedToolPermissionDenied(args.sessionId, "todowrite") ?? false;
+    const toolsMapUnavailable =
+        args.todowriteAvailability.frozen && !args.todowriteAvailability.callable;
+
+    if (args.isCacheBustingPass && args.client && !toolsMapUnavailable) {
+        try {
+            permissionDenied = await todowritePermissionDenied(
+                args.client,
+                args.sessionId,
+                args.activeAgent,
+            );
+        } catch (error) {
+            // A transient SDK read must not turn a previously denied tool back on.
+            // The cached verdict remains authoritative until the next bust can read
+            // the live permission state successfully.
+            sessionLog(
+                args.sessionId,
+                "todowrite permission read failed; retaining the cached live verdict:",
+                error,
+            );
+        }
+    }
+
+    const todowriteUnavailable = toolsMapUnavailable || permissionDenied;
+    if (args.isCacheBustingPass && todowriteUnavailable) {
+        removeSyntheticTodoParts(args.messages);
+        // Clear the persisted synthetic anchor even if an older row contains only
+        // one synthetic field; otherwise stale partial data could keep part of the
+        // pair after the tool becomes unavailable.
+        clearPersistedTodoSyntheticAnchor(args.db, args.sessionId);
+        if (persistedAnchor) {
+            sessionLog(
+                args.sessionId,
+                "todowrite synthetic pair cleared on a cache-busting pass because the tool is denied",
+            );
+        }
+        return 0;
+    }
+
+    if (args.isCacheBustingPass) {
+        const part = buildSyntheticTodoPart(args.sessionMeta.lastTodoState);
+        const persistedInjection =
+            part !== null && persistedAnchor && persistedAnchor.callId === part.callID
+                ? injectPersistedTodoAnchor(
+                      args.messages,
+                      args.sessionId,
+                      persistedAnchor.messageId,
+                      part,
+                  )
+                : null;
+        if (part === null) {
+            if (persistedAnchor) clearPersistedTodoSyntheticAnchor(args.db, args.sessionId);
+            return 0;
+        }
+        if (persistedAnchor && persistedInjection?.injected) {
+            if (persistedAnchor.stateJson.length === 0) {
+                setPersistedTodoSyntheticAnchor(
+                    args.db,
+                    args.sessionId,
+                    persistedAnchor.callId,
+                    persistedAnchor.messageId,
+                    args.sessionMeta.lastTodoState,
+                );
+            }
+            return persistedInjection.prependedMessageCount;
+        }
+
+        const existingAssistantId = injectToolPartIntoLatestAssistant(args.messages, part);
+        const injection =
+            existingAssistantId === null
+                ? injectSyntheticTodoAtHead(args.messages, args.sessionId, part)
+                : {
+                      injected: true,
+                      messageId: existingAssistantId,
+                      prependedMessageCount: 0,
+                  };
+        setPersistedTodoSyntheticAnchor(
+            args.db,
+            args.sessionId,
+            part.callID,
+            injection.messageId,
+            args.sessionMeta.lastTodoState,
+        );
+        return injection.prependedMessageCount;
+    }
+
+    // Defer pass: rebuild from the persisted snapshot, never from live
+    // last_todo_state, so a real todowrite between passes cannot change bytes.
+    if (persistedAnchor && persistedAnchor.stateJson.length > 0) {
+        const part = buildSyntheticTodoPart(persistedAnchor.stateJson);
+        if (part !== null && part.callID === persistedAnchor.callId) {
+            return injectPersistedTodoAnchor(
+                args.messages,
+                args.sessionId,
+                persistedAnchor.messageId,
+                part,
+            ).prependedMessageCount;
+        }
+    }
+    return 0;
 }
 
 /**
@@ -374,6 +521,10 @@ interface RunPostTransformPhaseArgs {
      *  synthetic todo-pair injection below: a session whose tools map filters
      *  todowrite out must not get a synthetic pair for a tool it cannot call. */
     todowriteAvailability: ToolAvailabilityVerdict;
+    /** OpenCode SDK for live permission checks on cache-busting passes. */
+    client?: PluginContext["client"];
+    /** Active agent selected by the latest user message or hook input. */
+    activeAgent?: string;
     batch: { finalize: () => void } | null;
     contextUsage: { percentage: number; inputTokens: number };
     schedulerDecision: "execute" | "defer";
@@ -773,6 +924,33 @@ export async function runPostTransformPhase(
     // remain narrow (each reads its own dedicated set) so adjunct refresh
     // and history rebuild are decoupled from materialization timing.
     const isCacheBustingPass = shouldApplyPendingOps || shouldRunHeuristics;
+    // ctx_reduce stays frozen for prompt-hash stability, but observe the live
+    // permission signal on the same busts so an operator knows guidance may be
+    // stale until the session restarts. This log never changes the wire.
+    if (
+        isCacheBustingPass &&
+        args.client &&
+        args.ctxReduceAvailability.callable &&
+        !hasLoggedCtxReducePermissionDeny(args.sessionId)
+    ) {
+        try {
+            const denied = await resolveToolPermissionDenied(
+                args.client,
+                args.sessionId,
+                "ctx_reduce",
+                args.activeAgent,
+            );
+            if (denied) {
+                markCtxReducePermissionDenyLogged(args.sessionId);
+                sessionLog(
+                    args.sessionId,
+                    "ctx_reduce permission is denied by OpenCode; frozen guidance remains until session restart",
+                );
+            }
+        } catch (error) {
+            sessionLog(args.sessionId, "ctx_reduce permission read failed (ignored):", error);
+        }
+    }
     const canUseEmptySentinels = modelAcceptsEmptyContent(args.resolvedProviderID);
     if (shouldRunHeuristics) {
         const subagentRerun =
@@ -1548,143 +1726,21 @@ export async function runPostTransformPhase(
         }
     }
 
-    // Todo state synthesis: inject a synthetic `todowrite` tool part into the
-    // latest eligible assistant so the agent reads current todos through its
-    // native todowrite-tracking mental model. Summary assistants are excluded
-    // because marker reconciliation rebuilds them. When no eligible assistant
-    // exists, the pair uses a deterministic head anchor before the retained tail.
-    // The wire shape is identical to OpenCode's stored todowrite tool parts, so providers,
-    // serializers, and downstream code see something indistinguishable from
-    // a real call.
-    //
-    // Cache safety:
-    //   - Snapshot capture (in hook-handlers.ts on tool.execute.after) writes
-    //     DB only — no message mutation.
-    //   - Synthetic callID is deterministic from the snapshot JSON, so a
-    //     stable snapshot produces a stable wire shape across both cache-
-    //     busting and defer passes.
-    //   - This block runs AFTER tagging and applyPendingOperations, so the
-    //     synthetic part is never tagged and never targeted by ctx_reduce or
-    //     heuristic cleanup.
-    //   - Defer passes only replay an already-persisted (callID, anchor) pair
-    //     via `injectToolPartIntoAssistantById`, which is idempotent on
-    //     callID — repeated defer-pass calls produce byte-identical output.
-    // Compaction-off: synthetic todowrite context-management injection (B7)
-    // is gated off with the rest of the compaction surface.
+    // Todo state synthesis is deliberately isolated so its live permission
+    // refresh and cache-boundary behavior can be tested independently.
     if (args.fullFeatureMode && !compactionOff) {
-        const persistedAnchor = getPersistedTodoSyntheticAnchor(args.db, args.sessionId);
-        // A FROZEN "unavailable" verdict means the session's tools map filters
-        // the native todowrite tool out (user/agent config disabled it). Such a
-        // session must not be handed a synthetic todowrite pair for a tool it
-        // cannot call — confusing wire content and pointless tokens. A
-        // provisional (non-frozen) verdict fails open and injects as before.
-        //
-        // Cache discipline (detect-on-bust, replay-everywhere-else): the pair
-        // is only ever REMOVED on a cache-busting pass, because that pass is
-        // already rewriting provider bytes. On a defer pass we keep replaying
-        // the persisted pair byte-identically even though the verdict is
-        // unavailable — first-removing it on a defer would mutate bytes the
-        // provider has cached and bust the prefix. The next busting pass clears
-        // the anchor, after which defers have nothing left to replay.
-        const todowriteUnavailable =
-            args.todowriteAvailability.frozen && !args.todowriteAvailability.callable;
-        if (isCacheBustingPass && todowriteUnavailable) {
-            if (persistedAnchor) {
-                clearPersistedTodoSyntheticAnchor(args.db, args.sessionId);
-            }
-        } else if (isCacheBustingPass) {
-            const part = buildSyntheticTodoPart(args.sessionMeta.lastTodoState);
-            const persistedInjection =
-                part !== null && persistedAnchor && persistedAnchor.callId === part.callID
-                    ? injectPersistedTodoAnchor(
-                          args.messages,
-                          args.sessionId,
-                          persistedAnchor.messageId,
-                          part,
-                      )
-                    : null;
-            if (part === null) {
-                if (persistedAnchor) {
-                    clearPersistedTodoSyntheticAnchor(args.db, args.sessionId);
-                }
-            } else if (persistedAnchor && persistedInjection?.injected) {
-                prependedMessageCount += persistedInjection.prependedMessageCount;
-                // Snapshot unchanged AND persisted anchor message still
-                // present — idempotent re-inject leaves DB and messages
-                // byte-identical.
-                //
-                // Council Finding #1 v2 (Oracle final audit): if a legacy
-                // row was upgraded with `stateJson=""` (default after v11
-                // migration ran on a session that already had `callId` and
-                // `messageId` from the pre-stateJson build), backfill the
-                // snapshot now so subsequent defer passes have something
-                // to replay. Without this, defer at line 770 skips on
-                // `stateJson.length === 0` and the synthetic vanishes
-                // from T1 — exactly the regression Finding #1 was meant
-                // to prevent. callId equality (line 743) under sha256
-                // truncated to 64 bits gives negligible collision risk
-                // for non-adversarial inputs (~2^32 distinct stateJsons
-                // expected before one collision), so the current snapshot
-                // is overwhelmingly likely to equal what the old build
-                // hashed; backfill is safe in practice.
-                if (persistedAnchor.stateJson.length === 0) {
-                    setPersistedTodoSyntheticAnchor(
-                        args.db,
-                        args.sessionId,
-                        persistedAnchor.callId,
-                        persistedAnchor.messageId,
-                        args.sessionMeta.lastTodoState,
-                    );
-                }
-            } else {
-                const existingAssistantId = injectToolPartIntoLatestAssistant(args.messages, part);
-                const injection =
-                    existingAssistantId === null
-                        ? injectSyntheticTodoAtHead(args.messages, args.sessionId, part)
-                        : {
-                              injected: true,
-                              messageId: existingAssistantId,
-                              prependedMessageCount: 0,
-                          };
-                prependedMessageCount += injection.prependedMessageCount;
-                setPersistedTodoSyntheticAnchor(
-                    args.db,
-                    args.sessionId,
-                    part.callID,
-                    injection.messageId,
-                    // Persist the SNAPSHOT we injected, not just the callID.
-                    // Defer-pass replay rebuilds from THIS state so prefix bytes
-                    // stay identical even if a real todowrite mutates
-                    // last_todo_state before the next cache-busting pass.
-                    args.sessionMeta.lastTodoState,
-                );
-            }
-        } else if (persistedAnchor && persistedAnchor.stateJson.length > 0) {
-            // Defer pass — byte-identical replay. Rebuild the part from the
-            // PERSISTED snapshot, NOT from `args.sessionMeta.lastTodoState`.
-            //
-            // Why: between the last cache-busting pass T0 and this defer
-            // pass T1, the agent may have called `todowrite` which updated
-            // `last_todo_state`. T0 injected the OLD state at the anchor;
-            // for T1 to keep prefix bytes identical to T0 (so Anthropic
-            // prompt cache stays warm), T1 must inject the SAME old state
-            // at the SAME anchor. The next cache-busting pass will adopt
-            // the new state and re-anchor.
-            //
-            // Empty `stateJson` means the row was persisted by an older
-            // build that didn't store the snapshot — fall through to skip,
-            // matching legacy behavior.
-            const part = buildSyntheticTodoPart(persistedAnchor.stateJson);
-            if (part !== null && part.callID === persistedAnchor.callId) {
-                const injection = injectPersistedTodoAnchor(
-                    args.messages,
-                    args.sessionId,
-                    persistedAnchor.messageId,
-                    part,
-                );
-                prependedMessageCount += injection.prependedMessageCount;
-            }
-        }
+        prependedMessageCount += await applyTodoSynthesis({
+            db: args.db,
+            sessionId: args.sessionId,
+            messages: args.messages,
+            fullFeatureMode: args.fullFeatureMode,
+            compactionOff,
+            isCacheBustingPass,
+            sessionMeta: args.sessionMeta,
+            todowriteAvailability: args.todowriteAvailability,
+            client: args.client,
+            activeAgent: args.activeAgent,
+        });
     }
 
     logTransformTiming(args.sessionId, "pp.noteAndTodoSynthesis", tNoteAndTodo);

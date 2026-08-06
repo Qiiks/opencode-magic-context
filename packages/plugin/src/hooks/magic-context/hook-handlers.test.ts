@@ -67,6 +67,66 @@ describe("createToolExecuteAfterHook todo snapshots", () => {
         }
     });
 
+    test("permission-denied todowrite capture is refused, including lookalike calls", async () => {
+        const db = createTestDb();
+        try {
+            let denied = true;
+            const client = {
+                app: {
+                    agents: async () => ({
+                        data: [
+                            {
+                                name: "build",
+                                permission: { todowrite: denied ? "deny" : "allow" },
+                            },
+                        ],
+                    }),
+                },
+                session: {
+                    get: async () => ({ data: { agent: "build" } }),
+                },
+            } as never;
+            const hook = createToolExecuteAfterHook({
+                db,
+                channel1StateBySession: new Map(),
+                client,
+            });
+
+            await hook({
+                tool: "todowrite",
+                sessionID: "ses-denied-capture",
+                args: {
+                    todos: [{ status: "pending", priority: "high", content: "Must not capture" }],
+                },
+            });
+            expect(getOrCreateSessionMeta(db, "ses-denied-capture").lastTodoState).toBe("");
+
+            // A third-party lookalike is never accepted as a native todowrite capture.
+            denied = false;
+            await hook({
+                tool: "mcp_Todowrite",
+                sessionID: "ses-denied-capture",
+                args: {
+                    todos: [{ status: "pending", priority: "high", content: "Still refuse" }],
+                },
+            });
+            expect(getOrCreateSessionMeta(db, "ses-denied-capture").lastTodoState).toBe("");
+
+            await hook({
+                tool: "todowrite",
+                sessionID: "ses-denied-capture",
+                args: {
+                    todos: [{ status: "pending", priority: "high", content: "Capture now" }],
+                },
+            });
+            expect(getOrCreateSessionMeta(db, "ses-denied-capture").lastTodoState).toContain(
+                "Capture now",
+            );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("todowrite persists the latest todo state", async () => {
         const db = createTestDb();
         try {

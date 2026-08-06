@@ -23,7 +23,11 @@ import { clearSidebarSnapshotCache } from "../../plugin/sidebar-snapshot-cache";
 import type { PluginContext } from "../../plugin/types";
 import { sessionLog } from "../../shared/logger";
 import { clearAutoSearchForSession } from "./auto-search-runner";
-import { resolveTodowriteAvailability } from "./ctx-reduce-availability";
+import {
+    cachedToolPermissionDenied,
+    resolveTodowriteAvailability,
+    todowritePermissionDenied,
+} from "./ctx-reduce-availability";
 import {
     buildChannel1Reminder,
     CHANNEL1_SENTINEL,
@@ -508,6 +512,7 @@ function maybeInjectChannel1Nudge(
 export function createToolExecuteAfterHook(args: {
     db: Parameters<typeof getOrCreateSessionMeta>[0];
     channel1StateBySession: Map<string, Channel1State>;
+    client?: PluginContext["client"];
     transformMode?: "ts" | "rust";
     todoStateSet?: (input: {
         sessionId: string;
@@ -516,7 +521,12 @@ export function createToolExecuteAfterHook(args: {
     }) => Promise<unknown>;
 }) {
     return async (input: unknown, output?: unknown) => {
-        const typedInput = input as { tool?: string; sessionID?: string; args?: unknown };
+        const typedInput = input as {
+            tool?: string;
+            sessionID?: string;
+            args?: unknown;
+            agent?: string;
+        };
         if (!typedInput.sessionID || !typedInput.tool) {
             return;
         }
@@ -547,16 +557,37 @@ export function createToolExecuteAfterHook(args: {
             }
         }
         if (typedInput.tool === "todowrite") {
-            // Belt-and-braces gate: when the session's tools map filters the
-            // native todowrite tool out (frozen "unavailable" verdict), do not
-            // persist todo state for it. A disabled tool never fires
-            // tool.execute.after under its exact name in the first place, so
-            // this mostly guards against MCP-shaped lookalikes (mcp_Todowrite,
-            // etc.) writing state that the synthetic injector would later replay
-            // for a tool the session does not have. A provisional verdict fails
-            // open and captures as before.
+            // Persist todo state only for the exact native `todowrite` tool
+            // after checking its availability and live permission. MCP-shaped
+            // lookalikes such as `mcp_Todowrite` do not enter this branch and
+            // remain refused.
             const todowriteVerdict = resolveTodowriteAvailability(typedInput.sessionID);
             if (todowriteVerdict.frozen && !todowriteVerdict.callable) return;
+            const activeAgent = typedInput.agent;
+            if (args.client) {
+                try {
+                    if (
+                        await todowritePermissionDenied(
+                            args.client,
+                            typedInput.sessionID,
+                            activeAgent,
+                        )
+                    ) {
+                        return;
+                    }
+                } catch (error) {
+                    // Preserve a prior live deny across a transient SDK read;
+                    // otherwise a failed read could resume stale capture.
+                    if (cachedToolPermissionDenied(typedInput.sessionID, "todowrite")) {
+                        return;
+                    }
+                    sessionLog(
+                        typedInput.sessionID,
+                        "todowrite permission read failed during capture (ignored):",
+                        error,
+                    );
+                }
+            }
             // Only trigger note nudge when ALL todo items are terminal (completed/cancelled).
             // Firing on every todowrite is too eager — agents call it repeatedly while working.
             const todoArgs = typedInput.args as { todos?: unknown } | undefined;
