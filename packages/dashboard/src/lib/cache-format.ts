@@ -1,5 +1,35 @@
 import type { DbCacheEvent } from "./types";
 
+const SEVERITY_RANK: Record<DbCacheEvent["severity"], number> = {
+  full_bust: 6,
+  bust: 5,
+  warming: 4,
+  warning: 3,
+  stable: 2,
+  info: 1,
+  unknown: 0,
+};
+
+/**
+ * Select the event that supplies a turn's summary severity and cause. Equal
+ * severities intentionally favor the later event so the displayed cause
+ * describes the newest equally-severe step.
+ */
+export function selectWorstCacheEvent(events: readonly DbCacheEvent[]): DbCacheEvent | undefined {
+  let winner: DbCacheEvent | undefined;
+  for (const event of events) {
+    if (
+      !winner ||
+      SEVERITY_RANK[event.severity] > SEVERITY_RANK[winner.severity] ||
+      (SEVERITY_RANK[event.severity] === SEVERITY_RANK[winner.severity] &&
+        event.timestamp >= winner.timestamp)
+    ) {
+      winner = event;
+    }
+  }
+  return winner;
+}
+
 // Map a cache-event severity to a bar/pill color class. Severity is the source
 // of truth (computed cross-step in the backend); colors follow it directly.
 export function severityColorClass(severity: string): string {
@@ -19,7 +49,10 @@ export function severityColorClass(severity: string): string {
 }
 
 const CACHE_CAUSE_LABELS: Record<string, string> = {
-  mc_transform_missing: "Magic Context transform did not run (fail-open pass)",
+  mc_transform_failed_open: "Magic Context transform failed open",
+  // Older dashboard backends may still emit this retired inference. It is not
+  // evidence of a failed transform, so keep the legacy value non-alarming.
+  mc_transform_missing: "No attribution recorded",
 };
 
 export function cacheCauseLabel(cause: string): string {
@@ -27,12 +60,12 @@ export function cacheCauseLabel(cause: string): string {
 }
 
 export function cacheCauseColor(cause: string): string {
-  return cause === "mc_transform_missing" ? "red" : "amber";
+  return cause === "mc_transform_failed_open" ? "red" : "amber";
 }
 
 export function cacheCauseTooltip(cause: string): string | undefined {
-  return cause === "mc_transform_missing"
-    ? "Magic Context returned the original messages after a transform failure, so the provider-side cache bust is attributed to a fail-open pass."
+  return cause === "mc_transform_failed_open"
+    ? "Magic Context recorded a transform error and returned the original messages for this pass."
     : undefined;
 }
 

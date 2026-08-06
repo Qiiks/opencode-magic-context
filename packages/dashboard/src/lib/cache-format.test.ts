@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { normalizeEstimatedContextLimits } from "./cache-format";
+import {
+  cacheCauseColor,
+  cacheCauseLabel,
+  normalizeEstimatedContextLimits,
+  selectWorstCacheEvent,
+} from "./cache-format";
 import type { DbCacheEvent } from "./types";
 
 function ev(partial: Partial<DbCacheEvent>): DbCacheEvent {
@@ -24,6 +29,48 @@ function ev(partial: Partial<DbCacheEvent>): DbCacheEvent {
     ...partial,
   };
 }
+
+describe("cacheCauseLabel", () => {
+  it("renders a fail-open warning only for recorded transform failures", () => {
+    expect(cacheCauseLabel("mc_transform_failed_open")).toBe("Magic Context transform failed open");
+    expect(cacheCauseColor("mc_transform_failed_open")).toBe("red");
+    expect(cacheCauseLabel("mc_transform_missing")).toBe("No attribution recorded");
+    expect(cacheCauseColor("mc_transform_missing")).toBe("amber");
+  });
+});
+
+describe("selectWorstCacheEvent", () => {
+  it("keeps the cause from the step that determined the worst severity", () => {
+    const winner = selectWorstCacheEvent([
+      ev({ message_id: "m1", timestamp: 100, severity: "stable", cause: "No change" }),
+      ev({
+        message_id: "m2",
+        timestamp: 200,
+        severity: "full_bust",
+        cause: "Compaction pressure",
+      }),
+      ev({
+        message_id: "m3",
+        timestamp: 300,
+        severity: "stable",
+        cause: "No change",
+      }),
+    ]);
+
+    expect(winner?.severity).toBe("full_bust");
+    expect(winner?.cause).toBe("Compaction pressure");
+  });
+
+  it("chooses the newest event when severities tie", () => {
+    const winner = selectWorstCacheEvent([
+      ev({ message_id: "m1", timestamp: 100, severity: "bust", cause: "First cause" }),
+      ev({ message_id: "m2", timestamp: 200, severity: "bust", cause: "Newest cause" }),
+    ]);
+
+    expect(winner?.message_id).toBe("m2");
+    expect(winner?.cause).toBe("Newest cause");
+  });
+});
 
 describe("normalizeEstimatedContextLimits", () => {
   it("collapses a climbing max-prompt fallback to the per-session max (no fragmentation)", () => {
