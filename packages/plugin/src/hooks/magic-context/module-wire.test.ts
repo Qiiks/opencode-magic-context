@@ -86,6 +86,47 @@ describe("resolveOrdinalsForModule provisional tails", () => {
         }
     }
 
+    it("continues wholly fresh post-descent arrays from the durable provisional base", async () => {
+        const sessionId = "module-wire-wholly-fresh-descent";
+        const unregister = setRawMessageProvider(sessionId, {
+            readMessages: () => [],
+            readMessageOrdinalPage: () => [],
+            getStoredMessageCount: () => 0,
+        });
+        const messages = [
+            {
+                info: { id: "summary", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "continuation summary" }],
+            },
+            {
+                info: { id: "tail", role: "assistant", sessionID: sessionId },
+                parts: [{ type: "text", text: "continued answer" }],
+            },
+        ] as MessageLike[];
+        try {
+            const resolved = await resolveOrdinalsForModule({
+                sessionId,
+                messages,
+                generation: 1,
+                memoGeneration: 1,
+                memo: new Map(),
+                memoAnchor: null,
+                memoStoredCount: 0,
+                memoCanonicalCount: 0,
+                provisionalBase: 97,
+            });
+            expect(resolved.ok).toBe(true);
+            if (!resolved.ok) throw new Error(resolved.reason);
+            expect(
+                encodeOpenCodeMessagesToCk(resolved.annotatedInput as MessageLike[]).map(
+                    (message) => message.ck.meta.ordinal,
+                ),
+            ).toEqual([98, 99]);
+        } finally {
+            unregister();
+        }
+    });
+
     it("assigns one unpersisted append the next absolute ordinal", async () => {
         const result = await resolveTail(1);
         try {

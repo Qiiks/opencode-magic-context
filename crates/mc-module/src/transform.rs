@@ -36,7 +36,8 @@ use crate::selection::{
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
-    BlockIdentity, Channel1AppendRow, DeferredExecuteState, McStore, McStoreError, McTagRow,
+    BlockIdentity, Channel1AppendRow, DeferredExecuteState, LineageAnchor, LineageConstituent,
+    LineageDescentDisposition, LineageDescentRequest, McStore, McStoreError, McTagRow,
     MemoryRevision, ModuleMeta, ModuleUsage, NoteDelivery, PendingAgentDrop, PendingRewriteState,
     ServedBlockFingerprint, StoredCompartment, TagCacheSummary, TagMintInput, TemporalMarkInput,
     TemporalMarkRow, TransformCommit, TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
@@ -597,6 +598,22 @@ pub struct TransformRequest {
     pub history_budget_tokens: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_trim: Option<DeclaredTrim>,
+    /// Composed fake-compaction edge delivered by the lineage owner. Missing fields retain
+    /// legacy no-switch behavior; the module never infers a switch from summary text alone.
+    #[serde(default)]
+    pub lineage_switched: bool,
+    #[serde(default)]
+    pub descent_edge_id: u64,
+    #[serde(default)]
+    pub prior_conversation_key: String,
+    #[serde(default)]
+    pub prior_epoch: u64,
+    #[serde(default)]
+    pub new_epoch: u64,
+    #[serde(default)]
+    pub constituents: Vec<(String, String, u64)>,
+    #[serde(default)]
+    pub compaction_observed: bool,
 }
 
 fn default_wire_version() -> u32 {
@@ -683,6 +700,20 @@ struct TransformRequestWire {
     history_budget_tokens: Option<f64>,
     #[serde(default)]
     declared_trim: Option<DeclaredTrim>,
+    #[serde(default)]
+    lineage_switched: bool,
+    #[serde(default)]
+    descent_edge_id: u64,
+    #[serde(default)]
+    prior_conversation_key: String,
+    #[serde(default)]
+    prior_epoch: u64,
+    #[serde(default)]
+    new_epoch: u64,
+    #[serde(default)]
+    constituents: Vec<(String, String, u64)>,
+    #[serde(default)]
+    compaction_observed: bool,
 }
 
 impl<'de> Deserialize<'de> for TransformRequest {
@@ -730,6 +761,13 @@ impl<'de> Deserialize<'de> for TransformRequest {
             detected_context_limit_model_key: wire.detected_context_limit_model_key,
             history_budget_tokens: wire.history_budget_tokens,
             declared_trim: wire.declared_trim,
+            lineage_switched: wire.lineage_switched,
+            descent_edge_id: wire.descent_edge_id,
+            prior_conversation_key: wire.prior_conversation_key,
+            prior_epoch: wire.prior_epoch,
+            new_epoch: wire.new_epoch,
+            constituents: wire.constituents,
+            compaction_observed: wire.compaction_observed,
         })
     }
 }
@@ -1005,6 +1043,13 @@ pub struct TransformResponse {
     pub committed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage_ordinal: Option<u64>,
+    /// Exact composed edge id consumed by observed durable state. Omitted on ordinary,
+    /// subagent, defer-only protocol-error, and pending-build-skew responses.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub lineage_switch_consumed_id: Option<u64>,
+    /// Prior lineage tail used as the provisional ordinal base for native adapters.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ordinal_continuation_base: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub historian: Option<HistorianDiagnostics>,
     /// The actual output messages for this pass: synthetic m0 and m1 messages followed
@@ -1053,6 +1098,8 @@ impl TransformResponse {
             surface_state: SurfaceState::Inactive,
             committed: false,
             coverage_ordinal: None,
+            lineage_switch_consumed_id: None,
+            ordinal_continuation_base: None,
             historian: None,
             ck_messages: None,
             native_messages: None,
@@ -1081,6 +1128,8 @@ impl TransformResponse {
             surface_state: SurfaceState::Inactive,
             committed: false,
             coverage_ordinal: None,
+            lineage_switch_consumed_id: None,
+            ordinal_continuation_base: None,
             historian: None,
             ck_messages: Some(
                 ck_messages
@@ -1133,6 +1182,7 @@ pub struct TransformWithProjection {
     pub revert_epoch: u64,
     pub reasoning_watermark: u64,
     pub mutation_exempt_mid: Option<String>,
+    pub lineage_anchor_mid: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1237,6 +1287,7 @@ struct OverlayComputation<'a, 'ctx> {
     tagging_enabled: bool,
     temporal_enabled: bool,
     mutation_exempt_mid: Option<&'a str>,
+    lineage_anchor_mid: Option<&'a str>,
 }
 
 impl PendingOverlayDecisions {
@@ -1302,6 +1353,9 @@ pub enum TransformError {
     /// from the tail compartment's claimed end. Trimming on that claim would discard a
     /// different raw message than the anchor identifies.
     BoundaryOrdinalMismatch(String),
+    /// A delivered lineage edge or continued ordinal base violates the required lineage or
+    /// ordinal-continuation rules.
+    LineageProtocol(String),
 }
 
 impl std::fmt::Display for TransformError {
@@ -1340,6 +1394,7 @@ impl std::fmt::Display for TransformError {
             TransformError::BoundaryOrdinalMismatch(m) => {
                 write!(f, "compartment boundary ordinal mismatch: {m}")
             }
+            TransformError::LineageProtocol(m) => write!(f, "lineage protocol error: {m}"),
         }
     }
 }
@@ -1540,6 +1595,184 @@ fn normalize_synthetic_todo_ingress(req: &TransformRequest) -> Option<TransformR
     normalized
 }
 
+const CONTINUATION_SUMMARY_PREFIX: &str =
+    "This session is being continued from a previous conversation";
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LineagePassState {
+    acknowledge_edge: Option<u64>,
+    ordinal_base: Option<u64>,
+    force_hard: bool,
+}
+
+fn continuation_summary_anchor(
+    req: &TransformRequest,
+    projection: &FlatProjection,
+) -> Option<LineageAnchor> {
+    let first = req.messages.first()?;
+    if first.ck.role != "user" {
+        return None;
+    }
+    let last_text_index = first
+        .ck
+        .content
+        .iter()
+        .rposition(|block| matches!(block.kind, ck_wire::CkKind::Text { .. }))?;
+    let matching_index =
+        first
+            .ck
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, block)| match &block.kind {
+                ck_wire::CkKind::Text { text } if text.starts_with(CONTINUATION_SUMMARY_PREFIX) => {
+                    Some(index)
+                }
+                _ => None,
+            })?;
+    if matching_index != last_text_index {
+        return None;
+    }
+    let flat = projection
+        .blocks
+        .iter()
+        .find(|block| block.mid == first.mid && block.block_index == matching_index)?;
+    let mut content_hash = String::with_capacity(flat.content_hash.len() * 2);
+    for byte in flat.content_hash {
+        write!(&mut content_hash, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Some(LineageAnchor {
+        block_id: flat.id.clone(),
+        message_id: first.mid.clone(),
+        content_hash,
+        ordinal: first.ordinal,
+    })
+}
+
+fn validate_lineage_anchor(
+    meta: &ModuleMeta,
+    req: &TransformRequest,
+    projection: &FlatProjection,
+) -> Result<(), String> {
+    let (Some(anchor_id), Some(expected_hash), Some(base)) = (
+        meta.anchor_block_id.as_deref(),
+        meta.anchor_content_hash.as_deref(),
+        meta.ordinal_continuation_base,
+    ) else {
+        return if meta.descent_completed {
+            Err("completed descent is missing anchor identity or ordinal base".to_string())
+        } else {
+            Ok(())
+        };
+    };
+    let expected_ordinal = base
+        .checked_add(1)
+        .ok_or_else(|| "anchor ordinal overflow".to_string())?;
+    let block = projection
+        .blocks
+        .iter()
+        .find(|block| block.id == anchor_id)
+        .ok_or_else(|| format!("anchor block {anchor_id} is absent"))?;
+    if block.ordinal != expected_ordinal {
+        return Err(format!(
+            "anchor block {anchor_id} moved from ordinal {expected_ordinal} to {}",
+            block.ordinal
+        ));
+    }
+    let first = req
+        .messages
+        .first()
+        .ok_or_else(|| "anchor message at messages[0] is absent".to_string())?;
+    if first.mid != block.mid {
+        return Err(format!(
+            "anchor block {anchor_id} is no longer in messages[0]"
+        ));
+    }
+    let last_text_index = first
+        .ck
+        .content
+        .iter()
+        .rposition(|candidate| matches!(candidate.kind, ck_wire::CkKind::Text { .. }))
+        .ok_or_else(|| "anchor message has no text blocks".to_string())?;
+    if block.block_index != last_text_index {
+        return Err(format!(
+            "anchor block {anchor_id} is no longer the last text block"
+        ));
+    }
+    let mut actual_hash = String::with_capacity(block.content_hash.len() * 2);
+    for byte in block.content_hash {
+        write!(&mut actual_hash, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    if actual_hash != expected_hash {
+        return Err(format!("anchor block {anchor_id} content hash changed"));
+    }
+    Ok(())
+}
+
+fn rebase_descent_ordinals(
+    req: &TransformRequest,
+    base: u64,
+) -> Result<Option<TransformRequest>, TransformError> {
+    let Some(first) = req
+        .messages
+        .iter()
+        .find(|message| !message.ck.meta.synthetic)
+    else {
+        return Err(TransformError::LineageProtocol(
+            "descent replacement array has no real messages".to_string(),
+        ));
+    };
+    let expected_first = base.checked_add(1).ok_or_else(|| {
+        TransformError::LineageProtocol("descent ordinal base overflow".to_string())
+    })?;
+    if first.ordinal == expected_first {
+        return Ok(None);
+    }
+    if first.ordinal != 1 {
+        return Err(TransformError::LineageProtocol(format!(
+            "descent replacement array starts at ordinal {}, expected fresh ordinal 1 or continued ordinal {expected_first}",
+            first.ordinal
+        )));
+    }
+    let mut rebased = req.clone();
+    for message in &mut rebased.messages {
+        if message.ordinal == 0 {
+            return Err(TransformError::LineageProtocol(
+                "descent replacement array contains ordinal 0".to_string(),
+            ));
+        }
+        message.ordinal = message.ordinal.checked_add(base).ok_or_else(|| {
+            TransformError::LineageProtocol("descent ordinal overflow".to_string())
+        })?;
+        message.ck.meta.ordinal = Some(message.ordinal);
+    }
+    Ok(Some(rebased))
+}
+
+fn lineage_protocol_passthrough(
+    req: &TransformRequest,
+    projection: FlatProjection,
+) -> TransformWithProjection {
+    TransformWithProjection {
+        tag_numbers: BTreeMap::new(),
+        projection,
+        scheduler_pass: scheduler::PassDecision::Defer,
+        boundary_state: BoundaryState::Absent,
+        trim_mismatch: None,
+        revert_epoch: 0,
+        reasoning_watermark: 0,
+        mutation_exempt_mid: None,
+        lineage_anchor_mid: None,
+        response: TransformResponse::passthrough(
+            req.messages
+                .iter()
+                .map(|message| message.ck.clone())
+                .collect(),
+            req.full_array_fingerprint.clone(),
+        ),
+    }
+}
+
 fn apply_once(
     store: &McStore,
     req: &TransformRequest,
@@ -1554,10 +1787,88 @@ fn apply_once(
     // copy that marker into CK metadata, so recognize the reserved call-id namespace here too.
     // Normalizing before projection keeps the replayed pair out of selection, coverage, and output.
     let normalized_req = normalize_synthetic_todo_ingress(req);
-    let req = normalized_req.as_ref().unwrap_or(req);
+    let ingress_req = normalized_req.as_ref().unwrap_or(req);
+    // Recognition uses the canonical block projection before overlays, field stripping, or
+    // ordinal rewriting. Hash only the matched continuation block so changes to sibling blocks
+    // cannot invalidate the persisted anchor.
+    let initial_projection = project_messages(&ingress_req.messages)?;
+    if ingress_req.lineage_switched && ingress_req.is_subagent {
+        return Ok(lineage_protocol_passthrough(
+            ingress_req,
+            initial_projection,
+        ));
+    }
+    let mut lineage_state = LineagePassState::default();
+    let mut rebased_req = None;
+    if ingress_req.lineage_switched && !ingress_req.is_subagent {
+        if ingress_req.descent_edge_id == 0
+            || ingress_req.prior_conversation_key.is_empty()
+            || ingress_req.constituents.len() > 5
+            || ingress_req.session_id
+                != ingress_req
+                    .constituents
+                    .last()
+                    .map(|(_, new_key, _)| new_key.as_str())
+                    .unwrap_or(ingress_req.session_id.as_str())
+        {
+            eprintln!(
+                "mc-module: lineage protocol error for {}: malformed edge {} or target mismatch",
+                ingress_req.session_id, ingress_req.descent_edge_id
+            );
+            return Ok(lineage_protocol_passthrough(
+                ingress_req,
+                initial_projection,
+            ));
+        }
+        let initial_state = store.load(&ingress_req.session_id)?;
+        let anchor = continuation_summary_anchor(ingress_req, &initial_projection);
+        let constituents = ingress_req
+            .constituents
+            .iter()
+            .map(|(prior_key, new_key, epoch)| LineageConstituent {
+                prior_key: prior_key.clone(),
+                new_key: new_key.clone(),
+                epoch: *epoch,
+            })
+            .collect::<Vec<_>>();
+        let outcome = store.descend_lineage(LineageDescentRequest {
+            target_key: &ingress_req.session_id,
+            expected_target_row_version: initial_state.row_version,
+            edge_id: ingress_req.descent_edge_id,
+            prior_key: &ingress_req.prior_conversation_key,
+            prior_epoch: ingress_req.prior_epoch,
+            new_epoch: ingress_req.new_epoch,
+            constituents: &constituents,
+            compaction_observed: ingress_req.compaction_observed,
+            anchor: anchor.as_ref(),
+            now_ms: ctx.now_ms,
+        })?;
+        if outcome.disposition == LineageDescentDisposition::PendingBuildSkew {
+            eprintln!(
+                "mc-module: lineage descent pending build-skew for target {} edge {}",
+                ingress_req.session_id, ingress_req.descent_edge_id
+            );
+            return Ok(lineage_protocol_passthrough(
+                ingress_req,
+                initial_projection,
+            ));
+        }
+        lineage_state.acknowledge_edge = outcome.acknowledge.then_some(ingress_req.descent_edge_id);
+        lineage_state.ordinal_base = outcome.prior_last_ordinal;
+        lineage_state.force_hard = outcome.materialization_required;
+        if let Some(base) = lineage_state.ordinal_base {
+            rebased_req = rebase_descent_ordinals(ingress_req, base)?;
+        }
+    }
+    let req = rebased_req.as_ref().unwrap_or(ingress_req);
+
     // --- ingress: CK messages -> flat blocks, then strip synthetic before cache logic ---
     let projection_started_at = Instant::now();
-    let projection = project_messages(&req.messages)?;
+    let projection = if rebased_req.is_some() {
+        project_messages(&req.messages)?
+    } else {
+        initial_projection
+    };
     timings.projection = elapsed_ms(projection_started_at);
     timings.projection_blocks = projection.blocks.len();
     if let Some(id) = duplicate_ids(&projection.blocks) {
@@ -1602,6 +1913,35 @@ fn apply_once(
     timings.store_overlay_frontier = transform_snapshot.timings.overlay_frontier_ms;
     let loaded = transform_snapshot.loaded;
     let overlay_frontier = transform_snapshot.overlay_frontier;
+    let lineage_anchor_mid = loaded
+        .meta
+        .anchor_block_id
+        .as_deref()
+        .and_then(split_block_id)
+        .map(|(mid, _)| mid);
+    if let Some(base) = loaded.meta.ordinal_continuation_base {
+        let expected_boundary = base.checked_add(1).ok_or_else(|| {
+            TransformError::LineageProtocol(
+                "durable ordinal continuation base overflow".to_string(),
+            )
+        })?;
+        let compartment_end = store.max_compartment_end_ordinal(&req.session_id)?;
+        if compartment_end <= 0 || compartment_end as u64 != expected_boundary {
+            return Err(TransformError::LineageProtocol(format!(
+                "continued lineage requires boundary ordinal {expected_boundary}, found compartment end {compartment_end}; refusing silent re-base-to-1 fallback"
+            )));
+        }
+        let first_live = req
+            .messages
+            .iter()
+            .find(|message| !message.ck.meta.synthetic)
+            .map(|message| message.ordinal);
+        if first_live != Some(expected_boundary) {
+            return Err(TransformError::LineageProtocol(format!(
+                "continued lineage requires first live ordinal {expected_boundary}, found {first_live:?}"
+            )));
+        }
+    }
     // Legacy sessions stored the CC latch before the generic surface latch existed.
     // Treat that old true value as the generic latch so an upgrade does not repeat a fold.
     let persisted_tagging_surface_active =
@@ -1718,7 +2058,7 @@ fn apply_once(
     // truncate-all arm is eliminated, not gated: only a committed truncate may bump the
     // revert epoch, and this arm never owns a truncate. It records one durable alarm and
     // then serves raw bytes without touching identity, usage, scheduler, or core state.
-    if pending_rewrite_absent_shape {
+    if pending_rewrite_absent_shape && loaded.meta.anchor_block_id.is_none() {
         let fingerprint = absent_shape_fingerprint(&live);
         if loaded.meta.pending_rewrite.is_some() {
             eprintln!(
@@ -1891,6 +2231,7 @@ fn apply_once(
         &projection,
         &loaded.core,
         provisional_tail_mid,
+        lineage_anchor_mid,
     )?;
     let mut pending_overlays = PendingOverlayDecisions::default();
     // When caveman tagging is requested, compute tag rows from the persisted tag order even if
@@ -1914,6 +2255,7 @@ fn apply_once(
             tagging_enabled: tagging_active,
             temporal_enabled: temporal_active,
             mutation_exempt_mid,
+            lineage_anchor_mid,
         })?;
         timings.tag_mint_candidates = pending_overlays.tag_mint_candidates;
         timings.tag_mint_new = pending_overlays.tag_mint_count;
@@ -2172,7 +2514,10 @@ fn apply_once(
     } else {
         HashSet::new()
     };
-    if let Some(mid) = mutation_exempt_mid {
+    for mid in [mutation_exempt_mid, lineage_anchor_mid]
+        .into_iter()
+        .flatten()
+    {
         protected_block_ids.extend(
             projection
                 .blocks
@@ -2286,6 +2631,8 @@ fn apply_once(
         } else {
             PassPlan::Soft
         };
+    } else if lineage_state.force_hard {
+        plan = PassPlan::Hard;
     }
     let profile_transition = !loaded.meta.last_serializer_profile.is_empty()
         && loaded.meta.last_serializer_profile != req.serializer_profile;
@@ -2304,6 +2651,9 @@ fn apply_once(
         explicit_flush: loaded.meta.soft_refresh_pending,
         reductions_pending: reductions_pending_now,
     });
+    if lineage_state.force_hard {
+        materialize_reason = Some("lineage_descent".to_string());
+    }
 
     let mut core = loaded.core.clone();
     log_reasoning_drop_seed_skips(&core, &live, &req.session_id);
@@ -2350,6 +2700,7 @@ fn apply_once(
         req,
         &projection,
         provisional_tail_mid,
+        lineage_anchor_mid,
         &tail_identity_re_adoptions,
     );
     meta.cc_u1_active = cc_u1_active;
@@ -2358,6 +2709,29 @@ fn apply_once(
         meta.last_serializer_profile = req.serializer_profile.clone();
     }
     apply_scheduler_meta(&mut meta, &scheduler_outcome);
+
+    let soft_has_new_coverage = if matches!(plan, PassPlan::Soft)
+        && loaded.meta.anchor_block_id.is_some()
+        && compartment_seq_changed_since_meta
+    {
+        let compartments = store.load_compartments(&req.session_id)?;
+        coverage_ordinal_from_compartments(&compartments)? > loaded.meta.coverage_ordinal
+    } else {
+        false
+    };
+    let mut lineage_anchor_failure = false;
+    if matches!(plan, PassPlan::Hard | PassPlan::MigrateHard) || soft_has_new_coverage {
+        if let Err(detail) = validate_lineage_anchor(&loaded.meta, req, &projection) {
+            lineage_anchor_failure = true;
+            eprintln!(
+                "mc-module: lineage anchor validation failed closed for {}: {detail}",
+                req.session_id
+            );
+            core.reconcile_pending = true;
+            plan = PassPlan::Defer;
+            materialize_reason = Some("lineage_anchor_mismatch".to_string());
+        }
+    }
 
     let is_bust_pass = !req.is_subagent
         && matches!(
@@ -2373,7 +2747,13 @@ fn apply_once(
         meta.reasoning_cleared_through_ordinal = meta.reasoning_cleared_through_ordinal.max(cutoff);
     }
     let unit_mint_started_at = Instant::now();
-    let new_strip_units = new_frozen_strip_units(&loaded.core, req, &tag_numbers, is_bust_pass);
+    let new_strip_units = new_frozen_strip_units(
+        &loaded.core,
+        req,
+        &tag_numbers,
+        is_bust_pass,
+        lineage_anchor_mid,
+    );
     let caveman_age_basis_tag = if is_bust_pass && req.caveman_enabled {
         let basis = tag_rows
             .iter()
@@ -2653,6 +3033,9 @@ fn apply_once(
                     run_started: false,
                 });
                 meta.initialized = true;
+                if meta.descent_completed {
+                    meta.lineage_descent_materialized = true;
+                }
                 meta.memory_disabled = !ctx.memory_enabled;
                 meta.last_render_config = effective_render_config;
                 meta.last_provider_id = req.provider_id.clone().unwrap_or_default();
@@ -2844,6 +3227,9 @@ fn apply_once(
                     plan = PassPlan::Hard;
                     materialize_reason = Some("pressure_refold".to_string());
                     meta.initialized = true;
+                    if meta.descent_completed {
+                        meta.lineage_descent_materialized = true;
+                    }
                     meta.coverage_ordinal = comp.coverage_ordinal;
                     meta.coverage_start_ordinal = comp.first_covered_ordinal;
                     meta.coverage_compartment_seq = Some(comp.folded_compartment_seq);
@@ -2985,6 +3371,12 @@ fn apply_once(
             }
         }
     }
+    if lineage_anchor_failure {
+        // The soft-pressure path can preserve an existing reconcile state but cannot create
+        // one. Because the anchor check detected a new failure, set the pending flag after the
+        // state-machine step and commit it with the no-trim response.
+        core.reconcile_pending = true;
+    }
     timings.compose_m0m1 = elapsed_ms(compose_m0m1_started_at);
 
     // The two-pass watermark advances on every genuine pressure execute, even if the
@@ -3064,6 +3456,13 @@ fn apply_once(
     }
 
     let build_output_started_at = Instant::now();
+    let mut no_trim_meta = None;
+    if lineage_anchor_failure {
+        let mut output_meta = meta.clone();
+        output_meta.coverage_ordinal = None;
+        no_trim_meta = Some(output_meta);
+    }
+    let output_meta = no_trim_meta.as_ref().unwrap_or(&meta);
     let output_cache_snapshot = output_cache.map(|cache| {
         cache
             .lock()
@@ -3072,7 +3471,7 @@ fn apply_once(
     });
     let built_output = build_output_with_tags(
         &core,
-        &meta,
+        output_meta,
         &projection,
         req,
         tagging_active.then_some(&tag_overlay),
@@ -3088,7 +3487,7 @@ fn apply_once(
     if output_cache.is_some() {
         let fresh = build_output_with_tags(
             &core,
-            &meta,
+            output_meta,
             &projection,
             req,
             tagging_active.then_some(&tag_overlay),
@@ -3252,6 +3651,7 @@ fn apply_once(
             .reasoning_cleared_through_tag
             .max(meta.reasoning_cleared_through_ordinal),
         mutation_exempt_mid: mutation_exempt_mid.map(str::to_string),
+        lineage_anchor_mid: lineage_anchor_mid.map(str::to_string),
         response: TransformResponse {
             status: TransformStatus::Ok,
             served_from: ServedFrom::Transform,
@@ -3268,6 +3668,8 @@ fn apply_once(
             surface_state,
             committed: commit_required,
             coverage_ordinal: meta.coverage_ordinal,
+            lineage_switch_consumed_id: lineage_state.acknowledge_edge,
+            ordinal_continuation_base: meta.ordinal_continuation_base,
             historian: None,
             ck_messages: Some(ck_messages),
             native_messages: None,
@@ -3301,10 +3703,11 @@ fn enforce_block_identity(
     projection: &FlatProjection,
     core: &CoreState,
     provisional_tail_mid: Option<&str>,
+    lineage_anchor_mid: Option<&str>,
 ) -> Result<Vec<TailIdentityReAdoption>, TransformError> {
     let mut re_adoptions = Vec::new();
     for (mid, vector) in &projection.identity_by_mid {
-        if provisional_tail_mid == Some(mid.as_str()) {
+        if provisional_tail_mid == Some(mid.as_str()) || lineage_anchor_mid == Some(mid.as_str()) {
             continue;
         }
         let Some(stored) = meta.block_identity_by_mid.get(mid) else {
@@ -3338,7 +3741,7 @@ fn enforce_block_identity(
         let Some((mid, _)) = split_block_id(&target) else {
             continue;
         };
-        if provisional_tail_mid == Some(mid) {
+        if provisional_tail_mid == Some(mid) || lineage_anchor_mid == Some(mid) {
             continue;
         }
         if live_mids.contains(mid) && !live_ids.contains(target.as_str()) {
@@ -3392,6 +3795,7 @@ fn apply_ingress_meta(
     req: &TransformRequest,
     projection: &FlatProjection,
     provisional_tail_mid: Option<&str>,
+    lineage_anchor_mid: Option<&str>,
     re_adoptions: &[TailIdentityReAdoption],
 ) {
     if let Some(mid) = provisional_tail_mid {
@@ -3411,19 +3815,20 @@ fn apply_ingress_meta(
         .tail_identity_re_adopt_count
         .saturating_add(re_adoptions.len() as u64);
     for (mid, vector) in &projection.identity_by_mid {
-        if provisional_tail_mid == Some(mid.as_str()) {
+        if provisional_tail_mid == Some(mid.as_str()) || lineage_anchor_mid == Some(mid.as_str()) {
             continue;
         }
         meta.block_identity_by_mid
             .entry(mid.clone())
             .or_insert_with(|| vector.clone());
     }
-    meta.newest_live_block_id = projection
+    let newest_live = projection
         .blocks
         .iter()
         .filter(|block| !block.synthetic)
-        .max_by_key(|block| block.ordinal)
-        .map(|block| block.id.clone());
+        .max_by_key(|block| block.ordinal);
+    meta.newest_live_block_id = newest_live.map(|block| block.id.clone());
+    meta.newest_live_ordinal = newest_live.map_or(meta.newest_live_ordinal, |block| block.ordinal);
     if let Some(usage) = req.usage.as_ref().filter(|usage| usage.is_non_zero()) {
         meta.last_usage = Some(usage.clone());
     }
@@ -4595,6 +5000,7 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         revert_epoch,
         reasoning_watermark,
         mutation_exempt_mid,
+        lineage_anchor_mid: None,
         response,
     }
 }
@@ -5000,6 +5406,7 @@ fn tag_mint_inputs(
         projection,
         core,
         mutation_exempt_mid,
+        None,
         existing_tag_ids,
         None,
     )
@@ -5009,6 +5416,7 @@ fn tag_mint_inputs_from(
     projection: &FlatProjection,
     core: &CoreState,
     mutation_exempt_mid: Option<&str>,
+    lineage_anchor_mid: Option<&str>,
     existing_tag_ids: &HashSet<&str>,
     frontier_memo: Option<&mut TagMintFrontierMemo>,
 ) -> TagMintWork {
@@ -5025,7 +5433,10 @@ fn tag_mint_inputs_from(
         ..TagMintWork::default()
     };
     for block in projection.blocks.iter().skip(start) {
-        if frozen.contains(block.id.as_str()) || mutation_exempt_mid == Some(block.mid.as_str()) {
+        if frozen.contains(block.id.as_str())
+            || mutation_exempt_mid == Some(block.mid.as_str())
+            || lineage_anchor_mid == Some(block.mid.as_str())
+        {
             continue;
         }
         if existing_tag_ids.contains(block.id.as_str()) {
@@ -5616,6 +6027,7 @@ fn compute_active_overlay_decisions(
         tagging_enabled,
         temporal_enabled,
         mutation_exempt_mid,
+        lineage_anchor_mid,
     } = input;
     let tag_mint_work = {
         let existing_tag_ids = tag_rows
@@ -5634,6 +6046,7 @@ fn compute_active_overlay_decisions(
             projection,
             core,
             mutation_exempt_mid,
+            lineage_anchor_mid,
             &existing_tag_ids,
             Some(&mut memo),
         );
@@ -5666,6 +6079,7 @@ fn compute_active_overlay_decisions(
             && message.ck.role != "tool"
             && (message.ck.role != "user" || is_authored_user_message(message))
             && mutation_exempt_mid != Some(message.mid.as_str())
+            && lineage_anchor_mid != Some(message.mid.as_str())
     }) {
         let is_new = frontier.is_none_or(|frontier| message.ordinal > frontier);
         if !is_authored_user_message(message) || !is_new {
@@ -5771,6 +6185,7 @@ fn compute_active_overlay_decisions(
         .flatten()
         .filter(|message| frontier.is_none_or(|frontier| message.ordinal > frontier))
         .filter(|message| mutation_exempt_mid != Some(message.mid.as_str()))
+        .filter(|message| lineage_anchor_mid != Some(message.mid.as_str()))
         .and_then(|message| {
             let block = projection.blocks.iter().find(|block| {
                 block.mid == message.mid
@@ -6781,6 +7196,7 @@ fn new_frozen_strip_units(
     req: &TransformRequest,
     tag_numbers: &BTreeMap<String, u64>,
     is_bust_pass: bool,
+    lineage_anchor_mid: Option<&str>,
 ) -> Vec<FrozenUnit> {
     if !is_bust_pass {
         return Vec::new();
@@ -6801,7 +7217,10 @@ fn new_frozen_strip_units(
 
     for index in (0..req.messages.len()).rev() {
         let message = &req.messages[index];
-        if message.ck.meta.synthetic || message.mid.is_empty() {
+        if message.ck.meta.synthetic
+            || message.mid.is_empty()
+            || lineage_anchor_mid == Some(message.mid.as_str())
+        {
             continue;
         }
         let blocks = message.ck.content.as_slice();
@@ -7617,11 +8036,22 @@ fn build_output_with_tags_inner(
         let keep_leading_system = serializer_profile
             != Some(SerializerProfile::ClaudeCodeAnthropic)
             && is_uncovered_leading_system(msg, meta);
-        if !is_tail(msg.ordinal, output_coverage) && !keep_leading_system {
+        let keep_lineage_anchor = meta
+            .anchor_block_id
+            .as_deref()
+            .and_then(split_block_id)
+            .is_some_and(|(anchor_mid, _)| anchor_mid == msg.mid);
+        if !is_tail(msg.ordinal, output_coverage) && !keep_leading_system && !keep_lineage_anchor {
             continue;
         }
 
-        let mutation_exempt = mutation_exempt_mid == Some(msg.mid.as_str());
+        let lineage_anchor_exempt = meta
+            .anchor_block_id
+            .as_deref()
+            .and_then(split_block_id)
+            .is_some_and(|(anchor_mid, _)| anchor_mid == msg.mid);
+        let mutation_exempt =
+            mutation_exempt_mid == Some(msg.mid.as_str()) || lineage_anchor_exempt;
         let first_assistant_in_run = msg.ck.role == "assistant" && !prev_assistant;
         let blocks = blocks_by_mid
             .get(msg.mid.as_str())
@@ -8972,6 +9402,13 @@ mod tests {
             detected_context_limit_model_key: None,
             history_budget_tokens: None,
             declared_trim: None,
+            lineage_switched: false,
+            descent_edge_id: 0,
+            prior_conversation_key: String::new(),
+            prior_epoch: 0,
+            new_epoch: 0,
+            constituents: Vec::new(),
+            compaction_observed: false,
         }
     }
 
@@ -9254,7 +9691,7 @@ mod tests {
         .unwrap();
         let empty_tags: HashSet<&str> = HashSet::new();
         let full1 = tag_mint_inputs(&pass1, &core, None, &empty_tags);
-        let memo1 = tag_mint_inputs_from(&pass1, &core, None, &empty_tags, Some(&mut memo));
+        let memo1 = tag_mint_inputs_from(&pass1, &core, None, None, &empty_tags, Some(&mut memo));
         assert_same_tag_mint_work(&memo1, &full1);
         assert!(memo.frontier > 0);
 
@@ -9268,7 +9705,7 @@ mod tests {
         ])
         .unwrap();
         let full2 = tag_mint_inputs(&pass2, &core, None, &existing);
-        let memo2 = tag_mint_inputs_from(&pass2, &core, None, &existing, Some(&mut memo));
+        let memo2 = tag_mint_inputs_from(&pass2, &core, None, None, &existing, Some(&mut memo));
         assert_same_tag_mint_work(&memo2, &full2);
         assert_eq!(memo2.inputs.len(), 1, "only the appended block mints");
 
@@ -9801,6 +10238,7 @@ mod tests {
             &mutated_projection,
             &before.core,
             None,
+            None,
         )
         .unwrap();
         let mut speculative_meta = before.meta.clone();
@@ -9808,6 +10246,7 @@ mod tests {
             &mut speculative_meta,
             &mutated_request,
             &mutated_projection,
+            None,
             None,
             &re_adoptions,
         );
@@ -19380,5 +19819,328 @@ mod tests {
             cache.stats(&request.session_id),
             SerializedOutputCacheStats::default()
         );
+    }
+
+    fn seed_fake_compaction_prior(store: &McStore, key: &str) {
+        let messages = (1..=10)
+            .map(|ordinal| {
+                item(
+                    &format!("prior-{ordinal}"),
+                    ordinal,
+                    &format!("turn {ordinal}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        run(store, &req(key, "prior-cfg", messages), &spine());
+        store
+            .append_compartments(
+                key,
+                &[
+                    comp(1, 1, 3, "prior-3", "history one through three"),
+                    comp(2, 4, 6, "prior-6", "history four through six"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(store.load(key).unwrap().meta.newest_live_ordinal, 10);
+    }
+
+    fn fake_compaction_messages(date: &str, summary: &str) -> Vec<CkIngressMessage> {
+        vec![
+            wire_item(
+                "user",
+                "summary",
+                1,
+                &[
+                    &format!("<system-reminder>Today's date: {date}</system-reminder>"),
+                    summary,
+                ],
+            ),
+            wire_item("assistant", "tail", 2, &["continued answer"]),
+        ]
+    }
+
+    fn fake_compaction_request(
+        target: &str,
+        prior: &str,
+        epoch: u64,
+        edge_id: u64,
+        observed: bool,
+        messages: Vec<CkIngressMessage>,
+    ) -> TransformRequest {
+        let mut request = req(target, "descent-cfg", messages);
+        request.lineage_switched = true;
+        request.descent_edge_id = edge_id;
+        request.prior_conversation_key = prior.to_string();
+        request.prior_epoch = 1;
+        request.new_epoch = epoch;
+        request.constituents = vec![(prior.to_string(), target.to_string(), epoch)];
+        request.compaction_observed = observed;
+        request
+    }
+
+    fn continuation_summary(label: &str) -> String {
+        format!(
+            "{CONTINUATION_SUMMARY_PREFIX}.\n\nSummary:\nDurable summary {label}\n\nFull transcript: /tmp/session.jsonl"
+        )
+    }
+
+    #[test]
+    fn fake_compaction_descends_materializes_and_write_free_replay_acks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_fake_compaction_prior(&store, "A");
+        let summary = continuation_summary("alpha");
+        let request = fake_compaction_request(
+            "B",
+            "A",
+            2,
+            101,
+            true,
+            fake_compaction_messages("2026-08-06", &summary),
+        );
+        let prior_epoch = store.load("A").unwrap().meta.revert_epoch;
+
+        let first = run(&store, &request, &spine());
+        assert_eq!(first.action, "HARD");
+        assert_eq!(first.lineage_switch_consumed_id, Some(101));
+        assert_eq!(first.ordinal_continuation_base, Some(10));
+        assert_eq!(first.coverage_ordinal, Some(11));
+        assert!(!first.reconcile_pending);
+        assert_eq!(first.messages().len(), 4);
+        assert!(first.messages()[0].meta.synthetic && first.messages()[1].meta.synthetic);
+        assert!(!first.messages()[2].meta.synthetic);
+        assert_eq!(first.messages()[2].role, "user");
+        assert_eq!(first.messages()[3].role, "assistant");
+        assert!(first
+            .messages()
+            .iter()
+            .all(|message| message.role != "system"));
+        assert_eq!(
+            first.messages()[2].content[1].kind,
+            ck_wire::CkKind::Text {
+                text: summary.clone()
+            }
+        );
+        let target = store.load("B").unwrap();
+        assert!(target.meta.descent_completed);
+        assert!(target.meta.lineage_descent_materialized);
+        assert_eq!(target.meta.coverage_ordinal, Some(11));
+        assert_eq!(
+            store
+                .load_compartments("B")
+                .unwrap()
+                .iter()
+                .map(|row| (row.start_message, row.end_message))
+                .collect::<Vec<_>>(),
+            vec![(1, 3), (4, 6), (11, 11)]
+        );
+        assert_eq!(store.load("A").unwrap().meta.revert_epoch, prior_epoch + 1);
+
+        let second = run(&store, &request, &spine());
+        assert_eq!(second.action, "SOFT+");
+        assert_eq!(second.lineage_switch_consumed_id, Some(101));
+        assert!(!second.committed, "durable replay must stay write-free");
+        assert_eq!(store.load("A").unwrap().meta.revert_epoch, prior_epoch + 1);
+    }
+
+    #[test]
+    fn fake_compaction_anchor_fail_closes_but_sibling_date_and_overlays_are_exempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_fake_compaction_prior(&store, "A");
+        let summary = continuation_summary("stable");
+        let request = fake_compaction_request(
+            "B",
+            "A",
+            2,
+            201,
+            true,
+            fake_compaction_messages("2026-08-06", &summary),
+        );
+        run(&store, &request, &spine());
+
+        let mut edited = request.clone();
+        edited.render_config = "anchor-edited".to_string();
+        edited.messages[0].ck.content[1].kind = ck_wire::CkKind::Text {
+            text: continuation_summary("EDITED"),
+        };
+        edited.messages[0].ck.content[1].mark_modified();
+        let edited_response = run(&store, &edited, &spine());
+        assert_eq!(edited_response.action, "SOFT+");
+        assert!(edited_response.reconcile_pending);
+        assert_eq!(edited_response.coverage_ordinal, Some(11));
+        assert_eq!(
+            edited_response.messages().len(),
+            4,
+            "anchor edit cannot trim the tail"
+        );
+
+        let mut deleted = request.clone();
+        deleted.render_config = "anchor-deleted".to_string();
+        deleted.messages.remove(0);
+        deleted.messages[0].ordinal = 1;
+        deleted.messages[0].ck.meta.ordinal = Some(1);
+        let deleted_response = run(&store, &deleted, &spine());
+        assert_eq!(deleted_response.action, "SOFT+");
+        assert!(deleted_response.reconcile_pending);
+        assert_eq!(
+            deleted_response.messages().len(),
+            3,
+            "deleted anchor stays no-trim"
+        );
+
+        let mut rollover = request.clone();
+        rollover.render_config = "date-rollover".to_string();
+        rollover.messages = fake_compaction_messages("2026-08-07", &summary);
+        let rollover_response = run(&store, &rollover, &spine());
+        assert_eq!(rollover_response.action, "HARD");
+        assert!(!rollover_response.reconcile_pending);
+        assert_eq!(
+            rollover_response.messages()[2].content[1].kind,
+            request.messages[0].ck.content[1].kind
+        );
+
+        let mut active_surface = rollover.clone();
+        active_surface.render_config = "active-overlays-and-strips".to_string();
+        active_surface.serializer_profile = "claude-code-anthropic".to_string();
+        active_surface.tool_present = true;
+        active_surface.clear_reasoning_age = 1;
+        active_surface.protected_tags = 0;
+        let active_response = run(&store, &active_surface, &spine());
+        assert_eq!(active_response.action, "HARD");
+        assert!(!active_response.reconcile_pending);
+        assert_eq!(
+            active_response.messages()[2].content,
+            active_surface.messages[0].ck.content,
+            "the anchor message is exempt from both overlays and production strips"
+        );
+    }
+
+    #[test]
+    fn fake_compaction_recognition_and_terminal_protocol_branches_are_narrow() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_fake_compaction_prior(&store, "A");
+        let summary = continuation_summary("shape");
+
+        let missing_flag = fake_compaction_request(
+            "flag-missing",
+            "A",
+            2,
+            301,
+            false,
+            fake_compaction_messages("2026-08-06", &summary),
+        );
+        let missing_flag_response = run(&store, &missing_flag, &spine());
+        assert_eq!(missing_flag_response.lineage_switch_consumed_id, Some(301));
+        assert_eq!(
+            store
+                .load("flag-missing")
+                .unwrap()
+                .meta
+                .lineage_descent_disposition,
+            "observed_flag_missing_shape_present"
+        );
+        assert!(store.load_compartments("flag-missing").unwrap().is_empty());
+
+        let rewind = fake_compaction_request(
+            "rewind",
+            "A",
+            2,
+            302,
+            true,
+            vec![item("rewound-user", 1, "ordinary restored history")],
+        );
+        let rewind_response = run(&store, &rewind, &spine());
+        assert_eq!(rewind_response.lineage_switch_consumed_id, Some(302));
+        assert_eq!(
+            store
+                .load("rewind")
+                .unwrap()
+                .meta
+                .lineage_descent_disposition,
+            "not_compaction_shape"
+        );
+        assert!(store.load_compartments("rewind").unwrap().is_empty());
+
+        let mut wrong_position_messages = fake_compaction_messages("2026-08-06", &summary);
+        wrong_position_messages[0].ck.content.swap(0, 1);
+        let wrong_position =
+            fake_compaction_request("wrong-position", "A", 2, 303, true, wrong_position_messages);
+        run(&store, &wrong_position, &spine());
+        assert_eq!(
+            store
+                .load("wrong-position")
+                .unwrap()
+                .meta
+                .lineage_descent_disposition,
+            "not_compaction_shape",
+            "recognition must use the last text block, never content[0] or concatenation"
+        );
+
+        let mut subagent = fake_compaction_request(
+            "subagent-target",
+            "A",
+            2,
+            304,
+            true,
+            fake_compaction_messages("2026-08-06", &summary),
+        );
+        subagent.is_subagent = true;
+        let subagent_response = run(&store, &subagent, &spine());
+        assert_eq!(subagent_response.action, "PASSTHROUGH");
+        assert_eq!(subagent_response.lineage_switch_consumed_id, None);
+        assert!(store
+            .load("subagent-target")
+            .unwrap()
+            .meta
+            .lineage_descent_disposition
+            .is_empty());
+        assert_eq!(subagent_response.messages().len(), subagent.messages.len());
+
+        let mut mismatch = fake_compaction_request(
+            "resolved-target",
+            "A",
+            2,
+            305,
+            true,
+            fake_compaction_messages("2026-08-06", &summary),
+        );
+        mismatch.constituents[0].1 = "other-target".to_string();
+        let mismatch_response = run(&store, &mismatch, &spine());
+        assert_eq!(mismatch_response.action, "PASSTHROUGH");
+        assert_eq!(mismatch_response.lineage_switch_consumed_id, None);
+        assert!(store.load("resolved-target").unwrap().row_version.is_none());
+    }
+
+    #[test]
+    fn continued_lineage_missing_boundary_aborts_instead_of_rebasing_to_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_fake_compaction_prior(&store, "A");
+        let request = fake_compaction_request(
+            "B",
+            "A",
+            2,
+            401,
+            true,
+            fake_compaction_messages("2026-08-06", &continuation_summary("fallback")),
+        );
+        run(&store, &request, &spine());
+        store
+            .replace_compartments(
+                "B",
+                &[
+                    comp(1, 1, 3, "prior-3", "history one through three"),
+                    comp(2, 4, 6, "prior-6", "history four through six"),
+                ],
+            )
+            .unwrap();
+        let error =
+            transform(&store, &request, &pctx("git:proj", "/nonexistent-docs", 0)).unwrap_err();
+        assert!(matches!(error, TransformError::LineageProtocol(_)));
+        assert!(error
+            .to_string()
+            .contains("refusing silent re-base-to-1 fallback"));
     }
 }

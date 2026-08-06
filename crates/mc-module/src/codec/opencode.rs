@@ -20,12 +20,23 @@ pub type MessageV2Json = Value;
 const HARNESS: &str = "opencode";
 
 pub fn decode_opencode(messages: &[MessageV2Json]) -> DecodedHarnessMessages {
-    decode_opencode_with_sidecar(messages, None)
+    decode_opencode_with_sidecar_and_base(messages, None, 0)
 }
 
 pub fn decode_opencode_with_sidecar(
     messages: &[MessageV2Json],
     prior: Option<&DecodeSidecar>,
+) -> DecodedHarnessMessages {
+    decode_opencode_with_sidecar_and_base(messages, prior, 0)
+}
+
+/// Decode a wholly fresh OpenCode array in the absolute ordinal space inherited from a
+/// completed lineage descent. Explicit absolute ordinals win; otherwise the positional
+/// fallback starts after `provisional_base` instead of silently restarting at one.
+pub fn decode_opencode_with_sidecar_and_base(
+    messages: &[MessageV2Json],
+    prior: Option<&DecodeSidecar>,
+    provisional_base: u64,
 ) -> DecodedHarnessMessages {
     let mut sidecar = DecodeSidecar::new(HARNESS);
     if let Some(prior) = prior {
@@ -36,8 +47,16 @@ pub fn decode_opencode_with_sidecar(
     let mut boundary = None;
 
     for (message_index, raw_message) in messages.iter().enumerate() {
-        let ordinal = (message_index + 1) as u64;
         let info = raw_message.get("info").unwrap_or(raw_message);
+        let explicit_ordinal = raw_message
+            .get("absolute_ordinal")
+            .and_then(Value::as_u64)
+            .or_else(|| info.get("absolute_ordinal").and_then(Value::as_u64));
+        let ordinal = explicit_ordinal.unwrap_or_else(|| {
+            provisional_base
+                .saturating_add(message_index as u64)
+                .saturating_add(1)
+        });
         let stable_key = string_field(info, "id")
             .or_else(|| string_field(raw_message, "id"))
             .unwrap_or_else(|| format!("opencode-hash-{}", stable_hash_prefix(raw_message, 24)));
@@ -228,7 +247,10 @@ pub fn encode_opencode(
     sidecar: &DecodeSidecar,
     mutation_exempt_mid: Option<&str>,
 ) -> Vec<MessageV2Json> {
-    encode_opencode_impl(messages, sidecar, None, false, mutation_exempt_mid)
+    match mutation_exempt_mid {
+        Some(mid) => encode_opencode_impl(messages, sidecar, None, false, &[mid]),
+        None => encode_opencode_impl(messages, sidecar, None, false, &[]),
+    }
 }
 
 /// Encode CK messages back to OpenCode while optionally supplying the session id used by
@@ -241,7 +263,19 @@ pub fn encode_opencode_with_session(
     session_id: Option<&str>,
     mutation_exempt_mid: Option<&str>,
 ) -> Vec<MessageV2Json> {
-    encode_opencode_impl(messages, sidecar, session_id, true, mutation_exempt_mid)
+    match mutation_exempt_mid {
+        Some(mid) => encode_opencode_impl(messages, sidecar, session_id, true, &[mid]),
+        None => encode_opencode_impl(messages, sidecar, session_id, true, &[]),
+    }
+}
+
+pub fn encode_opencode_with_session_exemptions(
+    messages: &[CkWireMessage],
+    sidecar: &DecodeSidecar,
+    session_id: Option<&str>,
+    mutation_exempt_mids: &[&str],
+) -> Vec<MessageV2Json> {
+    encode_opencode_impl(messages, sidecar, session_id, true, mutation_exempt_mids)
 }
 
 fn encode_opencode_impl(
@@ -249,7 +283,7 @@ fn encode_opencode_impl(
     sidecar: &DecodeSidecar,
     session_id: Option<&str>,
     preserve_compaction: bool,
-    mutation_exempt_mid: Option<&str>,
+    mutation_exempt_mids: &[&str],
 ) -> Vec<MessageV2Json> {
     let mut encoded = Vec::with_capacity(messages.len());
     let mut index = 0;
@@ -282,7 +316,7 @@ fn encode_opencode_impl(
         // native envelope to a fresh module-authored m0/m1 message.
         let meta = meta_for_ck(sidecar, msg, index);
         encoded.push(match meta {
-            Some(meta) if mutation_exempt_mid == Some(meta.mid.as_str()) => meta.raw.clone(),
+            Some(meta) if mutation_exempt_mids.contains(&meta.mid.as_str()) => meta.raw.clone(),
             Some(meta) => encode_with_meta(msg, meta, preserve_compaction),
             None => encode_new_message(msg, session_id),
         });
@@ -1705,6 +1739,46 @@ mod tests {
         assert_eq!(served[1]["parts"][3], raw[1]["parts"][3]);
         assert_eq!(served[1]["parts"][2]["text"], "§7§ mutated latest answer");
         assert_eq!(served[1]["info"]["providerField"], "keep");
+    }
+
+    #[test]
+    fn lineage_anchor_and_live_assistant_exemptions_replay_native_envelopes_exactly() {
+        let raw = vec![
+            json!({
+                "info": { "id": "summary", "role": "user", "providerField": "anchor-info" },
+                "parts": [
+                    { "type": "text", "text": "volatile date", "providerField": "date-part" },
+                    { "type": "text", "text": "continuation summary", "providerField": "anchor-part" }
+                ]
+            }),
+            json!({
+                "info": { "id": "latest", "role": "assistant", "providerField": "live-info" },
+                "parts": [
+                    { "type": "reasoning", "text": "signed", "metadata": { "signature": "sig" } },
+                    { "type": "text", "text": "answer", "providerField": "live-part" }
+                ]
+            }),
+        ];
+        let decoded = decode_opencode(&raw);
+        let mut output = decoded
+            .messages
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        output[0].content[1].kind = CkKind::Text {
+            text: "overlay must not escape".to_string(),
+        };
+        output[1].content[1].kind = CkKind::Text {
+            text: "strip must not escape".to_string(),
+        };
+
+        let served = encode_opencode_with_session_exemptions(
+            &output,
+            &decoded.sidecar,
+            Some("ses_live"),
+            &["summary", "latest"],
+        );
+        assert_eq!(served, raw);
     }
 
     #[test]

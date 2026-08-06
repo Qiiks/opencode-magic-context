@@ -3168,10 +3168,27 @@ impl McHandler {
             .timings
             .tokenized_blocks
             .saturating_add(tokenized_blocks);
-        let last_compartment_end_ordinal = store
-            .max_compartment_end_ordinal(&parsed.session_id)
-            .ok()
-            .and_then(|ordinal| (ordinal > 0).then_some(ordinal as u64));
+        let compartment_end_result = store.max_compartment_end_ordinal(&parsed.session_id);
+        let last_compartment_end_ordinal = match compartment_end_result {
+            Ok(ordinal) if ordinal > 0 => Some(ordinal as u64),
+            Ok(_) | Err(_) if loaded.meta.ordinal_continuation_base.is_some() => {
+                let detail = "continued_ordinal_offset_missing";
+                eprintln!(
+                    "mc-module: aborting historian trigger for {}: {detail}",
+                    parsed.session_id
+                );
+                self.record_no_fire(&store, &parsed.session_id, &loaded, detail);
+                return PreparedHistorianAction::Complete(HistorianDiagnostics {
+                    fired: false,
+                    reason: None,
+                    no_fire: Some(detail.to_string()),
+                    state,
+                    progress: None,
+                    last_failure,
+                });
+            }
+            Ok(_) | Err(_) => None,
+        };
         let (context_limit, input_tokens, usage_percentage) = usage_numbers(parsed.usage.as_ref());
         let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile)
             .expect("serializer_profile validated upstream");
@@ -4387,6 +4404,9 @@ impl McHandler {
         } else {
             "inactive"
         };
+        let descent_counters = &loaded.meta.lineage_descent_counters;
+        let descent_pending_build_skew = descent_counters.pending_build_skew;
+        let descent_pending_no_responses = descent_counters.pending_no_responses;
         let historian = historian_status_summary(&loaded.meta.historian);
         let consecutive_publish_failures = loaded.meta.historian.consecutive_publish_failures;
         let publish_health = if consecutive_publish_failures >= 3 {
@@ -4484,6 +4504,25 @@ impl McHandler {
             // `last_divergence` field so stable status reads cannot imply a fresh bust.
             "pass_trace": pass_trace,
             "tail_identity_re_adopt_count": loaded.meta.tail_identity_re_adopt_count,
+            "fake_compaction": {
+                "compaction_seen": descent_counters.compaction_seen,
+                "compaction_answered": descent_counters.compaction_answered,
+                "fork_arm": descent_counters.fork_arm,
+                "descent_pending": {
+                    "build_skew": descent_pending_build_skew,
+                    "no_responses": descent_pending_no_responses,
+                },
+                "dispositions": {
+                    "descended": descent_counters.descended,
+                    "unknown_ancestor": descent_counters.unknown_ancestor,
+                    "already_bootstrapped": descent_counters.already_bootstrapped,
+                    "not_compaction_shape": descent_counters.not_compaction_shape,
+                    "observed_flag_missing_shape_present": descent_counters.observed_flag_missing_shape_present,
+                    "cycle_detected": descent_counters.cycle_detected,
+                },
+                "last_disposition": loaded.meta.lineage_descent_disposition,
+                "descent_completed": loaded.meta.descent_completed,
+            },
             "epochs": {
                 "memory_render_epoch": MEMORY_RENDER_FORMAT_EPOCH,
                 "compartment_render_epoch": COMPARTMENT_RENDER_FORMAT_EPOCH,
@@ -6137,6 +6176,7 @@ impl McHandler {
         let revert_epoch = result.revert_epoch;
         let reasoning_watermark = result.reasoning_watermark;
         let mutation_exempt_mid = result.mutation_exempt_mid;
+        let lineage_anchor_mid = result.lineage_anchor_mid;
         let tag_numbers = result.tag_numbers;
         let mut response = result.response;
         if response.committed {
@@ -6153,6 +6193,7 @@ impl McHandler {
                 reasoning_watermark,
                 &tag_numbers,
                 mutation_exempt_mid.as_deref(),
+                lineage_anchor_mid.as_deref(),
             );
         }
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
@@ -9032,6 +9073,7 @@ fn attach_native_messages(
         reasoning_watermark,
         &std::collections::BTreeMap::new(),
         mutation_exempt_mid,
+        None,
     );
 }
 
@@ -9060,6 +9102,7 @@ fn attach_native_messages_with_tags(
     reasoning_watermark: u64,
     tag_numbers: &std::collections::BTreeMap<String, u64>,
     mutation_exempt_mid: Option<&str>,
+    lineage_anchor_mid: Option<&str>,
 ) {
     if !request.serve_native {
         return;
@@ -9075,11 +9118,15 @@ fn attach_native_messages_with_tags(
         .iter()
         .map(|message| message.deref().clone())
         .collect::<Vec<_>>();
-    let mut native_messages = codec::encode_opencode_with_session(
+    let mutation_exempt_mids = [mutation_exempt_mid, lineage_anchor_mid]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let mut native_messages = codec::encode_opencode_with_session_exemptions(
         &served_messages,
         &sidecar,
         Some(&request.session_id),
-        mutation_exempt_mid,
+        &mutation_exempt_mids,
     );
     if let Some(profile) = SerializerProfile::parse(&request.serializer_profile) {
         transform::clear_served_native_reasoning_with_tags(
@@ -13217,6 +13264,7 @@ mod tests {
             reasoning_watermark,
             &old_tag_numbers,
             None,
+            None,
         );
         assert_eq!(replay.native_messages, Some(actual_native));
     }
@@ -16512,6 +16560,11 @@ mod tests {
         assert!(session_status["pass_trace"]["first_divergence"].is_null());
         assert!(session_status["pass_trace"]["last_divergence"].is_string());
         assert_eq!(session_status["epochs"]["state_sync_deltas"], json!(true));
+        assert_eq!(
+            session_status["fake_compaction"]["descent_pending"],
+            json!({ "build_skew": 0, "no_responses": 0 })
+        );
+        assert!(session_status["fake_compaction"]["dispositions"]["descended"].is_number());
     }
 
     #[tokio::test(flavor = "current_thread")]

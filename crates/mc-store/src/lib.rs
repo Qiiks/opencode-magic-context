@@ -2825,6 +2825,174 @@ pub struct DeferredExecuteState {
     pub reason: String,
 }
 
+/// Durable counters for fake-compaction lineage handling. Keeping them in the cache meta
+/// blob makes status reads consistent with the terminal disposition they describe.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineageDescentCounters {
+    #[serde(default)]
+    pub compaction_seen: u64,
+    #[serde(default)]
+    pub compaction_answered: u64,
+    #[serde(default)]
+    pub fork_arm: u64,
+    #[serde(default)]
+    pub descended: u64,
+    #[serde(default)]
+    pub unknown_ancestor: u64,
+    #[serde(default)]
+    pub already_bootstrapped: u64,
+    #[serde(default)]
+    pub not_compaction_shape: u64,
+    #[serde(default)]
+    pub observed_flag_missing_shape_present: u64,
+    #[serde(default)]
+    pub cycle_detected: u64,
+    #[serde(default)]
+    pub pending_build_skew: u64,
+    #[serde(default)]
+    pub pending_no_responses: u64,
+}
+
+/// One hop in a composed lineage edge. `epoch` is the epoch of `new_key`; the prior
+/// node's epoch is the edge's `prior_epoch` for the first hop and the preceding hop's
+/// epoch thereafter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineageConstituent {
+    pub prior_key: String,
+    pub new_key: String,
+    pub epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineageAnchor {
+    pub block_id: String,
+    pub message_id: String,
+    pub content_hash: String,
+    pub ordinal: u64,
+}
+
+/// Input to the single fenced lineage operation. Recognition is performed by mc-module
+/// over canonical pre-overlay blocks; the store owns source selection, validation, copy,
+/// terminal recording, and the prior-lineage publish fence.
+pub struct LineageDescentRequest<'a> {
+    pub target_key: &'a str,
+    pub expected_target_row_version: Option<u64>,
+    pub edge_id: u64,
+    pub prior_key: &'a str,
+    pub prior_epoch: u64,
+    pub new_epoch: u64,
+    pub constituents: &'a [LineageConstituent],
+    pub compaction_observed: bool,
+    pub anchor: Option<&'a LineageAnchor>,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineageDescentDisposition {
+    Descended,
+    UnknownAncestor,
+    AlreadyBootstrapped,
+    NotCompactionShape,
+    ObservedFlagMissingShapePresent,
+    CycleDetected,
+    PendingBuildSkew,
+    Replay,
+}
+
+impl LineageDescentDisposition {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Descended => "descended",
+            Self::UnknownAncestor => "unknown_ancestor",
+            Self::AlreadyBootstrapped => "already_bootstrapped",
+            Self::NotCompactionShape => "not_compaction_shape",
+            Self::ObservedFlagMissingShapePresent => "observed_flag_missing_shape_present",
+            Self::CycleDetected => "cycle_detected",
+            Self::PendingBuildSkew => "pending_build_skew",
+            Self::Replay => "replay",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LineageDescentOutcome {
+    pub loaded: LoadedState,
+    pub disposition: LineageDescentDisposition,
+    pub source_key: Option<String>,
+    pub prior_last_ordinal: Option<u64>,
+    /// True only while the copied state still requires the hard, state-committing pass that
+    /// consumes this lineage edge.
+    pub materialization_required: bool,
+    /// A terminal record was observed durably for this target and may be acknowledged
+    /// after the transform returns successfully.
+    pub acknowledge: bool,
+}
+
+fn record_lineage_disposition(
+    meta: &mut ModuleMeta,
+    target_key: &str,
+    edge_id: u64,
+    disposition: &LineageDescentDisposition,
+    source_key: Option<&str>,
+    prior_last_ordinal: Option<u64>,
+    completed: bool,
+) {
+    meta.lineage_descent_target_key = target_key.to_string();
+    meta.lineage_descent_edge_id = edge_id;
+    meta.lineage_descent_disposition = disposition.as_str().to_string();
+    meta.lineage_descent_source_key = source_key.map(str::to_string);
+    meta.ordinal_continuation_base = prior_last_ordinal;
+    meta.descent_completed = completed;
+    meta.lineage_descent_counters.compaction_seen = meta
+        .lineage_descent_counters
+        .compaction_seen
+        .saturating_add(1);
+    meta.lineage_descent_counters.compaction_answered = meta
+        .lineage_descent_counters
+        .compaction_answered
+        .saturating_add(1);
+    match disposition {
+        LineageDescentDisposition::Descended => {
+            meta.lineage_descent_counters.fork_arm =
+                meta.lineage_descent_counters.fork_arm.saturating_add(1);
+            meta.lineage_descent_counters.descended =
+                meta.lineage_descent_counters.descended.saturating_add(1);
+        }
+        LineageDescentDisposition::UnknownAncestor => {
+            meta.lineage_descent_counters.unknown_ancestor = meta
+                .lineage_descent_counters
+                .unknown_ancestor
+                .saturating_add(1);
+        }
+        LineageDescentDisposition::AlreadyBootstrapped => {
+            meta.lineage_descent_counters.already_bootstrapped = meta
+                .lineage_descent_counters
+                .already_bootstrapped
+                .saturating_add(1);
+        }
+        LineageDescentDisposition::NotCompactionShape => {
+            meta.lineage_descent_counters.not_compaction_shape = meta
+                .lineage_descent_counters
+                .not_compaction_shape
+                .saturating_add(1);
+        }
+        LineageDescentDisposition::ObservedFlagMissingShapePresent => {
+            meta.lineage_descent_counters
+                .observed_flag_missing_shape_present = meta
+                .lineage_descent_counters
+                .observed_flag_missing_shape_present
+                .saturating_add(1);
+        }
+        LineageDescentDisposition::CycleDetected => {
+            meta.lineage_descent_counters.cycle_detected = meta
+                .lineage_descent_counters
+                .cycle_detected
+                .saturating_add(1);
+        }
+        LineageDescentDisposition::PendingBuildSkew | LineageDescentDisposition::Replay => {}
+    }
+}
+
 /// A TypeScript-owned compaction marker waiting for the consuming transform pass.
 /// The module retains the marker during a TS-to-Rust transition so a restart cannot
 /// silently lose the pending boundary reconciliation.
@@ -3159,6 +3327,41 @@ pub struct ModuleMeta {
     /// Pending TypeScript compaction marker retained across authority transitions.
     #[serde(default)]
     pub pending_compaction_marker: Option<PendingCompactionMarkerState>,
+
+    // --- fake-compaction lineage descent ---
+    /// Highest real live ordinal observed on this lineage. Descent uses this durable tail,
+    /// rather than compacted coverage, as the provisional base for the replacement array.
+    #[serde(default)]
+    pub newest_live_ordinal: u64,
+    /// A successful cross-lineage copy wrote the real boundary row for this key. Terminal
+    /// refusal records deliberately leave this false so they are never selected as copy sources.
+    #[serde(default)]
+    pub descent_completed: bool,
+    /// Target key and edge whose durable terminal record makes response-loss retries ackable.
+    #[serde(default)]
+    pub lineage_descent_target_key: String,
+    #[serde(default)]
+    pub lineage_descent_edge_id: u64,
+    #[serde(default)]
+    pub lineage_descent_disposition: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage_descent_source_key: Option<String>,
+    /// Prior lineage's final ordinal. New-array ordinals start immediately after this base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinal_continuation_base: Option<u64>,
+    /// The summary block is the durable mutation/trim anchor, not the mutable whole message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_block_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_content_hash: Option<String>,
+    /// The fenced copy commits before transform composition. The materialized flag is set only
+    /// by the hard pass that consumes the copy; if the process crashes between those steps,
+    /// replay must materialize the copied state again.
+    #[serde(default)]
+    pub lineage_descent_materialized: bool,
+    #[serde(default)]
+    pub lineage_descent_counters: LineageDescentCounters,
+
     /// Channel-2 host lease state copied from the TypeScript session metadata.
     #[serde(default)]
     pub channel2_nudge_state: String,
@@ -4349,6 +4552,14 @@ enum AbandonHistorianTxnOutcome {
 enum TruncateTxnOutcome {
     Committed(TruncateOutcome),
     CasConflict(u64),
+    Serde(String),
+}
+
+#[allow(clippy::large_enum_variant)]
+enum LineageDescentTxnOutcome {
+    Committed(LineageDescentOutcome),
+    CasConflict(u64),
+    Invalid(String),
     Serde(String),
 }
 
@@ -8678,6 +8889,632 @@ impl McStore {
             Ok(v)
         })?;
         Ok(exists != 0)
+    }
+
+    /// Resolve and persist one fake-compaction lineage edge under the store's writer fence.
+    /// The method owns every row participating in adoption so callers cannot observe a copied
+    /// compartment set without its marker, anchor, ordinal base, or prior-lineage publish fence.
+    pub fn descend_lineage(
+        &self,
+        request: LineageDescentRequest<'_>,
+    ) -> Result<LineageDescentOutcome, McStoreError> {
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            let current_target = tx
+                .query_row(
+                    "SELECT row_version, core_state, meta FROM mc_cache_state WHERE session_id = ?1",
+                    params![request.target_key],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let current_target_version = current_target
+                .as_ref()
+                .map_or(NO_ROW, |(version, _, _)| *version);
+            let cas_ok = match request.expected_target_row_version {
+                Some(expected) => current_target_version == expected as i64,
+                None => current_target_version == NO_ROW,
+            };
+            if !cas_ok {
+                return Ok(LineageDescentTxnOutcome::CasConflict(
+                    current_target_version.max(0) as u64,
+                ));
+            }
+
+            let (mut target_core, mut target_meta) = match current_target.as_ref() {
+                Some((_, core_json, meta_json)) => {
+                    let core = match serde_json::from_str(core_json) {
+                        Ok(core) => core,
+                        Err(error) => {
+                            return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
+                        }
+                    };
+                    let meta = match serde_json::from_str(meta_json) {
+                        Ok(meta) => meta,
+                        Err(error) => {
+                            return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
+                        }
+                    };
+                    (core, meta)
+                }
+                None => (CoreState::default(), ModuleMeta::default()),
+            };
+
+            if !target_meta.lineage_descent_disposition.is_empty()
+                && target_meta.lineage_descent_target_key == request.target_key
+            {
+                return Ok(LineageDescentTxnOutcome::Committed(LineageDescentOutcome {
+                    source_key: target_meta.lineage_descent_source_key.clone(),
+                    prior_last_ordinal: target_meta.ordinal_continuation_base,
+                    materialization_required: target_meta.descent_completed
+                        && !target_meta.lineage_descent_materialized,
+                    acknowledge: true,
+                    disposition: LineageDescentDisposition::Replay,
+                    loaded: LoadedState {
+                        core: target_core,
+                        meta: target_meta,
+                        row_version: Some(current_target_version.max(0) as u64),
+                    },
+                }));
+            }
+
+            let mut path_is_cycle = request.new_epoch <= request.prior_epoch;
+            let mut path_is_contiguous = true;
+            let mut visited = HashSet::<(String, u64)>::new();
+            visited.insert((request.prior_key.to_string(), request.prior_epoch));
+            let mut previous_key = request.prior_key;
+            let mut previous_epoch = request.prior_epoch;
+            for hop in request.constituents {
+                if hop.prior_key != previous_key || hop.epoch <= previous_epoch {
+                    path_is_contiguous = false;
+                    path_is_cycle = true;
+                    break;
+                }
+                if !visited.insert((hop.new_key.clone(), hop.epoch)) {
+                    path_is_cycle = true;
+                    break;
+                }
+                previous_key = &hop.new_key;
+                previous_epoch = hop.epoch;
+            }
+            if !request.constituents.is_empty()
+                && (previous_key != request.target_key || previous_epoch != request.new_epoch)
+            {
+                path_is_contiguous = false;
+            }
+            if !path_is_contiguous && !path_is_cycle {
+                return Ok(LineageDescentTxnOutcome::Invalid(
+                    "lineage constituent path is not contiguous with the composed edge".to_string(),
+                ));
+            }
+
+            let terminal = if !target_core.boundary_id.trim().is_empty() {
+                Some(LineageDescentDisposition::AlreadyBootstrapped)
+            } else if path_is_cycle {
+                Some(LineageDescentDisposition::CycleDetected)
+            } else if request.anchor.is_none() {
+                Some(LineageDescentDisposition::NotCompactionShape)
+            } else if !request.compaction_observed {
+                Some(LineageDescentDisposition::ObservedFlagMissingShapePresent)
+            } else {
+                None
+            };
+
+            if let Some(disposition) = terminal {
+                record_lineage_disposition(
+                    &mut target_meta,
+                    request.target_key,
+                    request.edge_id,
+                    &disposition,
+                    None,
+                    None,
+                    false,
+                );
+                let next_version = current_target_version.max(0) as u64 + 1;
+                let core_json = match serde_json::to_string(&target_core) {
+                    Ok(json) => json,
+                    Err(error) => {
+                        return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
+                    }
+                };
+                let meta_json = match serde_json::to_string(&target_meta) {
+                    Ok(json) => json,
+                    Err(error) => {
+                        return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
+                    }
+                };
+                tx.execute(
+                    "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                         row_version = excluded.row_version,
+                         core_state = excluded.core_state,
+                         meta = excluded.meta,
+                         last_activity_at = excluded.last_activity_at",
+                    params![
+                        request.target_key,
+                        next_version as i64,
+                        core_json,
+                        meta_json,
+                        request.now_ms
+                    ],
+                )?;
+                return Ok(LineageDescentTxnOutcome::Committed(LineageDescentOutcome {
+                    loaded: LoadedState {
+                        core: target_core,
+                        meta: target_meta,
+                        row_version: Some(next_version),
+                    },
+                    disposition,
+                    source_key: None,
+                    prior_last_ordinal: None,
+                    materialization_required: false,
+                    acknowledge: true,
+                }));
+            }
+
+            let mut source_key = None;
+            for hop in request.constituents.iter().rev() {
+                let candidate = hop.prior_key.as_str();
+                let candidate_meta = tx
+                    .query_row(
+                        "SELECT meta FROM mc_cache_state WHERE session_id = ?1",
+                        params![candidate],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let Some(candidate_meta) = candidate_meta else {
+                    continue;
+                };
+                let candidate_meta: ModuleMeta = match serde_json::from_str(&candidate_meta) {
+                    Ok(meta) => meta,
+                    Err(error) => {
+                        return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
+                    }
+                };
+                if candidate_meta.descent_completed {
+                    source_key = Some(candidate.to_string());
+                    break;
+                }
+            }
+            if source_key.is_none() {
+                let root_exists = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM mc_cache_state WHERE session_id = ?1)",
+                        params![request.prior_key],
+                        |row| row.get::<_, i64>(0),
+                    )?
+                    != 0;
+                if root_exists {
+                    source_key = Some(request.prior_key.to_string());
+                }
+            }
+
+            let Some(source_key) = source_key else {
+                let disposition = LineageDescentDisposition::UnknownAncestor;
+                record_lineage_disposition(
+                    &mut target_meta,
+                    request.target_key,
+                    request.edge_id,
+                    &disposition,
+                    None,
+                    None,
+                    false,
+                );
+                let next_version = current_target_version.max(0) as u64 + 1;
+                let core_json = match serde_json::to_string(&target_core) {
+                    Ok(json) => json,
+                    Err(error) => {
+                        return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
+                    }
+                };
+                let meta_json = match serde_json::to_string(&target_meta) {
+                    Ok(json) => json,
+                    Err(error) => {
+                        return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
+                    }
+                };
+                tx.execute(
+                    "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                         row_version = excluded.row_version,
+                         core_state = excluded.core_state,
+                         meta = excluded.meta,
+                         last_activity_at = excluded.last_activity_at",
+                    params![
+                        request.target_key,
+                        next_version as i64,
+                        core_json,
+                        meta_json,
+                        request.now_ms
+                    ],
+                )?;
+                return Ok(LineageDescentTxnOutcome::Committed(LineageDescentOutcome {
+                    loaded: LoadedState {
+                        core: target_core,
+                        meta: target_meta,
+                        row_version: Some(next_version),
+                    },
+                    disposition,
+                    source_key: None,
+                    prior_last_ordinal: None,
+                    materialization_required: false,
+                    acknowledge: true,
+                }));
+            };
+
+            let source_row = tx
+                .query_row(
+                    "SELECT core_state, meta FROM mc_cache_state WHERE session_id = ?1",
+                    params![source_key],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let Some((source_core_json, source_meta_json)) = source_row else {
+                return Ok(LineageDescentTxnOutcome::Invalid(
+                    "selected lineage source disappeared inside the fenced transaction".to_string(),
+                ));
+            };
+            let source_core: CoreState = match serde_json::from_str(&source_core_json) {
+                Ok(core) => core,
+                Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
+            };
+            let source_meta: ModuleMeta = match serde_json::from_str(&source_meta_json) {
+                Ok(meta) => meta,
+                Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
+            };
+            let prior_last = source_meta.newest_live_ordinal;
+            if prior_last == 0 {
+                target_meta.lineage_descent_target_key = request.target_key.to_string();
+                target_meta.lineage_descent_edge_id = request.edge_id;
+                target_meta.lineage_descent_counters.compaction_seen = target_meta
+                    .lineage_descent_counters
+                    .compaction_seen
+                    .saturating_add(1);
+                target_meta
+                    .lineage_descent_counters
+                    .pending_build_skew = target_meta
+                    .lineage_descent_counters
+                    .pending_build_skew
+                    .saturating_add(1);
+                let next_version = current_target_version.max(0) as u64 + 1;
+                let core_json = match serde_json::to_string(&target_core) {
+                    Ok(json) => json,
+                    Err(error) => {
+                        return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
+                    }
+                };
+                let meta_json = match serde_json::to_string(&target_meta) {
+                    Ok(json) => json,
+                    Err(error) => {
+                        return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
+                    }
+                };
+                tx.execute(
+                    "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                         row_version = excluded.row_version,
+                         core_state = excluded.core_state,
+                         meta = excluded.meta,
+                         last_activity_at = excluded.last_activity_at",
+                    params![
+                        request.target_key,
+                        next_version as i64,
+                        core_json,
+                        meta_json,
+                        request.now_ms
+                    ],
+                )?;
+                return Ok(LineageDescentTxnOutcome::Committed(LineageDescentOutcome {
+                    loaded: LoadedState {
+                        core: target_core,
+                        meta: target_meta,
+                        row_version: Some(next_version),
+                    },
+                    disposition: LineageDescentDisposition::PendingBuildSkew,
+                    source_key: Some(source_key),
+                    prior_last_ordinal: None,
+                    materialization_required: false,
+                    acknowledge: false,
+                }));
+            }
+
+            let mut statement = tx.prepare(
+                "SELECT sequence, start_message, end_message
+                   FROM mc_compartments
+                  WHERE session_id = ?1
+                  ORDER BY sequence ASC",
+            )?;
+            let ranges = statement
+                .query_map(params![source_key], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            let prior_last_i64 = match i64::try_from(prior_last) {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(LineageDescentTxnOutcome::Invalid(
+                        "prior lineage ordinal exceeds SQLite range".to_string(),
+                    ))
+                }
+            };
+            let mut previous_end = None;
+            for (_, start, end) in &ranges {
+                if *start > *end
+                    || *end > prior_last_i64
+                    || previous_end.is_some_and(|previous| *start <= previous)
+                {
+                    return Ok(LineageDescentTxnOutcome::Invalid(format!(
+                        "descent range validation failed: [{start},{end}] after {previous_end:?}, prior_last={prior_last}"
+                    )));
+                }
+                previous_end = Some(*end);
+            }
+            let anchor = request.anchor.expect("eligible descent has an anchor");
+            let placeholder_ordinal = match prior_last.checked_add(1) {
+                Some(value) => value,
+                None => {
+                    return Ok(LineageDescentTxnOutcome::Invalid(
+                        "prior lineage ordinal overflow".to_string(),
+                    ))
+                }
+            };
+            if anchor.ordinal != 1 && anchor.ordinal != placeholder_ordinal {
+                return Ok(LineageDescentTxnOutcome::Invalid(format!(
+                    "descent anchor {} has ordinal {}, expected fresh ordinal 1 or continued ordinal {}",
+                    anchor.block_id, anchor.ordinal, placeholder_ordinal
+                )));
+            }
+            let placeholder_ordinal_i64 = match i64::try_from(placeholder_ordinal) {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(LineageDescentTxnOutcome::Invalid(
+                        "placeholder ordinal exceeds SQLite range".to_string(),
+                    ))
+                }
+            };
+            let placeholder_sequence = ranges
+                .last()
+                .map_or(1, |(sequence, _, _)| sequence.saturating_add(1));
+
+            // Prepare every fallible blob mutation before the first row copy. From this point
+            // onward any SQL failure unwinds the fenced transaction instead of returning a
+            // success-shaped validation outcome that could commit a partial adoption.
+            let prior_row = tx
+                .query_row(
+                    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
+                    params![request.prior_key],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let Some((prior_version, prior_meta_json)) = prior_row else {
+                return Ok(LineageDescentTxnOutcome::Invalid(
+                    "root prior lineage has no cache state for the publish fence".to_string(),
+                ));
+            };
+            let mut prior_meta: ModuleMeta = match serde_json::from_str(&prior_meta_json) {
+                Ok(meta) => meta,
+                Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
+            };
+            prior_meta.revert_epoch = prior_meta.revert_epoch.saturating_add(1);
+            prior_meta.last_recut = Some(format!(
+                "lineage descent edge {} fenced prior key at epoch {}",
+                request.edge_id, prior_meta.revert_epoch
+            ));
+            let prior_meta_json = match serde_json::to_string(&prior_meta) {
+                Ok(json) => json,
+                Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
+            };
+
+            target_core = source_core;
+            target_core.boundary_id = anchor.block_id.clone();
+            target_core.reconcile_pending = false;
+            target_meta = source_meta;
+            target_meta.coverage_ordinal = Some(placeholder_ordinal);
+            target_meta.coverage_compartment_seq = Some(placeholder_sequence);
+            target_meta.newest_live_ordinal = prior_last;
+            target_meta.historian = HistorianDurableState::default();
+            target_meta.pending_rewrite = None;
+            target_meta.pending_rewrite_trip_count = 0;
+            target_meta.pending_rewrite_ambiguous = false;
+            target_meta.pending_rewrite_last_failure = None;
+            target_meta.served_output_fingerprint.clear();
+            target_meta.anchor_block_id = Some(anchor.block_id.clone());
+            target_meta.anchor_content_hash = Some(anchor.content_hash.clone());
+            target_meta.ordinal_continuation_base = Some(prior_last);
+            target_meta.lineage_descent_materialized = false;
+            record_lineage_disposition(
+                &mut target_meta,
+                request.target_key,
+                request.edge_id,
+                &LineageDescentDisposition::Descended,
+                Some(&source_key),
+                Some(prior_last),
+                true,
+            );
+            let next_target_version = current_target_version.max(0) as u64 + 1;
+            let target_core_json = match serde_json::to_string(&target_core) {
+                Ok(json) => json,
+                Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
+            };
+            let target_meta_json = match serde_json::to_string(&target_meta) {
+                Ok(json) => json,
+                Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
+            };
+
+            for table in [
+                "mc_chunk_transcripts",
+                "mc_compartments",
+                "mc_tags",
+                "mc_temporal_marks",
+                "mc_user_hints",
+                "mc_channel1_appends",
+                "mc_overlay_frontiers",
+            ] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE session_id = ?1"),
+                    params![request.target_key],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO mc_compartments (
+                     session_id, sequence, start_message, end_message, start_message_id,
+                     end_message_id, start_date, end_date, title, content, p1, p2, p3, p4,
+                     importance, episode_type, legacy, created_at
+                 )
+                 SELECT ?1, sequence, start_message, end_message, start_message_id,
+                        end_message_id, start_date, end_date, title, content, p1, p2, p3, p4,
+                        importance, episode_type, legacy, created_at
+                   FROM mc_compartments WHERE session_id = ?2",
+                params![request.target_key, source_key],
+            )?;
+            tx.execute(
+                "INSERT INTO mc_chunk_transcripts (
+                     session_id, compartment_seq, start_ordinal, end_ordinal,
+                     transcript_deflate, created_at_ms
+                 )
+                 SELECT ?1, compartment_seq, start_ordinal, end_ordinal,
+                        transcript_deflate, created_at_ms
+                   FROM mc_chunk_transcripts WHERE session_id = ?2",
+                params![request.target_key, source_key],
+            )?;
+            tx.execute(
+                "INSERT INTO mc_tags (
+                     session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes
+                 )
+                 SELECT ?1, tag_number, block_id, kind, token_count, created_at_ms, source_bytes
+                   FROM mc_tags WHERE session_id = ?2",
+                params![request.target_key, source_key],
+            )?;
+            tx.execute(
+                "INSERT INTO mc_temporal_marks (session_id, block_id, marker_text, created_at)
+                 SELECT ?1, block_id, marker_text, created_at
+                   FROM mc_temporal_marks WHERE session_id = ?2",
+                params![request.target_key, source_key],
+            )?;
+            tx.execute(
+                "INSERT INTO mc_user_hints (session_id, block_id, hint_text, created_at)
+                 SELECT ?1, block_id, hint_text, created_at
+                   FROM mc_user_hints WHERE session_id = ?2",
+                params![request.target_key, source_key],
+            )?;
+            tx.execute(
+                "INSERT INTO mc_channel1_appends (session_id, block_id, reminder_text, fired_at_ms)
+                 SELECT ?1, block_id, reminder_text, fired_at_ms
+                   FROM mc_channel1_appends WHERE session_id = ?2",
+                params![request.target_key, source_key],
+            )?;
+            tx.execute(
+                "INSERT INTO mc_overlay_frontiers (session_id, max_seen_ordinal)
+                 SELECT ?1, max_seen_ordinal
+                   FROM mc_overlay_frontiers WHERE session_id = ?2",
+                params![request.target_key, source_key],
+            )?;
+            tx.execute(
+                "INSERT INTO mc_compartments (
+                     session_id, sequence, start_message, end_message, start_message_id,
+                     end_message_id, start_date, end_date, title, content, p1, p2, p3, p4,
+                     importance, episode_type, legacy, created_at
+                 ) VALUES (?1, ?2, ?3, ?3, ?4, ?5, NULL, NULL, '', '', '', '', '', '', 100,
+                           'lineage_boundary', 0, ?6)",
+                params![
+                    request.target_key,
+                    placeholder_sequence,
+                    placeholder_ordinal_i64,
+                    anchor.message_id,
+                    anchor.block_id,
+                    request.now_ms
+                ],
+            )?;
+            let placeholder_valid = tx
+                .query_row(
+                    "SELECT start_message, end_message, end_message_id
+                       FROM mc_compartments
+                      WHERE session_id = ?1 AND sequence = ?2",
+                    params![request.target_key, placeholder_sequence],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )?
+                == (
+                    placeholder_ordinal_i64,
+                    placeholder_ordinal_i64,
+                    anchor.block_id.clone(),
+                );
+            if !placeholder_valid {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+
+            tx.execute(
+                "UPDATE mc_cache_state
+                    SET row_version = ?2, meta = ?3, last_activity_at = ?4
+                  WHERE session_id = ?1 AND row_version = ?5",
+                params![
+                    request.prior_key,
+                    prior_version.saturating_add(1),
+                    prior_meta_json,
+                    request.now_ms,
+                    prior_version
+                ],
+            )?;
+
+            tx.execute(
+                "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     row_version = excluded.row_version,
+                     core_state = excluded.core_state,
+                     meta = excluded.meta,
+                     last_activity_at = excluded.last_activity_at",
+                params![
+                    request.target_key,
+                    next_target_version as i64,
+                    target_core_json,
+                    target_meta_json,
+                    request.now_ms
+                ],
+            )?;
+
+            Ok(LineageDescentTxnOutcome::Committed(LineageDescentOutcome {
+                loaded: LoadedState {
+                    core: target_core,
+                    meta: target_meta,
+                    row_version: Some(next_target_version),
+                },
+                disposition: LineageDescentDisposition::Descended,
+                source_key: Some(source_key),
+                prior_last_ordinal: Some(prior_last),
+                materialization_required: true,
+                acknowledge: true,
+            }))
+        })?;
+
+        match outcome {
+            LineageDescentTxnOutcome::Committed(outcome) => Ok(outcome),
+            LineageDescentTxnOutcome::CasConflict(found) => Err(McStoreError::CasConflict {
+                expected: request.expected_target_row_version,
+                found,
+            }),
+            LineageDescentTxnOutcome::Invalid(detail) => Err(McStoreError::Serde(format!(
+                "lineage descent validation failed: {detail}"
+            ))),
+            LineageDescentTxnOutcome::Serde(error) => Err(McStoreError::Serde(error)),
+        }
     }
 
     /// Return the newest note status version for the project. Note readiness is an
@@ -22596,6 +23433,585 @@ mod shadow_tests {
                 .unwrap()
                 .next_cursor,
             applied_feed_head
+        );
+    }
+}
+
+#[cfg(test)]
+mod lineage_descent_tests {
+    use super::*;
+    use cortexkit_store_types::{Isolation, StorageBackend};
+
+    fn store(dir: &std::path::Path) -> McStore {
+        McStore::open(&StorageDescriptor {
+            module_id: "magic-context-lineage-test".to_string(),
+            storage_namespace: "mc_cache".to_string(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.join("store.db").to_string_lossy().to_string(),
+            },
+        })
+        .unwrap()
+    }
+
+    fn compartment(sequence: i64, start: i64, end: i64, end_id: &str) -> StoredCompartment {
+        StoredCompartment {
+            sequence,
+            start_message: start,
+            end_message: end,
+            start_message_id: format!("m{start}#0"),
+            end_message_id: end_id.to_string(),
+            title: format!("range-{start}-{end}"),
+            content: format!("history {start} through {end}"),
+            p1: Some(format!("history {start} through {end}")),
+            importance: 50,
+            ..Default::default()
+        }
+    }
+
+    fn seed_lineage(store: &McStore, key: &str, newest_live_ordinal: u64) {
+        let core = CoreState {
+            boundary_id: "m6#0".to_string(),
+            ..CoreState::default()
+        };
+        let meta = ModuleMeta {
+            initialized: true,
+            newest_live_ordinal,
+            coverage_ordinal: Some(6),
+            ..ModuleMeta::default()
+        };
+        store.commit(key, None, &core, &meta).unwrap();
+        store
+            .append_compartments(
+                key,
+                &[compartment(1, 1, 3, "m3#0"), compartment(2, 4, 6, "m6#0")],
+            )
+            .unwrap();
+    }
+
+    fn anchor() -> LineageAnchor {
+        LineageAnchor {
+            block_id: "summary#1".to_string(),
+            message_id: "summary".to_string(),
+            content_hash: "abc123".to_string(),
+            ordinal: 1,
+        }
+    }
+
+    fn direct_hop(prior: &str, target: &str, epoch: u64) -> Vec<LineageConstituent> {
+        vec![LineageConstituent {
+            prior_key: prior.to_string(),
+            new_key: target.to_string(),
+            epoch,
+        }]
+    }
+
+    #[test]
+    fn descent_copies_verbatim_ranges_writes_real_boundary_and_replay_does_not_rebump() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_lineage(&store, "A", 10);
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO mc_tags
+                         (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
+                     VALUES ('A', 1, 'm2#0', 'message', 7, 1, X'61')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO mc_temporal_marks(session_id, block_id, marker_text, created_at)
+                     VALUES ('A', 'm2#0', '<!-- +1m -->', 1)",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO mc_chunk_transcripts(
+                         session_id, compartment_seq, start_ordinal, end_ordinal,
+                         transcript_deflate, created_at_ms
+                     ) VALUES ('A', 1, 1, 3, ?1, 1)",
+                    params![compress_transcript("U: pre-compaction transcript").unwrap()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let before_epoch = store.load("A").unwrap().meta.revert_epoch;
+        let hops = direct_hop("A", "B", 2);
+        let anchor = anchor();
+        let outcome = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "B",
+                expected_target_row_version: None,
+                edge_id: 41,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 2,
+                constituents: &hops,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 10,
+            })
+            .unwrap();
+        assert_eq!(outcome.disposition, LineageDescentDisposition::Descended);
+        assert_eq!(outcome.source_key.as_deref(), Some("A"));
+        assert_eq!(outcome.prior_last_ordinal, Some(10));
+        assert!(outcome.materialization_required && outcome.acknowledge);
+
+        let copied = store.load_compartments("B").unwrap();
+        assert_eq!(
+            copied
+                .iter()
+                .map(|row| (
+                    row.start_message,
+                    row.end_message,
+                    row.end_message_id.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(1, 3, "m3#0"), (4, 6, "m6#0"), (11, 11, "summary#1")]
+        );
+        let target = store.load("B").unwrap();
+        assert!(target.meta.descent_completed);
+        assert_eq!(target.meta.anchor_block_id.as_deref(), Some("summary#1"));
+        assert_eq!(target.meta.anchor_content_hash.as_deref(), Some("abc123"));
+        assert_eq!(target.meta.ordinal_continuation_base, Some(10));
+        assert_eq!(target.core.boundary_id, "summary#1");
+        assert_eq!(
+            store.load("A").unwrap().meta.revert_epoch,
+            before_epoch + 1,
+            "descent must activate the shipped prior-key historian fence"
+        );
+        let copied_markers = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM mc_tags WHERE session_id = 'B'),
+                         (SELECT COUNT(*) FROM mc_temporal_marks WHERE session_id = 'B')",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(copied_markers, (1, 1));
+        let transcript = store.load_chunk_transcripts_for_range("B", 1, 3).unwrap();
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(
+            transcript[0].transcript.as_deref(),
+            Some("U: pre-compaction transcript")
+        );
+        assert_eq!(
+            (transcript[0].start_ordinal, transcript[0].end_ordinal),
+            (1, 3)
+        );
+
+        let replay = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "B",
+                expected_target_row_version: target.row_version,
+                edge_id: 41,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 2,
+                constituents: &hops,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 11,
+            })
+            .unwrap();
+        assert_eq!(replay.disposition, LineageDescentDisposition::Replay);
+        assert_eq!(
+            store.load("A").unwrap().meta.revert_epoch,
+            before_epoch + 1,
+            "write-free replay must not re-bump the prior publish fence"
+        );
+    }
+
+    #[test]
+    fn newest_completed_constituent_wins_and_unmarked_rows_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_lineage(&store, "A", 10);
+        let first_hops = direct_hop("A", "B", 2);
+        let anchor = anchor();
+        store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "B",
+                expected_target_row_version: None,
+                edge_id: 1,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 2,
+                constituents: &first_hops,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 1,
+            })
+            .unwrap();
+        store
+            .append_compartments("B", &[compartment(4, 12, 13, "b-work#0")])
+            .unwrap();
+        let mut b = store.load("B").unwrap();
+        b.meta.newest_live_ordinal = 14;
+        store.commit("B", b.row_version, &b.core, &b.meta).unwrap();
+        let composed = vec![
+            LineageConstituent {
+                prior_key: "A".to_string(),
+                new_key: "B".to_string(),
+                epoch: 2,
+            },
+            LineageConstituent {
+                prior_key: "B".to_string(),
+                new_key: "C".to_string(),
+                epoch: 3,
+            },
+        ];
+        let c = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "C",
+                expected_target_row_version: None,
+                edge_id: 2,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 3,
+                constituents: &composed,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 2,
+            })
+            .unwrap();
+        assert_eq!(c.source_key.as_deref(), Some("B"));
+        assert!(store
+            .load_compartments("C")
+            .unwrap()
+            .iter()
+            .any(|row| row.end_message_id == "b-work#0"));
+
+        let mut unmarked_meta = ModuleMeta {
+            initialized: true,
+            newest_live_ordinal: 20,
+            ..ModuleMeta::default()
+        };
+        let mut unmarked_core = CoreState::default();
+        unmarked_core.boundary_id.clear();
+        store
+            .commit("D", None, &unmarked_core, &unmarked_meta)
+            .unwrap();
+        store
+            .append_compartments("D", &[compartment(1, 18, 19, "aborted-own-row#0")])
+            .unwrap();
+        unmarked_meta = store.load("D").unwrap().meta;
+        assert!(!unmarked_meta.descent_completed);
+        let through_unmarked = vec![
+            LineageConstituent {
+                prior_key: "A".to_string(),
+                new_key: "D".to_string(),
+                epoch: 4,
+            },
+            LineageConstituent {
+                prior_key: "D".to_string(),
+                new_key: "E".to_string(),
+                epoch: 5,
+            },
+        ];
+        let e = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "E",
+                expected_target_row_version: None,
+                edge_id: 3,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 5,
+                constituents: &through_unmarked,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 3,
+            })
+            .unwrap();
+        assert_eq!(e.source_key.as_deref(), Some("A"));
+        assert!(!store
+            .load_compartments("E")
+            .unwrap()
+            .iter()
+            .any(|row| row.end_message_id == "aborted-own-row#0"));
+    }
+
+    #[test]
+    fn terminal_branches_are_durable_before_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let anchor = anchor();
+
+        let unknown_hops = direct_hop("missing", "unknown", 2);
+        let unknown = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "unknown",
+                expected_target_row_version: None,
+                edge_id: 10,
+                prior_key: "missing",
+                prior_epoch: 1,
+                new_epoch: 2,
+                constituents: &unknown_hops,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            unknown.disposition,
+            LineageDescentDisposition::UnknownAncestor
+        );
+        assert!(unknown.acknowledge);
+        assert_eq!(
+            store
+                .load("unknown")
+                .unwrap()
+                .meta
+                .lineage_descent_disposition,
+            "unknown_ancestor"
+        );
+
+        store
+            .commit(
+                "legacy-source",
+                None,
+                &CoreState::default(),
+                &ModuleMeta::default(),
+            )
+            .unwrap();
+        let build_skew_hops = direct_hop("legacy-source", "build-skew", 2);
+        let build_skew = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "build-skew",
+                expected_target_row_version: None,
+                edge_id: 9,
+                prior_key: "legacy-source",
+                prior_epoch: 1,
+                new_epoch: 2,
+                constituents: &build_skew_hops,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            build_skew.disposition,
+            LineageDescentDisposition::PendingBuildSkew
+        );
+        assert!(!build_skew.acknowledge);
+        assert_eq!(
+            store
+                .load("build-skew")
+                .unwrap()
+                .meta
+                .lineage_descent_counters
+                .pending_build_skew,
+            1
+        );
+
+        seed_lineage(&store, "A", 10);
+        let missing_shape_hops = direct_hop("A", "rewind", 2);
+        let rewind = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "rewind",
+                expected_target_row_version: None,
+                edge_id: 11,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 2,
+                constituents: &missing_shape_hops,
+                compaction_observed: true,
+                anchor: None,
+                now_ms: 2,
+            })
+            .unwrap();
+        assert_eq!(
+            rewind.disposition,
+            LineageDescentDisposition::NotCompactionShape
+        );
+        assert!(store.load_compartments("rewind").unwrap().is_empty());
+
+        let flag_hops = direct_hop("A", "restart-window", 2);
+        let flag_missing = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "restart-window",
+                expected_target_row_version: None,
+                edge_id: 12,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 2,
+                constituents: &flag_hops,
+                compaction_observed: false,
+                anchor: Some(&anchor),
+                now_ms: 3,
+            })
+            .unwrap();
+        assert_eq!(
+            flag_missing.disposition,
+            LineageDescentDisposition::ObservedFlagMissingShapePresent
+        );
+
+        let boot_core = CoreState {
+            boundary_id: "own#0".to_string(),
+            ..CoreState::default()
+        };
+        store
+            .commit("boot", None, &boot_core, &ModuleMeta::default())
+            .unwrap();
+        let boot_hops = direct_hop("A", "boot", 2);
+        let boot = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "boot",
+                expected_target_row_version: store.load("boot").unwrap().row_version,
+                edge_id: 13,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 2,
+                constituents: &boot_hops,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 4,
+            })
+            .unwrap();
+        assert_eq!(
+            boot.disposition,
+            LineageDescentDisposition::AlreadyBootstrapped
+        );
+        assert_eq!(store.load("boot").unwrap().core.boundary_id, "own#0");
+
+        let cycle = vec![
+            LineageConstituent {
+                prior_key: "A".to_string(),
+                new_key: "B".to_string(),
+                epoch: 2,
+            },
+            LineageConstituent {
+                prior_key: "B".to_string(),
+                new_key: "cycle-target".to_string(),
+                epoch: 2,
+            },
+        ];
+        let cycle_outcome = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "cycle-target",
+                expected_target_row_version: None,
+                edge_id: 14,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 2,
+                constituents: &cycle,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 5,
+            })
+            .unwrap();
+        assert_eq!(
+            cycle_outcome.disposition,
+            LineageDescentDisposition::CycleDetected
+        );
+    }
+
+    #[test]
+    fn descent_cas_loser_leaves_the_concurrent_target_and_prior_fence_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_lineage(&store, "A", 10);
+        store
+            .commit(
+                "B",
+                None,
+                &CoreState::default(),
+                &ModuleMeta::default(),
+            )
+            .unwrap();
+        let target_before = store.load("B").unwrap();
+        let prior_before = store.load("A").unwrap();
+        let hops = direct_hop("A", "B", 2);
+        let anchor = anchor();
+
+        let error = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "B",
+                expected_target_row_version: None,
+                edge_id: 19,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 2,
+                constituents: &hops,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 1,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            McStoreError::CasConflict {
+                expected: None,
+                found: _
+            }
+        ));
+        let target_after = store.load("B").unwrap();
+        assert_eq!(target_after.row_version, target_before.row_version);
+        assert!(target_after.meta.lineage_descent_disposition.is_empty());
+        assert_eq!(
+            store.load("A").unwrap().meta.revert_epoch,
+            prior_before.meta.revert_epoch
+        );
+
+        let retry = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "B",
+                expected_target_row_version: target_before.row_version,
+                edge_id: 19,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 2,
+                constituents: &hops,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 2,
+            })
+            .unwrap();
+        assert_eq!(retry.disposition, LineageDescentDisposition::Descended);
+    }
+
+    #[test]
+    fn invalid_source_ranges_abort_without_partial_target_or_prior_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_lineage(&store, "A", 10);
+        store
+            .replace_compartments(
+                "A",
+                &[compartment(1, 1, 6, "m6#0"), compartment(2, 5, 8, "m8#0")],
+            )
+            .unwrap();
+        let prior_before = store.load("A").unwrap();
+        let hops = direct_hop("A", "B", 2);
+        let anchor = anchor();
+        let error = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "B",
+                expected_target_row_version: None,
+                edge_id: 20,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 2,
+                constituents: &hops,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 1,
+            })
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("lineage descent validation failed"));
+        assert!(store.load("B").unwrap().row_version.is_none());
+        assert!(store.load_compartments("B").unwrap().is_empty());
+        let prior_after = store.load("A").unwrap();
+        assert_eq!(prior_after.row_version, prior_before.row_version);
+        assert_eq!(
+            prior_after.meta.revert_epoch,
+            prior_before.meta.revert_epoch
         );
     }
 }

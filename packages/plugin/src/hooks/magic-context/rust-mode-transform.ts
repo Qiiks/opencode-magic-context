@@ -145,6 +145,9 @@ interface RustSessionState extends ModuleStateSyncState {
     ordinalMemoAnchor: RawMessageOrdinalAnchor | null;
     ordinalMemoStoredCount: number | null;
     ordinalMemoCanonicalCount: number;
+    /** Durable prior-lineage tail returned by the module after descent. Fresh arrays
+     * continue after this base instead of regenerating index+1 ordinals. */
+    ordinalContinuationBase: number | null;
     failureCount: number;
     parkCount: number;
     syntheticTurnCount: number;
@@ -537,6 +540,7 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             ordinalMemoAnchor: null,
             ordinalMemoStoredCount: null,
             ordinalMemoCanonicalCount: 0,
+            ordinalContinuationBase: null,
             seedPassPending: true,
             failureCount: 0,
             parkCount: 0,
@@ -928,6 +932,15 @@ function buildTransformBody(args: {
         caveman_enabled: args.passInputs.caveman_enabled === true,
         caveman_min_chars: args.passInputs.caveman_min_chars ?? 500,
         cache_ttl: args.passInputs.cache_ttl,
+        // Thalamus owns these values. The plugin neither interprets nor recomposes the edge;
+        // explicit pass-through keeps mixed direct/plugin deployments wire-compatible.
+        lineage_switched: args.passInputs.lineage_switched === true,
+        descent_edge_id: args.passInputs.descent_edge_id,
+        prior_conversation_key: args.passInputs.prior_conversation_key,
+        prior_epoch: args.passInputs.prior_epoch,
+        new_epoch: args.passInputs.new_epoch,
+        constituents: args.passInputs.constituents,
+        compaction_observed: args.passInputs.compaction_observed === true,
         pass_inputs: args.passInputs,
         declared_trim: args.declaredTrim,
     };
@@ -1440,11 +1453,15 @@ export function createRustModeTransform(
                           const priorId = messageIdOf(messages[index]);
                           if (!priorId) continue;
                           const prior = state.idOrdinalMemo.get(priorId);
-                          if (prior !== undefined) return prior;
+                          if (prior !== undefined)
+                              return Math.max(prior, state.ordinalContinuationBase ?? 0);
                       }
-                      return state.ordinalMemoCanonicalCount;
+                      return Math.max(
+                          state.ordinalMemoCanonicalCount,
+                          state.ordinalContinuationBase ?? 0,
+                      );
                   })()
-                : undefined;
+                : (state.ordinalContinuationBase ?? undefined);
             const ordinalStartedAt = performance.now();
             let resolved = await resolveOrdinalsForModule({
                 sessionId,
@@ -1473,6 +1490,7 @@ export function createRustModeTransform(
                     memoAnchor: state.ordinalMemoAnchor,
                     memoStoredCount: state.ordinalMemoStoredCount,
                     memoCanonicalCount: state.ordinalMemoCanonicalCount,
+                    provisionalBase: state.ordinalContinuationBase ?? undefined,
                 });
                 logStage(
                     sessionId,
@@ -1716,6 +1734,7 @@ export function createRustModeTransform(
                         memoAnchor: state.ordinalMemoAnchor,
                         memoStoredCount: state.ordinalMemoStoredCount,
                         memoCanonicalCount: state.ordinalMemoCanonicalCount,
+                        provisionalBase: state.ordinalContinuationBase ?? undefined,
                     });
                     logStage(
                         sessionId,
@@ -1929,6 +1948,20 @@ export function createRustModeTransform(
                     // fails; the module will re-serve those bytes on a later natural bust.
                     sessionLog(sessionId, "rust note delivery ack failed (will retry):", ackError);
                 }
+            }
+            const ordinalContinuationBase = response.ordinal_continuation_base;
+            if (
+                typeof ordinalContinuationBase === "number" &&
+                Number.isSafeInteger(ordinalContinuationBase) &&
+                ordinalContinuationBase > 0
+            ) {
+                if (state.ordinalContinuationBase === null) {
+                    for (const [messageId, ordinal] of state.idOrdinalMemo) {
+                        state.idOrdinalMemo.set(messageId, ordinal + ordinalContinuationBase);
+                    }
+                    state.ordinalMemoCanonicalCount += ordinalContinuationBase;
+                }
+                state.ordinalContinuationBase = ordinalContinuationBase;
             }
             if (!stateSyncRetryBusy) {
                 state.initialized = true;
