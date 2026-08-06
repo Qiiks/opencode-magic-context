@@ -214,6 +214,15 @@ const recordedSessionProjectIdentity = new BoundedSessionMap<string>(MESSAGE_TOK
 // Deriving live every pass (not memoized) is ~K×2.8µs and is inherently
 // revert-safe: it tracks the actual post-cleanup wire with no stored state to go
 // stale. Returns 0 (today's full load) when nothing is tagged yet.
+function activeAgentFromMessages(messages: readonly MessageLike[]): string | undefined {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const info = messages[index]?.info as { role?: unknown; agent?: unknown } | undefined;
+        if (info?.role !== "user") continue;
+        return typeof info.agent === "string" && info.agent.length > 0 ? info.agent : undefined;
+    }
+    return undefined;
+}
+
 function deriveTaggerLoadFloor(
     messages: MessageLike[],
     sessionId: string,
@@ -681,6 +690,7 @@ export function createTransform(deps: TransformDeps) {
 
         const tUserMsg = performance.now();
         const currentTurnId = findLastUserMessageId(messages);
+        const activeAgent = activeAgentFromMessages(messages);
         logTransformTiming(sessionId, "findLastUserMessageId", tUserMsg);
 
         const tMeta = performance.now();
@@ -2106,6 +2116,8 @@ export function createTransform(deps: TransformDeps) {
             tagger: deps.tagger,
             ctxReduceAvailability,
             todowriteAvailability,
+            client: deps.client,
+            activeAgent,
             batch,
             contextUsage,
             schedulerDecision,

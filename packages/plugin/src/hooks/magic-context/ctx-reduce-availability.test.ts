@@ -4,9 +4,11 @@ import { describe, expect, it } from "bun:test";
 import {
     clearCtxReduceAvailability,
     clearTodowriteAvailability,
+    permissionDisabled,
     resetCtxReduceRegisteredGloballyForTest,
     resolveCtxReduceAvailabilityFromMessages,
     resolveTodowriteAvailabilityFromMessages,
+    resolveToolPermissionDenied,
     setCtxReduceRegisteredGlobally,
 } from "./ctx-reduce-availability";
 
@@ -126,6 +128,73 @@ describe("todowrite availability (generalized resolver)", () => {
         const todo = resolveTodowriteAvailabilityFromMessages("ses-td-mixed", [map]);
         expect(reduce).toEqual({ callable: true, frozen: true });
         expect(todo).toEqual({ callable: false, frozen: true });
+    });
+});
+
+describe("OpenCode todowrite permission evaluator", () => {
+    it("denies a top-level agent rule for the whole tool", () => {
+        expect(
+            permissionDisabled("todowrite", [
+                { permission: "todowrite", pattern: "*", action: "deny" },
+            ]),
+        ).toBe(true);
+    });
+
+    it("uses findLast semantics so a later per-agent allow overrides deny", () => {
+        expect(
+            permissionDisabled("todowrite", [
+                { permission: "todowrite", pattern: "*", action: "deny" },
+                { permission: "todowrite", pattern: "*", action: "allow" },
+            ]),
+        ).toBe(false);
+    });
+
+    it("applies a session overlay after the merged agent rules", () => {
+        expect(
+            permissionDisabled("todowrite", [
+                { permission: "todowrite", pattern: "*", action: "allow" },
+                { permission: "todowrite", pattern: "*", action: "deny" },
+            ]),
+        ).toBe(true);
+    });
+
+    it("fails open when no rule matches", () => {
+        expect(permissionDisabled("todowrite", [])).toBe(false);
+        expect(
+            permissionDisabled("todowrite", [
+                { permission: "todowrite", pattern: "src/**", action: "deny" },
+            ]),
+        ).toBe(false);
+    });
+
+    it("reads the active agent and session overlay through the SDK", async () => {
+        const client = {
+            app: {
+                agents: async () => ({
+                    data: [
+                        {
+                            name: "build",
+                            permission: [
+                                { permission: "todowrite", pattern: "*", action: "allow" },
+                            ],
+                        },
+                    ],
+                }),
+            },
+            session: {
+                get: async () => ({
+                    data: {
+                        agent: "build",
+                        permission: {
+                            todowrite: "deny",
+                        },
+                    },
+                }),
+            },
+        } as never;
+        await expect(
+            resolveToolPermissionDenied(client, "ses-permission-overlay", "todowrite"),
+        ).resolves.toBe(true);
     });
 });
 
