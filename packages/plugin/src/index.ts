@@ -317,9 +317,14 @@ const server: Plugin = async (ctx) => {
     if (pluginConfig.enabled) {
         const dreamerRunnable = isDreamerRunnable(pluginConfig);
         const classifyModuleClient = createDreamTimerModuleClient(rustModeModuleClient);
-        const timerProjectIdentity = resolveProjectIdentityForSession(ctx.directory);
+        const timerProjectIdentity = resolveProjectIdentityForSession(
+            ctx.directory,
+            pluginConfig.allow_home_project,
+        );
         if (!timerProjectIdentity) {
-            log("[magic-context] dream timer skipped: cwd is the user's home directory");
+            log(
+                "[magic-context] dream timer skipped: no project identity is bound for this directory",
+            );
         } else {
             const timerRegistration = {
                 directory: ctx.directory,

@@ -521,6 +521,8 @@ export interface TransformDeps {
     commitSeenLastPass?: Map<string, boolean>;
     client?: PluginContext["client"];
     directory?: string;
+    /** Whether user-level configuration lets this session use the canonical home directory as its project. */
+    allowHomeProject?: boolean;
     memoryConfig?: {
         enabled: boolean;
         injectionBudgetTokens: number;
@@ -1527,7 +1529,7 @@ export function createTransform(deps: TransformDeps) {
             projectIdentity ??
             (sessionDirectory ? resolveProjectIdentity(sessionDirectory) : deps.projectPath);
         const sessionIdentityForBinding = sessionDirectory
-            ? resolveProjectIdentityForSession(sessionDirectory)
+            ? resolveProjectIdentityForSession(sessionDirectory, deps.allowHomeProject)
             : undefined;
         if (sessionDirectory) {
             maybeSendProjectIdentityWarning(deps, sessionId, sessionDirectory, notificationParams);

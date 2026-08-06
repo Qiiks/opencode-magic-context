@@ -41,6 +41,8 @@ export interface CtxSessionUpgradeRuntimeDeps {
 	historianThinkingLevel?: string;
 	language?: string;
 	memoryEnabled: boolean;
+	/** Allow a session started exactly in the canonical home directory only when user-level configuration enables it. */
+	allowHomeProject?: boolean;
 	autoPromote: boolean;
 	userMemoriesEnabled?: boolean;
 	compactionOff?: boolean;
@@ -158,6 +160,7 @@ export function registerCtxSessionUpgradeCommand(
 						timeoutMs: currentDeps.historianTimeoutMs,
 						thinkingLevel: currentDeps.historianThinkingLevel,
 						directory: ctx.cwd,
+						allowHomeProject: currentDeps.allowHomeProject,
 						sessionId,
 						userMemoriesEnabled: currentDeps.userMemoriesEnabled,
 						language: currentDeps.language,
@@ -173,7 +176,10 @@ export function registerCtxSessionUpgradeCommand(
 			//   • none + migration already done → no-op "already upgraded"
 			//   • none + migration still pending → migration only (skip recomp)
 			if (upgradableCount === 0) {
-				const projectPath = resolveProjectIdentityForSession(ctx.cwd);
+				const projectPath = resolveProjectIdentityForSession(
+					ctx.cwd,
+					currentDeps.allowHomeProject,
+				);
 				if (!projectPath) return;
 				// migrationPending mirrors OpenCode: only pending when memory is
 				// enabled AND the project hasn't been migrated yet.

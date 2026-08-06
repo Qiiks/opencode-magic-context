@@ -3,6 +3,8 @@
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use crate::db::{self, ProjectRow};
@@ -644,6 +646,11 @@ pub fn apply_workspace_changes(
     let mut add_map: BTreeMap<String, WorkspaceMemberChange> = BTreeMap::new();
     for member in add_members {
         let identity = normalize_stored_project_path(&member.project_path);
+        if is_user_home_workspace_member(&identity, &member.display_path) {
+            return Err(constraint_error(
+                "The home directory cannot be added to a workspace. Home sessions are intentionally isolated from workspace memory sharing.",
+            ));
+        }
         validate_display_name(&member.display_name)?;
         if add_map.insert(identity.clone(), member).is_some() {
             return Err(constraint_error(format!(
@@ -825,6 +832,27 @@ pub fn apply_workspace_changes(
 
     tx.commit()?;
     Ok(())
+}
+
+fn is_user_home_workspace_member(identity: &str, display_path: &str) -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let Ok(canonical_home) = fs::canonicalize(home) else {
+        return false;
+    };
+    let home_digest = format!(
+        "{:x}",
+        md5::compute(canonical_home.to_string_lossy().as_bytes())
+    );
+    let home_identity = format!("dir:{}", &home_digest[..12]);
+    if identity == home_identity {
+        return true;
+    }
+
+    fs::canonicalize(Path::new(display_path))
+        .map(|canonical_display| canonical_display == canonical_home)
+        .unwrap_or(false)
 }
 
 fn temporary_display_name(

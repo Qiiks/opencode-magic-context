@@ -266,6 +266,35 @@ fn workspace_crud_round_trip() {
 }
 
 #[test]
+fn workspace_refuses_the_user_home_directory() {
+    let _g = env_lock();
+    let mut conn = make_db_v35();
+    let ws = seed_workspace(&conn, "pool");
+    let home = std::fs::canonicalize(dirs::home_dir().expect("user home")).expect("canonical home");
+    let digest = format!("{:x}", md5::compute(home.to_string_lossy().as_bytes()));
+    let home_identity = format!("dir:{}", &digest[..12]);
+
+    let err = workspaces::apply_workspace_changes(
+        &mut conn,
+        ws,
+        None,
+        vec![add(
+            &home_identity,
+            "home",
+            home.to_str().expect("utf8 home path"),
+        )],
+        Vec::new(),
+        Vec::new(),
+        default_share_categories(),
+    )
+    .expect_err("home projects must not join workspaces");
+
+    assert!(err
+        .to_string()
+        .contains("home directory cannot be added to a workspace"));
+}
+
+#[test]
 fn list_workspaces_returns_normalized_share_categories() {
     let _g = env_lock();
     let conn = make_db_v35();

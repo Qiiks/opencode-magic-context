@@ -10,6 +10,11 @@
       "description": "Enable magic context (default: true)",
       "type": "boolean"
     },
+    "allow_home_project": {
+      "default": false,
+      "description": "Allow Magic Context sessions launched from the exact canonical home directory. The home session uses its deterministic dir: identity so pre-gate memories reconnect. USER-LEVEL ONLY: project config is ignored. The home identity is excluded from registry seed exports, never resolves descendants by containment, and cannot join a workspace.",
+      "type": "boolean"
+    },
     "experimental": {
       "default": {
         "mural": {

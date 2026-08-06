@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DREAMER_AGENT } from "../../agents/dreamer";
 import { SIDEKICK_AGENT } from "../../agents/sidekick";
@@ -26,6 +26,7 @@ import type {
     EmbeddingProvider,
     EmbeddingPurpose,
 } from "../../features/magic-context/memory/embedding-provider";
+import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 
@@ -308,6 +309,37 @@ describe("createCtxMemoryTools", () => {
         closeQuietly(db);
         _setTestProviderFactoryForProject(null);
         _resetProjectEmbeddingRegistryForTests();
+    });
+
+    it("writes and reads a memory through an opted-in home session identity", async () => {
+        const homeIdentity = resolveProjectIdentityForSession(homedir(), true);
+        expect(homeIdentity).toBeDefined();
+        const homeTools = createCtxMemoryTools({
+            db,
+            resolveProjectPath: (directory) => resolveProjectIdentityForSession(directory, true),
+            memoryEnabled: true,
+            embeddingEnabled: false,
+        });
+        const homeContext = { ...toolContext(), directory: homedir() } as never;
+
+        const write = await homeTools.ctx_memory.execute(
+            {
+                action: "write",
+                category: "USER_DIRECTIVES",
+                content: "Retain global troubleshooting context.",
+            },
+            homeContext,
+        );
+        expect(write).toContain("Saved memory [ID:");
+
+        const [memory] = getMemoriesByProject(db, homeIdentity as string);
+        if (!memory) throw new Error("expected home-session memory");
+        expect(memory.content).toBe("Retain global troubleshooting context.");
+        const read = await homeTools.ctx_memory.execute(
+            { action: "get", ids: [memory.id] },
+            homeContext,
+        );
+        expect(read).toContain("Retain global troubleshooting context.");
     });
 
     describe("#given write action", () => {

@@ -654,6 +654,22 @@ describe("loadPluginConfig — user-only settings", () => {
         expect(result.auto_update).toBe(false);
     });
 
+    it("allows user config to opt in to an exact home project", () => {
+        const result = loadWithUserConfig(JSON.stringify({ allow_home_project: true }));
+
+        expect(result.allow_home_project).toBe(true);
+    });
+
+    it("prevents project config from opting in to a home project", () => {
+        const result = loadWithUserAndProjectConfig(
+            JSON.stringify({ allow_home_project: false }),
+            JSON.stringify({ allow_home_project: true }),
+        );
+
+        expect(result.allow_home_project).toBe(false);
+        expect(result.configWarnings?.join("\n")).toContain("Ignoring allow_home_project");
+    });
+
     it("prevents project config from overriding user auto_update", () => {
         const result = loadWithUserAndProjectConfig(
             JSON.stringify({ auto_update: true, enabled: true }),

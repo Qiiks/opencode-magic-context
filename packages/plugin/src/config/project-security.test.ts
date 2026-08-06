@@ -26,6 +26,17 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(warnings.some((w) => w.includes("fail_closed_blocking"))).toBe(true);
     });
 
+    it("strips allow_home_project from project config (user-tier only)", () => {
+        const raw: Record<string, unknown> = {
+            allow_home_project: true,
+            dreamer: { model: "x" },
+        };
+        const warnings = stripUnsafeProjectConfigFields(raw);
+        expect("allow_home_project" in raw).toBe(false);
+        expect(raw.dreamer).toEqual({ model: "x" });
+        expect(warnings.some((w) => w.includes("allow_home_project"))).toBe(true);
+    });
+
     it("strips language from project config", () => {
         const raw: Record<string, unknown> = { language: "tr", dreamer: { model: "x" } };
         const warnings = stripUnsafeProjectConfigFields(raw);

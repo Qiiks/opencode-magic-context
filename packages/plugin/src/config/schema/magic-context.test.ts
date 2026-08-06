@@ -14,6 +14,7 @@ describe("MagicContextConfigSchema", () => {
 
             expect(result).toMatchObject({
                 enabled: true,
+                allow_home_project: false,
                 fail_closed_blocking: true,
                 transform_mode: "ts",
                 storage: { enforce_private_permissions: true },
@@ -49,6 +50,7 @@ describe("MagicContextConfigSchema", () => {
         it("parses an enabled config without stale reduction-specific keys", () => {
             const input = {
                 enabled: true,
+                allow_home_project: false,
                 fail_closed_blocking: true,
                 experimental: { mural: { enabled: false } },
                 transform_mode: "ts",

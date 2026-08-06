@@ -44,6 +44,8 @@ export interface PiMemoryMigrationDeps {
 	thinkingLevel?: string;
 	/** Project working directory (resolves project identity). */
 	directory: string;
+	/** Allow a session started exactly in the canonical home directory only when user-level configuration enables it. */
+	allowHomeProject?: boolean;
 	/** Session id used for token accounting attribution. */
 	sessionId: string;
 	/** Route user_observations to the user-memory candidate pool when enabled. */
@@ -59,7 +61,10 @@ export interface PiMemoryMigrationOutcome {
 export async function runPiMemoryMigration(
 	deps: PiMemoryMigrationDeps,
 ): Promise<PiMemoryMigrationOutcome> {
-	const projectPath = resolveProjectIdentityForSession(deps.directory);
+	const projectPath = resolveProjectIdentityForSession(
+		deps.directory,
+		deps.allowHomeProject,
+	);
 	if (!projectPath) {
 		return {
 			ran: false,
