@@ -50,6 +50,9 @@ describe("context-limit resolution", () => {
         const sessionId = await h.createSession();
         await h.sendPrompt(sessionId, "probe turn for context-limit resolution.");
 
+        // Mock Anthropic uses a shared context window: resolveLimit reserves
+        // min(8,192, 25% of 50,000) = 8,192 output tokens, leaving 41,808
+        // usable input tokens. The exact pressure is 20,000 / 41,808 * 100.
         // Give the event handler a moment to persist last_context_percentage.
         await Bun.sleep(300);
 
@@ -59,12 +62,12 @@ describe("context-limit resolution", () => {
             .get(sessionId) as { last_context_percentage: number } | null;
 
         const pct = row?.last_context_percentage ?? 0;
-        console.log(`[TEST] last_context_percentage = ${pct} (expected exactly 40 for 20K/50K)`);
+        console.log(
+            `[TEST] last_context_percentage = ${pct} (expected 47.83773440489858 for 20K/41,808)`,
+        );
 
-        // 20_000 input_tokens / 50_000 context_limit = exactly 40%. Mock returns
-        // exact usage and plugin rounds to 1 decimal; this must be 40.0.
-        // Tightened from the old 35-45 range (Finding #5 — the range was masking
-        // a real regression surface because ANY value in [35,45] passed).
-        expect(pct).toBe(40);
+        // Keep the exact value: a broad range would hide changes to the
+        // shared-window output reservation arithmetic.
+        expect(pct).toBe(47.83773440489858);
     }, 60_000);
 });

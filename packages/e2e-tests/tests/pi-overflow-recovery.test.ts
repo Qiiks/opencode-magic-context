@@ -118,7 +118,10 @@ describe("pi context overflow detection", () => {
         );
 
         expect(afterNext.detected_context_limit).toBe(120_000);
-        expect(afterNext.last_context_percentage).toBe(50);
+        // The detected combined window is narrowed before reservation:
+        // 120,000 - min(8,192, 25% of 120,000) = 111,808 usable tokens.
+        // The next pass therefore reports 60,000 / 111,808 * 100 exactly.
+        expect(afterNext.last_context_percentage).toBe(53.66342301087579);
     }, 120_000);
 
     it("does not persist detected_context_limit for non-overflow rate-limit errors", async () => {

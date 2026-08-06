@@ -60,6 +60,8 @@ describe("pi context-limit resolution", () => {
             { timeoutMs: 5_000, label: "pi last_context_percentage persisted" },
         );
 
-        expect(pct).toBe(40);
+        // Pi's shared-window model reserves min(8,192, 25% of 50,000) =
+        // 8,192 output tokens, so 20,000 / 41,808 * 100 is the exact pressure.
+        expect(pct).toBe(47.83773440489858);
     }, 60_000);
 });
