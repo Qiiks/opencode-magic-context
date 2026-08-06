@@ -3822,7 +3822,13 @@ function maybeFireHistorian(args: {
 			let snapshot = ensureRunnablePiBoundaryForTests(
 				resolvePiBoundarySnapshot(),
 			);
-			if (!hasRunnableCompartmentWindow(snapshot) && usage.percentage >= 80) {
+			// Derived band, not literal 80: under a raised execute threshold the
+			// emergency-scaled retry must not relax the boundary below the force
+			// band (same escalation class as the OpenCode trigger's force gate).
+			if (
+				!hasRunnableCompartmentWindow(snapshot) &&
+				usage.percentage >= historianForceMaterializationPercentage
+			) {
 				snapshot = ensureRunnablePiBoundaryForTests(
 					resolvePiBoundarySnapshot(usage.percentage >= 95 ? 0.25 : 0.5),
 				);

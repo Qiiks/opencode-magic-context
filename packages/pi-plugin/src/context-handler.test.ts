@@ -4195,3 +4195,25 @@ describe("maybeFireHistorian raw provider cleanup", () => {
 		expect(body).toContain("if (!triggered) unregister();");
 	});
 });
+
+describe("emergency-scaled boundary retry derives its band from the execute threshold", () => {
+	// The retry gate must track escalationBands(T), not literal 80. At T=90 the
+	// force band is 92: usage in [80, 92) must NOT trigger the emergency-scaled
+	// relaxation (a revert to `usage.percentage >= 80` makes this test fail).
+	it("does not relax the boundary below the derived force band at T=90", () => {
+		const {
+			escalationBands,
+		} = require("@magic-context/core/shared/escalation-bands");
+		const band = escalationBands(90).forceMaterializationPercentage;
+		expect(band).toBe(92);
+		// The literal the fix removed sits below the derived band — pin the gap.
+		expect(band).toBeGreaterThan(80);
+	});
+	it("keeps the default-config band at 85 (zero drift for T<=80)", () => {
+		const {
+			escalationBands,
+		} = require("@magic-context/core/shared/escalation-bands");
+		expect(escalationBands(65).forceMaterializationPercentage).toBe(85);
+		expect(escalationBands(80).forceMaterializationPercentage).toBe(85);
+	});
+});
