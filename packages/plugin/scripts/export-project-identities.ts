@@ -36,10 +36,12 @@ function isCanonicalHomeRoot(root: string): boolean {
 const dbPath =
     process.env.MAGIC_CONTEXT_DB ??
     join(homedir(), ".local", "share", "cortexkit", "magic-context", "context.db");
-const db = new Database(`file:${dbPath}?mode=ro`, { readonly: true });
+// Plain path + options object, not a file: URI — bun:sqlite on Linux rejects
+// file: URIs (the CLI database-access fix established this pattern).
+const db = new Database(dbPath, { readonly: true });
 const openCodePath =
     process.env.OPENCODE_DB ?? join(homedir(), ".local", "share", "opencode", "opencode.db");
-const opencodeDb = new Database(`file:${openCodePath}?mode=ro`, { readonly: true });
+const opencodeDb = new Database(openCodePath, { readonly: true });
 
 interface Row {
     identity: string;
