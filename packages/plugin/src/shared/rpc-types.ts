@@ -126,10 +126,19 @@ export interface StatusDetail extends SidebarSnapshot {
     isSubagent: boolean;
     pendingOps: Array<{ tagId: number; operation: string }>;
     contextLimit: number;
+    /**
+     * Parsed cache TTL in ms. -1 = never expires (cacheTtl "never"; Infinity
+     * cannot ride JSON-RPC and 0 would be indistinguishable from unset). The
+     * values discriminate without the cacheNeverExpires flag: -1 never /
+     * N live. Falsy-value contract: see storage_versions for the precedent.
+     */
     cacheTtlMs: number;
+    /** Remaining ms in the idle-TTL window. -1 = never expires; 0 = expired
+     *  (only meaningful when lastResponseTime > 0); N = live countdown. */
     cacheRemainingMs: number;
     cacheExpired: boolean;
-    /** True when cacheTtl is "never" — the idle-TTL heuristic is disabled on this lane. */
+    /** True when cacheTtl is "never" — the idle-TTL heuristic is disabled on
+     *  this lane. Redundant with cacheTtlMs === -1; kept as the readable form. */
     cacheNeverExpires?: boolean;
     executeThreshold: number;
     /**

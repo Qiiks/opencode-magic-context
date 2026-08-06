@@ -487,9 +487,13 @@ describe("buildStatusDetail — cacheNeverExpires with 'never' TTL", () => {
             expect(detail.cacheExpired).toBe(false);
             // Infinity must NOT leak into the numeric RPC field — JSON.stringify
             // converts Infinity to null, violating the StatusDetail contract.
-            expect(detail.cacheRemainingMs).toBe(0);
+            // -1 is the never-expires sentinel: distinguishable from 0 (expired)
+            // by the value alone, so a consumer that never learned the flag cannot
+            // misread a warm lane as expired.
+            expect(detail.cacheRemainingMs).toBe(-1);
+            expect(detail.cacheTtlMs).toBe(-1);
             const roundTripped = JSON.parse(JSON.stringify(detail));
-            expect(roundTripped.cacheRemainingMs).toBe(0);
+            expect(roundTripped.cacheRemainingMs).toBe(-1);
             expect(roundTripped.cacheRemainingMs).not.toBeNull();
         } finally {
             closeQuietly(db);

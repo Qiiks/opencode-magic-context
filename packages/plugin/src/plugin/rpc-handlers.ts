@@ -736,15 +736,19 @@ export function buildStatusDetail(
         }
         detail.cacheTtlMs = safeParseTtl(detail.cacheTtl);
         if (detail.cacheTtlMs === Number.POSITIVE_INFINITY) {
+            // Infinity does not survive JSON-RPC (JSON.stringify emits null), and
+            // 0 would be indistinguishable from a fresh/expired lane to a consumer
+            // that never learned the cacheNeverExpires convention. -1 is the
+            // never-expires sentinel: the VALUES discriminate on their own
+            // (-1 never / 0 expired-or-unset / N live), and the flag stays as a
+            // convenience for consumers that prefer it.
             detail.cacheNeverExpires = true;
-            detail.cacheTtlMs = 0;
+            detail.cacheTtlMs = -1;
         }
         if (detail.lastResponseTime > 0) {
             const elapsed = Date.now() - detail.lastResponseTime;
             if (detail.cacheNeverExpires) {
-                // Infinity does not survive JSON-RPC; cacheNeverExpires is the
-                // authoritative flag — the TUI keys on it first.
-                detail.cacheRemainingMs = 0;
+                detail.cacheRemainingMs = -1;
                 detail.cacheExpired = false;
             } else {
                 detail.cacheRemainingMs = Math.max(0, detail.cacheTtlMs - elapsed);
