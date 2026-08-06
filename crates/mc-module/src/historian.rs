@@ -1803,6 +1803,13 @@ mod tests {
             detected_context_limit_model_key: None,
             history_budget_tokens: None,
             declared_trim: None,
+            lineage_switched: false,
+            descent_edge_id: 0,
+            prior_conversation_key: String::new(),
+            prior_epoch: 0,
+            new_epoch: 0,
+            constituents: Vec::new(),
+            compaction_observed: false,
         }
     }
 

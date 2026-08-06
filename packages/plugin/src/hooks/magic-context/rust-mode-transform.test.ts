@@ -350,6 +350,40 @@ describe("Rust mode authority adapter", () => {
         expect(body.history_budget_tokens).toBe(42_000);
     });
 
+    it("passes lineage-switch transport fields through opaquely", () => {
+        const constituents: Array<[string, string, number]> = [
+            ["prior", "middle", 8],
+            ["middle", "new", 9],
+        ];
+        const body = __rustModeTransformTest.buildTransformBody({
+            sessionId: "lineage-wire",
+            input: [],
+            nativeMessages: [],
+            passInputs: {
+                lineage_switched: true,
+                descent_edge_id: 77,
+                prior_conversation_key: "prior",
+                prior_epoch: 7,
+                new_epoch: 9,
+                constituents,
+                compaction_observed: true,
+            },
+            usage: {},
+            modelKey: null,
+            providerId: null,
+            midTurn: false,
+        });
+        expect(body).toMatchObject({
+            lineage_switched: true,
+            descent_edge_id: 77,
+            prior_conversation_key: "prior",
+            prior_epoch: 7,
+            new_epoch: 9,
+            constituents,
+            compaction_observed: true,
+        });
+    });
+
     it("copies caveman settings onto the authority wire", () => {
         const body = __rustModeTransformTest.buildTransformBody({
             sessionId: "caveman-wire",

@@ -3,7 +3,8 @@ pub mod pi;
 pub mod sidecar;
 
 pub use opencode::{
-    decode_opencode, decode_opencode_with_sidecar, encode_opencode, encode_opencode_with_session,
+    decode_opencode, decode_opencode_with_sidecar, decode_opencode_with_sidecar_and_base,
+    encode_opencode, encode_opencode_with_session, encode_opencode_with_session_exemptions,
     MessageV2Json,
 };
 pub use pi::{decode_pi, decode_pi_with_sidecar, encode_pi, PiSessionEntryJson};
