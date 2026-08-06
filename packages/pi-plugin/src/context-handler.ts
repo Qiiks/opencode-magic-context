@@ -202,6 +202,7 @@ import {
 	trimPiMessagesToCachedBoundary,
 } from "./inject-compartments-pi";
 import { hasVisibleNoteReadCallPi } from "./note-visibility-pi";
+import { resolvePiUsableContextLimit } from "./pi-context-limit";
 import { type PiHistorianDeps, runPiHistorian } from "./pi-historian-runner";
 import { injectSyntheticTodowriteForPi } from "./pi-todo-inject";
 import {
@@ -227,7 +228,6 @@ import {
 	type PiMessageTokenCacheEntry,
 	tokenizePiMessages,
 } from "./tokenize-pi-messages";
-import { resolvePiUsableContextLimit } from "./pi-context-limit";
 import { createPiTranscript } from "./transcript-pi";
 
 /** Emergency-block threshold — mirrors OpenCode's >=95% emergency path. */

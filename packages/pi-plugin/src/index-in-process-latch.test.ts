@@ -3,9 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-
-import magicContextPiExtension from "./index";
-import { __test } from "./index";
+import magicContextPiExtension, { __test } from "./index";
 import { MAGIC_CONTEXT_PI_SUBAGENT_ENV } from "./subagent-runner";
 
 const originalEnv = {

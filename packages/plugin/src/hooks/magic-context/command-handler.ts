@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { COMPACTION_ENABLED_PATH } from '../../config/agent-disable';
+import { COMPACTION_ENABLED_PATH } from "../../config/agent-disable";
 import type { DreamerConfig, SidekickConfig } from "../../config/schema/magic-context";
 import type { ResolvedTransformMode } from "../../config/transform-mode";
 import {

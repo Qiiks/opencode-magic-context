@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
-import { LocalEmbeddingProvider, type LocalEmbeddingDtype } from "./embedding-local";
-import { isNativeRuntimeMissingError } from "./embedding-local";
+import {
+    isNativeRuntimeMissingError,
+    type LocalEmbeddingDtype,
+    LocalEmbeddingProvider,
+} from "./embedding-local";
 
 // Part A of issue #128: classify the PERMANENT "native runtime not installed"
 // failure so the provider degrades once (one actionable log line) instead of

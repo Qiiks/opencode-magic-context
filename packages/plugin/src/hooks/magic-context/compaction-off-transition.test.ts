@@ -114,11 +114,7 @@ function createOpenCodeDb(sessionId: string): Database {
     return db;
 }
 
-function insertMessage(
-    db: Database,
-    sessionId: string,
-    message: OcMessage,
-): void {
+function insertMessage(db: Database, sessionId: string, message: OcMessage): void {
     const time = message.timeCreated ?? 1;
     const data = {
         id: message.id,
@@ -181,7 +177,11 @@ function insertNativeMarker(
     insertPart(db, sessionId, {
         id: args.partId,
         messageId: args.boundaryMessageId,
-        data: { type: "compaction", auto: true, ...(args.tailStartId ? { tail_start_id: args.tailStartId } : {}) },
+        data: {
+            type: "compaction",
+            auto: true,
+            ...(args.tailStartId ? { tail_start_id: args.tailStartId } : {}),
+        },
     });
     insertMessage(db, sessionId, {
         id: args.summaryId,
@@ -201,7 +201,10 @@ function insertNativeMarker(
     });
 }
 
-function dumpRows(db: Database, sessionId: string): {
+function dumpRows(
+    db: Database,
+    sessionId: string,
+): {
     messages: Array<{ id: string; data: string }>;
     parts: Array<{ id: string; message_id: string; data: string }>;
 } {
@@ -255,9 +258,7 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
             expect(result.removedRows).toBe(3);
             expect(result.retainedLineages).toBe(0);
             // The boundary USER row is real history — never deleted.
-            const userRow = db
-                .prepare("SELECT id FROM message WHERE id = 'msg-user-1'")
-                .get();
+            const userRow = db.prepare("SELECT id FROM message WHERE id = 'msg-user-1'").get();
             expect(userRow).not.toBeNull();
             const userTextPart = db
                 .prepare("SELECT id FROM part WHERE id = 'prt-user-1-text'")
@@ -619,9 +620,7 @@ describe("reconcileCompactionMode — transition algebra", () => {
         expect(second.recordToWrite).toBe("off");
         commitCompactionModeRecord(db, "ses-1", second.recordToWrite!);
         expect(getCompactionModeRecord(db, "ses-1")).toBe("off");
-        expect(
-            ocDb.prepare("SELECT id FROM part WHERE id = 'prt-mc-compaction'").get(),
-        ).toBeNull();
+        expect(ocDb.prepare("SELECT id FROM part WHERE id = 'prt-mc-compaction'").get()).toBeNull();
         closeQuietly(ocDb);
     });
 
@@ -699,9 +698,9 @@ describe("reconcileCompactionMode — transition algebra", () => {
         }
         // Existing unknown values remain fail-closed as no record rather than
         // becoming a new mode or widening the old value domain implicitly.
-        db.prepare("UPDATE session_meta SET compaction_mode_record = 'legacy' WHERE session_id = ?").run(
-            "ses-1",
-        );
+        db.prepare(
+            "UPDATE session_meta SET compaction_mode_record = 'legacy' WHERE session_id = ?",
+        ).run("ses-1");
         expect(getCompactionModeRecord(db, "ses-1")).toBeNull();
     });
 
@@ -844,9 +843,7 @@ describe("reconcileCompactionMode — transition algebra", () => {
         expect(result.notice).toContain("/ctx-wrapup");
         // The catch-up signal primes the compartment phase.
         const row = db
-            .prepare(
-                "SELECT compartment_in_progress FROM session_meta WHERE session_id = 'ses-1'",
-            )
+            .prepare("SELECT compartment_in_progress FROM session_meta WHERE session_id = 'ses-1'")
             .get() as { compartment_in_progress: number };
         expect(row.compartment_in_progress).toBe(1);
     });
@@ -869,9 +866,7 @@ describe("reconcileCompactionMode — transition algebra", () => {
         expect(result.historianCatchUpSignaled).toBe(false);
         expect(result.notice).toBeNull();
         const row = db
-            .prepare(
-                "SELECT compartment_in_progress FROM session_meta WHERE session_id = 'ses-1'",
-            )
+            .prepare("SELECT compartment_in_progress FROM session_meta WHERE session_id = 'ses-1'")
             .get() as { compartment_in_progress: number };
         expect(row.compartment_in_progress).toBe(0);
     });

@@ -9,16 +9,11 @@ import {
     getLastCompartmentEndMessageId,
     type SessionFact,
 } from "../../features/magic-context/compartment-storage";
-import {
-    MEMORY_CATEGORY_ORDER_SQL,
-    V2_MEMORY_CATEGORIES,
-} from "../../features/magic-context/memory/constants";
+import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory/constants";
 import {
     getMaxMemoryIdForProjects,
     getMemoriesByProject,
     getMemoriesByProjects,
-    getMemorySelectColumns,
-    isMemoryRow,
 } from "../../features/magic-context/memory/storage-memory";
 import type { Memory } from "../../features/magic-context/memory/types";
 import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
@@ -2080,7 +2075,9 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         // rows exist but never render into <session-history>. The snapshot
         // markers still read the real maxCompartmentSeq so the staleness
         // check stays accurate; only the render input is emptied.
-        compartments = options.compactionOff ? [] : readM0Compartments(options.db, options.sessionId);
+        compartments = options.compactionOff
+            ? []
+            : readM0Compartments(options.db, options.sessionId);
         // v2 faithful facts: session_facts is retired as a render source (facts
         // promote to project memory, rendered below via `memories`). Keep `facts`
         // empty so renderSessionHistoryWithDecay never emits a <session_facts>

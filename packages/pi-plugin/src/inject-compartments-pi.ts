@@ -76,8 +76,6 @@ import {
 	DEFAULT_MEMORY_BUDGET_TOKENS,
 	DEFAULT_USER_PROFILE_BUDGET_TOKENS,
 	type MemoryRenderOptions,
-	type PreparedCompartmentInjection,
-	prepareCompartmentInjection,
 	renderMemoryBlockV2,
 	stripMemoryMuralBlock,
 	trimMemoriesToBudgetV2,
@@ -87,7 +85,6 @@ import {
 } from "@magic-context/core/hooks/magic-context/inject-compartments";
 
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
-import type { MessageLike } from "@magic-context/core/hooks/magic-context/tag-messages";
 import { sessionLog as logSession } from "@magic-context/core/shared/logger";
 import { resolvePiStableId, SYNTH_USER_ID_PREFIX } from "./read-session-pi";
 
@@ -115,73 +112,13 @@ type PiToolResultMessage = {
 };
 type PiAgentMessage = PiUserMessage | PiAssistantMessage | PiToolResultMessage;
 
-/**
- * Resolve the cross-pass-stable id for the i-th Pi message.
- *
- * Pi historian writes boundary IDs into the `compartments.start_message_id`
- * / `end_message_id` columns using SessionEntry IDs (the JSONL entry UUIDs)
- * via `read-session-pi.ts` → `RawMessage.id = entry.id`. Boundary lookup
- * MUST use the same scheme — otherwise injected `<session-history>` cannot
- * trim raw history because the cutoff id never matches anything in the
- * AgentMessage[] view.
- *
- * Pi's `pi.on("context")` event delivers `AgentMessage[]` only, with no
- * back-reference to the SessionEntry layer. Caller is responsible for
- * walking `ctx.sessionManager.getBranch()`, filtering to message-type
- * entries (the same filter `buildSessionContext` applies), and producing
- * an `entryIds: (string | undefined)[]` array indexed 1:1 with `piMessages`.
- *
- * When `entryIds[i]` is missing or undefined we fall back to a synthesized
- * `pi-msg-${index}-${ts}-${role}` id. That synthesized form has zero
- * cross-pass stability (the index moves whenever earlier messages are
- * trimmed) but is harmless because no compartment boundary will ever
- * match it. The fallback only exists so that the projection has *some*
- * id field for the trim machinery; it never produces a real cutoff.
- */
+/** Resolve a live Pi message to the stable ID stored with its compartment boundary. */
 function resolveStableId(
 	msg: PiAgentMessage,
 	index: number,
 	entryIds: readonly (string | undefined)[] | undefined,
 ): string {
-	// Delegate to the shared resolver (single source of truth). This path has no
-	// entryIdByRef (the trim projection is positional-only), so it uses the
-	// positional real id then the index fallback. resolvePiStableId returns
-	// undefined only for non-object msg; msg is a real PiAgentMessage here, so the
-	// `?? ""` is unreachable in practice and just satisfies the non-optional type.
 	return resolvePiStableId(msg, index, entryIds) ?? "";
-}
-
-/**
- * Build a minimal MessageLike-shaped projection of Pi messages so the
- * shared compartment-injection trim logic can run. Only the `info.id`
- * field is read (for the `findIndex(m => m.info.id === lastEndMessageId)`
- * cutoff search). `parts` stays empty because the trim logic doesn't
- * read part content.
- *
- * The returned array is a brand-new array, NOT a live view into Pi
- * messages. The shared `prepareCompartmentInjection` calls `splice` on
- * this projection to remove covered messages — those mutations stay
- * local to the projection and we map the resulting cutoff back to Pi
- * messages ourselves.
- */
-function buildMessageLikeProjection(
-	piMessages: PiAgentMessage[],
-	entryIds: readonly (string | undefined)[] | undefined,
-): MessageLike[] {
-	const projection: MessageLike[] = [];
-	for (let i = 0; i < piMessages.length; i++) {
-		const msg = piMessages[i];
-		if (!msg) continue;
-		projection.push({
-			info: {
-				id: resolveStableId(msg, i, entryIds),
-				role: msg.role,
-				sessionID: undefined,
-			},
-			parts: [],
-		});
-	}
-	return projection;
 }
 
 /**
@@ -361,95 +298,6 @@ export const __test = {
 	renderFreshM0PiNonPersisted,
 	clearPiMuralProcessCache,
 };
-
-/**
- * Find the first user message in the Pi AgentMessage[] and prepend the
- * `<session-history>` block to its first text content. Mirrors
- * OpenCode's `findFirstTextPart` + `textPart.text = block + textPart.text`
- * write pattern.
- *
- * Pi user messages can have `content: string` (legacy) or
- * `content: (TextContent | ImageContent)[]`. For the string case we
- * convert to an array first. For the array case we prepend a new text
- * content block at index 0 (matching how OpenCode injects ahead of any
- * existing text part).
- *
- * If no user message exists at all (e.g. session starts with assistant
- * output, edge case) we synthesize a leading user message holding only
- * the history block — same fallback OpenCode uses (`messages.unshift({
- * info: { role: "user", ... }, parts: [{ type: "text", text: block }] })`).
- *
- * Returns true when an injection happened.
- */
-function injectHistoryBlockIntoFirstUserMessage(
-	piMessages: PiAgentMessage[],
-	historyBlock: string,
-): boolean {
-	for (let i = 0; i < piMessages.length; i++) {
-		const msg = piMessages[i];
-		if (msg?.role !== "user") continue;
-
-		const userMsg = msg as PiUserMessage;
-		if (typeof userMsg.content === "string") {
-			// Convert string → array form so the history block sits as a
-			// distinct text block ahead of the user's text. Matches the
-			// OpenCode write pattern (block + "\n\n" + existing text).
-			piMessages[i] = {
-				...userMsg,
-				content: [
-					{ type: "text", text: `${historyBlock}\n\n${userMsg.content}` },
-				],
-			};
-			return true;
-		}
-		if (Array.isArray(userMsg.content)) {
-			// Find the first text content; prepend block to it. Falls back
-			// to inserting a new text block at the front when the array is
-			// image-only or empty.
-			const contentArr = userMsg.content;
-			const firstTextIndex = contentArr.findIndex(
-				(p) =>
-					p &&
-					typeof p === "object" &&
-					(p as { type?: unknown }).type === "text",
-			);
-			if (firstTextIndex >= 0) {
-				const existing = contentArr[firstTextIndex] as PiTextContent;
-				const newContent = contentArr.slice();
-				newContent[firstTextIndex] = {
-					...existing,
-					text: `${historyBlock}\n\n${existing.text}`,
-				};
-				piMessages[i] = { ...userMsg, content: newContent };
-			} else {
-				const newContent = [
-					{ type: "text" as const, text: historyBlock },
-					...contentArr,
-				];
-				piMessages[i] = { ...userMsg, content: newContent };
-			}
-			return true;
-		}
-
-		// Unknown content shape — replace with array containing only the
-		// history block. Defensive; AgentMessage's shape doesn't allow
-		// other content forms today.
-		piMessages[i] = {
-			...userMsg,
-			content: [{ type: "text", text: historyBlock }],
-		};
-		return true;
-	}
-
-	// No user message anywhere — inject a synthetic leading user message
-	// holding only the history block. Same fallback OpenCode uses.
-	piMessages.unshift({
-		role: "user",
-		content: [{ type: "text", text: historyBlock }],
-		timestamp: Date.now(),
-	});
-	return true;
-}
 
 const PI_M1_PLACEHOLDER =
 	"<session-history-since>(no new content since last materialization)</session-history-since>";

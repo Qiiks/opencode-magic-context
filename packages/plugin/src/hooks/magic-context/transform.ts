@@ -50,7 +50,7 @@ import {
     normalizeMaterializeReason,
     recordPendingTransformDecision,
 } from "../../features/magic-context/transform-decision-log";
-import type { ContextUsage, SchedulerDecision } from "../../features/magic-context/types";
+import type { ContextUsage } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
@@ -59,10 +59,7 @@ import { getSdkContextLimit } from "../../shared/models-dev-cache";
 import { applyMidTurnDeferral, detectMidTurnBypassReason } from "./boundary-execution";
 import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 import { replayCavemanCompression } from "./caveman-cleanup";
-import {
-    commitCompactionModeRecord,
-    reconcileCompactionMode,
-} from "./compaction-off-transition";
+import { commitCompactionModeRecord, reconcileCompactionMode } from "./compaction-off-transition";
 import { getActiveCompartmentRun, startCompartmentAgent } from "./compartment-runner";
 import { buildTriggerInMemoryTail, checkCompartmentTrigger } from "./compartment-trigger";
 import {
@@ -72,7 +69,6 @@ import {
     type ToolAvailabilityVerdict,
 } from "./ctx-reduce-availability";
 import { computeTailTokenEstimate, shouldTriggerChannel2 } from "./ctx-reduce-nudge";
-import { DEFAULT_HISTORY_BUDGET_TOKENS } from "./decay-render";
 import { deriveTriggerBudget } from "./derive-budgets";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
@@ -122,7 +118,6 @@ import {
     applyFlushedStatuses,
     type MessageLike,
     stripStructuralNoise,
-    type TagNormalizationTarget,
     type TagTarget,
     tagMessages,
 } from "./transform-operations";
@@ -349,21 +344,24 @@ function authorityModuleForProject(
     module: RustModeModuleClient,
     projectRoot: string,
 ): AuthorityModuleClient {
-    if (!module.authorityStatus || !module.authorityDrain || !module.mirrorPull) {
+    const authorityStatus = module.authorityStatus;
+    const authorityDrain = module.authorityDrain;
+    const mirrorPull = module.mirrorPull;
+    if (!authorityStatus || !authorityDrain || !mirrorPull) {
         throw new Error(
             "the module does not expose authority.status, authority.drain, and mirror.pull",
         );
     }
     return {
-        authorityStatus: (request) => module.authorityStatus!({ ...request, projectRoot }),
+        authorityStatus: (request) => authorityStatus.call(module, { ...request, projectRoot }),
         authorityPrepare: (request) => {
             if (!module.authorityPrepare) {
                 throw new Error("the module does not expose authority.prepare");
             }
             return module.authorityPrepare({ ...request, projectRoot });
         },
-        authorityDrain: (request) => module.authorityDrain!({ ...request, projectRoot }),
-        mirrorPull: (request) => module.mirrorPull!({ ...request, projectRoot }),
+        authorityDrain: (request) => authorityDrain.call(module, { ...request, projectRoot }),
+        mirrorPull: (request) => mirrorPull.call(module, { ...request, projectRoot }),
     };
 }
 
@@ -444,6 +442,7 @@ function scheduleTsAuthorityRecovery(args: {
 }): void {
     if (!getAuthorityManagedMarker(args.db, args.projectPath)) return;
     if (tsAuthorityRecoveryStateByProject.has(args.projectPath)) return;
+    const module = args.module;
 
     if (!tsAuthorityMismatchLoggedProjects.has(args.projectPath)) {
         tsAuthorityMismatchLoggedProjects.add(args.projectPath);
@@ -451,7 +450,7 @@ function scheduleTsAuthorityRecovery(args: {
             `[magic-context] project ${args.projectPath} is module-authority-managed but transform_mode is TS; draining authority back to TypeScript`,
         );
     }
-    if (!args.module) {
+    if (!module) {
         tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
         if (!tsAuthorityUnreachableLoggedProjects.has(args.projectPath)) {
             tsAuthorityUnreachableLoggedProjects.add(args.projectPath);
@@ -464,7 +463,7 @@ function scheduleTsAuthorityRecovery(args: {
 
     tsAuthorityRecoveryStateByProject.set(args.projectPath, "running");
     void Promise.resolve()
-        .then(() => recoverTsAuthorityProject({ ...args, module: args.module! }))
+        .then(() => recoverTsAuthorityProject({ ...args, module }))
         .then((outcome) => {
             if (outcome === "completed") {
                 tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
@@ -820,11 +819,7 @@ export function createTransform(deps: TransformDeps) {
             }
         } catch (error) {
             passOutcome.record("compaction-mode-transition-failure");
-            sessionLog(
-                sessionId,
-                "compaction mode transition failed (retrying next pass):",
-                error,
-            );
+            sessionLog(sessionId, "compaction mode transition failed (retrying next pass):", error);
         }
         // §N§ prefix + ctx_reduce + Channel 1 are gated on this single signal,
         // NOT on subagent status. `ctx_reduce` is registered process-globally
@@ -1272,10 +1267,7 @@ export function createTransform(deps: TransformDeps) {
         const emergencyCeilingLimit = thresholdContextLimit ?? 0;
         const emergencyCeilingTokens =
             Number.isFinite(emergencyCeilingLimit) && emergencyCeilingLimit > 0
-                ? Math.floor(
-                      emergencyCeilingLimit *
-                           (effectiveExecuteThresholdPercentage / 100),
-                  )
+                ? Math.floor(emergencyCeilingLimit * (effectiveExecuteThresholdPercentage / 100))
                 : undefined;
         // Compaction-off: drop scheduling is gated off — the scheduler never
         // approves an execute pass, so no pending-op drain, heuristic cleanup,
@@ -1284,13 +1276,13 @@ export function createTransform(deps: TransformDeps) {
         const schedulerDecisionEarly = compactionOff
             ? ("defer" as const)
             : resolveSchedulerDecision(
-                deps.scheduler,
-                sessionMeta,
-                contextUsageEarly,
-                sessionId,
-                deps.getModelKey?.(sessionId),
-                resolvedContextLimit,
-            );
+                  deps.scheduler,
+                  sessionMeta,
+                  contextUsageEarly,
+                  sessionId,
+                  deps.getModelKey?.(sessionId),
+                  resolvedContextLimit,
+              );
         const midTurn = isMidTurn(deps, resolvedSessionId);
         const bypassReason = detectMidTurnBypassReason({
             contextUsage: contextUsageEarly,
@@ -1728,7 +1720,6 @@ export function createTransform(deps: TransformDeps) {
             { type: string; thinking?: string; text?: string }[]
         >();
         let messageTagNumbers = new Map<MessageLike, number>();
-        let tagNormalizationTargets: TagNormalizationTarget[] = [];
         let batch: { finalize: () => void } | null = null;
         let hasRecentReduceCall = false;
         // Inject temporal markers before tagging so the §N§ tag prefix wraps
@@ -1772,65 +1763,64 @@ export function createTransform(deps: TransformDeps) {
         // self-heals: the tagger lazily mints on first observation of
         // untagged wire content once this gate reopens.
         if (!compactionOff) {
-        try {
-            const t0 = performance.now();
-            const tInitFromDb = performance.now();
-            // taggerFloor was derived once above (before the trigger block) and is
-            // reused here so the tagger map and the trigger's tag scans scope to
-            // the identical live-wire floor.
-            deps.tagger.initFromDb(sessionId, db, taggerFloor);
-            logTransformTiming(sessionId, "tag.initFromDb", tInitFromDb);
-            // Skip §N§ prefix injection only when ctx_reduce is unavailable in
-            // this session's tool allow-list. Subagents with the tool DO get
-            // prefixes now — they self-manage tool bloat. DB tag records are
-            // maintained either way so heuristics and drops continue to work;
-            // only the agent-visible prefix is gated.
-            const skipPrefixInjection = !ctxReduceCallable;
-            const result = tagMessages(sessionId, messages, deps.tagger, db, {
-                skipPrefixInjection,
-            });
-            targets = result.targets;
-            reasoningByMessage = result.reasoningByMessage;
-            messageTagNumbers = result.messageTagNumbers;
-            tagNormalizationTargets = result.normalizationTargets;
-            batch = result.batch;
-            hasRecentReduceCall = result.hasRecentReduceCall;
-            const hadPriorCommitState = deps.commitSeenLastPass?.has(sessionId) ?? false;
-            const sawCommitLastPass = deps.commitSeenLastPass?.get(sessionId) ?? false;
-            // Only trigger on NEW commits — not on first pass after restart where
-            // we have no baseline. First pass establishes the baseline silently.
-            // Subagents never deliver note nudges (gated in postprocess), so skip
-            // accumulating orphan trigger state.
-            if (
-                fullFeatureMode &&
-                hadPriorCommitState &&
-                result.hasRecentCommit &&
-                !sawCommitLastPass
-            ) {
-                onNoteTrigger(db, sessionId, "commit_detected");
-            }
-            deps.commitSeenLastPass?.set(sessionId, result.hasRecentCommit);
-            logTransformTiming(sessionId, "tagMessages", t0);
-            taggingSucceeded = true;
-        } catch (error) {
-            passOutcome.record("tagging-persistence-failure");
-            sessionLog(
-                sessionId,
-                "transform tag persistence failed; continuing without tagging:",
-                error,
-            );
-            // Drop in-memory tagger state for this session so the next pass
-            // re-loads from the DB. Without this, a stale counter or stale
-            // assignments map can keep producing the same UNIQUE collision
-            // turn after turn until the process restarts. With the DB-
-            // authoritative allocation in tagger.assignTag, a fresh load
-            // typically self-heals in one pass.
             try {
-                deps.tagger.cleanup(sessionId);
-            } catch (cleanupError) {
-                sessionLog(sessionId, "tagger cleanup after failure threw:", cleanupError);
+                const t0 = performance.now();
+                const tInitFromDb = performance.now();
+                // taggerFloor was derived once above (before the trigger block) and is
+                // reused here so the tagger map and the trigger's tag scans scope to
+                // the identical live-wire floor.
+                deps.tagger.initFromDb(sessionId, db, taggerFloor);
+                logTransformTiming(sessionId, "tag.initFromDb", tInitFromDb);
+                // Skip §N§ prefix injection only when ctx_reduce is unavailable in
+                // this session's tool allow-list. Subagents with the tool DO get
+                // prefixes now — they self-manage tool bloat. DB tag records are
+                // maintained either way so heuristics and drops continue to work;
+                // only the agent-visible prefix is gated.
+                const skipPrefixInjection = !ctxReduceCallable;
+                const result = tagMessages(sessionId, messages, deps.tagger, db, {
+                    skipPrefixInjection,
+                });
+                targets = result.targets;
+                reasoningByMessage = result.reasoningByMessage;
+                messageTagNumbers = result.messageTagNumbers;
+                batch = result.batch;
+                hasRecentReduceCall = result.hasRecentReduceCall;
+                const hadPriorCommitState = deps.commitSeenLastPass?.has(sessionId) ?? false;
+                const sawCommitLastPass = deps.commitSeenLastPass?.get(sessionId) ?? false;
+                // Only trigger on NEW commits — not on first pass after restart where
+                // we have no baseline. First pass establishes the baseline silently.
+                // Subagents never deliver note nudges (gated in postprocess), so skip
+                // accumulating orphan trigger state.
+                if (
+                    fullFeatureMode &&
+                    hadPriorCommitState &&
+                    result.hasRecentCommit &&
+                    !sawCommitLastPass
+                ) {
+                    onNoteTrigger(db, sessionId, "commit_detected");
+                }
+                deps.commitSeenLastPass?.set(sessionId, result.hasRecentCommit);
+                logTransformTiming(sessionId, "tagMessages", t0);
+                taggingSucceeded = true;
+            } catch (error) {
+                passOutcome.record("tagging-persistence-failure");
+                sessionLog(
+                    sessionId,
+                    "transform tag persistence failed; continuing without tagging:",
+                    error,
+                );
+                // Drop in-memory tagger state for this session so the next pass
+                // re-loads from the DB. Without this, a stale counter or stale
+                // assignments map can keep producing the same UNIQUE collision
+                // turn after turn until the process restarts. With the DB-
+                // authoritative allocation in tagger.assignTag, a fresh load
+                // typically self-heals in one pass.
+                try {
+                    deps.tagger.cleanup(sessionId);
+                } catch (cleanupError) {
+                    sessionLog(sessionId, "tagger cleanup after failure threw:", cleanupError);
+                }
             }
-        }
         }
 
         // P0 perf: replace single SELECT-everything load with three
@@ -2207,108 +2197,109 @@ export function createTransform(deps: TransformDeps) {
         const finalWireTail = describeFinalWireTail(messages);
         let finalWireEstimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
         if (!compactionOff) {
-        // Fresh-tokenize only in the emergency band. This estimate is telemetry,
-        // never an abort gate: provider-accurate accounting is deferred to the
-        // module-side implementation.
-        finalWireEstimate =
-            contextUsage.percentage >= 95
-                ? estimateFinalWireInputTokens({
-                      messages,
-                      systemPromptTokens: sessionMeta.systemPromptTokens,
-                      providerID: modelForBudget?.providerID,
-                      modelID: modelForBudget?.modelID,
-                      agentName: notificationParams.agent,
-                  })
-                : undefined;
-        if (finalWireEstimate) {
-            sessionLog(
-                sessionId,
-                `transform: final-wire telemetry estimate=${finalWireEstimate.tokens} trusted=${finalWireEstimate.trusted} conversation=${finalWireEstimate.messageTokens.conversation} tools=${finalWireEstimate.messageTokens.toolCall} system=${finalWireEstimate.systemTokens} toolDefinitions=${finalWireEstimate.toolDefinitionTokens ?? "unknown"} tail=${finalWireTail}`,
-            );
-        }
-        const currentModelKeyForRecovery = deps.getModelKey?.(sessionId);
-        const overflowStateForFinalWire = getOverflowState(
-            db,
-            sessionId,
-            currentModelKeyForRecovery,
-        );
-        // A catalog or user-configured limit is useful for budgeting, but it cannot
-        // prove that this provider accepts the recovered wire shape. Only the limit
-        // parsed from this model's own overflow response may disarm recovery.
-        const providerProvenLimitTokens =
-            typeof currentModelKeyForRecovery === "string" &&
-            currentModelKeyForRecovery.length > 0 &&
-            overflowStateForFinalWire.detectedContextLimit > 0 &&
-            overflowStateForFinalWire.detectedContextLimitModelKey === currentModelKeyForRecovery
-                ? overflowStateForFinalWire.detectedContextLimit
-                : undefined;
-        const emergencyFailClosed = evaluateEmergencyFailClosed({
-            usagePercentage: contextUsage.percentage,
-            emergencyRecoveryArmed,
-            emergencyRecoveryOrigin,
-            foldMaterializedThisPass: postTransformResult.historianFoldMaterializedThisPass,
-            finalWireEstimate,
-            providerProvenLimitTokens,
-        });
-        if (emergencyFailClosed.disarm) {
-            clearEmergencyRecovery(db, sessionId);
-            sessionLog(
-                sessionId,
-                `emergency disarm: trusted final-wire ${emergencyFailClosed.disarm.finalWireTokens} under limit ${emergencyFailClosed.disarm.provenLimitTokens}`,
-            );
-        }
-        if (emergencyFailClosed.shouldAbort) {
-            if (!deps.client) {
-                throw new EmergencyFailClosedError(
-                    "Cannot fail closed: OpenCode client is unavailable",
-                );
-            }
-            // The notice must finish before self-abort so recovery instructions survive interruption.
-            let notification: Awaited<ReturnType<typeof sendIgnoredMessage>>;
-            try {
-                notification = await sendIgnoredMessage(
-                    deps.client,
-                    sessionId,
-                    "Context full — /ctx-flush or /clear to continue.",
-                    notificationParams,
-                );
-            } catch (error) {
-                throw new EmergencyFailClosedError("Emergency recovery notification failed", {
-                    cause: error,
-                });
-            }
-            if (notification !== "sent" && notification !== "queued") {
-                throw new EmergencyFailClosedError(
-                    `Emergency recovery notification was ${notification}`,
-                );
-            }
-            try {
-                await abortSessionFailClosed(deps.client, sessionId);
-            } catch (error) {
+            // Fresh-tokenize only in the emergency band. This estimate is telemetry,
+            // never an abort gate: provider-accurate accounting is deferred to the
+            // module-side implementation.
+            finalWireEstimate =
+                contextUsage.percentage >= 95
+                    ? estimateFinalWireInputTokens({
+                          messages,
+                          systemPromptTokens: sessionMeta.systemPromptTokens,
+                          providerID: modelForBudget?.providerID,
+                          modelID: modelForBudget?.modelID,
+                          agentName: notificationParams.agent,
+                      })
+                    : undefined;
+            if (finalWireEstimate) {
                 sessionLog(
                     sessionId,
-                    "transform: emergency fail-closed abort failed; refusing to return a sendable prompt:",
-                    getErrorMessage(error),
+                    `transform: final-wire telemetry estimate=${finalWireEstimate.tokens} trusted=${finalWireEstimate.trusted} conversation=${finalWireEstimate.messageTokens.conversation} tools=${finalWireEstimate.messageTokens.toolCall} system=${finalWireEstimate.systemTokens} toolDefinitions=${finalWireEstimate.toolDefinitionTokens ?? "unknown"} tail=${finalWireTail}`,
                 );
-                throw new EmergencyFailClosedError("Emergency recovery abort failed", {
-                    cause: error,
-                });
             }
-            // The abort prevents a fresh provider usage sample. Release the
-            // stale-sample latch so the retry can reclaim additional tools.
-            try {
-                clearEmergencyDropSample(db, sessionId);
-            } catch (error) {
-                throw new EmergencyFailClosedError("Emergency recovery cleanup failed", {
-                    cause: error,
-                });
-            }
-            sessionLog(
+            const currentModelKeyForRecovery = deps.getModelKey?.(sessionId);
+            const overflowStateForFinalWire = getOverflowState(
+                db,
                 sessionId,
-                `EMERGENCY: fail-closed (reason=${emergencyFailClosed.reason}, recoveryOrigin=${emergencyRecoveryOrigin ?? "unknown"}, finalEstimate=${finalWireEstimate?.tokens ?? "unavailable"}, estimateTrusted=${finalWireEstimate?.trusted ?? false}, syntheticUsage=${usagePercentageSynthetic})`,
+                currentModelKeyForRecovery,
             );
-            return;
-        }
+            // A catalog or user-configured limit is useful for budgeting, but it cannot
+            // prove that this provider accepts the recovered wire shape. Only the limit
+            // parsed from this model's own overflow response may disarm recovery.
+            const providerProvenLimitTokens =
+                typeof currentModelKeyForRecovery === "string" &&
+                currentModelKeyForRecovery.length > 0 &&
+                overflowStateForFinalWire.detectedContextLimit > 0 &&
+                overflowStateForFinalWire.detectedContextLimitModelKey ===
+                    currentModelKeyForRecovery
+                    ? overflowStateForFinalWire.detectedContextLimit
+                    : undefined;
+            const emergencyFailClosed = evaluateEmergencyFailClosed({
+                usagePercentage: contextUsage.percentage,
+                emergencyRecoveryArmed,
+                emergencyRecoveryOrigin,
+                foldMaterializedThisPass: postTransformResult.historianFoldMaterializedThisPass,
+                finalWireEstimate,
+                providerProvenLimitTokens,
+            });
+            if (emergencyFailClosed.disarm) {
+                clearEmergencyRecovery(db, sessionId);
+                sessionLog(
+                    sessionId,
+                    `emergency disarm: trusted final-wire ${emergencyFailClosed.disarm.finalWireTokens} under limit ${emergencyFailClosed.disarm.provenLimitTokens}`,
+                );
+            }
+            if (emergencyFailClosed.shouldAbort) {
+                if (!deps.client) {
+                    throw new EmergencyFailClosedError(
+                        "Cannot fail closed: OpenCode client is unavailable",
+                    );
+                }
+                // The notice must finish before self-abort so recovery instructions survive interruption.
+                let notification: Awaited<ReturnType<typeof sendIgnoredMessage>>;
+                try {
+                    notification = await sendIgnoredMessage(
+                        deps.client,
+                        sessionId,
+                        "Context full — /ctx-flush or /clear to continue.",
+                        notificationParams,
+                    );
+                } catch (error) {
+                    throw new EmergencyFailClosedError("Emergency recovery notification failed", {
+                        cause: error,
+                    });
+                }
+                if (notification !== "sent" && notification !== "queued") {
+                    throw new EmergencyFailClosedError(
+                        `Emergency recovery notification was ${notification}`,
+                    );
+                }
+                try {
+                    await abortSessionFailClosed(deps.client, sessionId);
+                } catch (error) {
+                    sessionLog(
+                        sessionId,
+                        "transform: emergency fail-closed abort failed; refusing to return a sendable prompt:",
+                        getErrorMessage(error),
+                    );
+                    throw new EmergencyFailClosedError("Emergency recovery abort failed", {
+                        cause: error,
+                    });
+                }
+                // The abort prevents a fresh provider usage sample. Release the
+                // stale-sample latch so the retry can reclaim additional tools.
+                try {
+                    clearEmergencyDropSample(db, sessionId);
+                } catch (error) {
+                    throw new EmergencyFailClosedError("Emergency recovery cleanup failed", {
+                        cause: error,
+                    });
+                }
+                sessionLog(
+                    sessionId,
+                    `EMERGENCY: fail-closed (reason=${emergencyFailClosed.reason}, recoveryOrigin=${emergencyRecoveryOrigin ?? "unknown"}, finalEstimate=${finalWireEstimate?.tokens ?? "unavailable"}, estimateTrusted=${finalWireEstimate?.trusted ?? false}, syntheticUsage=${usagePercentageSynthetic})`,
+                );
+                return;
+            }
         }
         if (!finalWireEstimate) {
             sessionLog(

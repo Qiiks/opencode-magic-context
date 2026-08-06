@@ -40,20 +40,24 @@
 import { existsSync } from "node:fs";
 import {
     getOpenCodeDbPath,
-    removeMcOwnedCompactionMarkers,
     type McOwnedMarkerCleanupResult,
+    removeMcOwnedCompactionMarkers,
 } from "../../features/magic-context/compaction-marker";
-import { clearPendingOps, getPendingOps, updateSessionMeta } from "../../features/magic-context/storage";
 import {
+    clearPendingOps,
+    getPendingOps,
+    updateSessionMeta,
+} from "../../features/magic-context/storage";
+import {
+    type CompactionModeRecord,
     clearEmergencyRecovery,
     clearPendingCompactionMarkerStateIf,
-    type CompactionModeRecord,
     getChannel2NudgeState,
-    resolveCompactionModeRecord,
     getCompactionModeRecord,
     getOverflowState,
     getPendingCompactionMarkerState,
     getPersistedCompactionMarkerState,
+    resolveCompactionModeRecord,
     setChannel2NudgeState,
     setCompactionModeRecord,
     setPersistedCompactionMarkerState,
@@ -332,7 +336,13 @@ export function reconcileCompactionMode(args: {
     }
 
     return {
-        recordToWrite: notice ? (markerCleanup.verified ? "off" : "off_cleanup_pending") : markerCleanup.verified ? "off" : null,
+        recordToWrite: notice
+            ? markerCleanup.verified
+                ? "off"
+                : "off_cleanup_pending"
+            : markerCleanup.verified
+              ? "off"
+              : null,
         notice,
         invalidatedM0Baseline,
         historianCatchUpSignaled: false,

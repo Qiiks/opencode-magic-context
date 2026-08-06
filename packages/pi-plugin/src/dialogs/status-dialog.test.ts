@@ -26,10 +26,15 @@ describe("Pi status dialog", () => {
 				getSystemPrompt: () => "system prompt",
 			};
 
-			const detail = buildPiStatusDetail({ getAllTools: () => [] } as never, ctx as never, {
-				db,
-				projectIdentity: resolveProjectIdentity(process.cwd()),
-			}, sessionId);
+			const detail = buildPiStatusDetail(
+				{ getAllTools: () => [] } as never,
+				ctx as never,
+				{
+					db,
+					projectIdentity: resolveProjectIdentity(process.cwd()),
+				},
+				sessionId,
+			);
 			expect(detail.contextLimit).toBe(80_000);
 			expect(detail.usagePercentage).toBe(62.5);
 		} finally {

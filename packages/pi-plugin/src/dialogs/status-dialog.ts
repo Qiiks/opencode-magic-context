@@ -29,14 +29,13 @@ import { formatBytes } from "@magic-context/core/hooks/magic-context/format-byte
 import { computeM0BlockTokens } from "@magic-context/core/hooks/magic-context/m0-token-breakdown";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { countCompartmentsNeedingUpgrade } from "@magic-context/core/hooks/magic-context/upgrade-reminder";
-import { resolvePiUsableContextLimit } from "../pi-context-limit";
 import {
 	formatThresholdClampNote,
 	formatThresholdPercent,
 } from "@magic-context/core/shared/format-threshold";
-
 import packageJson from "../../package.json";
 import { resolveSessionId } from "../commands/pi-command-utils";
+import { resolvePiUsableContextLimit } from "../pi-context-limit";
 import { isPiRecompInFlight } from "../pi-recomp-runner";
 
 // Mirror packages/plugin/src/tui/slots/sidebar-content.tsx COLORS so the Pi

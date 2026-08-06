@@ -9,7 +9,6 @@ import { getOverflowState } from "@magic-context/core/features/magic-context/sto
 import { getNotes } from "@magic-context/core/features/magic-context/storage-notes";
 import { getTagsBySession } from "@magic-context/core/features/magic-context/storage-tags";
 import { executeStatus } from "@magic-context/core/hooks/magic-context/execute-status";
-import { formatBytes } from "@magic-context/core/hooks/magic-context/format-bytes";
 import { describeError } from "@magic-context/core/shared/error-message";
 import { showStatusDialog } from "../dialogs/status-dialog";
 import { resolvePiUsableContextLimit } from "../pi-context-limit";
@@ -102,7 +101,10 @@ export function registerCtxStatusCommand(
 					: undefined;
 				let detectedContextLimit: number | undefined;
 				try {
-					const detected = getOverflowState(currentDeps.db, sessionId).detectedContextLimit;
+					const detected = getOverflowState(
+						currentDeps.db,
+						sessionId,
+					).detectedContextLimit;
 					if (detected > 0) detectedContextLimit = detected;
 				} catch {
 					// Status remains available when overflow metadata cannot be read.

@@ -69,9 +69,7 @@ describe("Pi compaction-off mode", () => {
 				historianRunnable: true,
 			});
 			expect(transition.recordToWrite).toBe("off");
-			expect(getCompactionModeRecord(db, sessionId)).toBe(
-				"off_notice_pending",
-			);
+			expect(getCompactionModeRecord(db, sessionId)).toBe("off_notice_pending");
 			expect(transition.clearDeferredMarkerState).toBe(true);
 			expect(getPendingOps(db, sessionId)).toEqual([]);
 			expect(getOverflowState(db, sessionId).needsEmergencyRecovery).toBe(
@@ -126,9 +124,7 @@ describe("Pi compaction-off mode", () => {
 				historianRunnable: true,
 			});
 			expect(resumed.recordToWrite).toBe("on");
-			expect(getCompactionModeRecord(db, sessionId)).toBe(
-				"on_notice_pending",
-			);
+			expect(getCompactionModeRecord(db, sessionId)).toBe("on_notice_pending");
 			expect(resumed.historianCatchUpSignaled).toBe(true);
 			expect(resumed.notice).toContain("/ctx-wrapup");
 		} finally {
@@ -148,9 +144,7 @@ describe("Pi compaction-off mode", () => {
 				historianRunnable: true,
 			});
 			expect(first.notice).toContain("compaction-off mode");
-			expect(getCompactionModeRecord(db, sessionId)).toBe(
-				"off_notice_pending",
-			);
+			expect(getCompactionModeRecord(db, sessionId)).toBe("off_notice_pending");
 
 			// Simulate restart after the clears committed but before the caller
 			// reached Pi's UI. The pending record, not process memory, requests
@@ -162,7 +156,10 @@ describe("Pi compaction-off mode", () => {
 				historianRunnable: true,
 			});
 			expect(restarted.notice).toBe(first.notice);
-			commitPiCompactionModeRecord(db, sessionId, restarted.recordToWrite!);
+			const recordToWrite = restarted.recordToWrite;
+			if (!recordToWrite)
+				throw new Error("expected a compaction mode record to persist");
+			commitPiCompactionModeRecord(db, sessionId, recordToWrite);
 			expect(getCompactionModeRecord(db, sessionId)).toBe("off");
 		} finally {
 			closeQuietly(db);
