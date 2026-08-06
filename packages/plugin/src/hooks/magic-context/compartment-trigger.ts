@@ -31,6 +31,7 @@ import {
     type RawMessage,
 } from "./read-session-raw";
 import { estimateTrueRawMessageTokens } from "./read-session-true-raw-tokens";
+import { modelAcceptsEmptyContent } from "./sentinel";
 
 const PROACTIVE_TRIGGER_OFFSET_PERCENTAGE = 2;
 const POST_DROP_TARGET_RATIO = 0.75;
@@ -75,6 +76,16 @@ export interface CompartmentTriggerResult {
 export interface InMemoryTailSource {
     messages: RawMessage[];
     absoluteMessageCount: number;
+}
+
+/**
+ * Wire capability for projecting reclaimable reasoning bytes. OpenCode derives
+ * this from the provider's empty-sentinel support; Pi overrides it because its
+ * serializers safely omit cleared thinking for every provider.
+ */
+export interface ReasoningProjectionCapability {
+    providerID?: string;
+    canClearReasoning?: boolean;
 }
 
 /**
@@ -207,8 +218,9 @@ function estimateProjectedPostDropPercentage(
     sessionId: string,
     usage: ContextUsage,
     activeTags: readonly TagEntry[],
-    clearReasoningAge?: number,
-    clearedReasoningThroughTag?: number,
+    clearReasoningAge: number | undefined,
+    clearedReasoningThroughTag: number | undefined,
+    canClearReasoning: boolean,
 ): number | null {
     // Denominator must include both text/tool bytes and reasoning bytes to match the numerator
     const totalActiveBytes = activeTags.reduce(
@@ -234,7 +246,11 @@ function estimateProjectedPostDropPercentage(
     //    projected as droppable here. The tiered emergency drop fires only at ≥85%,
     //    which is above this trigger's window, so it is intentionally not modeled.)
     const maxTag = activeTags.reduce((max, t) => Math.max(max, t.tagNumber), 0);
-    if (clearReasoningAge !== undefined && clearedReasoningThroughTag !== undefined) {
+    if (
+        canClearReasoning &&
+        clearReasoningAge !== undefined &&
+        clearedReasoningThroughTag !== undefined
+    ) {
         const reasoningAgeCutoff = maxTag - clearReasoningAge;
         for (const tag of activeTags) {
             if (tag.type !== "message") continue;
@@ -418,6 +434,7 @@ export function checkCompartmentTrigger(
     contextLimit?: number,
     inMemoryTail?: InMemoryTailSource | LazyInMemoryTailSource,
     taggerFloorOverride?: number,
+    reasoningProjection?: ReasoningProjectionCapability,
 ): CompartmentTriggerResult {
     if (sessionMeta.compartmentInProgress) {
         sessionLog(
@@ -588,6 +605,13 @@ export function checkCompartmentTrigger(
         return { shouldFire: false };
     }
 
+    // Never project reclaimed reasoning unless this harness can actually clear
+    // it from the provider wire. The OpenCode fallback shares the sentinel
+    // predicate with the postprocess clearing path; Pi explicitly supplies its
+    // own provider-independent capability.
+    const canClearReasoning =
+        reasoningProjection?.canClearReasoning ??
+        modelAcceptsEmptyContent(reasoningProjection?.providerID);
     const projectedPostDropPercentage = estimateProjectedPostDropPercentage(
         db,
         sessionId,
@@ -595,6 +619,7 @@ export function checkCompartmentTrigger(
         preloadedActiveTags ?? getActiveTagsBySession(db, sessionId),
         clearReasoningAge,
         sessionMeta.clearedReasoningThroughTag,
+        canClearReasoning,
     );
     const relativePostDropTarget = executeThresholdPercentage * POST_DROP_TARGET_RATIO;
 

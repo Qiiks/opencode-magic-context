@@ -3842,6 +3842,9 @@ function maybeFireHistorian(args: {
 			}
 		}
 
+		// Pi's cleared thinking is safe to project for every provider: its
+		// serializers omit empty thinking blocks, unlike OpenCode's
+		// canonical-Anthropic-only empty-sentinel path.
 		const trigger = checkCompartmentTrigger(
 			db,
 			sessionId,
@@ -3859,6 +3862,7 @@ function maybeFireHistorian(args: {
 				return { messages, absoluteMessageCount: messages.length };
 			},
 			args.taggerFloor,
+			{ canClearReasoning: true },
 		);
 
 		if (!trigger.shouldFire) {
