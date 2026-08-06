@@ -1600,6 +1600,7 @@ export function createTransform(deps: TransformDeps) {
                     boundaryContextLimit,
                     inMemoryTail,
                     taggerFloor,
+                    { providerID: resolvedProviderID },
                 );
                 if (triggerResult.shouldFire) {
                     sessionLog(
