@@ -59,6 +59,28 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(warnings.some((w) => w.includes("sqlite"))).toBe(true);
     });
 
+    it("strips storage.enforce_private_permissions from project config (only-key case)", () => {
+        const raw: Record<string, unknown> = {
+            storage: { enforce_private_permissions: false },
+        };
+
+        const warnings = stripUnsafeProjectConfigFields(raw);
+
+        expect(raw.storage).toEqual({});
+        expect(warnings.some((w) => w.includes("storage.enforce_private_permissions"))).toBe(true);
+    });
+
+    it("strips storage.enforce_private_permissions but keeps a sibling key", () => {
+        const raw: Record<string, unknown> = {
+            storage: { enforce_private_permissions: false, futureSibling: 1 },
+        };
+
+        const warnings = stripUnsafeProjectConfigFields(raw);
+
+        expect(raw.storage).toEqual({ futureSibling: 1 });
+        expect(warnings.some((w) => w.includes("storage.enforce_private_permissions"))).toBe(true);
+    });
+
     it("strips Pi subagent extension allowlists from project config", () => {
         const raw: Record<string, unknown> = {
             pi: { subagent_extensions: ["./repo-controlled-extension.ts"] },

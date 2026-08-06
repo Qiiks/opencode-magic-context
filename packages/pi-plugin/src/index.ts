@@ -93,6 +93,7 @@ import { setKeepSubagents } from "@magic-context/core/shared/keep-subagents";
 import { log } from "@magic-context/core/shared/logger";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import { resolveFallbackChain } from "@magic-context/core/shared/resolve-fallbacks";
+import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
 
 import { handlePiCloneSessionStart } from "./clone-inheritance";
 import {
@@ -721,6 +722,20 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	markPiMagicContextActive();
 	beginBootQuietPeriod();
 
+	// Resolve the user-tier storage policy before opening the shared database.
+	// Project config cannot alter it, so every project in this process shares the
+	// operator's chosen owner-private or externally managed permission policy.
+	const bootProjectDir = process.cwd();
+	ensureConfigLocationsMigrated(bootProjectDir);
+	const bootConfig = loadPiConfig({ cwd: bootProjectDir });
+	setStoragePrivatePermissionEnforcement(
+		bootConfig.config.storage.enforce_private_permissions,
+	);
+	setSqlitePragmaConfig({
+		cacheSizeMb: bootConfig.config.sqlite.cache_size_mb,
+		mmapSizeMb: bootConfig.config.sqlite.mmap_size_mb,
+	});
+
 	const storageDir = getMagicContextStorageDir();
 	const dbPath = join(storageDir, "context.db");
 
@@ -894,10 +909,13 @@ async function startPiMagicContextRuntime(
 		dedupe: true,
 	});
 
-	// Pi opens the shared DB before config is available (above), so apply the
-	// configured SQLite tuning to the already-open connection now. cache_size /
-	// mmap_size take effect live; future opens in this process pick them up via
+	// Reapply boot-resolved storage and SQLite settings in case config changed
+	// between the initial open and runtime registration. cache_size / mmap_size
+	// take effect live; future opens in this process pick them up via
 	// setSqlitePragmaConfig.
+	setStoragePrivatePermissionEnforcement(
+		config.storage.enforce_private_permissions,
+	);
 	setSqlitePragmaConfig({
 		cacheSizeMb: config.sqlite.cache_size_mb,
 		mmapSizeMb: config.sqlite.mmap_size_mb,

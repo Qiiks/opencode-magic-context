@@ -442,6 +442,13 @@ export interface MagicContextConfig {
         mmap_size_mb: number;
     };
     /**
+     * Keep shared-storage permissions under an external operator's control.
+     * USER config only; project configs cannot weaken local data privacy.
+     */
+    storage: {
+        enforce_private_permissions: boolean;
+    };
+    /**
      * Controls whether and where Magic Context augments the system prompt
      * (`## Magic Context` guidance, `<project-docs>`, `<user-profile>`,
      * sticky date) inside `experimental.chat.system.transform`.
@@ -754,6 +761,19 @@ export const MagicContextConfigSchema = z
             .default({ cache_size_mb: 64, mmap_size_mb: 0 })
             .describe(
                 "SQLite connection tuning for Magic Context's own context.db. These are per-connection PRAGMAs applied at open; they do not change the schema or what is stored.",
+            ),
+        storage: z
+            .object({
+                enforce_private_permissions: z
+                    .boolean()
+                    .default(true)
+                    .describe(
+                        "When true (default), Magic Context creates and re-tightens its storage directories to owner-only 0700 and storage files to owner-only 0600. Set false only for a deliberate trusted-group deployment whose operator manages directory, database, WAL/SHM, cache, and RPC file permissions externally; Magic Context then never chmods or supplies restrictive creation modes. USER-LEVEL ONLY — ignored in project config for security. On Windows, POSIX chmod modes are already meaningless, so this setting is a no-op.",
+                    ),
+            })
+            .default({ enforce_private_permissions: true })
+            .describe(
+                "Storage permission policy. The default keeps session content and memories owner-private. Disabling enforcement is for trusted shared-group storage managed externally; every group member able to read the storage can read all stored session content and memories.",
             ),
         embedding: EmbeddingConfigSchema.default({
             provider: "local",

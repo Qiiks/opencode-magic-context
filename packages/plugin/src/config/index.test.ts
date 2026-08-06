@@ -355,6 +355,16 @@ describe("loadPluginConfig — secret redaction", () => {
         expect(result.embedding.endpoint).toBe("https://embeddings.example/v1");
     });
 
+    it("honors user storage permissions while ignoring a project-tier override", () => {
+        const result = loadWithUserAndProjectConfig(
+            JSON.stringify({ storage: { enforce_private_permissions: false } }),
+            JSON.stringify({ storage: { enforce_private_permissions: true, futureSibling: 1 } }),
+        );
+
+        expect(result.storage.enforce_private_permissions).toBe(false);
+        expect(result.configWarnings?.join("\n")).toContain("storage.enforce_private_permissions");
+    });
+
     it("ignores embedding destination fields from untrusted project config", () => {
         const userConfig = JSON.stringify({
             embedding: {

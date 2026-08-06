@@ -168,6 +168,29 @@ describe("loadPiConfig", () => {
 		expect(result.loadedFromPaths).toEqual([userPath]);
 	});
 
+	it("honors user storage permissions while ignoring a project-tier override", () => {
+		const cwd = makeTempRoot("mc-pi-cwd-");
+		const home = makeTempRoot("mc-pi-home-");
+		withHome(home);
+		writeUserConfig(
+			home,
+			JSON.stringify({ storage: { enforce_private_permissions: false } }),
+		);
+		writeProjectConfig(
+			cwd,
+			JSON.stringify({
+				storage: { enforce_private_permissions: true, futureSibling: 1 },
+			}),
+		);
+
+		const result = loadPiConfig({ cwd });
+
+		expect(result.config.storage.enforce_private_permissions).toBe(false);
+		expect(result.warnings.join("\n")).toContain(
+			"storage.enforce_private_permissions",
+		);
+	});
+
 	it("merges user then project with project overrides winning", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");

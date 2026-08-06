@@ -2,13 +2,13 @@ import {
     chmodSync,
     copyFileSync,
     cpSync,
+    type Dirent,
     existsSync,
     mkdirSync,
     mkdtempSync,
     readdirSync,
     readFileSync,
     unlinkSync,
-    type Dirent,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -22,6 +22,7 @@ import { log } from "../../shared/logger";
 import { isPidAlive, parseRpcPortFile } from "../../shared/rpc-utils";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
 import { ensureContextStoreUuid } from "./context-authority";
 import { runMigrations, runMigrationsWithRetry } from "./migrations";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
@@ -90,20 +91,35 @@ export const LATEST_SUPPORTED_VERSION = 72;
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
 const PERMISSIONS_ENFORCEABLE = process.platform !== "win32";
 
+const defaultStoragePermissionFs = { chmodSync, mkdirSync };
+let storagePermissionFs = defaultStoragePermissionFs;
+
+/** Test seam: captures permission-changing calls without changing real fixture modes. */
+export function __setStoragePermissionFsForTests(
+    overrides: Partial<typeof defaultStoragePermissionFs>,
+): void {
+    storagePermissionFs = { ...defaultStoragePermissionFs, ...overrides };
+}
+
+export function __resetStoragePermissionFsForTests(): void {
+    storagePermissionFs = defaultStoragePermissionFs;
+}
+
 /**
- * Create `dir` (recursively) owner-only and tighten an existing dir to 0o700.
- *
- * The storage tree holds project memories, raw conversation history, and
- * embeddings. Created with the default umask these can be group/world-readable,
- * leaking that content to other local users. We create with mode 0o700 and
- * additionally chmod (mkdir's `mode` is masked by umask and a no-op when the
- * dir already exists). Best-effort: a chmod failure is logged, not fatal.
+ * Create `dir` recursively. When private permissions are enabled, also create
+ * and tighten it to owner-only 0o700. When an operator manages trusted-group
+ * permissions, do not pass a mode or chmod an existing directory.
  */
 function ensureSecureStorageDir(dir: string): void {
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (!shouldEnforcePrivateStoragePermissions()) {
+        storagePermissionFs.mkdirSync(dir, { recursive: true });
+        return;
+    }
+
+    storagePermissionFs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     if (!PERMISSIONS_ENFORCEABLE) return;
     try {
-        chmodSync(dir, 0o700);
+        storagePermissionFs.chmodSync(dir, 0o700);
     } catch (error) {
         log(
             `[magic-context] could not restrict storage dir permissions on ${dir}: ${getErrorMessage(error)}`,
@@ -112,18 +128,17 @@ function ensureSecureStorageDir(dir: string): void {
 }
 
 /**
- * Restrict the SQLite DB file and its WAL/SHM sidecars to owner-only (0o600).
- * They are created with the process umask, which can be group/world-readable;
- * since they hold the same durable state as the storage dir, tighten them once
- * they exist. Best-effort per file.
+ * Restrict the SQLite DB file and its WAL/SHM sidecars to owner-only (0o600)
+ * only when Magic Context owns storage permission management. A trusted-group
+ * deployment keeps the operator's modes unchanged, including sidecars.
  */
 function restrictDatabaseFilePermissions(dbPath: string): void {
-    if (!PERMISSIONS_ENFORCEABLE) return;
+    if (!PERMISSIONS_ENFORCEABLE || !shouldEnforcePrivateStoragePermissions()) return;
     for (const suffix of ["", "-wal", "-shm"]) {
         const file = `${dbPath}${suffix}`;
         if (!existsSync(file)) continue;
         try {
-            chmodSync(file, 0o600);
+            storagePermissionFs.chmodSync(file, 0o600);
         } catch (error) {
             log(
                 `[magic-context] could not restrict DB file permissions on ${file}: ${getErrorMessage(error)}`,
@@ -442,7 +457,6 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
     return { state: "stale", serverPids: [], staleFiles };
 }
 
-
 /**
  * Refuse an on-open migration when another live OpenCode server still has this
  * shared DB open. That server loaded its plugin dist at boot and cannot observe
@@ -568,8 +582,8 @@ function finishDatabaseOpen(
     // never hits a missing-table failure path.
     setToolDefinitionDatabase(db);
     loadToolDefinitionMeasurements(db);
-    // Tighten the DB + WAL/SHM sidecars to owner-only now that WAL mode has
-    // created the sidecars; best-effort, never fatal.
+    // When enabled, tighten the DB + WAL/SHM sidecars now that WAL mode has
+    // created them. Externally managed trusted-group storage skips this entirely.
     restrictDatabaseFilePermissions(dbPath);
     databases.set(dbPath, db);
     pathByDatabase.set(db, dbPath);

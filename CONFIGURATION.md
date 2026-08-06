@@ -26,6 +26,20 @@ So memories you write in OpenCode appear in Pi sessions for the same project (an
 
 For semantic search to work cross-harness, both plugins resolve embedding config per project identity on every retrieval path. OpenCode and Pi can run in the same process against different projects without sharing one process-global embedding provider. For one project, keep the effective `embedding` block consistent across the OpenCode and Pi config stack; Magic Context tags stored vectors with the resolved model identity and clears stale vectors for that project when the provider/model changes.
 
+### Trusted-group shared storage
+
+By default, Magic Context enforces owner-only `0700` storage directories and `0600` storage files. For a deliberate Unix deployment where trusted users share one store and an operator manages permissions externally, set this **in user config only**:
+
+```jsonc
+{
+  "storage": {
+    "enforce_private_permissions": false
+  }
+}
+```
+
+For example, the operator may maintain the storage directory as `2770` and `context.db`, `context.db-wal`, and `context.db-shm` as `0660` for a trusted Unix group. With this setting disabled, Magic Context never re-tightens directory, database, WAL/SHM, model-cache, or RPC-file permissions; missing paths are still created using the operator's umask. Every group member that can read this store can read **all** stored session content and memories, so use this only for a deliberately trusted group. On Windows, POSIX modes are not meaningful, so the setting has no effect.
+
 ### JSON Schema
 
 Add `$schema` to your config file for autocomplete and validation in VS Code and other editors:
@@ -114,6 +128,7 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | `keep_subagents` | `boolean` | `false` | Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success, so their full transcript stays in the host session store for inspection. Kept sessions accumulate until cleared manually — leave `false` for normal use. |
 | `todowrite` | `object` | See below | **Pi only.** Controls Magic Context's built-in `todowrite` tool and persistent task overlay. OpenCode has its own built-in `todowrite`, so this setting has no effect there. |
 | `sqlite` | `object` | See below | Per-connection SQLite tuning for Magic Context's own `context.db`. |
+| `storage.enforce_private_permissions` | `boolean` | `true` | User-config-only. Keep owner-only `0700` directories and `0600` files. Set `false` only for an externally managed trusted-group deployment; Magic Context will never re-tighten storage permissions. |
 
 ### `fail_closed_blocking`
 

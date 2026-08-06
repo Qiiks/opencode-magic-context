@@ -30,6 +30,7 @@ import { join } from "node:path";
 import { getMagicContextStorageDir } from "./data-path";
 import { getHarness } from "./harness";
 import { sessionLog } from "./logger";
+import { shouldEnforcePrivateStoragePermissions } from "./storage-permissions";
 
 interface OpencodeClientLike {
     config: {
@@ -143,7 +144,11 @@ function persistApiCache(): void {
         mkdirSync(dir, { recursive: true });
         const target = persistFilePath();
         const tmp = `${target}.${process.pid}.tmp`;
-        writeFileSync(tmp, JSON.stringify(obj), { encoding: "utf-8", mode: 0o600 });
+        if (shouldEnforcePrivateStoragePermissions()) {
+            writeFileSync(tmp, JSON.stringify(obj), { encoding: "utf-8", mode: 0o600 });
+        } else {
+            writeFileSync(tmp, JSON.stringify(obj), { encoding: "utf-8" });
+        }
         renameSync(tmp, target);
     } catch {
         // best-effort — a failed persist only loses cold-start warmth, not correctness

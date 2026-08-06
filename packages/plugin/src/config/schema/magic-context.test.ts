@@ -16,6 +16,7 @@ describe("MagicContextConfigSchema", () => {
                 enabled: true,
                 fail_closed_blocking: true,
                 transform_mode: "ts",
+                storage: { enforce_private_permissions: true },
                 cache_ttl: "5m",
                 execute_threshold_percentage: 65,
                 protected_tags: 20,
@@ -66,6 +67,9 @@ describe("MagicContextConfigSchema", () => {
                 sqlite: {
                     cache_size_mb: 64,
                     mmap_size_mb: 0,
+                },
+                storage: {
+                    enforce_private_permissions: false,
                 },
                 system_prompt_injection: {
                     enabled: true,
@@ -127,6 +131,19 @@ describe("MagicContextConfigSchema", () => {
             const result = MagicContextConfigSchema.parse(input);
 
             expect(result).toEqual(input);
+        });
+
+        it("accepts a boolean storage permission policy and rejects non-booleans", () => {
+            expect(
+                MagicContextConfigSchema.parse({
+                    storage: { enforce_private_permissions: false },
+                }).storage.enforce_private_permissions,
+            ).toBe(false);
+            expect(
+                MagicContextConfigSchema.safeParse({
+                    storage: { enforce_private_permissions: "false" },
+                }).success,
+            ).toBe(false);
         });
 
         it("applies sidekick defaults when the object is present", () => {

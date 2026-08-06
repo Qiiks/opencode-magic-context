@@ -56,6 +56,7 @@ import type { ContextDatabase } from "@magic-context/core/features/magic-context
 import { openDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { setHarness } from "@magic-context/core/shared/harness";
 import { log } from "@magic-context/core/shared/logger";
+import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
 import { loadPiConfig } from "./config";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { registerMagicContextTools } from "./tools";
@@ -81,6 +82,13 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async () => {
 		try {
+			// Load shared config before opening storage so a trusted-group deployment
+			// never has its externally managed permissions re-tightened by a child.
+			const directory = process.cwd();
+			const { config: cfg } = loadPiConfig({ cwd: directory });
+			setStoragePrivatePermissionEnforcement(
+				cfg.storage.enforce_private_permissions,
+			);
 			const db = openDatabase();
 			if (!db) {
 				throw new Error(
@@ -88,13 +96,6 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 				);
 			}
 			openedDb = db;
-
-			// Load shared config so embedding settings + memory enabled
-			// flag match the parent's runtime. Subagent doesn't honor
-			// historian/dreamer/sidekick blocks at all (those are
-			// parent-only concerns).
-			const directory = process.cwd();
-			const { config: cfg } = loadPiConfig({ cwd: directory });
 			await ensureProjectRegisteredFromPiDirectory(directory, db);
 			const dreamerActionsEnabled =
 				pi.getFlag(SUBAGENT_DREAMER_ACTIONS_FLAG) === true;

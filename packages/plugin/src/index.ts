@@ -55,6 +55,7 @@ import { log } from "./shared/logger";
 import { refreshModelLimitsFromApi } from "./shared/models-dev-cache";
 import { MagicContextRpcServer } from "./shared/rpc-server";
 import { closeQuietly } from "./shared/sqlite-helpers";
+import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";
 
 const server: Plugin = async (ctx) => {
     beginBootQuietPeriod();
@@ -73,7 +74,10 @@ const server: Plugin = async (ctx) => {
             ...(pluginConfig.configWarnings ?? []),
         ];
     }
-    // Apply SQLite connection tuning before the first openDatabase() below.
+    // Apply process-wide storage policy and SQLite tuning before the first
+    // openDatabase() below. Storage is user-tier only, so it is shared safely by
+    // every project handled by this plugin process.
+    setStoragePrivatePermissionEnforcement(pluginConfig.storage.enforce_private_permissions);
     setSqlitePragmaConfig({
         cacheSizeMb: pluginConfig.sqlite.cache_size_mb,
         mmapSizeMb: pluginConfig.sqlite.mmap_size_mb,
