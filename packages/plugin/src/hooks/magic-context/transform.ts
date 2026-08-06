@@ -269,7 +269,11 @@ export function computeHardCacheExpired(
         onInvalid?.(error);
         ttlMs = 5 * 60 * 1000;
     }
-    return lastResponseTime > 0 && now - lastResponseTime >= ttlMs;
+    // Strict > matches the Rust scheduler's predicate exactly: at elapsed == ttl
+    // both sides DEFER (one more pass at the boundary is safe; a premature HARD
+    // fold is a paid cache rebuild). Keep the comparators identical — the Rust
+    // doc comment asserts this parity and an audit caught them disagreeing.
+    return lastResponseTime > 0 && now - lastResponseTime > ttlMs;
 }
 
 /**

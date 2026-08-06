@@ -199,3 +199,12 @@ describe("computeHardCacheExpired", () => {
         expect(computeHardCacheExpired("never", tenDaysAgo, now)).toBe(false);
     });
 });
+
+describe("computeHardCacheExpired finite boundary parity", () => {
+    it("defers at exactly elapsed == ttl, matching the Rust scheduler's strict predicate", () => {
+        const now = Date.now();
+        const ttl = 5 * 60 * 1000;
+        expect(computeHardCacheExpired("5m", now - ttl, now)).toBe(false);
+        expect(computeHardCacheExpired("5m", now - ttl - 1, now)).toBe(true);
+    });
+});
