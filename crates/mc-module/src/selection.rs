@@ -179,7 +179,7 @@ pub struct SelectionContext {
 pub enum PassClass {
     /// A normal execute+bust pass: control-plane / edit / two-pass / ctx_reduce run.
     Execute,
-    /// A ≥85% force pass: the emergency tiered drop runs (in addition).
+    /// A derived force-band pass: the emergency tiered drop runs (in addition).
     EmergencyForce,
     /// A defer pass: selection produces nothing new (mechanics replay frozen).
     Defer,
@@ -665,7 +665,7 @@ fn bytes_to_tokens(bytes: usize) -> f64 {
     (bytes as f64 * TOKENS_PER_BYTE).round()
 }
 
-/// 1.3 Emergency tiered drop (≥85% force). Target headroom = fixedFloor + 0.30 ×
+/// 1.3 Emergency tiered drop (derived force-band). Target headroom = fixedFloor + 0.30 ×
 /// (ceiling − fixedFloor); walk T3→T2→T1 oldest-first, skipping the protected tail
 /// and the newest-20% T1/T2 reserve, until reclaim met. Frozen arcs are INACTIVE
 /// (excluded from candidates, reserve, and the floor/reclaim accounting). Returns the

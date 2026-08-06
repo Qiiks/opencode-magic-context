@@ -45,10 +45,6 @@ const DEFAULT_MIN_COMMIT_CLUSTERS_FOR_TRIGGER: usize = 3;
 const TAIL_SIZE_TRIGGER_MULTIPLIER: f64 = 3.0;
 const FORCE_COMPARTMENT_PERCENTAGE: f64 = 80.0;
 const BLOCK_UNTIL_DONE_PERCENTAGE: f64 = 95.0;
-// Retained even though this module does not use the value; the full threshold
-// constant set is covered by tests so related configuration values cannot drift independently.
-#[allow(dead_code)]
-const FORCE_MATERIALIZE_PERCENTAGE: f64 = 85.0;
 const MAX_COMMITS_PER_BLOCK: usize = 5;
 
 const SYSTEM_DIRECTIVE_PREFIX: &str = "[SYSTEM DIRECTIVE: MAGIC-CONTEXT";
@@ -2164,11 +2160,6 @@ mod tests {
             &constants,
             "BLOCK_UNTIL_DONE_PERCENTAGE",
             BLOCK_UNTIL_DONE_PERCENTAGE,
-        );
-        assert_const(
-            &constants,
-            "FORCE_MATERIALIZE_PERCENTAGE",
-            FORCE_MATERIALIZE_PERCENTAGE,
         );
         assert_const(
             &constants,

@@ -64,11 +64,7 @@ import {
     reconcileCompactionMode,
 } from "./compaction-off-transition";
 import { getActiveCompartmentRun, startCompartmentAgent } from "./compartment-runner";
-import {
-    buildTriggerInMemoryTail,
-    checkCompartmentTrigger,
-    FORCE_MATERIALIZE_PERCENTAGE,
-} from "./compartment-trigger";
+import { buildTriggerInMemoryTail, checkCompartmentTrigger } from "./compartment-trigger";
 import {
     type CtxReduceAvailabilityVerdict,
     resolveCtxReduceAvailabilityFromMessages,
@@ -80,6 +76,7 @@ import { DEFAULT_HISTORY_BUDGET_TOKENS } from "./decay-render";
 import { deriveTriggerBudget } from "./derive-budgets";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
+    escalationBands,
     resolveExecuteThreshold,
     resolveModelKey,
     resolveTrustedContextLimit,
@@ -1215,6 +1212,25 @@ export function createTransform(deps: TransformDeps) {
               })
             : undefined;
         const currentModelKeyForBoundary = deps.getModelKey?.(sessionId);
+        const thresholdContextLimit =
+            resolvedContextLimit && resolvedContextLimit > 0
+                ? resolvedContextLimit
+                : contextUsageEarly.percentage > 0
+                  ? contextUsageEarly.inputTokens / (contextUsageEarly.percentage / 100)
+                  : undefined;
+        const effectiveExecuteThresholdPercentage = resolveExecuteThreshold(
+            deps.executeThresholdPercentage ?? 65,
+            currentModelKeyForBoundary,
+            65,
+            {
+                tokensConfig: deps.executeThresholdTokens,
+                contextLimit: thresholdContextLimit,
+                sessionId,
+            },
+        );
+        const { forceMaterializationPercentage } = escalationBands(
+            effectiveExecuteThresholdPercentage,
+        );
         const persistedUsageFreshForBoundary =
             persistedUsageBeforeResets &&
             Date.now() - persistedUsageBeforeResets.updatedAt <= 10 * 60 * 1000 &&
@@ -1241,30 +1257,16 @@ export function createTransform(deps: TransformDeps) {
         // (the usable working ceiling, NOT scaled by history_budget_percentage).
         // Resolve the limit the same way resolveHistoryBudgetTokens does: prefer
         // the model's stable limit, else back-derive from live usage. The
-        // emergency drop only fires at ≥85%, where percentage is reliably high,
+        // emergency drop only fires at the derived force band, where percentage is reliably high,
         // so the back-derivation is sound (it would only be unreliable at the
         // percentage=0 cold start, which is far below the trigger). Undefined
         // when neither is available → emergency drop skips, 95% block backstops.
-        let emergencyCeilingLimit =
-            resolvedContextLimit && resolvedContextLimit > 0 ? resolvedContextLimit : 0;
-        if (emergencyCeilingLimit <= 0 && contextUsageEarly.percentage > 0) {
-            emergencyCeilingLimit =
-                contextUsageEarly.inputTokens / (contextUsageEarly.percentage / 100);
-        }
+        const emergencyCeilingLimit = thresholdContextLimit ?? 0;
         const emergencyCeilingTokens =
             Number.isFinite(emergencyCeilingLimit) && emergencyCeilingLimit > 0
                 ? Math.floor(
                       emergencyCeilingLimit *
-                          (resolveExecuteThreshold(
-                              deps.executeThresholdPercentage ?? 65,
-                              deps.getModelKey?.(sessionId),
-                              65,
-                              {
-                                  tokensConfig: deps.executeThresholdTokens,
-                                  contextLimit: emergencyCeilingLimit,
-                              },
-                          ) /
-                              100),
+                           (effectiveExecuteThresholdPercentage / 100),
                   )
                 : undefined;
         // Compaction-off: drop scheduling is gated off — the scheduler never
@@ -1287,6 +1289,7 @@ export function createTransform(deps: TransformDeps) {
             sessionMeta,
             historyRefreshSessions: deps.historyRefreshSessions,
             sessionId,
+            effectiveExecuteThresholdPercentage,
         });
 
         const { midTurnAdjustedSchedulerDecision, sideEffect } = applyMidTurnDeferral({
@@ -1318,12 +1321,13 @@ export function createTransform(deps: TransformDeps) {
         const earlyActiveRunBlocksMaterialization =
             (getActiveCompartmentRun(sessionId) !== undefined ||
                 sessionMeta.compartmentInProgress) &&
-            contextUsageEarly.percentage < FORCE_MATERIALIZE_PERCENTAGE;
+            contextUsageEarly.percentage < forceMaterializationPercentage;
         const canConsumeDeferredEarly = canConsumeDeferredOnThisPass({
             schedulerDecision: midTurnAdjustedSchedulerDecision,
             contextPercentage: contextUsageEarly.percentage,
             justAwaitedPublication: false,
             activeRunBlocksMaterialization: earlyActiveRunBlocksMaterialization,
+            forceMaterializationPercentage,
         });
         const consumingDeferredEarly =
             canConsumeDeferredEarly && deferredHistoryWasPendingAtPassStart;
@@ -2081,15 +2085,16 @@ export function createTransform(deps: TransformDeps) {
 
         const lateActiveRunBlocksMaterialization =
             getActiveCompartmentRun(sessionId) !== undefined &&
-            contextUsageEarly.percentage < FORCE_MATERIALIZE_PERCENTAGE;
+            contextUsageEarly.percentage < forceMaterializationPercentage;
         const canConsumeDeferredLate = canConsumeDeferredOnThisPass({
             schedulerDecision: midTurnAdjustedSchedulerDecision,
             contextPercentage: contextUsageEarly.percentage,
             justAwaitedPublication: compartmentPhase.justAwaitedPublication,
             activeRunBlocksMaterialization: lateActiveRunBlocksMaterialization,
+            forceMaterializationPercentage,
         });
         const wasEmergencyBlock =
-            contextUsageEarly.percentage >= FORCE_MATERIALIZE_PERCENTAGE &&
+            contextUsageEarly.percentage >= forceMaterializationPercentage &&
             compartmentPhase.justAwaitedPublication;
         const historyRebuiltThisPass = wasEmergencyBlock
             ? compartmentPhase.rebuiltHistoryThisPass
@@ -2149,7 +2154,7 @@ export function createTransform(deps: TransformDeps) {
             pendingCompartmentInjection,
             didMutateFromFlushedStatuses,
             watermark,
-            forceMaterializationPercentage: FORCE_MATERIALIZE_PERCENTAGE,
+            forceMaterializationPercentage,
             hasRecentReduceCall,
             // Session-scoped (not launch) identity so note-nudge + auto-search
             // target the resumed session's real project. See sessionProjectIdentity.
@@ -2188,7 +2193,7 @@ export function createTransform(deps: TransformDeps) {
         });
         passOutcome.markFinalized();
         // Compaction-off: the emergency/overflow machinery is fully disarmed
-        // (≥85% tiered drop, 95% fail-closed block, overflow-recovery latch).
+        // (derived force-band tiered drop, absolute 95% fail-closed block, overflow-recovery latch).
         // A persisted latch is cleared by the off-transition, never consumed
         // here; overflow propagates to native compaction instead of blocking.
         if (!compactionOff) {

@@ -84,7 +84,7 @@ export interface SidebarSnapshot {
     executeThreshold: number;
     /**
      * True when `executeThreshold` was clamped down from a higher configured value
-     * (tokens config above 80% × contextLimit, or a percentage above the 80% cap).
+     * (tokens config above 90% × contextLimit, or a percentage above the 90% cap).
      * The sidebar/status dialog append a small marker so the user knows their
      * configured value was reduced rather than applied verbatim (issue #241).
      * Absent when no clamp occurred.

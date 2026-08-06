@@ -22,9 +22,9 @@ pub const DEFAULT_MEMORY_BUDGET_TOKENS: f64 = 8_000.0;
 /// Default token budget for user-profile injection. It must remain 4,000 tokens so the Rust
 /// module and the TypeScript renderer use the same default.
 pub const DEFAULT_USER_PROFILE_BUDGET_TOKENS: f64 = 4_000.0;
-/// Maximum execute threshold percentage (80.0). The Rust module reads config without the
-/// plugin, so this must stay identical to packages/plugin/src/config/schema/magic-context.ts.
-const MAX_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 80.0;
+/// Maximum execute threshold percentage (90.0). Output capacity is already reserved
+/// from the usable window, leaving the final 10% for mid-turn input growth.
+const MAX_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 90.0;
 /// Minimum historian producer chunk size. The derived budget is one quarter of the model
 /// context limit, but it is never allowed to fall below 8,000 tokens.
 pub const MIN_HISTORIAN_CHUNK_TOKENS: usize = 8_000;
@@ -506,9 +506,9 @@ mod tests {
     #[test]
     fn project_threshold_may_only_raise() {
         let user = serde_json::json!({ "execute_threshold_percentage": 70 });
-        let project = serde_json::json!({ "execute_threshold_percentage": 90 });
+        let project = serde_json::json!({ "execute_threshold_percentage": 91 });
         let cfg = merge_tiers(Some(&user), Some(&project));
-        assert_eq!(cfg.execute_threshold_percentage, 80.0);
+        assert_eq!(cfg.execute_threshold_percentage, 90.0);
     }
 
     #[test]

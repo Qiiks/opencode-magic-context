@@ -18,6 +18,7 @@ import {
 	type ContextDatabase,
 	clearEmergencyRecovery,
 	getOrCreateSessionMeta,
+	getOverflowState,
 	getWrapupInProgressState,
 	releaseWrapupInProgress,
 	updateWrapupInProgress,
@@ -30,6 +31,7 @@ import {
 import { setRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { COMPACTION_OFF_COMMAND_UNAVAILABLE } from "../compaction-off-pi";
+import { resolvePiUsableContextLimit } from "../pi-context-limit";
 import {
 	signalPiDeferredHistoryRefresh,
 	signalPiDeferredMaterialization,
@@ -202,7 +204,7 @@ export async function runPiWrapup(
 	const unregister = setRawMessageProvider(sessionId, provider);
 	let holderId = "";
 	try {
-		const contextLimit = resolvePiContextLimit(ctx);
+		const contextLimit = resolvePiContextLimit(ctx, deps.db, sessionId);
 		const modelKey = ctx.model
 			? `${ctx.model.provider}/${ctx.model.id}`
 			: undefined;
@@ -487,18 +489,26 @@ export async function runPiWrapup(
 	}
 }
 
-function resolvePiContextLimit(ctx: ExtensionCommandContext): number {
+function resolvePiContextLimit(
+	ctx: ExtensionCommandContext,
+	db: ContextDatabase,
+	sessionId: string,
+): number {
 	const usage = ctx.getContextUsage?.();
-	if (typeof usage?.contextWindow === "number" && usage.contextWindow > 0) {
-		return usage.contextWindow;
+	let detectedContextLimit: number | undefined;
+	try {
+		const detected = getOverflowState(db, sessionId).detectedContextLimit;
+		if (detected > 0) detectedContextLimit = detected;
+	} catch {
+		// Wrap-up can continue with the runtime model window.
 	}
-	if (
-		typeof ctx.model?.contextWindow === "number" &&
-		ctx.model.contextWindow > 0
-	) {
-		return ctx.model.contextWindow;
-	}
-	return 128_000;
+	return (
+		resolvePiUsableContextLimit({
+			rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
+			model: ctx.model,
+			detectedContextLimit,
+		}) ?? 128_000
+	);
 }
 
 async function acquireCompartmentLeaseEventually(

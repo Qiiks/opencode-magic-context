@@ -23,8 +23,8 @@ import { estimateTokens } from "./read-session-formatting";
 function formatExecuteThreshold(detail: ExecuteThresholdDetail, contextLimit: number): string {
     const { percentage, mode } = detail;
     // Surfaces the silent clamp from issue #241: when the configured value exceeded
-    // the 80% safety cap, append a note showing the configured value and the cap so
-    // the user sees the math (e.g. "190,000 > 80% of 128,000"). "" when not clamped.
+    // the 90% safety cap, append a note showing the configured value and the cap so
+    // the user sees the math (e.g. "190,000 > 90% of 128,000"). "" when not clamped.
     const clampNote = formatThresholdClampNote({
         clamped: detail.clamped,
         mode,

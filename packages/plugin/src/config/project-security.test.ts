@@ -37,6 +37,17 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(warnings.some((w) => w.includes("allow_home_project"))).toBe(true);
     });
 
+    it("strips output_reserve from project config", () => {
+        const raw: Record<string, unknown> = {
+            output_reserve: 0,
+            dreamer: { model: "x" },
+        };
+        const warnings = stripUnsafeProjectConfigFields(raw);
+        expect("output_reserve" in raw).toBe(false);
+        expect(raw.dreamer).toEqual({ model: "x" });
+        expect(warnings.some((w) => w.includes("output_reserve"))).toBe(true);
+    });
+
     it("strips language from project config", () => {
         const raw: Record<string, unknown> = { language: "tr", dreamer: { model: "x" } };
         const warnings = stripUnsafeProjectConfigFields(raw);

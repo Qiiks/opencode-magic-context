@@ -41,13 +41,11 @@ const DEFAULT_MIN_COMMIT_CLUSTERS_FOR_TRIGGER = 3;
 const TAIL_SIZE_TRIGGER_MULTIPLIER = 3;
 const FORCE_COMPARTMENT_PERCENTAGE = 80;
 const BLOCK_UNTIL_DONE_PERCENTAGE = 95;
-const FORCE_MATERIALIZE_PERCENTAGE = 85;
 const CONTENT_TAG_OWNER_SUFFIX = /:(?:p|file)\d+$/;
 
 export {
     BLOCK_UNTIL_DONE_PERCENTAGE,
     FORCE_COMPARTMENT_PERCENTAGE,
-    FORCE_MATERIALIZE_PERCENTAGE,
     POST_DROP_TARGET_RATIO,
 };
 
@@ -243,7 +241,7 @@ function estimateProjectedPostDropPercentage(
 
     // 2. Reasoning clearing: reasoning bytes on message tags between watermark and age cutoff.
     //    (Phase 2 removed routine age-based tool drops — tool outputs are no longer
-    //    projected as droppable here. The tiered emergency drop fires only at ≥85%,
+    //    projected as droppable here. The tiered emergency drop fires only at the derived force band,
     //    which is above this trigger's window, so it is intentionally not modeled.)
     const maxTag = activeTags.reduce((max, t) => Math.max(max, t.tagNumber), 0);
     if (

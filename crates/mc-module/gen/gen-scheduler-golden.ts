@@ -12,7 +12,7 @@ const resolve = (m: string) => Bun.resolveSync(m, pluginDir);
 const schedulerMod = await import(resolve("./src/features/magic-context/scheduler"));
 const eventResolvers = await import(resolve("./src/hooks/magic-context/event-resolvers"));
 const overflowMod = await import(resolve("./src/features/magic-context/overflow-detection"));
-const boundaryExecution = await import(resolve("./src/hooks/magic-context/boundary-execution"));
+const escalation = await import(resolve("./src/shared/escalation-bands"));
 const compartmentTrigger = await import(resolve("./src/hooks/magic-context/compartment-trigger"));
 const storageMeta = await import(resolve("./src/features/magic-context/storage-meta-persisted"));
 const schema = await import(resolve("./src/config/schema/magic-context"));
@@ -96,7 +96,7 @@ function effectiveContextLimit(
 
 const thresholdCases = [
     { label: "percentage numeric below cap", percentage_config: 65, fallback: 65 },
-    { label: "percentage cap at 80", percentage_config: 95, fallback: 65 },
+    { label: "percentage cap at 90", percentage_config: 95, fallback: 65 },
     {
         label: "per-model exact match",
         percentage_config: { default: 65, "anthropic/claude-sonnet-4-20250514": 72 },
@@ -363,14 +363,16 @@ const parse_ttl_cases = ["5m", "30s", "2h", "1500", " 5m ", "garbage"].map((ttl)
 const constants = {
     default_execute_threshold_percentage: schema.DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
     max_execute_threshold_percentage: resolveExecuteThreshold(999, undefined, 65),
-    force_materialize_percentage: boundaryExecution.FORCE_MATERIALIZE_PERCENTAGE,
+    force_materialize_percentage:
+        escalation.escalationBands(65).forceMaterializationPercentage,
     emergency_percentage: compartmentTrigger.BLOCK_UNTIL_DONE_PERCENTAGE,
     default_cache_ttl_ms: parseCacheTtl("5m"),
     one_second_ms: parseCacheTtl("1s"),
     one_minute_ms: parseCacheTtl("1m"),
     one_hour_ms: parseCacheTtl("1h"),
     bare_numeric_ms: parseCacheTtl("1234"),
-    emergency_drain_enter_percentage: storageMeta.EMERGENCY_DRAIN_ENTER_PERCENTAGE,
+    emergency_drain_enter_percentage:
+        escalation.escalationBands(65).forceMaterializationPercentage,
     emergency_drain_exit_margin: storageMeta.EMERGENCY_DRAIN_EXIT_MARGIN,
     emergency_drain_fallback_exit_percentage: storageMeta.EMERGENCY_DRAIN_FALLBACK_EXIT_PERCENTAGE,
     emergency_drain_failure_backoff_ms: storageMeta.EMERGENCY_DRAIN_FAILURE_BACKOFF_MS,

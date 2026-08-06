@@ -5,12 +5,14 @@ import { getMemoryCount } from "@magic-context/core/features/magic-context/memor
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getPendingOps } from "@magic-context/core/features/magic-context/storage";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
+import { getOverflowState } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { getNotes } from "@magic-context/core/features/magic-context/storage-notes";
 import { getTagsBySession } from "@magic-context/core/features/magic-context/storage-tags";
 import { executeStatus } from "@magic-context/core/hooks/magic-context/execute-status";
 import { formatBytes } from "@magic-context/core/hooks/magic-context/format-bytes";
 import { describeError } from "@magic-context/core/shared/error-message";
 import { showStatusDialog } from "../dialogs/status-dialog";
+import { resolvePiUsableContextLimit } from "../pi-context-limit";
 import { resolveSessionId, sendCtxStatusMessage } from "./pi-command-utils";
 
 export interface RegisterCtxStatusDeps {
@@ -98,6 +100,18 @@ export function registerCtxStatusCommand(
 				const modelKey = ctx.model
 					? `${ctx.model.provider}/${ctx.model.id}`
 					: undefined;
+				let detectedContextLimit: number | undefined;
+				try {
+					const detected = getOverflowState(currentDeps.db, sessionId).detectedContextLimit;
+					if (detected > 0) detectedContextLimit = detected;
+				} catch {
+					// Status remains available when overflow metadata cannot be read.
+				}
+				const usableContextLimit = resolvePiUsableContextLimit({
+					rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
+					model: ctx.model,
+					detectedContextLimit,
+				});
 				const statusText = executeStatus(
 					currentDeps.db,
 					sessionId,
@@ -107,7 +121,7 @@ export function registerCtxStatusCommand(
 					currentDeps.historyBudgetPercentage,
 					currentDeps.commitClusterTrigger,
 					currentDeps.executeThresholdTokens,
-					usage?.contextWindow,
+					usableContextLimit,
 				);
 				const details = buildStatusDetails(currentDeps, sessionId);
 				sendCtxStatusMessage(

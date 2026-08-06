@@ -1,7 +1,7 @@
 {
   "constants": {
     "default_execute_threshold_percentage": 65,
-    "max_execute_threshold_percentage": 80,
+    "max_execute_threshold_percentage": 90,
     "force_materialize_percentage": 85,
     "emergency_percentage": 95,
     "default_cache_ttl_ms": 300000,
@@ -9,7 +9,7 @@
     "one_minute_ms": 60000,
     "one_hour_ms": 3600000,
     "bare_numeric_ms": 1234,
-    "emergency_drain_enter_percentage": 95,
+    "emergency_drain_enter_percentage": 85,
     "emergency_drain_exit_margin": 10,
     "emergency_drain_fallback_exit_percentage": 55,
     "emergency_drain_failure_backoff_ms": 60000,
@@ -78,10 +78,10 @@
       "expected": 65
     },
     {
-      "label": "percentage cap at 80",
+      "label": "percentage cap at 90",
       "percentage_config": 95,
       "fallback": 65,
-      "expected": 80
+      "expected": 90
     },
     {
       "model_key": "anthropic/claude-sonnet-4-20250514",
@@ -121,7 +121,7 @@
       "label": "tokens config cap at 80 percent",
       "percentage_config": 65,
       "fallback": 65,
-      "expected": 80
+      "expected": 90
     },
     {
       "tokens_config": {
@@ -315,8 +315,8 @@
         "input_tokens": 80000
       },
       "now_ms": 2000,
-      "expected": "execute",
-      "expected_threshold": 80
+      "expected": "defer",
+      "expected_threshold": 90
     },
     {
       "label": "scheduler ttl boundary defers on equality",

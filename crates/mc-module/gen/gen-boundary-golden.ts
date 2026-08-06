@@ -368,7 +368,6 @@ function constantsFromSource(): Record<string, number> {
         TAIL_SIZE_TRIGGER_MULTIPLIER: read(files.trigger, "TAIL_SIZE_TRIGGER_MULTIPLIER"),
         FORCE_COMPARTMENT_PERCENTAGE: read(files.trigger, "FORCE_COMPARTMENT_PERCENTAGE"),
         BLOCK_UNTIL_DONE_PERCENTAGE: read(files.trigger, "BLOCK_UNTIL_DONE_PERCENTAGE"),
-        FORCE_MATERIALIZE_PERCENTAGE: read(files.trigger, "FORCE_MATERIALIZE_PERCENTAGE"),
         MAX_COMMITS_PER_BLOCK: read(files.formatting, "MAX_COMMITS_PER_BLOCK"),
     };
 }

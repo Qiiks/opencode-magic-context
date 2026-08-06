@@ -179,7 +179,7 @@ describe("source contract: peek-then-drain in runPipeline (history)", () => {
 		);
 		expect(code).toContain("args.forceMaterialization === true");
 		expect(code).toContain(
-			"args.contextUsage.percentage >= FORCE_MATERIALIZATION_PERCENTAGE",
+			"args.contextUsage.percentage >= forceMaterializationPercentage",
 		);
 		expect(code).toContain("const deferredMaterialize =");
 		expect(code).toContain("const deferredHistoryRefresh =");

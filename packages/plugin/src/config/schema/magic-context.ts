@@ -10,14 +10,11 @@ import type {
 import { AgentOverrideConfigSchema } from "./agent-overrides";
 
 export const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE = 65;
-// Explains WHY execute_threshold is hard-capped at 80% (not just "too big").
-// A single agent step can be large enough to overflow the context window before
-// Magic Context can compact between turns; staying at/below 80% leaves headroom
-// to absorb that and compact safely instead of falling back to OpenCode's native
-// compaction (far harder to recover from). 80% also sits below the 85% emergency
-// and 95% block-and-recover bands, which are tuned around it.
+// Output reservation now removes generation capacity from the usable window.
+// The 90% cap leaves roughly 10% of that safe input budget for mid-turn growth;
+// escalation derives above the effective threshold and the 95% wall stays fixed.
 export const EXECUTE_THRESHOLD_CAP_MESSAGE =
-    "execute_threshold is capped at 80% for cache safety: a single large agent step can overflow the context window before Magic Context can compact between turns, forcing OpenCode's native compaction (hard to recover from). 80% also leaves headroom below the 85%/95% emergency bands. Use a value between 20 and 80.";
+    "execute_threshold is capped at 90% for cache safety: output capacity is reserved from the usable context window, and the remaining 10% absorbs mid-turn growth before the absolute 95% emergency wall. Use a value between 20 and 90.";
 export const DEFAULT_HISTORIAN_TIMEOUT_MS = 300_000;
 export const DEFAULT_HISTORY_BUDGET_PERCENTAGE = 0.15;
 
@@ -423,12 +420,14 @@ export interface MagicContextConfig {
     historian?: HistorianConfig;
     dreamer?: DreamerConfig;
     cache_ttl: string | { default: string; [modelKey: string]: string };
+    /** User-only output-token reservation override. Zero disables reservation. */
+    output_reserve?: number | { default: number; [modelKey: string]: number };
     /** TUI toast lifetime in milliseconds for Magic Context notifications. Default: 5000. */
     toast_duration_ms?: number;
     execute_threshold_percentage: number | { default: number; [modelKey: string]: number };
     /** Absolute token thresholds per model. When set for a given model (or via `default`),
      *  this overrides `execute_threshold_percentage` for that model. Useful for hard caps
-     *  matching provider input limits. Values above 80% × context_limit are clamped with a warning. */
+     *  matching provider input limits. Values above 90% × context_limit are clamped with a warning. */
     execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
     protected_tags: number;
     clear_reasoning_age: number;
@@ -649,6 +648,15 @@ export const MagicContextConfigSchema = z
             .describe(
                 'Cache TTL: string (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "model-id": "10m" }). Set to "never" for lanes kept warm by an external keepwarm proxy — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time.',
             ),
+        output_reserve: z
+            .union([
+                z.number().min(0),
+                z.object({ default: z.number().min(0) }).catchall(z.number().min(0)),
+            ])
+            .optional()
+            .describe(
+                'User-only output-token reservation override. Number or per-model object ({ default: 16384, "provider/model": 8192 }); 0 disables reservation. When unset, Magic Context reserves the catalog output limit (capped at 25% of context) for shared-window providers and keeps proven separate-quota Google/Gemini windows unchanged.',
+            ),
         toast_duration_ms: z
             .number()
             .min(0)
@@ -659,14 +667,14 @@ export const MagicContextConfigSchema = z
             ),
         execute_threshold_percentage: z
             .union([
-                z.number().min(20).max(80, EXECUTE_THRESHOLD_CAP_MESSAGE),
+                z.number().min(20).max(90, EXECUTE_THRESHOLD_CAP_MESSAGE),
                 z
-                    .object({ default: z.number().min(20).max(80, EXECUTE_THRESHOLD_CAP_MESSAGE) })
-                    .catchall(z.number().min(20).max(80, EXECUTE_THRESHOLD_CAP_MESSAGE)),
+                    .object({ default: z.number().min(20).max(90, EXECUTE_THRESHOLD_CAP_MESSAGE) })
+                    .catchall(z.number().min(20).max(90, EXECUTE_THRESHOLD_CAP_MESSAGE)),
             ])
             .default(DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE)
             .describe(
-                'Context percentage that forces queued operations to execute. Number or per-model object ({ default: 65, "provider/model": 45 }). Values above 80 are rejected because the runtime caps at 80% for cache safety (MAX_EXECUTE_THRESHOLD). Default: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE',
+                'Context percentage that forces queued operations to execute. Number or per-model object ({ default: 65, "provider/model": 45 }). Values above 90 are rejected because the runtime caps at 90% of the output-reserved safe window (MAX_EXECUTE_THRESHOLD). Default: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE',
             ),
         execute_threshold_tokens: z
             .object({
@@ -675,7 +683,7 @@ export const MagicContextConfigSchema = z
             .catchall(z.number().min(5_000).max(2_000_000))
             .optional()
             .describe(
-                "Absolute token thresholds per model. When matched, overrides execute_threshold_percentage for that model. Accepts `default` for all models or per-model keys. Values above 80% × context_limit are clamped with a warning log. Min 5_000, max 2_000_000.",
+                "Absolute token thresholds per model. When matched, overrides execute_threshold_percentage for that model. Accepts `default` for all models or per-model keys. Values above 90% × context_limit are clamped with a warning log. Min 5_000, max 2_000_000.",
             ),
         protected_tags: z
             .number()

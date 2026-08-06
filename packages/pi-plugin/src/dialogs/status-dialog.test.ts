@@ -3,9 +3,40 @@ import { resolveProjectIdentity } from "@magic-context/core/features/magic-conte
 import { setSessionWorkMetrics } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { createTestDb, fakeContext } from "../test-utils.test";
-import { showStatusDialog } from "./status-dialog";
+import { buildPiStatusDetail, showStatusDialog } from "./status-dialog";
 
 describe("Pi status dialog", () => {
+	it("displays usage against the output-reserved safe window", () => {
+		const db = createTestDb();
+		try {
+			const sessionId = "ses-status-reserved-window";
+			const ctx = {
+				...fakeContext(sessionId),
+				model: {
+					provider: "anthropic",
+					id: "claude",
+					contextWindow: 100_000,
+					maxTokens: 20_000,
+				},
+				getContextUsage: () => ({
+					tokens: 50_000,
+					percent: 50,
+					contextWindow: 100_000,
+				}),
+				getSystemPrompt: () => "system prompt",
+			};
+
+			const detail = buildPiStatusDetail({ getAllTools: () => [] } as never, ctx as never, {
+				db,
+				projectIdentity: resolveProjectIdentity(process.cwd()),
+			}, sessionId);
+			expect(detail.contextLimit).toBe(80_000);
+			expect(detail.usagePercentage).toBe(62.5);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("renders stored work metrics", async () => {
 		const db = createTestDb();
 		try {

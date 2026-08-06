@@ -156,6 +156,7 @@ import {
 	advanceToolReclaimWatermarkToCurrentMax,
 	buildSyntheticToolReclaimOps,
 } from "@magic-context/core/hooks/magic-context/tool-reclaim";
+import { escalationBands } from "@magic-context/core/shared/escalation-bands";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
@@ -221,15 +222,13 @@ import { stripPiDroppedPlaceholderMessages } from "./strip-placeholders-pi";
 import { stripPiProcessedImages } from "./strip-processed-images-pi";
 import { clearPiSystemPromptSession } from "./system-prompt";
 import { injectPiTemporalMarkers } from "./temporal-awareness-pi";
-/** Force-materialization threshold — mirrors OpenCode's FORCE_MATERIALIZE_PERCENTAGE (85%). */
 import { withTimeout } from "./timeout";
 import {
 	type PiMessageTokenCacheEntry,
 	tokenizePiMessages,
 } from "./tokenize-pi-messages";
+import { resolvePiUsableContextLimit } from "./pi-context-limit";
 import { createPiTranscript } from "./transcript-pi";
-
-const FORCE_MATERIALIZATION_PERCENTAGE = 85;
 
 /** Emergency-block threshold — mirrors OpenCode's >=95% emergency path. */
 const EMERGENCY_BLOCK_PERCENTAGE = 95;
@@ -237,8 +236,8 @@ const EMERGENCY_BLOCK_PERCENTAGE = 95;
 // estimateTokens (char-based) under-counts the real provider
 // tokenizer + untagged structural/reasoning parts: the observed overflow was
 // >400K real vs a ~340K forward estimate (~15% gap). Scaling the limit DOWN for
-// the forward percentage trips the 85% force / 95% emergency bands at a real size
-// that genuinely corresponds to the window, not at the under-counted estimate.
+// the forward percentage reaches the derived force and absolute 95% emergency
+// bands at a real size that corresponds to the window, not the under-counted estimate.
 // 0.85 (not 0.90): 0.90 would make the 95% emergency band fire only at ~360K
 // estimated, still short of the >400K real seen here.
 const FORWARD_PRESSURE_LIMIT_FACTOR = 0.85;
@@ -2322,6 +2321,7 @@ export function registerPiContextHandler(
 			let usageContextLimit = isSaneLimit(piUsage?.contextWindow)
 				? piUsage.contextWindow
 				: undefined;
+			let detectedContextLimit: number | undefined;
 
 			// Overflow recovery: a previous LLM call ended with a
 			// provider context-overflow error AND the pi.on("message_end")
@@ -2345,6 +2345,7 @@ export function registerPiContextHandler(
 					? { detectedContextLimit: 0, needsEmergencyRecovery: false }
 					: getOverflowState(options.db, sessionId);
 				if (overflowState.detectedContextLimit > 0) {
+					detectedContextLimit = overflowState.detectedContextLimit;
 					// Always prefer detected limit over reported window
 					// when one exists — the reported window came from
 					// metadata that produced a wrong answer last time.
@@ -2384,6 +2385,24 @@ export function registerPiContextHandler(
 					usageContextLimit = modelWindow;
 				}
 			}
+			usageContextLimit = resolvePiUsableContextLimit({
+				rawContextWindow: usageContextLimit,
+				model: ctx.model,
+				detectedContextLimit,
+			});
+			const effectiveExecuteThresholdPercentage = resolveExecuteThreshold(
+				schedulerConfig.executeThresholdPercentage,
+				modelKey,
+				65,
+				{
+					tokensConfig: schedulerConfig.executeThresholdTokens,
+					contextLimit: usageContextLimit,
+					sessionId,
+				},
+			);
+			const { forceMaterializationPercentage } = escalationBands(
+				effectiveExecuteThresholdPercentage,
+			);
 			// Fallback-path percentage correction: when we DIDN'T use persisted
 			// usage, `usagePercentage` is on Pi's raw denominator — which is wrong
 			// once we've corrected the limit (detected-overflow cap, or a sane
@@ -2523,6 +2542,7 @@ export function registerPiContextHandler(
 				sessionMeta,
 				historyRefreshSessions,
 				sessionId,
+				effectiveExecuteThresholdPercentage,
 			});
 
 			const { midTurnAdjustedSchedulerDecision, sideEffect } =
@@ -2564,11 +2584,11 @@ export function registerPiContextHandler(
 				`[boundary-exec] base=${schedulerDecisionEarly} bypass=${bypassReason} midTurn=${midTurn} effective=${midTurnAdjustedSchedulerDecision} sideEffect=${sideEffect}`,
 			);
 
-			// Force-materialization @ 85%+: aggressive drop-all-tools mode.
+			// At the derived force band, enable aggressive drop-all-tools mode.
 			// Mirrors OpenCode transform-postprocess-phase.ts:145-146.
 			const forceMaterialization =
 				!options.compactionOff &&
-				usagePercentage >= FORCE_MATERIALIZATION_PERCENTAGE;
+				usagePercentage >= forceMaterializationPercentage;
 
 			// 95% emergency block: usage is dangerous enough that we
 			// MUST wait for any in-flight historian to finish so its
@@ -2588,7 +2608,7 @@ export function registerPiContextHandler(
 			//   - We cap the wait at 30s to avoid stalling the user's
 			//     turn forever if historian hangs. After 30s we fall
 			//     through to the normal pipeline (with drop-all-tools
-			//     still active via the 85%+ branch).
+			//     still active via the derived force-band branch).
 			const isEmergency =
 				!options.compactionOff && usagePercentage >= EMERGENCY_BLOCK_PERCENTAGE;
 			if (isEmergency) {
@@ -2632,7 +2652,7 @@ export function registerPiContextHandler(
 				if (
 					emergencyRecoveryArmed &&
 					realUsagePercentageBeforeEmergencyBump <
-						FORCE_MATERIALIZATION_PERCENTAGE &&
+						forceMaterializationPercentage &&
 					!inFlightHistorian.has(sessionId) &&
 					!hasEligiblePiCompartmentHistory(options.db, sessionId)
 				) {
@@ -2760,9 +2780,10 @@ export function registerPiContextHandler(
 				stableIdSchemeCutover,
 				schedulerDecision,
 				// 95% emergency forces drop-all-tools regardless of the
-				// 85% gate, so the LLM call sees the smallest possible
+				// derived force gate, so the LLM call sees the smallest possible
 				// prompt before we hand control back to Pi.
 				forceMaterialization: forceMaterialization || isEmergency,
+				forceMaterializationPercentage,
 				contextUsage: {
 					percentage: usagePercentage,
 					inputTokens: usageInputTokens,
@@ -3546,7 +3567,7 @@ function spawnPiHistorianRun(args: {
 					//     historian published; persists until the next pipeline
 					//     pass actually materializes them. Without this signal,
 					//     drops sit in pending_ops and context climbs until the
-					//     85% force-materialization threshold — exactly the
+					//     derived force-materialization threshold — exactly the
 					//     "context kept going up after historian ran" symptom
 					//     users observed at 64% → 69%+ on Pi.
 					//
@@ -3670,6 +3691,7 @@ function maybeFireHistorian(args: {
 		usageContextLimit = isSaneLimit(piUsage?.contextWindow)
 			? piUsage.contextWindow
 			: undefined;
+		let detectedContextLimit: number | undefined;
 		// Cold-start: fall back to the model's window when usage hasn't reported
 		// a sane one yet (first pass after restart).
 		if (
@@ -3683,6 +3705,7 @@ function maybeFireHistorian(args: {
 		try {
 			const overflowState = getOverflowState(db, sessionId);
 			if (overflowState.detectedContextLimit > 0) {
+				detectedContextLimit = overflowState.detectedContextLimit;
 				usageContextLimit = Math.min(
 					usageContextLimit ?? overflowState.detectedContextLimit,
 					overflowState.detectedContextLimit,
@@ -3691,6 +3714,11 @@ function maybeFireHistorian(args: {
 		} catch {
 			// Best-effort — fall through with the uncorrected limit.
 		}
+		usageContextLimit = resolvePiUsableContextLimit({
+			rawContextWindow: usageContextLimit,
+			model: ctx.model,
+			detectedContextLimit,
+		});
 		const sessionMetaForUsage = getOrCreateSessionMeta(db, sessionId);
 		if (
 			sessionMetaForUsage.lastContextPercentage > 0 &&
@@ -3768,6 +3796,9 @@ function maybeFireHistorian(args: {
 		modelKey,
 		usageContextLimit,
 	});
+	const historianForceMaterializationPercentage = escalationBands(
+		triggerInputs.executeThresholdPercentage,
+	).forceMaterializationPercentage;
 	const boundaryContextLimit = triggerInputs.contextLimit;
 	const resolvePiBoundarySnapshot = (
 		emergencyTailScale?: 0.5 | 0.25,
@@ -3899,14 +3930,14 @@ function maybeFireHistorian(args: {
 				const overflowState = getOverflowState(db, sessionId);
 				if (
 					overflowState.needsEmergencyRecovery &&
-					usage.percentage < FORCE_MATERIALIZATION_PERCENTAGE &&
+					usage.percentage < historianForceMaterializationPercentage &&
 					!inFlightHistorian.has(sessionId)
 				) {
 					boundarySnapshot ??= resolveRunnablePiBoundarySnapshot();
 				}
 				if (
 					overflowState.needsEmergencyRecovery &&
-					usage.percentage < FORCE_MATERIALIZATION_PERCENTAGE &&
+					usage.percentage < historianForceMaterializationPercentage &&
 					!inFlightHistorian.has(sessionId) &&
 					boundarySnapshot !== undefined &&
 					!hasRunnableCompartmentWindow(boundarySnapshot)
@@ -4042,10 +4073,12 @@ interface RunPipelineArgs {
 	schedulerDecision: "execute" | "defer";
 	/**
 	 * Force-materialization signal: when true, drop-all-tools mode
-	 * activates (mirrors OpenCode's >=85% emergency cleanup). Caller
+	 * activates (mirrors OpenCode's derived force-band emergency cleanup). Caller
 	 * computes from current usage percentage.
 	 */
 	forceMaterialization?: boolean;
+	/** Resolved escalation band for this pass (defaults to 85 for test/direct callers). */
+	forceMaterializationPercentage?: number;
 	contextUsage: { percentage: number; inputTokens: number };
 	/**
 	 * One-shot signal that the injection cache should be invalidated and
@@ -4240,6 +4273,9 @@ async function runCompactionOffPipeline(
 
 async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (args.compactionOff) return runCompactionOffPipeline(args);
+	const forceMaterializationPercentage =
+		args.forceMaterializationPercentage ??
+		escalationBands(65).forceMaterializationPercentage;
 	let executedWorkThisPass = false;
 	let historyWasConsumedThisPass = false;
 	let materializationSatisfiedThisPass = false;
@@ -4348,7 +4384,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const canConsumeDeferredLate =
 		args.schedulerDecision === "execute" ||
 		args.forceMaterialization === true ||
-		args.contextUsage.percentage >= FORCE_MATERIALIZATION_PERCENTAGE;
+		args.contextUsage.percentage >= forceMaterializationPercentage;
 	const deferredMaterializeEligible =
 		canConsumeDeferredLate &&
 		deferredMaterializationSessions.has(args.sessionId);
@@ -4849,9 +4885,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				{
 					protectedTags: args.protectedTags,
 					staleReduceStripEnabled: args.canUseEmptySentinels,
-					// Tiered emergency drop fires only at ≥85% AND when the
+					// Tiered emergency drop fires only at the derived force band AND when the
 					// ceiling is known. forceMaterialization already incorporates
-					// the ≥85% / emergency condition for Pi (primary-equivalent).
+					// the derived force-band / emergency condition for Pi (primary-equivalent).
 					emergency:
 						args.forceMaterialization === true &&
 						args.emergencyCeilingTokens !== undefined &&
@@ -5000,7 +5036,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		pendingOpsDidMutate || heuristicOrReasoningDidMutate;
 	const emergencyDropEligible =
 		args.forceMaterialization === true ||
-		args.contextUsage.percentage >= FORCE_MATERIALIZATION_PERCENTAGE;
+		args.contextUsage.percentage >= forceMaterializationPercentage;
 	let autoReclaimTargetCount = 0;
 	let autoReclaimDidMutate = false;
 	if (

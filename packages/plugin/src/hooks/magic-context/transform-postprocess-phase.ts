@@ -773,7 +773,7 @@ export async function runPostTransformPhase(
         args.contextUsage.percentage >= args.forceMaterializationPercentage;
     // Tiered emergency drop eligibility (Phase 2). Unlike `forceMaterialization`
     // (primary-only — it also forces m[0] materialization), the emergency tool
-    // floor fires at ≥85% for BOTH primary AND subagent: it's the only tool
+    // floor fires at the derived force band for BOTH primary AND subagent: it's the only tool
     // floor subagents have now that routine age-drops are gone. It's still a
     // cache-busting-pass operation (selection persisted, defer passes replay),
     // so it only runs when heuristics run (see shouldRunHeuristics) AND usage is
@@ -825,7 +825,7 @@ export async function runPostTransformPhase(
     // Bypass the compartment-running veto when this pass is busting the Anthropic
     // prefix REGARDLESS — so the pending-op drain + heuristics ride that one bust
     // instead of being deferred into a SECOND bust ~a turn later. Two cases:
-    //   - forceMaterialization (>=85%): overflow prevention trumps cache stability.
+    //   - forceMaterialization (the derived force band): overflow prevention trumps cache stability.
     //   - m0HardFoldThisPass: a HARD m[0] fold (model/system-hash/epoch/etc.) is
     //     re-caching m[0] this pass; the prefix is already gone, so draining into
     //     it is free. Without this, a hard fold landing while the historian runs
@@ -850,11 +850,9 @@ export async function runPostTransformPhase(
             compartmentRunning);
     const pendingOps = shouldReadPendingOps ? getPendingOps(args.db, args.sessionId) : [];
     const hasPendingUserOps = pendingOps.length > 0;
-    // Finding #3: include `forceMaterialization` so the emergency bypass is
-    // self-sufficient. Without it, if `MAX_EXECUTE_THRESHOLD` is ever raised
-    // above 85%, scheduler would return "defer" at 85% usage, but heuristic
-    // cleanup would still fire (it gates on forceMaterialization directly),
-    // causing unguarded cache busts while pending ops stop materializing.
+    // Keep pending-op materialization coupled to the force signal itself. This
+    // prevents an escalation-band change from letting emergency cleanup mutate
+    // the wire while queued operations remain deferred.
     const shouldApplyPendingOps =
         !compactionOff &&
         (args.schedulerDecision === "execute" ||
@@ -870,7 +868,7 @@ export async function runPostTransformPhase(
     // needing historian/compartments.
     //
     // `forceMaterialization` remains gated by `fullFeatureMode` above (line ~125)
-    // so subagents do NOT get 85% force-drop-all-tools or 95% block. Subagents
+    // so subagents do NOT get force-band drop-all-tools or the 95% block. Subagents
     // rely on normal overflow detection + clean failure if they exhaust context.
     //
     // Subagent once-per-turn bypass: a subagent's entire lifecycle is one user
@@ -897,8 +895,8 @@ export async function runPostTransformPhase(
             // mid-turn cache busts; this pass busts anyway), so a hard fold that
             // lands mid-turn still drains.
             m0HardFoldThisPass ||
-            // ≥85% emergency floor for BOTH primary and subagent. For a primary
-            // this coincides with forceMaterialization (fullFeatureMode && ≥85%);
+            // the derived force band emergency floor for BOTH primary and subagent. For a primary
+            // this coincides with forceMaterialization (fullFeatureMode && the derived force band);
             // for a subagent (no forceMaterialization) it's the only path that
             // fires the tiered drop, even if the scheduler deferred mid-turn.
             emergencyDropEligible ||
@@ -990,7 +988,7 @@ export async function runPostTransformPhase(
     }
     if (compartmentRunning && hasPendingUserOps) {
         if (bypassCompartmentGate) {
-            const bypassReason = forceMaterialization ? "emergency >=85%" : "m0 hard fold";
+            const bypassReason = forceMaterialization ? `emergency >=${args.forceMaterializationPercentage}%` : "m0 hard fold";
             sessionLog(
                 args.sessionId,
                 `transform: compartment-gate bypass (${bypassReason}) — applying ${pendingOps.length} pending ops while compartment agent runs (${args.contextUsage.percentage.toFixed(1)}%)`,
@@ -1091,7 +1089,7 @@ export async function runPostTransformPhase(
                 args.messageTagNumbers,
                 {
                     protectedTags: args.protectedTags,
-                    // Tiered emergency drop fires only at ≥85% (both primary and
+                    // Tiered emergency drop fires only at the derived force band (both primary and
                     // subagent) AND only when the ceiling is known. Undefined
                     // ceiling (cold start) or below-threshold usage → no
                     // emergency arg → routine pass does dedup/injection-strip

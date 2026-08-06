@@ -398,7 +398,7 @@ export function createEventHook(args: {
         // agent had already received 4-8 earlier reduction nudges from the
         // rolling band system and ignored all of them — the emergency nudge
         // was louder but mechanistically identical. Automatic safety valves
-        // (85% force-drop-tools in transform-postprocess-phase.ts, 95%
+        // (derived force-band drop-tools in transform-postprocess-phase.ts, 95%
         // block-and-wait-for-historian in transform.ts) keep context from
         // overflowing without depending on agent cooperation, so the nudge
         // was doing more harm than good: firing repeatedly during slow-

@@ -22,11 +22,10 @@
  *     inputTokens = usage.input + usage.cacheRead + usage.cacheWrite
  *     percentage  = (inputTokens / contextLimit) * 100
  *
- * The contextLimit MUST already reflect any persisted
- * `session_meta.detected_context_limit` correction — callers are
- * responsible for resolving the right limit before calling this
- * helper, mirroring OpenCode's `resolveContextLimit()` plus
- * detected-limit override path.
+ * The contextLimit MUST already be the output-reserved safe window, with any
+ * persisted `session_meta.detected_context_limit` applied to the raw window
+ * first. Callers resolve that ordering before invoking this helper, mirroring
+ * OpenCode's `resolveContextLimit()` path.
  */
 
 interface PiAssistantUsage {
