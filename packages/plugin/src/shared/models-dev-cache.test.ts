@@ -490,3 +490,63 @@ describe("models-dev-cache (SDK-only)", () => {
         expect(getSdkContextLimit("p", "m3")).toBe(200000);
     });
 });
+
+describe("getSdkContextLimit prompt_only pre-carve arm", () => {
+    // The v0.34.0 re-verify found no behavioral test for the provenance
+    // ternary: a prompt_only detected limit must enter the pre-carved INPUT
+    // arm (no output subtraction), while combined detections narrow the raw
+    // context BEFORE reservation. A regression routing prompt_only through
+    // the context arm double-reserves and these fixtures go red.
+    beforeEach(() => clearModelsDevCache());
+    afterEach(() => clearModelsDevCache());
+    const seed = () =>
+        refreshModelLimitsFromApi({
+            config: {
+                providers: async () => ({
+                    data: {
+                        providers: [
+                            {
+                                id: "anthropic",
+                                models: {
+                                    "prov-model": {
+                                        limit: { context: 200000, output: 64000 },
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                }),
+            },
+        });
+
+    test("prompt_only detection routes through the input arm without double reservation", async () => {
+        await seed();
+        expect(
+            getSdkContextLimit("anthropic", "prov-model", 167000, {
+                detectedLimitProvenance: "prompt_only",
+            }),
+        ).toBe(167000);
+    });
+
+    test("combined detection narrows raw context before reservation", async () => {
+        await seed();
+        // min(200000, 131072) = 131072, then arm-2 reserve min(64000, 25%) = 32768.
+        expect(
+            getSdkContextLimit("anthropic", "prov-model", 131072, {
+                detectedLimitProvenance: "combined",
+            }),
+        ).toBe(131072 - 32768);
+    });
+
+    test("prompt_only with reservation none serves the prompt cap as the native denominator", async () => {
+        await seed();
+        // The input arm short-circuits before reservation: the native metric
+        // sees the provider-enforced prompt wall, not the raw window.
+        expect(
+            getSdkContextLimit("anthropic", "prov-model", 167000, {
+                detectedLimitProvenance: "prompt_only",
+                reservation: "none",
+            }),
+        ).toBe(167000);
+    });
+});
