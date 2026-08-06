@@ -9,6 +9,7 @@ import {
   cacheCauseColor,
   cacheCauseLabel,
   cacheCauseTooltip,
+  selectWorstCacheEvent,
   severityColorClass,
 } from "../../lib/cache-format";
 import type { DbCacheEvent, Harness, SessionCacheStats } from "../../lib/types";
@@ -135,6 +136,7 @@ export default function CacheDiagnostics() {
     firstCacheRead: number;
     lastCacheRead: number;
     worstSeverity: DbCacheEvent["severity"];
+    worstEvent: DbCacheEvent;
     totalInputTokens: number;
     agent: string | null;
   }
@@ -402,21 +404,6 @@ export default function CacheDiagnostics() {
     return win ? win.events : [];
   };
 
-  // Ordering used for worst-severity promotion across multi-step turns.
-  // Higher rank wins — full_bust > bust > warning > stable > info > unknown.
-  // "unknown" (provider reports no cache accounting) ranks below stable so a
-  // mixed turn never surfaces as unknown when any step was actually classified.
-  const SEVERITY_RANK: Record<string, number> = {
-    full_bust: 6,
-    bust: 5,
-    warming: 4,
-    warning: 3,
-    stable: 2,
-    info: 1,
-    unknown: 0,
-  };
-  const severityRank = (severity: string): number => SEVERITY_RANK[severity] ?? 0;
-
   // Per-step events for the Cache Hit Timeline bars, oldest→newest so the
   // chart reads left-to-right chronologically. One bar per API round-trip
   // (step) so mid-turn busts are individually visible instead of being
@@ -450,6 +437,7 @@ export default function CacheDiagnostics() {
           firstCacheRead: event.cache_read,
           lastCacheRead: event.cache_read,
           worstSeverity: event.severity,
+          worstEvent: event,
           totalInputTokens: 0,
           agent: event.agent,
         };
@@ -461,10 +449,12 @@ export default function CacheDiagnostics() {
       turn.totalCacheWrite += event.cache_write;
       turn.lastCacheRead = event.cache_read;
       turn.totalInputTokens += event.input_tokens;
-      // Promote worst severity across all steps so a multi-step turn with a
-      // mid-turn cache bust doesn't render as STABLE in the parent row.
-      if (severityRank(event.severity) > severityRank(turn.worstSeverity)) {
-        turn.worstSeverity = event.severity;
+    }
+    for (const turn of turns) {
+      const worstEvent = selectWorstCacheEvent(turn.events);
+      if (worstEvent) {
+        turn.worstSeverity = worstEvent.severity;
+        turn.worstEvent = worstEvent;
       }
     }
     // Sort by start time descending (newest first) so the list is chronological
@@ -758,8 +748,8 @@ export default function CacheDiagnostics() {
                   // actually shipped), not an aggregate across steps. Aggregation
                   // double-counts a bust child and produces nonsense like
                   // prompt=823k for a 540k actual turn (see fix in chart-bar above).
-                  const first = turn.events[0];
                   const last = turn.events[turn.events.length - 1];
+                  const worstCause = turn.worstEvent.cause;
                   const isExpanded = () => expandedTurns().has(turn.turnId);
                   const totalPrompt = last.cache_read + last.cache_write + last.input_tokens;
                   // Retention of the turn's final (shipped) step — hit_ratio now
@@ -879,7 +869,7 @@ export default function CacheDiagnostics() {
                           />
                         </div>
                       </div>
-                      <Show when={last.cause ?? first.cause}>
+                      <Show when={worstCause}>
                         {(cause) => (
                           <div
                             style={{

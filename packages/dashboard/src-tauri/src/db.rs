@@ -712,6 +712,9 @@ struct TransformDecisionCause {
     emergency: bool,
 }
 
+const MC_TRANSFORM_FAILED_OPEN_CAUSE: &str = "mc_transform_failed_open";
+const UNATTRIBUTED_CACHE_BUST_CAUSE: &str = "Unattributed cache bust";
+
 /// Estimate tokens using ~4 chars per token (CHARS_PER_TOKEN_ESTIMATE = 4)
 fn estimate_tokens(chars: i64) -> i64 {
     (chars + 3) / 4 // Round up
@@ -906,6 +909,9 @@ fn transform_decision_reason_label(reason: &str) -> Option<&'static str> {
 
 fn transform_decision_cause(decision: Option<&TransformDecisionCause>) -> Option<String> {
     let decision = decision?;
+    if decision.decision == "error" {
+        return Some(MC_TRANSFORM_FAILED_OPEN_CAUSE.to_string());
+    }
     if decision.emergency {
         return Some("Compaction pressure".to_string());
     }
@@ -1298,16 +1304,80 @@ fn load_transform_decision_causes_from_conn(
     out
 }
 
-fn build_db_cache_events(rows: Vec<RawDbCacheEvent>, enrich_causes: bool) -> Vec<DbCacheEvent> {
-    build_db_cache_events_with_decisions(rows, enrich_causes, None)
+fn load_transform_failure_sessions(
+    keys: &HashSet<(Harness, String)>,
+) -> HashSet<(Harness, String)> {
+    if keys.is_empty() {
+        return HashSet::new();
+    }
+    let Some(db_path) = resolve_db_path() else {
+        return HashSet::new();
+    };
+    let Ok(conn) = open_readonly(&db_path) else {
+        return HashSet::new();
+    };
+    load_transform_failure_sessions_from_conn(&conn, keys)
 }
 
+fn load_transform_failure_sessions_from_conn(
+    conn: &Connection,
+    keys: &HashSet<(Harness, String)>,
+) -> HashSet<(Harness, String)> {
+    let mut out = HashSet::new();
+    if keys.is_empty() {
+        return out;
+    }
+    let session_ids: HashSet<String> = keys.iter().map(|(_, sid)| sid.clone()).collect();
+    let placeholders = vec!["?"; session_ids.len()].join(",");
+    let sql = format!(
+        "SELECT session_id, harness
+         FROM session_meta
+         WHERE session_id IN ({})
+           AND TRIM(COALESCE(last_transform_error, '')) != ''",
+        placeholders
+    );
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return out;
+    };
+    let rows = stmt.query_map(params_from_iter(session_ids.iter()), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    });
+    if let Ok(rows) = rows {
+        for row in rows.flatten() {
+            let Ok(harness) = row.1.parse::<Harness>() else {
+                continue;
+            };
+            let key = (harness, row.0);
+            if keys.contains(&key) {
+                out.insert(key);
+            }
+        }
+    }
+    out
+}
+
+fn build_db_cache_events(rows: Vec<RawDbCacheEvent>, enrich_causes: bool) -> Vec<DbCacheEvent> {
+    build_db_cache_events_with_attribution(rows, enrich_causes, None, None)
+}
+
+#[cfg(test)]
 fn build_db_cache_events_with_decisions(
     rows: Vec<RawDbCacheEvent>,
     enrich_causes: bool,
     transform_decisions_override: Option<
         HashMap<(Harness, String, String), TransformDecisionCause>,
     >,
+) -> Vec<DbCacheEvent> {
+    build_db_cache_events_with_attribution(rows, enrich_causes, transform_decisions_override, None)
+}
+
+fn build_db_cache_events_with_attribution(
+    rows: Vec<RawDbCacheEvent>,
+    enrich_causes: bool,
+    transform_decisions_override: Option<
+        HashMap<(Harness, String, String), TransformDecisionCause>,
+    >,
+    transform_failure_sessions_override: Option<HashSet<(Harness, String)>>,
 ) -> Vec<DbCacheEvent> {
     // Build a map of earliest timestamp per session in our window so we can
     // detect whether an event is truly the session's first message vs just
@@ -1499,6 +1569,13 @@ fn build_db_cache_events_with_decisions(
             HashMap::new()
         }
     });
+    let transform_failure_sessions = transform_failure_sessions_override.unwrap_or_else(|| {
+        if enrich_causes {
+            load_transform_failure_sessions(&session_keys)
+        } else {
+            HashSet::new()
+        }
+    });
 
     // ── Pass 2: turn grouping + cross-step retention severity ──
     // Expected next cache_read = prev.cache_read + growth, where growth is the
@@ -1513,9 +1590,6 @@ fn build_db_cache_events_with_decisions(
     // anthropic/openai/etc.; real busts land < 0.4. Recovery steps grow exactly
     // as predicted, so they classify stable with no separate "warming" state.)
     let mut seen_sessions: HashSet<(Harness, String)> = HashSet::new();
-    // Sessions where an earlier event in this window had a transform-decision
-    // row, i.e. Magic Context was demonstrably active before the current event.
-    let mut mc_active_sessions: HashSet<(Harness, String)> = HashSet::new();
     let mut last_finish_by_session: HashMap<(Harness, String), String> = HashMap::new();
     let mut current_turn_id_by_session: HashMap<(Harness, String), String> = HashMap::new();
     let mut prev_event_idx_by_session: HashMap<(Harness, String), usize> = HashMap::new();
@@ -1562,20 +1636,18 @@ fn build_db_cache_events_with_decisions(
             chronological[i].message_id.clone(),
         );
         let decision_row = transform_decisions.get(&decision_key);
-        let has_prior_transform_decision = mc_active_sessions.contains(&session_key);
-        if decision_row.is_some() {
-            mc_active_sessions.insert(session_key.clone());
-        }
-        let cause_from_decision = || {
-            transform_decision_cause(decision_row).or_else(|| {
-                if decision_row.is_none() && has_prior_transform_decision {
-                    Some("mc_transform_missing".to_string())
-                } else if decision_row.is_none()
-                    && chronological[i].harness.has_magic_context_plugin_state()
-                {
-                    Some("Provider-side (not Magic Context)".to_string())
+        let has_transform_failure = transform_failure_sessions.contains(&session_key);
+        // A missing decision is normal for routine passes that do not invalidate
+        // the cache: the plugin persists decisions only when they bust the cache.
+        // Attribute a transform failure only when a recorded error proves it;
+        // otherwise report the cache loss as having an unknown origin.
+        let cause_from_decision = || transform_decision_cause(decision_row);
+        let cause_from_bust = || {
+            cause_from_decision().or_else(|| {
+                if has_transform_failure {
+                    Some(MC_TRANSFORM_FAILED_OPEN_CAUSE.to_string())
                 } else {
-                    None
+                    Some(UNATTRIBUTED_CACHE_BUST_CAUSE.to_string())
                 }
             })
         };
@@ -1655,7 +1727,7 @@ fn build_db_cache_events_with_decisions(
                         (
                             "full_bust".to_string(),
                             if enrich_causes {
-                                cause_from_decision()
+                                cause_from_bust()
                             } else {
                                 None
                             },
@@ -1679,7 +1751,7 @@ fn build_db_cache_events_with_decisions(
                             (
                                 "bust".to_string(),
                                 if enrich_causes {
-                                    cause_from_decision()
+                                    cause_from_bust()
                                 } else {
                                     None
                                 },
@@ -7137,6 +7209,32 @@ mod cache_turn_tests {
         }
     }
 
+    fn turn_summary_event(events: &[DbCacheEvent]) -> Option<&DbCacheEvent> {
+        fn rank(severity: &str) -> u8 {
+            match severity {
+                "full_bust" => 6,
+                "bust" => 5,
+                "warming" => 4,
+                "warning" => 3,
+                "stable" => 2,
+                "info" => 1,
+                _ => 0,
+            }
+        }
+
+        events.iter().fold(None, |winner, event| match winner {
+            None => Some(event),
+            Some(current)
+                if rank(event.severity.as_str()) > rank(current.severity.as_str())
+                    || (rank(event.severity.as_str()) == rank(current.severity.as_str())
+                        && event.timestamp >= current.timestamp) =>
+            {
+                Some(event)
+            }
+            Some(current) => Some(current),
+        })
+    }
+
     #[test]
     fn first_event_is_new_turn() {
         let rows = vec![raw(
@@ -7308,6 +7406,123 @@ mod cache_turn_tests {
         assert_eq!(events[1].turn_id, "b1");
         assert_eq!(events[2].turn_id, "a1");
         assert_eq!(events[3].turn_id, "b1");
+    }
+
+    #[test]
+    fn multi_step_turn_worst_event_carries_its_own_cause() {
+        let rows = vec![
+            raw(
+                Harness::Opencode,
+                "m1",
+                "s1",
+                100,
+                10,
+                200,
+                100,
+                310,
+                Some("tool-calls"),
+            ),
+            raw(
+                Harness::Opencode,
+                "m2",
+                "s1",
+                200,
+                10,
+                0,
+                0,
+                10,
+                Some("tool-calls"),
+            ),
+            raw(
+                Harness::Opencode,
+                "m3",
+                "s1",
+                300,
+                10,
+                10,
+                0,
+                20,
+                Some("stop"),
+            ),
+        ];
+        let decisions = HashMap::from([(
+            (Harness::Opencode, "s1".to_string(), "m2".to_string()),
+            TransformDecisionCause {
+                decision: "execute".to_string(),
+                materialize_reason: Some("pressure_refold".to_string()),
+                emergency: false,
+            },
+        )]);
+
+        let events = build_db_cache_events_with_decisions(rows, true, Some(decisions));
+        let winner = turn_summary_event(&events).expect("turn has events");
+        assert_eq!(winner.message_id, "m2");
+        assert_eq!(winner.severity, "full_bust");
+        assert_eq!(winner.cause.as_deref(), Some("Compaction pressure"));
+    }
+
+    #[test]
+    fn multi_step_turn_severity_tie_uses_newest_cause() {
+        let rows = vec![
+            raw(
+                Harness::Opencode,
+                "m1",
+                "s1",
+                100,
+                10,
+                200,
+                100,
+                310,
+                Some("tool-calls"),
+            ),
+            raw(
+                Harness::Opencode,
+                "m2",
+                "s1",
+                200,
+                10,
+                50,
+                10,
+                70,
+                Some("tool-calls"),
+            ),
+            raw(
+                Harness::Opencode,
+                "m3",
+                "s1",
+                300,
+                10,
+                10,
+                0,
+                20,
+                Some("stop"),
+            ),
+        ];
+        let decisions = HashMap::from([
+            (
+                (Harness::Opencode, "s1".to_string(), "m2".to_string()),
+                TransformDecisionCause {
+                    decision: "execute".to_string(),
+                    materialize_reason: Some("pressure_refold".to_string()),
+                    emergency: false,
+                },
+            ),
+            (
+                (Harness::Opencode, "s1".to_string(), "m3".to_string()),
+                TransformDecisionCause {
+                    decision: "defer".to_string(),
+                    materialize_reason: Some("explicit_flush".to_string()),
+                    emergency: false,
+                },
+            ),
+        ]);
+
+        let events = build_db_cache_events_with_decisions(rows, true, Some(decisions));
+        assert_eq!(events[1].severity, "bust");
+        assert_eq!(events[2].severity, "bust");
+        let winner = turn_summary_event(&events).expect("turn has events");
+        assert_eq!(winner.message_id, "m3");
+        assert_eq!(winner.cause.as_deref(), Some("Manual flush"));
     }
 
     #[test]
@@ -7540,7 +7755,10 @@ mod cache_turn_tests {
                 materialize_reason: Some(reason.to_string()),
                 emergency: false,
             };
-            assert_eq!(transform_decision_cause(Some(&cause)).as_deref(), Some(label));
+            assert_eq!(
+                transform_decision_cause(Some(&cause)).as_deref(),
+                Some(label)
+            );
         }
 
         let unknown = TransformDecisionCause {
@@ -7555,7 +7773,7 @@ mod cache_turn_tests {
     }
 
     #[test]
-    fn bust_without_transform_decision_is_provider_side() {
+    fn bust_without_transform_decision_is_unattributed() {
         let rows = vec![
             raw(
                 Harness::Opencode,
@@ -7584,12 +7802,12 @@ mod cache_turn_tests {
         assert_eq!(events[1].severity, "full_bust");
         assert_eq!(
             events[1].cause.as_deref(),
-            Some("Provider-side (not Magic Context)")
+            Some(UNATTRIBUTED_CACHE_BUST_CAUSE)
         );
     }
 
     #[test]
-    fn missing_transform_decision_after_mc_activity_is_fail_open_cause() {
+    fn missing_transform_decision_after_mc_activity_is_unattributed() {
         let rows = vec![
             raw(
                 Harness::Opencode,
@@ -7626,7 +7844,163 @@ mod cache_turn_tests {
 
         let events = build_db_cache_events_with_decisions(rows, true, Some(decisions));
         assert_eq!(events[1].severity, "full_bust");
-        assert_eq!(events[1].cause.as_deref(), Some("mc_transform_missing"));
+        assert_eq!(
+            events[1].cause.as_deref(),
+            Some(UNATTRIBUTED_CACHE_BUST_CAUSE)
+        );
+    }
+
+    #[test]
+    fn steady_state_missing_transform_decision_has_no_alarm_cause() {
+        let rows = vec![
+            raw(
+                Harness::Opencode,
+                "m1",
+                "s1",
+                100,
+                10,
+                135,
+                5,
+                150,
+                Some("tool-calls"),
+            ),
+            raw(
+                Harness::Opencode,
+                "m2",
+                "s1",
+                200,
+                10,
+                140,
+                5,
+                155,
+                Some("stop"),
+            ),
+        ];
+        let decisions = HashMap::from([(
+            (Harness::Opencode, "s1".to_string(), "m1".to_string()),
+            TransformDecisionCause {
+                decision: "defer".to_string(),
+                materialize_reason: None,
+                emergency: false,
+            },
+        )]);
+
+        let events = build_db_cache_events_with_decisions(rows, true, Some(decisions));
+        assert_eq!(events[1].severity, "stable");
+        assert_eq!(events[1].cause, None);
+    }
+
+    #[test]
+    fn recorded_transform_error_is_fail_open_cause() {
+        let rows = vec![
+            raw(
+                Harness::Opencode,
+                "m1",
+                "s1",
+                100,
+                2,
+                200_000,
+                1_000,
+                201_102,
+                Some("tool-calls"),
+            ),
+            raw(
+                Harness::Opencode,
+                "m2",
+                "s1",
+                200,
+                205_000,
+                0,
+                0,
+                205_500,
+                Some("stop"),
+            ),
+        ];
+        let decisions = HashMap::from([(
+            (Harness::Opencode, "s1".to_string(), "m2".to_string()),
+            TransformDecisionCause {
+                decision: "error".to_string(),
+                materialize_reason: None,
+                emergency: false,
+            },
+        )]);
+
+        let events = build_db_cache_events_with_decisions(rows, true, Some(decisions));
+        assert_eq!(events[1].severity, "full_bust");
+        assert_eq!(
+            events[1].cause.as_deref(),
+            Some(MC_TRANSFORM_FAILED_OPEN_CAUSE)
+        );
+    }
+
+    #[test]
+    fn session_transform_error_is_fail_open_cause() {
+        let rows = vec![
+            raw(
+                Harness::Opencode,
+                "m1",
+                "s1",
+                100,
+                2,
+                200_000,
+                1_000,
+                201_102,
+                Some("tool-calls"),
+            ),
+            raw(
+                Harness::Opencode,
+                "m2",
+                "s1",
+                200,
+                205_000,
+                0,
+                0,
+                205_500,
+                Some("stop"),
+            ),
+        ];
+        let failures = HashSet::from([(Harness::Opencode, "s1".to_string())]);
+
+        let events = build_db_cache_events_with_attribution(
+            rows,
+            true,
+            Some(HashMap::new()),
+            Some(failures),
+        );
+        assert_eq!(events[1].severity, "full_bust");
+        assert_eq!(
+            events[1].cause.as_deref(),
+            Some(MC_TRANSFORM_FAILED_OPEN_CAUSE)
+        );
+    }
+
+    #[test]
+    fn transform_failure_loader_requires_a_recorded_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_meta (
+                session_id TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                last_transform_error TEXT
+            );
+            INSERT INTO session_meta (session_id, harness, last_transform_error) VALUES
+                ('s1', 'opencode', 'transform failed'),
+                ('s2', 'opencode', ''),
+                ('s3', 'opencode', '   ');",
+        )
+        .unwrap();
+        let keys = HashSet::from([
+            (Harness::Opencode, "s1".to_string()),
+            (Harness::Opencode, "s2".to_string()),
+            (Harness::Opencode, "s3".to_string()),
+        ]);
+
+        let failures = load_transform_failure_sessions_from_conn(&conn, &keys);
+
+        assert_eq!(
+            failures,
+            HashSet::from([(Harness::Opencode, "s1".to_string())])
+        );
     }
 
     #[test]
