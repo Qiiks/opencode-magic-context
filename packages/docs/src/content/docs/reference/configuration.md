@@ -23,7 +23,7 @@ Add the schema line for editor validation and autocomplete:
 ```
 
 :::note
-Project-level configs cannot use `{env:VAR}` / `{file:path}` expansion. A cloned repository also cannot set `sqlite.*`, hidden-agent prompts/permissions, `historian.model`, or `historian.fallback_models`. Project `execute_threshold_percentage` / `execute_threshold_tokens` may only RAISE thresholds relative to the user's effective settings (a repo may delay compaction, not make it happen earlier). Dreamer model/schedule/task tuning and `memory.enabled` remain allowed project overrides.
+Project-level configs cannot use `{env:VAR}` / `{file:path}` expansion. A cloned repository also cannot set `sqlite.*`, `storage.enforce_private_permissions`, hidden-agent prompts/permissions, `historian.model`, or `historian.fallback_models`. Project `execute_threshold_percentage` / `execute_threshold_tokens` may only RAISE thresholds relative to the user's effective settings (a repo may delay compaction, not make it happen earlier). Dreamer model/schedule/task tuning and `memory.enabled` remain allowed project overrides.
 :::
 
 ## Top-level switches
@@ -250,6 +250,8 @@ Behavior tuning most installs never need to touch.
 | `sqlite` | object | — | SQLite connection tuning for Magic Context's own context.db. These are per-connection PRAGMAs applied at open; they do not change the schema or what is stored. |
 | `sqlite.cache_size_mb` | number (2–2048) | `64` | Page-cache size in MiB per connection (PRAGMA cache_size). Larger keeps more hot pages resident, cutting re-reads on repeated full-table scans. (min 2, max 2048, default 64) |
 | `sqlite.mmap_size_mb` | number (0–8192) | `0` | Memory-mapped I/O size in MiB (PRAGMA mmap_size). 0 disables mmap (SQLite default). Raising it can cut read overhead on large DBs at the cost of address space. (min 0, max 8192, default 0) |
+| `storage` | object | — | Storage permission policy. The default keeps session content and memories owner-private. Disabling enforcement is for trusted shared-group storage managed externally; every group member able to read the storage can read all stored session content and memories. |
+| `storage.enforce_private_permissions` | boolean | `true` | When true (default), Magic Context creates and re-tightens its storage directories to owner-only 0700 and storage files to owner-only 0600. Set false only for a deliberate trusted-group deployment whose operator manages directory, database, WAL/SHM, cache, and RPC file permissions externally; Magic Context then never chmods or supplies restrictive creation modes. USER-LEVEL ONLY — ignored in project config for security. On Windows, POSIX chmod modes are already meaningless, so this setting is a no-op. |
 
 ## Other
 

@@ -198,6 +198,10 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *    process). A cloned repo could set a huge value to exhaust host memory /
  *    address space — a resource-exhaustion vector with no legitimate per-repo
  *    use. Honor user-level config only.
+ *  - `storage.enforce_private_permissions` — changing a shared store from
+ *    owner-private to group-readable changes every session and memory's local
+ *    confidentiality. Only the machine operator's user config may opt into an
+ *    externally managed trusted-group deployment.
  *  - `embedding.endpoint` / `embedding.provider` — a repo must not choose
  *    where private memory/search/commit text is embedded. User-level config is
  *    the trust boundary for embedding destinations.
@@ -253,6 +257,17 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         warnings.push(
             "Ignoring sqlite.* from project config (security: SQLite cache/mmap PRAGMAs apply to the " +
                 "process-global shared database handle; only user-level config may set them).",
+        );
+    }
+
+    // storage.enforce_private_permissions is USER-tier only because disabling it
+    // changes the confidentiality of the process-global shared store. Field-scoped
+    // stripping preserves future project-tier storage settings in the same block.
+    const storage = projectRaw.storage;
+    if (isPlainObject(storage) && "enforce_private_permissions" in storage) {
+        delete storage.enforce_private_permissions;
+        warnings.push(
+            "Ignoring storage.enforce_private_permissions from project config (security: only user-level config may opt into externally managed shared storage permissions).",
         );
     }
 

@@ -1259,6 +1259,20 @@
         }
       }
     },
+    "storage": {
+      "default": {
+        "enforce_private_permissions": true
+      },
+      "description": "Storage permission policy. The default keeps session content and memories owner-private. Disabling enforcement is for trusted shared-group storage managed externally; every group member able to read the storage can read all stored session content and memories.",
+      "type": "object",
+      "properties": {
+        "enforce_private_permissions": {
+          "default": true,
+          "description": "When true (default), Magic Context creates and re-tightens its storage directories to owner-only 0700 and storage files to owner-only 0600. Set false only for a deliberate trusted-group deployment whose operator manages directory, database, WAL/SHM, cache, and RPC file permissions externally; Magic Context then never chmods or supplies restrictive creation modes. USER-LEVEL ONLY — ignored in project config for security. On Windows, POSIX chmod modes are already meaningless, so this setting is a no-op.",
+          "type": "boolean"
+        }
+      }
+    },
     "embedding": {
       "description": "Embedding provider configuration",
       "type": "object",

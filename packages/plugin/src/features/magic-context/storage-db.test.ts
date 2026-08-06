@@ -2,6 +2,7 @@
 
 import { afterEach, describe, expect, it } from "bun:test";
 import {
+    type chmodSync,
     existsSync,
     mkdirSync,
     mkdtempSync,
@@ -15,6 +16,12 @@ import { dirname, join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
+    __resetStoragePrivatePermissionEnforcementForTests,
+    setStoragePrivatePermissionEnforcement,
+} from "../../shared/storage-permissions";
+import {
+    __resetStoragePermissionFsForTests,
+    __setStoragePermissionFsForTests,
     closeDatabase,
     getMigrationOnOpenRefusal,
     isDatabasePersisted,
@@ -57,9 +64,9 @@ function seedPendingMigration(dataHome: string): string {
 function readPersistedVersion(dbPath: string): number {
     const db = new Database(dbPath);
     try {
-        const row = db
-            .prepare("SELECT MAX(version) AS version FROM schema_migrations")
-            .get() as { version: number };
+        const row = db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as {
+            version: number;
+        };
         return row.version;
     } finally {
         closeQuietly(db);
@@ -68,6 +75,8 @@ function readPersistedVersion(dbPath: string): number {
 
 afterEach(() => {
     closeDatabase();
+    __resetStoragePermissionFsForTests();
+    __resetStoragePrivatePermissionEnforcementForTests();
     process.env.XDG_DATA_HOME = originalXdgDataHome;
 
     for (const dir of tempDirs) {
@@ -113,6 +122,44 @@ describe("storage-db", () => {
                     expect(statSync(sidecar).mode & 0o777).toBe(0o600);
                 }
             }
+        });
+
+        it("#when private permission enforcement is disabled #then a full storage open makes zero chmod calls", () => {
+            const dataHome = useTempDataHome("storage-db-external-perms-");
+            const chmodCalls: Array<[string, number]> = [];
+            setStoragePrivatePermissionEnforcement(false);
+            __setStoragePermissionFsForTests({
+                chmodSync: ((path, mode) => {
+                    chmodCalls.push([String(path), Number(mode)]);
+                }) as typeof chmodSync,
+            });
+
+            openDatabase();
+
+            expect(existsSync(resolveDbPath(dataHome))).toBe(true);
+            expect(chmodCalls).toEqual([]);
+        });
+
+        it("#when private permission enforcement is enabled #then a full storage open restricts the directory and database", () => {
+            if (process.platform === "win32") return;
+            const dataHome = useTempDataHome("storage-db-private-perms-spy-");
+            const dbPath = resolveDbPath(dataHome);
+            const chmodCalls: Array<[string, number]> = [];
+            setStoragePrivatePermissionEnforcement(true);
+            __setStoragePermissionFsForTests({
+                chmodSync: ((path, mode) => {
+                    chmodCalls.push([String(path), Number(mode)]);
+                }) as typeof chmodSync,
+            });
+
+            openDatabase();
+
+            expect(chmodCalls).toEqual(
+                expect.arrayContaining([
+                    [dirname(dbPath), 0o700],
+                    [dbPath, 0o600],
+                ]),
+            );
         });
 
         it("#when called first time #then creates required tables", () => {

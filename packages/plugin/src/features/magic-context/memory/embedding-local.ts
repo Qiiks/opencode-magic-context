@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../../../config/schema/magic-context";
 import { getMagicContextStorageDir } from "../../../shared/data-path";
 import { log } from "../../../shared/logger";
+import { shouldEnforcePrivateStoragePermissions } from "../../../shared/storage-permissions";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./embedding-provider";
 
@@ -497,16 +498,21 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                 // or buffer" failures. Using our own storage dir survives plugin updates too.
                 const modelCacheDir = join(getMagicContextStorageDir(), "models");
                 try {
-                    // Owner-only: the cache lives under the same storage tree as
-                    // memories/history. mkdir's mode is masked by umask, so chmod
-                    // afterwards (no-op on Windows, where POSIX modes are ignored).
-                    mkdirSync(modelCacheDir, { recursive: true, mode: 0o700 });
-                    if (process.platform !== "win32") {
-                        try {
-                            chmodSync(modelCacheDir, 0o700);
-                        } catch {
-                            // Non-fatal — leave default perms if chmod is rejected.
+                    // Keep the cache owner-only by default because it shares the
+                    // storage tree with memories/history. Trusted-group deployments
+                    // manage this directory externally, so skip both mode creation
+                    // and chmod rather than attempting a different permission change.
+                    if (shouldEnforcePrivateStoragePermissions()) {
+                        mkdirSync(modelCacheDir, { recursive: true, mode: 0o700 });
+                        if (process.platform !== "win32") {
+                            try {
+                                chmodSync(modelCacheDir, 0o700);
+                            } catch {
+                                // Non-fatal — leave default perms if chmod is rejected.
+                            }
                         }
+                    } else {
+                        mkdirSync(modelCacheDir, { recursive: true });
                     }
                     env.cacheDir = modelCacheDir;
                 } catch {
