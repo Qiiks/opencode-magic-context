@@ -49,6 +49,7 @@ import {
     resetNoteNudgeCooldownOnly,
 } from "./note-nudger";
 import { readRawSessionMessageById, readRawSessionMessages } from "./read-session-chunk";
+import { clearIgnoredMessages, flushIgnoredMessages } from "./send-session-notification";
 import { variantChangeBustsProviderCache } from "./sentinel";
 import { normalizeTodoStateJson } from "./todo-view";
 
@@ -387,10 +388,18 @@ export function createEventHook(args: {
             args.deferredMaterializationSessions.delete(sessionId);
             args.lastHeuristicsTurnId.delete(sessionId);
             args.commitSeenLastPass?.delete(sessionId);
+            clearIgnoredMessages(sessionId);
             resetNoteNudgeCooldownOnly(sessionId);
             clearAutoSearchForSession(sessionId);
             clearSidebarSnapshotCache(sessionId);
             clearSessionTracking(sessionId);
+        }
+
+        // Terminal message.updated/session events are the other existing idle
+        // boundary. `flushIgnoredMessages` checks the same DB signal again, so
+        // streaming deltas cannot accidentally release the queue mid-turn.
+        if (input.event.type !== "session.deleted") {
+            await flushIgnoredMessages(sessionId);
         }
 
         // Historical note: v0.14.1 removed the 80% "context emergency" nudge
@@ -530,6 +539,11 @@ export function createToolExecuteAfterHook(args: {
         if (!typedInput.sessionID || !typedInput.tool) {
             return;
         }
+
+        // `tool.execute.after` is the next existing host event after a tool
+        // boundary. The queue helper re-checks the read-only mid-turn signal,
+        // so this is a no-op until the assistant is actually idle.
+        await flushIgnoredMessages(typedInput.sessionID);
 
         if (typedInput.tool === "ctx_reduce") {
             // Mark the Channel 1 baseline dirty so the next nudge re-measures the
