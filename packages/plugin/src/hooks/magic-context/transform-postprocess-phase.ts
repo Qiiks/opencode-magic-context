@@ -12,6 +12,7 @@ import {
     getNoteNudgeAnchors,
     getPendingCompactionMarkerState,
     getPendingOps,
+    getPersistedTodoPermissionDenied,
     getPersistedTodoSyntheticAnchor,
     getProcessedImageStrippedIds,
     getStaleReduceStrippedIds,
@@ -20,6 +21,7 @@ import {
     peekDeferredExecutePending,
     pruneAutoSearchHintDecisions,
     pruneNoteNudgeAnchors,
+    setPersistedTodoPermissionDenied,
     setPersistedTodoSyntheticAnchor,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
@@ -220,7 +222,10 @@ export async function applyTodoSynthesis(args: {
     if (!args.fullFeatureMode || args.compactionOff) return 0;
 
     const persistedAnchor = getPersistedTodoSyntheticAnchor(args.db, args.sessionId);
-    let permissionDenied = cachedToolPermissionDenied(args.sessionId, "todowrite") ?? false;
+    let permissionDenied =
+        cachedToolPermissionDenied(args.sessionId, "todowrite") ??
+        getPersistedTodoPermissionDenied(args.db, args.sessionId) ??
+        false;
     const toolsMapUnavailable =
         args.todowriteAvailability.frozen && !args.todowriteAvailability.callable;
 
@@ -231,13 +236,14 @@ export async function applyTodoSynthesis(args: {
                 args.sessionId,
                 args.activeAgent,
             );
+            setPersistedTodoPermissionDenied(args.db, args.sessionId, permissionDenied);
         } catch (error) {
             // A transient SDK read must not turn a previously denied tool back on.
-            // The cached verdict remains authoritative until the next bust can read
-            // the live permission state successfully.
+            // Keep the last in-memory or durable verdict until a later permission
+            // refresh successfully reads the live state.
             sessionLog(
                 args.sessionId,
-                "todowrite permission read failed; retaining the cached live verdict:",
+                "todowrite permission read failed; retaining the last successful verdict:",
                 error,
             );
         }

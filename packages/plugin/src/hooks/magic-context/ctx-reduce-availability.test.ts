@@ -167,6 +167,21 @@ describe("OpenCode todowrite permission evaluator", () => {
         ).toBe(false);
     });
 
+    it("treats regex punctuation literally while preserving wildcard segments", () => {
+        const deny = (permission: string, toolName: string): boolean =>
+            permissionDisabled(toolName, [{ permission, pattern: "*", action: "deny" }]);
+
+        expect(() => deny("to(do*", "to(doThing")).not.toThrow();
+        expect(deny("to(do*", "to(doThing")).toBe(true);
+        expect(deny("to(do*", "todoThing")).toBe(false);
+        expect(deny("todo.rite*", "todo.riteLater")).toBe(true);
+        expect(deny("todo.rite*", "todowriteLater")).toBe(false);
+        expect(deny("to*write", "todowrite")).toBe(true);
+        expect(deny("to*write", "to-something-write")).toBe(true);
+        expect(deny("*", "todowrite")).toBe(true);
+        expect(deny("todowrite", "todowrite")).toBe(true);
+    });
+
     it("reads the active agent and session overlay through the SDK", async () => {
         const client = {
             app: {

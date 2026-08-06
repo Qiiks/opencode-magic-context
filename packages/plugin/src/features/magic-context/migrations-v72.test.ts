@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { runMigrations } from "./migrations";
+import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
 import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 import { getCompactionModeRecord, setCompactionModeRecord } from "./storage-meta-persisted";
 
@@ -59,8 +59,8 @@ describe("migration v72 — per-session compaction mode record (issue #266)", ()
         }
     });
 
-    test("LATEST_SUPPORTED_VERSION bumped to 72 (schema-fence lockstep)", () => {
-        expect(LATEST_SUPPORTED_VERSION).toBe(72);
+    test("schema-fence remains in lockstep after v72", () => {
+        expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
     });
 
     test("read/write helpers round-trip on, off, and null (no-record)", () => {

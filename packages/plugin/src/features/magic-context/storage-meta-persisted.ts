@@ -46,6 +46,10 @@ interface PersistedTodoSyntheticAnchorRow {
     todo_synthetic_state_json: string;
 }
 
+interface PersistedTodoPermissionRow {
+    todo_permission_denied: number;
+}
+
 interface PersistedHistorianFailureRow {
     historian_failure_count: number;
     historian_last_error: string | null;
@@ -1544,6 +1548,27 @@ export function removeAutoSearchHintDecisionByMessageId(
         { ensureRow: false },
     );
     return ok && removed;
+}
+
+export function getPersistedTodoPermissionDenied(db: Database, sessionId: string): boolean | null {
+    const row = db
+        .prepare("SELECT todo_permission_denied FROM session_meta WHERE session_id = ?")
+        .get(sessionId) as PersistedTodoPermissionRow | undefined;
+    if (row?.todo_permission_denied === 1) return true;
+    if (row?.todo_permission_denied === 0) return false;
+    return null;
+}
+
+export function setPersistedTodoPermissionDenied(
+    db: Database,
+    sessionId: string,
+    denied: boolean,
+): void {
+    ensureSessionMetaRow(db, sessionId);
+    db.prepare("UPDATE session_meta SET todo_permission_denied = ? WHERE session_id = ?").run(
+        denied ? 1 : 0,
+        sessionId,
+    );
 }
 
 export function getPersistedTodoSyntheticAnchor(

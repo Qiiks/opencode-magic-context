@@ -23,14 +23,17 @@ import {
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
     getPersistedCompactionMarkerState,
+    getPersistedTodoPermissionDenied,
     getPersistedTodoSyntheticAnchor,
     setPersistedCompactionMarkerState,
+    setPersistedTodoPermissionDenied,
     setPersistedTodoSyntheticAnchor,
 } from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
 import { Database } from "../../shared/sqlite";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { registerActiveCompartmentRun } from "./compartment-runner";
+import { clearToolPermissionDenied } from "./ctx-reduce-availability";
 import { estimateMessageTokens } from "./final-wire-token-estimate";
 import { injectM0M1, type M0HardSignals } from "./inject-compartments";
 import {
@@ -2688,6 +2691,7 @@ async function runTodoGatePass(args: {
     messages: MessageLike[];
     schedulerDecision: "execute" | "defer";
     todowriteAvailability: { callable: boolean; frozen: boolean };
+    client?: PostTransformArgs["client"];
 }): Promise<void> {
     const tagger = createTagger();
     const tagged = tagMessages(args.sessionId, args.messages, tagger, db);
@@ -2700,6 +2704,7 @@ async function runTodoGatePass(args: {
             messageTagNumbers: tagged.messageTagNumbers,
             batch: tagged.batch,
             todowriteAvailability: args.todowriteAvailability,
+            client: args.client,
         }),
     );
 }
@@ -2829,6 +2834,40 @@ describe("todo synthesis — disabled todowrite tool gate", () => {
         const anchor = getPersistedTodoSyntheticAnchor(db, sessionId);
         expect(anchor?.messageId).toBe("a1");
         expect(anchor?.stateJson).toBe(TODO_ACTIVE_STATE);
+    });
+
+    it("retains a persisted denial after restart when the SDK permission read fails", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-todo-gate-cold-cache";
+        updateSessionMeta(db, sessionId, { lastTodoState: TODO_ACTIVE_STATE });
+        setPersistedTodoPermissionDenied(db, sessionId, true);
+        clearToolPermissionDenied(sessionId, "todowrite");
+        const failingClient = {
+            app: {
+                agents: async () => {
+                    throw new Error("permission service unavailable");
+                },
+            },
+            session: {
+                get: async () => {
+                    throw new Error("permission service unavailable");
+                },
+            },
+        } as never;
+
+        const messages = buildTodoGateMessages(sessionId);
+        await runTodoGatePass({
+            sessionId,
+            messages,
+            schedulerDecision: "execute",
+            todowriteAvailability: AVAILABLE,
+            client: failingClient,
+        });
+
+        expect(findTodoPart(messages)).toBeNull();
+        expect(getPersistedTodoSyntheticAnchor(db, sessionId)).toBeNull();
+        expect(getPersistedTodoPermissionDenied(db, sessionId)).toBe(true);
     });
 
     it("(d) a provisional (not yet frozen) verdict fails open and still injects", async () => {

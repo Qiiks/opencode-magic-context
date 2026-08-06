@@ -45,6 +45,7 @@ const dubiousOwnershipLoggedDirectories = new Set<string>();
 const dubiousOwnershipWarnedDirectories = new Set<string>();
 const transientGitIdentityReuseLoggedDirectories = new Set<string>();
 let execFileSyncForIdentity: typeof execFileSync = execFileSync;
+let userHomeDirectoryForIdentity = (): string => homedir();
 let nowMs = (): number => Date.now();
 
 /**
@@ -408,11 +409,11 @@ export function takeDubiousOwnershipProjectIdentityWarning(directory: string): s
 
 /**
  * Compare filesystem-canonical paths so a symlink spelling of $HOME cannot
- * accidentally create a second directory identity. Descendants remain valid
- * project directories; only the exact home directory is rejected.
+ * accidentally create a second directory identity. The session resolver also
+ * checks descendants whose nearest git root is the home directory.
  */
 function canonicalUserHomeDirectory(): string {
-    return realpathSync.native(homedir());
+    return realpathSync.native(userHomeDirectoryForIdentity());
 }
 
 export function isUserHomeDirectory(directory: string): boolean {
@@ -502,17 +503,36 @@ function hasGitDir(canonical: string): boolean {
     }
 }
 
-function hasGitDirInAncestorChain(startDirectory: string): boolean {
+function gitRootInAncestorChain(startDirectory: string): string | null {
     let current = startDirectory;
     while (true) {
         if (existsSync(path.join(current, ".git"))) {
-            return true;
+            try {
+                return realpathSync.native(current);
+            } catch {
+                return path.resolve(current);
+            }
         }
         const parent = path.dirname(current);
         if (parent === current) {
-            return false;
+            return null;
         }
         current = parent;
+    }
+}
+
+function hasGitDirInAncestorChain(startDirectory: string): boolean {
+    return gitRootInAncestorChain(startDirectory) !== null;
+}
+
+function gitRootDirectory(canonical: string): string | null {
+    const direct = gitRootInAncestorChain(canonical);
+    if (direct) return direct;
+    try {
+        const realCanonical = realpathSync.native(canonical);
+        return realCanonical === canonical ? null : gitRootInAncestorChain(realCanonical);
+    } catch {
+        return null;
     }
 }
 
@@ -520,12 +540,21 @@ export function resolveProjectIdentityForSession(
     directory: string,
     allowHomeProject = false,
 ): string | undefined {
-    if (isUserHomeDirectory(directory)) {
+    const canonicalHome = canonicalUserHomeDirectory();
+    const canonicalDirectory = (() => {
+        try {
+            return realpathSync.native(path.resolve(directory));
+        } catch {
+            return path.resolve(directory);
+        }
+    })();
+    const inheritsHomeRepository = gitRootDirectory(canonicalDirectory) === canonicalHome;
+    if (canonicalDirectory === canonicalHome || inheritsHomeRepository) {
         if (!allowHomeProject) return undefined;
-        // A home session always uses the normal directory fallback, even if
-        // $HOME contains a .git directory. This preserves the existing dir:
-        // identity and prevents symlink spellings from creating separate pools.
-        return directoryFallback(canonicalUserHomeDirectory());
+        // A session whose effective git root is $HOME belongs to the same protected
+        // home identity as an exact-home session. This prevents a child directory
+        // from bypassing the opt-in by inheriting $HOME/.git.
+        return directoryFallback(canonicalHome);
     }
     return resolveProjectIdentityOrFallback(directory);
 }
@@ -571,9 +600,11 @@ export function storedPathBelongsToIdentity(
 
 export function __setProjectIdentityTestHooks(hooks: {
     execFileSync?: typeof execFileSync;
+    homeDirectory?: () => string;
     nowMs?: () => number;
 }): void {
     execFileSyncForIdentity = hooks.execFileSync ?? execFileSync;
+    userHomeDirectoryForIdentity = hooks.homeDirectory ?? (() => homedir());
     nowMs = hooks.nowMs ?? (() => Date.now());
 }
 
@@ -603,5 +634,6 @@ export function __resetProjectIdentityForTests(): void {
     dubiousOwnershipWarnedDirectories.clear();
     transientGitIdentityReuseLoggedDirectories.clear();
     execFileSyncForIdentity = execFileSync;
+    userHomeDirectoryForIdentity = (): string => homedir();
     nowMs = (): number => Date.now();
 }
