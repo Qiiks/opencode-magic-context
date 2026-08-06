@@ -36,17 +36,43 @@ describe("resolveProjectIdentity directory fallback", () => {
         expect(resolveProjectIdentityForSession(homedir(), true)).toBe(expected);
     });
 
-    test("never lets a home identity match a contained directory", () => {
+    test("keeps a contained repository distinct from the home identity", () => {
         const contained = mkdtempSync(join(homedir(), "mc-home-identity-"));
         try {
+            mkdirSync(join(contained, ".git"));
+            __setProjectIdentityTestHooks({ execFileSync: returningRootCommit("abc1234") });
             const homeIdentity = resolveProjectIdentityForSession(homedir(), true);
             const containedIdentity = resolveProjectIdentityForSession(contained, true);
 
             expect(homeIdentity).toBeDefined();
-            expect(containedIdentity).toBeDefined();
+            expect(containedIdentity).toBe("git:abc1234");
             expect(containedIdentity).not.toBe(homeIdentity);
         } finally {
             rmSync(contained, { recursive: true, force: true });
+        }
+    });
+
+    test("requires home opt-in when a child inherits the home git repository", () => {
+        const fakeHome = tempDir();
+        const child = join(fakeHome, "nested", "project");
+        try {
+            mkdirSync(join(fakeHome, ".git"));
+            mkdirSync(child, { recursive: true });
+            __setProjectIdentityTestHooks({
+                execFileSync: returningRootCommit("def5678"),
+                homeDirectory: () => fakeHome,
+            });
+            const expectedHomeIdentity = `dir:${createHash("md5")
+                .update(realpathSync.native(fakeHome), "utf8")
+                .digest("hex")
+                .slice(0, 12)}`;
+
+            expect(resolveProjectIdentityForSession(fakeHome)).toBeUndefined();
+            expect(resolveProjectIdentityForSession(child)).toBeUndefined();
+            expect(resolveProjectIdentityForSession(fakeHome, true)).toBe(expectedHomeIdentity);
+            expect(resolveProjectIdentityForSession(child, true)).toBe(expectedHomeIdentity);
+        } finally {
+            rmSync(fakeHome, { recursive: true, force: true });
         }
     });
     test("flips dir: fallback to git: once a repo gains its first commit (no stale cache)", () => {

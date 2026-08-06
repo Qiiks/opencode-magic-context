@@ -235,11 +235,15 @@ function responseData(value: unknown): unknown {
     return value;
 }
 
+function escapeRegExpLiteral(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function permissionNameMatches(rulePermission: string, toolName: string): boolean {
     if (rulePermission === "*" || rulePermission === toolName) return true;
     if (!rulePermission.includes("*")) return false;
-    const escaped = rulePermission.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&");
-    return new RegExp(`^${escaped.replaceAll("*", ".*")}$`).test(toolName);
+    const pattern = rulePermission.split("*").map(escapeRegExpLiteral).join(".*");
+    return new RegExp(`^${pattern}$`).test(toolName);
 }
 
 /**

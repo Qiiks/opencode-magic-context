@@ -2712,6 +2712,20 @@ const MIGRATIONS: Migration[] = [
             }
         },
     },
+    {
+        version: 73,
+        description: "persist the last successful todowrite permission verdict",
+        up(db: Database): void {
+            if (tableExists(db, "session_meta")) {
+                ensureColumn(
+                    db,
+                    "session_meta",
+                    "todo_permission_denied",
+                    "INTEGER NOT NULL DEFAULT 2",
+                );
+            }
+        },
+    },
 ];
 
 /**

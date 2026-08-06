@@ -504,19 +504,19 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
                     domain,
                     rows: page,
                 });
-                const identities = (seedResponse.module_row_ids ?? [])
-                    .map((moduleRowId, index) => ({
-                        moduleRowId,
-                        sourceRowId: seedSourceRowId(page[index]),
-                    }))
-                    .filter(
-                        (
-                            identity,
-                        ): identity is {
-                            moduleRowId: number;
-                            sourceRowId: number;
-                        } => identity.sourceRowId !== null,
-                    );
+                const identityByModuleRowId = new Map<
+                    number,
+                    { moduleRowId: number; sourceRowId: number }
+                >();
+                for (const [index, moduleRowId] of (seedResponse.module_row_ids ?? []).entries()) {
+                    const sourceRowId = seedSourceRowId(page[index]);
+                    if (sourceRowId === null) continue;
+                    // The module coalesces same-frame natural-key duplicates to the
+                    // last snapshot. Repeated module ids therefore choose the last
+                    // source id as the canonical mirror-back target as well.
+                    identityByModuleRowId.set(moduleRowId, { moduleRowId, sourceRowId });
+                }
+                const identities = [...identityByModuleRowId.values()];
                 if (identities.length > 0) {
                     // Seed identities are one response batch: keeping the SELECT+insert
                     // sequence in one local transaction prevents one SQLite write lock per row.

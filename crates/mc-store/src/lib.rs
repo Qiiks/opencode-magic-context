@@ -21,7 +21,7 @@ use rusqlite::{functions::FunctionFlags, params, types::Value as SqlValue, Optio
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Cursor, Error, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -2165,6 +2165,87 @@ const MIGRATIONS: &[Migration] = &[
          WHERE id IN (SELECT stale_id FROM mc_memory_generation_collisions);
         DROP TABLE mc_memory_generation_merge_values;
         DROP TABLE mc_memory_generation_collisions;
+        "#,
+    },
+    Migration {
+        version: 45,
+        // Migration 44 selected a survivor only when a row carried the live binding UUID.
+        // Restored data may contain only stale generations, so select the newest row for each
+        // project/category/hash group even without a current-generation row, preserve monotonic
+        // timestamps, and delete the other duplicate render rows before seeding authority records.
+        statements: r#"
+        DROP TABLE IF EXISTS temp.mc_memory_stale_generation_survivors;
+        DROP TABLE IF EXISTS temp.mc_memory_stale_generation_groups;
+        CREATE TEMP TABLE mc_memory_stale_generation_groups AS
+        SELECT project_path, category, normalized_hash
+          FROM mc_memories
+         GROUP BY project_path, category, normalized_hash
+        HAVING COUNT(*) > 1;
+
+        DELETE FROM mc_memory_stale_generation_groups AS duplicate_group
+         WHERE EXISTS (
+             SELECT 1
+               FROM mc_authority_route_bindings binding
+               JOIN mc_memories current
+                 ON current.project_path = duplicate_group.project_path
+                AND current.category = duplicate_group.category
+                AND current.normalized_hash = duplicate_group.normalized_hash
+                AND current.context_store_uuid = binding.context_store_uuid
+              WHERE binding.project = duplicate_group.project_path
+         );
+
+        CREATE TEMP TABLE mc_memory_stale_generation_survivors AS
+        SELECT duplicate_group.project_path,
+               duplicate_group.category,
+               duplicate_group.normalized_hash,
+               (
+                   SELECT candidate.id
+                     FROM mc_memories candidate
+                    WHERE candidate.project_path = duplicate_group.project_path
+                      AND candidate.category = duplicate_group.category
+                      AND candidate.normalized_hash = duplicate_group.normalized_hash
+                    ORDER BY candidate.updated_at DESC, candidate.id DESC
+                    LIMIT 1
+               ) AS survivor_id
+          FROM mc_memory_stale_generation_groups duplicate_group;
+
+        UPDATE mc_memories AS survivor
+           SET updated_at = (
+                   SELECT MAX(candidate.updated_at)
+                     FROM mc_memories candidate
+                    WHERE candidate.project_path = survivor.project_path
+                      AND candidate.category = survivor.category
+                      AND candidate.normalized_hash = survivor.normalized_hash
+               ),
+               verified_at = (
+                   SELECT MAX(candidate.verified_at)
+                     FROM mc_memories candidate
+                    WHERE candidate.project_path = survivor.project_path
+                      AND candidate.category = survivor.category
+                      AND candidate.normalized_hash = survivor.normalized_hash
+               ),
+               classified_at = (
+                   SELECT MAX(candidate.classified_at)
+                     FROM mc_memories candidate
+                    WHERE candidate.project_path = survivor.project_path
+                      AND candidate.category = survivor.category
+                      AND candidate.normalized_hash = survivor.normalized_hash
+               )
+         WHERE survivor.id IN (
+             SELECT survivor_id FROM mc_memory_stale_generation_survivors
+         );
+
+        DELETE FROM mc_memories AS duplicate
+         WHERE EXISTS (
+             SELECT 1
+               FROM mc_memory_stale_generation_survivors survivor
+              WHERE survivor.project_path = duplicate.project_path
+                AND survivor.category = duplicate.category
+                AND survivor.normalized_hash = duplicate.normalized_hash
+                AND survivor.survivor_id != duplicate.id
+         );
+        DROP TABLE mc_memory_stale_generation_survivors;
+        DROP TABLE mc_memory_stale_generation_groups;
         "#,
     },
 ];
@@ -12554,6 +12635,14 @@ impl McStore {
         project: &str,
         rows: &[AuthoritySeedRow],
     ) -> Result<Vec<i64>, McStoreError> {
+        struct PreparedMemorySeed {
+            source_row_id: i64,
+            snapshot_json: String,
+            mapping_json: Option<String>,
+            category: String,
+            normalized_hash: String,
+        }
+
         let prepared = rows
             .iter()
             .map(|row| {
@@ -12573,9 +12662,50 @@ impl McStore {
                     .map(serde_json::to_string)
                     .transpose()
                     .map_err(|error| McStoreError::Serde(error.to_string()))?;
-                Ok((row.source_row_id, snapshot_json, mapping_json))
+                Ok(PreparedMemorySeed {
+                    source_row_id: row.source_row_id,
+                    snapshot_json,
+                    mapping_json,
+                    category: object
+                        .get("category")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    normalized_hash: object
+                        .get("normalized_hash")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                })
             })
             .collect::<Result<Vec<_>, McStoreError>>()?;
+
+        // A wire frame can contain natural-key duplicates even though source row ids differ.
+        // The source database's final row is authoritative, so process only the last snapshot
+        // while retaining an alias from every source id to that survivor's module row.
+        let mut last_index_by_natural_key = BTreeMap::new();
+        for (index, row) in prepared.iter().enumerate() {
+            last_index_by_natural_key
+                .insert((row.category.clone(), row.normalized_hash.clone()), index);
+        }
+        let survivor_index_for_row = prepared
+            .iter()
+            .map(|row| {
+                *last_index_by_natural_key
+                    .get(&(row.category.clone(), row.normalized_hash.clone()))
+                    .expect("every prepared memory has a natural-key survivor")
+            })
+            .collect::<Vec<_>>();
+        let source_aliases = prepared
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                (
+                    row.source_row_id,
+                    prepared[survivor_index_for_row[index]].source_row_id,
+                )
+            })
+            .collect::<HashMap<_, _>>();
 
         #[cfg(any(test, feature = "test-support"))]
         self.authority_seed_transaction_count
@@ -12583,16 +12713,77 @@ impl McStore {
 
         self.inner
             .with_conn_fenced(|tx| {
-                // A restored context database keeps memory content but mints a new store UUID.
-                // Re-key a natural-key match before the identity upsert so the two unique keys
-                // converge on one module row instead of rejecting the complete seed frame.
-                let mut memory_adopt = tx.prepare(
+                let mut memory_by_identity = tx.prepare(
+                    "SELECT id, project_path, category, normalized_hash
+                       FROM mc_memories
+                      WHERE context_store_uuid = ?1 AND context_row_id = ?2",
+                )?;
+                let mut memory_by_natural_key = tx.prepare(
+                    "SELECT id FROM mc_memories
+                      WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
+                      ORDER BY updated_at DESC, id DESC
+                      LIMIT 1",
+                )?;
+                let mut memory_merge_into_survivor = tx.prepare(
+                    "UPDATE mc_memories AS survivor
+                        SET content = COALESCE((
+                                SELECT candidate.content
+                                  FROM mc_memories candidate
+                                 WHERE candidate.project_path = ?1
+                                   AND candidate.category = ?2
+                                   AND candidate.normalized_hash = ?3
+                                 ORDER BY candidate.updated_at DESC, candidate.id DESC
+                                 LIMIT 1
+                            ), survivor.content),
+                            updated_at = COALESCE((
+                                SELECT MAX(candidate.updated_at)
+                                  FROM mc_memories candidate
+                                 WHERE candidate.project_path = ?1
+                                   AND candidate.category = ?2
+                                   AND candidate.normalized_hash = ?3
+                            ), survivor.updated_at),
+                            verified_at = (
+                                SELECT MAX(candidate.verified_at)
+                                  FROM mc_memories candidate
+                                 WHERE candidate.id = ?4 OR (
+                                       candidate.project_path = ?1
+                                   AND candidate.category = ?2
+                                   AND candidate.normalized_hash = ?3
+                                 )
+                            ),
+                            classified_at = (
+                                SELECT MAX(candidate.classified_at)
+                                  FROM mc_memories candidate
+                                 WHERE candidate.id = ?4 OR (
+                                       candidate.project_path = ?1
+                                   AND candidate.category = ?2
+                                   AND candidate.normalized_hash = ?3
+                                 )
+                            )
+                      WHERE survivor.id = ?4",
+                )?;
+                let mut mapping_delete_twins = tx.prepare(
+                    "DELETE FROM mc_memory_mappings
+                      WHERE memory_id != ?4
+                        AND memory_id IN (
+                            SELECT id FROM mc_memories
+                             WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
+                        )",
+                )?;
+                let mut memory_delete_twins = tx.prepare(
+                    "DELETE FROM mc_memories
+                      WHERE id != ?4
+                        AND project_path = ?1 AND category = ?2 AND normalized_hash = ?3",
+                )?;
+                let mut memory_adopt_by_id = tx.prepare(
                     "UPDATE mc_memories
-                        SET project_path=?1, category=?2, content=?3, normalized_hash=?4,
+                        SET project_path=?1, category=?2,
+                            content=CASE WHEN ?27 != 0 OR ?14 >= updated_at THEN ?3 ELSE content END,
+                            normalized_hash=?4,
                             importance=?5, scope=?6, shareable=?7, source_session_id=?8,
                             source_type=?9, seen_count=?10, retrieval_count=?11,
-                            first_seen_at=?12, created_at=?13, updated_at=?14, last_seen_at=?15,
-                            last_retrieved_at=?16, status=?17, expires_at=?18,
+                            first_seen_at=?12, created_at=?13, updated_at=MAX(updated_at, ?14),
+                            last_seen_at=?15, last_retrieved_at=?16, status=?17, expires_at=?18,
                             verification_status=?19,
                             verified_at=CASE
                                 WHEN verified_at IS NULL THEN ?20
@@ -12606,8 +12797,7 @@ impl McStore {
                             END,
                             superseded_by_memory_id=?22, merged_from=?23, metadata_json=?24,
                             context_store_uuid=?25, context_row_id=?26
-                      WHERE project_path=?1 AND category=?2 AND normalized_hash=?4
-                        AND NOT (context_store_uuid IS ?25 AND context_row_id IS ?26)",
+                      WHERE id=?28",
                 )?;
                 let mut memory_upsert = tx.prepare(
                     "INSERT INTO mc_memories
@@ -12665,9 +12855,8 @@ impl McStore {
                          mapped_files_json = excluded.mapped_files_json,
                          updated_at = excluded.updated_at",
                 )?;
-                let mut mapping_delete = tx.prepare(
-                    "DELETE FROM mc_memory_mappings WHERE memory_id = ?1",
-                )?;
+                let mut mapping_delete =
+                    tx.prepare("DELETE FROM mc_memory_mappings WHERE memory_id = ?1")?;
                 let mut seed_row_upsert = tx.prepare(
                     "INSERT INTO mc_authority_seed_rows(
                          context_store_uuid, project, domain, source_row_id, snapshot_json
@@ -12675,14 +12864,21 @@ impl McStore {
                      ON CONFLICT(context_store_uuid, project, domain, source_row_id)
                      DO UPDATE SET snapshot_json = excluded.snapshot_json",
                 )?;
-                let mut module_row_ids = Vec::with_capacity(rows.len());
+                let mut module_row_id_by_survivor = HashMap::new();
 
-                for ((source_row_id, snapshot_json, mapping_json), row) in prepared.iter().zip(rows) {
+                for (index, row) in rows.iter().enumerate() {
+                    if survivor_index_for_row[index] != index {
+                        continue;
+                    }
+                    let prepared_row = &prepared[index];
                     let object = row.snapshot.as_object().expect("validated memory seed object");
                     let text = |name: &str| object.get(name).and_then(Value::as_str);
                     let integer = |name: &str| object.get(name).and_then(Value::as_i64);
                     let target_source_row_id = integer("superseded_by_memory_id");
-                    let superseded_by_memory_id = match target_source_row_id {
+                    let canonical_target_source_row_id = target_source_row_id.map(|target| {
+                        source_aliases.get(&target).copied().unwrap_or(target)
+                    });
+                    let superseded_by_memory_id = match canonical_target_source_row_id {
                         Some(target) => memory_by_source
                             .query_row(params![context_store_uuid, project, target], |row| {
                                 row.get::<_, i64>(0)
@@ -12690,40 +12886,58 @@ impl McStore {
                             .optional()?,
                         None => None,
                     };
-                    let adopted = memory_adopt.execute(params![
-                        project,
-                        text("category").unwrap_or_default(),
-                        text("content").unwrap_or_default(),
-                        text("normalized_hash").unwrap_or_default(),
-                        integer("importance"),
-                        text("scope").unwrap_or("project"),
-                        integer("shareable").unwrap_or(0),
-                        text("source_session_id"),
-                        text("source_type").unwrap_or("historian"),
-                        integer("seen_count").unwrap_or(1),
-                        integer("retrieval_count").unwrap_or(0),
-                        integer("first_seen_at").unwrap_or(0),
-                        integer("created_at").unwrap_or(0),
-                        integer("updated_at").unwrap_or(0),
-                        integer("last_seen_at").unwrap_or(0),
-                        integer("last_retrieved_at"),
-                        text("status").unwrap_or("active"),
-                        integer("expires_at"),
-                        text("verification_status").unwrap_or("unverified"),
-                        integer("verified_at"),
-                        integer("classified_at"),
-                        superseded_by_memory_id,
-                        text("merged_from"),
-                        text("metadata_json"),
-                        context_store_uuid,
-                        source_row_id,
-                    ])?;
-                    if adopted == 0 {
-                        memory_upsert.execute(params![
+                    let existing_identity = memory_by_identity
+                        .query_row(params![context_store_uuid, prepared_row.source_row_id], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        })
+                        .optional()?;
+                    let natural_candidate = memory_by_natural_key
+                        .query_row(
+                            params![project, &prepared_row.category, &prepared_row.normalized_hash],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()?;
+                    let selected_id = existing_identity
+                        .as_ref()
+                        .map(|existing| existing.0)
+                        .or(natural_candidate);
+
+                    if let Some(selected_id) = selected_id {
+                        memory_merge_into_survivor.execute(params![
                             project,
-                            text("category").unwrap_or_default(),
+                            &prepared_row.category,
+                            &prepared_row.normalized_hash,
+                            selected_id,
+                        ])?;
+                        mapping_delete_twins.execute(params![
+                            project,
+                            &prepared_row.category,
+                            &prepared_row.normalized_hash,
+                            selected_id,
+                        ])?;
+                        memory_delete_twins.execute(params![
+                            project,
+                            &prepared_row.category,
+                            &prepared_row.normalized_hash,
+                            selected_id,
+                        ])?;
+                        let force_incoming_content = existing_identity
+                            .as_ref()
+                            .is_some_and(|existing| {
+                                existing.1 != project
+                                    || existing.2 != prepared_row.category
+                                    || existing.3 != prepared_row.normalized_hash
+                            });
+                        memory_adopt_by_id.execute(params![
+                            project,
+                            &prepared_row.category,
                             text("content").unwrap_or_default(),
-                            text("normalized_hash").unwrap_or_default(),
+                            &prepared_row.normalized_hash,
                             integer("importance"),
                             text("scope").unwrap_or("project"),
                             integer("shareable").unwrap_or(0),
@@ -12745,24 +12959,62 @@ impl McStore {
                             text("merged_from"),
                             text("metadata_json"),
                             context_store_uuid,
-                            source_row_id,
+                            prepared_row.source_row_id,
+                            i64::from(force_incoming_content),
+                            selected_id,
+                        ])?;
+                    } else {
+                        memory_upsert.execute(params![
+                            project,
+                            &prepared_row.category,
+                            text("content").unwrap_or_default(),
+                            &prepared_row.normalized_hash,
+                            integer("importance"),
+                            text("scope").unwrap_or("project"),
+                            integer("shareable").unwrap_or(0),
+                            text("source_session_id"),
+                            text("source_type").unwrap_or("historian"),
+                            integer("seen_count").unwrap_or(1),
+                            integer("retrieval_count").unwrap_or(0),
+                            integer("first_seen_at").unwrap_or(0),
+                            integer("created_at").unwrap_or(0),
+                            integer("updated_at").unwrap_or(0),
+                            integer("last_seen_at").unwrap_or(0),
+                            integer("last_retrieved_at"),
+                            text("status").unwrap_or("active"),
+                            integer("expires_at"),
+                            text("verification_status").unwrap_or("unverified"),
+                            integer("verified_at"),
+                            integer("classified_at"),
+                            superseded_by_memory_id,
+                            text("merged_from"),
+                            text("metadata_json"),
+                            context_store_uuid,
+                            prepared_row.source_row_id,
                         ])?;
                     }
+
                     let module_row_id: i64 = memory_by_source.query_row(
-                        params![context_store_uuid, project, source_row_id],
+                        params![context_store_uuid, project, prepared_row.source_row_id],
                         |row| row.get(0),
                     )?;
-                    if let (Some(target), None) = (target_source_row_id, superseded_by_memory_id) {
+                    if let (Some(target), None) =
+                        (canonical_target_source_row_id, superseded_by_memory_id)
+                    {
                         pending_upsert.execute(params![
                             context_store_uuid,
                             project,
-                            source_row_id,
+                            prepared_row.source_row_id,
                             target,
                         ])?;
                     } else {
-                        pending_delete.execute(params![context_store_uuid, project, source_row_id])?;
+                        pending_delete.execute(params![
+                            context_store_uuid,
+                            project,
+                            prepared_row.source_row_id
+                        ])?;
                     }
-                    if let Some(mapped_files_json) = mapping_json {
+                    if let Some(mapped_files_json) = &prepared_row.mapping_json {
                         mapping_upsert.execute(params![
                             module_row_id,
                             project,
@@ -12772,16 +13024,54 @@ impl McStore {
                     } else {
                         mapping_delete.execute(params![module_row_id])?;
                     }
+                    module_row_id_by_survivor.insert(index, module_row_id);
+                }
+
+                // Keep the digest source complete even though duplicate natural keys share one
+                // physical module row. Pending target references use the same aliases so a
+                // reference to either context row resolves to the survivor.
+                for prepared_row in &prepared {
                     seed_row_upsert.execute(params![
                         context_store_uuid,
                         project,
-                        source_row_id,
-                        snapshot_json,
+                        prepared_row.source_row_id,
+                        &prepared_row.snapshot_json,
                     ])?;
-                    module_row_ids.push(module_row_id);
                 }
+                for (source_row_id, survivor_source_row_id) in &source_aliases {
+                    if source_row_id == survivor_source_row_id {
+                        continue;
+                    }
+                    tx.execute(
+                        "UPDATE mc_authority_pending_memory_references
+                            SET target_context_row_id = ?1
+                          WHERE context_store_uuid = ?2 AND project = ?3 AND domain = 'memories'
+                            AND target_context_row_id = ?4",
+                        params![
+                            survivor_source_row_id,
+                            context_store_uuid,
+                            project,
+                            source_row_id
+                        ],
+                    )?;
+                    pending_delete.execute(params![context_store_uuid, project, source_row_id])?;
+                }
+
+                let module_row_ids = survivor_index_for_row
+                    .iter()
+                    .map(|survivor_index| {
+                        *module_row_id_by_survivor
+                            .get(survivor_index)
+                            .expect("every natural-key survivor was seeded")
+                    })
+                    .collect::<Vec<_>>();
                 drop((
-                    memory_adopt,
+                    memory_by_identity,
+                    memory_by_natural_key,
+                    memory_merge_into_survivor,
+                    mapping_delete_twins,
+                    memory_delete_twins,
+                    memory_adopt_by_id,
                     memory_upsert,
                     memory_by_source,
                     pending_upsert,
@@ -16381,10 +16671,303 @@ mod tests {
     }
 
     #[test]
+    fn migration_45_merges_three_stale_generations_without_a_current_row() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE mc_authority_route_bindings (
+                 route_project_root TEXT PRIMARY KEY,
+                 context_store_uuid TEXT NOT NULL,
+                 project TEXT NOT NULL
+             );
+             CREATE TABLE mc_memories (
+                 id INTEGER PRIMARY KEY,
+                 project_path TEXT NOT NULL,
+                 category TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 normalized_hash TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 verified_at INTEGER,
+                 classified_at INTEGER,
+                 context_store_uuid TEXT,
+                 context_row_id INTEGER
+             );
+             INSERT INTO mc_authority_route_bindings
+                 (route_project_root, context_store_uuid, project)
+             VALUES ('/repo', 'current-store', 'git:project');
+             INSERT INTO mc_memories
+                 (id, project_path, category, content, normalized_hash, updated_at,
+                  verified_at, classified_at, context_store_uuid, context_row_id)
+             VALUES
+                 (1, 'git:project', 'CONSTRAINTS', 'old generation', 'same-hash', 10,
+                  90, NULL, 'old-store-a', 101),
+                 (2, 'git:project', 'CONSTRAINTS', 'new generation', 'same-hash', 30,
+                  NULL, 70, 'old-store-b', 202),
+                 (3, 'git:project', 'CONSTRAINTS', 'newest id wins tie', 'same-hash', 30,
+                  80, 60, '', NULL);",
+        )
+        .unwrap();
+
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 45)
+            .unwrap();
+        conn.execute_batch(migration.statements).unwrap();
+
+        let survivor = conn
+            .query_row(
+                "SELECT id, content, updated_at, verified_at, classified_at,
+                        context_store_uuid, context_row_id
+                   FROM mc_memories",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            survivor,
+            (
+                3,
+                "newest id wins tie".to_string(),
+                30,
+                Some(90),
+                Some(70),
+                Some(String::new()),
+                None,
+            )
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM mc_memories", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    fn rebuild_mc_memories_without_natural_unique(path: &std::path::Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mc_memories'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let replacement = table_sql.replace(
+            ",\n            UNIQUE(project_path, category, normalized_hash)",
+            "",
+        );
+        assert_ne!(
+            replacement, table_sql,
+            "fixture must remove the natural-key UNIQUE"
+        );
+        let schema_objects = conn
+            .prepare(
+                "SELECT sql FROM sqlite_master
+                  WHERE tbl_name = 'mc_memories'
+                    AND type IN ('index', 'trigger')
+                    AND sql IS NOT NULL
+                  ORDER BY type, name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")
+            .unwrap();
+        conn.execute_batch("ALTER TABLE mc_memories RENAME TO mc_memories_with_natural_unique;")
+            .unwrap();
+        conn.execute_batch(&replacement).unwrap();
+        conn.execute_batch(
+            "INSERT INTO mc_memories SELECT * FROM mc_memories_with_natural_unique;
+             DROP TABLE mc_memories_with_natural_unique;",
+        )
+        .unwrap();
+        for schema_sql in schema_objects {
+            conn.execute_batch(&schema_sql).unwrap();
+        }
+        conn.execute_batch("COMMIT; PRAGMA foreign_keys = ON;")
+            .unwrap();
+    }
+
+    #[test]
+    fn authority_seed_adopts_one_all_stale_twin_and_coalesces_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial = McStore::open(&descriptor(dir.path())).unwrap();
+        drop(initial);
+        rebuild_mc_memories_without_natural_unique(&dir.path().join("store.db"));
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute_batch(
+                    "INSERT INTO mc_memories
+                         (id, project_path, category, content, normalized_hash, importance,
+                          status, first_seen_at, created_at, updated_at, last_seen_at,
+                          verification_status, verified_at, classified_at,
+                          context_store_uuid, context_row_id)
+                     VALUES
+                         (700, 'git:project', 'CONSTRAINTS', 'older stale', 'same-hash', 10,
+                          'active', 1, 2, 500, 3, 'verified', 900, NULL,
+                          'stale-store-a', 9),
+                         (701, 'git:project', 'CONSTRAINTS', 'newer stale', 'same-hash', 20,
+                          'active', 1, 2, 700, 3, 'verified', NULL, 1000,
+                          'stale-store-b', 10);",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let incoming = AuthoritySeedRow {
+            source_row_id: 42,
+            snapshot: serde_json::json!({
+                "id": 42,
+                "project_path": "git:project",
+                "category": "CONSTRAINTS",
+                "content": "restored content",
+                "normalized_hash": "same-hash",
+                "importance": 80,
+                "first_seen_at": 10,
+                "created_at": 20,
+                "updated_at": 800,
+                "last_seen_at": 30,
+                "status": "active",
+                "verification_status": "verified",
+                "verified_at": 700,
+                "classified_at": 600
+            }),
+        };
+
+        let ids = store
+            .seed_authority_rows(
+                "current-store",
+                "git:project",
+                "memories",
+                std::slice::from_ref(&incoming),
+            )
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![701],
+            "newest stale row is adopted deterministically"
+        );
+        let adopted = store.get_memory_full(701).unwrap().unwrap();
+        assert_eq!(adopted.content, "restored content");
+        assert_eq!(adopted.updated_at, 800);
+        assert_eq!(adopted.verified_at, Some(900));
+        assert_eq!(adopted.classified_at, Some(1000));
+        assert_eq!(adopted.context_store_uuid.as_deref(), Some("current-store"));
+        assert_eq!(adopted.context_row_id, Some(42));
+        let remaining = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_memories
+                      WHERE project_path = 'git:project'
+                        AND category = 'CONSTRAINTS'
+                        AND normalized_hash = 'same-hash'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(remaining, 1);
+    }
+
+    #[test]
+    fn authority_seed_same_batch_natural_duplicates_alias_to_the_last_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let rows = [
+            AuthoritySeedRow {
+                source_row_id: 100,
+                snapshot: serde_json::json!({
+                    "id": 100,
+                    "project_path": "git:project",
+                    "category": "CONSTRAINTS",
+                    "content": "first snapshot",
+                    "normalized_hash": "same-hash",
+                    "updated_at": 100,
+                    "status": "active"
+                }),
+            },
+            AuthoritySeedRow {
+                source_row_id: 200,
+                snapshot: serde_json::json!({
+                    "id": 200,
+                    "project_path": "git:project",
+                    "category": "CONSTRAINTS",
+                    "content": "last snapshot",
+                    "normalized_hash": "same-hash",
+                    "updated_at": 200,
+                    "status": "active"
+                }),
+            },
+            AuthoritySeedRow {
+                source_row_id: 300,
+                snapshot: serde_json::json!({
+                    "id": 300,
+                    "project_path": "git:project",
+                    "category": "ARCHITECTURE",
+                    "content": "references the first alias",
+                    "normalized_hash": "other-hash",
+                    "updated_at": 300,
+                    "status": "active",
+                    "superseded_by_memory_id": 100
+                }),
+            },
+        ];
+
+        let ids = store
+            .seed_authority_rows("current-store", "git:project", "memories", &rows)
+            .unwrap();
+        assert_eq!(
+            ids[0], ids[1],
+            "both source ids alias the surviving module row"
+        );
+        assert_ne!(ids[1], ids[2]);
+        let survivor = store.get_memory_full(ids[1]).unwrap().unwrap();
+        assert_eq!(survivor.content, "last snapshot");
+        assert_eq!(survivor.context_row_id, Some(200));
+        assert_eq!(
+            store
+                .get_memory_full(ids[2])
+                .unwrap()
+                .unwrap()
+                .superseded_by_memory_id,
+            Some(ids[1]),
+            "pending references through either source alias resolve to the survivor"
+        );
+        let count = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_memories
+                      WHERE project_path = 'git:project'
+                        AND category = 'CONSTRAINTS'
+                        AND normalized_hash = 'same-hash'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=44).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=45).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -19776,7 +20359,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=44).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=45).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)

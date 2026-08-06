@@ -515,6 +515,37 @@ describe("memory authority protocol", () => {
         expect(Math.max(...seedCalls.bytes)).toBeLessThan(1024 * 1024);
     });
 
+    test("records the last source row when a seed frame coalesces duplicate module ids", async () => {
+        const database = db();
+        const module = protocol({ bytes: [] });
+        module.authoritySeed = async () => ({ seeded: 2, module_row_ids: [900, 900] });
+
+        await prepareAuthority({
+            db: database,
+            projectPath: "/repo",
+            domains: ["memories"],
+            module,
+            seedPages: async () => [
+                {
+                    source_row_id: 100,
+                    snapshot: { id: 100, project_path: "/repo", normalized_hash: "same" },
+                },
+                {
+                    source_row_id: 200,
+                    snapshot: { id: 200, project_path: "/repo", normalized_hash: "same" },
+                },
+            ],
+        });
+
+        expect(
+            database
+                .prepare(
+                    "SELECT context_row_id FROM mirror_identity WHERE domain = 'memories' AND module_project = '/repo' AND module_row_id = 900",
+                )
+                .get(),
+        ).toEqual({ context_row_id: 200 });
+    });
+
     test("module checksum mismatch aborts, removes the marker, and restores TS writes", async () => {
         const database = db();
         const seedCalls = { bytes: [] as number[] };
