@@ -274,7 +274,7 @@ All three agents (`historian`, `dreamer`, `sidekick`) accept these additional fi
 | `mode` | `"subagent"` \| `"primary"` \| `"all"` | OpenCode agent mode. Magic Context internal agents run as `subagent`. |
 | `top_p` | `number` (0–1) | Nucleus sampling. |
 | `maxSteps` | `number` | Max reasoning steps per agent call. |
-| `maxTokens` | `number` | Max output tokens. ⚠️ OpenCode does not currently consume this field for plugin-registered agents — setting it has no effect. Tracked in the project as a known limitation. |
+| `maxTokens` | `number` | Max output tokens. For reasoning-heavy historian models, reserve enough output budget for the complete compartment structure after reasoning. |
 | `color` | `string` (`#RRGGBB`) | Display color in OpenCode UI. |
 
 Example — restricting historian to read-only tools and denying bash:
@@ -351,6 +351,8 @@ Configures the background historian agent that compresses session history into c
 | `thinking_level` | `string` | **Pi only.** Explicit reasoning level passed to Pi when spawning the historian subagent (`off`, `low`, `medium`, `high`). Required for GitHub Copilot reasoning models on Pi — without it, Copilot injects `"minimal"` as a default and then rejects it (HTTP 400). The Pi setup wizard prompts for this when you pick a `github-copilot/*` model. |
 | `prompt` | `string` | Custom system prompt override. |
 | `two_pass` | `boolean` | Default `false`. When `true`, runs a second editor pass after each successful historian output. The editor (a separate hidden `historian-editor` agent using the same model resolution as the historian) re-reads the draft and removes low-signal `U:` lines, redundant paraphrases, and cross-compartment duplicates, producing cleaner narrative-first summaries. Falls back to the draft if the editor call or its validation fails, so it can never regress behavior. Adds one extra historian-scale call per compartment publication. Recommended for non-reasoning models and open-weight local models where the single-pass draft is noisier. For models with extended thinking/reasoning enabled in OpenCode (Claude 4+, GPT-5.x reasoning variants), the single-pass output is usually already clean and `two_pass` can stay `false`. |
+
+> **Reasoning-heavy models:** Route `historian.model` to a low- or no-reasoning lane/variant. Reasoning can consume the entire output budget before the model emits compartment text. Set `historian.maxTokens` high enough to leave room for the complete compartment structure.
 
 ---
 

@@ -4,16 +4,23 @@ import { HISTORIAN_AGENT, HISTORIAN_EDITOR_AGENT } from "../../agents/historian"
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
 import { openDatabase } from "../../features/magic-context/storage";
 import type { SubagentKind } from "../../features/magic-context/storage-subagent-invocations";
-import { recordChildInvocation } from "../../features/magic-context/subagent-token-capture";
+import {
+    recordChildInvocation,
+    sumTokensFromChildMessages,
+} from "../../features/magic-context/subagent-token-capture";
 import type { PluginContext } from "../../plugin/types";
 import * as shared from "../../shared";
-import { extractLatestAssistantText } from "../../shared/assistant-message-extractor";
+import {
+    extractLatestAssistantText,
+    hasLengthCappedOutput,
+} from "../../shared/assistant-message-extractor";
 import {
     ensureCortexKitArtifactGitignore,
     getProjectMagicContextHistorianDir,
 } from "../../shared/data-path";
 import { describeError, getErrorMessage } from "../../shared/error-message";
 import { shouldKeepSubagents } from "../../shared/keep-subagents";
+import { isRecord } from "../../shared/record-type-guard";
 import type { Database } from "../../shared/sqlite";
 import { createChildSessionWithFence } from "./child-session-spawn";
 import { buildHistorianEditorPrompt } from "./compartment-prompt";
@@ -43,6 +50,50 @@ const MAX_HISTORIAN_RETRIES = 2;
 interface HistorianModelOverride {
     providerID: string;
     modelID: string;
+}
+
+const HISTORIAN_REASONING_PART_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
+
+/**
+ * Read reasoning only for the historian after the normal text extractor found no text.
+ * Historian output still passes the compartment parser and validator before publication;
+ * shared extractors remain text-only so fail-closed dreamer manifest parsers never accept
+ * a model's private reasoning as normal task output.
+ */
+function extractLatestHistorianReasoning(messages: unknown): string | null {
+    if (!Array.isArray(messages)) return null;
+
+    const latest = messages
+        .filter(
+            (message): message is Record<string, unknown> =>
+                isRecord(message) && isRecord(message.info) && message.info.role === "assistant",
+        )
+        .sort(
+            (left, right) => historianMessageCreatedAt(right) - historianMessageCreatedAt(left),
+        )[0];
+    if (!latest || !Array.isArray(latest.parts)) return null;
+
+    return (
+        latest.parts
+            .filter(isHistorianReasoningPart)
+            .map((part) => part.text)
+            .join("\n") || null
+    );
+}
+
+function isHistorianReasoningPart(part: unknown): part is { type: string; text: string } {
+    return (
+        isRecord(part) &&
+        typeof part.type === "string" &&
+        HISTORIAN_REASONING_PART_TYPES.has(part.type) &&
+        typeof part.text === "string" &&
+        part.text.length > 0
+    );
+}
+
+function historianMessageCreatedAt(message: Record<string, unknown>): number {
+    if (!isRecord(message.info) || !isRecord(message.info.time)) return 0;
+    return typeof message.info.time.created === "number" ? message.info.time.created : 0;
 }
 
 export async function runValidatedHistorianPass(args: {
@@ -403,7 +454,19 @@ async function runHistorianPrompt(args: {
             preferResponseOnMissingData: true,
         });
         const invocationId = recordInvocation({ status: "completed", messages });
-        const result = extractLatestAssistantText(messages);
+        const lengthCapped = hasLengthCappedOutput(messages);
+        const textResult = extractLatestAssistantText(messages);
+        const reasoningResult = textResult ? null : extractLatestHistorianReasoning(messages);
+        if (!textResult && reasoningResult && lengthCapped) {
+            const outputTokens = sumTokensFromChildMessages(messages).output;
+            return {
+                ok: false,
+                error: `historian output length-capped at ${outputTokens} tokens (all reasoning, no text) — set historian.maxTokens or route historian.model to a low-reasoning lane/variant`,
+                invocationId: invocationId ?? undefined,
+            };
+        }
+
+        const result = textResult ?? reasoningResult;
         if (!result) {
             return {
                 ok: false,
