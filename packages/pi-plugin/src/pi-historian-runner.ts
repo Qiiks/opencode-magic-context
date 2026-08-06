@@ -373,6 +373,8 @@ export interface PiHistorianDeps {
 	thinkingLevel?: string;
 	/** Cross-session memory feature gate (`memory.enabled`). */
 	memoryEnabled?: boolean;
+	/** Allow a session started exactly in the canonical home directory only when user-level configuration enables it. */
+	allowHomeProject?: boolean;
 	/** Automatic-promotion gate (`memory.auto_promote`). */
 	autoPromote?: boolean;
 	/** User-memory feature gate (`dreamer.user_memories.enabled`). Gates whether
@@ -426,6 +428,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 		twoPass,
 		thinkingLevel,
 		memoryEnabled,
+		allowHomeProject,
 		autoPromote,
 		userMemoriesEnabled,
 		onPublished,
@@ -669,7 +672,10 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			// memory block so historian can dedup new facts against existing
 			// project memories. Cross-harness coherence comes free here —
 			// memories written by OpenCode show up in this Pi historian run.
-			const projectPath = resolveProjectIdentityForSession(directory);
+			const projectPath = resolveProjectIdentityForSession(
+				directory,
+				allowHomeProject,
+			);
 			if (!projectPath) {
 				rollbackDrainReservation();
 				return;

@@ -111,7 +111,8 @@ export function createToolRegistry(args: {
     // OpenCode's top-level `ctx.directory` reflects the launch dir, not the
     // session's actual working directory (e.g. when launched via
     // `opencode -s <id>` from outside the project).
-    const resolveProjectPath = (directory: string) => resolveProjectIdentityForSession(directory);
+    const resolveProjectPath = (directory: string) =>
+        resolveProjectIdentityForSession(directory, pluginConfig.allow_home_project);
 
     // When memory is off the <project-memory> block is never injected, so an
     // agent's memory writes would never resurface. Omit ctx_memory entirely

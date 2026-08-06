@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -23,9 +24,30 @@ afterEach(() => {
 });
 
 describe("resolveProjectIdentity directory fallback", () => {
-    test("does not bind the exact canonical home directory", () => {
+    test("refuses the exact canonical home directory unless the user opts in", () => {
         expect(resolveProjectIdentityForSession(homedir())).toBeUndefined();
         expect(resolveProjectIdentityForSession(join(homedir(), "a-project"))).not.toBeUndefined();
+    });
+
+    test("uses the canonical home directory's stable dir identity when opted in", () => {
+        const canonicalHome = realpathSync.native(homedir());
+        const expected = `dir:${createHash("md5").update(canonicalHome, "utf8").digest("hex").slice(0, 12)}`;
+
+        expect(resolveProjectIdentityForSession(homedir(), true)).toBe(expected);
+    });
+
+    test("never lets a home identity match a contained directory", () => {
+        const contained = mkdtempSync(join(homedir(), "mc-home-identity-"));
+        try {
+            const homeIdentity = resolveProjectIdentityForSession(homedir(), true);
+            const containedIdentity = resolveProjectIdentityForSession(contained, true);
+
+            expect(homeIdentity).toBeDefined();
+            expect(containedIdentity).toBeDefined();
+            expect(containedIdentity).not.toBe(homeIdentity);
+        } finally {
+            rmSync(contained, { recursive: true, force: true });
+        }
     });
     test("flips dir: fallback to git: once a repo gains its first commit (no stale cache)", () => {
         const dir = tempDir();

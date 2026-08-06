@@ -52,6 +52,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { openDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { setHarness } from "@magic-context/core/shared/harness";
@@ -102,6 +103,8 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 			registerMagicContextTools(pi, {
 				db,
 				ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
+				resolveProjectIdentity: (ctx) =>
+					resolveProjectIdentityForSession(ctx.cwd, cfg.allow_home_project),
 				// Sidekick is retrieval-only and consumes untrusted /ctx-aug prompt text,
 				// so only dreamer subagents register ctx_memory in child processes.
 				memoryToolEnabled: dreamerActionsEnabled,

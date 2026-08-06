@@ -410,6 +410,8 @@ export interface ExperimentalConfig {
 
 export interface MagicContextConfig {
     enabled: boolean;
+    /** User-level setting that lets a session started exactly in the canonical home directory use a deterministic directory identity. */
+    allow_home_project: boolean;
     experimental: ExperimentalConfig;
     /** Selects the runtime implementation for this project. Rust mode is experimental and requires user-level subc configuration. */
     transform_mode: "ts" | "rust";
@@ -567,6 +569,12 @@ export interface MagicContextConfig {
 export const MagicContextConfigSchema = z
     .object({
         enabled: z.boolean().default(true).describe("Enable magic context (default: true)"),
+        allow_home_project: z
+            .boolean()
+            .default(false)
+            .describe(
+                "Allow Magic Context sessions launched from the exact canonical home directory. The home session uses its deterministic dir: identity so pre-gate memories reconnect. USER-LEVEL ONLY: project config is ignored. The home identity is excluded from registry seed exports, never resolves descendants by containment, and cannot join a workspace.",
+            ),
         experimental: z
             .object({
                 mural: z

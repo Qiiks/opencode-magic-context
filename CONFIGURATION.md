@@ -97,6 +97,7 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | `boolean` | `true` | Master toggle. |
+| `allow_home_project` | `boolean` | `false` | User-config-only opt-in for a Magic Context session launched from exactly `$HOME`. See below. |
 | `auto_update` | `boolean` | `true` | User-config-only plugin self-update toggle; project configs cannot disable it. |
 | `fail_closed_blocking` | `boolean` | `true` | User-config-only. When Magic Context cannot operate (schema fence mismatch, storage open/migration failure), block the primary-session prompt with a loud recovery error instead of silently degrading to native compaction. Set `false` only to restore the old degrade-silently behavior (not recommended). Project configs cannot set this. |
 | `language` | `string` | unset | User-config-only output language for Magic Context generated prose and primary guidance, as a 2-letter ISO 639-1 code, for example `"tr"`, `"es"`, or `"pt"`. Structural tokens stay in English. |
@@ -140,6 +141,22 @@ Set `language` in your **user config** when you want Magic Context generated pro
 This affects historian summaries, dreamer content, sidekick output, and the Magic Context guidance block. It does not translate schemas, XML tags, memory category names, code identifiers, file paths, commands, logs, or quoted text. Project configs cannot set this field for security, since it is injected into hidden-agent system prompts.
 
 Changing `language` does not rewrite existing compartments or memories. A project can temporarily have a mixed-language pool after a mid-project switch; older stored entries keep their original language until they are naturally rewritten or superseded.
+
+### `allow_home_project`
+
+Set this in **user config only** to keep Magic Context memory for global troubleshooting or chat sessions that intentionally run from exactly your home directory:
+
+```jsonc
+{
+  "allow_home_project": true
+}
+```
+
+The default is `false`, so a home-directory session continues to run without a Magic Context project identity. Project-level config cannot enable this setting.
+
+The opt-in is deliberately narrow: Magic Context uses the deterministic `dir:<md5-12>` identity for the **canonical** `$HOME` path, and only an exact `$HOME` session can use it. A directory below `$HOME` always resolves as its own project; it never resolves into the home project by containment. The home identity is excluded from project-registry seed exports and cannot be added to a workspace, so it cannot turn a broad home directory into a fleet registry seed or a workspace-wide memory pool.
+
+This is also the recovery path for home memories created before the home-session gate: the identity is derived from the same canonical-path MD5 prefix, so setting the flag reconnects that existing `dir:` memory pool without a migration. If you leave the flag off after setup has disabled OpenCode native compaction (`compaction.auto=false`), home sessions have no context manager; either enable this flag or re-enable native compaction for those sessions.
 
 ### `commit_cluster_trigger`
 

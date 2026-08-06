@@ -125,6 +125,8 @@ export interface MagicContextDeps {
     liveSessionState?: LiveSessionState;
     config: {
         protected_tags: number;
+        /** User-level setting that lets a session started exactly in the canonical home directory use it as the project. */
+        allow_home_project?: boolean;
         language?: string;
         smart_drops?: boolean;
         toast_duration_ms?: number;
@@ -257,9 +259,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         return null;
     }
 
-    const projectPath = resolveProjectIdentityForSession(deps.directory);
+    const projectPath = resolveProjectIdentityForSession(
+        deps.directory,
+        deps.config.allow_home_project,
+    );
     if (!projectPath) {
-        log("[magic-context] not binding a project identity for the user's home directory");
+        log("[magic-context] not binding a project identity for this directory");
         clearHookInitFailure();
         recordHookInitFailure({ type: "no_project" });
         return null;
@@ -495,7 +500,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             return "Embedding is already running for this session.";
         }
         await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
-        const sessionProjectIdentity = resolveProjectIdentityForSession(directory);
+        const sessionProjectIdentity = resolveProjectIdentityForSession(
+            directory,
+            deps.config.allow_home_project,
+        );
         if (!sessionProjectIdentity) return "No project identity is bound for the home directory.";
         maybeSendProjectIdentitySessionWarning(sessionId, directory);
         embedPauseBySession.delete(sessionId);
@@ -588,7 +596,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         const ctrl = embedRunStateBySession.get(sessionId);
         if (ctrl) ctrl.abort();
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
-        const sessionProjectIdentity = resolveProjectIdentityForSession(directory);
+        const sessionProjectIdentity = resolveProjectIdentityForSession(
+            directory,
+            deps.config.allow_home_project,
+        );
         if (!sessionProjectIdentity) return "No project identity is bound for the home directory.";
         maybeSendProjectIdentitySessionWarning(sessionId, directory);
         const cov = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
@@ -597,7 +608,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const getEmbedStatusText = (sessionId: string): string => {
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
-        const sessionProjectIdentity = resolveProjectIdentityForSession(directory);
+        const sessionProjectIdentity = resolveProjectIdentityForSession(
+            directory,
+            deps.config.allow_home_project,
+        );
         if (!sessionProjectIdentity) return "No project identity is bound for the home directory.";
         maybeSendProjectIdentitySessionWarning(sessionId, directory);
         const coverage = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
@@ -626,7 +640,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 // transform return first, keeping the hot path clean.
                 await new Promise((resolve) => setTimeout(resolve, 0));
                 await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
-                const sessionProjectIdentity = resolveProjectIdentityForSession(directory);
+                const sessionProjectIdentity = resolveProjectIdentityForSession(
+                    directory,
+                    deps.config.allow_home_project,
+                );
                 if (!sessionProjectIdentity) return;
                 maybeSendProjectIdentitySessionWarning(sessionId, directory);
                 const coverage = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
@@ -904,6 +921,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         internalChildSessions,
         client: deps.client,
         directory: deps.directory,
+        allowHomeProject: deps.config.allow_home_project,
         injectDocs: deps.config.dreamer?.inject_docs !== false,
         memoryConfig: deps.config.memory
             ? {

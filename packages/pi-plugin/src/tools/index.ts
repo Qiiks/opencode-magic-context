@@ -31,6 +31,8 @@ export interface RegisterToolsOptions {
 	memoryEnabled?: boolean;
 	embeddingEnabled?: boolean;
 	gitCommitsEnabled?: boolean;
+	/** Resolve the current directory's project identity using the user-level home-project setting. */
+	resolveProjectIdentity?: (ctx: { cwd: string }) => string | undefined;
 	/** When true, ctx_memory exposes dreamer-only actions (update, merge, archive).
 	 *  Set by the subagent extension entry when the parent passes
 	 *  `--magic-context-dreamer-actions`. The main extension entry
@@ -68,6 +70,10 @@ export function registerMagicContextTools(
 	pi: ExtensionAPI,
 	opts: RegisterToolsOptions,
 ): void {
+	const resolveProjectIdentity = opts.resolveProjectIdentity
+		? (directory: string) => opts.resolveProjectIdentity?.({ cwd: directory })
+		: undefined;
+
 	pi.registerTool(
 		createCtxSearchTool({
 			db: opts.db,
@@ -75,6 +81,7 @@ export function registerMagicContextTools(
 			memoryEnabled: opts.memoryEnabled,
 			embeddingEnabled: opts.embeddingEnabled,
 			gitCommitsEnabled: opts.gitCommitsEnabled,
+			resolveProjectIdentity,
 		}),
 	);
 
@@ -86,6 +93,7 @@ export function registerMagicContextTools(
 				memoryEnabled: opts.memoryEnabled,
 				embeddingEnabled: opts.embeddingEnabled,
 				allowDreamerActions: opts.allowDreamerActions ?? false,
+				resolveProjectIdentity,
 			}),
 		);
 	}
@@ -101,6 +109,7 @@ export function registerMagicContextTools(
 				db: opts.db,
 				dreamerEnabled: opts.dreamerEnabled ?? false,
 				resolveDreamerEnabled: opts.resolveDreamerEnabled,
+				resolveProjectIdentity,
 			}),
 		);
 

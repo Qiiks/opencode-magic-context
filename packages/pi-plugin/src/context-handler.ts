@@ -893,6 +893,8 @@ export interface PiHistorianOptions {
 	thinkingLevel?: string;
 	/** Cross-session memory feature gate (`memory.enabled`). */
 	memoryEnabled?: boolean;
+	/** Allow a session started exactly in the canonical home directory only when user-level configuration enables it. */
+	allowHomeProject?: boolean;
 	/** Automatic-promotion gate (`memory.auto_promote`). */
 	autoPromote?: boolean;
 	/** User-memory feature gate (`dreamer.user_memories.enabled`). Gates whether
@@ -1038,6 +1040,8 @@ export interface PiContextHandlerOptions {
 	resolveForProject?: (projectDir: string) => PiContextHandlerOptions;
 	/** Boot-resolved compaction-off flag. It remains fixed for this Pi process. */
 	compactionOff?: boolean;
+	/** Allow a session started exactly in the canonical home directory only when user-level configuration enables it. */
+	allowHomeProject?: boolean;
 	maybeAutoEmbedSession?: (
 		sessionId: string,
 		projectDir: string,
@@ -2008,7 +2012,10 @@ export function registerPiContextHandler(
 			const schedulerConfig = options.scheduler ?? DEFAULT_SCHEDULER_CONFIG;
 			const scheduler = schedulerFor(options);
 			const projectIdentity =
-				resolveProjectIdentityForSession(projectDirectory) ?? "";
+				resolveProjectIdentityForSession(
+					projectDirectory,
+					options.allowHomeProject,
+				) ?? "";
 			updateSessionProjectTracking(sessionId, projectIdentity, options.db);
 			logTransformTiming(
 				sessionId,
@@ -3500,6 +3507,7 @@ function spawnPiHistorianRun(args: {
 				twoPass: historian.twoPass,
 				thinkingLevel: historian.thinkingLevel,
 				memoryEnabled: historian.memoryEnabled,
+				allowHomeProject: historian.allowHomeProject,
 				autoPromote: historian.autoPromote,
 				userMemoriesEnabled: historian.userMemoriesEnabled,
 				language: historian.language,

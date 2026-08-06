@@ -224,12 +224,16 @@ function clearPiMagicContextActive(): void {
 	}
 }
 
-function resolveCurrentProject(ctx: { cwd: string }): {
+function resolveCurrentProject(
+	ctx: { cwd: string },
+	allowHomeProject = false,
+): {
 	projectDir: string;
 	projectIdentity: string;
 } {
 	const projectDir = ctx.cwd;
-	const projectIdentity = resolveProjectIdentityForSession(projectDir) ?? "";
+	const projectIdentity =
+		resolveProjectIdentityForSession(projectDir, allowHomeProject) ?? "";
 	return { projectDir, projectIdentity };
 }
 
@@ -616,6 +620,7 @@ export function resolveSidekickFromConfig(
 		thinking_level: sidekick.thinking_level,
 		fallbackModels: resolveFallbackChain(sidekick.fallback_models),
 		language: config.language,
+		allowHomeProject: config.allow_home_project,
 	};
 }
 
@@ -668,6 +673,7 @@ export function resolveHistorianFromConfig(
 		autoPromote: config.memory.auto_promote,
 		userMemoriesEnabled: userMemoryCollectionEnabled(config.dreamer),
 		language: config.language,
+		allowHomeProject: config.allow_home_project,
 	};
 }
 
@@ -841,15 +847,7 @@ async function startPiMagicContextRuntime(
 	// identity/path resolution uses ctx.cwd per hook/command so session cwd
 	// switches follow the active project without reloading config.
 	const projectDir = process.cwd();
-	const projectIdentity = resolveProjectIdentityForSession(projectDir) ?? "";
 	const seenDreamerProjectIdentities = new Set<string>();
-	if (projectIdentity) seenDreamerProjectIdentities.add(projectIdentity);
-
-	info(
-		`loaded v${PLUGIN_VERSION} | harness=pi | db=${dbPath} | ` +
-			`project=${projectIdentity} | dir=${projectDir}`,
-	);
-
 	// Step 5b: load the user's full magic-context.jsonc config. The loader
 	// reads the shared CortexKit project/user paths, validates them through the
 	// shared Zod schema, falls back to Pi-owned legacy files only while migration
@@ -863,6 +861,14 @@ async function startPiMagicContextRuntime(
 	const { config, warnings, loadedFromPaths } = loadPiConfig({
 		cwd: projectDir,
 	});
+	const projectIdentity =
+		resolveProjectIdentityForSession(projectDir, config.allow_home_project) ??
+		"";
+	if (projectIdentity) seenDreamerProjectIdentities.add(projectIdentity);
+	info(
+		`loaded v${PLUGIN_VERSION} | harness=pi | db=${dbPath} | ` +
+			`project=${projectIdentity} | dir=${projectDir}`,
+	);
 	// Pi tools are registered once per process, so this mode is intentionally
 	// boot-resolved rather than following later /cd project config changes.
 	const compactionOff = !isCompactionEnabled(config);
@@ -971,6 +977,7 @@ async function startPiMagicContextRuntime(
 		autoSearch: auto,
 		resolveForProject: resolveContextOptionsForProject,
 		compactionOff,
+		allowHomeProject: cfg.allow_home_project,
 		maybeAutoEmbedSession: (sessionId, dir, identity) => {
 			maybeAutoEmbedPiSession(
 				{
@@ -1003,7 +1010,9 @@ async function startPiMagicContextRuntime(
 			hist.onStatusChange = (ctx) => {
 				updateStatusLine(ctx, {
 					db: database,
-					projectIdentity: resolveCurrentProject(ctx).projectIdentity ?? "",
+					projectIdentity:
+						resolveCurrentProject(ctx, cfg.allow_home_project)
+							.projectIdentity ?? "",
 				});
 			};
 		}
@@ -1037,7 +1046,12 @@ async function startPiMagicContextRuntime(
 		});
 		const switchedConfig = switchedLoad.config;
 		const switchedIdentity =
-			identityOverride ?? resolveProjectIdentityForSession(dir) ?? "";
+			identityOverride ??
+			resolveProjectIdentityForSession(
+				dir,
+				switchedConfig.allow_home_project,
+			) ??
+			"";
 		const built = buildProjectDeps(dir, switchedIdentity, switchedConfig);
 		projectDepsByDir.set(dir, built);
 		return built;
@@ -1046,11 +1060,7 @@ async function startPiMagicContextRuntime(
 	function resolveCurrentProjectDeps(ctx: {
 		cwd: string;
 	}): ResolvedPiProjectDeps {
-		const currentProject = resolveCurrentProject(ctx);
-		return resolveProjectDepsForDir(
-			currentProject.projectDir,
-			currentProject.projectIdentity,
-		);
+		return resolveProjectDepsForDir(ctx.cwd);
 	}
 
 	function resolveContextOptionsForProject(
@@ -1096,6 +1106,8 @@ async function startPiMagicContextRuntime(
 		protectedTags: config.protected_tags ?? 20,
 		resolveProtectedTags: (ctx) =>
 			resolveCurrentProjectDeps(ctx).config.protected_tags ?? 20,
+		resolveProjectIdentity: (ctx) =>
+			resolveCurrentProjectDeps(ctx).projectIdentity,
 		// Smart notes (surface_condition) only work when dreamer is
 		// running — otherwise the note sits `pending` forever with no
 		// path to surface. Match the user's dreamer config flag.
@@ -1201,7 +1213,6 @@ async function startPiMagicContextRuntime(
 			return {
 				db,
 				projectIdentity: current.projectIdentity,
-				resolveProject: resolveCurrentProject,
 				protectedTags: current.config.protected_tags,
 				executeThresholdPercentage: current.config.execute_threshold_percentage,
 				historyBudgetPercentage: current.config.history_budget_percentage,
@@ -1321,6 +1332,7 @@ async function startPiMagicContextRuntime(
 		historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
 		language: bootProjectDeps.config.language,
 		memoryEnabled: bootProjectDeps.config.memory.enabled,
+		allowHomeProject: bootProjectDeps.config.allow_home_project,
 		autoPromote: bootProjectDeps.config.memory.auto_promote,
 		compactionOff,
 		userMemoriesEnabled: userMemoryCollectionEnabled(
@@ -1340,6 +1352,7 @@ async function startPiMagicContextRuntime(
 				historianThinkingLevel: current.historianConfig?.thinkingLevel,
 				language: current.config.language,
 				memoryEnabled: current.config.memory.enabled,
+				allowHomeProject: current.config.allow_home_project,
 				autoPromote: current.config.memory.auto_promote,
 				compactionOff,
 				userMemoriesEnabled: userMemoryCollectionEnabled(
@@ -1354,7 +1367,13 @@ async function startPiMagicContextRuntime(
 		db,
 		projectDir,
 		projectIdentity,
-		resolveProject: resolveCurrentProject,
+		resolveProject: (ctx) => {
+			const current = resolveCurrentProjectDeps(ctx);
+			return {
+				projectDir: current.projectDir,
+				projectIdentity: current.projectIdentity,
+			};
+		},
 		dreamerEnabled: bootProjectDeps.dreamerEnabled,
 		resolveDreamerEnabled: (ctx) =>
 			resolveCurrentProjectDeps(ctx).dreamerEnabled,
@@ -1369,7 +1388,13 @@ async function startPiMagicContextRuntime(
 		memoryEnabled: bootProjectDeps.config.memory.enabled,
 		resolveMemoryEnabled: (ctx) =>
 			resolveCurrentProjectDeps(ctx).config.memory.enabled,
-		resolveProject: resolveCurrentProject,
+		resolveProject: (ctx) => {
+			const current = resolveCurrentProjectDeps(ctx);
+			return {
+				projectDir: current.projectDir,
+				projectIdentity: current.projectIdentity,
+			};
+		},
 	});
 	info("registered /ctx-embed");
 

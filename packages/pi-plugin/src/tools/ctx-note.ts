@@ -187,11 +187,15 @@ export interface CtxNoteToolDeps {
 	 *  registers tools once, but `/cd` can switch to a project with different
 	 *  smart-note support. */
 	resolveDreamerEnabled?: (ctx: { cwd: string }) => boolean | undefined;
+	/** Resolve a directory's project identity, allowing home only when user-level configuration enables it. */
+	resolveProjectIdentity?: (directory: string) => string | undefined;
 }
 
 export function createCtxNoteTool(
 	deps: CtxNoteToolDeps,
 ): ToolDefinition<typeof ParamsSchema> {
+	const resolveProject =
+		deps.resolveProjectIdentity ?? resolveProjectIdentityForSession;
 	return {
 		name: "ctx_note",
 		label: "Magic Context: Notes",
@@ -236,7 +240,7 @@ export function createCtxNoteTool(
 							"Error: Smart notes require dreamer to be enabled. Enable dreamer in magic-context.jsonc to use surface_condition.",
 						);
 					}
-					const projectIdentity = resolveProjectIdentityForSession(ctx.cwd);
+					const projectIdentity = resolveProject(ctx.cwd);
 					if (!projectIdentity) {
 						return err(
 							"Error: Could not resolve project identity for smart note.",
@@ -266,7 +270,7 @@ export function createCtxNoteTool(
 				if (typeof params.note_id !== "number") {
 					return err("Error: 'note_id' is required when action is 'dismiss'.");
 				}
-				const projectIdentity = resolveProjectIdentityForSession(ctx.cwd);
+				const projectIdentity = resolveProject(ctx.cwd);
 				if (!projectIdentity) {
 					return err(
 						"Error: Could not resolve project identity for note dismiss.",
@@ -296,7 +300,7 @@ export function createCtxNoteTool(
 						"Error: Provide 'content' and/or 'surface_condition' to update.",
 					);
 				}
-				const projectIdentity = resolveProjectIdentityForSession(ctx.cwd);
+				const projectIdentity = resolveProject(ctx.cwd);
 				if (!projectIdentity) {
 					return err(
 						"Error: Could not resolve project identity for note update.",
@@ -338,6 +342,7 @@ export function createCtxNoteTool(
 				db: deps.db,
 				sessionId,
 				cwd: ctx.cwd,
+				resolveProjectIdentity: resolveProject,
 				filter: params.filter,
 				limit,
 				offset,
@@ -382,11 +387,12 @@ function readNotes(args: {
 	db: ContextDatabase;
 	sessionId: string;
 	cwd: string;
+	resolveProjectIdentity: (directory: string) => string | undefined;
 	filter: CtxNoteReadFilter | undefined;
 	limit: number;
 	offset: number;
 }): string[] {
-	const projectIdentity = resolveProjectIdentityForSession(args.cwd);
+	const projectIdentity = args.resolveProjectIdentity(args.cwd);
 
 	if (args.filter === undefined) {
 		// Default mixed view: active session notes + READY smart notes.

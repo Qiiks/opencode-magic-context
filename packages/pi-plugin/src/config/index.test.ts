@@ -307,6 +307,21 @@ describe("loadPiConfig", () => {
 		);
 	});
 
+	it("strips allow_home_project from PROJECT config but honors USER config", () => {
+		const cwd = makeTempRoot("mc-pi-cwd-");
+		const home = makeTempRoot("mc-pi-home-");
+		withHome(home);
+		writeUserConfig(home, JSON.stringify({ allow_home_project: false }));
+		writeProjectConfig(cwd, JSON.stringify({ allow_home_project: true }));
+
+		const result = loadPiConfig({ cwd });
+
+		expect(result.config.allow_home_project).toBe(false);
+		expect(result.warnings.join("\n")).toContain(
+			"Ignoring allow_home_project from project config",
+		);
+	});
+
 	it("keeps historian model selection user-owned when project config tries to override it", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");

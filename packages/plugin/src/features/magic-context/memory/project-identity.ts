@@ -411,9 +411,13 @@ export function takeDubiousOwnershipProjectIdentityWarning(directory: string): s
  * accidentally create a second directory identity. Descendants remain valid
  * project directories; only the exact home directory is rejected.
  */
+function canonicalUserHomeDirectory(): string {
+    return realpathSync.native(homedir());
+}
+
 export function isUserHomeDirectory(directory: string): boolean {
     try {
-        return realpathSync.native(path.resolve(directory)) === realpathSync.native(homedir());
+        return realpathSync.native(path.resolve(directory)) === canonicalUserHomeDirectory();
     } catch {
         return false;
     }
@@ -512,8 +516,17 @@ function hasGitDirInAncestorChain(startDirectory: string): boolean {
     }
 }
 
-export function resolveProjectIdentityForSession(directory: string): string | undefined {
-    if (isUserHomeDirectory(directory)) return undefined;
+export function resolveProjectIdentityForSession(
+    directory: string,
+    allowHomeProject = false,
+): string | undefined {
+    if (isUserHomeDirectory(directory)) {
+        if (!allowHomeProject) return undefined;
+        // A home session always uses the normal directory fallback, even if
+        // $HOME contains a .git directory. This preserves the existing dir:
+        // identity and prevents symlink spellings from creating separate pools.
+        return directoryFallback(canonicalUserHomeDirectory());
+    }
     return resolveProjectIdentityOrFallback(directory);
 }
 
