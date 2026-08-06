@@ -81,7 +81,11 @@ import {
     resolveModelKey,
     resolveTrustedContextLimit,
 } from "./event-resolvers";
-import { estimateFinalWireInputTokens, estimateMessageTokens } from "./final-wire-token-estimate";
+import {
+    describeFinalWireTail,
+    estimateFinalWireInputTokens,
+    estimateMessageTokens,
+} from "./final-wire-token-estimate";
 import type { LiveModelBySession } from "./hook-handlers";
 import {
     type PreparedCompartmentInjection,
@@ -2200,11 +2204,13 @@ export function createTransform(deps: TransformDeps) {
         // (derived force-band tiered drop, absolute 95% fail-closed block, overflow-recovery latch).
         // A persisted latch is cleared by the off-transition, never consumed
         // here; overflow propagates to native compaction instead of blocking.
+        const finalWireTail = describeFinalWireTail(messages);
+        let finalWireEstimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
         if (!compactionOff) {
         // Fresh-tokenize only in the emergency band. This estimate is telemetry,
         // never an abort gate: provider-accurate accounting is deferred to the
         // module-side implementation.
-        const finalWireEstimate =
+        finalWireEstimate =
             contextUsage.percentage >= 95
                 ? estimateFinalWireInputTokens({
                       messages,
@@ -2217,7 +2223,7 @@ export function createTransform(deps: TransformDeps) {
         if (finalWireEstimate) {
             sessionLog(
                 sessionId,
-                `transform: final-wire telemetry estimate=${finalWireEstimate.tokens} trusted=${finalWireEstimate.trusted} conversation=${finalWireEstimate.messageTokens.conversation} tools=${finalWireEstimate.messageTokens.toolCall} system=${finalWireEstimate.systemTokens} toolDefinitions=${finalWireEstimate.toolDefinitionTokens ?? "unknown"}`,
+                `transform: final-wire telemetry estimate=${finalWireEstimate.tokens} trusted=${finalWireEstimate.trusted} conversation=${finalWireEstimate.messageTokens.conversation} tools=${finalWireEstimate.messageTokens.toolCall} system=${finalWireEstimate.systemTokens} toolDefinitions=${finalWireEstimate.toolDefinitionTokens ?? "unknown"} tail=${finalWireTail}`,
             );
         }
         const currentModelKeyForRecovery = deps.getModelKey?.(sessionId);
@@ -2271,7 +2277,7 @@ export function createTransform(deps: TransformDeps) {
                     cause: error,
                 });
             }
-            if (notification !== "sent") {
+            if (notification !== "sent" && notification !== "queued") {
                 throw new EmergencyFailClosedError(
                     `Emergency recovery notification was ${notification}`,
                 );
@@ -2303,6 +2309,12 @@ export function createTransform(deps: TransformDeps) {
             );
             return;
         }
+        }
+        if (!finalWireEstimate) {
+            sessionLog(
+                sessionId,
+                `transform: final-wire telemetry estimate=unavailable trusted=false conversation=unknown tools=unknown system=unknown toolDefinitions=unknown tail=${finalWireTail}`,
+            );
         }
 
         if (passOutcome.captureEligible) {
