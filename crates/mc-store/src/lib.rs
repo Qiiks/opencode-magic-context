@@ -2086,6 +2086,87 @@ const MIGRATIONS: &[Migration] = &[
         END;
     ",
     },
+    Migration {
+        version: 44,
+        // A restored context database can leave old store identities beside the generation named
+        // by the live route binding. Merge only natural-key twins with an existing current row;
+        // unmatched identity-less module rows remain available for the next mirror adoption.
+        statements: r#"
+        DROP TABLE IF EXISTS temp.mc_memory_generation_merge_values;
+        DROP TABLE IF EXISTS temp.mc_memory_generation_collisions;
+        CREATE TEMP TABLE mc_memory_generation_collisions AS
+        SELECT DISTINCT current.id AS current_id, stale.id AS stale_id
+          FROM mc_authority_route_bindings binding
+          JOIN mc_memories current
+            ON current.project_path = binding.project
+           AND current.context_store_uuid = binding.context_store_uuid
+          JOIN mc_memories stale
+            ON stale.project_path = current.project_path
+           AND stale.category = current.category
+           AND stale.normalized_hash = current.normalized_hash
+           AND stale.id != current.id
+         WHERE stale.context_store_uuid IS NOT binding.context_store_uuid;
+
+        CREATE TEMP TABLE mc_memory_generation_merge_values AS
+        SELECT collision.current_id,
+               MAX(stale.updated_at) AS updated_at,
+               MAX(stale.verified_at) AS verified_at,
+               MAX(stale.classified_at) AS classified_at
+          FROM mc_memory_generation_collisions collision
+          JOIN mc_memories stale ON stale.id = collision.stale_id
+         GROUP BY collision.current_id;
+
+        UPDATE mc_memories AS current
+           SET updated_at = MAX(
+                   current.updated_at,
+                   (SELECT merged.updated_at
+                      FROM mc_memory_generation_merge_values merged
+                     WHERE merged.current_id = current.id)
+               ),
+               verified_at = CASE
+                   WHEN current.verified_at IS NULL THEN (
+                       SELECT merged.verified_at
+                         FROM mc_memory_generation_merge_values merged
+                        WHERE merged.current_id = current.id
+                   )
+                   WHEN (SELECT merged.verified_at
+                           FROM mc_memory_generation_merge_values merged
+                          WHERE merged.current_id = current.id) IS NULL
+                       THEN current.verified_at
+                   ELSE MAX(
+                       current.verified_at,
+                       (SELECT merged.verified_at
+                          FROM mc_memory_generation_merge_values merged
+                         WHERE merged.current_id = current.id)
+                   )
+               END,
+               classified_at = CASE
+                   WHEN current.classified_at IS NULL THEN (
+                       SELECT merged.classified_at
+                         FROM mc_memory_generation_merge_values merged
+                        WHERE merged.current_id = current.id
+                   )
+                   WHEN (SELECT merged.classified_at
+                           FROM mc_memory_generation_merge_values merged
+                          WHERE merged.current_id = current.id) IS NULL
+                       THEN current.classified_at
+                   ELSE MAX(
+                       current.classified_at,
+                       (SELECT merged.classified_at
+                          FROM mc_memory_generation_merge_values merged
+                         WHERE merged.current_id = current.id)
+                   )
+               END
+         WHERE current.id IN (
+             SELECT current_id FROM mc_memory_generation_merge_values
+         );
+
+        DELETE FROM mc_memories
+         WHERE id IN (SELECT stale_id FROM mc_memory_generation_collisions);
+        DROP TABLE mc_memory_generation_merge_values;
+        DROP TABLE mc_memory_generation_collisions;
+        "#,
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -12502,6 +12583,32 @@ impl McStore {
 
         self.inner
             .with_conn_fenced(|tx| {
+                // A restored context database keeps memory content but mints a new store UUID.
+                // Re-key a natural-key match before the identity upsert so the two unique keys
+                // converge on one module row instead of rejecting the complete seed frame.
+                let mut memory_adopt = tx.prepare(
+                    "UPDATE mc_memories
+                        SET project_path=?1, category=?2, content=?3, normalized_hash=?4,
+                            importance=?5, scope=?6, shareable=?7, source_session_id=?8,
+                            source_type=?9, seen_count=?10, retrieval_count=?11,
+                            first_seen_at=?12, created_at=?13, updated_at=?14, last_seen_at=?15,
+                            last_retrieved_at=?16, status=?17, expires_at=?18,
+                            verification_status=?19,
+                            verified_at=CASE
+                                WHEN verified_at IS NULL THEN ?20
+                                WHEN ?20 IS NULL THEN verified_at
+                                ELSE MAX(verified_at, ?20)
+                            END,
+                            classified_at=CASE
+                                WHEN classified_at IS NULL THEN ?21
+                                WHEN ?21 IS NULL THEN classified_at
+                                ELSE MAX(classified_at, ?21)
+                            END,
+                            superseded_by_memory_id=?22, merged_from=?23, metadata_json=?24,
+                            context_store_uuid=?25, context_row_id=?26
+                      WHERE project_path=?1 AND category=?2 AND normalized_hash=?4
+                        AND NOT (context_store_uuid IS ?25 AND context_row_id IS ?26)",
+                )?;
                 let mut memory_upsert = tx.prepare(
                     "INSERT INTO mc_memories
                         (project_path, category, content, normalized_hash, importance, scope, shareable,
@@ -12521,7 +12628,16 @@ impl McStore {
                         updated_at=excluded.updated_at, last_seen_at=excluded.last_seen_at,
                         last_retrieved_at=excluded.last_retrieved_at, status=excluded.status,
                         expires_at=excluded.expires_at, verification_status=excluded.verification_status,
-                        verified_at=excluded.verified_at, classified_at=excluded.classified_at,
+                        verified_at=CASE
+                            WHEN verified_at IS NULL THEN excluded.verified_at
+                            WHEN excluded.verified_at IS NULL THEN verified_at
+                            ELSE MAX(verified_at, excluded.verified_at)
+                        END,
+                        classified_at=CASE
+                            WHEN classified_at IS NULL THEN excluded.classified_at
+                            WHEN excluded.classified_at IS NULL THEN classified_at
+                            ELSE MAX(classified_at, excluded.classified_at)
+                        END,
                         superseded_by_memory_id=excluded.superseded_by_memory_id,
                         merged_from=excluded.merged_from, metadata_json=excluded.metadata_json",
                 )?;
@@ -12574,7 +12690,7 @@ impl McStore {
                             .optional()?,
                         None => None,
                     };
-                    memory_upsert.execute(params![
+                    let adopted = memory_adopt.execute(params![
                         project,
                         text("category").unwrap_or_default(),
                         text("content").unwrap_or_default(),
@@ -12602,6 +12718,36 @@ impl McStore {
                         context_store_uuid,
                         source_row_id,
                     ])?;
+                    if adopted == 0 {
+                        memory_upsert.execute(params![
+                            project,
+                            text("category").unwrap_or_default(),
+                            text("content").unwrap_or_default(),
+                            text("normalized_hash").unwrap_or_default(),
+                            integer("importance"),
+                            text("scope").unwrap_or("project"),
+                            integer("shareable").unwrap_or(0),
+                            text("source_session_id"),
+                            text("source_type").unwrap_or("historian"),
+                            integer("seen_count").unwrap_or(1),
+                            integer("retrieval_count").unwrap_or(0),
+                            integer("first_seen_at").unwrap_or(0),
+                            integer("created_at").unwrap_or(0),
+                            integer("updated_at").unwrap_or(0),
+                            integer("last_seen_at").unwrap_or(0),
+                            integer("last_retrieved_at"),
+                            text("status").unwrap_or("active"),
+                            integer("expires_at"),
+                            text("verification_status").unwrap_or("unverified"),
+                            integer("verified_at"),
+                            integer("classified_at"),
+                            superseded_by_memory_id,
+                            text("merged_from"),
+                            text("metadata_json"),
+                            context_store_uuid,
+                            source_row_id,
+                        ])?;
+                    }
                     let module_row_id: i64 = memory_by_source.query_row(
                         params![context_store_uuid, project, source_row_id],
                         |row| row.get(0),
@@ -12635,6 +12781,7 @@ impl McStore {
                     module_row_ids.push(module_row_id);
                 }
                 drop((
+                    memory_adopt,
                     memory_upsert,
                     memory_by_source,
                     pending_upsert,
@@ -16141,10 +16288,103 @@ mod tests {
     }
 
     #[test]
+    fn migration_44_merges_generation_twins_and_keeps_unmatched_identityless_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE mc_authority_route_bindings (
+                 route_project_root TEXT PRIMARY KEY,
+                 context_store_uuid TEXT NOT NULL,
+                 project TEXT NOT NULL
+             );
+             CREATE TABLE mc_memories (
+                 id INTEGER PRIMARY KEY,
+                 project_path TEXT NOT NULL,
+                 category TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 normalized_hash TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 verified_at INTEGER,
+                 classified_at INTEGER,
+                 context_store_uuid TEXT,
+                 context_row_id INTEGER
+             );
+             INSERT INTO mc_authority_route_bindings
+                 (route_project_root, context_store_uuid, project)
+             VALUES ('/repo', 'current-store', 'git:project');
+             INSERT INTO mc_memories
+                 (id, project_path, category, content, normalized_hash, updated_at,
+                  verified_at, classified_at, context_store_uuid, context_row_id)
+             VALUES
+                 (1, 'git:project', 'CONSTRAINTS', 'current', 'same-hash', 10,
+                  20, NULL, 'current-store', 101),
+                 (2, 'git:project', 'CONSTRAINTS', 'stale', 'same-hash', 30,
+                  NULL, 40, 'stale-store', 202),
+                 (3, 'git:project', 'CONSTRAINTS', 'identityless twin', 'same-hash', 25,
+                  35, 30, '', NULL),
+                 (4, 'git:project', 'ARCHITECTURE', 'module original', 'unmatched-hash', 50,
+                  60, 70, '', NULL);",
+        )
+        .unwrap();
+
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 44)
+            .unwrap();
+        conn.execute_batch(migration.statements).unwrap();
+
+        let current = conn
+            .query_row(
+                "SELECT content, updated_at, verified_at, classified_at,
+                        context_store_uuid, context_row_id
+                   FROM mc_memories WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            current,
+            (
+                "current".to_string(),
+                30,
+                Some(35),
+                Some(40),
+                Some("current-store".to_string()),
+                Some(101),
+            )
+        );
+        let remaining = conn
+            .prepare("SELECT id, context_store_uuid FROM mc_memories ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec![
+                (1, Some("current-store".to_string())),
+                (4, Some(String::new())),
+            ],
+            "only natural-key twins are merged; an unmatched module-authored row survives"
+        );
+    }
+
+    #[test]
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=43).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=44).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -19536,7 +19776,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=43).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=44).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)
@@ -20311,6 +20551,88 @@ mod shadow_tests {
             })
             .unwrap();
         assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn authority_seed_adopts_stale_generation_and_preserves_classification_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_memories
+                         (id, project_path, category, content, normalized_hash, importance,
+                          status, first_seen_at, created_at, updated_at, last_seen_at,
+                          verification_status, verified_at, classified_at,
+                          context_store_uuid, context_row_id)
+                     VALUES (700, 'git:project', 'CONSTRAINTS', 'stale content', 'same-hash', 10,
+                             'active', 1, 2, 500, 3, 'verified', 900, 800,
+                             'stale-store', 9)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let incoming = AuthoritySeedRow {
+            source_row_id: 42,
+            snapshot: serde_json::json!({
+                "id": 42,
+                "project_path": "git:project",
+                "category": "CONSTRAINTS",
+                "content": "current content",
+                "normalized_hash": "same-hash",
+                "importance": 80,
+                "first_seen_at": 10,
+                "created_at": 20,
+                "updated_at": 600,
+                "last_seen_at": 30,
+                "status": "active",
+                "verification_status": "verified",
+                "verified_at": 700,
+                "classified_at": 1000
+            }),
+        };
+
+        let first = store
+            .seed_authority_rows(
+                "current-store",
+                "git:project",
+                "memories",
+                std::slice::from_ref(&incoming),
+            )
+            .unwrap();
+        assert_eq!(first, vec![700], "adoption retains the module row identity");
+        let adopted = store.get_memory_full(700).unwrap().unwrap();
+        assert_eq!(adopted.content, "current content");
+        assert_eq!(adopted.importance, Some(80));
+        assert_eq!(adopted.updated_at, 600);
+        assert_eq!(adopted.context_store_uuid.as_deref(), Some("current-store"));
+        assert_eq!(adopted.context_row_id, Some(42));
+        assert_eq!(adopted.verified_at, Some(900));
+        assert_eq!(adopted.classified_at, Some(1000));
+
+        let second = store
+            .seed_authority_rows("current-store", "git:project", "memories", &[incoming])
+            .unwrap();
+        assert_eq!(second, first);
+        let retried = store.get_memory_full(700).unwrap().unwrap();
+        assert_eq!(retried.verified_at, Some(900));
+        assert_eq!(retried.classified_at, Some(1000));
+        let natural_key_count = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_memories
+                      WHERE project_path = 'git:project'
+                        AND category = 'CONSTRAINTS'
+                        AND normalized_hash = 'same-hash'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(natural_key_count, 1);
     }
 
     #[test]
