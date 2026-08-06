@@ -16,6 +16,7 @@ use mc_tokenizer::estimate_tokens;
 use regex::Regex;
 use serde_json::Value;
 
+use crate::scheduler::escalation_bands;
 use crate::selection::SelKind;
 
 // --- Constants for protected-tail sizing and trigger thresholds. ---
@@ -43,7 +44,7 @@ const MIN_PROACTIVE_TAIL_TOKEN_ESTIMATE: f64 = 6_000.0;
 const MIN_PROACTIVE_TAIL_MESSAGE_COUNT: usize = 12;
 const DEFAULT_MIN_COMMIT_CLUSTERS_FOR_TRIGGER: usize = 3;
 const TAIL_SIZE_TRIGGER_MULTIPLIER: f64 = 3.0;
-const FORCE_COMPARTMENT_PERCENTAGE: f64 = 80.0;
+const FORCE80_CAP_TIER_PERCENTAGE: f64 = 80.0;
 const BLOCK_UNTIL_DONE_PERCENTAGE: f64 = 95.0;
 const MAX_COMMITS_PER_BLOCK: usize = 5;
 
@@ -150,7 +151,7 @@ pub struct BoundaryContext {
     pub prior_boundary_ordinal: u64,
     /// Whether the floor based on `prior_boundary_ordinal` is currently active.
     pub migration_floor_active: bool,
-    /// Optional emergency shrink scale (`0.5` at 80% pressure, `0.25` at 95% pressure).
+    /// Optional emergency shrink scale (`0.5` at force-band pressure, `0.25` at 95% pressure).
     pub emergency_tail_scale: Option<f64>,
     /// Optional pre-derived trigger budget; when omitted, [`derive_trigger_budget`] is used.
     pub trigger_budget: Option<f64>,
@@ -281,8 +282,8 @@ impl Default for TriggerContext {
 pub enum TriggerReason {
     /// Context pressure reached the projected-headroom threshold and drops are not enough.
     ProjectedHeadroom,
-    /// Context pressure reached the force band (80% or higher).
-    Force80,
+    /// Context pressure reached the threshold-derived force band.
+    ForceBand,
     /// Enough assistant commit clusters accumulated in the eligible head.
     CommitClusters,
     /// Enough TC-chunked tail eligible for historian summarization accumulated.
@@ -294,7 +295,7 @@ impl TriggerReason {
     pub fn as_str(self) -> &'static str {
         match self {
             TriggerReason::ProjectedHeadroom => "projected_headroom",
-            TriggerReason::Force80 => "force_80",
+            TriggerReason::ForceBand => "force_band",
             TriggerReason::CommitClusters => "commit_clusters",
             TriggerReason::TailSize => "tail_size",
         }
@@ -480,7 +481,9 @@ fn resolve_protected_tail_boundary_with_index(
     let mut protected_tail_start = boundary.max(runtime_floor);
 
     let mut floored_by_live_prompt = false;
-    if ctx.emergency_tail_scale.is_none() && usage_percentage < FORCE_COMPARTMENT_PERCENTAGE {
+    let force_materialization_percentage =
+        escalation_bands(ctx.execute_threshold_percentage).force_materialize_percentage;
+    if ctx.emergency_tail_scale.is_none() && usage_percentage < force_materialization_percentage {
         if let Some(last_meaningful_user) = messages
             .iter()
             .rev()
@@ -795,15 +798,22 @@ fn check_compartment_trigger_with_index(
     let relative_post_drop_target =
         ctx.boundary.execute_threshold_percentage * POST_DROP_TARGET_RATIO;
 
-    if ctx.boundary.usage_percentage >= FORCE_COMPARTMENT_PERCENTAGE {
+    let force_materialization_percentage =
+        escalation_bands(ctx.boundary.execute_threshold_percentage).force_materialize_percentage;
+    if ctx.boundary.usage_percentage >= force_materialization_percentage {
         if ctx
             .projected_post_drop_percentage
             .is_some_and(|pct| pct <= relative_post_drop_target)
         {
             return no_fire_with_progress(progress);
         }
-        if has_runnable_compartment_window(&boundary, ctx.boundary.usage_percentage, None) {
-            return fire_with_progress(TriggerReason::Force80, &boundary, progress);
+        if has_runnable_compartment_window(
+            &boundary,
+            ctx.boundary.usage_percentage,
+            ctx.boundary.execute_threshold_percentage,
+            None,
+        ) {
+            return fire_with_progress(TriggerReason::ForceBand, &boundary, progress);
         }
         let scale = if ctx.boundary.usage_percentage >= BLOCK_UNTIL_DONE_PERCENTAGE {
             0.25
@@ -817,9 +827,10 @@ fn check_compartment_trigger_with_index(
         if has_runnable_compartment_window(
             &scaled_boundary,
             ctx.boundary.usage_percentage,
+            ctx.boundary.execute_threshold_percentage,
             Some(scale),
         ) {
-            return fire_with_progress(TriggerReason::Force80, &scaled_boundary, progress);
+            return fire_with_progress(TriggerReason::ForceBand, &scaled_boundary, progress);
         }
         return no_fire_with_progress(progress);
     }
@@ -938,7 +949,10 @@ fn select_per_run_cap(
         .max(1.0);
     if usage_percentage >= BLOCK_UNTIL_DONE_PERCENTAGE {
         force95_per_run_cap(usable, n)
-    } else if usage_percentage >= FORCE_COMPARTMENT_PERCENTAGE {
+    // Capacity sizing deliberately retains its historical 80% tier. For execute
+    // thresholds from 84% through 90%, this cap no longer coincides with the
+    // derived force-band transition.
+    } else if usage_percentage >= FORCE80_CAP_TIER_PERCENTAGE {
         force80_per_run_cap(usable, n)
     } else {
         non_emergency_per_run_cap(usable, n)
@@ -948,12 +962,15 @@ fn select_per_run_cap(
 fn has_runnable_compartment_window(
     boundary: &BoundaryResolution,
     usage_percentage: f64,
+    execute_threshold_percentage: f64,
     emergency_tail_scale: Option<f64>,
 ) -> bool {
     if boundary.eligible_head.start >= boundary.protected_start_ordinal {
         return false;
     }
-    if usage_percentage >= FORCE_COMPARTMENT_PERCENTAGE || emergency_tail_scale.is_some() {
+    let force_materialization_percentage =
+        escalation_bands(execute_threshold_percentage).force_materialize_percentage;
+    if usage_percentage >= force_materialization_percentage || emergency_tail_scale.is_some() {
         boundary.true_raw_eligible_tokens >= derive_min_force_eligible_tokens(boundary.n_tokens)
             || boundary.eligible_head.end > boundary.eligible_head.start
     } else {
@@ -2150,11 +2167,6 @@ mod tests {
             &constants,
             "TAIL_SIZE_TRIGGER_MULTIPLIER",
             TAIL_SIZE_TRIGGER_MULTIPLIER,
-        );
-        assert_const(
-            &constants,
-            "FORCE_COMPARTMENT_PERCENTAGE",
-            FORCE_COMPARTMENT_PERCENTAGE,
         );
         assert_const(
             &constants,

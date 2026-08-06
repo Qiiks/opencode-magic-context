@@ -443,10 +443,19 @@ export function buildSidebarSnapshot(
         }
 
         // Native compaction watches the model's full window, not Magic Context's
-        // execute threshold. Keep this measurement independent of persisted
-        // threshold-relative state so the TUI cannot relabel a threshold fill.
+        // output-reserved budget or execute threshold. Resolve the same catalog
+        // chokepoint without reservation so this display metric cannot inherit a
+        // budget denominator; every scheduling consumer keeps `contextLimit`.
+        const nativeContextLimit =
+            activeProviderID && activeModelID
+                ? resolveContextLimit(activeProviderID, activeModelID, {
+                      db,
+                      sessionID: sessionId,
+                      reservation: "none",
+                  })
+                : contextLimit;
         const nativeContextUsagePercentage =
-            contextLimit > 0 ? (effectiveInputTokens / contextLimit) * 100 : undefined;
+            nativeContextLimit > 0 ? (effectiveInputTokens / nativeContextLimit) * 100 : undefined;
 
         const calibration = resolveModelCalibration(activeProviderID, activeModelID);
         const calibrated = calibrateBuckets({

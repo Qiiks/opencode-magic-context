@@ -1,3 +1,7 @@
+import {
+    type ContextLimitProvenance,
+    normalizeContextLimitProvenance,
+} from "../../shared/context-limit-provenance";
 import { escalationBands } from "../../shared/escalation-bands";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
@@ -636,7 +640,10 @@ const COMPACTION_MODE_RECORD_VALUES: ReadonlySet<CompactionModeRecord> = new Set
 
 function normalizeCompactionModeRecord(value: unknown): CompactionModeRecord | null {
     if (value === null || value === undefined) return null;
-    if (typeof value === "string" && COMPACTION_MODE_RECORD_VALUES.has(value as CompactionModeRecord)) {
+    if (
+        typeof value === "string" &&
+        COMPACTION_MODE_RECORD_VALUES.has(value as CompactionModeRecord)
+    ) {
         return value as CompactionModeRecord;
     }
     return null;
@@ -658,7 +665,6 @@ export function resolveCompactionModeRecord(
             return null;
     }
 }
-
 
 /** Reads the persisted compaction mode record for a session. NULL → no record. */
 export function getCompactionModeRecord(
@@ -785,9 +791,7 @@ export function reserveProtectedTailDrainTokens(args: {
         // so the next pass sees the resolved state even when we skip below.
         const exitThreshold = emergencyDrainExitThreshold(args.executeThresholdPercentage);
         let latchActiveSince = meta.emergencyDrainActive;
-        const { forceMaterializationPercentage } = escalationBands(
-            args.executeThresholdPercentage,
-        );
+        const { forceMaterializationPercentage } = escalationBands(args.executeThresholdPercentage);
         if (args.usagePercentage >= forceMaterializationPercentage) {
             if (latchActiveSince <= 0) latchActiveSince = now;
         } else if (latchActiveSince > 0) {
@@ -1731,6 +1735,8 @@ export interface PersistedOverflowState {
     detectedContextLimit: number;
     /** Model key that produced the detected limit, when known. */
     detectedContextLimitModelKey: string | null;
+    /** Whether the detected number is prompt-only, combined, or ambiguous. */
+    detectedContextLimitProvenance: ContextLimitProvenance;
     /** True while emergency recovery is still required. */
     needsEmergencyRecovery: boolean;
     /** Why recovery was armed; null for unarmed or untyped legacy state. */
@@ -1752,12 +1758,13 @@ export function getOverflowState(
 ): PersistedOverflowState {
     const result = db
         .prepare(
-            "SELECT detected_context_limit, detected_context_limit_model_key, needs_emergency_recovery, emergency_recovery_origin FROM session_meta WHERE session_id = ?",
+            "SELECT detected_context_limit, detected_context_limit_model_key, detected_context_limit_provenance, needs_emergency_recovery, emergency_recovery_origin FROM session_meta WHERE session_id = ?",
         )
         .get(sessionId) as
         | {
               detected_context_limit?: number;
               detected_context_limit_model_key?: string | null;
+              detected_context_limit_provenance?: string | null;
               needs_emergency_recovery?: number;
               emergency_recovery_origin?: string | null;
           }
@@ -1766,12 +1773,14 @@ export function getOverflowState(
         return {
             detectedContextLimit: 0,
             detectedContextLimitModelKey: null,
+            detectedContextLimitProvenance: "unknown",
             needsEmergencyRecovery: false,
             emergencyRecoveryOrigin: null,
         };
     }
     const storedModelKey = normalizeDetectedLimitModelKey(result.detected_context_limit_model_key);
     const requestedModelKey = normalizeDetectedLimitModelKey(modelKey);
+    const provenance = normalizeContextLimitProvenance(result.detected_context_limit_provenance);
     const limit =
         typeof result.detected_context_limit === "number" && result.detected_context_limit > 0
             ? result.detected_context_limit
@@ -1791,6 +1800,7 @@ export function getOverflowState(
     return {
         detectedContextLimit: modelMatches ? limit : 0,
         detectedContextLimitModelKey: storedModelKey,
+        detectedContextLimitProvenance: provenance,
         needsEmergencyRecovery: needs,
         emergencyRecoveryOrigin: recoveryOrigin,
     };
@@ -1808,6 +1818,7 @@ export function recordOverflowDetected(
     reportedLimit: number | undefined,
     modelKey?: string | null,
     origin: EmergencyRecoveryOrigin = "provider_overflow",
+    provenance: ContextLimitProvenance = "unknown",
 ): void {
     // Arm before the durable write so an unreadable or failed write remains fail-closed.
     emergencyRecoveryArmedSessions.add(sessionId);
@@ -1825,8 +1836,14 @@ export function recordOverflowDetected(
         }
         if (typeof reportedLimit === "number" && reportedLimit > 0) {
             db.prepare(
-                "UPDATE session_meta SET detected_context_limit = ?, detected_context_limit_model_key = ?, needs_emergency_recovery = 1, emergency_recovery_origin = ?, observed_safe_input_tokens = 0, cache_alert_sent = 0 WHERE session_id = ?",
-            ).run(reportedLimit, normalizeDetectedLimitModelKey(modelKey), origin, sessionId);
+                "UPDATE session_meta SET detected_context_limit = ?, detected_context_limit_model_key = ?, detected_context_limit_provenance = ?, needs_emergency_recovery = 1, emergency_recovery_origin = ?, observed_safe_input_tokens = 0, cache_alert_sent = 0 WHERE session_id = ?",
+            ).run(
+                reportedLimit,
+                normalizeDetectedLimitModelKey(modelKey),
+                normalizeContextLimitProvenance(provenance),
+                origin,
+                sessionId,
+            );
         } else {
             db.prepare(
                 "UPDATE session_meta SET needs_emergency_recovery = 1, emergency_recovery_origin = ?, observed_safe_input_tokens = 0, cache_alert_sent = 0 WHERE session_id = ?",
@@ -1846,13 +1863,19 @@ export function recordDetectedContextLimit(
     sessionId: string,
     reportedLimit: number,
     modelKey?: string | null,
+    provenance: ContextLimitProvenance = "unknown",
 ): void {
     if (!(reportedLimit > 0)) return;
     db.transaction(() => {
         ensureSessionMetaRow(db, sessionId);
         db.prepare(
-            "UPDATE session_meta SET detected_context_limit = ?, detected_context_limit_model_key = ?, observed_safe_input_tokens = 0, cache_alert_sent = 0 WHERE session_id = ?",
-        ).run(reportedLimit, normalizeDetectedLimitModelKey(modelKey), sessionId);
+            "UPDATE session_meta SET detected_context_limit = ?, detected_context_limit_model_key = ?, detected_context_limit_provenance = ?, observed_safe_input_tokens = 0, cache_alert_sent = 0 WHERE session_id = ?",
+        ).run(
+            reportedLimit,
+            normalizeDetectedLimitModelKey(modelKey),
+            normalizeContextLimitProvenance(provenance),
+            sessionId,
+        );
     })();
 }
 
@@ -1883,7 +1906,7 @@ export function clearDetectedContextLimit(db: Database, sessionId: string): void
     db.transaction(() => {
         ensureSessionMetaRow(db, sessionId);
         db.prepare(
-            "UPDATE session_meta SET detected_context_limit = 0, detected_context_limit_model_key = NULL WHERE session_id = ?",
+            "UPDATE session_meta SET detected_context_limit = 0, detected_context_limit_model_key = NULL, detected_context_limit_provenance = 'unknown' WHERE session_id = ?",
         ).run(sessionId);
     })();
 }

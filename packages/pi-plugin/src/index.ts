@@ -2157,11 +2157,18 @@ async function startPiMagicContextRuntime(
 				msg.model.length > 0
 					? `${msg.provider}/${msg.model}`
 					: undefined;
-			recordOverflowDetected(db, sessionId, detection.reportedLimit, modelKey);
+			recordOverflowDetected(
+				db,
+				sessionId,
+				detection.reportedLimit,
+				modelKey,
+				"provider_overflow",
+				detection.reportedLimitProvenance,
+			);
 			log(
 				`[magic-context][${sessionId}] overflow detected: reportedLimit=${
 					detection.reportedLimit ?? "?"
-				} pattern=${detection.matchedPattern ?? "?"}`,
+				} provenance=${detection.reportedLimitProvenance ?? "?"} pattern=${detection.matchedPattern ?? "?"}`,
 			);
 		} catch (err) {
 			warn("message_end: overflow detection failed:", err);

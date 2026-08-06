@@ -4,7 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { runMigrations } from "./migrations";
-import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
+import { initializeDatabase } from "./storage-db";
 import {
     getPersistedTodoPermissionDenied,
     setPersistedTodoPermissionDenied,
@@ -80,7 +80,16 @@ describe("migration v73 — durable todowrite permission verdict", () => {
         }
     });
 
-    test("LATEST_SUPPORTED_VERSION is bumped to 73", () => {
-        expect(LATEST_SUPPORTED_VERSION).toBe(73);
+    test("retains v73 in migration history after later schema upgrades", () => {
+        const db = new Database(":memory:");
+        try {
+            initializeDatabase(db);
+            runMigrations(db);
+            expect(
+                db.prepare("SELECT version FROM schema_migrations WHERE version = 73").get(),
+            ).toEqual({ version: 73 });
+        } finally {
+            closeQuietly(db);
+        }
     });
 });

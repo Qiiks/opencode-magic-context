@@ -27,6 +27,7 @@
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { ContextLimitProvenance } from "./context-limit-provenance";
 import { getMagicContextStorageDir } from "./data-path";
 import { getHarness } from "./harness";
 import { piModelRefToCanonical } from "./harness-provider-map";
@@ -56,9 +57,7 @@ export function isSaneLimit(limit: number | undefined): limit is number {
     return typeof limit === "number" && limit >= MIN_SANE_LIMIT && limit <= MAX_SANE_LIMIT;
 }
 
-export type OutputReserveConfig =
-    | number
-    | { default: number; [modelKey: string]: number };
+export type OutputReserveConfig = number | { default: number; [modelKey: string]: number };
 
 export interface ModelLimit {
     context?: number;
@@ -133,8 +132,7 @@ function loadPersistedApiCacheOnce(): void {
         const map = new Map<string, CachedModelMetadata>();
         for (const [key, persisted] of Object.entries(obj)) {
             const limit = typeof persisted === "number" ? persisted : persisted.limit;
-            const contextLimit =
-                typeof persisted === "number" ? undefined : persisted.contextLimit;
+            const contextLimit = typeof persisted === "number" ? undefined : persisted.contextLimit;
             const inputLimit = typeof persisted === "number" ? undefined : persisted.inputLimit;
             const outputLimit = typeof persisted === "number" ? undefined : persisted.outputLimit;
             const vision = typeof persisted === "number" ? false : persisted.vision === true;
@@ -215,7 +213,8 @@ function configuredOutputReserve(
     providerID: string,
     modelID: string,
 ): number | undefined {
-    if (typeof config === "number") return Number.isFinite(config) && config >= 0 ? config : undefined;
+    if (typeof config === "number")
+        return Number.isFinite(config) && config >= 0 ? config : undefined;
     if (!config) return undefined;
     for (const candidate of modelKeyLookupOrder(providerID, modelID)) {
         const value = config[candidate];
@@ -498,25 +497,38 @@ export function getSdkContextLimit(
     providerID: string,
     modelID: string,
     detectedContextLimit?: number,
+    options?: {
+        reservation?: "default" | "none";
+        detectedLimitProvenance?: ContextLimitProvenance;
+    },
 ): number | undefined {
     loadPersistedApiCacheOnce();
     const metadata = lookupMetadataWithTagFallback(apiCache, providerID, modelID);
     if (!metadata) return undefined;
     const rawContext = metadata.contextLimit ?? metadata.limit;
+    const promptOnlyDetected =
+        options?.detectedLimitProvenance === "prompt_only" && isFinitePositive(detectedContextLimit)
+            ? detectedContextLimit
+            : undefined;
     const context =
-        isFinitePositive(detectedContextLimit) && isFinitePositive(rawContext)
+        promptOnlyDetected === undefined &&
+        isFinitePositive(detectedContextLimit) &&
+        isFinitePositive(rawContext)
             ? Math.min(rawContext, detectedContextLimit)
-            : isFinitePositive(detectedContextLimit)
+            : promptOnlyDetected === undefined && isFinitePositive(detectedContextLimit)
               ? detectedContextLimit
               : rawContext;
+    const inputCandidates = [metadata.inputLimit, promptOnlyDetected].filter(isFinitePositive);
+    const input = inputCandidates.length > 0 ? Math.min(...inputCandidates) : undefined;
     return resolveLimit(
         {
             context,
-            input: metadata.inputLimit,
+            input,
             output: metadata.outputLimit,
         },
         providerID,
         modelID,
+        options?.reservation === "none" ? 0 : undefined,
     );
 }
 

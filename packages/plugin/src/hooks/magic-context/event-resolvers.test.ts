@@ -3,6 +3,8 @@ import { describe, expect, it } from "bun:test";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { updateSessionMeta } from "../../features/magic-context/storage-meta";
+import { recordDetectedContextLimit } from "../../features/magic-context/storage-meta-persisted";
+import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
@@ -45,6 +47,48 @@ describe("event-resolvers", () => {
 
             //#then
             expect(limit).toBe(128_000);
+        });
+
+        it("does not reserve output twice from a detected prompt-only ceiling", async () => {
+            const db = new Database(":memory:");
+            initializeDatabase(db);
+            runMigrations(db);
+            const sessionId = "ses-prompt-only-limit";
+            try {
+                clearModelsDevCache();
+                await refreshModelLimitsFromApi({
+                    config: {
+                        providers: async () => ({
+                            data: {
+                                providers: [
+                                    {
+                                        id: "anthropic",
+                                        models: {
+                                            claude: {
+                                                limit: { context: 200_000, output: 32_000 },
+                                            },
+                                        },
+                                    },
+                                ],
+                            },
+                        }),
+                    },
+                });
+                recordDetectedContextLimit(
+                    db,
+                    sessionId,
+                    167_000,
+                    "anthropic/claude",
+                    "prompt_only",
+                );
+
+                expect(
+                    resolveContextLimit("anthropic", "claude", { db, sessionID: sessionId }),
+                ).toBe(167_000);
+            } finally {
+                clearModelsDevCache();
+                closeQuietly(db);
+            }
         });
     });
 

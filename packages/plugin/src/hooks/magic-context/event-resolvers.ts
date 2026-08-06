@@ -3,10 +3,7 @@ import {
     getOverflowState,
     loadPersistedUsage,
 } from "../../features/magic-context/storage-meta-persisted";
-import {
-    escalationBands,
-    MAX_EXECUTE_THRESHOLD,
-} from "../../shared/escalation-bands";
+import { escalationBands, MAX_EXECUTE_THRESHOLD } from "../../shared/escalation-bands";
 import { log, sessionLog } from "../../shared/logger";
 import { getSdkContextLimit, isSaneLimit } from "../../shared/models-dev-cache";
 
@@ -16,39 +13,43 @@ export const DEFAULT_CONTEXT_LIMIT = 128_000;
 type CacheTtlConfig = string | Record<string, string>;
 
 /**
- * Resolve the effective context limit for a (providerID, modelID) pair.
- *
- * Resolution order:
- *   1. Load the raw OpenCode catalog/config model window.
- *   2. Narrow that raw window with a provider-reported overflow limit.
- *   3. Resolve the input/output/context arms into the usable safe window.
- *   4. Fall back to the conservative 128K default when metadata is unavailable.
- *
- * The session context (db + sessionID) is optional — callers that operate
- * outside a specific session (e.g. warm-up, status-bar summaries) can omit it
- * and fall back to the global cache/default.
+ * Resolve the effective context limit for a provider/model pair. By default
+ * this returns the output-reserved safe input budget. `reservation: "none"`
+ * preserves the same catalog, detected-limit, and fallback resolution while
+ * exposing the unreserved window for native-usage display metrics only.
  */
 export function resolveContextLimit(
     providerID: string | undefined,
     modelID: string | undefined,
-    ctx?: { db?: ContextDatabase; sessionID?: string },
+    ctx?: {
+        db?: ContextDatabase;
+        sessionID?: string;
+        reservation?: "default" | "none";
+    },
 ): number {
     const modelKey = resolveModelKey(providerID, modelID);
     let detected: number | undefined;
+    let detectedLimitProvenance: "prompt_only" | "combined" | "unknown" = "unknown";
     if (ctx?.db && ctx.sessionID) {
         try {
             const overflow = getOverflowState(ctx.db, ctx.sessionID, modelKey);
-            if (overflow.detectedContextLimit > 0) detected = overflow.detectedContextLimit;
+            if (overflow.detectedContextLimit > 0) {
+                detected = overflow.detectedContextLimit;
+                detectedLimitProvenance = overflow.detectedContextLimitProvenance;
+            }
         } catch {
             // Reading session meta is best-effort — fall through to the catalog.
         }
     }
 
-    // detectedContextLimit is measured wire truth for the combined window. It
-    // narrows the raw context first; output reservation is applied afterwards.
+    // Combined/unknown detections narrow the raw context before output
+    // reservation. Prompt-only detections enter the pre-carved input arm.
     const fromModelsDev =
         providerID && modelID
-            ? getSdkContextLimit(providerID, modelID, detected)
+            ? getSdkContextLimit(providerID, modelID, detected, {
+                  reservation: ctx?.reservation,
+                  detectedLimitProvenance,
+              })
             : undefined;
     return fromModelsDev ?? detected ?? DEFAULT_CONTEXT_LIMIT;
 }
@@ -79,22 +80,27 @@ export function resolveTrustedContextLimit(
 ): number | undefined {
     const modelKey = resolveModelKey(providerID, modelID);
     let detected: number | undefined;
+    let detectedLimitProvenance: "prompt_only" | "combined" | "unknown" = "unknown";
     if (ctx?.db && ctx.sessionID) {
         try {
             const overflow = getOverflowState(ctx.db, ctx.sessionID, modelKey);
             if (overflow.detectedContextLimit > 0) {
                 detected = overflow.detectedContextLimit;
+                detectedLimitProvenance = overflow.detectedContextLimitProvenance;
             }
         } catch {
             // best-effort; ignore
         }
     }
 
-    // Apply measured wire truth to the raw catalog context before reservation;
-    // comparing against an already-reserved budget would double-count output.
+    // Apply measured wire truth to the matching resolver arm. Comparing a
+    // combined detection against an already-reserved budget would double-count
+    // output, while a prompt-only detection must not reserve output again.
     const fromModelsDev =
         providerID && modelID
-            ? getSdkContextLimit(providerID, modelID, detected)
+            ? getSdkContextLimit(providerID, modelID, detected, {
+                  detectedLimitProvenance,
+              })
             : undefined;
     if (typeof fromModelsDev === "number" && fromModelsDev > 0) return fromModelsDev;
     if (detected !== undefined) return detected;

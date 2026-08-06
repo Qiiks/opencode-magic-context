@@ -19,6 +19,7 @@ const chunkMod = await import(resolve("./src/hooks/magic-context/read-session-ch
 const formatting = await import(resolve("./src/hooks/magic-context/read-session-formatting"));
 const budgets = await import(resolve("./src/hooks/magic-context/derive-budgets"));
 const stable = await import(resolve("./src/shared/stable-json"));
+const escalation = await import(resolve("./src/shared/escalation-bands"));
 
 const { resolveProtectedTailBoundary, hasRunnableCompartmentWindow } = boundaryMod as {
     resolveProtectedTailBoundary: (ctx: Record<string, unknown>) => Record<string, unknown>;
@@ -42,6 +43,9 @@ const { deriveTriggerBudget } = budgets as {
     deriveTriggerBudget: (contextLimit: number, executeThresholdPercentage: number) => number;
 };
 const { stableStringify } = stable as { stableStringify: (value: unknown) => string };
+const { escalationBands } = escalation as {
+    escalationBands: (threshold: number) => { forceMaterializationPercentage: number };
+};
 
 interface RawMessage {
     ordinal: number;
@@ -288,7 +292,10 @@ function runTsTrigger(spec: TriggerSpec): Record<string, unknown> {
                 : null,
     });
 
-    if (ctx.usage_percentage >= 80) {
+    const forceMaterializationPercentage = escalationBands(
+        ctx.execute_threshold_percentage,
+    ).forceMaterializationPercentage;
+    if (ctx.usage_percentage >= forceMaterializationPercentage) {
         if (
             spec.ctx.projected_post_drop_percentage !== null &&
             spec.ctx.projected_post_drop_percentage !== undefined &&
@@ -296,10 +303,10 @@ function runTsTrigger(spec: TriggerSpec): Record<string, unknown> {
         ) {
             return { fire: false, reason: null, consume_through_ordinal: null };
         }
-        if (hasRunnableCompartmentWindow(primary)) return fireFrom("force_80", primary);
+        if (hasRunnableCompartmentWindow(primary)) return fireFrom("force_band", primary);
         const scale = ctx.usage_percentage >= 95 ? 0.25 : 0.5;
         const scaled = tsBoundary(spec.messages, { ...ctx, trigger_budget: triggerBudget, emergency_tail_scale: scale }, `${spec.label}-scaled`);
-        if (hasRunnableCompartmentWindow(scaled)) return fireFrom("force_80", scaled);
+        if (hasRunnableCompartmentWindow(scaled)) return fireFrom("force_band", scaled);
         return { fire: false, reason: null, consume_through_ordinal: null };
     }
 
@@ -366,7 +373,6 @@ function constantsFromSource(): Record<string, number> {
         MIN_PROACTIVE_TAIL_MESSAGE_COUNT: read(files.trigger, "MIN_PROACTIVE_TAIL_MESSAGE_COUNT"),
         DEFAULT_MIN_COMMIT_CLUSTERS_FOR_TRIGGER: read(files.trigger, "DEFAULT_MIN_COMMIT_CLUSTERS_FOR_TRIGGER"),
         TAIL_SIZE_TRIGGER_MULTIPLIER: read(files.trigger, "TAIL_SIZE_TRIGGER_MULTIPLIER"),
-        FORCE_COMPARTMENT_PERCENTAGE: read(files.trigger, "FORCE_COMPARTMENT_PERCENTAGE"),
         BLOCK_UNTIL_DONE_PERCENTAGE: read(files.trigger, "BLOCK_UNTIL_DONE_PERCENTAGE"),
         MAX_COMMITS_PER_BLOCK: read(files.formatting, "MAX_COMMITS_PER_BLOCK"),
     };
@@ -417,9 +423,9 @@ const boundarySpecs = [
         flags: { floored_by_live_prompt: true, fenced_by_open_arc: false },
     },
     {
-        label: "live prompt bypass force usage",
+        label: "live prompt bypass derived force usage",
         messages: [text(1, "user", "old"), text(2, "assistant", BIG), text(3, "user", "please answer"), text(4, "assistant", BIG), text(5, "assistant", BIG)],
-        ctx: smallCtx(81),
+        ctx: smallCtx(85, { execute_threshold_percentage: 65 }),
         flags: { floored_by_live_prompt: false, fenced_by_open_arc: false },
     },
     {
@@ -438,7 +444,7 @@ const boundarySpecs = [
         label: "migration prior boundary floor",
         messages: [text(1, "user", "old"), text(2, "assistant", MID), text(3, "user", "next"), text(4, "assistant", SMALL), text(5, "assistant", SMALL)],
         ctx: smallCtx(81, { prior_boundary_ordinal: 4, migration_floor_active: true }),
-        flags: { floored_by_live_prompt: false, fenced_by_open_arc: false },
+        flags: { floored_by_live_prompt: true, fenced_by_open_arc: false },
     },
     {
         label: "emergency quarter scale",
@@ -517,14 +523,19 @@ const triggerSpecs: TriggerSpec[] = [
         ctx: triggerCtx(smallCtx(20)),
     },
     {
-        label: "force80 projected drops suppress",
+        label: "force band projected drops suppress",
         messages: [text(1, "user", "start"), text(2, "assistant", BIG), text(3, "user", "next"), text(4, "assistant", SMALL)],
-        ctx: triggerCtx(smallCtx(81), { projected_post_drop_percentage: 20 }),
+        ctx: triggerCtx(smallCtx(85, { execute_threshold_percentage: 65 }), { projected_post_drop_percentage: 20 }),
     },
     {
-        label: "force80 fires with runnable head",
+        label: "force band fires with runnable head",
         messages: [text(1, "user", "start"), text(2, "assistant", BIG), text(3, "user", "next"), text(4, "assistant", BIG), text(5, "assistant", SMALL)],
-        ctx: triggerCtx(smallCtx(81)),
+        ctx: triggerCtx(smallCtx(85, { execute_threshold_percentage: 65 })),
+    },
+    {
+        label: "raised threshold usage below force band no-fire",
+        messages: [text(1, "user", "start"), text(2, "assistant", BIG), text(3, "user", "next"), text(4, "assistant", BIG), text(5, "assistant", SMALL)],
+        ctx: triggerCtx(smallCtx(86, { execute_threshold_percentage: 90 })),
     },
     {
         label: "proactive pressure fires above floor",
@@ -646,7 +657,7 @@ for (const c of trigger_cases) {
     }
 }
 
-const requiredTriggerReasons = ["tail_size", "commit_clusters", "force_80", "projected_headroom"];
+const requiredTriggerReasons = ["tail_size", "commit_clusters", "force_band", "projected_headroom"];
 const firedReasons = new Set(
     trigger_cases
         .filter((c) => c.expected.fire === true)
