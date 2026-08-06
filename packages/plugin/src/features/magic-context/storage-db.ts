@@ -85,7 +85,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 73;
+export const LATEST_SUPPORTED_VERSION = 74;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -1207,6 +1207,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       is_subagent INTEGER DEFAULT 0,
       last_context_percentage REAL DEFAULT 0,
       last_input_tokens INTEGER DEFAULT 0,
+      detected_context_limit_provenance TEXT NOT NULL DEFAULT 'unknown',
       observed_safe_input_tokens INTEGER NOT NULL DEFAULT 0,
       cache_alert_sent INTEGER NOT NULL DEFAULT 0,
       times_execute_threshold_reached INTEGER DEFAULT 0,
@@ -1585,6 +1586,12 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // when parseReportedLimit() extracts a number; cleared on model switch.
     ensureColumn(db, "session_meta", "detected_context_limit", "INTEGER DEFAULT 0");
     ensureColumn(db, "session_meta", "detected_context_limit_model_key", "TEXT");
+    ensureColumn(
+        db,
+        "session_meta",
+        "detected_context_limit_provenance",
+        "TEXT NOT NULL DEFAULT 'unknown'",
+    );
     // True when the session needs emergency recovery after either a provider
     // overflow or proactive model shrink. The persisted origin distinguishes
     // provider-proven abort eligibility from best-effort proactive recovery.

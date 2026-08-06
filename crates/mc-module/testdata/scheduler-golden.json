@@ -24,6 +24,7 @@
       "maximum prompt length is \\d+",
       "reduce the length of the messages",
       "maximum context length is \\d+ tokens",
+      "maximum model length is \\d+",
       "exceeds the limit of \\d+",
       "exceeds the available context size",
       "greater than the context length",
@@ -421,6 +422,7 @@
       "expected": {
         "is_overflow": true,
         "reported_limit": 200000,
+        "reported_limit_provenance": "prompt_only",
         "matched_pattern": "prompt is too long"
       }
     },
@@ -440,6 +442,7 @@
       "expected": {
         "is_overflow": true,
         "reported_limit": 128000,
+        "reported_limit_provenance": "combined",
         "matched_pattern": "maximum context length is \\d+ tokens"
       }
     },
@@ -459,6 +462,7 @@
       "expected": {
         "is_overflow": true,
         "reported_limit": 256000,
+        "reported_limit_provenance": "prompt_only",
         "matched_pattern": "maximum prompt length is \\d+"
       }
     },
@@ -478,7 +482,19 @@
       "expected": {
         "is_overflow": true,
         "reported_limit": 32768,
+        "reported_limit_provenance": "combined",
         "matched_pattern": "maximum context length is \\d+ tokens"
+      }
+    },
+    {
+      "label": "vllm-model",
+      "input": "maximum model length is 8192 tokens",
+      "expected_message": "maximum model length is 8192 tokens",
+      "expected": {
+        "is_overflow": true,
+        "reported_limit": 8192,
+        "reported_limit_provenance": "combined",
+        "matched_pattern": "maximum model length is \\d+"
       }
     },
     {
@@ -488,6 +504,7 @@
       "expected": {
         "is_overflow": true,
         "reported_limit": 64000,
+        "reported_limit_provenance": "unknown",
         "matched_pattern": "exceeds the limit of \\d+"
       }
     },
@@ -552,6 +569,7 @@
       "expected": {
         "is_overflow": true,
         "reported_limit": 4096,
+        "reported_limit_provenance": "combined",
         "matched_pattern": "context length is only \\d+ tokens"
       }
     },
@@ -562,6 +580,7 @@
       "expected": {
         "is_overflow": true,
         "reported_limit": 8000,
+        "reported_limit_provenance": "combined",
         "matched_pattern": "input length.*exceeds.*context length"
       }
     },
@@ -581,6 +600,7 @@
       "expected": {
         "is_overflow": true,
         "reported_limit": 32768,
+        "reported_limit_provenance": "combined",
         "matched_pattern": "too large for model with \\d+ maximum context length"
       }
     },
@@ -657,47 +677,82 @@
     {
       "label": "maximum prompt length",
       "message": "the maximum prompt length is 256000 tokens",
-      "expected": 256000
+      "expected": {
+        "value": 256000,
+        "provenance": "prompt_only"
+      }
     },
     {
       "label": "maximum context length",
       "message": "maximum context length is 32768 tokens",
-      "expected": 32768
+      "expected": {
+        "value": 32768,
+        "provenance": "combined"
+      }
+    },
+    {
+      "label": "maximum model length",
+      "message": "maximum model length is 8192 tokens",
+      "expected": {
+        "value": 8192,
+        "provenance": "combined"
+      }
     },
     {
       "label": "context length is only",
       "message": "context length is only 4096 tokens",
-      "expected": 4096
+      "expected": {
+        "value": 4096,
+        "provenance": "combined"
+      }
     },
     {
       "label": "exceeds limit",
       "message": "Prompt exceeds the limit of 64000 tokens",
-      "expected": 64000
+      "expected": {
+        "value": 64000,
+        "provenance": "unknown"
+      }
     },
     {
       "label": "anthropic maximum",
       "message": "prompt is too long: 210000 tokens > 200000 maximum",
-      "expected": 200000
+      "expected": {
+        "value": 200000,
+        "provenance": "prompt_only"
+      }
     },
     {
       "label": "anthropic max",
       "message": "prompt is too long: 210000 tokens > 200000 max",
-      "expected": 200000
+      "expected": {
+        "value": 200000,
+        "provenance": "prompt_only"
+      }
     },
     {
       "label": "anthropic limit",
       "message": "prompt is too long: 210000 tokens > 200000 limit",
-      "expected": 200000
+      "expected": {
+        "value": 200000,
+        "provenance": "prompt_only"
+      }
     },
     {
       "label": "mistral",
       "message": "Too large for model with 32768 maximum context length",
-      "expected": 32768
+      "expected": {
+        "value": 32768,
+        "provenance": "combined"
+      }
     },
     {
       "label": "plausible floor accepted",
       "message": "maximum context length is 1024 tokens",
-      "expected": 1024
+      "expected": {
+        "value": 1024,
+        "provenance": "combined"
+      }
     },
     {
       "label": "below plausible floor rejected",
@@ -706,7 +761,10 @@
     {
       "label": "plausible ceiling accepted",
       "message": "maximum context length is 10000000 tokens",
-      "expected": 10000000
+      "expected": {
+        "value": 10000000,
+        "provenance": "combined"
+      }
     },
     {
       "label": "above plausible ceiling rejected",

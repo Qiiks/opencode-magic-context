@@ -44,13 +44,9 @@ describe("output-token reservation", () => {
     });
 
     test("reserves output for Anthropic shared windows", () => {
-        expect(
-            resolveLimit(
-                { context: 1_000_000, output: 64_000 },
-                "anthropic",
-                "claude",
-            ),
-        ).toBe(936_000);
+        expect(resolveLimit({ context: 1_000_000, output: 64_000 }, "anthropic", "claude")).toBe(
+            936_000,
+        );
     });
 
     test("makes the reporter's 95% send safe under the shared provider wall", () => {
@@ -65,21 +61,13 @@ describe("output-token reservation", () => {
 
     test("caps absurd catalog output at 25% of context", () => {
         expect(
-            resolveLimit(
-                { context: 100_000, output: 60_000 },
-                "anthropic",
-                "absurd-output",
-            ),
+            resolveLimit({ context: 100_000, output: 60_000 }, "anthropic", "absurd-output"),
         ).toBe(75_000);
     });
 
     test("keeps proven separate-quota Gemini windows unchanged", () => {
         expect(
-            resolveLimit(
-                { context: 1_048_576, output: 65_536 },
-                "google",
-                "gemini-2.5-pro",
-            ),
+            resolveLimit({ context: 1_048_576, output: 65_536 }, "google", "gemini-2.5-pro"),
         ).toBe(1_048_576);
         expect(
             resolveLimit(
@@ -91,22 +79,12 @@ describe("output-token reservation", () => {
     });
 
     test("output_reserve overrides shared and separate quota defaults", () => {
-        expect(
-            resolveLimit(
-                { context: 100_000, output: 20_000 },
-                "anthropic",
-                "claude",
-                0,
-            ),
-        ).toBe(100_000);
+        expect(resolveLimit({ context: 100_000, output: 20_000 }, "anthropic", "claude", 0)).toBe(
+            100_000,
+        );
         const perModelReserve = { default: 4_000, "google/gemini": 8_000 };
         expect(
-            resolveLimit(
-                { context: 100_000, output: 20_000 },
-                "google",
-                "gemini",
-                perModelReserve,
-            ),
+            resolveLimit({ context: 100_000, output: 20_000 }, "google", "gemini", perModelReserve),
         ).toBe(92_000);
         expect(
             resolveLimit(
@@ -222,7 +200,18 @@ describe("models-dev-cache (SDK-only)", () => {
             ]),
         );
 
-        expect(getSdkContextLimit("anthropic", "claude", 120_000)).toBe(100_000);
+        expect(
+            getSdkContextLimit("anthropic", "claude", 120_000, {
+                detectedLimitProvenance: "combined",
+            }),
+        ).toBe(100_000);
+        // A provider-reported prompt ceiling is already pre-carved. Treating it
+        // as combined would subtract the 20K output allowance a second time.
+        expect(
+            getSdkContextLimit("anthropic", "claude", 120_000, {
+                detectedLimitProvenance: "prompt_only",
+            }),
+        ).toBe(120_000);
     });
 
     test("matches a tagged ollama model against its tag-less SDK entry", async () => {

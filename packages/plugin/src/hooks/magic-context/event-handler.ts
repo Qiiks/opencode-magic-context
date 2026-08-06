@@ -327,11 +327,13 @@ export function createEventHandler(deps: EventHandlerDeps) {
                             deps.db,
                             errInfo.sessionID,
                             detection.reportedLimit,
+                            undefined,
+                            detection.reportedLimitProvenance,
                         );
                     }
                     sessionLog(
                         errInfo.sessionID,
-                        `overflow detected on subagent: reportedLimit=${detection.reportedLimit ?? "unknown"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only (subagents cannot run historian)`,
+                        `overflow detected on subagent: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only (subagents cannot run historian)`,
                     );
                     return;
                 }
@@ -351,19 +353,28 @@ export function createEventHandler(deps: EventHandlerDeps) {
                             deps.db,
                             errInfo.sessionID,
                             detection.reportedLimit,
+                            undefined,
+                            detection.reportedLimitProvenance,
                         );
                     }
                     sessionLog(
                         errInfo.sessionID,
-                        `overflow detected in compaction-off mode: reportedLimit=${detection.reportedLimit ?? "unknown"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only (recovery disarmed; native compaction owns the window)`,
+                        `overflow detected in compaction-off mode: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only (recovery disarmed; native compaction owns the window)`,
                     );
                     return;
                 }
                 dropSlot(errInfo.sessionID, "overflow-recovery-arm");
-                recordOverflowDetected(deps.db, errInfo.sessionID, detection.reportedLimit);
+                recordOverflowDetected(
+                    deps.db,
+                    errInfo.sessionID,
+                    detection.reportedLimit,
+                    undefined,
+                    "provider_overflow",
+                    detection.reportedLimitProvenance,
+                );
                 sessionLog(
                     errInfo.sessionID,
-                    `overflow detected via session.error: reportedLimit=${detection.reportedLimit ?? "unknown"} pattern=${detection.matchedPattern ?? "n/a"} (previousRecovery=${existing.needsEmergencyRecovery})`,
+                    `overflow detected via session.error: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"} (previousRecovery=${existing.needsEmergencyRecovery})`,
                 );
                 deps.onSessionCacheInvalidated?.(errInfo.sessionID);
             } catch (error) {
@@ -437,11 +448,12 @@ export function createEventHandler(deps: EventHandlerDeps) {
                                     info.sessionID,
                                     detection.reportedLimit,
                                     overflowModelKey,
+                                    detection.reportedLimitProvenance,
                                 );
                             }
                             sessionLog(
                                 info.sessionID,
-                                `overflow detected on subagent via message.updated: reportedLimit=${detection.reportedLimit ?? "unknown"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only`,
+                                `overflow detected on subagent via message.updated: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only`,
                             );
                         } else if (deps.compactionOff) {
                             // Compaction-off: record the limit only, never arm
@@ -455,11 +467,12 @@ export function createEventHandler(deps: EventHandlerDeps) {
                                     info.sessionID,
                                     detection.reportedLimit,
                                     overflowModelKey,
+                                    detection.reportedLimitProvenance,
                                 );
                             }
                             sessionLog(
                                 info.sessionID,
-                                `overflow detected in compaction-off mode via message.updated: reportedLimit=${detection.reportedLimit ?? "unknown"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only`,
+                                `overflow detected in compaction-off mode via message.updated: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only`,
                             );
                         } else {
                             dropSlot(info.sessionID, "overflow-recovery-arm");
@@ -468,10 +481,12 @@ export function createEventHandler(deps: EventHandlerDeps) {
                                 info.sessionID,
                                 detection.reportedLimit,
                                 overflowModelKey,
+                                "provider_overflow",
+                                detection.reportedLimitProvenance,
                             );
                             sessionLog(
                                 info.sessionID,
-                                `overflow detected via message.updated: reportedLimit=${detection.reportedLimit ?? "unknown"} pattern=${detection.matchedPattern ?? "n/a"}`,
+                                `overflow detected via message.updated: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"}`,
                             );
                             deps.onSessionCacheInvalidated?.(info.sessionID);
                         }

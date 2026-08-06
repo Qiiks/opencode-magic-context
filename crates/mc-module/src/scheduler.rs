@@ -42,6 +42,7 @@ const OVERFLOW_PATTERN_SOURCES: &[&str] = &[
     r"maximum prompt length is \d+",
     r"reduce the length of the messages",
     r"maximum context length is \d+ tokens",
+    r"maximum model length is \d+",
     r"exceeds the limit of \d+",
     r"exceeds the available context size",
     r"greater than the context length",
@@ -57,16 +58,47 @@ const OVERFLOW_PATTERN_SOURCES: &[&str] = &[
     r"context size has been exceeded",
 ];
 
-const LIMIT_EXTRACTION_PATTERN_SOURCES: &[&str] = &[
-    r"maximum prompt length is (\d+)",
-    r"maximum context length is (\d+) tokens?",
-    r"context length is only (\d+) tokens?",
-    r"exceeds the limit of (\d+)",
-    r"too large for model with (\d+) maximum context length",
-    r"context size.*(\d+) tokens?",
-    r"exceeds? the context length of (\d+)",
-    r">\s*(\d+)\s*(?:tokens?\s*)?(?:maximum|max|limit)\b",
-    r"max(?:imum)?.*context.*?(\d+)",
+const LIMIT_EXTRACTION_PATTERN_SOURCES: &[(&str, ContextLimitProvenance)] = &[
+    (
+        r"maximum prompt length is (\d+)",
+        ContextLimitProvenance::PromptOnly,
+    ),
+    (
+        r"maximum context length is (\d+) tokens?",
+        ContextLimitProvenance::Combined,
+    ),
+    (
+        r"maximum model length is (\d+)",
+        ContextLimitProvenance::Combined,
+    ),
+    (
+        r"context length is only (\d+) tokens?",
+        ContextLimitProvenance::Combined,
+    ),
+    (
+        r"exceeds the limit of (\d+)",
+        ContextLimitProvenance::Unknown,
+    ),
+    (
+        r"too large for model with (\d+) maximum context length",
+        ContextLimitProvenance::Combined,
+    ),
+    (
+        r"context size.*(\d+) tokens?",
+        ContextLimitProvenance::Combined,
+    ),
+    (
+        r"exceeds? the context length of (\d+)",
+        ContextLimitProvenance::Combined,
+    ),
+    (
+        r">\s*(\d+)\s*(?:tokens?\s*)?(?:maximum|max|limit)\b",
+        ContextLimitProvenance::PromptOnly,
+    ),
+    (
+        r"max(?:imum)?.*context.*?(\d+)",
+        ContextLimitProvenance::Unknown,
+    ),
 ];
 
 /// A parse error for cache idle TTL strings.
@@ -242,6 +274,27 @@ impl LatchState {
     }
 }
 
+/// Provenance of a numeric limit extracted from a provider overflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextLimitProvenance {
+    /// The provider already reported its accepted input/prompt ceiling.
+    PromptOnly,
+    /// The provider reported a combined input-plus-output context window.
+    Combined,
+    /// The message does not identify which accounting convention it uses.
+    Unknown,
+}
+
+/// A plausible provider-reported limit with its accounting provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportedContextLimit {
+    /// Numeric token ceiling.
+    pub value: u64,
+    /// Accounting convention attached to the extraction pattern.
+    pub provenance: ContextLimitProvenance,
+}
+
 /// Provider context-overflow detection result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OverflowDetection {
@@ -249,6 +302,8 @@ pub struct OverflowDetection {
     pub is_overflow: bool,
     /// Reported provider context limit in tokens, when one is extractable and plausible.
     pub reported_limit: Option<u64>,
+    /// Accounting convention for `reported_limit`, when a limit was extracted.
+    pub reported_limit_provenance: Option<ContextLimitProvenance>,
     /// Source text of the first overflow regex that matched, for diagnostics.
     pub matched_pattern: Option<String>,
 }
@@ -298,11 +353,18 @@ pub struct SchedulerOutcome {
     pub deferred_execute: Option<DeferredExecute>,
     /// Detected provider context limit in tokens, when overflow text reports one.
     pub detected_limit: Option<u64>,
+    /// Accounting convention attached to `detected_limit`.
+    pub detected_limit_provenance: Option<ContextLimitProvenance>,
 }
 
 struct CompiledPattern {
     source: &'static str,
     regex: Regex,
+}
+
+struct CompiledLimitPattern {
+    regex: Regex,
+    provenance: ContextLimitProvenance,
 }
 
 /// Parse a cache idle TTL string into milliseconds.
@@ -554,6 +616,7 @@ pub fn detect_overflow(error_text: &str) -> OverflowDetection {
         return OverflowDetection {
             is_overflow: false,
             reported_limit: None,
+            reported_limit_provenance: None,
             matched_pattern: None,
         };
     }
@@ -568,13 +631,16 @@ pub fn detect_overflow(error_text: &str) -> OverflowDetection {
         return OverflowDetection {
             is_overflow: false,
             reported_limit: None,
+            reported_limit_provenance: None,
             matched_pattern: None,
         };
     }
 
+    let reported = parse_reported_limit(error_text);
     OverflowDetection {
         is_overflow: true,
-        reported_limit: parse_reported_limit(error_text),
+        reported_limit: reported.map(|limit| limit.value),
+        reported_limit_provenance: reported.map(|limit| limit.provenance),
         matched_pattern: matched.map(|pattern| pattern.source.to_string()),
     }
 }
@@ -586,12 +652,12 @@ pub fn detect_overflow_value(error: &serde_json::Value) -> OverflowDetection {
 }
 
 /// Extract a plausible reported provider context limit from an error message.
-pub fn parse_reported_limit(message: &str) -> Option<u64> {
+pub fn parse_reported_limit(message: &str) -> Option<ReportedContextLimit> {
     if message.is_empty() {
         return None;
     }
-    for regex in limit_patterns() {
-        let Some(captures) = regex.captures(message) else {
+    for pattern in limit_patterns() {
+        let Some(captures) = pattern.regex.captures(message) else {
             continue;
         };
         let Some(raw) = captures.get(1).map(|m| m.as_str()) else {
@@ -601,7 +667,10 @@ pub fn parse_reported_limit(message: &str) -> Option<u64> {
             continue;
         };
         if (MIN_PLAUSIBLE_CONTEXT_LIMIT..=MAX_PLAUSIBLE_CONTEXT_LIMIT).contains(&value) {
-            return Some(value);
+            return Some(ReportedContextLimit {
+                value,
+                provenance: pattern.provenance,
+            });
         }
     }
     None
@@ -668,14 +737,17 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
         threshold,
         inputs.now_ms,
     );
-    let detected_limit = inputs.overflow_error_text.as_deref().and_then(|text| {
-        let detection = detect_overflow(text);
-        if detection.is_overflow {
-            detection.reported_limit
-        } else {
-            None
-        }
-    });
+    let overflow_detection = inputs
+        .overflow_error_text
+        .as_deref()
+        .map(detect_overflow)
+        .filter(|detection| detection.is_overflow);
+    let detected_limit = overflow_detection
+        .as_ref()
+        .and_then(|detection| detection.reported_limit);
+    let detected_limit_provenance = overflow_detection
+        .as_ref()
+        .and_then(|detection| detection.reported_limit_provenance);
 
     SchedulerOutcome {
         pass,
@@ -684,6 +756,7 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
         drain_latch,
         deferred_execute,
         detected_limit,
+        detected_limit_provenance,
     }
 }
 
@@ -779,13 +852,16 @@ fn overflow_patterns() -> &'static [CompiledPattern] {
         .as_slice()
 }
 
-fn limit_patterns() -> &'static [Regex] {
-    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+fn limit_patterns() -> &'static [CompiledLimitPattern] {
+    static PATTERNS: OnceLock<Vec<CompiledLimitPattern>> = OnceLock::new();
     PATTERNS
         .get_or_init(|| {
             LIMIT_EXTRACTION_PATTERN_SOURCES
                 .iter()
-                .map(|source| compile_case_insensitive(source))
+                .map(|(source, provenance)| CompiledLimitPattern {
+                    regex: compile_case_insensitive(source),
+                    provenance: *provenance,
+                })
                 .collect()
         })
         .as_slice()
@@ -890,6 +966,7 @@ mod tests {
     struct OverflowExpected {
         is_overflow: bool,
         reported_limit: Option<u64>,
+        reported_limit_provenance: Option<ContextLimitProvenance>,
         matched_pattern: Option<String>,
     }
 
@@ -897,7 +974,7 @@ mod tests {
     struct LimitCase {
         label: String,
         message: String,
-        expected: Option<u64>,
+        expected: Option<ReportedContextLimit>,
     }
 
     fn assert_close(got: f64, expected: f64, label: &str) {
@@ -1062,6 +1139,11 @@ mod tests {
             assert_eq!(
                 got.reported_limit, case.expected.reported_limit,
                 "reported limit {}",
+                case.label
+            );
+            assert_eq!(
+                got.reported_limit_provenance, case.expected.reported_limit_provenance,
+                "reported limit provenance {}",
                 case.label
             );
             assert_eq!(

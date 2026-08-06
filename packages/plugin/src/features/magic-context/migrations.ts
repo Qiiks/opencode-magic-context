@@ -2726,6 +2726,20 @@ const MIGRATIONS: Migration[] = [
             }
         },
     },
+    {
+        version: 74,
+        description: "persist detected context-limit provenance",
+        up(db: Database): void {
+            if (tableExists(db, "session_meta")) {
+                ensureColumn(
+                    db,
+                    "session_meta",
+                    "detected_context_limit_provenance",
+                    "TEXT NOT NULL DEFAULT 'unknown'",
+                );
+            }
+        },
+    },
 ];
 
 /**

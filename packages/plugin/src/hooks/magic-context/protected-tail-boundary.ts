@@ -6,6 +6,7 @@ import {
     resetProtectedTailNoEligibleHead,
 } from "../../features/magic-context/storage-meta-persisted";
 import { getAllStatusTagTokenTotalsFlat } from "../../features/magic-context/storage-tags";
+import { escalationBands } from "../../shared/escalation-bands";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { deriveTriggerBudget } from "./derive-budgets";
@@ -227,6 +228,9 @@ export function selectPerRunCap(
         Math.round((snapshot.contextLimit * snapshot.executeThresholdPercentage) / 100),
     );
     if (snapshot.usagePercentage >= 95) return force95PerRunCap(usable, snapshot.N);
+    // Capacity sizing deliberately retains its historical 80% tier. For execute
+    // thresholds from 84% through 90%, this cap no longer coincides with the
+    // derived force-band transition.
     if (snapshot.usagePercentage >= 80) return force80PerRunCap(usable, snapshot.N);
     return nonEmergencyPerRunCap(usable, snapshot.N);
 }
@@ -550,15 +554,18 @@ export function resolveProtectedTailBoundary(
     // production on a tool-heavy session: the in-flight turn's suffix was all
     // assistant/tool messages, so pure token sizing left the current prompt
     // eligible — structurally impossible under v2's user-turn rule, regained
-    // here). Emergency-scaled re-resolution (force_80/95 second attempt) may
+    // here). Emergency-scaled re-resolution (force-band/95 second attempt) may
     // deliberately cross it: a sparse session with one user turn and a huge
     // assistant tail must stay compactable under genuine pressure (#132),
     // and overflow is strictly worse than narrating the live prompt.
-    // The floor lifts at force pressure (>=80%) for the same reason — the
+    // The floor lifts at the derived force pressure for the same reason — the
     // sparse #132 session (one user turn, huge assistant tail) must expose a
     // runnable head on the force path's FIRST attempt, not only after the
     // emergency-scaled retry.
-    if (!ctx.emergencyTailScale && usagePercentage < 80) {
+    const forceMaterializationPercentage = escalationBands(
+        ctx.executeThresholdPercentage,
+    ).forceMaterializationPercentage;
+    if (!ctx.emergencyTailScale && usagePercentage < forceMaterializationPercentage) {
         let lastMeaningfulUserOrdinal = 0;
         for (let i = messages.length - 1; i >= 0; i--) {
             const message = messages[i];
@@ -881,7 +888,10 @@ export function hasProtectedEligibleHead(snapshot: ProtectedTailBoundarySnapshot
 
 export function hasRunnableCompartmentWindow(snapshot: ProtectedTailBoundarySnapshot): boolean {
     if (snapshot.offset >= snapshot.protectedTailStart) return false;
-    if (snapshot.usagePercentage >= 80 || snapshot.emergencyTailScale) {
+    const forceMaterializationPercentage = escalationBands(
+        snapshot.executeThresholdPercentage,
+    ).forceMaterializationPercentage;
+    if (snapshot.usagePercentage >= forceMaterializationPercentage || snapshot.emergencyTailScale) {
         return (
             snapshot.trueRawEligibleTokens >= deriveMinForceEligibleTokens(snapshot.N) ||
             snapshot.eligibleEndOrdinal > snapshot.offset
@@ -974,7 +984,12 @@ export function recordHighPressureNoEligibleHead(
     db: Database,
     snapshot: ProtectedTailBoundarySnapshot,
 ): number {
-    if (snapshot.usagePercentage < 80 && !snapshot.emergencyTailScale) return 0;
+    const forceMaterializationPercentage = escalationBands(
+        snapshot.executeThresholdPercentage,
+    ).forceMaterializationPercentage;
+    if (snapshot.usagePercentage < forceMaterializationPercentage && !snapshot.emergencyTailScale) {
+        return 0;
+    }
     return recordProtectedTailNoEligibleHead(db, snapshot.sessionId);
 }
 

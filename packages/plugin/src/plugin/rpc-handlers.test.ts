@@ -205,6 +205,52 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
 });
 
 describe("buildSidebarSnapshot — context limit", () => {
+    test("keeps native full-window usage distinct from the reserved budget metric", async () => {
+        const db = createTestDb();
+        try {
+            const sessionId = "ses-sidebar-native-full-window";
+            db.prepare(
+                `INSERT INTO session_meta (
+                    session_id, last_input_tokens, last_context_percentage,
+                    system_prompt_tokens, memory_block_cache, memory_block_count
+                ) VALUES (?, 120000, 80, 0, '', 0)`,
+            ).run(sessionId);
+            await refreshModelLimitsFromApi({
+                config: {
+                    providers: async () => ({
+                        data: {
+                            providers: [
+                                {
+                                    id: "test-provider",
+                                    models: {
+                                        "reserved-model": {
+                                            limit: { context: 200_000, output: 64_000 },
+                                        },
+                                    },
+                                },
+                            ],
+                        },
+                    }),
+                },
+            });
+            const live = createLiveSessionState();
+            live.liveModelBySession.set(sessionId, {
+                providerID: "test-provider",
+                modelID: "reserved-model",
+            });
+
+            const snapshot = buildSidebarSnapshot(db, sessionId, process.cwd(), live, 4000);
+
+            // Output reserve is capped at 25%: 200K raw -> 150K safe input.
+            expect(snapshot.contextLimit).toBe(150_000);
+            expect(snapshot.usagePercentage).toBe(80);
+            expect(snapshot.native_context_usage_percentage).toBe(60);
+            expect(snapshot.native_context_usage_percentage).not.toBe(snapshot.usagePercentage);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("populates contextLimit from the active session model", async () => {
         const db = createTestDb();
         try {

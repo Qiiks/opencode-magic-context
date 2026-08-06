@@ -556,6 +556,65 @@ describe("checkCompartmentTrigger", () => {
         expect(result).toEqual({ shouldFire: false });
     });
 
+    it("keeps raised-threshold usage below the force band on the proactive ladder", () => {
+        useTempDataHome("compartment-trigger-derived-force-band-");
+        const sessionId = "ses-derived-force-band";
+        createOpenCodeDb(sessionId, [
+            { id: "m-1", role: "user", text: "a ".repeat(3500) },
+            { id: "m-2", role: "assistant", text: "b ".repeat(3500) },
+            { id: "m-3", role: "user", text: "live prompt" },
+            { id: "m-4", role: "assistant", text: "live response" },
+        ]);
+        const db = openDatabase();
+        insertCoveredMessageTag(db, sessionId, "m-1", 1, 7_000);
+
+        // With T=90 the force band is 92. Reverting the trigger to literal 80
+        // would force-fire this runnable head instead of reaching the proactive floor.
+        expect(
+            checkCompartmentTrigger(
+                db,
+                sessionId,
+                makeSessionMeta(sessionId, 85),
+                { percentage: 86, inputTokens: 17_200 },
+                85,
+                90,
+                6_500,
+                undefined,
+                undefined,
+                undefined,
+                20_000,
+            ),
+        ).toEqual({ shouldFire: false });
+    });
+
+    it("force-fires at the unchanged default-config band", () => {
+        useTempDataHome("compartment-trigger-default-force-band-");
+        const sessionId = "ses-default-force-band";
+        createOpenCodeDb(sessionId, [
+            { id: "m-1", role: "user", text: "a ".repeat(3500) },
+            { id: "m-2", role: "assistant", text: "b ".repeat(3500) },
+            { id: "m-3", role: "user", text: "live prompt" },
+            { id: "m-4", role: "assistant", text: "live response" },
+        ]);
+        const db = openDatabase();
+
+        expect(
+            checkCompartmentTrigger(
+                db,
+                sessionId,
+                makeSessionMeta(sessionId, 84),
+                { percentage: 85, inputTokens: 17_000 },
+                84,
+                65,
+                6_500,
+                undefined,
+                undefined,
+                undefined,
+                20_000,
+            ),
+        ).toMatchObject({ shouldFire: true, reason: "force_band" });
+    });
+
     it("does not fire when only unsummarized history is inside the protected tail", () => {
         //#given: 3 messages, all 3 are user turns so protected tail covers all
         useTempDataHome("compartment-trigger-protected-only-");

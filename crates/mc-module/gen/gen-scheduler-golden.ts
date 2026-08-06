@@ -295,6 +295,7 @@ const overflowInputs: Array<[string, unknown]> = [
     ["xai", "the maximum prompt length is 256000 tokens but the prompt was 300000"],
     ["groq", "Please reduce the length of the messages or completion"],
     ["openrouter", "the maximum context length is 32768 tokens"],
+    ["vllm-model", "maximum model length is 8192 tokens"],
     ["copilot", "Prompt exceeds the limit of 64000 tokens"],
     ["llamacpp", "Prompt exceeds the available context size"],
     ["lmstudio", "Prompt greater than the context length of the model"],
@@ -323,6 +324,7 @@ const overflow_cases = overflowInputs.map(([label, input]) => {
         expected: {
             is_overflow: detection.isOverflow,
             reported_limit: detection.reportedLimit,
+            reported_limit_provenance: detection.reportedLimitProvenance,
             matched_pattern: detection.matchedPattern,
         },
     };
@@ -331,6 +333,7 @@ const overflow_cases = overflowInputs.map(([label, input]) => {
 const limitMessages = [
     ["maximum prompt length", "the maximum prompt length is 256000 tokens"],
     ["maximum context length", "maximum context length is 32768 tokens"],
+    ["maximum model length", "maximum model length is 8192 tokens"],
     ["context length is only", "context length is only 4096 tokens"],
     ["exceeds limit", "Prompt exceeds the limit of 64000 tokens"],
     ["anthropic maximum", "prompt is too long: 210000 tokens > 200000 maximum"],
@@ -377,8 +380,8 @@ const constants = {
     emergency_drain_fallback_exit_percentage: storageMeta.EMERGENCY_DRAIN_FALLBACK_EXIT_PERCENTAGE,
     emergency_drain_failure_backoff_ms: storageMeta.EMERGENCY_DRAIN_FAILURE_BACKOFF_MS,
     emergency_drain_max_latch_ms: storageMeta.EMERGENCY_DRAIN_MAX_LATCH_MS,
-    min_plausible_context_limit: parseReportedLimit("maximum context length is 1024 tokens"),
-    max_plausible_context_limit: parseReportedLimit("maximum context length is 10000000 tokens"),
+    min_plausible_context_limit: parseReportedLimit("maximum context length is 1024 tokens")?.value,
+    max_plausible_context_limit: parseReportedLimit("maximum context length is 10000000 tokens")?.value,
     overflow_pattern_sources: OVERFLOW_PATTERNS.map((p) => p.source),
 };
 
