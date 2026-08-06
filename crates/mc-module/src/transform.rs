@@ -1047,6 +1047,12 @@ pub struct TransformResponse {
     /// subagent, defer-only protocol-error, and pending-build-skew responses.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lineage_switch_consumed_id: Option<u64>,
+    /// Outcome of the resolved descent edge ("descended", "replay", or a
+    /// terminal refusal). Present exactly when an edge was resolved this
+    /// pass; lets the sender distinguish inheritance from refusal without
+    /// reading this module's store.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub lineage_descent_disposition: Option<String>,
     /// Prior lineage tail used as the provisional ordinal base for native adapters.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ordinal_continuation_base: Option<u64>,
@@ -1099,6 +1105,7 @@ impl TransformResponse {
             committed: false,
             coverage_ordinal: None,
             lineage_switch_consumed_id: None,
+            lineage_descent_disposition: None,
             ordinal_continuation_base: None,
             historian: None,
             ck_messages: None,
@@ -1129,6 +1136,7 @@ impl TransformResponse {
             committed: false,
             coverage_ordinal: None,
             lineage_switch_consumed_id: None,
+            lineage_descent_disposition: None,
             ordinal_continuation_base: None,
             historian: None,
             ck_messages: Some(
@@ -1598,9 +1606,15 @@ fn normalize_synthetic_todo_ingress(req: &TransformRequest) -> Option<TransformR
 const CONTINUATION_SUMMARY_PREFIX: &str =
     "This session is being continued from a previous conversation";
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct LineagePassState {
     acknowledge_edge: Option<u64>,
+    /// Wire-visible outcome of the edge resolution ("descended", "replay",
+    /// or a terminal refusal such as "cycle_detected"). Without it the
+    /// sender cannot distinguish inheritance from refusal: consumed_id acks
+    /// terminal dispositions too, and reading our store is not an option
+    /// for the proxy seat (drive round-1 finding).
+    disposition: Option<&'static str>,
     ordinal_base: Option<u64>,
     force_hard: bool,
 }
@@ -1854,6 +1868,7 @@ fn apply_once(
             ));
         }
         lineage_state.acknowledge_edge = outcome.acknowledge.then_some(ingress_req.descent_edge_id);
+        lineage_state.disposition = Some(outcome.disposition.as_str());
         lineage_state.ordinal_base = outcome.prior_last_ordinal;
         lineage_state.force_hard = outcome.materialization_required;
         if let Some(base) = lineage_state.ordinal_base {
@@ -3669,6 +3684,7 @@ fn apply_once(
             committed: commit_required,
             coverage_ordinal: meta.coverage_ordinal,
             lineage_switch_consumed_id: lineage_state.acknowledge_edge,
+            lineage_descent_disposition: lineage_state.disposition.map(str::to_string),
             ordinal_continuation_base: meta.ordinal_continuation_base,
             historian: None,
             ck_messages: Some(ck_messages),
@@ -19903,6 +19919,11 @@ mod tests {
         let first = run(&store, &request, &spine());
         assert_eq!(first.action, "HARD");
         assert_eq!(first.lineage_switch_consumed_id, Some(101));
+        // The disposition rides beside the ack so the sender can tell
+        // inheritance from a terminal refusal without reading our store
+        // (drive round-1: consumed_id alone acked a cycle_detected refusal
+        // and read as success from the proxy seat).
+        assert_eq!(first.lineage_descent_disposition.as_deref(), Some("descended"));
         assert_eq!(first.ordinal_continuation_base, Some(10));
         assert_eq!(first.coverage_ordinal, Some(11));
         assert!(!first.reconcile_pending);
@@ -19939,6 +19960,8 @@ mod tests {
         let second = run(&store, &request, &spine());
         assert_eq!(second.action, "SOFT+");
         assert_eq!(second.lineage_switch_consumed_id, Some(101));
+        // The write-free replay arm also names its outcome.
+        assert_eq!(second.lineage_descent_disposition.as_deref(), Some("replay"));
         assert!(!second.committed, "durable replay must stay write-free");
         assert_eq!(store.load("A").unwrap().meta.revert_epoch, prior_epoch + 1);
     }
