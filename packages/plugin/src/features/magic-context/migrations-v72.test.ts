@@ -92,14 +92,7 @@ describe("migration v72 — per-session compaction mode record (issue #266)", ()
         try {
             initializeDatabase(db);
             runMigrations(db);
-            expect(() =>
-                setCompactionModeRecord(
-                    db,
-                    "ses-bad",
-                    // biome-ignore lint/suspicious/noExplicitAny: testing the defensive guard
-                    "disabled" as any,
-                ),
-            ).toThrow();
+            expect(() => setCompactionModeRecord(db, "ses-bad", "disabled" as any)).toThrow();
         } finally {
             closeQuietly(db);
         }

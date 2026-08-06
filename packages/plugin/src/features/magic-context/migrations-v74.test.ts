@@ -35,9 +35,7 @@ describe("migration v74: detected context-limit provenance", () => {
             initializeDatabase(db);
             runMigrations(db);
 
-            expect(columnNames(db, "session_meta")).toContain(
-                "detected_context_limit_provenance",
-            );
+            expect(columnNames(db, "session_meta")).toContain("detected_context_limit_provenance");
             expect(LATEST_SUPPORTED_VERSION).toBe(74);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
         } finally {
@@ -74,7 +72,9 @@ describe("migration v74: detected context-limit provenance", () => {
                 detected_context_limit_provenance: "unknown",
             });
             expect(
-                db.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 74").get() as {
+                db
+                    .prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 74")
+                    .get() as {
                     count: number;
                 },
             ).toEqual({ count: 1 });

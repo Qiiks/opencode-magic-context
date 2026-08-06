@@ -118,11 +118,7 @@ export function createMessagesTransformHandler(args: {
         const compactionOffInputSnapshot = args.compactionOff ? [...output.messages] : null;
         const restoreCompactionOffInput = (): void => {
             if (compactionOffInputSnapshot && output.messages !== compactionOffInputSnapshot) {
-                output.messages.splice(
-                    0,
-                    output.messages.length,
-                    ...compactionOffInputSnapshot,
-                );
+                output.messages.splice(0, output.messages.length, ...compactionOffInputSnapshot);
             }
         };
 

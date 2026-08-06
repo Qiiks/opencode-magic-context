@@ -203,12 +203,9 @@ export async function runCompressCues(args: CompressCuesArgs): Promise<CompressC
             // never hand a chunk less than the floor (a slice too small for the
             // model guarantees a timeout).
             const sliceMs = computeChunkSliceMs(remainingMs, chunks.length - i);
-            const outcome = await compressOneChunk(
-                args,
-                chunks[i]!,
-                sliceMs,
-                abortController.signal,
-            );
+            const chunk = chunks[i];
+            if (!chunk) break;
+            const outcome = await compressOneChunk(args, chunk, sliceMs, abortController.signal);
             result.compressed += outcome.compressed;
             result.skipped += outcome.skipped;
             result.remaining -= outcome.compressed;

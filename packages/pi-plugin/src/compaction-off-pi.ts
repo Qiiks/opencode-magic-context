@@ -1,3 +1,4 @@
+import { COMPACTION_ENABLED_PATH } from "@magic-context/core/config/agent-disable";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
 	clearCachedM0M1,
@@ -18,7 +19,6 @@ import {
 	resolveCompactionModeRecord,
 	setCompactionModeRecord,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
-import { COMPACTION_ENABLED_PATH } from "@magic-context/core/config/agent-disable";
 import { sessionLog } from "@magic-context/core/shared/logger";
 
 /** Exact refusal text shared by Pi's context-management commands. */

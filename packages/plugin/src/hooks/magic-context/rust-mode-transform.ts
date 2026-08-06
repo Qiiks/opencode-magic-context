@@ -710,14 +710,35 @@ async function prepareRustMemoryAuthority(args: {
     // locals would sever `this` and only fail at runtime (test fakes are object
     // literals and cannot catch the difference).
     const authorityModule: AuthorityModuleClient = {
-        authorityStatus: (request) => module.authorityStatus!({ ...request, projectRoot }),
-        authorityPrepare: (request) => module.authorityPrepare!({ ...request, projectRoot }),
-        authoritySeed: (request) => module.authoritySeed!({ ...request, projectRoot }),
+        authorityStatus: (request) => {
+            const method = module.authorityStatus;
+            if (!method) throw new MemoryAuthorityUnavailableError("authority.status unavailable");
+            return method.call(module, { ...request, projectRoot });
+        },
+        authorityPrepare: (request) => {
+            const method = module.authorityPrepare;
+            if (!method) throw new MemoryAuthorityUnavailableError("authority.prepare unavailable");
+            return method.call(module, { ...request, projectRoot });
+        },
+        authoritySeed: (request) => {
+            const method = module.authoritySeed;
+            if (!method) throw new MemoryAuthorityUnavailableError("authority.seed unavailable");
+            return method.call(module, { ...request, projectRoot });
+        },
         authorityDrain: module.authorityDrain
-            ? (request) => module.authorityDrain!({ ...request, projectRoot })
+            ? (request) => {
+                  const method = module.authorityDrain;
+                  if (!method)
+                      throw new MemoryAuthorityUnavailableError("authority.drain unavailable");
+                  return method.call(module, { ...request, projectRoot });
+              }
             : undefined,
         mirrorPull: module.mirrorPull
-            ? (request) => module.mirrorPull!({ ...request, projectRoot })
+            ? (request) => {
+                  const method = module.mirrorPull;
+                  if (!method) throw new MemoryAuthorityUnavailableError("mirror.pull unavailable");
+                  return method.call(module, { ...request, projectRoot });
+              }
             : undefined,
     };
     const contextStoreUuid = ensureContextStoreUuid(db);
@@ -1512,12 +1533,13 @@ export function createRustModeTransform(
                         };
                     }
                 }
+                const stateSyncCapabilities = options.moduleClient.stateSyncCapabilities;
                 const stateSyncResult = await syncModuleState({
                     client: {
                         call: callModule,
-                        stateSyncCapabilities: options.moduleClient.stateSyncCapabilities
+                        stateSyncCapabilities: stateSyncCapabilities
                             ? (capabilityArgs) =>
-                                  options.moduleClient.stateSyncCapabilities!(capabilityArgs)
+                                  stateSyncCapabilities.call(options.moduleClient, capabilityArgs)
                             : undefined,
                     },
                     state,
@@ -1955,14 +1977,16 @@ export function createRustModeTransform(
                     sessionLog(sessionId, "rust memory mirror-back failed (ignored):", error);
                 }
             }
-            if (options.moduleClient.getCompartmentsAfter) {
+            const getCompartmentsAfter = options.moduleClient.getCompartmentsAfter;
+            if (getCompartmentsAfter) {
                 try {
                     await mirrorModuleCompartments({
                         db: deps.db,
                         sessionId,
                         reader: {
                             getCompartmentsAfter: (mirroredSessionId, afterSequence) =>
-                                options.moduleClient.getCompartmentsAfter!(
+                                getCompartmentsAfter.call(
+                                    options.moduleClient,
                                     mirroredSessionId,
                                     afterSequence,
                                 ),

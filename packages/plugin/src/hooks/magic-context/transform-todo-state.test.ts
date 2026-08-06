@@ -258,9 +258,9 @@ describe("todo state synthesis — live permission cache boundaries", () => {
         const deniedBustMessages = buildMessages();
         const priorSyntheticPart = buildSyntheticTodoPart(ACTIVE_TODOS_JSON);
         if (!priorSyntheticPart) throw new Error("expected active synthetic part");
-        deniedBustMessages.find((message) => message.info.id === "msg-asst-2")?.parts.push(
-            priorSyntheticPart,
-        );
+        deniedBustMessages
+            .find((message) => message.info.id === "msg-asst-2")
+            ?.parts.push(priorSyntheticPart);
         await applyTodoSynthesis({
             db,
             sessionId,

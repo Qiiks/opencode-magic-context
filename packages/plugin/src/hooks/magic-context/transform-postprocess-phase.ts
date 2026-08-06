@@ -81,11 +81,7 @@ import {
 } from "./strip-content";
 import { buildEditSupersessionReclaim, buildSupersessionReclaimOps } from "./supersession-reclaim";
 import { byteSize, prependTag } from "./tag-content-primitives";
-import {
-    buildSyntheticTodoPart,
-    isSyntheticTodoPart,
-    type SyntheticTodoPart,
-} from "./todo-view";
+import { buildSyntheticTodoPart, isSyntheticTodoPart, type SyntheticTodoPart } from "./todo-view";
 import {
     advanceToolReclaimWatermarkToCurrentMax,
     buildSyntheticToolReclaimOps,
@@ -994,7 +990,9 @@ export async function runPostTransformPhase(
     }
     if (compartmentRunning && hasPendingUserOps) {
         if (bypassCompartmentGate) {
-            const bypassReason = forceMaterialization ? `emergency >=${args.forceMaterializationPercentage}%` : "m0 hard fold";
+            const bypassReason = forceMaterialization
+                ? `emergency >=${args.forceMaterializationPercentage}%`
+                : "m0 hard fold";
             sessionLog(
                 args.sessionId,
                 `transform: compartment-gate bypass (${bypassReason}) — applying ${pendingOps.length} pending ops while compartment agent runs (${args.contextUsage.percentage.toFixed(1)}%)`,

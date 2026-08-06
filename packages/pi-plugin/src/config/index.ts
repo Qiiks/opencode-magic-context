@@ -6,9 +6,7 @@ import {
 	resolveLegacyConfigSourcesForHarness,
 } from "@magic-context/core/config/migrate-config-location";
 import "@magic-context/core/config/prune-config-leaf";
-import { setOutputReserveConfig } from "@magic-context/core/shared/models-dev-cache";
 import { existsSync, readFileSync } from "node:fs";
-
 import { migrateLegacyAgentEnabledInMemory } from "@magic-context/core/config/agent-disable";
 import { migrateDreamerV2 } from "@magic-context/core/config/migrate-dreamer-v2";
 import { migrateLegacyExperimental } from "@magic-context/core/config/migrate-experimental";
@@ -23,6 +21,7 @@ import {
 	MagicContextConfigSchema,
 } from "@magic-context/core/config/schema/magic-context";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
+import { setOutputReserveConfig } from "@magic-context/core/shared/models-dev-cache";
 import { parse as parseJsonc } from "comment-json";
 
 export interface LoadPiConfigOptions {

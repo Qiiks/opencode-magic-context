@@ -31,12 +31,12 @@ import {
 import { setRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { COMPACTION_OFF_COMMAND_UNAVAILABLE } from "../compaction-off-pi";
-import { resolvePiUsableContextLimit } from "../pi-context-limit";
 import {
 	signalPiDeferredHistoryRefresh,
 	signalPiDeferredMaterialization,
 } from "../context-handler";
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
+import { resolvePiUsableContextLimit } from "../pi-context-limit";
 import { runPiHistorian } from "../pi-historian-runner";
 import { isPiRecompInFlight } from "../pi-recomp-runner";
 import { readPiSessionMessages } from "../read-session-pi";

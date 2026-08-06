@@ -15,9 +15,7 @@ import { afterEach, describe, expect, it, mock } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import {
-    replaceAllCompartments,
-} from "../../features/magic-context/compartment-storage";
+import { replaceAllCompartments } from "../../features/magic-context/compartment-storage";
 import { insertMemory } from "../../features/magic-context/memory";
 import {
     __resetProjectIdentityForTests,
@@ -208,7 +206,7 @@ function allText(messages: TestMessage[]): string {
     return messages
         .map((message) =>
             message.parts
-                .map((part) => (part.type === "text" ? part.text : part.state?.output ?? ""))
+                .map((part) => (part.type === "text" ? part.text : (part.state?.output ?? "")))
                 .join("\n"),
         )
         .join("\n");

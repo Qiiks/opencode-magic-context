@@ -181,7 +181,7 @@ export function createFailClosedController(options?: {
                 (blockedPassCount === 1 || blockedPassCount % reprobeEveryN === 0);
             if (shouldReprobe) {
                 try {
-                    const healed = await input.tryReopen!();
+                    const healed = await input.tryReopen?.();
                     if (healed) {
                         reason = null;
                         blockedPassCount = 0;
