@@ -24,6 +24,7 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
 import { ensureContextStoreUuid } from "./context-authority";
+import type { FailClosedBlockingProcess } from "./fail-closed-block";
 import { runMigrations, runMigrationsWithRetry } from "./migrations";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import {
@@ -56,12 +57,14 @@ let lastSchemaFenceRejection: { persistedVersion: number; supportedVersion: numb
 // shared schema while a live OpenCode server still holds the old build in memory.
 // The port files are the server's durable liveness signal; this latch lets callers
 // distinguish that intentional refusal from ordinary storage failures.
-let lastMigrationOnOpenRefusal: {
+export interface MigrationOnOpenRefusal {
     persistedVersion: number;
     supportedVersion: number;
     serverPids: number[];
     unreadableFile?: string;
-} | null = null;
+}
+
+let lastMigrationOnOpenRefusal: MigrationOnOpenRefusal | null = null;
 
 export function getSchemaFenceRejection(): {
     persistedVersion: number;
@@ -70,12 +73,7 @@ export function getSchemaFenceRejection(): {
     return lastSchemaFenceRejection;
 }
 
-export function getMigrationOnOpenRefusal(): {
-    persistedVersion: number;
-    supportedVersion: number;
-    serverPids: number[];
-    unreadableFile?: string;
-} | null {
+export function getMigrationOnOpenRefusal(): MigrationOnOpenRefusal | null {
     return lastMigrationOnOpenRefusal;
 }
 
@@ -361,6 +359,7 @@ export function enforceSchemaFence(
 ): boolean {
     const persistedVersion = getPersistedSchemaVersion(db);
     if (persistedVersion <= latestSupportedVersion) {
+        lastSchemaFenceRejection = null;
         return true;
     }
     lastSchemaFenceRejection = { persistedVersion, supportedVersion: latestSupportedVersion };
@@ -455,6 +454,13 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
         }
     }
     return { state: "stale", serverPids: [], staleFiles };
+}
+
+/** Return the live OpenCode servers that would block an on-open migration. */
+export function getLiveMigrationBlockingProcesses(storageDir: string): FailClosedBlockingProcess[] {
+    const discovery = inspectRpcServerDiscovery(storageDir);
+    if (discovery.state !== "live") return [];
+    return discovery.serverPids.map((pid) => ({ harness: "OpenCode server", pid }));
 }
 
 /**
@@ -1901,6 +1907,8 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
     const explicitDbPath = options?.dbPath !== undefined;
     const { dbDir, dbPath } = resolveDatabasePath(options?.dbPath);
     const latestSupportedVersion = getRuntimeLatestSupportedVersion(options);
+    lastSchemaFenceRejection = null;
+    lastMigrationOnOpenRefusal = null;
     const existing = databases.get(dbPath);
     if (existing) {
         if (!enforceSchemaFence(existing, dbPath, latestSupportedVersion)) {
@@ -1960,6 +1968,8 @@ export async function openDatabaseAsync(
     const explicitDbPath = options?.dbPath !== undefined;
     const { dbDir, dbPath } = resolveDatabasePath(options?.dbPath);
     const latestSupportedVersion = getRuntimeLatestSupportedVersion(options);
+    lastSchemaFenceRejection = null;
+    lastMigrationOnOpenRefusal = null;
     const existing = databases.get(dbPath);
     if (existing) {
         if (!enforceSchemaFence(existing, dbPath, latestSupportedVersion)) return null;
