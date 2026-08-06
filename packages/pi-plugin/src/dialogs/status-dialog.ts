@@ -15,7 +15,10 @@ import { getMemoryCount } from "@magic-context/core/features/magic-context/memor
 import { parseCacheTtl } from "@magic-context/core/features/magic-context/scheduler";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
-import { getSessionWorkMetrics } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import {
+	getOverflowState,
+	getSessionWorkMetrics,
+} from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { getNotes } from "@magic-context/core/features/magic-context/storage-notes";
 import { getTagsBySession } from "@magic-context/core/features/magic-context/storage-tags";
 import {
@@ -26,6 +29,7 @@ import { formatBytes } from "@magic-context/core/hooks/magic-context/format-byte
 import { computeM0BlockTokens } from "@magic-context/core/hooks/magic-context/m0-token-breakdown";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { countCompartmentsNeedingUpgrade } from "@magic-context/core/hooks/magic-context/upgrade-reminder";
+import { resolvePiUsableContextLimit } from "../pi-context-limit";
 import {
 	formatThresholdClampNote,
 	formatThresholdPercent,
@@ -401,16 +405,26 @@ export function buildPiStatusDetail(
 	const meta = getOrCreateSessionMeta(deps.db, sessionId);
 	const inputTokens =
 		typeof usage?.tokens === "number" ? usage.tokens : meta.lastInputTokens;
-	const usagePercentage =
-		typeof usage?.percent === "number"
-			? usage.percent
-			: meta.lastContextPercentage;
+	let detectedContextLimit: number | undefined;
+	try {
+		const detected = getOverflowState(deps.db, sessionId).detectedContextLimit;
+		if (detected > 0) detectedContextLimit = detected;
+	} catch {
+		// Status remains available when overflow metadata cannot be read.
+	}
 	const contextLimit =
-		typeof usage?.contextWindow === "number" && usage.contextWindow > 0
-			? usage.contextWindow
-			: usagePercentage > 0
-				? Math.round(inputTokens / (usagePercentage / 100))
-				: 0;
+		resolvePiUsableContextLimit({
+			rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
+			model: ctx.model,
+			detectedContextLimit,
+		}) ??
+		(meta.lastContextPercentage > 0
+			? Math.round(inputTokens / (meta.lastContextPercentage / 100))
+			: 0);
+	const usagePercentage =
+		contextLimit > 0 && inputTokens > 0
+			? (inputTokens / contextLimit) * 100
+			: meta.lastContextPercentage;
 
 	const compartments = getCompartments(deps.db, sessionId);
 	const metaRow = readSessionMetaRow(deps.db, sessionId);

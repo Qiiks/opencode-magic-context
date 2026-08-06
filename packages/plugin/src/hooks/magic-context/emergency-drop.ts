@@ -1,14 +1,14 @@
 // Tiered target-headroom emergency tool-output drop (Phase 2).
 //
 // This is the EMERGENCY floor that replaces the old `dropAllTools` nuke at the
-// 85% force-materialize pass. It is need-aware (tier-ordered) and target-driven
+// derived force-materialize pass. It is need-aware (tier-ordered) and target-driven
 // (reclaim down to ~30% of working space) instead of need-blind ("drop all" /
 // "older than X"). Selection is PURE here; the harness applies the returned
 // plan (drop primitive + `updateTagStatus(...,"dropped")` + watermark persist),
 // so OpenCode and Pi run identical selection logic.
 //
 // CACHE CONTRACT (see .alfonso/plans/ctx-reduce-phase2-v3.md):
-//   - The caller MUST invoke this only on the ≥85% force-materialize pass (a
+//   - The caller MUST invoke this only on the ≥derived force-materialize pass (a
 //     cache-busting pass, never a defer pass).
 //   - Each tag is dropped AT MOST ONCE: candidates are gated on
 //     `tagNumber > priorWatermark` AND `status==="active"`, and the watermark
@@ -28,7 +28,7 @@ export const TIER_RECENCY_RESERVE = 0.2;
 /**
  * Don't bust the cache for a trivial reclaim. If the computed reclaim is at or
  * below this, the pass is a no-op (combined with the watermark, this prevents
- * 85%-94.9% oscillation).
+ * force-band-to-94.9% oscillation).
  */
 export const EMERGENCY_REARM_MIN_TOKENS = 2000;
 
@@ -115,7 +115,7 @@ export function estimateEmergencyDropReclaimTokens(tag: EmergencyDropTag): numbe
  *   non-droppable tool tags). Only their token sum matters — it makes
  *   `fixedFloor` the true irreducible prefix. Passing a narrower set (e.g.
  *   tool-only) folds real conversation/reasoning tail into the "floor",
- *   raising the target and systematically under-evicting at ≥85%.
+ *   raising the target and systematically under-evicting at the derived force band.
  * - `tags`: the evictable candidates — active tool tags whose drop target
  *   would actually reclaim bytes (caller pre-filters on `canDrop()` so no
  *   phantom tag is counted as reclaimed).
@@ -175,8 +175,8 @@ export function planEmergencyDrop(input: {
 
     // Idempotence latch. After a drop the wire is reduced, but the provider
     // hasn't re-measured it — `currentTotalInputTokens` stays at the pre-drop
-    // value until the next assistant response. A second ≥85% pass on that SAME
-    // stale reading would recompute the floor from the now-smaller active tail
+    // value until the next assistant response. A second pass at the derived force band
+    // using that same stale reading would recompute the floor from the now-smaller active tail
     // and over-drop the rest of the tail (busting the cache again). So once we
     // have dropped at a given usage sample, no-op until a FRESH sample arrives
     // (the reading changes). New measured pressure ⇒ different sample ⇒ release.

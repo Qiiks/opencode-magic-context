@@ -249,6 +249,24 @@ the harness I/O differs:
 
 ---
 
+## 9a. Safe context limits reserve output tokens through one shared rule
+
+**OpenCode:** model metadata supplies `limit.context`, `limit.input`, and
+`limit.output`. A smaller `input` is already pre-carved; otherwise the shared
+resolver subtracts output capacity (capped at 25% of context), except for the
+proven separate-quota Google family.
+
+**Pi:** the raw context comes from `ctx.getContextUsage().contextWindow` or
+`ctx.model.contextWindow`, and output capacity comes from `ctx.model.maxTokens`.
+Pi sends both through the same `resolveLimit` rule (including
+`google-antigravity` and user `output_reserve` handling) before pressure,
+history budgets, status displays, or Rust wire input uses the value. In both
+harnesses an overflow-detected limit narrows the raw combined window before
+output reservation, preventing a detected wire truth from being compared with
+an already-reserved budget.
+
+---
+
 ## 9b. Pi floors persisted pressure with live forward usage
 
 **OpenCode:** pressure is refreshed per step through `message.updated` /

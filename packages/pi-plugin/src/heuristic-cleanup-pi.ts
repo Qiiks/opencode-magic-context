@@ -87,7 +87,7 @@ export interface PiHeuristicCleanupConfig {
 	staleReduceStripEnabled: boolean;
 	/**
 	 * Tiered target-headroom emergency drop (Phase 2). Provided only on the
-	 * ≥85% force-materialize (cache-busting) pass; undefined on routine execute
+	 * derived force-band materialize (cache-busting) pass; undefined on routine execute
 	 * passes (routine age-based tool drops were removed). Mirrors OpenCode's
 	 * `applyHeuristicCleanup` emergency config.
 	 */
@@ -302,7 +302,7 @@ export function applyPiHeuristicCleanup(
 
 	// ── Pass 1: tiered target-headroom emergency drop ─────────────────
 	// Replaces the old need-blind aged-drop + dropAllTools nuke. Runs only when
-	// the caller supplies `emergency` (≥85% cache-busting pass). Selection is
+	// the caller supplies `emergency` (derived force-band cache-busting pass). Selection is
 	// pure (`planEmergencyDrop`); we apply it and advance the persisted watermark
 	// so each tag drops once. Mirrors OpenCode `applyHeuristicCleanup`.
 	if (config.emergency) {

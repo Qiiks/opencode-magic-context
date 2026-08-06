@@ -42,7 +42,7 @@ export function applyHeuristicCleanup(
     config: {
         protectedTags: number;
         /**
-         * Tiered target-headroom emergency drop. Provided only on the ≥85%
+         * Tiered target-headroom emergency drop. Provided only on the the derived force band
          * force-materialize (cache-busting) pass; undefined on routine execute
          * passes (Phase 2 removed routine age-based tool drops entirely). When
          * present, the emergency drop runs before dedup/injection-strip.
@@ -89,7 +89,7 @@ export function applyHeuristicCleanup(
 
     // ── Tiered target-headroom emergency drop (Phase 2) ──
     // Replaces the old need-blind routine age-drop + `dropAllTools` nuke. Runs
-    // only when the caller supplies `emergency` (i.e. ≥85% force-materialize
+    // only when the caller supplies `emergency` (i.e. the derived force band force-materialize
     // cache-busting pass). Selection is pure (`planEmergencyDrop`); we apply the
     // returned plan and advance the persisted watermark so each tag drops once.
     if (config.emergency) {

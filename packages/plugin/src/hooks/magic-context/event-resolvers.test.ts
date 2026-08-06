@@ -171,11 +171,11 @@ describe("event-resolvers", () => {
             expect(resolveExecuteThreshold(50, undefined, 65)).toBe(50);
         });
 
-        it("caps any resolved value at 80%", () => {
-            expect(resolveExecuteThreshold(95, "openai/gpt-4o", 65)).toBe(80);
+        it("caps any resolved value at 90%", () => {
+            expect(resolveExecuteThreshold(95, "openai/gpt-4o", 65)).toBe(90);
             expect(
                 resolveExecuteThreshold({ default: 95, "openai/gpt-4o": 90 }, "openai/gpt-4o", 65),
-            ).toBe(80);
+            ).toBe(90);
         });
 
         it("prefers exact provider/model key when present", () => {
@@ -305,15 +305,15 @@ describe("event-resolvers", () => {
             expect(result).toBe(37.5);
         });
 
-        it("clamps token value above 80% × contextLimit and still returns capped percentage", () => {
-            //#when — 500K requested on 200K model: cap is 160K (80% of 200K) = 80%
+        it("clamps token value above 90% × contextLimit and still returns capped percentage", () => {
+            //#when — 500K requested on 200K model: cap is 180K (90% of 200K) = 90%
             const result = resolveExecuteThreshold(65, "some/model", 65, {
                 tokensConfig: { "some/model": 500_000 },
                 contextLimit: 200_000,
             });
 
-            //#then — clamped to 80% max
-            expect(result).toBe(80);
+            //#then — clamped to 90% max
+            expect(result).toBe(90);
         });
 
         it("falls through to percentage config when tokens config is missing", () => {
@@ -426,17 +426,17 @@ describe("event-resolvers", () => {
         });
 
         it("reports mode='tokens' with absoluteTokens equal to clamp cap when over-cap", () => {
-            //#when — 500K requested on 200K model → clamp to 160K (80%)
+            //#when — 500K requested on 200K model → clamp to 180K (90%)
             const detail = resolveExecuteThresholdDetail(65, "some/model", 65, {
                 tokensConfig: { "some/model": 500_000 },
                 contextLimit: 200_000,
                 sessionId: "ses-test-clamp-detail",
             });
 
-            //#then — tokens won, clamped to cap, percentage = 80
+            //#then — tokens won, clamped to cap, percentage = 90
             expect(detail.mode).toBe("tokens");
-            expect(detail.percentage).toBe(80);
-            expect(detail.absoluteTokens).toBe(160_000);
+            expect(detail.percentage).toBe(90);
+            expect(detail.absoluteTokens).toBe(180_000);
         });
 
         it("guards against NaN contextLimit (runtime division hazard) — falls through to percentage", () => {
@@ -513,7 +513,7 @@ describe("event-resolvers", () => {
         });
 
         it("sets clamped + configuredValue when a tokens config is reduced to the cap (#241)", () => {
-            //#when — 190K requested on a 128K model → cap is 80% × 128K = 102.4K
+            //#when — 190K requested on a 128K model → cap is 90% × 128K = 115.2K
             const detail = resolveExecuteThresholdDetail(65, "some/model", 65, {
                 tokensConfig: { "some/model": 190_000 },
                 contextLimit: 128_000,
@@ -524,12 +524,12 @@ describe("event-resolvers", () => {
             expect(detail.mode).toBe("tokens");
             expect(detail.clamped).toBe(true);
             expect(detail.configuredValue).toBe(190_000);
-            expect(detail.absoluteTokens).toBe(102_400);
-            expect(detail.percentage).toBe(80);
+            expect(detail.absoluteTokens).toBe(115_200);
+            expect(detail.percentage).toBe(90);
         });
 
         it("leaves clamped unset when a tokens config fits under the cap (#241)", () => {
-            //#when — 100K on a 200K model = 50%, well under the 80% cap
+            //#when — 100K on a 200K model = 50%, well under the 90% cap
             const detail = resolveExecuteThresholdDetail(65, "some/model", 65, {
                 tokensConfig: { "some/model": 100_000 },
                 contextLimit: 200_000,
@@ -542,15 +542,15 @@ describe("event-resolvers", () => {
             expect(detail.absoluteTokens).toBe(100_000);
         });
 
-        it("sets clamped + configuredValue when a percentage config is capped at 80 (#241)", () => {
-            //#when — a runtime-derived percentage above the 80% cap
+        it("sets clamped + configuredValue when a percentage config is capped at 90 (#241)", () => {
+            //#when — a runtime-derived percentage above the 90% cap
             const detail = resolveExecuteThresholdDetail(95, "some/model", 65);
 
-            //#then — capped to 80, original 95 surfaced for display
+            //#then — capped to 90, original 95 surfaced for display
             expect(detail.mode).toBe("percentage");
             expect(detail.clamped).toBe(true);
             expect(detail.configuredValue).toBe(95);
-            expect(detail.percentage).toBe(80);
+            expect(detail.percentage).toBe(90);
         });
 
         it("leaves clamped unset for an in-range percentage config (#241)", () => {

@@ -3,11 +3,15 @@ import {
     getOverflowState,
     loadPersistedUsage,
 } from "../../features/magic-context/storage-meta-persisted";
+import {
+    escalationBands,
+    MAX_EXECUTE_THRESHOLD,
+} from "../../shared/escalation-bands";
 import { log, sessionLog } from "../../shared/logger";
 import { getSdkContextLimit, isSaneLimit } from "../../shared/models-dev-cache";
 
+export { escalationBands, MAX_EXECUTE_THRESHOLD };
 export const DEFAULT_CONTEXT_LIMIT = 128_000;
-export const MAX_EXECUTE_THRESHOLD = 80;
 
 type CacheTtlConfig = string | Record<string, string>;
 
@@ -15,12 +19,10 @@ type CacheTtlConfig = string | Record<string, string>;
  * Resolve the effective context limit for a (providerID, modelID) pair.
  *
  * Resolution order:
- *   1. Detected limit from a prior overflow error, when smaller than the
- *      configured/cache limit. Providers report the REAL limit in the error
- *      message, which is authoritative for the current deployment.
- *   2. OpenCode's models.dev cache (overlaid with user's
- *      `provider.*.models.*.limit.context`).
- *   3. Conservative default (128k).
+ *   1. Load the raw OpenCode catalog/config model window.
+ *   2. Narrow that raw window with a provider-reported overflow limit.
+ *   3. Resolve the input/output/context arms into the usable safe window.
+ *   4. Fall back to the conservative 128K default when metadata is unavailable.
  *
  * The session context (db + sessionID) is optional — callers that operate
  * outside a specific session (e.g. warm-up, status-bar summaries) can omit it
@@ -31,26 +33,24 @@ export function resolveContextLimit(
     modelID: string | undefined,
     ctx?: { db?: ContextDatabase; sessionID?: string },
 ): number {
-    const fromModelsDev =
-        providerID && modelID ? getSdkContextLimit(providerID, modelID) : undefined;
-    const baseline = fromModelsDev ?? DEFAULT_CONTEXT_LIMIT;
     const modelKey = resolveModelKey(providerID, modelID);
-
+    let detected: number | undefined;
     if (ctx?.db && ctx.sessionID) {
         try {
             const overflow = getOverflowState(ctx.db, ctx.sessionID, modelKey);
-            // A detected limit only wins when it is smaller than the baseline —
-            // providers never under-report their real limit. If the baseline is
-            // already accurate, no need to downgrade.
-            if (overflow.detectedContextLimit > 0 && overflow.detectedContextLimit < baseline) {
-                return overflow.detectedContextLimit;
-            }
+            if (overflow.detectedContextLimit > 0) detected = overflow.detectedContextLimit;
         } catch {
-            // Reading session meta is best-effort — fall through to baseline.
+            // Reading session meta is best-effort — fall through to the catalog.
         }
     }
 
-    return baseline;
+    // detectedContextLimit is measured wire truth for the combined window. It
+    // narrows the raw context first; output reservation is applied afterwards.
+    const fromModelsDev =
+        providerID && modelID
+            ? getSdkContextLimit(providerID, modelID, detected)
+            : undefined;
+    return fromModelsDev ?? detected ?? DEFAULT_CONTEXT_LIMIT;
 }
 
 /**
@@ -77,10 +77,7 @@ export function resolveTrustedContextLimit(
     modelID: string | undefined,
     ctx?: { db?: ContextDatabase; sessionID?: string },
 ): number | undefined {
-    const fromModelsDev =
-        providerID && modelID ? getSdkContextLimit(providerID, modelID) : undefined;
     const modelKey = resolveModelKey(providerID, modelID);
-
     let detected: number | undefined;
     if (ctx?.db && ctx.sessionID) {
         try {
@@ -93,16 +90,14 @@ export function resolveTrustedContextLimit(
         }
     }
 
-    // A detected (real) limit overrides the cache only when smaller, because
-    // providers never under-report. When models.dev has no entry, a detected
-    // limit is the next trusted signal we have.
-    if (typeof fromModelsDev === "number" && fromModelsDev > 0) {
-        if (detected !== undefined && detected < fromModelsDev) return detected;
-        return fromModelsDev;
-    }
-    if (detected !== undefined) {
-        return detected;
-    }
+    // Apply measured wire truth to the raw catalog context before reservation;
+    // comparing against an already-reserved budget would double-count output.
+    const fromModelsDev =
+        providerID && modelID
+            ? getSdkContextLimit(providerID, modelID, detected)
+            : undefined;
+    if (typeof fromModelsDev === "number" && fromModelsDev > 0) return fromModelsDev;
+    if (detected !== undefined) return detected;
 
     // Usage reports are trusted only for the model that produced them. A
     // session-scoped limit from a previous model must not leak across a switch.
@@ -152,7 +147,7 @@ export interface ExecuteThresholdOptions {
      *  overrides the percentage-based threshold. */
     tokensConfig?: ExecuteThresholdTokensConfig;
     /** Required when `tokensConfig` is provided — used to convert tokens → percentage
-     *  and to clamp values above 80% × context_limit. */
+     *  and to clamp values above 90% × context_limit. */
     contextLimit?: number;
     /** Session ID for warn logs when clamping. If absent, warns to global log. */
     sessionId?: string;
@@ -161,18 +156,18 @@ export interface ExecuteThresholdOptions {
 export type ExecuteThresholdMode = "percentage" | "tokens";
 
 export interface ExecuteThresholdDetail {
-    /** Effective execute threshold as a percentage (0–80). Downstream math keys off this. */
+    /** Effective execute threshold as a percentage (0–90). Downstream math keys off this. */
     percentage: number;
     /** Which source was authoritative: tokens config (when matched + valid context) or percentage. */
     mode: ExecuteThresholdMode;
-    /** When mode is "tokens", the absolute token value after clamping (≤ 80% × contextLimit). */
+    /** When mode is "tokens", the absolute token value after clamping (≤ 90% × contextLimit). */
     absoluteTokens?: number;
     /** The config key that matched, if any (for display/debugging). `"default"` when default fallback. */
     matchedKey?: string;
     /**
      * True when the user's configured value exceeded the safe cap and was reduced.
-     * Tokens mode: configured tokens > 80% × contextLimit. Percentage mode:
-     * configured percentage > MAX_EXECUTE_THRESHOLD (80). Display surfaces read this
+     * Tokens mode: configured tokens > 90% × contextLimit. Percentage mode:
+     * configured percentage > MAX_EXECUTE_THRESHOLD (90). Display surfaces read this
      * to tell the user their value was clamped instead of silently ignoring it (#241).
      * Only present (true) when a clamp actually happened; absent otherwise.
      */
@@ -180,7 +175,7 @@ export interface ExecuteThresholdDetail {
     /**
      * The raw configured value before clamping — a token count in tokens mode, a
      * percentage in percentage mode. Populated only alongside `clamped` so display
-     * surfaces can show the math (e.g. "190,000 > 80% of 128,000").
+     * surfaces can show the math (e.g. "190,000 > 90% of 128,000").
      */
     configuredValue?: number;
 }
@@ -262,7 +257,7 @@ export function resolveExecuteThresholdDetail(
                 const dedupeKey = `${options.sessionId ?? "__global__"}|${modelKey ?? "__default__"}|${tokenMatch.value}|${cap}`;
                 if (!clampWarnSeen.has(dedupeKey)) {
                     clampWarnSeen.add(dedupeKey);
-                    const msg = `execute_threshold_tokens clamped: ${tokenMatch.value} → ${effectiveTokens} (80% of ${contextLimit}) for ${modelKey ?? "default"}`;
+                    const msg = `execute_threshold_tokens clamped: ${tokenMatch.value} → ${effectiveTokens} (${MAX_EXECUTE_THRESHOLD}% of ${contextLimit}) for ${modelKey ?? "default"}`;
                     if (options.sessionId) {
                         sessionLog(options.sessionId, `WARN: ${msg}`);
                     } else {
@@ -278,8 +273,8 @@ export function resolveExecuteThresholdDetail(
                 matchedKey: tokenMatch.matchedKey,
             };
             // effectiveTokens < requested means Math.min(value, cap) clamped the
-            // user's token budget down to 80% × contextLimit. Record the original
-            // value so status surfaces can show "190000 > 80% of 128000" (#241).
+            // user's token budget down to MAX_EXECUTE_THRESHOLD × contextLimit. Record the original
+            // value so status surfaces can show "190000 > 90% of 128000" (#241).
             if (effectiveTokens < tokenMatch.value) {
                 detail.clamped = true;
                 detail.configuredValue = tokenMatch.value;
@@ -321,18 +316,16 @@ export function resolveExecuteThresholdDetail(
         resolved = fallback;
     }
 
-    // Cap at 80% — higher values create a gap between execute_threshold and
-    // forceMaterialization (85%) where shouldRunHeuristics fires on defer
-    // passes without isCacheBustingPass, causing unguarded cache busts. (Config
-    // load normally rejects >80 via zod, but a runtime-derived value can still
-    // exceed it, so we clamp + warn here too.)
+    // Cap at 90% of the output-reserved safe window. The escalation band is
+    // derived from this effective threshold, so it remains strictly above normal
+    // execution and below the absolute 95% provider wall.
     const cappedPercentage = Math.min(resolved, MAX_EXECUTE_THRESHOLD);
     const percentageClamped = cappedPercentage < resolved;
     if (percentageClamped) {
         const dedupeKey = `pct|${options?.sessionId ?? "__global__"}|${modelKey ?? "__default__"}|${resolved}`;
         if (!clampWarnSeen.has(dedupeKey)) {
             clampWarnSeen.add(dedupeKey);
-            const msg = `execute_threshold clamped ${resolved}% → ${MAX_EXECUTE_THRESHOLD}% for ${modelKey ?? "default"} (capped for cache safety; a large step can overflow before compaction, and 80% stays below the 85%/95% emergency bands)`;
+            const msg = `execute_threshold clamped ${resolved}% → ${MAX_EXECUTE_THRESHOLD}% for ${modelKey ?? "default"} (capped against the output-reserved safe window; 10% remains for mid-turn growth before the absolute 95% wall)`;
             if (options?.sessionId) {
                 sessionLog(options.sessionId, `WARN: ${msg}`);
             } else {
@@ -345,8 +338,8 @@ export function resolveExecuteThresholdDetail(
         mode: "percentage",
         matchedKey,
     };
-    // A runtime-derived percentage above the 80% cap was reduced. Record the
-    // original so status surfaces can show "95% > 80%" alongside the value (#241).
+    // A runtime-derived percentage above the 90% cap was reduced. Record the
+    // original so status surfaces can show "95% > 90%" alongside the value (#241).
     if (percentageClamped) {
         detail.clamped = true;
         detail.configuredValue = resolved;

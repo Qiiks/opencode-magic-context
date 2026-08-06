@@ -119,6 +119,7 @@ const SECTION_ORDER: Array<{ keys: string[]; title: string; intro: string }> = [
     {
         keys: [
             "cache_ttl",
+            "output_reserve",
             "execute_threshold_percentage",
             "execute_threshold_tokens",
             "protected_tags",
@@ -253,7 +254,7 @@ Add the schema line for editor validation and autocomplete:
 \`\`\`
 
 :::note
-Project-level configs cannot use \`{env:VAR}\` / \`{file:path}\` expansion. A cloned repository also cannot set \`sqlite.*\`, \`storage.enforce_private_permissions\`, hidden-agent prompts/permissions, \`historian.model\`, or \`historian.fallback_models\`. Project \`execute_threshold_percentage\` / \`execute_threshold_tokens\` may only RAISE thresholds relative to the user's effective settings (a repo may delay compaction, not make it happen earlier). Dreamer model/schedule/task tuning and \`memory.enabled\` remain allowed project overrides.
+Project-level configs cannot use \`{env:VAR}\` / \`{file:path}\` expansion. A cloned repository also cannot set \`output_reserve\`, \`sqlite.*\`, \`storage.enforce_private_permissions\`, hidden-agent prompts/permissions, \`historian.model\`, or \`historian.fallback_models\`. Project \`execute_threshold_percentage\` / \`execute_threshold_tokens\` may only RAISE thresholds relative to the user's effective settings (a repo may delay compaction, not make it happen earlier). Dreamer model/schedule/task tuning and \`memory.enabled\` remain allowed project overrides.
 :::
 
 ${sections.join("\n\n")}

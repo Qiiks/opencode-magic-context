@@ -28,7 +28,7 @@ describe("executeStatus", () => {
         initializeDatabase(db);
         getOrCreateSessionMeta(db, SESSION_ID);
 
-        // 190K requested on a 128K model → clamped to 80% × 128K. The status must
+        // 190K requested on a 128K model → clamped to 90% × 128K. The status must
         // say so explicitly (configured value + cap) rather than silently showing
         // the reduced value, which is what confused users in issue #241.
         const status = executeStatus(
@@ -44,7 +44,7 @@ describe("executeStatus", () => {
         );
 
         expect(status).toContain("[token-mode] [clamped:");
-        expect(status).toContain("> 80% of");
+        expect(status).toContain("> 90% of");
         db.close();
     });
 

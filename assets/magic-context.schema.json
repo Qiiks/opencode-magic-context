@@ -1115,6 +1115,31 @@
         }
       ]
     },
+    "output_reserve": {
+      "description": "User-only output-token reservation override. Number or per-model object ({ default: 16384, \"provider/model\": 8192 }); 0 disables reservation. When unset, Magic Context reserves the catalog output limit (capped at 25% of context) for shared-window providers and keeps proven separate-quota Google/Gemini windows unchanged.",
+      "anyOf": [
+        {
+          "type": "number",
+          "minimum": 0
+        },
+        {
+          "type": "object",
+          "properties": {
+            "default": {
+              "type": "number",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "default"
+          ],
+          "additionalProperties": {
+            "type": "number",
+            "minimum": 0
+          }
+        }
+      ]
+    },
     "toast_duration_ms": {
       "default": 5000,
       "description": "TUI toast lifetime in milliseconds for Magic Context notifications. Set to 0 to disable Magic Context toasts entirely (min: 0, max: 60000, default: 5000)",
@@ -1124,12 +1149,12 @@
     },
     "execute_threshold_percentage": {
       "default": 65,
-      "description": "Context percentage that forces queued operations to execute. Number or per-model object ({ default: 65, \"provider/model\": 45 }). Values above 80 are rejected because the runtime caps at 80% for cache safety (MAX_EXECUTE_THRESHOLD). Default: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE",
+      "description": "Context percentage that forces queued operations to execute. Number or per-model object ({ default: 65, \"provider/model\": 45 }). Values above 90 are rejected because the runtime caps at 90% of the output-reserved safe window (MAX_EXECUTE_THRESHOLD). Default: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE",
       "anyOf": [
         {
           "type": "number",
           "minimum": 20,
-          "maximum": 80
+          "maximum": 90
         },
         {
           "type": "object",
@@ -1137,7 +1162,7 @@
             "default": {
               "type": "number",
               "minimum": 20,
-              "maximum": 80
+              "maximum": 90
             }
           },
           "required": [
@@ -1146,13 +1171,13 @@
           "additionalProperties": {
             "type": "number",
             "minimum": 20,
-            "maximum": 80
+            "maximum": 90
           }
         }
       ]
     },
     "execute_threshold_tokens": {
-      "description": "Absolute token thresholds per model. When matched, overrides execute_threshold_percentage for that model. Accepts `default` for all models or per-model keys. Values above 80% × context_limit are clamped with a warning log. Min 5_000, max 2_000_000.",
+      "description": "Absolute token thresholds per model. When matched, overrides execute_threshold_percentage for that model. Accepts `default` for all models or per-model keys. Values above 90% × context_limit are clamped with a warning log. Min 5_000, max 2_000_000.",
       "type": "object",
       "properties": {
         "default": {

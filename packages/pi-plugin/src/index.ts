@@ -91,7 +91,6 @@ import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path"
 import { setHarness } from "@magic-context/core/shared/harness";
 import { setKeepSubagents } from "@magic-context/core/shared/keep-subagents";
 import { log } from "@magic-context/core/shared/logger";
-import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import { resolveFallbackChain } from "@magic-context/core/shared/resolve-fallbacks";
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
 
@@ -147,6 +146,7 @@ import {
 import { loadDefaultPiSessionApi } from "./dreamer/pi-session-api";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { registerPiFailClosedSurface } from "./fail-closed-pi";
+import { resolvePiUsableContextLimit } from "./pi-context-limit";
 import { computePiPressure, extractAssistantUsage } from "./pi-pressure";
 import { awaitInFlightRecomps } from "./pi-recomp-runner";
 import { readPiSessionMessages } from "./read-session-pi";
@@ -479,26 +479,28 @@ function resolvePiPressureContextLimit(args: {
 	db: ContextDatabase;
 	sessionId: string;
 	piContextWindow: number;
+	model?: { provider?: string; id?: string; maxTokens?: number };
 }): number {
 	// Pi reports the model's context window directly (ctx.getContextUsage() /
-	// ctx.getModel().contextWindow) — its own authoritative source. We no longer
+	// ctx.model.contextWindow) — its own authoritative source. We no longer
 	// consult models.dev for Pi. Sanity-bound the reported value so a transient
 	// garbage window can't poison pressure (mirrors OpenCode's SDK sane bound).
-	let effectiveContextLimit = isSaneLimit(args.piContextWindow)
-		? args.piContextWindow
-		: 0;
+	let detectedContextLimit: number | undefined;
 	try {
 		const overflowState = getOverflowState(args.db, args.sessionId);
 		if (overflowState.detectedContextLimit > 0) {
-			effectiveContextLimit =
-				effectiveContextLimit > 0
-					? Math.min(effectiveContextLimit, overflowState.detectedContextLimit)
-					: overflowState.detectedContextLimit;
+			detectedContextLimit = overflowState.detectedContextLimit;
 		}
 	} catch (err) {
 		warn("message_end: getOverflowState failed:", err);
 	}
-	return effectiveContextLimit;
+	return (
+		resolvePiUsableContextLimit({
+			rawContextWindow: args.piContextWindow,
+			model: args.model,
+			detectedContextLimit,
+		}) ?? 0
+	);
 }
 
 export async function persistPiPressureFromMessageEnd(args: {
@@ -506,6 +508,7 @@ export async function persistPiPressureFromMessageEnd(args: {
 	sessionId: string;
 	message: unknown;
 	piContextWindow: number;
+	piModel?: { provider?: string; id?: string; maxTokens?: number };
 	piTokens?: number;
 	notifyIssue?: (message: string) => unknown | Promise<unknown>;
 }): Promise<void> {
@@ -514,6 +517,7 @@ export async function persistPiPressureFromMessageEnd(args: {
 		db: args.db,
 		sessionId: args.sessionId,
 		piContextWindow: args.piContextWindow,
+		model: args.piModel ?? { provider, id: model },
 	});
 	const usage = extractAssistantUsage(args.message);
 	const pressure = computePiPressure(usage, effectiveContextLimit);
@@ -570,9 +574,9 @@ export async function persistPiPressureFromMessageEnd(args: {
 		}
 	} else if (typeof args.piTokens === "number") {
 		updates.lastInputTokens = args.piTokens;
-		if (args.piContextWindow > 0) {
+		if (effectiveContextLimit > 0) {
 			updates.lastContextPercentage =
-				(args.piTokens / args.piContextWindow) * 100;
+				(args.piTokens / effectiveContextLimit) * 100;
 		}
 	}
 
@@ -2052,6 +2056,7 @@ async function startPiMagicContextRuntime(
 				sessionId,
 				message: event.message,
 				piContextWindow,
+				piModel: ctx.model,
 				piTokens:
 					piUsage && typeof piUsage.tokens === "number"
 						? piUsage.tokens

@@ -46,6 +46,27 @@ describe("MagicContextConfigSchema", () => {
         });
     });
 
+    describe("budget configuration", () => {
+        it("accepts 90% execute thresholds and rejects 91%", () => {
+            expect(
+                MagicContextConfigSchema.safeParse({ execute_threshold_percentage: 90 }).success,
+            ).toBe(true);
+            expect(
+                MagicContextConfigSchema.safeParse({ execute_threshold_percentage: 91 }).success,
+            ).toBe(false);
+        });
+
+        it("accepts numeric and per-model output reserves including zero", () => {
+            expect(MagicContextConfigSchema.parse({ output_reserve: 0 }).output_reserve).toBe(0);
+            expect(
+                MagicContextConfigSchema.parse({
+                    output_reserve: { default: 16_384, "google/gemini": 0 },
+                }).output_reserve,
+            ).toEqual({ default: 16_384, "google/gemini": 0 });
+            expect(MagicContextConfigSchema.safeParse({ output_reserve: -1 }).success).toBe(false);
+        });
+    });
+
     describe("valid config", () => {
         it("parses an enabled config without stale reduction-specific keys", () => {
             const input = {

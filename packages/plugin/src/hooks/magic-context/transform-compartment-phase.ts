@@ -343,7 +343,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
 
     let awaitedCompartmentRun = false;
 
-    // At 85%, run aggressive heuristic cleanup (dropAllTools) but do NOT block
+    // At the derived force band, run aggressive heuristic cleanup (dropAllTools) but do NOT block
     // the transform waiting for historian. Historian runs in the background.
     // Blocking here freezes the session UI at "Thinking" with no LLM call.
     // Only 95% (BLOCK_UNTIL_DONE_PERCENTAGE) should block.
@@ -398,7 +398,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             // runLoop break condition checks `lastUser.id < lastAssistant.id`, and
             // a fresh notification-user-message every transform pass makes that
             // condition stay false → runLoop keeps iterating → mock returns text
-            // with >85% usage → transform fires again → notification fires again
+            // above-force-band usage → transform fires again → notification fires again
             // → INFINITE LOOP. We've observed this on CI with >1700 requests per turn.
             //
             // Guard: only send the notification ONCE per active compartment run.

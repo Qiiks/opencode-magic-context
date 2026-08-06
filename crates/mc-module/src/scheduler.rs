@@ -14,15 +14,13 @@ use crate::selection::PassClass;
 /// Default execute threshold percentage used when config has no usable value.
 pub const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 65.0;
 /// Maximum execute threshold percentage; higher values leave too little headroom.
-pub const MAX_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 80.0;
-/// Context-usage percentage that forces materialization and bypasses mid-turn deferral.
-pub const FORCE_MATERIALIZE_PERCENTAGE: f64 = 85.0;
+pub const MAX_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 90.0;
+/// Lowest context-usage percentage that may force materialization.
+pub const MIN_FORCE_MATERIALIZE_PERCENTAGE: f64 = 85.0;
 /// Context-usage percentage that enters the block-and-drain emergency band.
 pub const EMERGENCY_PERCENTAGE: f64 = 95.0;
 /// Default cache idle TTL used when the configured TTL string is invalid.
 pub const DEFAULT_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
-/// Usage percentage at or above which the emergency drain latch arms.
-pub const EMERGENCY_DRAIN_ENTER_PERCENTAGE: f64 = 95.0;
 /// Percentage points below the execute threshold required to clear the latch.
 pub const EMERGENCY_DRAIN_EXIT_MARGIN: f64 = 10.0;
 /// Exit percentage used when the execute threshold is missing or unusable.
@@ -140,12 +138,34 @@ pub enum BaseDecision {
     Execute,
 }
 
+/// Escalation thresholds derived from the effective execute threshold.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EscalationBands {
+    /// Dynamic force-materialization and emergency-drop threshold.
+    pub force_materialize_percentage: f64,
+    /// Absolute provider-wall threshold; intentionally never derived from config.
+    pub emergency_percentage: f64,
+}
+
+/// Derive every sub-95 escalation site from the effective execute threshold.
+pub fn escalation_bands(effective_threshold_percentage: f64) -> EscalationBands {
+    let threshold = if effective_threshold_percentage.is_finite() {
+        effective_threshold_percentage.min(MAX_EXECUTE_THRESHOLD_PERCENTAGE)
+    } else {
+        DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE
+    };
+    EscalationBands {
+        force_materialize_percentage: MIN_FORCE_MATERIALIZE_PERCENTAGE.max(threshold + 2.0),
+        emergency_percentage: EMERGENCY_PERCENTAGE,
+    }
+}
+
 /// Pressure band derived from provider-reported context usage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Band {
     /// Below the force-materialization threshold.
     Normal,
-    /// At or above 85%, force materialization and bypass mid-turn deferral.
+    /// At or above the derived force band, materialize and bypass mid-turn deferral.
     Force85,
     /// At or above 95%, block and drain in the emergency band.
     Emergency95,
@@ -158,7 +178,7 @@ pub enum PassDecision {
     Defer,
     /// Run a normal cache-busting pass.
     Execute,
-    /// Force materialization at or above 85% usage.
+    /// Force materialization at or above the derived escalation band.
     Force85,
     /// Emergency block-and-drain pass at or above 95% usage.
     Emergency95,
@@ -408,10 +428,11 @@ pub fn should_execute(
 }
 
 /// Derive the pressure band from provider-reported usage percentage.
-pub fn derive_band(usage_percentage: f64) -> Band {
-    if usage_percentage >= EMERGENCY_PERCENTAGE {
+pub fn derive_band(usage_percentage: f64, effective_threshold_percentage: f64) -> Band {
+    let bands = escalation_bands(effective_threshold_percentage);
+    if usage_percentage >= bands.emergency_percentage {
         Band::Emergency95
-    } else if usage_percentage >= FORCE_MATERIALIZE_PERCENTAGE {
+    } else if usage_percentage >= bands.force_materialize_percentage {
         Band::Force85
     } else {
         Band::Normal
@@ -467,7 +488,9 @@ pub fn advance_drain_latch(
     execute_threshold_percentage: f64,
     now_ms: u64,
 ) -> LatchState {
-    if usage_percentage >= EMERGENCY_DRAIN_ENTER_PERCENTAGE {
+    if usage_percentage
+        >= escalation_bands(execute_threshold_percentage).force_materialize_percentage
+    {
         return LatchState {
             active_since_ms: state.active_since_ms.or(Some(now_ms)),
         };
@@ -621,7 +644,7 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
             PassDecision::Defer
         };
 
-    pass = match derive_band(inputs.usage.percentage) {
+    pass = match derive_band(inputs.usage.percentage, threshold) {
         Band::Emergency95 => PassDecision::Emergency95,
         Band::Force85 => PassDecision::Force85,
         Band::Normal => pass,
@@ -923,7 +946,7 @@ mod tests {
             "max execute threshold",
         );
         assert_close(
-            FORCE_MATERIALIZE_PERCENTAGE,
+            escalation_bands(DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE).force_materialize_percentage,
             golden.constants.force_materialize_percentage,
             "force materialize percentage",
         );
@@ -938,7 +961,7 @@ mod tests {
         assert_eq!(3_600_000, golden.constants.one_hour_ms);
         assert_eq!(1234, golden.constants.bare_numeric_ms);
         assert_close(
-            EMERGENCY_DRAIN_ENTER_PERCENTAGE,
+            escalation_bands(DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE).force_materialize_percentage,
             golden.constants.emergency_drain_enter_percentage,
             "emergency drain enter",
         );
@@ -1060,10 +1083,29 @@ mod tests {
 
     #[test]
     fn band_boundaries_are_non_vacuous() {
-        assert_eq!(derive_band(84.9), Band::Normal);
-        assert_eq!(derive_band(85.0), Band::Force85);
-        assert_eq!(derive_band(94.9), Band::Force85);
-        assert_eq!(derive_band(95.0), Band::Emergency95);
+        assert_eq!(derive_band(84.9, 65.0), Band::Normal);
+        assert_eq!(derive_band(85.0, 65.0), Band::Force85);
+        assert_eq!(derive_band(94.9, 90.0), Band::Force85);
+        assert_eq!(derive_band(95.0, 90.0), Band::Emergency95);
+    }
+
+    #[test]
+    fn escalation_bands_stay_ordered_above_execute_and_below_emergency() {
+        for (threshold, expected_force) in [(65.0, 85.0), (80.0, 85.0), (88.0, 90.0), (90.0, 92.0)]
+        {
+            let bands = escalation_bands(threshold);
+            assert_eq!(bands.force_materialize_percentage, expected_force);
+            assert!(threshold < bands.force_materialize_percentage);
+            assert!(bands.force_materialize_percentage >= 85.0);
+            assert!(bands.force_materialize_percentage < 95.0);
+            assert_eq!(bands.emergency_percentage, 95.0);
+        }
+    }
+
+    #[test]
+    fn pre_raise_thresholds_keep_the_exact_85_percent_force_band() {
+        assert_eq!(escalation_bands(65.0).force_materialize_percentage, 85.0);
+        assert_eq!(escalation_bands(80.0).force_materialize_percentage, 85.0);
     }
 
     #[test]
@@ -1136,8 +1178,13 @@ mod tests {
         assert_eq!(exited.active_since_ms, None);
 
         let expired =
-            advance_drain_latch(entered, 90.0, 65.0, t + EMERGENCY_DRAIN_MAX_LATCH_MS + 1);
+            advance_drain_latch(entered, 84.0, 65.0, t + EMERGENCY_DRAIN_MAX_LATCH_MS + 1);
         assert_eq!(expired.active_since_ms, None);
+
+        let below_raised_band = advance_drain_latch(LatchState::default(), 91.0, 90.0, t);
+        assert_eq!(below_raised_band.active_since_ms, None);
+        let at_raised_band = advance_drain_latch(LatchState::default(), 92.0, 90.0, t);
+        assert_eq!(at_raised_band.active_since_ms, Some(t));
 
         let failure_at = t + 10;
         assert!(

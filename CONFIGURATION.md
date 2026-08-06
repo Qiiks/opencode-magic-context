@@ -123,10 +123,11 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | `fail_closed_blocking` | `boolean` | `true` | User-config-only. When Magic Context cannot operate (schema fence mismatch, storage open/migration failure), block the primary-session prompt with a loud recovery error instead of silently degrading to native compaction. Set `false` only to restore the old degrade-silently behavior (not recommended). Project configs cannot set this. |
 | `language` | `string` | unset | User-config-only output language for Magic Context generated prose and primary guidance, as a 2-letter ISO 639-1 code, for example `"tr"`, `"es"`, or `"pt"`. Structural tokens stay in English. |
 | `cache_ttl` | `string` or `object` | `"5m"` | Time after a response before applying pending ops. String or per-model map. |
+| `output_reserve` | `number` or `object` | automatic | User-config-only output-token reservation override. `0` disables reservation; supports per-model maps. See below. |
 | `protected_tags` | `number` (1–100) | `20` | Last N active tags immune from immediate dropping. |
 | `toast_duration_ms` | `number` (0–60000) | `5000` | TUI toast lifetime for Magic Context notifications in milliseconds. Increase this if toasts disappear too quickly, or set to `0` to disable Magic Context toasts entirely. |
-| `execute_threshold_percentage` | `number` (20–80) or `object` | `65` | Context usage that forces queued ops to execute. Capped at 80% max for cache safety. Supports per-model map. |
-| `execute_threshold_tokens` | `object` (per-model map) | — | **Optional absolute-tokens variant of `execute_threshold_percentage`.** Per-model map (e.g. `{ "default": 150000, "github-copilot/gpt-5.2-codex": 40000 }`). When set for a model, overrides the percentage-based threshold for that model. Clamped to `80% × context_limit` with a warn log. Requires a resolvable context limit — falls through to percentage if unavailable. See below. |
+| `execute_threshold_percentage` | `number` (20–90) or `object` | `65` | Context usage that forces queued ops to execute. Capped at 90% of the output-reserved safe window, leaving about 10% for mid-turn input growth. Supports per-model maps. |
+| `execute_threshold_tokens` | `object` (per-model map) | — | **Optional absolute-tokens variant of `execute_threshold_percentage`.** Per-model map (e.g. `{ "default": 150000, "github-copilot/gpt-5.2-codex": 40000 }`). When set for a model, overrides the percentage-based threshold for that model. Clamped to `90% × context_limit` with a warn log. Requires a resolvable context limit — falls through to percentage if unavailable. See below. |
 | `clear_reasoning_age` | `number` | `50` | Clear thinking/reasoning blocks older than N tags. |
 | `historian_timeout_ms` | `number` | `300000` | Timeout per historian call (ms). |
 | `history_budget_percentage` | `number` (0.05–0.5) | `0.15` | Fraction of usable context (`context_limit × execute_threshold`) reserved for the history block. Triggers compression when exceeded. |
@@ -254,6 +255,29 @@ Per-connection PRAGMAs applied to Magic Context's own `context.db` at open. Thes
 
 Separately, Magic Context runs `PRAGMA optimize` (bounded by `PRAGMA analysis_limit=400`) on its 15-minute maintenance tick. This is self-gating — it re-analyses a table only when its row count has drifted enough to matter — so the query planner keeps choosing good indexes as the database grows. There is no config knob for it.
 
+### `output_reserve`
+
+Magic Context budgets against the **safe input window**, not the catalog's combined input-plus-output number. By default it uses these rules:
+
+1. A provider-declared `input` smaller than `context` is already pre-carved and is used unchanged.
+2. Otherwise, output tokens are reserved from `context`, capped at 25% of the context window.
+3. Google and Pi's `google-antigravity` Gemini family keep the full context window because their output quota is separate.
+
+Use `output_reserve` in user config to override rules 2 and 3. A number applies to every model; an object supports exact `provider/model`, bare-model, and `default` entries:
+
+```jsonc
+{
+  "output_reserve": {
+    "default": 16384,
+    "google/gemini-2.5-pro": 0
+  }
+}
+```
+
+Set `0` to disable reservation. Project configs cannot set this field. Very large values are clamped so the usable window remains at least half of the raw context (and never below the module's plausibility floor); Magic Context logs when a clamp is required.
+
+Percentages in `/ctx-status`, the sidebar, and the Pi TUI use this safe window. Consequently, the displayed percentage rises and absolute compaction points move earlier for shared-window models even when the raw provider context number is unchanged.
+
 ### `execute_threshold_tokens`
 
 An absolute-tokens alternative to `execute_threshold_percentage`. Useful when you want a hard cap expressed in tokens rather than a percentage — for example, when a provider limits effective prompt size below its advertised context window.
@@ -272,7 +296,7 @@ An absolute-tokens alternative to `execute_threshold_percentage`. Useful when yo
 - Per-model map only — no bare-number form. All sessions are assumed to have different context limits, so the `default` key acts as a fallback inside the map.
 - **Tokens wins:** when a matching entry exists for the current model, it overrides the percentage-based threshold for that model. Other models continue to use `execute_threshold_percentage`.
 - **Progressive key lookup** just like percentage config — `openai/gpt-5.4-fast` matches `openai/gpt-5.4` if the derived key is absent.
-- **Clamped at 80% × context_limit** for the same cache-safety reason as percentage. If the clamp fires, a `log.warn` records the original and capped value.
+- **Clamped at 90% × context_limit** for the same cache-safety reason as percentage. If the clamp fires, a `log.warn` records the original and capped value.
 - Requires a **resolvable context limit** at runtime. On brand-new sessions before any response arrives, the context limit is unknown — in that case, resolution falls through to `execute_threshold_percentage`. Once the first response lands, the correct tokens-based threshold is applied on the following turn.
 
 **When to prefer tokens over percentage:**

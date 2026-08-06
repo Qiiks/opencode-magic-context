@@ -327,9 +327,9 @@ describe("loadPluginConfig — secret redaction", () => {
         expect(combined).toMatch(/number 5/);
     });
 
-    it("rejects execute_threshold_percentage > 80 with the cache-safety explanation (issue #111)", () => {
+    it("rejects execute_threshold_percentage > 90 with the cache-safety explanation (issue #111)", () => {
         const config = JSON.stringify({
-            execute_threshold_percentage: 85, // above cap (80)
+            execute_threshold_percentage: 91, // above cap (90)
         });
 
         const result = loadWithUserConfig(config);
@@ -338,7 +338,7 @@ describe("loadPluginConfig — secret redaction", () => {
 
         expect(combined).toContain("execute_threshold_percentage");
         // The custom message explains WHY, not just "too big".
-        expect(combined).toContain("capped at 80% for cache safety");
+        expect(combined).toContain("capped at 90% for cache safety");
     });
     it("keeps embedding destination fields from trusted user config", () => {
         const config = JSON.stringify({

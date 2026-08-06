@@ -1,3 +1,4 @@
+import { escalationBands } from "../../shared/escalation-bands";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { stableStringify } from "../../shared/stable-json";
@@ -703,8 +704,6 @@ export function protectedTailWindowBudget(
     return Math.min(500_000, Math.max(perRunCap, Math.round(0.2 * usable)));
 }
 
-/** Usage % at/above which a session enters the emergency drain catch-up latch. */
-export const EMERGENCY_DRAIN_ENTER_PERCENTAGE = 95;
 /**
  * The latch exits when usage falls this far BELOW the execute threshold, leaving
  * headroom for a normal execute cycle to resume after the drops (exiting exactly
@@ -776,13 +775,16 @@ export function reserveProtectedTailDrainTokens(args: {
             meta = loadProtectedTailMeta(args.db, args.sessionId);
         }
 
-        // Emergency drain catch-up latch lifecycle (usage-driven). Enter when the
-        // session spikes into the emergency band; exit once usage falls back below
+        // Drain catch-up latch lifecycle (usage-driven). Enter when the session
+        // reaches the derived force band; exit once usage falls back below
         // the safe zone, or after a self-expiry backstop. Persisted unconditionally
         // so the next pass sees the resolved state even when we skip below.
         const exitThreshold = emergencyDrainExitThreshold(args.executeThresholdPercentage);
         let latchActiveSince = meta.emergencyDrainActive;
-        if (args.usagePercentage >= EMERGENCY_DRAIN_ENTER_PERCENTAGE) {
+        const { forceMaterializationPercentage } = escalationBands(
+            args.executeThresholdPercentage,
+        );
+        if (args.usagePercentage >= forceMaterializationPercentage) {
             if (latchActiveSince <= 0) latchActiveSince = now;
         } else if (latchActiveSince > 0) {
             const expired = now - latchActiveSince > EMERGENCY_DRAIN_MAX_LATCH_MS;
@@ -913,7 +915,7 @@ export function clearPersistedReasoningWatermark(db: Database, sessionId: string
 // `status='active'` set, so they can't be re-selected). The drop reduces the
 // wire, but the provider hasn't re-measured it yet — the persisted usage stays
 // at the pre-drop value until the next assistant response lands. Without this
-// latch a second ≥85% pass on the SAME stale reading recomputes the floor from
+// latch a second force-band pass on the SAME stale reading recomputes the floor from
 // the now-smaller active tail and over-drops the rest of the tail (and busts the
 // cache again). We only re-evaluate once a FRESH provider sample arrives (the
 // reading changes). Reset to 0 on model change (which moves the ceiling).

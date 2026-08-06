@@ -6,6 +6,7 @@ import {
 	resolveLegacyConfigSourcesForHarness,
 } from "@magic-context/core/config/migrate-config-location";
 import "@magic-context/core/config/prune-config-leaf";
+import { setOutputReserveConfig } from "@magic-context/core/shared/models-dev-cache";
 import { existsSync, readFileSync } from "node:fs";
 
 import { migrateLegacyAgentEnabledInMemory } from "@magic-context/core/config/agent-disable";
@@ -381,6 +382,7 @@ export function loadPiConfig(
 	}
 
 	const parsed = parsePiConfig(rawConfig);
+	setOutputReserveConfig(parsed.config.output_reserve);
 	warnings.push(
 		...parsed.warnings.map((warning) => `[merged config] ${warning}`),
 	);
@@ -551,6 +553,7 @@ export function loadPiConfigDetailed(
 
 	const recoveredTopLevelKeys: string[] = [];
 	const parsed = parsePiConfig(rawConfig, recoveredTopLevelKeys);
+	setOutputReserveConfig(parsed.config.output_reserve);
 	warnings.push(
 		...parsed.warnings.map((warning) => `[merged config] ${warning}`),
 	);
