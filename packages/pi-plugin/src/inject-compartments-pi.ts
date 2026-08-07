@@ -376,7 +376,7 @@ export interface PiM0M1State {
 	userProfileBudgetTokens?: number;
 	/** Provider-side cache-eviction signals for HARD-bust detection. */
 	hardSignals?: PiM0HardSignals;
-	/** Experimental mural feature switch (`experimental.mural.enabled`). When
+	/** Mural feature switch (`mural.enabled`). When
 	 *  true and the fold's model accepts images, HARD materialization resolves
 	 *  + renders the deterministic mural on demand and folds its image into the
 	 *  cached baseline. Defer passes replay the baked-in bytes without re-render. */

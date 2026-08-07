@@ -112,6 +112,7 @@ const SECTION_ORDER: Array<{ keys: string[]; title: string; intro: string }> = [
             "auto_update",
             "keep_subagents",
             "todowrite",
+            "mural",
         ],
         title: "Top-level switches",
         intro: "Global on/off switches for the plugin and its agent-facing surface.",

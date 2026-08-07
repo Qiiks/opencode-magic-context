@@ -619,7 +619,7 @@ interface RunPostTransformPhaseArgs {
         historyBudgetTokens?: number;
         temporalAwareness?: boolean;
         hardSignals?: M0HardSignals;
-        /** experimental.mural.enabled — drives the on-demand deterministic mural
+        /** mural.enabled — drives the on-demand deterministic mural
          *  render inside the HARD fold. */
         muralEnabled?: boolean;
     };

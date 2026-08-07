@@ -801,7 +801,7 @@ export interface M0M1RenderOptions {
      * so the injected data-url only swaps on a natural fold. Tests may still pass
      * an explicit `mural` to drive the render deterministically. */
     mural?: { enabled: boolean; supportsVision: boolean; dataUrl?: string; contentHash?: string };
-    /** Experimental mural feature switch (experimental.mural.enabled). When true
+    /** Mural feature switch (mural.enabled). When true
      * and the fold's model accepts images, materializeM0 resolves + renders the
      * deterministic mural on demand and folds its image into the m[0] baseline. */
     muralEnabled?: boolean;

@@ -21,6 +21,8 @@ export const RENDERED_PREFIXES: readonly string[] = [
   "enabled",
   "language",
   "toast_duration_ms",
+  // Mural
+  "mural",
   // Thresholds (custom PerModelField widgets)
   "cache_ttl",
   "execute_threshold_percentage",
@@ -87,6 +89,18 @@ export const OMITTED_BY_DESIGN: Readonly<Record<string, string>> = {
   shadow_embedding: "developer-only shadow embedding lane; raw JSONC and never a dashboard knob",
   transform_mode:
     "experimental project-wide Rust runtime cutover; requires user-level subc configuration and is not exposed in the dashboard yet",
+  allow_home_project:
+    "user-only home-directory identity setting; raw JSONC because it is ignored from project configs",
+  output_reserve:
+    "user-only output-token reservation; raw JSONC because project configs cannot change it",
+  "storage.enforce_private_permissions":
+    "user-only shared-storage permission policy; raw JSONC because project configs cannot change it",
+  fail_closed_blocking:
+    "user-only inoperability policy; raw JSONC because project configs cannot change it",
+  "compaction.enabled":
+    "user-only context-management ownership policy; raw JSONC because project configs cannot change it",
+  "pi.subagent_extensions":
+    "user-only Pi extension allowlist; raw JSONC because project configs cannot choose child extensions",
 };
 
 /**

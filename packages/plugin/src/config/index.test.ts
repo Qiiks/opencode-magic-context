@@ -109,6 +109,38 @@ function loadWithUserAndProjectConfig(
     }
 }
 
+describe("loadPluginConfig — graduated mural config", () => {
+    it("adopts legacy experimental.mural at the top-level and warns once", () => {
+        const result = loadWithUserConfig(
+            JSON.stringify({
+                experimental: { mural: { enabled: true, model: "provider/cue-model" } },
+            }),
+        );
+
+        expect(result.mural).toEqual({ enabled: true, model: "provider/cue-model" });
+        expect((result as Record<string, unknown>).experimental).toBeUndefined();
+        expect(
+            result.configWarnings?.some((warning) =>
+                warning.includes('Deprecated "experimental.mural"; use top-level "mural" instead'),
+            ),
+        ).toBe(true);
+    });
+
+    it("keeps the top-level mural values when both spellings exist", () => {
+        const result = loadWithUserConfig(
+            JSON.stringify({
+                mural: { enabled: false, model: "provider/new-model" },
+                experimental: { mural: { enabled: true, model: "provider/old-model" } },
+            }),
+        );
+
+        expect(result.mural).toEqual({ enabled: false, model: "provider/new-model" });
+        expect(result.configWarnings ?? []).not.toContain(
+            expect.stringContaining('Deprecated "experimental.mural"'),
+        );
+    });
+});
+
 describe("loadPluginConfig — transform mode resolution", () => {
     it("downgrades rust when compaction is off and emits one boot warning", () => {
         const result = loadWithUserConfig(

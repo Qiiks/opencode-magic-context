@@ -918,7 +918,7 @@ export async function runDoctor(
 
             // Relocate graduated feature flags out of the (retired) experimental.*
             // namespace to their new homes:
-            //   - temporal_awareness / caveman_text_compression → top-level keys
+            //   - temporal_awareness / caveman_text_compression / mural → top-level keys
             //   - auto_search / git_commit_indexing → memory.* (recall features)
             // We preserve the user's explicit values so opt-ins/opt-outs survive;
             // the destination wins when a user has already started graduating,
@@ -952,6 +952,7 @@ export async function runDoctor(
             if (experimental) {
                 relocateGraduated("temporal_awareness", mcConfig, "");
                 relocateGraduated("caveman_text_compression", mcConfig, "");
+                relocateGraduated("mural", mcConfig, "");
                 const memoryDest = (mcConfig.memory as Record<string, unknown> | undefined) ?? {};
                 relocateGraduated("auto_search", memoryDest, "memory.");
                 relocateGraduated("git_commit_indexing", memoryDest, "memory.");

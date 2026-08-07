@@ -479,7 +479,7 @@ describe("createDreamTaskExecutor — compress-cues", () => {
             client: client as never,
             sessionDirectory: project,
             openOpenCodeDb: () => null,
-            experimentalMural: { enabled: true },
+            mural: { enabled: true },
             moduleClient: { authorityStatus, call: moduleCall } as never,
         });
         const leaseKey = leaseKeyFor("compress-cues", project);
@@ -520,7 +520,7 @@ describe("createDreamTaskExecutor — compress-cues", () => {
             client: client as never,
             sessionDirectory: project,
             openOpenCodeDb: () => null,
-            experimentalMural: { enabled: true },
+            mural: { enabled: true },
         });
         const leaseKey = leaseKeyFor("compress-cues", project);
         expect(acquireLease(db, "holder-malformed-cues", leaseKey)).toBe(true);
@@ -561,7 +561,7 @@ describe("createDreamTaskExecutor — compress-cues", () => {
             client: client as never,
             sessionDirectory: project,
             openOpenCodeDb: () => null,
-            experimentalMural: { enabled: true },
+            mural: { enabled: true },
         });
         const leaseKey = leaseKeyFor("compress-cues", project);
         expect(acquireLease(db, "holder-complete-cues", leaseKey)).toBe(true);

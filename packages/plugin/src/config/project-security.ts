@@ -213,6 +213,8 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *    requires trusted user-level `subc` configuration before Rust can activate.
  *  - `historian.model` / `historian.fallback_models` — historian model spend is
  *    user-level only; a cloned repo cannot force extra compaction cost.
+ *  - `mural.model` — mural cue-compressor model selection is user-level only;
+ *    a cloned repo cannot choose a model that sends project memory to a provider.
  *  - `pi.subagent_extensions` — a cloned repo must not choose which extensions
  *    the user's Pi child processes load.
  *  - hidden-agent `prompt`/`permission`/`tools` — a repo must not reprogram or
@@ -337,6 +339,27 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
                     "(security: historian model selection is user-level only; a repository cannot force extra compaction cost).",
             );
         }
+    }
+
+    const mural = projectRaw.mural;
+    if (isPlainObject(mural) && "model" in mural) {
+        delete mural.model;
+        warnings.push(
+            "Ignoring mural.model from project config (security: the mural cue-compressor model is a user-level setting; a repository cannot choose where project memory is sent).",
+        );
+    }
+
+    // Keep the same trust boundary while accepting the pre-graduation spelling.
+    // This must run before the in-memory migration moves experimental.mural.model
+    // to mural.model, otherwise an untrusted project could bypass the user-only
+    // model check.
+    const experimental = projectRaw.experimental;
+    const legacyMural = isPlainObject(experimental) ? experimental.mural : undefined;
+    if (isPlainObject(legacyMural) && "model" in legacyMural) {
+        delete legacyMural.model;
+        warnings.push(
+            "Ignoring experimental.mural.model from project config (security: the mural cue-compressor model is a user-level setting; use user-level mural.model).",
+        );
     }
 
     for (const agentKey of HIDDEN_AGENT_KEYS) {
