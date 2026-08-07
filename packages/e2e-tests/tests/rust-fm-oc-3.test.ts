@@ -12,6 +12,7 @@ import {
     RUST_PARK_RETRY_INTERVAL,
     rustPrereqs,
     sendOutagePasses,
+    sessionLogLines,
 } from "../src/rust-scenario-support";
 
 describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-heal", () => {
@@ -74,7 +75,8 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-h
                 true,
             );
             expect(recoveryVersions.at(-1)).toBeGreaterThan(healthyVersions.at(-1) ?? 0);
-            expect(h.diagnosticLog()).toContain("mc_rust_park_transition");
+            const lines = sessionLogLines(h, sessionId);
+            expect(lines.some((line) => line.includes("mc_rust_park_transition"))).toBe(true);
             assertLoudModuleFailure(h, sessionId);
             assertMessagesHaveNoPlaceholders(h.lastMainMessages(), sessionId);
         },

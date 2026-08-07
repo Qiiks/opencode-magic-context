@@ -55,6 +55,11 @@ describe.skipIf(!active)("rust failure-mode drill FM-OC-1: LKG after SIGKILL", (
             expect(after.some((pass) => pass.servedFrom === "lkg" || pass.servedFrom === "raw")).toBe(true);
 
             const lines = assertLoudModuleFailure(h, sessionId);
+            expect(
+                sessionLogLines(h, sessionId).some((line) =>
+                    line.includes("rust transform failed; attempting LKG replay"),
+                ),
+            ).toBe(true);
             assertExactlyOneLkgOutcome(lines, sessionId);
             if (servedLkg) {
                 const recoveredWire = JSON.parse(h.lastMainWireSerialized()) as unknown[];

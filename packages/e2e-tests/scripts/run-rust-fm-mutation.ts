@@ -37,7 +37,7 @@ const mutations: Record<string, MutationCase[]> = {
         {
             name: "FM_OC_1_RUNG_DELETION",
             source: pluginTransform,
-            oldText: 'sessionLog(sessionId, "lkg_replay_served");',
+            oldText: 'sessionLog(sessionId, "rust transform failed; attempting LKG replay:", error);',
             replacement: "",
         },
     ],
@@ -70,7 +70,8 @@ const mutations: Record<string, MutationCase[]> = {
         {
             name: "FM_OC_3_RUNG_DELETION",
             source: pluginTransform,
-            oldText: "state.parked = false;",
+            oldText:
+                "sessionLog(\n            sessionId,\n            `mc_rust_park_transition failure_passes=${state.consecutiveFailures} pass_count=${state.passCount} park_count=${state.parkCount}`,\n        );",
             replacement: "",
         },
     ],
