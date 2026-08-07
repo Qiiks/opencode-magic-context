@@ -18,6 +18,7 @@ import {
     casChannel2NudgeState,
     clearEmergencyRecovery,
     getChannel2NudgeState,
+    getEmergencyRecoveryArmedAt,
     getOverflowState,
     isEmergencyRecoveryArmed,
     isProviderOverflowReconfirmed,
@@ -608,6 +609,36 @@ function passUsage(usage: ContextUsage, limit: number): Record<string, number> {
         current_total_input_tokens: usage.inputTokens,
         context_limit_tokens: limit,
     };
+}
+
+function shouldDisarmRustEmergencyRecovery(input: {
+    materialized: boolean;
+    usagePercentage: number;
+    recoveryOrigin: "provider_overflow" | "proactive_model_shrink" | null;
+    recoveryArmedAt: number | null;
+    usageEntry: { updatedAt: number; hasUsageTokens?: boolean } | null | undefined;
+    finalWireEstimate?: { tokens: number; trusted: boolean };
+    providerProvenLimitTokens: number;
+}): "fresh-usage" | "trusted-final-wire" | null {
+    if (
+        input.finalWireEstimate?.trusted === true &&
+        input.providerProvenLimitTokens > 0 &&
+        input.finalWireEstimate.tokens < input.providerProvenLimitTokens * 0.8
+    ) {
+        return "trusted-final-wire";
+    }
+    if (!input.materialized || input.usagePercentage >= 80) return null;
+    if (input.recoveryOrigin !== "provider_overflow") return "fresh-usage";
+    if (
+        input.usageEntry?.hasUsageTokens === true &&
+        (input.recoveryArmedAt === null || input.usageEntry.updatedAt > input.recoveryArmedAt)
+    ) {
+        // A missing process-local arm timestamp means the durable arm predates this
+        // process; persisted usage is loaded with hasUsageTokens=false, so true can
+        // only come from a provider response observed after restart.
+        return "fresh-usage";
+    }
+    return null;
 }
 
 function directiveTextOf(response: Record<string, unknown>): string | undefined {
@@ -1698,6 +1729,9 @@ export function createRustModeTransform(
                 wireDelta ? `mode=tail_delta input=${encodedInput.length}` : "mode=full",
             );
             let response: Record<string, unknown> | undefined;
+            let servedFinalWireEstimate:
+                | ReturnType<typeof estimateFinalWireInputTokens>
+                | undefined;
             for (const [index, page] of pages.entries()) {
                 timings.transportBytes += Buffer.byteLength(JSON.stringify(page));
                 const transportStartedAt = performance.now();
@@ -1898,6 +1932,15 @@ export function createRustModeTransform(
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {
                     assertNativeBoundary(appliedMessages, sessionId, boundaryId);
                 }
+                if (passInputs.emergency_recovery_armed === true) {
+                    servedFinalWireEstimate = estimateFinalWireInputTokens({
+                        messages: appliedMessages as MessageLike[],
+                        systemPromptTokens: sessionMeta.systemPromptTokens,
+                        providerID: model?.providerID,
+                        modelID: model?.modelID,
+                        agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                    });
+                }
                 logStage(sessionId, "apply", applyStartedAt, timings);
                 const lkgSnapshotStartedAt = performance.now();
                 const explicitDecision =
@@ -2035,25 +2078,31 @@ export function createRustModeTransform(
                     sessionLog(sessionId, "rust compartment mirror-back failed (ignored):", error);
                 }
             }
-            // TS mode disarms overflow recovery when the historian publishes; in rust
-            // mode publication happens module-side, so the applied pass that lands a
-            // materialization is the equivalent proof the session recovered. Without
-            // this clear the latch stays armed forever, and its side effects persist
-            // (forced 95% pressure, LKG refusing to cover transport failures — the
-            // 20:38Z incident escalated to a 1.6M-token raw serve exactly this way).
-            if (
-                materializeReason !== "none" &&
-                passUsageSnapshot.percentage < 80 &&
-                getOverflowState(deps.db, sessionId).needsEmergencyRecovery
-            ) {
+            // Provider overflow proves the prior wire failed, so successful local
+            // materialization is not enough to clear recovery. Require either provider
+            // usage observed after the arm or a trusted estimate of the bytes actually
+            // returned by the module; persisted percentages can outlive failed requests.
+            const currentOverflowState = getOverflowState(deps.db, sessionId, modelKey);
+            const disarmEvidence = currentOverflowState.needsEmergencyRecovery
+                ? shouldDisarmRustEmergencyRecovery({
+                      materialized: materializeReason !== "none",
+                      usagePercentage: passUsageSnapshot.percentage,
+                      recoveryOrigin: currentOverflowState.emergencyRecoveryOrigin,
+                      recoveryArmedAt: getEmergencyRecoveryArmedAt(sessionId),
+                      usageEntry: deps.contextUsageMap.get(sessionId),
+                      finalWireEstimate: servedFinalWireEstimate,
+                      providerProvenLimitTokens: currentOverflowState.detectedContextLimit,
+                  })
+                : null;
+            if (disarmEvidence) {
                 try {
                     clearEmergencyRecovery(deps.db, sessionId);
                     sessionLog(
                         sessionId,
-                        `rust pass disarmed emergency recovery after ${materializeReason} at ${passUsageSnapshot.percentage.toFixed(1)}% usage`,
+                        `rust pass disarmed emergency recovery via ${disarmEvidence} after ${materializeReason} at ${passUsageSnapshot.percentage.toFixed(1)}% usage`,
                     );
                 } catch {
-                    // Best-effort: the next materializing pass retries the disarm.
+                    // Best-effort: a later pass with current recovery evidence retries the clear.
                 }
             }
             wireCaches.set(sessionId, pendingWireCache);
@@ -2143,6 +2192,7 @@ export const __rustModeTransformTest = {
     messageMatchesContentSnapshot,
     buildTransformBody,
     formatRustPassLog,
+    shouldDisarmRustEmergencyRecovery,
     createRustModeTransform,
     directiveTextOf,
     prepareRustMemoryAuthority,

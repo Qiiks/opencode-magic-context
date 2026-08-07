@@ -15,6 +15,7 @@ import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/mag
 import { initializeDatabase, openDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import {
+    getEmergencyRecoveryArmedAt,
     getOverflowState,
     recordDetectedContextLimit,
     recordOverflowDetected,
@@ -416,7 +417,7 @@ describe("Rust mode authority adapter", () => {
         );
     });
 
-    it("walks an armed low-usage Rust recovery through a forced fold and durable disarm", async () => {
+    it("keeps stale low usage armed until a post-overflow usage row proves recovery", async () => {
         const sessionId = `rust-overflow-recovery-${Date.now()}`;
         const db = makeDb();
         installRawProvider(sessionId);
@@ -455,7 +456,43 @@ describe("Rust mode authority adapter", () => {
         expect(transformBodies).toHaveLength(2);
         expect(transformBodies[1]?.emergency_recovery_armed).toBe(true);
         expect(transformBodies[1]?.tail_delta).toBeUndefined();
+        expect(getOverflowState(db, sessionId).needsEmergencyRecovery).toBe(true);
+
+        const armedAt = getEmergencyRecoveryArmedAt(sessionId);
+        expect(armedAt).not.toBeNull();
+        deps.contextUsageMap.set(sessionId, {
+            usage: { inputTokens: 30_000, percentage: 30 },
+            updatedAt: (armedAt as number) + 1,
+            hasUsageTokens: true,
+        });
+        const verifiedMessages = makeMessages(sessionId);
+        await runner.run(
+            sessionId,
+            verifiedMessages,
+            { messages: verifiedMessages },
+            makeMeta(db, sessionId),
+        );
+
+        expect(transformBodies).toHaveLength(3);
         expect(getOverflowState(db, sessionId).needsEmergencyRecovery).toBe(false);
+    });
+
+    it("never treats stale percentages as provider-overflow recovery evidence", () => {
+        for (const percentage of [0, 20.8, 79.9]) {
+            expect(
+                __rustModeTransformTest.shouldDisarmRustEmergencyRecovery({
+                    materialized: true,
+                    usagePercentage: percentage,
+                    recoveryOrigin: "provider_overflow",
+                    recoveryArmedAt: 200,
+                    usageEntry: {
+                        updatedAt: 100,
+                        hasUsageTokens: true,
+                    },
+                    providerProvenLimitTokens: 100_000,
+                }),
+            ).toBeNull();
+        }
     });
 
     it("binds every served Rust pass class to the provider assistant decision row", async () => {

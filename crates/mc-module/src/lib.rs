@@ -21058,6 +21058,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cold_start_state_seed_cannot_rewind_a_materialized_boundary() {
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        store
+            .replace_compartments(
+                "ses",
+                &[
+                    stored_comp(0, 0, 0, "m0", "older summary"),
+                    stored_comp(1, 1, 1, "m1", "latest summary"),
+                ],
+            )
+            .unwrap();
+        let live = vec![
+            ck("m0", 0, "covered zero"),
+            ck("m1", 1, "covered one"),
+            ck("m2", 2, "live tail"),
+        ];
+
+        let folded = call_transform_request(&handler, request(live.clone())).await;
+        assert_eq!(folded["boundary_id"], json!("m1#0"));
+        assert!(m0_text(&folded).contains("latest summary"));
+        assert_eq!(
+            folded["ck_messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["meta"]["synthetic"] != json!(true))
+                .map(|message| message["meta"]["harness_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["m2"]
+        );
+
+        // A second adapter process force-seeds its stale TypeScript mirror before transforming.
+        // The seed must add compatibility rows without replacing the module's newer fold cursor.
+        let second_seed = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "seed_boundary_id": "m0#0",
+                    "compartments": [state_sync_compartment(0, "stale mirror summary")],
+                    "acked_watermarks": { "compartment_sequence": 0 }
+                }),
+            )
+            .await;
+        assert!(
+            matches!(second_seed, HandlerOutcome::Response(_)),
+            "{second_seed:?}"
+        );
+
+        let after_restart = call_transform_request(&handler, request(live)).await;
+        assert_eq!(after_restart["decision"], json!("SOFT+"));
+        assert_eq!(after_restart["boundary_id"], json!("m1#0"));
+        assert!(m0_text(&after_restart).contains("latest summary"));
+        assert_eq!(
+            after_restart["ck_messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["meta"]["synthetic"] != json!(true))
+                .map(|message| message["meta"]["harness_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["m2"],
+            "the stale seed must not reclassify already-folded messages as live tail"
+        );
+    }
+
+    #[tokio::test]
     async fn paged_authority_transform_reassembles_and_executes() {
         let state = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(state, default_test_config());

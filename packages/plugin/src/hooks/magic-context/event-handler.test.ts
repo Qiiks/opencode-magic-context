@@ -45,6 +45,7 @@ type ContextUsageCacheEntry = {
     usage: ContextUsage;
     updatedAt: number;
     lastResponseTime?: number;
+    hasUsageTokens?: boolean;
 };
 
 const tempDirs: string[] = [];
@@ -482,6 +483,7 @@ describe("createEventHandler", () => {
         const expectedPercentage = ((120_000 + 15_000) / resolveContextLimit()) * 100;
         expect(usageEntry?.usage.inputTokens).toBe(135_000);
         expect(usageEntry?.usage.percentage).toBeCloseTo(expectedPercentage, 5);
+        expect(usageEntry?.hasUsageTokens).toBe(true);
         expect(usageEntry?.lastResponseTime).toBeGreaterThanOrEqual(before);
         expect(
             getOrCreateSessionMeta(openDatabase(), "ses-usage").lastResponseTime,

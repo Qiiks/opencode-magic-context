@@ -69,6 +69,7 @@ interface ContextUsageEntry {
     usage: ContextUsage;
     updatedAt: number;
     lastResponseTime?: number;
+    hasUsageTokens?: boolean;
 }
 
 interface MessageRemovedCleanupResult {
@@ -626,6 +627,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                         },
                         updatedAt: now,
                         lastResponseTime: now,
+                        hasUsageTokens: true,
                     });
 
                     updates.lastContextPercentage = percentage;

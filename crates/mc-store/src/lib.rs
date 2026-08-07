@@ -8459,13 +8459,24 @@ impl McStore {
                         })
                     }
                 };
-                core.boundary_id = adoption.boundary_id;
-                core.reconcile_pending = false;
-                meta.coverage_ordinal = Some(adoption.coverage_end_ordinal);
-                meta.coverage_start_ordinal = Some(adoption.coverage_start_ordinal);
-                meta.coverage_compartment_seq = Some(adoption.max_sequence);
-                meta.folded_compartment_seq = adoption.max_sequence;
-                meta.pending_rewrite = None;
+                if meta.initialized {
+                    // A force seed is process-local cold-start behavior, but this cache state is
+                    // durable. Re-adopting a lagging TypeScript mirror would move only the trim
+                    // cursor while retaining the module's newer m0/m1 bytes, so the next defer
+                    // would silently re-emit the already-folded interval as raw tail messages.
+                    eprintln!(
+                        "mc-store: retained materialized boundary {:?} over state-sync seed {:?} for session {}",
+                        core.boundary_id, adoption.boundary_id, request.session_id
+                    );
+                } else {
+                    core.boundary_id = adoption.boundary_id;
+                    core.reconcile_pending = false;
+                    meta.coverage_ordinal = Some(adoption.coverage_end_ordinal);
+                    meta.coverage_start_ordinal = Some(adoption.coverage_start_ordinal);
+                    meta.coverage_compartment_seq = Some(adoption.max_sequence);
+                    meta.folded_compartment_seq = adoption.max_sequence;
+                    meta.pending_rewrite = None;
+                }
             }
 
             let drop_seeds_skipped = materialize_drop_seed_units(
