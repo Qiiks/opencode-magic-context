@@ -100,14 +100,31 @@ The wizard auto-detects which harnesses you have (OpenCode, Pi, or both), adds t
 
 > **Why disable built-in compaction?** Magic Context manages context itself. The host's compaction would interfere with its cache-aware deferred operations and double-compress.
 
-**Manual setup** (OpenCode): add the plugin and turn compaction off in `opencode.json`, then drop a `magic-context.jsonc` in `<project>/.cortexkit/` (or `~/.config/cortexkit/` for user-wide defaults). See the [configuration reference](./CONFIGURATION.md).
+### Manual setup (OpenCode)
+
+If you cannot run the wizard, add this to `opencode.jsonc`:
 
 ```jsonc
 {
-  "plugin": ["@cortexkit/opencode-magic-context"],
+  "plugin": ["@cortexkit/opencode-magic-context@latest"],
   "compaction": { "auto": false, "prune": false }
 }
 ```
+
+Then create `magic-context.jsonc` with the one setting the historian needs:
+
+```jsonc
+{
+  "$schema": "https://raw.githubusercontent.com/cortexkit/magic-context/master/assets/magic-context.schema.json",
+  "historian": { "model": "provider/model-id" }
+}
+```
+
+- **Required:** `historian.model` must be a real `provider/model-id`. Without it, the plugin loads but historian runs fail, older history is not summarized, and repeated failures show a `Magic Context — history comparting needs attention` notice.
+- **Optional:** `dreamer` and `sidekick` model/disable blocks. Omit them to leave periodic memory consolidation and `/ctx-aug` off.
+- **Optional:** `embedding`. Omit it to use the local `Xenova/all-MiniLM-L6-v2`; turning embeddings off removes semantic/embedding-backed search, but keyword search and context management continue.
+
+User-level config is `~/.config/cortexkit/magic-context.jsonc` on macOS/Linux and `%USERPROFILE%\.config\cortexkit\magic-context.jsonc` on Windows (or `$XDG_CONFIG_HOME/cortexkit/magic-context.jsonc` when set). OpenCode Desktop users can use the dashboard's config editor or hand-edit that file; Desktop does not include the CLI setup wizard.
 
 **Pi:** `npx @cortexkit/magic-context@latest setup --harness pi` (requires Pi `>= 0.74.0`). The Pi extension shares the same database as OpenCode; project memories and embeddings pool across both.
 
@@ -267,7 +284,7 @@ It reads directly from Magic Context's SQLite database. No extra server, no API.
 
 ## Configuration
 
-Settings live in `magic-context.jsonc`. Everything has sensible defaults; project config merges on top of user-wide settings. For the full reference — cache TTL tuning, per-model execute thresholds, historian and dreamer model selection, embedding providers, and memory settings — see **[CONFIGURATION.md](./CONFIGURATION.md)** or the **[configuration reference on docs.cortexkit.io](https://docs.cortexkit.io/magic-context/reference/configuration/)**.
+Settings live in `magic-context.jsonc`. Most settings have sensible defaults, but `historian.model` is required for history compacting; project config merges on top of user-wide settings. For the full reference — cache TTL tuning, per-model execute thresholds, historian and dreamer model selection, embedding providers, and memory settings — see **[CONFIGURATION.md](./CONFIGURATION.md)** or the **[configuration reference on docs.cortexkit.io](https://docs.cortexkit.io/magic-context/reference/configuration/)**.
 
 **Config locations** (one shared CortexKit location, project overrides user):
 1. `<project-root>/.cortexkit/magic-context.jsonc`

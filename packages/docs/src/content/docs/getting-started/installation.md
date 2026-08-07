@@ -38,11 +38,11 @@ To target one harness explicitly, pass `--harness opencode` or `--harness pi`.
 <Tabs>
 <TabItem label="OpenCode">
 
-Setup adds the plugin to your `opencode.json` and turns off compaction:
+Setup adds the plugin to your `opencode.jsonc` and turns off compaction:
 
 ```jsonc
 {
-  "plugin": ["@cortexkit/opencode-magic-context"],
+  "plugin": ["@cortexkit/opencode-magic-context@latest"],
   "compaction": { "auto": false, "prune": false }
 }
 ```
@@ -70,6 +70,32 @@ Pi setup prompts for `thinking_level` if you pick a `github-copilot/*` reasoning
 
 </TabItem>
 </Tabs>
+
+## Manual setup (OpenCode)
+
+If you cannot run the wizard, add this to `opencode.jsonc`:
+
+```jsonc
+{
+  "plugin": ["@cortexkit/opencode-magic-context@latest"],
+  "compaction": { "auto": false, "prune": false }
+}
+```
+
+Then create `magic-context.jsonc` with the one setting the historian needs:
+
+```jsonc
+{
+  "$schema": "https://raw.githubusercontent.com/cortexkit/magic-context/master/assets/magic-context.schema.json",
+  "historian": { "model": "provider/model-id" }
+}
+```
+
+- **Required:** `historian.model` must be a real `provider/model-id`. Without it, the plugin loads but historian runs fail, older history is not summarized, and repeated failures show a `Magic Context — history comparting needs attention` notice.
+- **Optional:** `dreamer` and `sidekick` model/disable blocks. Omit them to leave periodic memory consolidation and `/ctx-aug` off.
+- **Optional:** `embedding`. Omit it to use the local `Xenova/all-MiniLM-L6-v2`; turning embeddings off removes semantic/embedding-backed search, but keyword search and context management continue.
+
+User-level config is `~/.config/cortexkit/magic-context.jsonc` on macOS/Linux and `%USERPROFILE%\.config\cortexkit\magic-context.jsonc` on Windows (or `$XDG_CONFIG_HOME/cortexkit/magic-context.jsonc` when set). OpenCode Desktop users can use the dashboard's config editor or hand-edit that file; Desktop does not include the CLI setup wizard.
 
 ## Verify the install
 
