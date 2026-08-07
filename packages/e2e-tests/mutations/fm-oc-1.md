@@ -1,15 +1,3 @@
 # FM-OC-1 mutation record
 
-Runner: `bun scripts/run-rust-fm-mutation.ts FM-OC-1`
-
-Mutations were applied to temporary source copies and the contract assertion was run against each copy.
-
-- Rung swap: `servedFrom = replayed ? "lkg" : "raw";` → `servedFrom = replayed ? "raw" : "lkg";`
-- Rung deletion: removed `sessionLog(sessionId, "lkg_replay_served");`
-
-Output:
-
-```text
-FM_OC_1_RUNG_SWAP: FAIL (distinct contract assertion) — servedFrom = replayed ? "lkg" : "raw";
-FM_OC_1_RUNG_DELETION: FAIL (distinct contract assertion) — sessionLog(sessionId, "lkg_replay_served");
-```
+The canonical applied-diff, captured test output, exit status, and reverted green rerun are in [`fm-oc-1.json`](./fm-oc-1.json). The record was produced by running `bun scripts/run-rust-fm-mutation.ts 1`; mutations are applied in place, built, exercised by the real drill, reverted, rebuilt, and rerun.

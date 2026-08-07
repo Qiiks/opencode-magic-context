@@ -1,16 +1,3 @@
 # FM-OC-5 mutation record
 
-Runner: `bun scripts/run-rust-fm-mutation.ts FM-OC-5`
-
-Mutations were applied to temporary source copies and the contract assertion was run against each copy.
-
-- Rung swap: changed the fault action from `stopModule()` to `continueModule()` before the outage pass.
-- Rung deletion: removed the lineage-scoped `assertLoudModuleFailure` assertion.
-
-Output:
-
-```text
-FM_OC_5_RUNG_SWAP: FAIL (distinct contract assertion) — h.subc.stopModule();
-            await h.sendPrompt
-FM_OC_5_RUNG_DELETION: FAIL (distinct contract assertion) — assertLoudModuleFailure(h, sessionId);
-```
+The canonical applied-diff, captured test output, exit status, and reverted green rerun are in [`fm-oc-5.json`](./fm-oc-5.json). The record was produced by running `bun scripts/run-rust-fm-mutation.ts 5`; mutations are applied in place, built, exercised by the real drill, reverted, rebuilt, and rerun.
