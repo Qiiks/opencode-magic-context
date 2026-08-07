@@ -609,7 +609,7 @@
         },
         {
             "path": "tests/todo-synthesis.test.ts",
-            "tier": "both-modes",
+            "tier": "ts-only",
             "invocation": {
                 "ts": true,
                 "rust": false
