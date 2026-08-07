@@ -10,8 +10,14 @@ import {
     seedTaskScheduleState,
     writeTaskScheduleState,
 } from "./storage-task-schedule";
-import { evaluateTaskGate } from "./task-gates";
-import { compareTaskOrder, type DreamTaskName, leaseKeyFor, leaseKindFor } from "./task-registry";
+import { evaluateTaskGate, getDreamTaskBacklogs } from "./task-gates";
+import {
+    compareTaskOrder,
+    type DreamTaskBacklogMap,
+    type DreamTaskName,
+    leaseKeyFor,
+    leaseKindFor,
+} from "./task-registry";
 
 /** Bounded retry before a transient failure stops hot-retrying and waits for the
  *  next cron occurrence. */
@@ -266,7 +272,7 @@ interface DomainGroupCallbacks {
      */
     leaseWaitMs?: number;
     onRan?: (task: DreamTaskName) => void;
-    onFailed?: (task: DreamTaskName) => void;
+    onFailed?: (task: DreamTaskName, error?: string) => void;
     onBusy?: (task: DreamTaskName) => void;
 }
 
@@ -358,7 +364,7 @@ async function runDomainGroup(
                 cb?.onRan?.(due.config.task);
             } else if (outcome.transient) {
                 recordTransientFailure(db, projectIdentity, due, finishedAt, outcome.error ?? null);
-                cb?.onFailed?.(due.config.task);
+                cb?.onFailed?.(due.config.task, outcome.error);
             } else {
                 advanceAfterRun(
                     db,
@@ -368,7 +374,7 @@ async function runDomainGroup(
                     "failed",
                     outcome.error ?? null,
                 );
-                cb?.onFailed?.(due.config.task);
+                cb?.onFailed?.(due.config.task, outcome.error);
             }
         }
     } finally {
@@ -385,6 +391,12 @@ export interface ManualRunResult {
     deferredBusy: string[];
     /** Tasks that ran but failed. */
     failed: string[];
+    /** User-visible error details for failed tasks, including incomplete backlogs. */
+    failureDetails?: string[];
+    /** Read-only backlog snapshot before the selected tasks started. */
+    backlogBefore: DreamTaskBacklogMap;
+    /** Read-only backlog snapshot after the selected tasks finished or were skipped. */
+    backlogAfter: DreamTaskBacklogMap;
 }
 
 /**
@@ -401,7 +413,15 @@ export async function runManualDream(
     deps: Omit<RunDueTasksDeps, "now"> & { task?: DreamTaskName },
 ): Promise<ManualRunResult> {
     const now = Date.now();
-    const result: ManualRunResult = { ran: [], skippedNoWork: [], deferredBusy: [], failed: [] };
+    const result: ManualRunResult = {
+        ran: [],
+        skippedNoWork: [],
+        deferredBusy: [],
+        failed: [],
+        failureDetails: [],
+        backlogBefore: {},
+        backlogAfter: {},
+    };
 
     let selected: readonly DreamTaskRuntimeConfig[];
     let forceGate = false;
@@ -415,6 +435,10 @@ export async function runManualDream(
         selected = deps.tasks.filter((t) => t.schedule.trim() !== "");
     }
     if (selected.length === 0) return result;
+
+    const selectedTaskNames = selected.map((config) => config.task);
+    result.backlogBefore = getDreamTaskBacklogs(deps.db, deps.projectIdentity, selectedTaskNames);
+    result.backlogAfter = { ...result.backlogBefore };
 
     // Seed rows so completion advancement has a row to update.
     for (const cfg of selected) ensureSeeded(deps.db, deps.projectIdentity, cfg, now);
@@ -443,7 +467,14 @@ export async function runManualDream(
         if (pass) gated.push(d);
         else result.skippedNoWork.push(d.config.task);
     }
-    if (gated.length === 0) return result;
+    if (gated.length === 0) {
+        result.backlogAfter = getDreamTaskBacklogs(
+            deps.db,
+            deps.projectIdentity,
+            selectedTaskNames,
+        );
+        return result;
+    }
 
     const groups = new Map<string, DueTask[]>();
     for (const d of gated) {
@@ -459,11 +490,15 @@ export async function runManualDream(
                 forceGate,
                 leaseWaitMs: MANUAL_RUN_LEASE_WAIT_MS,
                 onRan: (t) => result.ran.push(t),
-                onFailed: (t) => result.failed.push(t),
+                onFailed: (task, error) => {
+                    result.failed.push(task);
+                    if (error) result.failureDetails?.push(`${task}: ${error}`);
+                },
                 onBusy: (t) => result.deferredBusy.push(t),
             }),
         ),
     );
+    result.backlogAfter = getDreamTaskBacklogs(deps.db, deps.projectIdentity, selectedTaskNames);
     return result;
 }
 

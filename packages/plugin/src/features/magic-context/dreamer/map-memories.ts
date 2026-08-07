@@ -70,6 +70,7 @@ export interface MapMemoriesArgs {
     model?: string;
     fallbackModels?: readonly string[];
     moduleRoute?: DreamerModuleRoute;
+    onProgress?: (processed: number) => void;
 }
 
 export interface MapMemoriesResult {
@@ -138,6 +139,7 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
             result.independent += counts.independent;
             result.remaining -= counts.mapped + counts.independent;
             result.batches += 1;
+            args.onProgress?.(result.mapped + result.independent);
         }
         result.complete = result.remaining === 0;
         log(

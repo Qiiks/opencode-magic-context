@@ -1,10 +1,12 @@
 import type { Database, Statement as PreparedStatement } from "../../../shared/sqlite";
+import type { DreamTaskRunBacklog } from "./task-registry";
 
 export interface DreamRunTaskSummary {
     name: string;
     durationMs: number;
     resultChars: number;
     error?: string;
+    backlog?: DreamTaskRunBacklog;
 }
 
 export interface DreamRunMemoryChanges {

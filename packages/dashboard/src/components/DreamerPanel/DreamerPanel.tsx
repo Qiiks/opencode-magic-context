@@ -98,6 +98,12 @@ function formatTaskTokens(task: DreamRunTask): string {
   return `input: ${task.tokens.input.toLocaleString()} · output: ${task.tokens.output.toLocaleString()}`;
 }
 
+function formatTaskBacklog(task: DreamRunTask): string {
+  const backlog = task.backlog;
+  if (!backlog) return "—";
+  return `${backlog.pendingAtEnd}/${backlog.totalAtEnd} pending · −${backlog.processed} (start ${backlog.pendingAtStart})`;
+}
+
 function formatTaskOutput(task: DreamRunTask, run: DreamRun): string {
   // Task name from the dream-run row is "evaluate-smart-notes" (registry
   // canonical). Matching "smart-notes" here never fired, so smart-note runs fell
@@ -629,6 +635,7 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
                     <th>Duration</th>
                     <th>Output</th>
                     <th>Tokens</th>
+                    <th>Backlog</th>
                     <th>Memory</th>
                     <th>Error</th>
                   </tr>
@@ -676,6 +683,7 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
                             >
                               {task() ? formatTaskTokens(task()) : "—"}
                             </td>
+                            <td>{task() ? formatTaskBacklog(task()) : "—"}</td>
                             <td>
                               <Show when={memChanged()} fallback="—">
                                 <span class="dream-run-flat-mem">
@@ -690,7 +698,7 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
                           </tr>
                           <Show when={expandedRun() === run.id && memChanged()}>
                             <tr class="dream-run-flat-detail-row">
-                              <td colspan="8">
+                              <td colspan="9">
                                 <Show
                                   when={memoryDetails()[run.id]}
                                   fallback={
@@ -830,6 +838,7 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
                                         <th>Duration</th>
                                         <th>Output</th>
                                         <th>Tokens</th>
+                                        <th>Backlog</th>
                                         <th>Status</th>
                                       </tr>
                                     </thead>
@@ -850,6 +859,7 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
                                             >
                                               {formatTaskTokens(task)}
                                             </td>
+                                            <td>{formatTaskBacklog(task)}</td>
                                             <td>
                                               <span
                                                 class={`dream-run-status ${task.error ? "error" : "success"}`}

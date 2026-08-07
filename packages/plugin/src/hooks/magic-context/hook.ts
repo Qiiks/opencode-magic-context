@@ -360,6 +360,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const recompProgressBySession =
         deps.liveSessionState?.recompProgressBySession ??
         new Map<string, import("./compartment-runner-types").RecompProgress>();
+    const dreamerProgressByProject =
+        deps.liveSessionState?.dreamerProgressByProject ??
+        new Map<
+            string,
+            import("../../features/magic-context/dreamer/task-registry").DreamTaskProgress
+        >();
     // Channel 1 (ctx_reduce tool-output nudge) per-session metric baseline.
     // Written at the end of each transform pass (post-drop), read in
     // tool.execute.after. Only populated for primary sessions.
@@ -439,6 +445,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             deferredMaterializationSessions,
             sessionDirectoryBySession,
             recompProgressBySession,
+            dreamerProgressByProject,
             internalChildSessions,
         },
         directory: deps.directory,
@@ -1111,6 +1118,13 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             // cached in a session, so a cold process cannot fall back to
             // the guarded TypeScript child path.
             moduleClient: rustModeModuleClient,
+            onProgress: (progress, completedTask) => {
+                if (progress) {
+                    dreamerProgressByProject.set(projectPath, progress);
+                } else if (dreamerProgressByProject.get(projectPath)?.task === completedTask) {
+                    dreamerProgressByProject.delete(projectPath);
+                }
+            },
         });
         void runDueTasksForProject({
             db,
@@ -1142,6 +1156,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             const model = resolveLiveModel(sessionId);
             return model ? `${model.providerID}/${model.modelID}` : undefined;
         },
+        getDreamerProgress: () => dreamerProgressByProject.get(projectPath) ?? null,
         getContextLimit: (sessionId) => {
             // Same DB fallback as getLiveModelKey — /ctx-status's "Resolved
             // context limit" and history-budget math depend on the live model.
@@ -1233,6 +1248,16 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               // lookup and module transport as scheduled runs.
                               // Do not rely on a transform-populated cache.
                               moduleClient: rustModeModuleClient,
+                              onProgress: (progress, completedTask) => {
+                                  if (progress) {
+                                      dreamerProgressByProject.set(projectPath, progress);
+                                  } else if (
+                                      dreamerProgressByProject.get(projectPath)?.task ===
+                                      completedTask
+                                  ) {
+                                      dreamerProgressByProject.delete(projectPath);
+                                  }
+                              },
                           }),
                           task,
                       }),

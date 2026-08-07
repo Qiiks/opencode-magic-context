@@ -550,11 +550,11 @@ describe("magic-context hook", () => {
             expect.objectContaining({
                 path: { id: "ses-dream" },
                 body: expect.objectContaining({
-                    parts: [
+                    parts: expect.arrayContaining([
                         expect.objectContaining({
-                            text: 'Running dream task "curate"...',
+                            text: expect.stringContaining("Backlog before starting:"),
                         }),
-                    ],
+                    ]),
                 }),
             }),
         );

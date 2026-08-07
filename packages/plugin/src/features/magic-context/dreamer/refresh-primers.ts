@@ -39,6 +39,7 @@ export interface RefreshPrimersArgs {
     model?: string;
     fallbackModels?: readonly string[];
     language?: string;
+    onProgress?: (processed: number) => void;
     /**
      * Pi only: builds a RawMessageProvider for an arbitrary historical session id
      * (JSONL), so the orientation seed read works on Pi-only installs where there
@@ -183,6 +184,7 @@ export async function refreshPrimers(args: RefreshPrimersArgs): Promise<RefreshP
             const refreshed = await refreshOnePrimer(args, primer, sliceMs, abortController.signal);
             if (refreshed) result.refreshed += 1;
             else result.skipped += 1;
+            args.onProgress?.(result.refreshed + result.skipped);
         }
         log(`[dreamer] refresh-primers: refreshed=${result.refreshed} skipped=${result.skipped}`);
         return result;

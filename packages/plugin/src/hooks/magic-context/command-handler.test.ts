@@ -1145,12 +1145,8 @@ describe("createMagicContextCommandHandler", () => {
 
             // No arg → run all enabled tasks (task is undefined).
             expect(runManual).toHaveBeenCalledWith(undefined);
-            expect(sendNotification).toHaveBeenNthCalledWith(
-                1,
-                "ses-dream",
-                "Starting dream run...",
-                { toastDurationMs: 5000 },
-            );
+            expect(sendNotification.mock.calls[0]?.[1]).toContain("Backlog before starting:");
+            expect(sendNotification.mock.calls[0]?.[1]).toContain("Starting dream run...");
             expect(sendNotification).toHaveBeenNthCalledWith(
                 2,
                 "ses-dream",
@@ -1188,12 +1184,8 @@ describe("createMagicContextCommandHandler", () => {
             );
 
             expect(runManual).toHaveBeenCalledWith("verify");
-            expect(sendNotification).toHaveBeenNthCalledWith(
-                1,
-                "ses-dream",
-                'Running dream task "verify"...',
-                { toastDurationMs: 5000 },
-            );
+            expect(sendNotification.mock.calls[0]?.[1]).toContain('Running dream task "verify"...');
+            expect(sendNotification.mock.calls[0]?.[1]).toContain("Backlog before starting:");
         });
 
         it("rejects an unknown task name without running", async () => {

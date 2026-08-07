@@ -3,6 +3,11 @@
  * Both sides import these — no SQLite dependency.
  */
 
+import type {
+    DreamTaskBacklogMap,
+    DreamTaskProgress,
+} from "../features/magic-context/dreamer/task-registry";
+
 export interface SidebarSnapshot {
     sessionId: string;
     usagePercentage: number;
@@ -101,6 +106,10 @@ export interface SidebarSnapshot {
      * sidebar "Recomp"/"Upgrade" progress bar and the /ctx-status dialog. Mirrors
      * the runtime `RecompProgress` shape from compartment-runner-types.ts.
      */
+    /** Read-only per-task candidate counts; populated by the server RPC. */
+    dreamerBacklog?: DreamTaskBacklogMap;
+    /** Process-local task progress; absent when no Dreamer task is running. */
+    dreamerProgress?: DreamTaskProgress | null;
     recompProgress?: {
         /** "recomp" → "Recomp" labels; "upgrade" → "Upgrade" labels. */
         kind?: "recomp" | "upgrade" | "embed" | "wrapup";

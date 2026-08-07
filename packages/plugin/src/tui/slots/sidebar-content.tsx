@@ -763,6 +763,14 @@ const SidebarContent = (props: {
                 </box>
             )}
 
+            {s()?.dreamerProgress && (
+                <box marginTop={1} width="100%">
+                    <text fg={props.theme.warning}>
+                        Dreamer {s()!.dreamerProgress!.task}: {s()!.dreamerProgress!.processed}/{s()!.dreamerProgress!.total} processed
+                    </text>
+                </box>
+            )}
+
             {/* Token breakdown bar. In collapsed mode the header, bar and the
                 3 summary rows stack with no vertical padding for a compact look;
                 expanded mode keeps the 1-row gap above the bar. */}
@@ -817,6 +825,16 @@ const SidebarContent = (props: {
                                     <text fg={props.theme.textMuted}>idle</text>
                                 )}
                             </box>
+                            <Show when={s()?.dreamerProgress}>
+                                {(progress) => (
+                                    <box width="100%" flexDirection="row" justifyContent="space-between">
+                                        <text fg={props.theme.textMuted}>Dreamer</text>
+                                        <text fg={props.theme.warning}>
+                                            {progress().task} {progress().processed}/{progress().total}
+                                        </text>
+                                    </box>
+                                )}
+                            </Show>
                             <box width="100%" flexDirection="row" justifyContent="space-between">
                                 <text fg={props.theme.textMuted}>Memories</text>
                                 <text fg={props.theme.textMuted}>
@@ -953,15 +971,39 @@ const SidebarContent = (props: {
                 )}
 
             {/* Dreamer */}
-            {sections().dreamer && s()?.lastDreamerRunAt && (
+            {sections().dreamer && (s()?.lastDreamerRunAt || s()?.dreamerProgress) && (
                 <>
                     <SectionHeader theme={props.theme} title="Dreamer" />
-                    <StatRow
-                        theme={props.theme}
-                        label="Last run"
-                        value={relativeTime(s()!.lastDreamerRunAt!)}
-                        dim
-                    />
+                    <Show when={s()?.dreamerProgress}>
+                        {(progress) => (
+                            <StatRow
+                                theme={props.theme}
+                                label="Current"
+                                value={`${progress().task} ${progress().processed}/${progress().total}`}
+                                warning
+                            />
+                        )}
+                    </Show>
+                    <Show when={s()?.lastDreamerRunAt}>
+                        {(lastRunAt) => (
+                            <StatRow
+                                theme={props.theme}
+                                label="Last run"
+                                value={relativeTime(lastRunAt())}
+                                dim
+                            />
+                        )}
+                    </Show>
+                    <For each={Object.entries(s()?.dreamerBacklog ?? {})}>
+                        {([task, backlog]) => (
+                            <StatRow
+                                theme={props.theme}
+                                label={task}
+                                value={`${backlog.pending}/${backlog.total}`}
+                                dim
+                            />
+                        )}
+                    </For>
                 </>
             )}
 

@@ -1,5 +1,10 @@
 import { DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE } from "../../config/schema/magic-context";
 import { getCompartments } from "../../features/magic-context/compartment-storage";
+import type {
+    DreamTaskBacklogMap,
+    DreamTaskProgress,
+} from "../../features/magic-context/dreamer/task-registry";
+import { formatDreamTaskBacklogs } from "../../features/magic-context/dreamer/task-registry";
 import { parseCacheTtl } from "../../features/magic-context/scheduler";
 import { getPendingOps } from "../../features/magic-context/storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
@@ -55,6 +60,7 @@ export function executeStatus(
     commitClusterTrigger?: { enabled: boolean; min_clusters: number },
     executeThresholdTokens?: { default?: number; [modelKey: string]: number | undefined },
     contextLimit?: number,
+    dreamer?: { backlog?: DreamTaskBacklogMap; progress?: DreamTaskProgress | null },
 ): string {
     // Single source of truth — resolver tells us both the effective percentage AND
     // which config source won (tokens vs percentage). Previously /ctx-status
@@ -138,6 +144,19 @@ export function executeStatus(
             `**Subagent session:** ${meta.isSubagent}`,
         ];
 
+        if (dreamer?.backlog && Object.keys(dreamer.backlog).length > 0) {
+            lines.push(
+                "",
+                "### Dreamer",
+                ...(dreamer.progress
+                    ? [
+                          `- Running: ${dreamer.progress.task} — ${dreamer.progress.processed}/${dreamer.progress.total} processed`,
+                      ]
+                    : []),
+                ...formatDreamTaskBacklogs(dreamer.backlog).split("\\n"),
+            );
+        }
+
         if (meta.lastContextPercentage > 0 || meta.lastInputTokens > 0) {
             lines.push(
                 "",
@@ -194,6 +213,17 @@ export function executeStatus(
             for (const op of pendingOps) {
                 lines.push(`- §${op.tagId}§ → ${op.operation}`);
             }
+        }
+
+        if (dreamer?.backlog && Object.keys(dreamer.backlog).length > 0) {
+            lines.push("", "### Dreamer Backlog", formatDreamTaskBacklogs(dreamer.backlog));
+        }
+        if (dreamer?.progress) {
+            lines.push(
+                "",
+                "### Dreamer Progress",
+                `- ${dreamer.progress.task}: ${dreamer.progress.processed}/${dreamer.progress.total} processed this run`,
+            );
         }
 
         return lines.join("\n");

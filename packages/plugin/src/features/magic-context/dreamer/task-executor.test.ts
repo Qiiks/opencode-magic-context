@@ -532,7 +532,7 @@ describe("createDreamTaskExecutor — compress-cues", () => {
 
         expect(result.status).toBe("failed");
         expect(result.transient).toBe(true);
-        expect(result.error).toContain("1 selected memories remain");
+        expect(result.error).toContain("1 remain (was 1 at run start; processed 0 this run)");
         expect(client.session.prompt).toHaveBeenCalledTimes(1);
     });
 

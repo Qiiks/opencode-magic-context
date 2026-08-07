@@ -2,9 +2,11 @@ import { randomUUID } from "node:crypto";
 import { COMPACTION_ENABLED_PATH } from "../../config/agent-disable";
 import type { DreamerConfig, SidekickConfig } from "../../config/schema/magic-context";
 import type { ResolvedTransformMode } from "../../config/transform-mode";
+import { getDreamTaskBacklogs } from "../../features/magic-context/dreamer/task-gates";
 import {
     CANONICAL_DREAM_TASKS,
     type DreamTaskName,
+    formatDreamTaskBacklogs,
     isCanonicalDreamTask,
 } from "../../features/magic-context/dreamer/task-registry";
 import type { ManualRunResult } from "../../features/magic-context/dreamer/task-scheduler";
@@ -382,10 +384,26 @@ async function executeAugmentation(
 
 export type ManualDreamSummary = ManualRunResult;
 
+function readDreamTaskBacklogsSafely(
+    db: Database,
+    projectPath: string,
+    tasks: readonly DreamTaskName[],
+) {
+    try {
+        return getDreamTaskBacklogs(db, projectPath, tasks);
+    } catch {
+        // Command handling must remain available while an older/empty database is migrating.
+        return {};
+    }
+}
+
 function summarizeManualDream(s: ManualDreamSummary): string {
     const lines: string[] = ["## /ctx-dream", ""];
     if (s.ran.length > 0) lines.push(`Ran: ${s.ran.join(", ")}`);
     if (s.failed.length > 0) lines.push(`Failed: ${s.failed.join(", ")}`);
+    if ((s.failureDetails?.length ?? 0) > 0) {
+        lines.push("Failure details:", ...(s.failureDetails ?? []).map((detail) => `- ${detail}`));
+    }
     if (s.skippedNoWork.length > 0) lines.push(`Skipped (no work): ${s.skippedNoWork.join(", ")}`);
     if (s.deferredBusy.length > 0)
         lines.push(
@@ -394,6 +412,12 @@ function summarizeManualDream(s: ManualDreamSummary): string {
             // this task itself. Say so, or the message reads as a lie.
             `Busy: ${s.deferredBusy.join(", ")} — another dream task holds this domain's lease; retry in a minute`,
         );
+    if (Object.keys(s.backlogBefore ?? {}).length > 0) {
+        lines.push("", "Backlog at run start:", formatDreamTaskBacklogs(s.backlogBefore ?? {}));
+    }
+    if (Object.keys(s.backlogAfter ?? {}).length > 0) {
+        lines.push("", "Backlog at run end:", formatDreamTaskBacklogs(s.backlogAfter ?? {}));
+    }
     if (
         s.ran.length === 0 &&
         s.failed.length === 0 &&
@@ -453,9 +477,22 @@ async function executeDreaming(
         task = requested;
     }
 
+    const backlogTasks = task ? [task] : CANONICAL_DREAM_TASKS;
+    const backlogBefore = readDreamTaskBacklogsSafely(
+        deps.db,
+        deps.dreamer.projectPath,
+        backlogTasks,
+    );
     await deps.sendNotification(
         sessionId,
-        task ? `Running dream task "${task}"...` : "Starting dream run...",
+        [
+            "## /ctx-dream",
+            "",
+            task ? `Running dream task "${task}"...` : "Starting dream run...",
+            "",
+            "Backlog before starting:",
+            formatDreamTaskBacklogs(backlogBefore, backlogTasks),
+        ].join("\n"),
         dreamNotificationParams,
     );
 
@@ -477,6 +514,9 @@ export function createMagicContextCommandHandler(deps: {
     getLiveModelKey?: (sessionId: string) => string | undefined;
     /** Optional live context limit resolver — used for tokens-based threshold display. */
     getContextLimit?: (sessionId: string) => number | undefined;
+    getDreamerProgress?: () =>
+        | import("../../features/magic-context/dreamer/task-registry").DreamTaskProgress
+        | null;
     onFlush?: (sessionId: string) => void;
     /** Runs /ctx-recomp. When `range` is provided, runs partial recomp over
      *  that range (snapped to enclosing compartment boundaries). When omitted,
@@ -732,6 +772,16 @@ export function createMagicContextCommandHandler(deps: {
                     deps.commitClusterTrigger,
                     deps.executeThresholdTokens,
                     liveContextLimit,
+                    deps.dreamer
+                        ? {
+                              backlog: readDreamTaskBacklogsSafely(
+                                  deps.db,
+                                  deps.dreamer.projectPath,
+                                  CANONICAL_DREAM_TASKS,
+                              ),
+                              progress: deps.getDreamerProgress?.() ?? null,
+                          }
+                        : undefined,
                 );
                 const moduleStatus = rustStatus ? `\n\n${formatRustStatusText(rustStatus)}` : "";
                 const modeStatus = deps.compactionOff
