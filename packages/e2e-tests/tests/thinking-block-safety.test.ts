@@ -58,6 +58,13 @@ beforeAll(async () => {
             // Keep the nudge band active but not aggressive — tests will
             // inject specific usage percentages via mock responses.
             execute_threshold_percentage: 80,
+            // Off because Bug B asserts the dropped paste body is absent from ALL
+            // user text. Dropped content intentionally stays searchable, so when
+            // the async FTS index catches up in time the auto-search hint quotes
+            // an 80-char fragment of the paste back into the next user message —
+            // a timing coin-flip that failed 3 of 20 serial runs. This suite
+            // tests thinking-block safety, not search recall.
+            auto_search: { enabled: false },
         },
         modelContextLimit: 50_000,
     });

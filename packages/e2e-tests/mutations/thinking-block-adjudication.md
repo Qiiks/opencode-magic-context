@@ -96,3 +96,22 @@ Received: "<session-history></session-history>\n<session-history-since>(no new c
  24 expect() calls
 Ran 3 tests across 1 file. [14.39s]
 ```
+
+## Adjudication closure (post-S1)
+
+Root cause identified from the recorded failure output: the failing text was
+not the paste shell — the `[dropped §N§]` placeholder assertion passed every
+time. The leak channel was the auto-search hint: dropped content remains
+searchable BY DESIGN (ctx_search is the recovery path for dropped tags), so
+when the async FTS index catches up before the next turn, the hint quotes an
+80-char fragment of the paste back into the next user message. Timing decides
+which side of the race a run lands on — hence 17/3 across identical serial
+invocations.
+
+Resolution: `auto_search: { enabled: false }` in this suite's spawn config,
+with the reason recorded at the config line. This is a test-scoping fix, not
+product behavior suppression: the suite's contract is thinking-block safety
+and turn-boundary preservation; search recall over dropped content is a
+separate, intended behavior with its own coverage (long-running-session
+exercises auto-search decisions explicitly). 12/12 serial runs green after
+the change (6 verified via summary line, 6 via fail-count grep).
