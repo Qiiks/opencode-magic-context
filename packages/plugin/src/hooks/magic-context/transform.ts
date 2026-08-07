@@ -491,7 +491,12 @@ export interface TransformDeps {
     scheduler: Scheduler;
     contextUsageMap: Map<
         string,
-        { usage: ContextUsage; updatedAt: number; lastResponseTime?: number }
+        {
+            usage: ContextUsage;
+            updatedAt: number;
+            lastResponseTime?: number;
+            hasUsageTokens?: boolean;
+        }
     >;
     db: ContextDatabase;
     /**
