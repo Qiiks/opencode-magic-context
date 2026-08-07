@@ -26,7 +26,10 @@ import {
 import { writeRustTransformDecision } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
-import { resolveCtxReduceAvailability } from "./ctx-reduce-availability";
+import {
+    resolveCtxReduceAvailability,
+    resolveTodowriteAvailabilityFromMessages,
+} from "./ctx-reduce-availability";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     resolveExecuteThreshold,
@@ -1310,6 +1313,9 @@ export function createRustModeTransform(
             }
         }
         const reduceAvailability = resolveCtxReduceAvailability(sessionId);
+        // Freeze the native todo-tool verdict before state sync reads it. Rust owns
+        // synthetic-todo bytes, but the host still observes OpenCode's per-session map.
+        resolveTodowriteAvailabilityFromMessages(sessionId, messages);
         // A provisional fail-open verdict must not activate provider-visible bytes. The
         // first persisted user message freezes the verdict for all later transform passes.
         const toolPresent = reduceAvailability.frozen && reduceAvailability.callable;

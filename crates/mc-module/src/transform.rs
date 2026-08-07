@@ -2016,7 +2016,13 @@ fn apply_once(
             tagger_feature_epoch: tagger_feature_epoch.clone(),
         },
     );
-    let tagging_active = tagging_surface_requested && persisted_tagging_surface_active;
+    // A brand-new session has no provider-visible prefix to invalidate, so its bootstrap HARD
+    // may mint and render tags immediately. Established dormant sessions still wait for the
+    // coordinating identity fold before tags can change their replayed bytes.
+    let bootstrap_tagging_active = !loaded.meta.initialized
+        && matches!(serializer_profile, Some(SerializerProfile::OpencodeAiSdk));
+    let tagging_active = tagging_surface_requested
+        && (persisted_tagging_surface_active || bootstrap_tagging_active);
     // Previously stored overlay rows may still replay when boundary-lineage validation
     // later forces pass-through. Decisions from this request stay in memory until the
     // final cache-state compare-and-swap accepts the pass.
@@ -11651,10 +11657,9 @@ mod tests {
             .iter()
             .find(|message| message["info"]["id"] == "assistant-reasoning")
             .unwrap();
-        assert_eq!(
-            serde_json::to_vec(untouched_assistant).unwrap(),
-            serde_json::to_vec(&raw[0]).unwrap()
-        );
+        assert_eq!(untouched_assistant["parts"][0], raw[0]["parts"][0]);
+        assert_eq!(untouched_assistant["parts"][1]["text"], "§1§ answer");
+        assert_eq!(untouched_assistant["parts"][1]["providerField"], "text-keep");
 
         let active = apply_once_with_estimator(&store, &request, &context, estimate, None).unwrap();
         assert_eq!(active.response.action, "SOFT+");
@@ -11932,8 +11937,8 @@ mod tests {
                 .unwrap()
                 .meta
                 .reasoning_cleared_through_tag,
-            0,
-            "tag minting alone must not advance the cutoff"
+            2,
+            "the bootstrap HARD records its pre-reasoning cutoff while preserving newer signatures"
         );
 
         messages.push(item("gap-c", 6, "separator"));
@@ -14729,13 +14734,15 @@ mod tests {
 
         let transition = run(&s, &request, &spine());
         assert_eq!(transition.surface_state, SurfaceState::Transition);
-        assert!(!serde_json::to_string(transition.messages())
+        let transition_bytes = serde_json::to_vec(transition.messages()).unwrap();
+        assert!(serde_json::to_string(transition.messages())
             .unwrap()
-            .contains("§1§"));
+            .contains("§1§ tool output"));
 
         let active = run(&s, &request, &spine());
         assert_eq!(active.surface_state, SurfaceState::Active);
         let active_bytes = serde_json::to_vec(active.messages()).unwrap();
+        assert_eq!(active_bytes, transition_bytes);
         assert!(serde_json::to_string(active.messages())
             .unwrap()
             .contains("§1§ tool output"));
@@ -14836,6 +14843,30 @@ mod tests {
         assert_eq!(after_commit.action, "SOFT+");
         assert_eq!(tail_bytes(&after_commit, "m1"), "§1§ hello");
         assert_eq!(s.load_tags_for_session("flip").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn first_active_render_commits_tagged_bytes_before_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let request = active_opencode_req("first-active", "cfg0", vec![item("m1", 1, "hello")]);
+
+        let first = run(&s, &request, &spine());
+        assert_eq!(first.action, "HARD");
+        assert_eq!(tail_bytes(&first, "m1"), "§1§ hello");
+        assert!(s
+            .load("first-active")
+            .unwrap()
+            .meta
+            .last_render_config
+            .contains("tfe3"));
+
+        let replay = run(&s, &request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_vec(first.messages()).unwrap(),
+            serde_json::to_vec(replay.messages()).unwrap()
+        );
     }
 
     #[test]

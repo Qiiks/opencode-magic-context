@@ -43,7 +43,9 @@ import {
 import { TestHarness } from "../src/harness";
 import { openTestDb } from "../src/test-db";
 import type { MockUsage } from "../src/mock-provider/server";
+import { FOLD_SKIP_REASON, foldInfraEnabled } from "../src/rust-scenario-support";
 
+const RUST_MODE = process.env.MC_E2E_MODE === "rust";
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 
 function isHistorianRequest(body: Record<string, unknown>): boolean {
@@ -278,6 +280,63 @@ function emitCtxReduceOnce(drop: string): void {
     });
 }
 
+function emitMemoryToolOnce(input: Record<string, unknown>): () => boolean {
+    let emitted = false;
+    h.mock.addMatcher((body) => {
+        if (emitted || !JSON.stringify(body.system ?? "").includes("## Magic Context")) return null;
+        const tools = Array.isArray(body.tools) ? body.tools : [];
+        const name = tools
+            .map((tool) =>
+                tool && typeof tool === "object" ? (tool as { name?: unknown }).name : null,
+            )
+            .find((value) => value === "ctx_memory");
+        if (typeof name !== "string") return null;
+        emitted = true;
+        return {
+            content: [
+                {
+                    type: "tool_use",
+                    id: `toolu_memory_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`,
+                    name,
+                    input,
+                },
+            ],
+            stop_reason: "tool_use" as const,
+            usage: DEFER_USAGE,
+        };
+    });
+    return () => emitted;
+}
+
+async function runMemoryTool(
+    sessionId: string,
+    input: Record<string, unknown>,
+    prompt: string,
+): Promise<void> {
+    h.mock.reset();
+    const wasEmitted = emitMemoryToolOnce(input);
+    setDefer("memory tool follow-up");
+    await h.sendPrompt(sessionId, prompt);
+    expect(wasEmitted()).toBe(true);
+}
+
+function memoryIdContaining(body: Record<string, unknown>, content: string): number {
+    const m0 = extractM0(body) ?? "";
+    const escaped = content.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = m0.match(new RegExp(`#(\\d+)(?: \\[[^\n]+\\])?: ${escaped}`));
+    if (!match) throw new Error(`no rendered memory id found for ${JSON.stringify(content)}`);
+    return Number(match[1]);
+}
+
+function thrownMessage(fn: () => unknown): string {
+    try {
+        fn();
+        return "";
+    } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+    }
+}
+
 function assertNoBusts(label: string): void {
     const requests = mainAgentRequests(h.mock.requests());
     const busts = findBusts(requests);
@@ -398,6 +457,24 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 installHistorianMatcher(h);
                 const sessionId = await h.createSession();
 
+                if (RUST_MODE) {
+                    // The hermetic Rust stack has no Broca fold runner, so a historian
+                    // publish cannot be produced here. Once that capability is enabled,
+                    // the fold-gated Rust scenario verifies that the publish survives m[1] replay.
+                    expect(foldInfraEnabled()).toBe(false);
+                    expect(FOLD_SKIP_REASON).toContain("broca");
+                    for (let turn = 1; turn <= 3; turn += 1) {
+                        setDefer(`B9 Rust replay ${turn}`);
+                        await h.sendPrompt(sessionId, `B9 Rust turn ${turn}: empty baseline replay.`);
+                    }
+                    const rustRequests = mainAgentRequests(h.mock.requests());
+                    expect(extractM0(rustRequests.at(-1)!.body)).toContain(
+                        "<session-history></session-history>",
+                    );
+                    assertNoBusts("B9-rust-no-fold-infra");
+                    return;
+                }
+
                 // Phase 1 — force an early execute pass so m[0] materializes EMPTY
                 // (0 compartments yet). A high-usage turn marks the next pass as
                 // execute; the pass after it does the empty materialization.
@@ -486,6 +563,28 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 // WITH that memory in the baseline (early execute pass). This
                 // freezes cachedM0MaxMemoryId at the baseline's id.
                 const sessionId = await h.createSession();
+                if (RUST_MODE) {
+                    const freshRule = "B10 fresh rule: always run the full gate before a release.";
+                    await runMemoryTool(
+                        sessionId,
+                        { action: "write", category: "PROJECT_RULES", content: freshRule },
+                        "B10 Rust writer: save the release rule.",
+                    );
+
+                    // PARITY.md assigns memory rows to module authority. Observe the
+                    // committed write through a fresh session's provider wire; a direct
+                    // TypeScript context.db insert is rejected instead of mutating m[1].
+                    const readerSessionId = await h.createSession();
+                    h.mock.reset();
+                    setDefer("B10 Rust reader");
+                    await h.sendPrompt(readerSessionId, "B10 Rust reader: load project memory.");
+                    const readerM0 = extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body)!;
+                    expect(readerM0).toContain(freshRule);
+                    expect(thrownMessage(() => seedMemory("B10 forbidden TS-side write"))).toContain(
+                        "managed by the Rust module",
+                    );
+                    return;
+                }
                 seedMemory("B10 baseline rule: prefer the project's own tools over shell fallbacks.");
                 setDefer("B10 warm 1");
                 await h.sendPrompt(sessionId, "B10 turn 1: warmup.");
@@ -548,6 +647,41 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 //#given — seed a memory and materialize m[0] WITH it in the
                 // baseline (so it's a rendered memory the mutation can target).
                 const sessionId = await h.createSession();
+                if (RUST_MODE) {
+                    const original = "B11 original rule: deploys go through the staging pipeline first.";
+                    await runMemoryTool(
+                        sessionId,
+                        { action: "write", category: "PROJECT_RULES", content: original },
+                        "B11 Rust writer: save the baseline rule.",
+                    );
+
+                    const mutationSessionId = await h.createSession();
+                    h.mock.reset();
+                    setDefer("B11 Rust baseline materialize");
+                    await h.sendPrompt(mutationSessionId, "B11 Rust turn 1: load project memory.");
+                    const baselineBody = mainAgentRequests(h.mock.requests()).at(-1)!.body;
+                    expect(extractM0(baselineBody)).toContain(original);
+                    const rustMemoryId = memoryIdContaining(baselineBody, original);
+
+                    const revised =
+                        "B11 revised rule: deploys go straight to production with a feature flag.";
+                    await runMemoryTool(
+                        mutationSessionId,
+                        { action: "update", ids: [rustMemoryId], content: revised },
+                        "B11 Rust turn 2: revise the deployment rule.",
+                    );
+                    const readerSessionId = await h.createSession();
+                    h.mock.reset();
+                    setDefer("B11 Rust reader");
+                    await h.sendPrompt(readerSessionId, "B11 Rust reader: load revised project memory.");
+                    const revisedM0 = extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body)!;
+                    expect(revisedM0).toContain(revised);
+                    expect(revisedM0).not.toContain(original);
+                    expect(
+                        thrownMessage(() => queueMemoryUpdate(rustMemoryId, "forbidden TS update")),
+                    ).toContain("managed by the Rust module");
+                    return;
+                }
                 const memId = seedMemory(
                     "B11 original rule: deploys go through the staging pipeline first.",
                 );
@@ -611,6 +745,34 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 //#given — get a memory riding m[1] (the B10 setup): materialize an
                 // empty m[0], then add a memory and surface it as an m[1] delta.
                 const sessionId = await h.createSession();
+                if (RUST_MODE) {
+                    const deltaRule =
+                        "B12 delta rule: keep the cache prefix byte-identical across defer passes.";
+                    await runMemoryTool(
+                        sessionId,
+                        { action: "write", category: "PROJECT_RULES", content: deltaRule },
+                        "B12 Rust writer: save a delta rule.",
+                    );
+                    const readerSessionId = await h.createSession();
+                    h.mock.reset();
+                    setDefer("B12 Rust reader");
+                    await h.sendPrompt(readerSessionId, "B12 Rust reader: load project memory.");
+                    const moduleOwnedM0 = extractM0(
+                        mainAgentRequests(h.mock.requests()).at(-1)!.body,
+                    )!;
+                    expect(moduleOwnedM0).toContain(deltaRule);
+
+                    // PARITY.md assigns the effective epoch to Rust authority. Mutating
+                    // the TS mirror succeeds but is intentionally inert on provider bytes;
+                    // the module unit gate pins the real epoch-bump HARD fold.
+                    bumpProjectEpoch();
+                    setDefer("B12 Rust inert TS epoch replay");
+                    await h.sendPrompt(readerSessionId, "B12 Rust reader: replay after TS mirror bump.");
+                    expect(extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body)).toBe(
+                        moduleOwnedM0,
+                    );
+                    return;
+                }
                 setDefer("B12 warm 1");
                 await h.sendPrompt(sessionId, "B12 turn 1: warmup.");
                 h.mock.setDefault({ text: "B12 high", usage: EXECUTE_USAGE });

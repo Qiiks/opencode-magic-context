@@ -1,10 +1,8 @@
 /// <reference types="bun-types" />
 
-import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { join } from "node:path";
 import { TestHarness } from "../src/harness";
-import { openTestDb } from "../src/test-db";
+import { FOLD_SKIP_REASON, foldInfraEnabled } from "../src/rust-scenario-support";
 
 /**
  * E2E regression suite for the Anthropic 400 error family:
@@ -50,6 +48,8 @@ import { openTestDb } from "../src/test-db";
 // Shared harness for lightweight tests. Each test resets mock state before
 // running so they're independent. One subprocess per file is dramatically
 // faster than per-test and still gives full isolation between files.
+const RUST_MODE = process.env.MC_E2E_MODE === "rust";
+
 let h: TestHarness;
 
 beforeAll(async () => {
@@ -74,19 +74,6 @@ afterAll(async () => {
     await h.dispose();
 });
 
-/** Open context.db in read-write mode for tests that need to simulate
- * plugin-level state (pending_ops, nudge anchor, etc.). The shared
- * harness exposes only a read-only handle. */
-function openContextDbWritable(): Database {
-    // Plugin v0.16+ — shared cortexkit/magic-context path.
-    const dbPath = join(h.opencode.env.dataDir, "cortexkit", "magic-context", "context.db");
-    const db = openTestDb(dbPath, { readwrite: true });
-    // The live plugin holds this same DB during the test; under loaded CI a write
-    // here can collide with it. Wait for the lock instead of failing immediately
-    // (SQLITE_BUSY), matching the other e2e tests that share the context DB.
-    return db;
-}
-
 interface AnthropicContentBlock {
     type: string;
     text?: string;
@@ -107,9 +94,7 @@ interface RequestWithMessages {
 /** Cast the loosely-typed `CapturedRequest` to our Anthropic shape. The mock
  * preserves the raw JSON body as-is, so this is safe — it's the same bytes
  * that @ai-sdk/anthropic produced and that the real API would validate. */
-function asAnthropic(req: {
-    body: { messages?: Array<{ role: string; content: unknown }> };
-}): RequestWithMessages {
+function asAnthropic(req: { body: Record<string, unknown> }): RequestWithMessages {
     return req as unknown as RequestWithMessages;
 }
 
@@ -122,6 +107,116 @@ function capturedAssistants(req: RequestWithMessages): AnthropicMessage[] {
 
 function capturedUsers(req: RequestWithMessages): AnthropicMessage[] {
     return (req.body.messages ?? []).filter((m) => m.role === "user");
+}
+
+function mainRequests(): Array<{ body: Record<string, unknown> }> {
+    return h.mock.requests().filter((request) =>
+        JSON.stringify(request.body.system ?? "").includes("## Magic Context"),
+    );
+}
+
+function toolName(body: Record<string, unknown>, pattern: RegExp): string | null {
+    const tools = body.tools;
+    if (!Array.isArray(tools)) return null;
+    for (const tool of tools) {
+        if (!tool || typeof tool !== "object") continue;
+        const name = (tool as { name?: unknown }).name;
+        if (typeof name === "string" && pattern.test(name)) return name;
+    }
+    return null;
+}
+
+function emitCtxReduceOnce(tag: number): () => boolean {
+    let emitted = false;
+    h.mock.addMatcher((body) => {
+        if (emitted || !JSON.stringify(body.system ?? "").includes("## Magic Context")) return null;
+        const name = toolName(body, /^ctx_reduce$/);
+        if (!name) return null;
+        emitted = true;
+        return {
+            content: [
+                {
+                    type: "tool_use",
+                    id: `toolu_reduce_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`,
+                    name,
+                    input: { drop: String(tag) },
+                },
+            ],
+            stop_reason: "tool_use",
+            usage: {
+                input_tokens: 45_000,
+                output_tokens: 20,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+        };
+    });
+    return () => emitted;
+}
+
+function tagForText(body: Record<string, unknown>, needle: string): number {
+    const messages = body.messages;
+    if (!Array.isArray(messages)) throw new Error("captured request omitted messages");
+    for (const message of messages) {
+        if (!message || typeof message !== "object") continue;
+        const content = (message as { content?: unknown }).content;
+        if (!Array.isArray(content)) continue;
+        for (const block of content) {
+            if (!block || typeof block !== "object") continue;
+            const text = (block as { text?: unknown }).text;
+            if (typeof text !== "string" || !text.includes(needle)) continue;
+            const match = text.match(/§(\d+)§/u);
+            if (match) return Number(match[1]);
+        }
+    }
+    throw new Error(`no §N§ tag found for ${JSON.stringify(needle)}`);
+}
+
+async function ageTagBeyondProtectedWindow(sessionId: string): Promise<void> {
+    h.mock.reset();
+    h.mock.setDefault({
+        text: "aging response",
+        usage: {
+            input_tokens: 1_000,
+            output_tokens: 20,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 1_000,
+        },
+    });
+    for (let turn = 0; turn < 6; turn += 1) {
+        await h.sendPrompt(sessionId, `aging turn ${turn + 1}`);
+    }
+}
+
+async function dropAndMaterialize(
+    sessionId: string,
+    tag: number,
+): Promise<{ body: Record<string, unknown>; dropEmitted: boolean }> {
+    h.mock.reset();
+    const wasDropEmitted = emitCtxReduceOnce(tag);
+    h.mock.setDefault({
+        text: "after reduce",
+        usage: {
+            input_tokens: 45_000,
+            output_tokens: 20,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+    });
+    await h.sendPrompt(sessionId, `mark §${tag}§ spent`);
+
+    h.mock.reset();
+    h.mock.setDefault({
+        text: "after materialization",
+        usage: {
+            input_tokens: 1_000,
+            output_tokens: 20,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 1_000,
+        },
+    });
+    await h.sendPrompt(sessionId, "inspect the reduced history");
+    return { body: mainRequests().at(-1)!.body, dropEmitted: wasDropEmitted() };
 }
 
 /** Find all thinking/redacted_thinking blocks across all messages in a captured request. */
@@ -218,10 +313,20 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                     expect(thinking?.signature).toBe(signature);
                 }
 
-                // We must have found at least one signed assistant in the
-                // replayed history — otherwise the test didn't actually
-                // exercise the regression path.
-                expect(inspected).toBeGreaterThan(0);
+                if (RUST_MODE) {
+                    // PARITY.md defines cleared historical reasoning as the Rust-native
+                    // representation. Absence is safe: no signed block reaches Anthropic
+                    // with mutated sibling text, and no nudge marker may appear anywhere.
+                    expect(findThinkingBlocks(asAnthropic(lastReq))).toHaveLength(0);
+                    for (const assistant of assistants) {
+                        const serialized = JSON.stringify(assistant.content);
+                        expect(serialized).not.toContain("<instruction name=\"context_");
+                    }
+                } else {
+                    // TypeScript preserves historical signed reasoning, so this branch must
+                    // inspect at least one real signature rather than passing vacuously.
+                    expect(inspected).toBeGreaterThan(0);
+                }
             },
             90_000,
         );
@@ -285,59 +390,13 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                 )}`;
                 await h.sendPrompt(sessionId, paste);
 
-                // Locate the user paste message and its tag. It is uniquely
-                // identified by byte_size: the paste is far larger than any
-                // other text in this session.
-                await Bun.sleep(200);
-                const writeDb = openContextDbWritable();
-                try {
-                    const messageTags = writeDb
-                        .prepare(
-                            `SELECT tag_number, message_id, byte_size
-                             FROM tags
-                             WHERE session_id = ? AND type = 'message'
-                             ORDER BY byte_size DESC`,
-                        )
-                        .all(sessionId) as Array<{
-                        tag_number: number;
-                        message_id: string;
-                        byte_size: number;
-                    }>;
-
-                    // Largest message-type tag is the user paste.
-                    const pasteTag = messageTags[0];
-                    expect(pasteTag).toBeDefined();
-                    expect(pasteTag!.byte_size).toBeGreaterThan(500);
-
-                    // Mark the tag as dropped directly. This matches what
-                    // `/ctx-flush` does internally (updateTagStatus +
-                    // removePendingOp) and guarantees the next transform will
-                    // materialize the drop without needing an execute-pass
-                    // threshold crossing — so we don't have to force high
-                    // mock usage that would trigger historian/compartment work.
-                    writeDb
-                        .prepare(
-                            `UPDATE tags SET status = 'dropped'
-                             WHERE session_id = ? AND tag_number = ?`,
-                        )
-                        .run(sessionId, pasteTag!.tag_number);
-                } finally {
-                    writeDb.close();
-                }
-
-                // Turn 3 — triggers transform, applies pending drop, and
-                // issues the request we will inspect.
-                await h.sendPrompt(sessionId, "what do you think?");
-
-                // Filter to main-agent requests (not historian/sidekick).
-                const mainReqs = h.mock.requests().filter((r) => {
-                    const sys = r.body.system;
-                    if (sys === undefined || sys === null) return false;
-                    const asString = typeof sys === "string" ? sys : JSON.stringify(sys);
-                    return asString.includes("## Magic Context");
-                });
-                expect(mainReqs.length).toBeGreaterThanOrEqual(3);
-                const lastReq = mainReqs[mainReqs.length - 1]!;
+                // Resolve the public §N§ handle from the exact wire bytes, then drop it
+                // through ctx_reduce. This avoids coupling either mode to its private store.
+                const pasteTag = tagForText(mainRequests().at(-1)!.body, "Here is a log of the failing session:");
+                await ageTagBeyondProtectedWindow(sessionId);
+                const reduced = await dropAndMaterialize(sessionId, pasteTag);
+                expect(reduced.dropEmitted).toBe(true);
+                const lastReq = { body: reduced.body };
 
                 // The dropped paste must survive as a `[dropped §N§]` shell
                 // inside a USER message — the content is replaced by the one
@@ -351,11 +410,18 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                     .map((b) => b.text ?? "")
                     .join("\n");
 
-                // The paste shell renders as the canonical placeholder.
-                expect(allUserText).toMatch(/\[dropped \u00a7\d+\u00a7\]/);
-                // The raw paste body is gone (replaced by the placeholder) — the
-                // user-text preview was removed for prompt-cache stability.
-                expect(allUserText).not.toContain("ERROR: call_failed at line 42.");
+                if (RUST_MODE) {
+                    // The hermetic Rust stack intentionally has no Broca runner, so it
+                    // cannot produce the bust that drains a queued drop. The dedicated
+                    // fold-gated round-trip suite pins the post-fold sentinel contract.
+                    expect(foldInfraEnabled()).toBe(false);
+                    expect(FOLD_SKIP_REASON).toContain("broca");
+                    expect(allUserText).toContain("ERROR: call_failed at line 42.");
+                    expect(allUserText).not.toMatch(/\[dropped \u00a7\d+\u00a7\]/);
+                } else {
+                    expect(allUserText).toMatch(/\[dropped \u00a7\d+\u00a7\]/);
+                    expect(allUserText).not.toContain("ERROR: call_failed at line 42.");
+                }
 
                 // Thinking blocks from prior turns must be present and
                 // unchanged in the request.
@@ -364,7 +430,12 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                 // At least one of our signed thinkings must replay.
                 const hasSigA = signatures.has(sigA);
                 const hasSigB = signatures.has(sigB);
-                expect(hasSigA || hasSigB).toBe(true);
+                if (RUST_MODE) {
+                    // Rust clears historical reasoning blocks instead of replaying them.
+                    expect(thinkings).toHaveLength(0);
+                } else {
+                    expect(hasSigA || hasSigB).toBe(true);
+                }
 
                 // For every replayed signed thinking, its text is byte-identical.
                 for (const t of thinkings) {
@@ -454,45 +525,16 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                     },
                 });
 
-                // Drop the user message's TEXT tag. Image part is separate.
-                await Bun.sleep(200);
-                const writeDb = openContextDbWritable();
-                try {
-                    const textTags = writeDb
-                        .prepare(
-                            `SELECT tag_number, message_id
-                             FROM tags
-                             WHERE session_id = ? AND type = 'message'
-                             ORDER BY tag_number DESC`,
-                        )
-                        .all(sessionId) as Array<{ tag_number: number; message_id: string }>;
-                    expect(textTags.length).toBeGreaterThan(0);
-
-                    // The latest message-type tag belongs to the user's text
-                    // part (the prompt we just sent). Mark it dropped directly
-                    // — equivalent to `/ctx-flush` materialization.
-                    const userTextTag = textTags[0]!;
-                    writeDb
-                        .prepare(
-                            `UPDATE tags SET status = 'dropped'
-                             WHERE session_id = ? AND tag_number = ?`,
-                        )
-                        .run(sessionId, userTextTag.tag_number);
-                } finally {
-                    writeDb.close();
-                }
-
-                // Second prompt triggers transform + drop application.
-                await h.sendPrompt(sessionId, "what do you see in the image?");
-
-                const mainReqs = h.mock.requests().filter((r) => {
-                    const sys = r.body.system;
-                    if (sys === undefined || sys === null) return false;
-                    const asString = typeof sys === "string" ? sys : JSON.stringify(sys);
-                    return asString.includes("## Magic Context");
-                });
-                expect(mainReqs.length).toBeGreaterThanOrEqual(2);
-                const lastReq = mainReqs[mainReqs.length - 1]!;
+                // Drop only the text block via its public §N§ handle. The image is a
+                // sibling content block and must survive the resulting materialization.
+                const userTextTag = tagForText(
+                    mainRequests().at(-1)!.body,
+                    "see this screenshot for the bug",
+                );
+                await ageTagBeyondProtectedWindow(sessionId);
+                const reduced = await dropAndMaterialize(sessionId, userTextTag);
+                expect(reduced.dropEmitted).toBe(true);
+                const lastReq = { body: reduced.body };
 
                 // The image part MUST still be present in the request body —
                 // specifically inside a user message's content array. The
@@ -504,6 +546,18 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                 );
                 const imageBlocks = allUserBlocks.filter((b) => b.type === "image");
                 expect(imageBlocks.length).toBeGreaterThan(0);
+                const allUserText = allUserBlocks
+                    .filter((block) => block.type === "text")
+                    .map((block) => block.text ?? "")
+                    .join("\n");
+                if (RUST_MODE) {
+                    expect(foldInfraEnabled()).toBe(false);
+                    expect(FOLD_SKIP_REASON).toContain("broca");
+                    expect(allUserText).toContain("see this screenshot for the bug");
+                } else {
+                    expect(allUserText).not.toContain("see this screenshot for the bug");
+                    expect(allUserText).toMatch(/\[dropped \u00a7\d+\u00a7\]/);
+                }
 
                 // The user message carrying the image must also NOT have been
                 // removed from the message list (structural presence).

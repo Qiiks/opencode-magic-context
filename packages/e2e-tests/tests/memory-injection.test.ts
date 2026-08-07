@@ -1,17 +1,7 @@
 /// <reference types="bun-types" />
 
-import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { realpathSync } from "node:fs";
-import { resolve as pathResolve, join } from "node:path";
 import { TestHarness } from "../src/harness";
-// Use the production identity + hash helpers so this test is not coupled to
-// Bun.hash's specific (version-dependent) output. The plugin computes the same
-// identity and normalized hash internally; importing the helpers here keeps the
-// test aligned with whatever the plugin does at runtime.
-import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
-import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
-import { openTestDb } from "../src/test-db";
 
 /**
  * Memory injection — regression test for v0.9.1.
@@ -20,11 +10,10 @@ import { openTestDb } from "../src/test-db";
  * returned null and <session-history> was never built. Memories were therefore not
  * injected until historian published its first compartment.
  *
- * This test seeds a project-scoped memory directly in the plugin DB before any
- * compartment exists, then drives a second turn and asserts that the request
- * body reaching the model contains <session-history> with <project-memory>
- * carrying our seeded directive — proving injection works even with zero
- * compartments.
+ * This test writes a project-scoped memory through ctx_memory before any
+ * compartment exists, then opens a fresh session and asserts that its first
+ * request contains <session-history> with <project-memory> carrying the saved
+ * directive — proving injection works even with zero compartments.
  */
 
 let h: TestHarness;
@@ -37,50 +26,38 @@ afterAll(async () => {
     await h.dispose();
 });
 
-/**
- * Compute the same project identity the plugin will resolve at runtime.
- *
- * CRITICAL: OpenCode passes a realpath-resolved directory to the plugin via
- * `hook.directory`. On macOS, `tmpdir()` returns a `/var/folders/...` path
- * that is a symlink to `/private/var/folders/...`. We must `realpathSync` here
- * so our call to `resolveProjectIdentity` matches what the plugin computes at
- * runtime; otherwise the memory seed lands on a different identity and the
- * injection misses silently.
- *
- * Delegates to the production `resolveProjectIdentity` so the test stays in
- * lockstep with the plugin's identity format and hash scheme (whatever they
- * happen to be at any given commit).
- */
-function computeDirIdentity(directory: string): string {
-    return resolveProjectIdentity(realpathSync(pathResolve(directory)));
-}
-
-/**
- * Seed a project-scoped memory row directly. We use a writable handle distinct
- * from the harness's read-only cached handle.
- */
-function seedMemory(h: TestHarness, projectIdentity: string, content: string): void {
-    // Plugin v0.16+ — shared cortexkit/magic-context path.
-    const dbPath = join(h.opencode.env.dataDir, "cortexkit", "magic-context", "context.db");
-    const db = openTestDb(dbPath);
-    try {
-        const now = Date.now();
-        // Use the production hash helper so this matches the value the plugin
-        // stores when it promotes a memory. Plugin uses Bun.CryptoHasher("md5"),
-        // which is stable across Bun versions (unlike Bun.hash).
-        const normalizedHash = computeNormalizedHash(content);
-        db.prepare(
-            `INSERT INTO memories (
-                project_path, category, content, normalized_hash,
-                source_session_id, source_type,
-                seen_count, retrieval_count,
-                first_seen_at, created_at, updated_at, last_seen_at,
-                status
-             ) VALUES (?, 'USER_DIRECTIVES', ?, ?, NULL, 'historian', 5, 0, ?, ?, ?, ?, 'active')`,
-        ).run(projectIdentity, content, normalizedHash, now, now, now, now);
-    } finally {
-        db.close();
-    }
+function emitMemoryWriteOnce(content: string): void {
+    let emitted = false;
+    h.mock.addMatcher((body) => {
+        if (emitted || !JSON.stringify(body.system ?? "").includes("## Magic Context")) return null;
+        const tools = body.tools;
+        if (!Array.isArray(tools)) return null;
+        const memoryTool = tools.find(
+            (tool) =>
+                tool !== null &&
+                typeof tool === "object" &&
+                (tool as { name?: unknown }).name === "ctx_memory",
+        ) as { name: string } | undefined;
+        if (!memoryTool) return null;
+        emitted = true;
+        return {
+            content: [
+                {
+                    type: "tool_use",
+                    id: `toolu_memory_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`,
+                    name: memoryTool.name,
+                    input: { action: "write", category: "PROJECT_RULES", content },
+                },
+            ],
+            stop_reason: "tool_use",
+            usage: {
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_creation_input_tokens: 100,
+                cache_read_input_tokens: 0,
+            },
+        };
+    });
 }
 
 describe("memory injection", () => {
@@ -96,32 +73,16 @@ describe("memory injection", () => {
             },
         });
 
-        // Turn 1 — bootstrap so the plugin creates context.db and writes the
-        // session_meta row. No memories seeded yet.
-        const sessionId = await h.createSession();
-        await h.sendPrompt(sessionId, "bootstrap turn");
-        await h.waitFor(() => h.hasContextDb() && h.countTags(sessionId) > 0, {
-            // Rust mode starts ck-subc/ck-mc before OpenCode; allow the shared
-            // initialization condition to settle without changing the contract.
-            timeoutMs: 60_000,
-            label: "plugin initialized",
-        });
-
-        // Seed one memory scoped to the workdir's project identity. This test
-        // writes directly to SQLite, bypassing the production ctx_memory path
-        // that clears the plugin process's in-memory empty-injection cache. Use
-        // a fresh session for the assertion so we are testing the intended
-        // zero-compartment first-turn path, not cache invalidation mechanics.
-        const projectIdentity = computeDirIdentity(h.opencode.env.workdir);
-        seedMemory(
-            h,
-            projectIdentity,
-            "test seeded directive: always prefer bun over npm for running scripts",
-        );
+        // Write through the public tool so each mode commits to its own authority
+        // store. A fresh session then proves first-turn project-memory injection.
+        const directive = "test seeded directive: always prefer bun over npm for running scripts";
+        const writerSessionId = await h.createSession();
+        emitMemoryWriteOnce(directive);
+        await h.sendPrompt(writerSessionId, "remember the project package-manager rule");
 
         const memorySessionId = await h.createSession();
 
-        // Clear captured requests so the assertion targets only turn 2's payload.
+        // Clear captured requests so the assertion targets only the fresh session.
         h.mock.reset();
         h.mock.setDefault({
             text: "ack 2",
@@ -135,10 +96,6 @@ describe("memory injection", () => {
 
         await h.sendPrompt(memorySessionId, "first turn after seeded memory");
 
-        // Still no compartments at this point — we're testing the zero-compartment
-        // memory injection path specifically.
-        expect(h.countCompartments(memorySessionId)).toBe(0);
-
         const req = h.mock.lastRequest();
         expect(req).not.toBeNull();
 
@@ -148,6 +105,7 @@ describe("memory injection", () => {
         const fullBody = JSON.stringify(req!.body);
         expect(fullBody).toContain("<session-history>");
         expect(fullBody).toContain("<project-memory>");
-        expect(fullBody).toContain("test seeded directive");
+        expect(fullBody).toContain(directive);
+        expect(fullBody).not.toContain("<summary");
     }, 60_000);
 });
