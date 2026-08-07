@@ -8,6 +8,7 @@ import {
     mkdtempSync,
     readdirSync,
     readFileSync,
+    statSync,
     unlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -62,6 +63,7 @@ export interface MigrationOnOpenRefusal {
     supportedVersion: number;
     serverPids: number[];
     unreadableFile?: string;
+    unreadableArm?: "parse" | "io";
 }
 
 let lastMigrationOnOpenRefusal: MigrationOnOpenRefusal | null = null;
@@ -371,37 +373,117 @@ export function enforceSchemaFence(
     return false;
 }
 
+export type RpcDiscoveryUnreadableArm = "parse" | "io";
+
 export interface RpcServerDiscovery {
     state: "absent" | "stale" | "live" | "unreadable";
     serverPids: number[];
     staleFiles: string[];
     unreadableFile?: string;
+    unreadableArm?: RpcDiscoveryUnreadableArm;
 }
 
-function unreadableDiscovery(path: string): RpcServerDiscovery {
+function unreadableDiscovery(path: string, arm: RpcDiscoveryUnreadableArm): RpcServerDiscovery {
     return {
         state: "unreadable",
         serverPids: [],
         staleFiles: [],
         unreadableFile: path,
+        unreadableArm: arm,
     };
+}
+
+const RPC_DISCOVERY_PARSE_GRACE_MS = 10 * 60 * 1000;
+
+export interface RpcDiscoveryFs {
+    readdirSync(path: string, options?: { withFileTypes?: boolean }): string[] | Dirent[];
+    readFileSync(path: string, encoding: "utf8"): string;
+    statSync(path: string): { mtimeMs: number };
+    unlinkSync(path: string): void;
+}
+
+const defaultRpcDiscoveryFs: RpcDiscoveryFs = {
+    readdirSync: (path, options) =>
+        options?.withFileTypes
+            ? (readdirSync(path, { withFileTypes: true }) as Dirent[])
+            : (readdirSync(path) as string[]),
+    readFileSync: (path, encoding) => String(readFileSync(path, encoding)),
+    statSync: (path) => ({ mtimeMs: statSync(path).mtimeMs }),
+    unlinkSync: (path) => unlinkSync(path),
+};
+let rpcDiscoveryFs = defaultRpcDiscoveryFs;
+
+/** Allows tests to simulate discovery filesystem errors and verify they reject the result rather than treating it as a valid server record. */
+export function __setRpcDiscoveryFsForTests(overrides: Partial<RpcDiscoveryFs>): void {
+    rpcDiscoveryFs = { ...defaultRpcDiscoveryFs, ...overrides };
+}
+
+export function __resetRpcDiscoveryFsForTests(): void {
+    rpcDiscoveryFs = defaultRpcDiscoveryFs;
+}
+
+type RpcDiscoveryJunkReason = "parse-invalid" | "invalid-pid";
+
+function invalidDiscoveryReason(raw: string): RpcDiscoveryJunkReason {
+    const trimmed = raw.trim();
+    if (trimmed.startsWith("{")) {
+        try {
+            const parsed = JSON.parse(trimmed) as { pid?: unknown };
+            if ("pid" in parsed) {
+                const pid = Number(parsed.pid);
+                if (!Number.isInteger(pid) || pid <= 0) return "invalid-pid";
+            }
+        } catch {
+            // The malformed JSON is a parse-invalid record, not an I/O failure.
+        }
+    }
+    // A legacy file containing only a port, with no server PID, is invalid and
+    // cannot be accepted while deciding whether migration is safe.
+    return "parse-invalid";
+}
+
+function classifyJunkDiscovery(
+    portFile: string,
+    raw: string,
+    staleFiles: string[],
+): RpcServerDiscovery | null {
+    let mtimeMs: number;
+    try {
+        mtimeMs = rpcDiscoveryFs.statSync(portFile).mtimeMs;
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        return unreadableDiscovery(portFile, "io");
+    }
+    const ageMs = Date.now() - mtimeMs;
+    if (!Number.isFinite(ageMs) || ageMs < RPC_DISCOVERY_PARSE_GRACE_MS) {
+        return unreadableDiscovery(portFile, "parse");
+    }
+
+    staleFiles.push(portFile);
+    const reason = invalidDiscoveryReason(raw);
+    log(
+        `[magic-context] removing stale RPC discovery file ${portFile}: ${reason} record older than 10 minutes`,
+    );
+    return null;
 }
 
 /**
  * Inspect the shared RPC discovery tree without treating partial evidence as
  * proof that no server is running. A missing/empty tree is a clean machine;
- * dead-PID files are removed; malformed or unreadable evidence is fail-closed.
+ * dead-PID and old malformed files are removed; fresh malformed or unreadable
+ * evidence is fail-closed because it could be a concurrent write or an I/O
+ * permission problem.
  */
 export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscovery {
     const rpcRoot = join(storageDir, "rpc");
     let projectEntries: Dirent[];
     try {
-        projectEntries = readdirSync(rpcRoot, { withFileTypes: true });
+        projectEntries = rpcDiscoveryFs.readdirSync(rpcRoot, { withFileTypes: true }) as Dirent[];
     } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") {
             return { state: "absent", serverPids: [], staleFiles: [] };
         }
-        return unreadableDiscovery(rpcRoot);
+        return unreadableDiscovery(rpcRoot, "io");
     }
 
     const portFiles: string[] = [];
@@ -410,9 +492,10 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
         const projectDir = join(rpcRoot, projectEntry.name);
         let entries: string[];
         try {
-            entries = readdirSync(projectDir);
-        } catch {
-            return unreadableDiscovery(projectDir);
+            entries = rpcDiscoveryFs.readdirSync(projectDir) as string[];
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+            return unreadableDiscovery(projectDir, "io");
         }
         for (const entry of entries) {
             if (entry === "port" || (entry.startsWith("port-") && entry.endsWith(".json"))) {
@@ -429,15 +512,19 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
     for (const portFile of portFiles) {
         let raw: string;
         try {
-            raw = readFileSync(portFile, "utf8");
-        } catch {
-            return unreadableDiscovery(portFile);
+            raw = rpcDiscoveryFs.readFileSync(portFile, "utf8");
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+            return unreadableDiscovery(portFile, "io");
         }
         const filename = basename(portFile);
         const pidFromName = /^port-(\d+)/.exec(filename)?.[1];
-        const record = parseRpcPortFile(raw, pidFromName ? Number(pidFromName) : 0);
+        const fallbackPid = pidFromName ? Number(pidFromName) : 0;
+        const record = parseRpcPortFile(raw, fallbackPid);
         if (!record || !Number.isInteger(record.pid) || record.pid <= 0) {
-            return unreadableDiscovery(portFile);
+            const junk = classifyJunkDiscovery(portFile, raw, staleFiles);
+            if (junk) return junk;
+            continue;
         }
         if (isPidAlive(record.pid) && isPidIdentityPlausible(record)) pids.add(record.pid);
         else staleFiles.push(portFile);
@@ -448,9 +535,9 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
     // every subsequent database-open guard pass.
     for (const staleFile of staleFiles) {
         try {
-            unlinkSync(staleFile);
+            rpcDiscoveryFs.unlinkSync(staleFile);
         } catch {
-            return unreadableDiscovery(staleFile);
+            return unreadableDiscovery(staleFile, "io");
         }
     }
 
@@ -494,10 +581,17 @@ function enforceMigrationOnOpenGuard(
         supportedVersion: latestSupportedVersion,
         serverPids: discovery.serverPids,
         ...(discovery.unreadableFile ? { unreadableFile: discovery.unreadableFile } : {}),
+        ...(discovery.unreadableArm ? { unreadableArm: discovery.unreadableArm } : {}),
     };
     if (discovery.state === "unreadable") {
+        const unreadableFile = discovery.unreadableFile ?? "<unknown>";
+        const arm = discovery.unreadableArm ?? "io";
+        const recovery =
+            arm === "io"
+                ? `If no OpenCode server is running, it is safe to delete ${unreadableFile} and retry.`
+                : `Retry after the file is older than the ten-minute grace window, or stop OpenCode before deleting it.`;
         log(
-            `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} because RPC discovery file ${discovery.unreadableFile ?? "<unknown>"} is unreadable or invalid, so the absence of a live OpenCode server cannot be proven. Restart OpenCode, remove or repair the named discovery file, then retry this process.`,
+            `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} because RPC discovery file ${unreadableFile} is uncertain (${arm} arm), so the absence of a live OpenCode server cannot be proven. ${recovery}`,
         );
     } else {
         log(

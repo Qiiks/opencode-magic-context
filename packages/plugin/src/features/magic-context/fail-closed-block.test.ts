@@ -60,6 +60,37 @@ describe("formatFailClosedBlockingMessage", () => {
         expect(message).toContain(FAIL_CLOSED_DOCTOR_COMMAND);
     });
 
+    it("names an uncertain discovery file and gives safe I/O recovery guidance", () => {
+        const file = "/home/user/.local/share/cortexkit/magic-context/rpc/project/port";
+        const message = formatFailClosedBlockingMessage({
+            kind: "migration_guard",
+            persistedVersion: 73,
+            supportedVersion: 74,
+            blockingProcesses: [],
+            unreadableFile: file,
+            unreadableArm: "io",
+        });
+        expect(message).toContain(file);
+        expect(message).toContain("io arm");
+        expect(message).toContain("safe to delete");
+        expect(message).toContain(FAIL_CLOSED_DOCTOR_COMMAND);
+    });
+
+    it("names a fresh parse-invalid discovery file separately from I/O uncertainty", () => {
+        const file = "/home/user/.local/share/cortexkit/magic-context/rpc/project/port";
+        const message = formatFailClosedBlockingMessage({
+            kind: "migration_guard",
+            persistedVersion: 73,
+            supportedVersion: 74,
+            blockingProcesses: [],
+            unreadableFile: file,
+            unreadableArm: "parse",
+        });
+        expect(message).toContain(file);
+        expect(message).toContain("parse arm");
+        expect(message).not.toContain("safe to delete");
+    });
+
     it("deduplicates and bounds the process list", () => {
         const processes = [
             ...Array.from({ length: 10 }, (_, index) => ({

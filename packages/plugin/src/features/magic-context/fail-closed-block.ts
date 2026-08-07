@@ -27,6 +27,8 @@ export type FailClosedReason =
           persistedVersion: number;
           supportedVersion: number;
           blockingProcesses: readonly FailClosedBlockingProcess[];
+          unreadableFile?: string;
+          unreadableArm?: "parse" | "io";
       }
     | {
           kind: "schema_fence";
@@ -96,6 +98,18 @@ export function formatFailClosedBlockingProcesses(
 
 export function formatFailClosedBlockingMessage(reason: FailClosedReason): string {
     if (reason.kind === "migration_guard") {
+        if (reason.unreadableFile) {
+            const arm = reason.unreadableArm ?? "io";
+            const recovery =
+                arm === "io"
+                    ? `If no OpenCode server is running, it is safe to delete ${reason.unreadableFile} and retry.`
+                    : `The file may be a recent incomplete write; retry after the file is older than the ten-minute grace window, or stop OpenCode before deleting it.`;
+            return [
+                `Magic Context cannot migrate the shared database because RPC discovery file ${reason.unreadableFile} is uncertain (${arm} arm), so the absence of a live OpenCode server cannot be proven.`,
+                recovery,
+                `Recovery: ${FAIL_CLOSED_DOCTOR_COMMAND}`,
+            ].join(" ");
+        }
         return [
             `Magic Context cannot migrate the shared database because ${formatFailClosedBlockingProcesses(reason.blockingProcesses)} may be running an older Magic Context build that would fail against the migrated database.`,
             "Restart the blocking process (it will pick up the new build and migrate on start), or shut it down and retry.",

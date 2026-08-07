@@ -240,12 +240,18 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             recordHookInitFailure({
                 type: "storage",
                 reason:
-                    migration && blockingProcesses.length > 0
+                    migration && (blockingProcesses.length > 0 || migration.unreadableFile)
                         ? {
                               kind: "migration_guard",
                               persistedVersion: migration.persistedVersion,
                               supportedVersion: migration.supportedVersion,
                               blockingProcesses,
+                              ...(migration.unreadableFile
+                                  ? { unreadableFile: migration.unreadableFile }
+                                  : {}),
+                              ...(migration.unreadableArm
+                                  ? { unreadableArm: migration.unreadableArm }
+                                  : {}),
                           }
                         : fence
                           ? {
