@@ -17049,6 +17049,51 @@ mod tests {
     /// partitioning 0..=16 on real live block ids, live tail 17..=19. Must
     /// bootstrap-HARD-fold with the last covered block as the minted boundary —
     /// and the mid-span system ordinal must be absorbed, not rejected.
+
+    /// Desk rehearsal of the round-3 drive seed: 18 live messages (system at
+    /// ordinal 1 mid-span), four imported compartments partitioning 0..=14 on
+    /// real live block ids, tail 15..=17. Must bootstrap-HARD-fold with
+    /// ccm-14#0 as the minted boundary.
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_import_round3_partition_rehearsal_folds() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let imported = call_dispatch_request(
+            &handler,
+            state_import_request(
+                "drive-round3-rehearsal",
+                0,
+                1,
+                vec![
+                    imported_compartment(1, 0, 2, "ccm-2#0", "parser retry loop fixed"),
+                    imported_compartment(2, 3, 6, "ccm-6#0", "queue drain benchmark"),
+                    imported_compartment(3, 7, 10, "ccm-10#0", "log rotation ownership"),
+                    imported_compartment(4, 11, 14, "ccm-14#0", "cache warmup ordering"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(imported["imported"], json!(4));
+
+        let mut live: Vec<CkIngressMessage> = Vec::new();
+        for n in 0u64..18 {
+            let mid = format!("ccm-{n}");
+            let role = if n == 1 {
+                "system"
+            } else if n == 0 || n % 2 == 1 {
+                "user"
+            } else {
+                "assistant"
+            };
+            live.push(ck_with_role(&mid, n, role, &format!("turn {n}")));
+        }
+        let response = call_transform_request(&handler, request(live)).await;
+        assert_eq!(response["action"], "HARD", "{response}");
+        assert_eq!(response["boundary_id"], "ccm-14#0", "{response}");
+        let after = store.load("ses").unwrap();
+        assert_eq!(after.core.boundary_id, "ccm-14#0");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn state_import_real_anchor_partition_with_midspan_system_folds() {
         let producer = Arc::new(ProducerState::default());
