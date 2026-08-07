@@ -9,6 +9,7 @@ import {
     readFileSync,
     rmSync,
     statSync,
+    utimesSync,
     writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -21,8 +22,10 @@ import {
     setStoragePrivatePermissionEnforcement,
 } from "../../shared/storage-permissions";
 import {
+    __resetRpcDiscoveryFsForTests,
     __resetSchemaFenceStateForTests,
     __resetStoragePermissionFsForTests,
+    __setRpcDiscoveryFsForTests,
     __setStoragePermissionFsForTests,
     closeDatabase,
     enforceSchemaFence,
@@ -94,6 +97,7 @@ function setLinuxIdentityProbe(processStartTicks = 10_000): void {
 
 afterEach(() => {
     closeDatabase();
+    __resetRpcDiscoveryFsForTests();
     __resetSchemaFenceStateForTests();
     __resetStoragePermissionFsForTests();
     __resetRpcIdentityTestHooks();
@@ -450,7 +454,7 @@ describe("storage-db", () => {
             expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
         });
 
-        it("#when a port file is unparseable #then refuses migration and names the partial signal", () => {
+        it("#when a fresh port file is unparseable #then refuses migration during the grace window", () => {
             const dataHome = useTempDataHome("storage-db-invalid-rpc-migration-");
             const dbPath = seedPendingMigration(dataHome);
             const portDir = join(dirname(dbPath), "rpc", "test-project");
@@ -458,19 +462,71 @@ describe("storage-db", () => {
             const portFile = join(portDir, "port-12345.json");
             writeFileSync(portFile, "{not-json");
 
-            // Mutation direction: treating malformed discovery as "no servers"
-            // migrates this fixture and changes the version below.
+            // The writer uses temp-file-plus-rename, but the grace window is cheap
+            // insurance for files left by older or interrupted installations.
             expect(openDatabase()).toBeNull();
             expect(getMigrationOnOpenRefusal()).toEqual({
                 persistedVersion: LATEST_SUPPORTED_VERSION - 1,
                 supportedVersion: LATEST_SUPPORTED_VERSION,
                 serverPids: [],
                 unreadableFile: portFile,
+                unreadableArm: "parse",
             });
             expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
         });
 
-        it("#when a port path cannot be read as a file #then refuses migration and names it", () => {
+        it("#when old malformed and pidless records are discovered #then deletes them and allows migration", () => {
+            const dataHome = useTempDataHome("storage-db-junk-rpc-migration-");
+            const dbPath = seedPendingMigration(dataHome);
+            const portDir = join(dirname(dbPath), "rpc", "test-project");
+            mkdirSync(portDir, { recursive: true });
+            const junk = [
+                ["port-1001.json", ""],
+                ["port-1002.json", '{"port":'],
+                ["port-1003.json", JSON.stringify({ port: 43123, started_at: 1 })],
+                ["port-1004.json", "\\u0000\\uffffbinary"],
+                ["port-1005.json", JSON.stringify({ port: 43123, pid: 0 })],
+            ].map(([name, content]) => {
+                const file = join(portDir, name);
+                writeFileSync(file, content);
+                const old = new Date(Date.now() - 11 * 60 * 1000);
+                utimesSync(file, old, old);
+                return file;
+            });
+
+            expect(openDatabase()).not.toBeNull();
+            for (const file of junk) expect(existsSync(file)).toBe(false);
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+            expect(getMigrationOnOpenRefusal()).toBeNull();
+        });
+
+        it("#when malformed records are fresh #then leaves them and refuses migration", () => {
+            const dataHome = useTempDataHome("storage-db-fresh-junk-rpc-migration-");
+            const dbPath = seedPendingMigration(dataHome);
+            const portDir = join(dirname(dbPath), "rpc", "test-project");
+            mkdirSync(portDir, { recursive: true });
+            const junk = [
+                ["port-1001.json", ""],
+                ["port-1002.json", '{"port":'],
+                ["port-1003.json", JSON.stringify({ port: 43123, started_at: 1 })],
+                ["port-1004.json", "\\u0000\\uffffbinary"],
+                ["port-1005.json", JSON.stringify({ port: 43123, pid: 0 })],
+            ].map(([name, content]) => {
+                const file = join(portDir, name);
+                writeFileSync(file, content);
+                return file;
+            });
+
+            expect(openDatabase()).toBeNull();
+            expect(junk.some((file) => getMigrationOnOpenRefusal()?.unreadableFile === file)).toBe(
+                true,
+            );
+            expect(getMigrationOnOpenRefusal()?.unreadableArm).toBe("parse");
+            for (const file of junk) expect(existsSync(file)).toBe(true);
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
+        });
+
+        it("#when a port path cannot be read as a file #then refuses migration and names the io arm", () => {
             const dataHome = useTempDataHome("storage-db-unreadable-rpc-migration-");
             const dbPath = seedPendingMigration(dataHome);
             const portDir = join(dirname(dbPath), "rpc", "test-project");
@@ -478,7 +534,66 @@ describe("storage-db", () => {
             mkdirSync(unreadableFile, { recursive: true });
 
             expect(openDatabase()).toBeNull();
-            expect(getMigrationOnOpenRefusal()?.unreadableFile).toBe(unreadableFile);
+            expect(getMigrationOnOpenRefusal()).toMatchObject({
+                unreadableFile,
+                unreadableArm: "io",
+            });
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
+        });
+
+        it("#when reading a port file returns EACCES #then refuses migration without deleting it", () => {
+            const dataHome = useTempDataHome("storage-db-eacces-rpc-migration-");
+            const dbPath = seedPendingMigration(dataHome);
+            const portDir = join(dirname(dbPath), "rpc", "test-project");
+            mkdirSync(portDir, { recursive: true });
+            const unreadableFile = join(portDir, "port-12345.json");
+            writeFileSync(unreadableFile, JSON.stringify({ port: 43123, pid: 12345 }));
+            __setRpcDiscoveryFsForTests({
+                readFileSync: (path) => {
+                    if (path === unreadableFile) {
+                        const error = new Error("permission denied") as NodeJS.ErrnoException;
+                        error.code = "EACCES";
+                        throw error;
+                    }
+                    throw new Error(`unexpected discovery read: ${path}`);
+                },
+            });
+
+            expect(openDatabase()).toBeNull();
+            expect(getMigrationOnOpenRefusal()).toMatchObject({
+                unreadableFile,
+                unreadableArm: "io",
+            });
+            expect(existsSync(unreadableFile)).toBe(true);
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
+        });
+
+        it("#when stale junk cleanup returns EACCES #then refuses migration with the cleanup file named", () => {
+            const dataHome = useTempDataHome("storage-db-unlink-eacces-rpc-migration-");
+            const dbPath = seedPendingMigration(dataHome);
+            const portDir = join(dirname(dbPath), "rpc", "test-project");
+            mkdirSync(portDir, { recursive: true });
+            const staleFile = join(portDir, "port-12345.json");
+            writeFileSync(staleFile, "{not-json");
+            const old = new Date(Date.now() - 11 * 60 * 1000);
+            utimesSync(staleFile, old, old);
+            __setRpcDiscoveryFsForTests({
+                unlinkSync: (path) => {
+                    if (path === staleFile) {
+                        const error = new Error("permission denied") as NodeJS.ErrnoException;
+                        error.code = "EACCES";
+                        throw error;
+                    }
+                    throw new Error(`unexpected discovery unlink: ${path}`);
+                },
+            });
+
+            expect(openDatabase()).toBeNull();
+            expect(getMigrationOnOpenRefusal()).toMatchObject({
+                unreadableFile: staleFile,
+                unreadableArm: "io",
+            });
+            expect(existsSync(staleFile)).toBe(true);
             expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
         });
 
@@ -534,6 +649,17 @@ describe("storage-db", () => {
             mkdirSync(portDir, { recursive: true });
             const livePortFile = join(portDir, `port-${process.pid}.json`);
             const stalePortFile = join(portDir, "port-2147483647.json");
+            const junkFiles = [
+                ["port-31001.json", ""],
+                ["port-31002.json", "{not-json"],
+                ["port-31003.json", JSON.stringify({ port: 43125, started_at: 1 })],
+            ].map(([name, content]) => {
+                const file = join(portDir, name);
+                writeFileSync(file, content);
+                const old = new Date(Date.now() - 11 * 60 * 1000);
+                utimesSync(file, old, old);
+                return file;
+            });
             writeFileSync(
                 livePortFile,
                 JSON.stringify({ port: 43123, pid: process.pid, started_at: 1_200_000 }),
@@ -549,6 +675,7 @@ describe("storage-db", () => {
             // goes red because the DB is no longer left at the previous version.
             expect(openDatabase()).toBeNull();
             expect(existsSync(stalePortFile)).toBe(false);
+            for (const junkFile of junkFiles) expect(existsSync(junkFile)).toBe(false);
             expect(existsSync(livePortFile)).toBe(true);
             expect(getMigrationOnOpenRefusal()).toEqual({
                 persistedVersion: LATEST_SUPPORTED_VERSION - 1,
