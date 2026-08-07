@@ -3089,11 +3089,20 @@ pub struct ServedBlockFingerprint {
     pub serialized_len: usize,
 }
 
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
-    /// A baseline has been materialized at least once. Gates the bootstrap-Hard rule.
+    /// Durable bootstrap has completed. A seeded session may still await its first module fold
+    /// while `bootstrap_seed_fold_pending` is true.
     pub initialized: bool,
+    /// A bootstrap state-sync adopted its boundary, but the module has not yet rendered the
+    /// initial frozen prefix regions (`m0` and `m1`).
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub bootstrap_seed_fold_pending: bool,
     /// The render-config fingerprint as of the last Hard fold; an incoming pass whose
     /// fingerprint differs is an epoch change → Hard.
     pub last_render_config: String,
@@ -4237,6 +4246,7 @@ pub enum ModuleStateSyncError {
     Store(McStoreError),
     GenerationMismatch { expected: u64, found: u64 },
     AuthoritySeqMismatch { expected: u64, found: u64 },
+    HistorianBusy { phase: HistorianPhase },
     InvalidSeedBoundary { declared: String, detail: String },
     Serde(String),
 }
@@ -4429,6 +4439,9 @@ impl std::fmt::Display for ModuleStateSyncError {
                 f,
                 "authority seq mismatch: expected {expected}, found {found}"
             ),
+            ModuleStateSyncError::HistorianBusy { phase } => {
+                write!(f, "historian compartment sync busy: {}", phase.as_str())
+            }
             ModuleStateSyncError::InvalidSeedBoundary { declared, detail } => {
                 write!(f, "invalid seed boundary {declared:?}: {detail}")
             }
@@ -4837,6 +4850,7 @@ enum ModuleStateSyncTxnOutcome {
     Committed(ModuleStateSyncResult),
     GenerationMismatch { found: u64 },
     AuthoritySeqMismatch { found: u64 },
+    HistorianBusy { phase: HistorianPhase },
     InvalidSeedBoundary { declared: String, detail: String },
     Serde(String),
 }
@@ -8437,7 +8451,15 @@ impl McStore {
                     (NO_ROW, core, ModuleMeta::default())
                 }
             };
+            let initialized_before_sync = meta.initialized;
 
+            if !request.compartments.is_empty()
+                && meta.historian.state != HistorianPhase::Idle
+            {
+                return Ok(ModuleStateSyncTxnOutcome::HistorianBusy {
+                    phase: meta.historian.state,
+                });
+            }
             if meta.shadow_generation != request.shadow_generation {
                 return Ok(ModuleStateSyncTxnOutcome::GenerationMismatch {
                     found: meta.shadow_generation,
@@ -8476,6 +8498,8 @@ impl McStore {
                     meta.coverage_compartment_seq = Some(adoption.max_sequence);
                     meta.folded_compartment_seq = adoption.max_sequence;
                     meta.pending_rewrite = None;
+                    meta.initialized = true;
+                    meta.bootstrap_seed_fold_pending = true;
                 }
             }
 
@@ -8554,8 +8578,32 @@ impl McStore {
                 request.strip_seed_skipped,
             );
 
+            let mut compartment_overwrites_skipped = 0usize;
             for compartment in request.compartments {
-                upsert_compartment_tx(tx, request.session_id, compartment)?;
+                if initialized_before_sync {
+                    let retained_sequence = meta.folded_compartment_seq;
+                    if compartment.sequence <= retained_sequence
+                        || !write_seed_compartment_tx(
+                            tx,
+                            request.session_id,
+                            compartment,
+                            false,
+                        )?
+                    {
+                        compartment_overwrites_skipped =
+                            compartment_overwrites_skipped.saturating_add(1);
+                    }
+                } else {
+                    write_seed_compartment_tx(tx, request.session_id, compartment, true)?;
+                }
+            }
+            if compartment_overwrites_skipped > 0 {
+                eprintln!(
+                    "mc-store: skipped {} state-sync compartment overwrite(s) while retaining folded sequence {} for session {}",
+                    compartment_overwrites_skipped,
+                    meta.folded_compartment_seq,
+                    request.session_id
+                );
             }
             if request.workspace_present {
                 replace_workspace_tx(tx, request.project_path, request.workspace)?;
@@ -8666,6 +8714,9 @@ impl McStore {
                     expected: request.expected_shadow_seq,
                     found,
                 })
+            }
+            ModuleStateSyncTxnOutcome::HistorianBusy { phase } => {
+                Err(ModuleStateSyncError::HistorianBusy { phase })
             }
             ModuleStateSyncTxnOutcome::InvalidSeedBoundary { declared, detail } => {
                 Err(ModuleStateSyncError::InvalidSeedBoundary { declared, detail })
@@ -14208,18 +14259,14 @@ impl McStore {
     }
 }
 
-fn upsert_compartment_tx(
+fn write_seed_compartment_tx(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
     c: &StoredCompartment,
-) -> rusqlite::Result<()> {
-    tx.execute(
-        "INSERT INTO mc_compartments
-           (session_id, sequence, start_message, end_message, start_message_id,
-            end_message_id, start_date, end_date, title, content, p1, p2, p3, p4,
-            importance, episode_type, legacy, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
-         ON CONFLICT(session_id, sequence) DO UPDATE SET
+    overwrite_existing: bool,
+) -> rusqlite::Result<bool> {
+    let conflict_clause = if overwrite_existing {
+        "ON CONFLICT(session_id, sequence) DO UPDATE SET
             start_message = excluded.start_message,
             end_message = excluded.end_message,
             start_message_id = excluded.start_message_id,
@@ -14235,7 +14282,20 @@ fn upsert_compartment_tx(
             importance = excluded.importance,
             episode_type = excluded.episode_type,
             legacy = excluded.legacy,
-            created_at = excluded.created_at",
+            created_at = excluded.created_at"
+    } else {
+        "ON CONFLICT(session_id, sequence) DO NOTHING"
+    };
+    let sql = format!(
+        "INSERT INTO mc_compartments
+           (session_id, sequence, start_message, end_message, start_message_id,
+            end_message_id, start_date, end_date, title, content, p1, p2, p3, p4,
+            importance, episode_type, legacy, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+         {conflict_clause}"
+    );
+    let changed = tx.execute(
+        &sql,
         params![
             session_id,
             c.sequence,
@@ -14257,7 +14317,7 @@ fn upsert_compartment_tx(
             c.created_at,
         ],
     )?;
-    Ok(())
+    Ok(changed != 0)
 }
 
 fn replace_workspace_tx(

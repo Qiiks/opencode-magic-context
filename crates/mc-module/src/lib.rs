@@ -1865,6 +1865,10 @@ pub struct McHandler {
     status_snapshot_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     state_sync_seed_now: Mutex<Option<Instant>>,
+    /// Test-only interleave seam that runs after the cheap historian read and immediately
+    /// before the fenced state-sync transaction.
+    #[cfg(test)]
+    state_sync_before_apply_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     classification_before_apply_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     connect_failure_commit_hook: ConnectFailureCommitHook,
@@ -2288,6 +2292,8 @@ impl McHandler {
             #[cfg(test)]
             state_sync_seed_now: Mutex::new(None),
             #[cfg(test)]
+            state_sync_before_apply_hook: Mutex::new(None),
+            #[cfg(test)]
             classification_before_apply_hook: Mutex::new(None),
             connect_failure_commit_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -2369,6 +2375,7 @@ impl McHandler {
             unknown_module_retry_delay: Mutex::new(None),
             status_snapshot_hook: Mutex::new(None),
             state_sync_seed_now: Mutex::new(None),
+            state_sync_before_apply_hook: Mutex::new(None),
             classification_before_apply_hook: Mutex::new(None),
             connect_failure_commit_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -6885,6 +6892,15 @@ impl McHandler {
                 "last_todo_state": parsed.last_todo_state.is_some(),
             })
         });
+        #[cfg(test)]
+        if let Some(hook) = self
+            .state_sync_before_apply_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            hook();
+        }
         match store.apply_authority_state_sync(ModuleStateSyncRequest {
             session_id: &binding.session,
             project_path: &root_path,
@@ -6964,6 +6980,9 @@ impl McHandler {
             }
             Err(ModuleStateSyncError::AuthoritySeqMismatch { expected, found }) => {
                 state_sync_seq_mismatch_error(expected, found)
+            }
+            Err(ModuleStateSyncError::HistorianBusy { phase }) => {
+                historian_compartment_sync_busy_error(phase)
             }
             Err(ModuleStateSyncError::InvalidSeedBoundary { declared, detail }) => {
                 HandlerOutcome::Error {
@@ -20752,6 +20771,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compartment_state_sync_rechecks_historian_phase_inside_transaction() {
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let hook_store = Arc::clone(&store);
+        *handler
+            .state_sync_before_apply_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(move || {
+            seed_historian_phase(&hook_store, HistorianPhase::Firing);
+        }));
+
+        let rejected = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "compartments": [state_sync_compartment(0, "raced writer")],
+                }),
+            )
+            .await;
+
+        assert_eq!(error_code(rejected), "historian_compartment_sync_busy");
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+        assert_eq!(store.load("ses").unwrap().meta.shadow_seq, 0);
+        assert_eq!(
+            store.load("ses").unwrap().meta.historian.state,
+            HistorianPhase::Firing
+        );
+    }
+
+    #[tokio::test]
     async fn interleaved_authority_senders_keep_the_seq_fence() {
         let state = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(state, default_test_config());
@@ -21079,6 +21132,7 @@ mod tests {
         let folded = call_transform_request(&handler, request(live.clone())).await;
         assert_eq!(folded["boundary_id"], json!("m1#0"));
         assert!(m0_text(&folded).contains("latest summary"));
+        let folded_m0_bytes = m0_text(&folded).into_bytes();
         assert_eq!(
             folded["ck_messages"]
                 .as_array()
@@ -21111,7 +21165,11 @@ mod tests {
             "{second_seed:?}"
         );
 
-        let after_restart = call_transform_request(&handler, request(live)).await;
+        assert_eq!(
+            store.load_compartments("ses").unwrap()[0].content,
+            "older summary"
+        );
+        let after_restart = call_transform_request(&handler, request(live.clone())).await;
         assert_eq!(after_restart["decision"], json!("SOFT+"));
         assert_eq!(after_restart["boundary_id"], json!("m1#0"));
         assert!(m0_text(&after_restart).contains("latest summary"));
@@ -21125,6 +21183,63 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["m2"],
             "the stale seed must not reclassify already-folded messages as live tail"
+        );
+
+        let mut next_hard_request = request(live);
+        next_hard_request["render_config"] = json!("cfg1");
+        let next_hard = call_transform_request(&handler, next_hard_request).await;
+        assert_eq!(next_hard["decision"], json!("HARD"));
+        assert_eq!(m0_text(&next_hard).as_bytes(), folded_m0_bytes);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_seed_initializes_before_a_second_force_seed() {
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+
+        let first_seed = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "seed_boundary_id": "m1#0",
+                    "compartments": [
+                        state_sync_compartment(0, "first zero"),
+                        state_sync_compartment(1, "first one"),
+                    ],
+                }),
+            )
+            .await;
+        assert!(matches!(first_seed, HandlerOutcome::Response(_)));
+        let adopted = store.load("ses").unwrap();
+        assert!(adopted.meta.initialized);
+        assert_eq!(adopted.core.boundary_id, "m1#0");
+
+        let second_seed = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "kind": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 1,
+                    "seed_boundary_id": "m0#0",
+                    "compartments": [state_sync_compartment(0, "second divergent zero")],
+                }),
+            )
+            .await;
+        assert!(matches!(second_seed, HandlerOutcome::Response(_)));
+
+        let retained = store.load("ses").unwrap();
+        assert!(retained.meta.initialized);
+        assert_eq!(retained.meta.shadow_seq, 2);
+        assert_eq!(retained.core.boundary_id, "m1#0");
+        assert_eq!(
+            store.load_compartments("ses").unwrap()[0].content,
+            "first zero"
         );
     }
 
