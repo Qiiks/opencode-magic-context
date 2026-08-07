@@ -27,6 +27,7 @@ import {
 } from "../../features/magic-context/transform-decision-log";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
+import { ABSOLUTE_EMERGENCY_PERCENTAGE } from "../../shared/escalation-bands";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import { getSlot } from "./lkg-slot";
@@ -36,6 +37,10 @@ import { closeReadOnlySessionDb } from "./read-session-db";
 import {
     __rustModeTransformTest,
     createRustModeTransform as createRustModeTransformImpl,
+    RUST_EMERGENCY_WALL_PCT,
+    RUST_FAILURE_PARK_THRESHOLD,
+    RUST_PARK_PROBE_PRESSURE_BYPASS_PCT,
+    RUST_PARK_RETRY_INTERVAL,
     type RustModeModuleClient,
 } from "./rust-mode-transform";
 import type { TransformDeps } from "./transform";
@@ -2513,5 +2518,19 @@ describe("delta prefix-mutation guard", () => {
             },
         ]);
         expect(transform.getState(sessionId).consecutiveFailures).toBe(0);
+    });
+});
+
+
+describe("Rust ladder observability constants", () => {
+    it("keeps the emergency wall locked to the shared 95% contract", () => {
+        expect(RUST_EMERGENCY_WALL_PCT).toBe(95);
+        expect(RUST_EMERGENCY_WALL_PCT).toBe(ABSOLUTE_EMERGENCY_PERCENTAGE);
+    });
+
+    it("exports the failure, retry, and pressure ladder budgets", () => {
+        expect(RUST_FAILURE_PARK_THRESHOLD).toBeGreaterThan(0);
+        expect(RUST_PARK_RETRY_INTERVAL).toBeGreaterThan(0);
+        expect(RUST_PARK_PROBE_PRESSURE_BYPASS_PCT).toBeLessThan(RUST_EMERGENCY_WALL_PCT);
     });
 });

@@ -81,8 +81,10 @@ export class MemoryAuthorityUnavailableError extends Error {
     }
 }
 
-const RUST_FAILURE_PARK_THRESHOLD = 3;
-const RUST_PROBE_INTERVAL = 5;
+export const RUST_FAILURE_PARK_THRESHOLD = 3;
+export const RUST_PARK_RETRY_INTERVAL = 5;
+export const RUST_EMERGENCY_WALL_PCT = 95;
+export const RUST_PARK_PROBE_PRESSURE_BYPASS_PCT = 90;
 const RUST_SEND_TIMEOUT_MS = 15_000;
 
 export interface RustModeModuleClient extends ModuleStateSyncClient {
@@ -1041,7 +1043,10 @@ export function createRustModeTransform(
         state.warningSent = true;
         const warning =
             "Rust Magic Context is unavailable for this session; retry after the module recovers.";
-        sessionLog(sessionId, "rust transform parked after three consecutive failures");
+        sessionLog(
+            sessionId,
+            `mc_rust_park_transition failure_passes=${state.consecutiveFailures} pass_count=${state.passCount} park_count=${state.parkCount}`,
+        );
         options.notifyParked?.(sessionId, warning);
     };
 
@@ -1243,7 +1248,7 @@ export function createRustModeTransform(
             preflightError ??= error;
         }
         emergencyFailClosed =
-            passUsageSnapshot.percentage >= 95 &&
+            passUsageSnapshot.percentage >= RUST_EMERGENCY_WALL_PCT &&
             resolvedContextLimit !== undefined &&
             resolvedContextLimit > 0;
         if (overflowState) {
@@ -1323,8 +1328,8 @@ export function createRustModeTransform(
             // three-failure park; later retries use the same global cadence.
             if (
                 !emergencyFailClosed &&
-                passUsageSnapshot.percentage < 90 &&
-                state.passCount % RUST_PROBE_INTERVAL !== 0
+                passUsageSnapshot.percentage < RUST_PARK_PROBE_PRESSURE_BYPASS_PCT &&
+                state.passCount % RUST_PARK_RETRY_INTERVAL !== 0
             ) {
                 decision = "parked";
                 const replayed = replayLastGood(
