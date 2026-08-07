@@ -17038,6 +17038,52 @@ mod tests {
         assert!(m0_text(&second).contains("autonomous summary"));
     }
 
+
+    /// Imported compartments whose anchor mids never appear in the live array
+    /// must refuse at the bootstrap fold: the minted boundary has to name a real
+    /// live block. Pins the anchor-acceptance rule that seeded/imported sessions
+    /// depend on (a synthetic-anchor seed can never compose, regardless of ranges).
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_import_synthetic_anchors_refuse_at_bootstrap_fold() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let imported = call_dispatch_request(
+            &handler,
+            state_import_request(
+                "drive-preseed-dryrun",
+                0,
+                1,
+                vec![
+                    imported_compartment(1, 0, 6, "preseed-m6#0", "parser retry loop fixed"),
+                    imported_compartment(2, 7, 11, "preseed-m11#0", "queue drain benchmark"),
+                    imported_compartment(3, 12, 17, "preseed-m17#0", "log rotation ownership"),
+                    imported_compartment(4, 18, 22, "preseed-m22#0", "cache warmup ordering"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(imported["imported"], json!(4));
+
+        let response = handler
+            .handle_transform_for_test(
+                7,
+                request(vec![
+                    ck("ccm-0", 0, "first user message"),
+                    ck("ccm-1", 1, "assistant reply"),
+                    ck("ccm-2", 2, "second user message"),
+                    ck("ccm-3", 3, "assistant reply two"),
+                ]),
+            )
+            .await;
+        // The import contract is carry-over-shaped: imported coverage references
+        // mids that exist in the continued conversation, so a payload whose anchors
+        // never appear in the live array must refuse at the bootstrap fold rather
+        // than compose an m0 with an unanchorable boundary.
+        let (code, message) = error_frame(response);
+        assert_eq!(code, "transform_failed");
+        assert!(message.contains("minted boundary not present"), "{message}");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn state_import_rejects_tail_anchor_at_a_different_live_ordinal() {
         let (handler, store, _dir, _project) =
