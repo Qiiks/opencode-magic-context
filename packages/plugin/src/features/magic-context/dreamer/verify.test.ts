@@ -23,6 +23,7 @@ import {
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { acquireLease } from "./lease";
+import { getTaskScheduleState, seedTaskScheduleState } from "./storage-task-schedule";
 import { applyVerifyManifest, runVerify, type VerifyArgs } from "./verify";
 
 const tempDirs: string[] = [];
@@ -83,7 +84,9 @@ function successfulVerifyClient(onPrompt?: () => void) {
             prompt: async (args: { body?: { parts?: Array<{ text?: string }> } }) => {
                 const prompt = args.body?.parts?.[0]?.text ?? "";
                 const ids = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) => Number(match[1]));
-                manifest = `<verify>${ids.map((id) => `<verified id="${id}" files="src/fact.ts"/>`).join("")}</verify>`;
+                // Omit files from the synthetic manifest to avoid filesystem/Git
+                // normalization; mappings recorded before the run still select each batch.
+                manifest = `<verify>${ids.map((id) => `<verified id="${id}"/>`).join("")}</verify>`;
                 onPrompt?.();
                 return {};
             },
@@ -147,12 +150,51 @@ describe("runVerify disposition", () => {
         }
     });
 
+    test("continues a broad cycle across deadlines and closes it on the final run", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-broad-cycle";
+            const dir = tempProject();
+            addMappedMemories(db, projectIdentity, 51);
+            seedTaskScheduleState(db, projectIdentity, "verify-broad", null, null, "0 3 * * 0");
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.forceBroad = true;
+            args.client = successfulVerifyClient(() => {
+                args.deadline = Date.now() - 1;
+            }) as never;
+
+            const first = await runVerify(args);
+            expect(first.verified).toBe(50);
+            expect(first.remaining).toBe(1);
+            expect(first.complete).toBe(false);
+            const cycleStart = getTaskScheduleState(
+                db,
+                projectIdentity,
+                "verify-broad",
+            )?.lastBroadRunAt;
+            expect(cycleStart).toBeGreaterThan(0);
+
+            args.deadline = Date.now() + 60_000;
+            args.client = successfulVerifyClient() as never;
+            const second = await runVerify(args);
+            expect(second.verified).toBe(1);
+            expect(second.remaining).toBe(0);
+            expect(second.complete).toBe(true);
+            expect(
+                getTaskScheduleState(db, projectIdentity, "verify-broad")?.lastBroadRunAt,
+            ).toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("reports a swallowed batch failure as incomplete", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:verify-failure";
             const dir = tempProject();
             addMappedMemories(db, projectIdentity, 1);
+            seedTaskScheduleState(db, projectIdentity, "verify-broad", null, null, "0 3 * * 0");
             const args = verifyArgs(db, dir, projectIdentity);
             args.forceBroad = true;
             args.client = {
@@ -166,6 +208,9 @@ describe("runVerify disposition", () => {
             const result = await runVerify(args);
             expect(result.complete).toBe(false);
             expect(result.remaining).toBe(1);
+            expect(
+                getTaskScheduleState(db, projectIdentity, "verify-broad")?.lastBroadRunAt,
+            ).toBeGreaterThan(0);
         } finally {
             closeQuietly(db);
         }

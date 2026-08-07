@@ -8,6 +8,7 @@ import {
 import { getPendingSmartNotes } from "../storage-notes";
 import { countPrimerCandidatesForProject, getActivePrimers } from "../storage-primers";
 import { getUserMemoryCandidates } from "../user-memory/storage-user-memory";
+import { getTaskScheduleState } from "./storage-task-schedule";
 import {
     CANONICAL_DREAM_TASKS,
     type DreamTaskBacklog,
@@ -124,6 +125,28 @@ function countUnverifiedMappedMemories(db: Database, projectPath: string): numbe
     return row?.cnt ?? 0;
 }
 
+function countBroadCycleCandidates(
+    db: Database,
+    projectPath: string,
+    cycleStartAt: number,
+): number {
+    const row = db
+        .prepare<[string, number], { cnt: number }>(
+            `SELECT COUNT(*) AS cnt
+               FROM memories m
+              WHERE m.project_path = ?
+                AND m.status IN ('active','permanent')
+                AND (
+                    SELECT MAX(v.verified_at)
+                      FROM memory_verifications v
+                     WHERE v.memory_id = m.id
+                       AND v.file_path <> ''
+                ) < ?`,
+        )
+        .get(projectPath, cycleStartAt);
+    return row?.cnt ?? 0;
+}
+
 function countCueCandidates(db: Database, projectPath: string): number {
     if (!hasMuralCueColumns(db)) return countActiveMemories(db, projectPath);
     const row = db
@@ -214,8 +237,19 @@ export function getDreamTaskBacklog(
         }
         case "verify-broad": {
             const total = countMappedMemories(db, projectPath);
-            // Broad verification deliberately selects the whole mapped pool on every run.
-            return { pending: total, total };
+            const cycleStartAt = getTaskScheduleState(
+                db,
+                projectPath,
+                "verify-broad",
+            )?.lastBroadRunAt;
+            // With no open cycle, the next broad run will open one over the whole
+            // mapped pool. Once open, report only the memories not yet verified for
+            // that cycle so run telemetry reflects the resumable backlog.
+            const pending =
+                cycleStartAt == null
+                    ? total
+                    : countBroadCycleCandidates(db, projectPath, cycleStartAt);
+            return { pending, total };
         }
         case "curate": {
             const total = countActiveMemories(db, projectPath);
@@ -297,9 +331,13 @@ export function evaluateTaskGate(task: DreamTaskName, ctx: TaskGateContext): boo
             return countActiveMemories(db, project) > 0;
 
         case "verify-broad":
-            // Broad re-verifies the WHOLE pool (incl. file-independent memories the
-            // incremental gate skips) — only needs a non-empty pool to run.
-            return countActiveMemories(db, project) > 0;
+            // Keep an open cycle runnable even when another task removed the last
+            // active memory; the executor then closes the now-empty cycle. A closed
+            // cycle still needs an active pool before taking the memory lease.
+            return (
+                getTaskScheduleState(db, project, "verify-broad")?.lastBroadRunAt != null ||
+                countActiveMemories(db, project) > 0
+            );
 
         case "curate":
             // Curate is whole-pool hygiene, but still needs an active pool before

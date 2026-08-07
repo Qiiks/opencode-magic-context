@@ -35,6 +35,7 @@ import {
     type DreamerModuleRoute,
     getModuleMemoryIdentities,
 } from "./module-apply";
+import { getTaskScheduleState, writeTaskScheduleState } from "./storage-task-schedule";
 import { partitionVerifyScope } from "./verify-gate";
 import {
     buildVerifyPrompt,
@@ -88,9 +89,31 @@ export interface VerifyResult {
     remaining: number;
     complete: boolean;
     mode: string;
+    /** The open broad-cycle watermark, when this run used verify-broad. */
+    broadCycleStartAt?: number;
+}
+
+function closeBroadCycle(args: VerifyArgs, cycleStartAt: number | undefined): void {
+    if (!args.forceBroad || cycleStartAt === undefined) return;
+    // Direct runVerify tests and legacy callers may not have a scheduler row. A
+    // scheduled run always has one because the scheduler seeds it before execution.
+    if (!getTaskScheduleState(args.db, args.projectIdentity, "verify-broad")) return;
+    runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
+        const current = getTaskScheduleState(args.db, args.projectIdentity, "verify-broad");
+        // Do not clear a cycle opened by a newer run if state changed while the
+        // model was working. The domain lease normally prevents this, but the
+        // equality check keeps the close operation safe under recovery tooling.
+        if (current?.lastBroadRunAt !== cycleStartAt) return;
+        if (!current) return;
+        writeTaskScheduleState(args.db, {
+            ...current,
+            lastBroadRunAt: null,
+        });
+    });
 }
 
 export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
+    const runStartedAt = Date.now();
     const result: VerifyResult = {
         verified: 0,
         updated: 0,
@@ -107,14 +130,21 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
         projectIdentity: args.projectIdentity,
         projectDirectory: args.sessionDirectory,
         forceBroad: args.forceBroad,
+        now: runStartedAt,
+        holderId: args.holderId,
+        leaseKey: args.leaseKey,
     });
     result.mode = gate.mode;
+    result.broadCycleStartAt = gate.broadCycleStartAt;
     result.inScope = gate.inScope.length;
     result.remaining = gate.inScope.length;
     log(
         `[dreamer] ${args.forceBroad ? "verify-broad" : "verify"} gate: mode=${gate.mode} in_scope=${gate.inScope.length} skipped=${gate.skippedIds.length} reason=${gate.reason}`,
     );
-    if (gate.inScope.length === 0) return result;
+    if (gate.inScope.length === 0) {
+        closeBroadCycle(args, gate.broadCycleStartAt);
+        return result;
+    }
 
     const batches: VerifyPromptMemory[][] = [];
     for (let i = 0; i < gate.inScope.length; i += VERIFY_BATCH_SIZE) {
@@ -142,6 +172,7 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
             args.onProgress?.(result.verified + result.updated + result.archived);
         }
         result.complete = result.remaining === 0;
+        if (result.complete) closeBroadCycle(args, gate.broadCycleStartAt);
         log(
             `[dreamer] ${args.forceBroad ? "verify-broad" : "verify"}: verified=${result.verified} updated=${result.updated} archived=${result.archived} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}`,
         );
