@@ -1,4 +1,4 @@
-import { For as _$For } from "opentui:runtime-module:%40opentui%2Fsolid";
+import { For as _$For } from "opentui:runtime-module:solid-js";
 import { createComponent as _$createComponent } from "opentui:runtime-module:%40opentui%2Fsolid";
 import { createTextNode as _$createTextNode } from "opentui:runtime-module:%40opentui%2Fsolid";
 import { effect as _$effect } from "opentui:runtime-module:%40opentui%2Fsolid";
