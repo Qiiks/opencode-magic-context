@@ -26,8 +26,17 @@
  */
 
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import {
+    appendFileSync,
+    copyFileSync,
+    existsSync,
+    linkSync,
+    mkdirSync,
+    readFileSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
+import { dirname, join, resolve } from "node:path";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 const MODULE_ID = "magic-context";
@@ -151,6 +160,24 @@ export async function buildHermeticBinaries(subconsciousRoot: string): Promise<B
 
         if (!ckMcBin || !existsSync(ckMcBin)) {
             throw new Error("ck-mc binary was not resolved after prerequisite detection");
+        }
+
+        // Run the module under a dev-distinct process name so a test binary is
+        // never mistaken for the production ck-mc in Activity Monitor / ps.
+        // A hardlink shares the inode (no copy cost, always current build);
+        // fall back to a copy across filesystems.
+        const devNamed = join(dirname(ckMcBin), "ckdev-mc-e2e");
+        try {
+            rmSync(devNamed, { force: true });
+            linkSync(ckMcBin, devNamed);
+            ckMcBin = devNamed;
+        } catch {
+            try {
+                copyFileSync(ckMcBin, devNamed);
+                ckMcBin = devNamed;
+            } catch {
+                // Keep the original path; naming is cosmetic, never a test failure.
+            }
         }
 
         const ckSubcRelease = join(subconsciousRoot, "target/release/ck-subc");
