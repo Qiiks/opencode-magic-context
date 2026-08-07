@@ -8,6 +8,7 @@ import {
   Show,
 } from "solid-js";
 import { getLogEntries, truncate } from "../../lib/api";
+import { formatLogTimestamp } from "../../lib/log-format";
 import FilterSelect from "../shared/FilterSelect";
 
 export default function LogViewer() {
@@ -198,8 +199,7 @@ export default function LogViewer() {
                         "flex-shrink": "0",
                       }}
                     >
-                      {entry.timestamp.split("T").pop()?.split(".")[0] ??
-                        entry.timestamp.slice(0, 19)}
+                      {formatLogTimestamp(entry.timestamp)}
                     </span>
                     {/* Session */}
                     <Show when={entry.session_id}>
