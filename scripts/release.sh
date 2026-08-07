@@ -17,11 +17,37 @@ set -euo pipefail
 #   7. Pushes commit + tag to origin
 #   8. CI takes over: test → build → publish npm + GitHub release
 
-VERSION="${1:-}"
-DRY="${2:-}"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+VERSION=""
+DRY=""
+FORCE_E2E_HOST=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry)
+      DRY="--dry"
+      ;;
+    --e2e-host)
+      FORCE_E2E_HOST=1
+      ;;
+    --*)
+      echo "Error: unknown option '$arg'"
+      echo "Usage: ./scripts/release.sh <version> [--dry] [--e2e-host]"
+      exit 1
+      ;;
+    *)
+      if [[ -n "$VERSION" ]]; then
+        echo "Error: more than one version was supplied"
+        echo "Usage: ./scripts/release.sh <version> [--dry] [--e2e-host]"
+        exit 1
+      fi
+      VERSION="$arg"
+      ;;
+  esac
+done
 
 if [[ -z "$VERSION" ]]; then
-  echo "Usage: ./scripts/release.sh <version> [--dry]"
+  echo "Usage: ./scripts/release.sh <version> [--dry] [--e2e-host]"
   echo "  e.g. ./scripts/release.sh 0.1.0"
   exit 1
 fi
@@ -182,15 +208,126 @@ run_e2e_group() {
   fi
 }
 
-if ! command -v opencode >/dev/null 2>&1; then
-  echo "Error: 'opencode' not found on PATH — the host E2E suite spawns 'opencode serve'."
-  echo "       Install it (curl -fsSL https://opencode.ai/install | bash) and ensure ~/.opencode/bin is on PATH."
-  exit 1
-fi
-E2E_OC_FILES=$(ls "$E2E_DIR"/tests/*.test.ts | grep -v "/pi-" | sed "s#$E2E_DIR/##" | tr '\n' ' ')
-E2E_PI_FILES=$(ls "$E2E_DIR"/tests/pi-*.test.ts | sed "s#$E2E_DIR/##" | tr '\n' ' ')
-run_e2e_group "opencode" "$E2E_OC_FILES"
-run_e2e_group "pi" "$E2E_PI_FILES"
+strip_leading_zeros() {
+  local value="$1"
+  while [[ "$value" == 0* && "$value" != 0 ]]; do
+    value="${value#0}"
+  done
+  printf '%s' "$value"
+}
+
+elapsed_seconds() {
+  local elapsed="$1"
+  local days=0 hours=0 minutes=0 seconds=0
+  local fields field_count
+  if [[ "$elapsed" == *-* ]]; then
+    days="${elapsed%%-*}"
+    elapsed="${elapsed#*-}"
+  fi
+  IFS=: read -r -a fields <<< "$elapsed"
+  field_count="${#fields[@]}"
+  if [[ "$field_count" -eq 2 ]]; then
+    minutes="${fields[0]}"
+    seconds="${fields[1]}"
+  elif [[ "$field_count" -eq 3 ]]; then
+    hours="${fields[0]}"
+    minutes="${fields[1]}"
+    seconds="${fields[2]}"
+  else
+    echo 0
+    return
+  fi
+  if ! [[ "$days" =~ ^[0-9]+$ && "$hours" =~ ^[0-9]+$ && "$minutes" =~ ^[0-9]+$ && "$seconds" =~ ^[0-9]+$ ]]; then
+    echo 0
+    return
+  fi
+  days=$(strip_leading_zeros "$days")
+  hours=$(strip_leading_zeros "$hours")
+  minutes=$(strip_leading_zeros "$minutes")
+  seconds=$(strip_leading_zeros "$seconds")
+  echo $((days * 86400 + hours * 3600 + minutes * 60 + seconds))
+}
+
+process_cwd() {
+  local pid="$1" cwd=""
+  if [[ -L "/proc/$pid/cwd" ]]; then
+    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
+  elif command -v lsof >/dev/null 2>&1; then
+    cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | while IFS= read -r entry; do
+      if [[ "$entry" == n* ]]; then
+        printf '%s\n' "${entry#n}"
+        break
+      fi
+    done)
+  fi
+  printf '%s' "$cwd"
+}
+
+is_e2e_sandbox_path() {
+  case "$1" in
+    */opencode-test-*|*/opencode-test-*/*|*/opencode-e2e-*|*/opencode-e2e-*/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+reap_stale_e2e_opencode() {
+  local pid etime command age cwd current_command current_cwd
+  local reaped=0
+  echo "  WARNING: using the host e2e path; checking only stale sandboxed opencode serve processes..."
+  while read -r pid etime command; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ "$command" =~ (^|[[:space:]/])opencode[[:space:]]+serve([[:space:]]|$) ]] || continue
+    cwd=$(process_cwd "$pid")
+    is_e2e_sandbox_path "$cwd" || continue
+    age=$(elapsed_seconds "$etime")
+    if (( age < 600 )); then
+      continue
+    fi
+    current_command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    [[ "$current_command" =~ (^|[[:space:]/])opencode[[:space:]]+serve([[:space:]]|$) ]] || continue
+    current_cwd=$(process_cwd "$pid")
+    is_e2e_sandbox_path "$current_cwd" || continue
+    echo "  Reaping stale e2e opencode serve pid=$pid age=${etime} cwd=$current_cwd"
+    kill -TERM "$pid" 2>/dev/null || true
+    reaped=$((reaped + 1))
+  done < <(ps -axo pid=,etime=,command= 2>/dev/null || true)
+  echo "  Host e2e reap guard: $reaped stale sandbox process(es) signaled"
+}
+
+docker_available() {
+  command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
+}
+
+run_host_e2e() {
+  if [[ "$FORCE_E2E_HOST" -eq 0 ]] && docker_available; then
+    echo "  [e2e] Docker is available; running both host e2e legs in the native container..."
+    "$SCRIPT_DIR/release-e2e-docker.sh"
+    return
+  fi
+
+  if [[ "$FORCE_E2E_HOST" -eq 1 ]]; then
+    echo "  WARNING: --e2e-host requested; bypassing the containerized host e2e gate."
+  else
+    echo "  WARNING: Docker is unavailable; falling back to the host e2e path (m1bench has no Docker)."
+  fi
+  reap_stale_e2e_opencode
+
+  if ! command -v opencode >/dev/null 2>&1; then
+    echo "Error: 'opencode' not found on PATH — the host E2E suite spawns 'opencode serve'."
+    echo "       Install it (curl -fsSL https://opencode.ai/install | bash) and ensure ~/.opencode/bin is on PATH."
+    exit 1
+  fi
+  E2E_OC_FILES=$(ls "$E2E_DIR"/tests/*.test.ts | grep -vE "/(pi-|rust-)" | sed "s#$E2E_DIR/##" | tr '\n' ' ')
+  E2E_PI_FILES=$(ls "$E2E_DIR"/tests/pi-*.test.ts | sed "s#$E2E_DIR/##" | tr '\n' ' ')
+  run_e2e_group "opencode" "$E2E_OC_FILES"
+  run_e2e_group "pi" "$E2E_PI_FILES"
+}
+
+run_host_e2e
 
 echo "  ✓ All checks passed"
 echo ""
