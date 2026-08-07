@@ -110,6 +110,7 @@ export interface RustPassLine {
     transportMs: number;
     transportPages: number;
     transportBytes: number;
+    rowVersion: number;
     raw: string;
 }
 
@@ -181,14 +182,21 @@ export class RustTestHarness {
 
         const logPath = join(env.dataDir, "cortexkit", "magic-context-e2e.log");
 
-        const opencode = await RustTestHarness.spawnServe({
-            env,
-            mockURL: baseURL,
-            connectionFile: subc.connectionFile,
-            logPath,
-            options,
-            rustMode: !options.startInTsMode,
-        });
+        let opencode: SpawnedOpencode;
+        try {
+            opencode = await RustTestHarness.spawnServe({
+                env,
+                mockURL: baseURL,
+                connectionFile: subc.connectionFile,
+                logPath,
+                options,
+                rustMode: !options.startInTsMode,
+            });
+        } catch (error) {
+            await subc.stop();
+            await mock.stop();
+            throw error;
+        }
 
         const sdk = await import("@opencode-ai/sdk");
         const client = sdk.createOpencodeClient({ baseUrl: opencode.url }) as unknown as SdkClient;
@@ -512,6 +520,12 @@ export class RustTestHarness {
         );
     }
 
+    /** Read the subprocess diagnostic log for assertions about the active lineage. */
+    diagnosticLog(): string {
+        if (!existsSync(this.logPath)) return "";
+        return readFileSync(this.logPath, "utf8");
+    }
+
     /** Parse every `rust pass:` diagnostic line the Rust transform emitted so far. */
     readRustPasses(): RustPassLine[] {
         if (!existsSync(this.logPath)) return [];
@@ -540,6 +554,7 @@ export class RustTestHarness {
                 transportMs: Number(stageField(body, "transport") || "0"),
                 transportPages: Number(stageField(body, "transport_pages") || "0"),
                 transportBytes: Number(stageField(body, "transport_bytes") || "0"),
+                rowVersion: Number(field(body, "row_version") || "0"),
                 raw: line,
             });
         }

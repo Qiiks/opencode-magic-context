@@ -32,14 +32,86 @@ import {
     existsSync,
     linkSync,
     mkdirSync,
+    readdirSync,
     readFileSync,
     rmSync,
     writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 const MODULE_ID = "magic-context";
+const RUST_E2E_PID_FILE = "rust-e2e-pids.json";
+
+type RustE2eProcessRole = "daemon" | "module";
+
+interface RustE2ePidRecord {
+    pid: number;
+    role: RustE2eProcessRole;
+}
+
+interface RustE2ePidFile {
+    createdAtMs: number;
+    pids: RustE2ePidRecord[];
+}
+
+function processStartTimeMs(pid: number): number | null {
+    const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+    });
+    if (result.status !== 0 || typeof result.stdout !== "string") return null;
+    const startedAt = Date.parse(result.stdout.trim());
+    return Number.isFinite(startedAt) ? startedAt : null;
+}
+
+/**
+ * Reap only PIDs recorded by an earlier Rust harness run. The recorded process
+ * start time check prevents a reused PID from turning startup cleanup into an
+ * unrelated-process kill; process names are never used as identity.
+ */
+function reapRecordedRustProcesses(): void {
+    let candidates: string[];
+    try {
+        candidates = readdirSync(tmpdir(), { withFileTypes: true })
+            .filter((entry) => entry.isDirectory() && entry.name.startsWith("opencode-e2e-"))
+            .map((entry) => join(tmpdir(), entry.name, "data", "cortexkit", RUST_E2E_PID_FILE));
+    } catch {
+        return;
+    }
+
+    for (const pidPath of candidates) {
+        if (!existsSync(pidPath)) continue;
+        try {
+            const record = JSON.parse(readFileSync(pidPath, "utf8")) as RustE2ePidFile;
+            if (!Number.isFinite(record.createdAtMs) || !Array.isArray(record.pids)) continue;
+            // `ps lstart` reports process start times only to whole seconds on
+            // supported Unix hosts, so compare against the PID record's creation
+            // time rounded down. Older processes predate this harness run and are
+            // not killed.
+            const createdAtBoundary = Math.floor(record.createdAtMs / 1_000) * 1_000;
+            for (const process of record.pids) {
+                if (!Number.isInteger(process?.pid) || process.pid <= 0) continue;
+                const startedAt = processStartTimeMs(process.pid);
+                if (startedAt === null || startedAt < createdAtBoundary) continue;
+                try {
+                    processKill(process.pid);
+                } catch {
+                    // The process may have exited between ps and kill.
+                }
+            }
+        } catch {
+            // A partial PID file is not an identity proof; leave unknown processes alone.
+        } finally {
+            rmSync(pidPath, { force: true });
+        }
+    }
+}
+
+function processKill(pid: number): void {
+    process.kill(pid, "SIGKILL");
+}
 
 /** ck-mc lives in THIS workspace; ck-subc in the sibling subconscious workspace. */
 const CK_MC_RELEASE = join(REPO_ROOT, "target/release/ck-mc");
@@ -241,7 +313,10 @@ export class HermeticSubcStack {
     private readonly daemonConfigDir: string;
     private readonly daemonLogPath: string;
     private readonly moduleLogPath: string;
+    private readonly pidFilePath: string;
     private readonly startTimeoutMs: number;
+    private pidFileCreatedAtMs = 0;
+    private readonly recordedPids = new Map<RustE2eProcessRole, number>();
     private daemon: ChildProcess | null = null;
     private module: ChildProcess | null = null;
 
@@ -258,21 +333,36 @@ export class HermeticSubcStack {
         this.daemonConfigDir = join(this.dataDir, "cortexkit", "_hermetic-daemon-config");
         this.daemonLogPath = join(this.dataDir, "cortexkit", "_hermetic-daemon.log");
         this.moduleLogPath = join(this.dataDir, "cortexkit", "_hermetic-module.log");
+        this.pidFilePath = join(this.dataDir, "cortexkit", RUST_E2E_PID_FILE);
     }
 
     static async start(opts: HermeticSubcOptions): Promise<HermeticSubcStack> {
+        reapRecordedRustProcesses();
         const stack = new HermeticSubcStack({
             dataDir: opts.dataDir,
             ckMcBin: opts.ckMcBin,
             ckSubcBin: opts.ckSubcBin,
             startTimeoutMs: opts.startTimeoutMs ?? 60_000,
         });
-        await stack.boot();
-        return stack;
+        try {
+            await stack.boot();
+            return stack;
+        } catch (error) {
+            await stack.stop();
+            throw error;
+        }
     }
 
     private async boot(): Promise<void> {
         mkdirSync(this.runtimeDir, { recursive: true });
+        // An interrupted run can leave a stale socket and logs behind. Remove
+        // those artifacts before starting the new daemon so registration proves
+        // this stack, not a dead predecessor, accepted the module.
+        rmSync(this.connectionFile, { force: true });
+        rmSync(this.daemonLogPath, { force: true });
+        rmSync(this.moduleLogPath, { force: true });
+        this.pidFileCreatedAtMs = Date.now();
+        this.persistPidFile();
         mkdirSync(join(this.daemonConfigDir, "cortexkit"), { recursive: true });
         // configured_modules=0 → the daemon does NOT supervise/launch the module;
         // the module connects as an ordinary external provider. That keeps module
@@ -300,15 +390,21 @@ export class HermeticSubcStack {
                 SUBC_LAUNCH_NONCE: "",
             },
         });
+        this.recordPid("daemon", this.daemon.pid);
         this.pipeToLog(this.daemon, this.daemonLogPath, "daemon");
         this.daemon.on("exit", () => {
             this.daemon = null;
+            this.forgetPid("daemon");
         });
 
         await pollUntil(() => existsSync(this.connectionFile), {
             timeoutMs: this.startTimeoutMs,
             label: "daemon connection file",
         });
+        // The daemon writes the connection file just before its listener enters
+        // the accept loop. Let that listener become reachable before the client
+        // attempts its one-shot registration handshake.
+        await sleep(100);
 
         await this.spawnModule();
         await this.waitForModuleRegistration();
@@ -326,10 +422,46 @@ export class HermeticSubcStack {
                 XDG_DATA_HOME: this.dataDir,
             },
         });
+        this.recordPid("module", this.module.pid);
         this.pipeToLog(this.module, this.moduleLogPath, "module");
-        this.module.on("exit", () => {
+        this.module.on("exit", (code, signal) => {
+            try {
+                appendFileSync(
+                    this.moduleLogPath,
+                    `module process exited code=${code ?? "null"} signal=${signal ?? "null"}\n`,
+                );
+            } catch {
+                // A lifecycle diagnostic must not turn teardown into a failure.
+            }
             this.module = null;
+            this.forgetPid("module");
         });
+    }
+
+    private recordPid(role: RustE2eProcessRole, pid: number | undefined): void {
+        if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return;
+        this.recordedPids.set(role, pid);
+        this.persistPidFile();
+    }
+
+    private forgetPid(role: RustE2eProcessRole): void {
+        this.recordedPids.delete(role);
+        this.persistPidFile();
+    }
+
+    private persistPidFile(): void {
+        if (!this.pidFileCreatedAtMs) return;
+        try {
+            writeFileSync(
+                this.pidFilePath,
+                JSON.stringify({
+                    createdAtMs: this.pidFileCreatedAtMs,
+                    pids: [...this.recordedPids.entries()].map(([role, pid]) => ({ role, pid })),
+                } satisfies RustE2ePidFile),
+            );
+        } catch {
+            // The reaper is a safety net; a write failure must not break the harness.
+        }
     }
 
     /**
@@ -339,10 +471,30 @@ export class HermeticSubcStack {
      * module (which the daemon rejects terminally as unknown_module).
      */
     private async waitForModuleRegistration(): Promise<void> {
-        await pollUntil(() => this.registrationCount() >= 1, {
-            timeoutMs: this.startTimeoutMs,
-            label: "module registration",
-        });
+        try {
+            await pollUntil(() => this.registrationCount() >= 1, {
+                timeoutMs: Math.min(this.startTimeoutMs, 10_000),
+                label: "module registration",
+            });
+            return;
+        } catch {
+            // A fresh daemon can publish its connection file before the listener
+            // is ready. Retry the external client once rather than treating that
+            // startup race as a failed hermetic prerequisite.
+            this.killModule();
+            await sleep(200);
+            await this.spawnModule();
+        }
+        try {
+            await pollUntil(() => this.registrationCount() >= 1, {
+                timeoutMs: this.startTimeoutMs,
+                label: "module registration",
+            });
+        } catch (error) {
+            throw new Error(
+                `${String(error)}\ndaemon log:\n${this.daemonLog().slice(-4000)}\nmodule log:\n${this.moduleLog().slice(-4000)}`,
+            );
+        }
     }
 
     /**
@@ -373,12 +525,51 @@ export class HermeticSubcStack {
         await this.waitForFreshModuleRegistration();
     }
 
+    /** Return a killed external module without restarting the OpenCode session. */
+    async restoreModule(): Promise<void> {
+        await sleep(200);
+        await this.spawnModule();
+        await this.waitForFreshModuleRegistration();
+    }
+
     /** Kill only the module process (leaving the daemon up), for fault injection. */
     killModule(): void {
         if (this.module && this.module.exitCode === null) {
             this.module.kill("SIGKILL");
         }
         this.module = null;
+        this.forgetPid("module");
+    }
+
+    /** Stop the live module without killing it, so daemon timeout handling can be tested. */
+    stopModule(): void {
+        if (this.module && this.module.exitCode === null) this.module.kill("SIGSTOP");
+    }
+
+    /** Continue a module paused by stopModule(). */
+    continueModule(): void {
+        if (this.module && this.module.exitCode === null) this.module.kill("SIGCONT");
+    }
+
+    /**
+     * Prove the hermetic daemon is using the external-provider path. A configured
+     * supervised module would restart after a long outage and invalidate the drill.
+     */
+    assertModuleNotSupervised(): void {
+        const configPath = join(this.daemonConfigDir, "cortexkit", "subc.jsonc");
+        const config = JSON.parse(readFileSync(configPath, "utf8")) as { modules?: unknown };
+        if (
+            config.modules === null ||
+            typeof config.modules !== "object" ||
+            Array.isArray(config.modules) ||
+            Object.keys(config.modules as Record<string, unknown>).length !== 0
+        ) {
+            throw new Error("Rust outage drill precondition failed: magic-context is configured for supervision");
+        }
+        const log = stripAnsi(this.daemonLog());
+        if (log.includes(MODULE_ID) && /supervis/.test(log)) {
+            throw new Error("Rust outage drill precondition failed: daemon reported magic-context as supervised");
+        }
     }
 
     /**
@@ -440,6 +631,8 @@ export class HermeticSubcStack {
             this.daemon.kill("SIGKILL");
         }
         this.daemon = null;
+        this.forgetPid("daemon");
+        rmSync(this.pidFilePath, { force: true });
         // Give the OS a beat to reap the processes so a following suite's daemon
         // can rebind the runtime dir cleanly.
         await sleep(100);

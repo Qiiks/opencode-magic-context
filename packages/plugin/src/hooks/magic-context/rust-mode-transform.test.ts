@@ -26,6 +26,7 @@ import {
     __test as transformDecisionTest,
 } from "../../features/magic-context/transform-decision-log";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
+import { ABSOLUTE_EMERGENCY_PERCENTAGE } from "../../shared/escalation-bands";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
@@ -36,6 +37,10 @@ import { closeReadOnlySessionDb } from "./read-session-db";
 import {
     __rustModeTransformTest,
     createRustModeTransform as createRustModeTransformImpl,
+    RUST_EMERGENCY_WALL_PCT,
+    RUST_FAILURE_PARK_THRESHOLD,
+    RUST_PARK_PROBE_PRESSURE_BYPASS_PCT,
+    RUST_PARK_RETRY_INTERVAL,
     type RustModeModuleClient,
 } from "./rust-mode-transform";
 import type { TransformDeps } from "./transform";
@@ -413,7 +418,7 @@ describe("Rust mode authority adapter", () => {
                 moduleElapsedMs: 8.765,
             }),
         ).toBe(
-            "rust pass: decision=HARD reason=first_render served_from=transform in=4 out=3 applied=true elapsed=12.3 ms module=8.8 ms stages=prefix_guard:0.0 ordinal_resolve:0.0 state_sync:0.0 clone:0.0 wire_build:0.0 wire_messages:0 transport:0.0 transport_pages:0 transport_bytes:0 apply:0.0 lkg_snapshot:0.0 other:12.3",
+            "rust pass: decision=HARD reason=first_render served_from=transform in=4 out=3 applied=true row_version=0 elapsed=12.3 ms module=8.8 ms stages=prefix_guard:0.0 ordinal_resolve:0.0 state_sync:0.0 clone:0.0 wire_build:0.0 wire_messages:0 transport:0.0 transport_pages:0 transport_bytes:0 apply:0.0 lkg_snapshot:0.0 other:12.3",
         );
     });
 
@@ -2513,5 +2518,18 @@ describe("delta prefix-mutation guard", () => {
             },
         ]);
         expect(transform.getState(sessionId).consecutiveFailures).toBe(0);
+    });
+});
+
+describe("Rust ladder observability constants", () => {
+    it("keeps the emergency wall locked to the shared 95% contract", () => {
+        expect(RUST_EMERGENCY_WALL_PCT).toBe(95);
+        expect(RUST_EMERGENCY_WALL_PCT).toBe(ABSOLUTE_EMERGENCY_PERCENTAGE);
+    });
+
+    it("exports the failure, retry, and pressure ladder budgets", () => {
+        expect(RUST_FAILURE_PARK_THRESHOLD).toBeGreaterThan(0);
+        expect(RUST_PARK_RETRY_INTERVAL).toBeGreaterThan(0);
+        expect(RUST_PARK_PROBE_PRESSURE_BYPASS_PCT).toBeLessThan(RUST_EMERGENCY_WALL_PCT);
     });
 });
