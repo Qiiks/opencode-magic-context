@@ -11,6 +11,10 @@ import { migrateMagicContextConfigLocations } from "./config/migrate-config-loca
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
+import type {
+    DreamTaskName,
+    DreamTaskProgress,
+} from "./features/magic-context/dreamer/task-registry";
 import {
     createFailClosedController,
     getLastHookInitFailure,
@@ -345,6 +349,22 @@ const server: Plugin = async (ctx) => {
                       }
                     : undefined,
                 ensureRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+                onDreamerProgress: (
+                    progress: DreamTaskProgress | null,
+                    completedTask: DreamTaskName | undefined,
+                ) => {
+                    if (progress) {
+                        liveSessionState.dreamerProgressByProject.set(
+                            timerProjectIdentity,
+                            progress,
+                        );
+                    } else if (
+                        liveSessionState.dreamerProgressByProject.get(timerProjectIdentity)
+                            ?.task === completedTask
+                    ) {
+                        liveSessionState.dreamerProgressByProject.delete(timerProjectIdentity);
+                    }
+                },
                 moduleClient: classifyModuleClient,
             };
             // Fail OPEN: the dream timer is best-effort background maintenance and must

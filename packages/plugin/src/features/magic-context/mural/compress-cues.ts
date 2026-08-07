@@ -78,6 +78,7 @@ export interface CompressCuesArgs {
     deadline: number;
     model?: string;
     fallbackModels?: readonly string[];
+    onProgress?: (processed: number) => void;
 }
 
 /** How a chunk failed, used by the run loop to decide whether to keep going.
@@ -210,6 +211,7 @@ export async function runCompressCues(args: CompressCuesArgs): Promise<CompressC
             result.skipped += outcome.skipped;
             result.remaining -= outcome.compressed;
             result.chunks += 1;
+            args.onProgress?.(result.compressed + result.skipped);
 
             if (outcome.failure?.class === "timeout") {
                 consecutiveTimeouts += 1;

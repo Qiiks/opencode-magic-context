@@ -1,3 +1,4 @@
+import type { DreamTaskProgress } from "../../features/magic-context/dreamer/task-registry";
 import type { RecompProgress } from "./compartment-runner-types";
 import type { AgentBySession, LiveModelBySession, VariantBySession } from "./hook-handlers";
 
@@ -47,6 +48,8 @@ export interface LiveSessionState {
      * only — a process restart interrupts the recomp anyway.
      */
     recompProgressBySession: Map<string, RecompProgress>;
+    /** Live Dreamer progress keyed by project identity; kept only in process memory and not read from or written to the prompt/result cache. */
+    dreamerProgressByProject: Map<string, DreamTaskProgress>;
     /**
      * Sessions that are Magic Context's OWN hidden children (historian,
      * dreamer, sidekick, memory-migration). Detected at `session.created` by
@@ -73,6 +76,7 @@ export function createLiveSessionState(): LiveSessionState {
         deferredMaterializationSessions: new Set<string>(),
         sessionDirectoryBySession: new Map<string, string>(),
         recompProgressBySession: new Map<string, RecompProgress>(),
+        dreamerProgressByProject: new Map<string, DreamTaskProgress>(),
         internalChildSessions: new Set<string>(),
     };
 }

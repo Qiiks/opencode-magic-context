@@ -5,6 +5,11 @@
 import { isCompactionEnabled } from "../config/agent-disable";
 import type { MagicContextConfig } from "../config/schema/magic-context";
 import { getMostRecentTaskRunAt } from "../features/magic-context/dreamer/storage-task-schedule";
+import { getDreamTaskBacklogs } from "../features/magic-context/dreamer/task-gates";
+import {
+    CANONICAL_DREAM_TASKS,
+    type DreamTaskBacklogMap,
+} from "../features/magic-context/dreamer/task-registry";
 import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
 import { getMural } from "../features/magic-context/mural/storage-mural";
 import { getEmbeddingCoverageStatus } from "../features/magic-context/project-embedding-registry";
@@ -334,6 +339,17 @@ export function buildSidebarSnapshot(
         const profileTokens = m0Blocks.profileTokens;
 
         let lastDreamerRunAt: number | null = null;
+        let dreamerBacklog: DreamTaskBacklogMap | undefined;
+        const dreamerProgress = projectIdentity
+            ? (liveSessionState?.dreamerProgressByProject?.get(projectIdentity) ?? null)
+            : null;
+        if (projectIdentity) {
+            try {
+                dreamerBacklog = getDreamTaskBacklogs(db, projectIdentity, CANONICAL_DREAM_TASKS);
+            } catch {
+                // A pre-Dreamer-V2 database may not have all task tables yet.
+            }
+        }
         if (projectIdentity) {
             try {
                 // Dreamer V2 retired the V1 dream_state['last_dream_at'] field;
@@ -495,6 +511,8 @@ export function buildSidebarSnapshot(
                 : null,
             lastDreamerRunAt,
             projectIdentity,
+            dreamerBacklog,
+            dreamerProgress,
             compartmentTokens: calibrated.compartmentTokens,
             factTokens: calibrated.factTokens,
             memoryTokens: calibrated.memoryTokens,

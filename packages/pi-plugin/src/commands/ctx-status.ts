@@ -1,6 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { getMostRecentTaskRunAt } from "@magic-context/core/features/magic-context/dreamer/storage-task-schedule";
+import { getDreamTaskBacklogs } from "@magic-context/core/features/magic-context/dreamer/task-gates";
+import { CANONICAL_DREAM_TASKS } from "@magic-context/core/features/magic-context/dreamer/task-registry";
 import { getMemoryCount } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getPendingOps } from "@magic-context/core/features/magic-context/storage";
@@ -57,6 +59,7 @@ export interface CtxStatusDetails {
 		enabled: boolean;
 		scheduleSummary: string | null;
 		lastRunAt: number | null;
+		backlog?: ReturnType<typeof getDreamTaskBacklogs>;
 	};
 	historian: {
 		lastFireCount: number;
@@ -124,6 +127,13 @@ export function registerCtxStatusCommand(
 					currentDeps.commitClusterTrigger,
 					currentDeps.executeThresholdTokens,
 					usableContextLimit,
+					{
+						backlog: getDreamTaskBacklogs(
+							currentDeps.db,
+							currentDeps.projectIdentity,
+							CANONICAL_DREAM_TASKS,
+						),
+					},
 				);
 				const details = buildStatusDetails(currentDeps, sessionId);
 				sendCtxStatusMessage(
@@ -178,6 +188,11 @@ function buildStatusDetails(
 		dreamer: {
 			enabled: deps.dreamer?.runnable === true,
 			scheduleSummary: deps.dreamer?.scheduleSummary ?? null,
+			backlog: getDreamTaskBacklogs(
+				deps.db,
+				deps.projectIdentity,
+				CANONICAL_DREAM_TASKS,
+			),
 			// Dreamer V2 retired the V1 dream_state['last_dream_at'] field; the
 			// live "last successful run" is MAX(last_run_at) across the project's
 			// task_schedule_state rows (issue #194).

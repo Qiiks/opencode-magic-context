@@ -109,6 +109,7 @@ export interface ClassifyArgs {
     moduleContextStoreUuid?: string;
     moduleAuthorityGeneration?: number;
     moduleCommandId?: string;
+    onProgress?: (processed: number) => void;
 }
 
 export interface ClassifyResult {
@@ -297,6 +298,7 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
             result.changed += counts.changed;
             result.remaining -= counts.classified;
             result.chunks += 1;
+            args.onProgress?.(result.classified);
         }
         result.complete = result.remaining === 0;
         log(

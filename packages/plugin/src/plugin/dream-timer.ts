@@ -20,6 +20,10 @@ import {
     userMemoryCollectionEnabled,
 } from "../features/magic-context/dreamer/task-config";
 import { createDreamTaskExecutor } from "../features/magic-context/dreamer/task-executor";
+import type {
+    DreamTaskName,
+    DreamTaskProgress,
+} from "../features/magic-context/dreamer/task-registry";
 import { leaseKeyFor } from "../features/magic-context/dreamer/task-registry";
 import { runDueTasksForProject } from "../features/magic-context/dreamer/task-scheduler";
 import {
@@ -105,6 +109,7 @@ interface ProjectRegistration {
         sessionId: string,
     ) => Promise<RawMessageProvider | null> | RawMessageProvider | null;
     transformMode?: "ts" | "rust";
+    onDreamerProgress?: (progress: DreamTaskProgress | null, completedTask?: DreamTaskName) => void;
     moduleClient?: ClassifyModuleClient & {
         authorityStatus?: (args: {
             context_store_uuid: string;
@@ -444,6 +449,8 @@ async function sweepProject(
             memoryInjectionBudgetTokens: reg.memoryInjectionBudgetTokens,
             transformMode: reg.transformMode,
             moduleClient: reg.moduleClient,
+            onProgress: (progress, completedTask) =>
+                reg.onDreamerProgress?.(progress, completedTask),
         });
         const ran = await runDueTasksForProject({
             db,

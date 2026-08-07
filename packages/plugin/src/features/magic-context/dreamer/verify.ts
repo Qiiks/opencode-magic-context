@@ -76,6 +76,7 @@ export interface VerifyArgs {
     fallbackModels?: readonly string[];
     language?: string;
     moduleRoute?: DreamerModuleRoute;
+    onProgress?: (processed: number) => void;
 }
 
 export interface VerifyResult {
@@ -138,6 +139,7 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
             result.archived += counts.archived;
             result.remaining -= counts.verified + counts.updated + counts.archived;
             result.batches += 1;
+            args.onProgress?.(result.verified + result.updated + result.archived);
         }
         result.complete = result.remaining === 0;
         log(

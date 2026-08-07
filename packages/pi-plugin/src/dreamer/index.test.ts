@@ -194,6 +194,9 @@ describe("Pi dreamer wiring", () => {
 			skippedNoWork: [],
 			deferredBusy: [],
 			failed: [],
+			failureDetails: [],
+			backlogBefore: { curate: { pending: 1, total: 1 } },
+			backlogAfter: { curate: { pending: 1, total: 1 } },
 		});
 
 		expect(capturedSystem).toContain(

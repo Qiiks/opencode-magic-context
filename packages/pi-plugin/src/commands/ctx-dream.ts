@@ -1,6 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getDreamTaskBacklogs } from "@magic-context/core/features/magic-context/dreamer/task-gates";
 import {
+	CANONICAL_DREAM_TASKS,
 	type DreamTaskName,
+	formatDreamTaskBacklogs,
 	isCanonicalDreamTask,
 } from "@magic-context/core/features/magic-context/dreamer/task-registry";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
@@ -71,7 +74,15 @@ export function registerCtxDreamCommand(
 				);
 				return;
 			}
-			// Tell the user we're starting a real run.
+			const backlogTasks = task ? [task] : CANONICAL_DREAM_TASKS;
+			const backlogBefore = getDreamTaskBacklogs(
+				deps.db,
+				project.projectIdentity,
+				backlogTasks,
+			);
+
+			// Tell the user we're starting a real run, including the read-only count
+			// captured before the task acquires its lease.
 			sendCtxStatusMessage(
 				pi,
 				{
@@ -83,6 +94,9 @@ export function registerCtxDreamCommand(
 							? `Running dream task "${task}" for ${project.projectIdentity}…`
 							: `Starting dream run for ${project.projectIdentity}…`,
 						`Project directory: ${project.projectDir}`,
+						"",
+						"Backlog before starting:",
+						formatDreamTaskBacklogs(backlogBefore, backlogTasks),
 					].join("\n"),
 					level: "info",
 				},
@@ -102,6 +116,12 @@ export function registerCtxDreamCommand(
 				if (result.ran.length > 0) lines.push(`Ran: ${result.ran.join(", ")}`);
 				if (result.failed.length > 0)
 					lines.push(`Failed: ${result.failed.join(", ")}`);
+				if ((result.failureDetails?.length ?? 0) > 0) {
+					lines.push(
+						"Failure details:",
+						...(result.failureDetails ?? []).map((detail) => `- ${detail}`),
+					);
+				}
 				if (result.skippedNoWork.length > 0)
 					lines.push(`Skipped (no work): ${result.skippedNoWork.join(", ")}`);
 				if (result.deferredBusy.length > 0)
@@ -111,6 +131,13 @@ export function registerCtxDreamCommand(
 						// manual curate), not this task itself.
 						`Busy: ${result.deferredBusy.join(", ")} — another dream task holds this domain's lease; retry in a minute`,
 					);
+				if (Object.keys(result.backlogAfter ?? {}).length > 0) {
+					lines.push(
+						"",
+						"Backlog at run end:",
+						formatDreamTaskBacklogs(result.backlogAfter),
+					);
+				}
 				if (lines.length === 0) lines.push("No enabled dream tasks to run.");
 
 				sendCtxStatusMessage(

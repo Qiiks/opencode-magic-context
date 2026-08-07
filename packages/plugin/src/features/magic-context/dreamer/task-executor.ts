@@ -60,6 +60,7 @@ import {
     isRetrospectiveWindowProcessed,
     recordRetrospectiveWindowProcessed,
 } from "./storage-task-schedule";
+import { getDreamTaskBacklog } from "./task-gates";
 import {
     buildDreamTaskPrompt,
     buildFrictionGatePrompt,
@@ -71,6 +72,12 @@ import {
     RETROSPECTIVE_SYSTEM_PROMPT,
     type RetrospectivePromptEvent,
 } from "./task-prompts";
+import {
+    type DreamTaskName,
+    type DreamTaskProgress,
+    type DreamTaskRunBacklog,
+    processedDreamTaskItems,
+} from "./task-registry";
 import type { DreamTaskRuntimeConfig, TaskExecOutcome, TaskExecutor } from "./task-scheduler";
 import { runVerify } from "./verify";
 
@@ -104,6 +111,8 @@ export interface DreamTaskExecutorDeps {
     dreamerModel?: string;
     mural?: { enabled: boolean; model?: string };
     memoryInjectionBudgetTokens?: number;
+    /** Process-local progress callback for user-facing status displays; it never reads from or writes to the prompt/result cache. */
+    onProgress?: (progress: DreamTaskProgress | null, completedTask?: DreamTaskName) => void;
     moduleClient?: ClassifyModuleClient & {
         authorityStatus?: (args: {
             context_store_uuid: string;
@@ -214,6 +223,20 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         const { db, projectIdentity, holderId, leaseKey } = ctx;
         const startedAt = Date.now();
         const deadline = startedAt + config.timeoutMinutes * 60 * 1000;
+        const backlogAtStart = getDreamTaskBacklog(db, projectIdentity, config.task);
+        const reportProgress = (processed: number): void => {
+            deps.onProgress?.({
+                task: config.task,
+                processed: Math.max(0, processed),
+                total: backlogAtStart.pending,
+                startedAt,
+            });
+        };
+        reportProgress(0);
+        const incompleteMessage = (remaining: number): string => {
+            const processed = processedDreamTaskItems(backlogAtStart.pending, remaining);
+            return `${config.task} incomplete: ${remaining} remain (was ${backlogAtStart.pending} at run start; processed ${processed} this run)`;
+        };
         const parent = await resolveParentSessionId();
         let moduleRoute: Awaited<ReturnType<typeof resolveDreamerModuleRoute>>;
         if (
@@ -258,6 +281,21 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                             durationMs: Date.now() - startedAt,
                             resultChars: 0,
                             ...(error ? { error } : {}),
+                            backlog: (() => {
+                                const end = getDreamTaskBacklog(db, projectIdentity, config.task);
+                                const processed = processedDreamTaskItems(
+                                    backlogAtStart.pending,
+                                    end.pending,
+                                );
+                                const value: DreamTaskRunBacklog = {
+                                    pendingAtStart: backlogAtStart.pending,
+                                    totalAtStart: backlogAtStart.total,
+                                    pendingAtEnd: end.pending,
+                                    totalAtEnd: end.total,
+                                    processed,
+                                };
+                                return value;
+                            })(),
                         },
                     ],
                     tasksSucceeded: status === "completed" ? 1 : 0,
@@ -326,12 +364,13 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     deadline,
                     model: config.model ?? deps.mural.model ?? deps.dreamerModel,
                     fallbackModels: config.fallbackModels,
+                    onProgress: (processed) => reportProgress(processed),
                 });
                 log(
                     `[dreamer] compress-cues: compressed=${result.compressed} skipped=${result.skipped} chunks=${result.chunks} remaining=${result.remaining}`,
                 );
                 if (!result.complete) {
-                    const error = `compress-cues incomplete: ${result.remaining} selected memories remain`;
+                    const error = incompleteMessage(result.remaining);
                     recordRun("failed", error);
                     return { status: "failed", transient: true, error };
                 }
@@ -373,12 +412,13 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     moduleRoute,
+                    onProgress: (processed) => reportProgress(processed),
                 });
                 log(
                     `[dreamer] map-memories: mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining}`,
                 );
                 if (!result.complete) {
-                    const error = `map-memories incomplete: ${result.remaining} selected memories remain`;
+                    const error = incompleteMessage(result.remaining);
                     recordRun("failed", error);
                     return { status: "failed", transient: true, error };
                 }
@@ -402,9 +442,10 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
                     moduleRoute,
+                    onProgress: (processed) => reportProgress(processed),
                 });
                 if (!result.complete) {
-                    const error = `${config.task} incomplete: ${result.remaining} selected memories remain`;
+                    const error = incompleteMessage(result.remaining);
                     recordRun("failed", error, {
                         memoryChanges: computeMemoryDelta(memoryBefore),
                     });
@@ -482,12 +523,13 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     ...moduleArgs,
+                    onProgress: (processed) => reportProgress(processed),
                 });
                 log(
                     `[dreamer] classify-memories: stage=${result.stage} classified=${result.classified} changed=${result.changed} chunks=${result.chunks} remaining=${result.remaining}`,
                 );
                 if (!result.complete) {
-                    const error = `classify-memories incomplete: ${result.remaining} selected memories remain`;
+                    const error = incompleteMessage(result.remaining);
                     recordRun("failed", error);
                     return { status: "failed", transient: true, error };
                 }
@@ -528,6 +570,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
                     rawProviderFactory: deps.primerRawProviderFactory,
+                    onProgress: (processed) => reportProgress(processed),
                 });
                 recordRun("completed", null);
                 log(
@@ -592,6 +635,8 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             recordRun("failed", brief);
             log(`[dreamer] task ${config.task} failed (transient=${transient}): ${brief}`);
             return { status: "failed", transient, error: brief };
+        } finally {
+            deps.onProgress?.(null, config.task);
         }
     };
 }

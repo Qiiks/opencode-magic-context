@@ -355,6 +355,13 @@ export interface DreamRunTask {
   durationMs: number;
   resultChars: number;
   error?: string;
+  backlog?: {
+    pendingAtStart: number;
+    totalAtStart: number;
+    pendingAtEnd: number;
+    totalAtEnd: number;
+    processed: number;
+  };
   tokens?: {
     total: number;
     input: number;
