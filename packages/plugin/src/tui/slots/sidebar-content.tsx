@@ -1,5 +1,5 @@
 /** @jsxImportSource @opentui/solid */
-import { Show, createEffect, createMemo, createSignal, on, onCleanup } from "solid-js"
+import { For, Show, createEffect, createMemo, createSignal, on, onCleanup } from "solid-js"
 import type { TuiSlotPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
 import packageJson from "../../../package.json"
 import { badgeTextColor } from '../badge-contrast';

@@ -1,4 +1,3 @@
-import { For as _$For } from "opentui:runtime-module:%40opentui%2Fsolid";
 import { createComponent as _$createComponent } from "opentui:runtime-module:%40opentui%2Fsolid";
 import { createTextNode as _$createTextNode } from "opentui:runtime-module:%40opentui%2Fsolid";
 import { effect as _$effect } from "opentui:runtime-module:%40opentui%2Fsolid";
@@ -8,7 +7,7 @@ import { insert as _$insert } from "opentui:runtime-module:%40opentui%2Fsolid";
 import { setProp as _$setProp } from "opentui:runtime-module:%40opentui%2Fsolid";
 import { createElement as _$createElement } from "opentui:runtime-module:%40opentui%2Fsolid";
 /** @jsxImportSource @opentui/solid */
-import { Show, createEffect, createMemo, createSignal, on, onCleanup } from "opentui:runtime-module:solid-js";
+import { For, Show, createEffect, createMemo, createSignal, on, onCleanup } from "opentui:runtime-module:solid-js";
 import packageJson from "../../../package.json";
 import { badgeTextColor } from "../badge-contrast";
 import { loadSidebarSnapshot } from "../data/context-db";
@@ -1164,7 +1163,7 @@ const SidebarContent = props => {
           },
           dim: true
         })
-      }), _$createComponent(_$For, {
+      }), _$createComponent(For, {
         get each() {
           return Object.entries(s()?.dreamerBacklog ?? {});
         },
