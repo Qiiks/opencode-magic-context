@@ -18,6 +18,7 @@ import {
     buildCompressCuesPrompt,
     COMPRESS_CUES_SYSTEM_PROMPT,
     type CompressCuesPromptMemory,
+    cueBudgetFor,
     parseCuesManifest,
 } from "./compress-cues-prompt";
 import { validateCue } from "./cue-validation";
@@ -25,6 +26,7 @@ import {
     computeCueContentHash,
     getMuralCueState,
     memoryNeedsCue,
+    recordMuralCueRejection,
     setMuralCue,
 } from "./storage-mural-cues";
 
@@ -59,6 +61,10 @@ export const COMPRESS_CUES_CHUNK_SIZE = 40;
  *  remaining budget drops below it we stop the run and bank progress instead of
  *  starting a chunk we already know cannot complete. */
 export const CHUNK_TIMEOUT_FLOOR_MS = 240_000;
+
+/** Three validation failures for one content hash are enough to stop spending
+ * a child session on a response that is not going to change. */
+export const CUE_REJECTION_LATCH_THRESHOLD = 3;
 
 /** How many chunks in a row may fail with a timeout-class error before the run
  *  stops early. A model that is consistently slower than its time slice will
@@ -129,6 +135,65 @@ function toPromptMemory(candidate: CueCandidate): CompressCuesPromptMemory {
         importance: memory.importance ?? 50,
         content: memory.content,
     };
+}
+
+function stripOwnIdToken(value: string, ownId: number): string {
+    return value.replace(new RegExp(`#${ownId}\\b`, "g"), "");
+}
+
+/** Truncate by codepoint budget, preferring a complete word when one exists. */
+function truncateCue(value: string, budget: number): string {
+    const trimmed = value.trim();
+    const codepoints = [...trimmed];
+    if (codepoints.length <= budget) return trimmed;
+    const prefix = codepoints.slice(0, budget).join("");
+    const boundary = prefix.search(/\s+\S*$/);
+    return (boundary > 0 ? prefix.slice(0, boundary) : prefix).trim();
+}
+
+function sanitizeCue(value: string, candidate: CueCandidate): string {
+    return truncateCue(
+        stripOwnIdToken(value, candidate.memory.id),
+        cueBudgetFor(candidate.memory.importance ?? 50),
+    );
+}
+
+/**
+ * Make a deterministic cue after the same response has failed validation three
+ * times. The model's final candidate gets first choice; source content is the
+ * second choice so a bad polarity or mechanism cannot keep the gate open.
+ */
+function deterministicFallbackCue(candidate: CueCandidate, lastCandidate: string): string {
+    const importance = candidate.memory.importance ?? 50;
+    const budget = cueBudgetFor(importance);
+    const sanitizedCandidate = sanitizeCue(lastCandidate, candidate);
+    if (validateCue(sanitizedCandidate, importance, candidate.memory.id) === null) {
+        return sanitizedCandidate;
+    }
+
+    const sourceSlice = sanitizeCue(candidate.memory.content, candidate);
+    if (validateCue(sourceSlice, importance, candidate.memory.id) === null) {
+        return sourceSlice;
+    }
+
+    // Source content can itself contain grammar markers or an unmatched
+    // parenthesis. Remove only those validator controls as a final deterministic
+    // repair; the remaining text is still a bounded slice of the memory.
+    const grammarSafe = truncateCue(
+        sourceSlice
+            .replaceAll("⊘", "")
+            .replace(/[()]/g, "")
+            .replace(/\b(?:must not|never|without|instead of|exclude|excludes)\b/gi, "")
+            .replace(/\s+/g, " "),
+        budget,
+    );
+    if (validateCue(grammarSafe, importance, candidate.memory.id) === null) {
+        return grammarSafe;
+    }
+
+    // Memory content is normally non-empty; keep this guard deterministic for
+    // malformed legacy rows while preserving the validator's non-empty rule.
+    return "memory";
 }
 
 /** Select the memories whose cue is missing or stale (content hash mismatch). */
@@ -363,9 +428,10 @@ async function compressOneChunk(
 
 /**
  * Validate each returned cue independently and write the valid ones as
- * column-only updates. A cue that fails validation is SKIPPED (its memory keeps
- * a NULL cue and is retried next run) — never rejecting the whole chunk for one
- * bad cue. The stored hash is the SELECTION-time content hash, so a memory
+ * column-only updates. The first validation failures are skipped (the memory keeps
+ * a NULL cue); after the rejection latch trips, a deterministic fallback is
+ * written instead of retrying forever. The stored hash is the SELECTION-time
+ * content hash, so a memory
  * edited mid-run doesn't adopt a cue compressed from its old content.
  */
 export function applyCues(
@@ -386,11 +452,33 @@ export function applyCues(
         for (const entry of parsed) {
             const candidate = byId.get(entry.id);
             if (!candidate) throw new Error(`cues manifest contains unknown id ${entry.id}`);
-            const failure = validateCue(entry.cue, candidate.memory.importance ?? 50);
+            const importance = candidate.memory.importance ?? 50;
+            const failure = validateCue(entry.cue, importance, candidate.memory.id);
             if (failure) {
+                const rejectionCount = recordMuralCueRejection(
+                    args.db,
+                    args.projectIdentity,
+                    entry.id,
+                    candidate.contentHash,
+                );
+                if (rejectionCount >= CUE_REJECTION_LATCH_THRESHOLD) {
+                    const fallback = deterministicFallbackCue(candidate, entry.cue);
+                    setMuralCue(
+                        args.db,
+                        args.projectIdentity,
+                        entry.id,
+                        fallback,
+                        candidate.contentHash,
+                    );
+                    compressed += 1;
+                    log(
+                        `[dreamer] compress-cues: fallback cue for memory ${entry.id} (${failure.reason}; ${rejectionCount} rejections; fallback)`,
+                    );
+                    continue;
+                }
                 skipped += 1;
                 log(
-                    `[dreamer] compress-cues: skipped cue for memory ${entry.id} (${failure.reason})`,
+                    `[dreamer] compress-cues: skipped cue for memory ${entry.id} (${failure.reason}; rejection ${rejectionCount}/${CUE_REJECTION_LATCH_THRESHOLD})`,
                 );
                 continue;
             }

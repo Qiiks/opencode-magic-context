@@ -1,5 +1,5 @@
 import type { Database, Statement as PreparedStatement } from "../../../shared/sqlite";
-import { hasMuralCueColumns } from "../mural/storage-mural-cues";
+import { hasMuralCueColumns, hasMuralCueRejectionCountColumn } from "../mural/storage-mural-cues";
 import { MEMORY_CATEGORY_ORDER_SQL } from "./constants";
 import { invalidateMemory, invalidateProject } from "./embedding-cache";
 import { computeNormalizedHash } from "./normalize-hash";
@@ -1033,8 +1033,11 @@ export function updateMemoryContent(
         // it, and the compress-cues gate re-selects this memory (NULL cue).
         // Column-guarded for pre-v65 DBs.
         if (hasMuralCueColumns(db)) {
+            const rejectionReset = hasMuralCueRejectionCountColumn(db)
+                ? ", mural_cue_rejection_count = 0"
+                : "";
             db.prepare(
-                "UPDATE memories SET mural_cue = NULL, mural_cue_hash = NULL, mural_cue_at = NULL WHERE id = ?",
+                `UPDATE memories SET mural_cue = NULL, mural_cue_hash = NULL, mural_cue_at = NULL${rejectionReset} WHERE id = ?`,
             ).run(id);
         }
 

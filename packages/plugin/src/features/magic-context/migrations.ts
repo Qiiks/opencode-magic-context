@@ -2743,6 +2743,16 @@ export const MIGRATIONS: Migration[] = [
             }
         },
     },
+    {
+        version: 75,
+        description: "persist mural cue validation rejection latches",
+        up(db: Database): void {
+            // A NULL cue remains eligible for compression, while this counter
+            // remembers repeated validation failures for its current content hash.
+            if (!tableExists(db, "memories")) return;
+            ensureColumn(db, "memories", "mural_cue_rejection_count", "INTEGER NOT NULL DEFAULT 0");
+        },
+    },
 ];
 
 /**
