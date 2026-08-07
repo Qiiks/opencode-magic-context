@@ -393,23 +393,11 @@ pub fn compose_m0_from_store(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cortexkit_store_types::StorageDescriptor;
+    use crate::test_support::FixtureBuilder;
     use mc_store::{InsertMemoryInput, ModuleMeta, StoredCompartment};
 
     fn no_estimate(_: &str) -> usize {
         0
-    }
-
-    fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
-        use cortexkit_store_types::{Isolation, StorageBackend};
-        StorageDescriptor {
-            module_id: "magic-context".into(),
-            storage_namespace: "mc_cache".into(),
-            isolation: Isolation::Module,
-            backend: StorageBackend::Sqlite {
-                path: dir.join("store.db").to_string_lossy().into_owned(),
-            },
-        }
     }
 
     fn comp(seq: i64, start: i64, end: i64, end_id: &str) -> StoredCompartment {
@@ -428,8 +416,9 @@ mod tests {
 
     #[test]
     fn composes_m0_from_compartments_with_coverage_anchor() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let dir = &fixture.dir;
+        let store = &fixture.store;
         let project = "git:proj";
         let project_dir = dir.path().join("repo");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -466,8 +455,9 @@ mod tests {
 
     #[test]
     fn disabled_docs_render_empty_block_and_hash_without_reading_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let dir = &fixture.dir;
+        let store = &fixture.store;
         std::fs::write(dir.path().join("ARCHITECTURE.md"), "secret docs").unwrap();
         let inputs = M0ComposeInputs {
             session_id: "docs-off",
@@ -490,8 +480,9 @@ mod tests {
 
     #[test]
     fn no_compartments_yields_empty_boundary_and_placeholder_history() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let dir = &fixture.dir;
+        let store = &fixture.store;
         let project_dir = dir.path().join("repo");
         std::fs::create_dir_all(&project_dir).unwrap();
 
@@ -519,8 +510,9 @@ mod tests {
 
     #[test]
     fn memory_disabled_omits_memory_blocks_and_watermarks() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let dir = &fixture.dir;
+        let store = &fixture.store;
         store
             .insert_memory(InsertMemoryInput {
                 project_path: "git:proj",
@@ -559,8 +551,9 @@ mod tests {
 
     #[test]
     fn sparse_coordinate_gap_composes_store_pure() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let dir = &fixture.dir;
+        let store = &fixture.store;
         let project_dir = dir.path().join("repo");
         std::fs::create_dir_all(&project_dir).unwrap();
 
@@ -589,8 +582,9 @@ mod tests {
 
     #[test]
     fn determinism_same_inputs_same_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let dir = &fixture.dir;
+        let store = &fixture.store;
         let project_dir = dir.path().join("repo");
         std::fs::create_dir_all(&project_dir).unwrap();
         store

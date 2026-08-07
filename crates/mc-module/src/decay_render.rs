@@ -366,6 +366,7 @@ pub fn extract_m0_block(m0_text: &str, tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::FixtureBuilder;
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
 
@@ -837,5 +838,12 @@ mod tests {
             golden.cases.len(),
             "every tight case must end within budget (or at the floor) under the real estimator"
         );
+    }
+    #[test]
+    fn fixture_builder_drives_tagged_session_render() {
+        let fixture = FixtureBuilder::tagged_session();
+        let rendered = render_decayed_compartments(&fixture.compartments, 10_000.0, no_guard);
+        assert!(rendered.contains("## 1-1 · Boundary"));
+        assert!(fixture.handle_transform()["messages"].is_array());
     }
 }

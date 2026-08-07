@@ -518,22 +518,11 @@ fn load_render_eligible_memories(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
+    use crate::test_support::{descriptor, FixtureBuilder};
     use mc_store::{InsertMemoryInput, ModuleStateSyncRequest, StoredCompartment};
 
     fn no_estimate(_: &str) -> usize {
         0
-    }
-
-    fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
-        StorageDescriptor {
-            module_id: "magic-context".into(),
-            storage_namespace: "mc_cache".into(),
-            isolation: Isolation::Module,
-            backend: StorageBackend::Sqlite {
-                path: dir.join("store.db").to_string_lossy().into_owned(),
-            },
-        }
     }
 
     fn comp(seq: i64, start: i64, end: i64, end_id: &str) -> StoredCompartment {
@@ -638,8 +627,8 @@ mod tests {
 
     #[test]
     fn revision_signal_is_stable_and_moves_on_change() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
         let p = "git:proj";
         let s0 = m1_revision_signal(&store, p, "ses").unwrap();
         let s1 = m1_revision_signal(&store, p, "ses").unwrap();
@@ -656,8 +645,8 @@ mod tests {
 
     #[test]
     fn profile_version_moves_the_in_session_revision_signal() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
         let before =
             m1_revision_signal_parts_for_pass(&store, "git:proj", "git:proj", "ses", 1, true, 0)
                 .unwrap();
@@ -734,8 +723,8 @@ mod tests {
 
     #[test]
     fn disabled_memory_inputs_do_not_move_revision_but_compartments_still_do() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
         let project = "git:proj";
         let foreign = "git:foreign";
         store
@@ -786,8 +775,8 @@ mod tests {
 
     #[test]
     fn disabled_memory_lane_renders_no_additions_or_corrections() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
         let project = "git:proj";
         let foreign = "git:foreign";
         store
@@ -842,8 +831,8 @@ mod tests {
 
     #[test]
     fn empty_delta_is_the_placeholder_body() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
         // a HARD folded everything (folded_seq covers all, no new memories/mutations)
         let meta = meta_after_hard(5, Some(50), 100, 9, vec![1, 2]);
         let m1 = compose_m1_from_store(
@@ -866,8 +855,8 @@ mod tests {
 
     #[test]
     fn new_compartment_rides_m1_and_extends_coverage() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
         // m0 folded C1 (covers ord 1-10, folded_seq=1, coverage=10). C2 (11-20) publishes.
         store
             .replace_compartments("ses", &[comp(1, 1, 10, "m10"), comp(2, 11, 20, "m20")])
@@ -897,8 +886,8 @@ mod tests {
 
     #[test]
     fn memory_only_delta_does_not_extend_coverage() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
         // one folded compartment; a NEW memory (id 5) past the folded max (0).
         store
             .replace_compartments("ses", &[comp(1, 1, 10, "m10")])
@@ -1009,8 +998,8 @@ mod tests {
 
     #[test]
     fn merge_replacement_omitted_from_m0_renders_with_lineage_and_one_revision_change() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
         let project = "git:proj";
         store
             .replace_compartments("ses", &[comp(1, 1, 10, "m10")])
@@ -1089,8 +1078,8 @@ mod tests {
 
     #[test]
     fn merge_replacement_newer_than_folded_max_is_deduplicated_from_additions() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
         let project = "git:proj";
         let source = store
             .insert_memory(insert_input(project, "CONSTRAINTS", "source fact", 1))
@@ -1136,8 +1125,8 @@ mod tests {
 
     #[test]
     fn workspace_merge_replacement_uses_calling_projects_visibility() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
         let foreign = "git:aaa-foreign";
         let own = "git:zzz-own";
         store
@@ -1189,8 +1178,8 @@ mod tests {
 
     #[test]
     fn workspace_replacement_chain_crosses_an_invisible_intermediate() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
         let own = "git:workspace-chain-own";
         let foreign = "git:workspace-chain-foreign";
         store
@@ -1265,8 +1254,8 @@ mod tests {
 
     #[test]
     fn replacement_chains_resolve_to_terminal_and_cycles_degrade_to_removal() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
         let project = "git:replacement-chain";
         let source = store
             .insert_memory(insert_input(project, "CONSTRAINTS", "chain source", 1))
@@ -1350,8 +1339,8 @@ mod tests {
 
     #[test]
     fn archived_replacement_terminal_degrades_source_to_removal() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
         let project = "git:archived-terminal";
         let source = store
             .insert_memory(insert_input(project, "CONSTRAINTS", "source", 1))
@@ -1390,8 +1379,8 @@ mod tests {
 
     #[test]
     fn classification_visibility_grant_and_revoke_render_on_m1() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
         let own = "git:visibility-own";
         let foreign = "git:visibility-foreign";
         store
@@ -1507,8 +1496,8 @@ mod tests {
 
     #[test]
     fn public_insert_renders_new_memories_without_mutation_log() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
         let project = "git:proj";
         store
             .replace_compartments("ses", &[comp(1, 1, 10, "m10")])
@@ -1556,8 +1545,8 @@ mod tests {
         // read must resolve own-visibility from the CALLING project, not the union's first
         // member — else this own memory is wrongly treated as foreign and filtered out
         // while the digest still advanced, leaving a silently stale m1.
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
         let own = "git:zzz-own"; // sorts AFTER the foreign member
         let foreign = "git:aaa-foreign";
         // a workspace sharing ONLY CONSTRAINTS; the new memory is ARCHITECTURE (non-shared)
@@ -1599,7 +1588,7 @@ mod tests {
         // the digest detects it too (MAX(id) over the union, no visibility filter), so the
         // body now AGREES with what the digest moved on — no silent stale m1.
         let before = {
-            let s = McStore::open(&descriptor(&dir.path().join("probe"))).unwrap();
+            let s = McStore::open(&descriptor(&fixture.dir.path().join("probe"))).unwrap();
             s.seed_workspace_member("ws", own, "[\"CONSTRAINTS\"]")
                 .unwrap();
             s.seed_workspace_member("ws", foreign, "[\"CONSTRAINTS\"]")

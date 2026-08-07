@@ -1059,6 +1059,7 @@ mod tests {
     use crate::ck_wire::{
         project_messages, CkIngressMessage, CkWireBlock, CkWireMessage, HarnessMeta,
     };
+    use crate::test_support::FixtureBuilder;
     use mc_store::{CkKind, MediaBlock, MediaKind, ProviderExtras, StoredCompartment};
     use serde::Deserialize;
     use serde_json::json;
@@ -1138,19 +1139,8 @@ mod tests {
     }
 
     fn store_for_tests() -> (tempfile::TempDir, mc_store::McStore) {
-        use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
-
-        let dir = tempfile::tempdir().unwrap();
-        let store = mc_store::McStore::open(&StorageDescriptor {
-            module_id: "magic-context-test".to_string(),
-            storage_namespace: "mc_cache".to_string(),
-            isolation: Isolation::Module,
-            backend: StorageBackend::Sqlite {
-                path: dir.path().join("store.db").to_string_lossy().to_string(),
-            },
-        })
-        .unwrap();
-        (dir, store)
+        let fixture = FixtureBuilder::store();
+        (fixture.dir, fixture.store)
     }
 
     fn stored_compartment(seq: i64, start: i64, end: i64, end_id: &str) -> StoredCompartment {
@@ -1909,5 +1899,12 @@ mod tests {
                 case.label
             );
         }
+    }
+    #[test]
+    fn fixture_builder_drives_boundary_chunk_assembly() {
+        let fixture = FixtureBuilder::session_with_boundary();
+        let built = project_and_build(&fixture.messages, 1, 1_000, 3);
+        assert!(built.text.contains("U: before boundary"));
+        assert_eq!(fixture.call_transform()["kind"], "transform");
     }
 }

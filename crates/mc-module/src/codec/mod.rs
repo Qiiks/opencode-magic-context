@@ -19,6 +19,7 @@ mod tests {
 
     use crate::ck_wire::CkWireMessage;
     use crate::injection::build_synthetic_todo_pair;
+    use crate::test_support::FixtureBuilder;
 
     use super::{
         decode_opencode, decode_pi, encode_opencode, encode_opencode_with_session, encode_pi,
@@ -284,5 +285,15 @@ mod tests {
             .into_iter()
             .filter(|entry| entry.get("type").and_then(Value::as_str) != Some("compaction"))
             .collect()
+    }
+    #[test]
+    fn fixture_builder_drives_synthetic_todo_wire_shape() {
+        let fixture = FixtureBuilder::synthetic_todo_armed();
+        assert_eq!(fixture.native_messages.len(), 2);
+        assert!(fixture
+            .native_messages
+            .iter()
+            .all(|message| message["meta"]["synthetic"] == true));
+        assert_eq!(fixture.state_import()["kind"], "state_import");
     }
 }

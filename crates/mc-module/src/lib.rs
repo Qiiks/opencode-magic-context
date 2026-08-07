@@ -106,6 +106,12 @@ use subc_protocol::{
 };
 #[cfg(test)]
 use transform::ReductionDecision;
+
+#[cfg(test)]
+pub mod test_support;
+
+#[cfg(test)]
+mod differential_goldens;
 use transform::{
     transform_with_projection_cached, HistorianDiagnostics, SerializedOutputCache, TransformRequest,
 };

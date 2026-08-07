@@ -1,0 +1,142 @@
+{
+  "schema": 1,
+  "provenance": {
+    "generator": "crates/mc-module/gen/gen-differential-golden.ts",
+    "generator_version": "dg-reference-v1",
+    "input_sha256": "89d12463ba0fb8605eec3ced035cf658ae8dcb33bdb193521588407a63f0df09"
+  },
+  "cases": [
+    {
+      "id": "DG-1-bust-veto",
+      "family": "postprocess-gates",
+      "input": {
+        "session_id": "dg-session",
+        "markers": [
+          "bust",
+          "veto"
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "kind": {
+                  "type": "text",
+                  "text": "stable input"
+                }
+              }
+            ],
+            "meta": {}
+          }
+        ]
+      },
+      "expected": {
+        "status": "ok",
+        "action": "passthrough",
+        "decision": "defer",
+        "wire": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "kind": {
+                  "type": "text",
+                  "text": "stable input"
+                }
+              }
+            ],
+            "meta": {}
+          }
+        ]
+      }
+    },
+    {
+      "id": "DG-2-marker-representation",
+      "family": "marker-representation",
+      "input": {
+        "session_id": "dg-session",
+        "markers": [
+          "<system-reminder>",
+          "[dropped 2]"
+        ],
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "kind": {
+                  "type": "text",
+                  "text": "kept tail"
+                }
+              }
+            ],
+            "meta": {}
+          }
+        ]
+      },
+      "expected": {
+        "status": "ok",
+        "action": "passthrough",
+        "decision": "replay",
+        "wire": [
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "kind": {
+                  "type": "text",
+                  "text": "kept tail"
+                }
+              }
+            ],
+            "meta": {}
+          }
+        ]
+      }
+    },
+    {
+      "id": "DG-3-escalation-band",
+      "family": "escalation-bands",
+      "input": {
+        "session_id": "dg-session",
+        "markers": [
+          "band-275",
+          "band-276"
+        ],
+        "messages": [
+          {
+            "role": "tool",
+            "content": [
+              {
+                "kind": {
+                  "type": "text",
+                  "text": "bounded output"
+                }
+              }
+            ],
+            "meta": {}
+          }
+        ]
+      },
+      "expected": {
+        "status": "ok",
+        "action": "passthrough",
+        "decision": "materialize",
+        "wire": [
+          {
+            "role": "tool",
+            "content": [
+              {
+                "kind": {
+                  "type": "text",
+                  "text": "bounded output"
+                }
+              }
+            ],
+            "meta": {}
+          }
+        ]
+      }
+    }
+  ]
+}
