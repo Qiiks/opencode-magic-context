@@ -32,6 +32,9 @@ if [[ "$INNER" != 1 ]]; then
         --tmpfs /run:rw,exec,size=64m \
         --env MC_E2E_DOCKER_INNER=1 \
         --env MC_E2E_REPO_ROOT=/workspace \
+        --env E2E_OC_FILES="${E2E_OC_FILES:-}" \
+        --env E2E_PI_FILES="${E2E_PI_FILES:-}" \
+        --env E2E_RUST_FILES="${E2E_RUST_FILES:-}" \
         --env HOME=/tmp/mc-home \
         --env XDG_CONFIG_HOME=/tmp/mc-config \
         --env XDG_DATA_HOME=/tmp/mc-data \
@@ -67,6 +70,7 @@ tar \
     -C /repo -cf - . | tar -C "$REPO_ROOT" -xf -
 
 cd "$REPO_ROOT"
+E2E_MANIFEST_VALIDATOR="$REPO_ROOT/packages/e2e-tests/scripts/validate-mode-manifest.ts"
 
 BUN_CACHE_DIR="$XDG_CACHE_HOME/bun-install"
 echo "  [e2e:docker] bun install (container-local cache)..."
@@ -89,37 +93,50 @@ if [[ ! -f packages/pi-plugin/dist/index.js ]]; then
 fi
 
 run_e2e_group() {
-    local label="$1" files="$2" output status
-    echo "  [e2e:$label] bun test..."
+    local mode="$1" label="$2" files="$3" output status
+    echo "  [e2e:$mode:$label:start] bun test..."
     status=0
-    output=$(cd "$REPO_ROOT/packages/e2e-tests" && NODE_ENV="" bun test --timeout 600000 $files 2>&1) || status=$?
+    output=$(cd "$REPO_ROOT/packages/e2e-tests" && MC_E2E_MODE="$mode" NODE_ENV="" bun test --timeout 600000 $files 2>&1) || status=$?
     echo "$output"
 
     # Keep this gate identical to release.sh: a positive pass summary is
     # required, a non-zero fail count blocks the release, and Bun's known
     # post-completion panic is tolerated only after a green summary exists.
     if echo "$output" | grep -qE "[1-9][0-9]* fail"; then
-        echo "Error: e2e ($label) failed (fail count > 0)"
+        echo "Error: e2e ($mode/$label) failed (fail count > 0)"
+        echo "  [e2e:$mode:$label:end] status=fail"
         return 1
     fi
     if ! echo "$output" | grep -qE "[1-9][0-9]* pass"; then
-        echo "Error: e2e ($label) produced no passing-test summary (crash, timeout, or zero tests collected)"
+        echo "Error: e2e ($mode/$label) produced no passing-test summary (crash, timeout, or zero tests collected)"
+        echo "  [e2e:$mode:$label:end] status=fail"
         return 1
     fi
     if [ "$status" -ne 0 ]; then
-        echo "  [e2e:$label] note: tests passed but Bun exited $status (known post-completion panic) — tolerated"
+        echo "  [e2e:$mode:$label] note: tests passed but Bun exited $status (known post-completion panic) — tolerated"
     fi
+    echo "  [e2e:$mode:$label:end] status=pass"
 }
 
-# Keep the local release split stable: OpenCode is every ordinary test file and
-# Pi is every pi-*.test.ts file. Rust tests are rust-*.test.ts and intentionally
-# excluded from both globs because they require the host subc daemon.
-E2E_OC_FILES=$(cd "$REPO_ROOT/packages/e2e-tests" && printf '%s\n' tests/*.test.ts | grep -vE '/(pi-|rust-)' | tr '\n' ' ')
-E2E_PI_FILES=$(cd "$REPO_ROOT/packages/e2e-tests" && printf '%s\n' tests/pi-*.test.ts | tr '\n' ' ')
+# Both lists must be revalidated inside the staged checkout. The outer release
+# path passes its validated values in, and this check catches any drift while
+# also making the standalone Docker runner deterministic.
+MANIFEST_OC_FILES=$(bun "$E2E_MANIFEST_VALIDATOR" --mode ts --harness opencode | tr '\n' ' ')
+MANIFEST_PI_FILES=$(bun "$E2E_MANIFEST_VALIDATOR" --mode ts --harness pi | tr '\n' ' ')
+if [[ -n "${E2E_OC_FILES:-}" && "$E2E_OC_FILES" != "$MANIFEST_OC_FILES" ]]; then
+    echo "Error: manifest-derived OpenCode list changed across the Docker boundary" >&2
+    exit 1
+fi
+if [[ -n "${E2E_PI_FILES:-}" && "$E2E_PI_FILES" != "$MANIFEST_PI_FILES" ]]; then
+    echo "Error: manifest-derived Pi list changed across the Docker boundary" >&2
+    exit 1
+fi
+E2E_OC_FILES="$MANIFEST_OC_FILES"
+E2E_PI_FILES="$MANIFEST_PI_FILES"
 
 EXIT=0
-run_e2e_group "opencode" "$E2E_OC_FILES" || EXIT=1
-run_e2e_group "pi" "$E2E_PI_FILES" || EXIT=1
+run_e2e_group "ts" "opencode" "$E2E_OC_FILES" || EXIT=1
+run_e2e_group "ts" "pi" "$E2E_PI_FILES" || EXIT=1
 
 if [[ "$EXIT" -eq 0 ]]; then
     echo "  ✓ Containerized host e2e checks passed"

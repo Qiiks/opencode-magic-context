@@ -11,6 +11,11 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import {
+    buildHermeticBinaries,
+    detectRustModePrereqs,
+    HermeticSubcStack,
+} from "../rust-runner/hermetic-subc";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 // Prefer the bundled `dist/index.js` (what published users actually run)
@@ -284,13 +289,58 @@ async function waitForReady(url: string, timeoutMs = 300_000): Promise<void> {
     );
 }
 
+interface RustSpawnResources {
+    env: IsolatedEnv;
+    connectionFile: string;
+    stack: HermeticSubcStack;
+}
+
+/**
+ * Provision the Rust stack at the shared OpenCode spawn seam. Keeping this
+ * decision here means a suite body never needs a mode branch: the same harness
+ * creates either a regular isolated process or the real ck-subc + ck-mc path.
+ */
+async function provisionRustMode(): Promise<RustSpawnResources> {
+    const prereqs = detectRustModePrereqs();
+    if (!prereqs.ok || !prereqs.subconsciousRoot) {
+        throw new Error(
+            `MC_E2E_MODE=rust prerequisite failure: ${prereqs.skipReason ?? "unknown prerequisite"}`,
+        );
+    }
+    const { ckMcBin, ckSubcBin } = await buildHermeticBinaries(prereqs.subconsciousRoot);
+    const env = createIsolatedEnv();
+    try {
+        const stack = await HermeticSubcStack.start({ dataDir: env.dataDir, ckMcBin, ckSubcBin });
+        return { env, connectionFile: stack.connectionFile, stack };
+    } catch (error) {
+        throw new Error(`MC_E2E_MODE=rust failed to start the hermetic stack: ${String(error)}`);
+    }
+}
+
 export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode> {
+    // MC_E2E_MODE is intentionally read only at this shared spawn seam. Rust
+    // suites that already supplied a daemon connection keep their existing
+    // stack; ordinary suites get one provisioned here for the rust invocation.
+    const rustMode = process.env.MC_E2E_MODE === "rust";
+    const resources = rustMode && !opts.userSubcConnectionFile ? await provisionRustMode() : null;
+    const resolvedOpts: SpawnOptions = resources
+        ? {
+              ...opts,
+              existingEnv: resources.env,
+              userSubcConnectionFile: resources.connectionFile,
+              projectMagicContextConfig: {
+                  ...(opts.projectMagicContextConfig ?? {}),
+                  transform_mode: "rust",
+              },
+          }
+        : opts;
+
     // Reuse a caller-provided env for the Rust-mode harness (connection file
     // pre-placed, data dir shared across a serve restart); otherwise allocate.
-    const env = opts.existingEnv ?? createIsolatedEnv();
-    const port = opts.port ?? (await pickFreePort());
+    const env = resolvedOpts.existingEnv ?? createIsolatedEnv();
+    const port = resolvedOpts.port ?? (await pickFreePort());
 
-    writeConfigs(env, opts.mockProviderURL, opts);
+    writeConfigs(env, resolvedOpts.mockProviderURL, resolvedOpts);
 
     // Explicitly strip any inherited OPENCODE_SERVER_PASSWORD from the parent shell —
     // our tests run unsecured on a random localhost port, and inherited auth would
@@ -326,7 +376,7 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
     // Caller overrides (e.g. MAGIC_CONTEXT_LOG_PATH pointing the plugin log at a
     // per-suite file so Rust-mode scenarios can assert on transform decisions).
     // Merged last so an explicit override wins over the inherited value.
-    for (const [key, value] of Object.entries(opts.extraEnv ?? {})) {
+    for (const [key, value] of Object.entries(resolvedOpts.extraEnv ?? {})) {
         childEnv[key] = value;
     }
 
@@ -362,10 +412,18 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
     } catch (err) {
         // Surface captured output on boot failure to help debugging.
         child.kill("SIGTERM");
+        await resources?.stack.stop();
         throw new Error(
             `opencode serve failed to start.\n--- stdout ---\n${stdoutBuf}\n--- stderr ---\n${stderrBuf}\n\n${String(err)}`,
         );
     }
+
+    let rustStackStopped = false;
+    const stopProvisionedRustStack = async (): Promise<void> => {
+        if (!resources || rustStackStopped) return;
+        rustStackStopped = true;
+        await resources.stack.stop();
+    };
 
     return {
         url,
@@ -374,18 +432,22 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
         stdout: () => stdoutBuf,
         stderr: () => stderrBuf,
         kill: async () => {
-            if (child.exitCode === null && child.signalCode === null) {
-                child.kill("SIGTERM");
-                await new Promise<void>((resolveKill) => {
-                    const timer = setTimeout(() => {
-                        child.kill("SIGKILL");
-                        resolveKill();
-                    }, 3000);
-                    child.once("exit", () => {
-                        clearTimeout(timer);
-                        resolveKill();
+            try {
+                if (child.exitCode === null && child.signalCode === null) {
+                    child.kill("SIGTERM");
+                    await new Promise<void>((resolveKill) => {
+                        const timer = setTimeout(() => {
+                            child.kill("SIGKILL");
+                            resolveKill();
+                        }, 3000);
+                        child.once("exit", () => {
+                            clearTimeout(timer);
+                            resolveKill();
+                        });
                     });
-                });
+                }
+            } finally {
+                await stopProvisionedRustStack();
             }
         },
     };

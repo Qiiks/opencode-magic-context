@@ -266,23 +266,18 @@ jobs:
       - name: Run host e2e suite (OpenCode tests only)
         env:
           NODE_ENV: ""
+          MC_E2E_MODE: ts
         run: |
-          # Match every test file except pi-*.test.ts and rust-*.test.ts. The
-          # shell glob is not great at "all .test.ts except a couple", so list
-          # them explicitly. rust-*.test.ts is the hermetic Rust-mode lane; it
-          # needs the Rust workspace + the sibling subconscious daemon build,
-          # which this runner does not provision, so it is excluded here and run
-          # separately (bun run --cwd packages/e2e-tests test:rust-e2e) on a
-          # runner that can build the Rust workspace. Left out of CI wiring for
-          # now — see packages/e2e-tests/README.md.
+          # The mode validator independently checks tests/**/*.test.ts and
+          # derives this OpenCode list. Rust is intentionally absent from public
+          # CI because its private ../commons and ../subconscious path-deps are
+          # not provisioned here; the local release gate runs that host group.
           cd packages/e2e-tests
-          # OpenCode host behavior tests, plus the cache-bust oracle unit test
-          # (src/cache-analysis.test.ts) — the oracle backs the cache-invariant
-          # suite, so a regression in it would silently neuter those guards.
-          files=$(ls tests/*.test.ts | grep -v "/pi-" | grep -v "/rust-" | tr '\n' ' ')
-          files="$files src/cache-analysis.test.ts"
-          echo "Running OpenCode host tests: $files"
+          files=$(bun scripts/validate-mode-manifest.ts --mode ts --harness opencode | tr '\n' ' ')
+          echo "Running OpenCode host tests from mode manifest: $files"
           bun test --timeout 600000 $files
+          # This oracle is outside the manifest's tests/**/*.test.ts inventory.
+          bun test --timeout 600000 src/cache-analysis.test.ts
 
   e2e-host-pi:
     name: E2E (Pi, host behavior)
@@ -327,9 +322,12 @@ jobs:
       # the OpenCode host job. Pi historian publish path also crosses an
       # HTTP boundary into the mock provider, which is slower on shared
       # runners than on local hardware.
-      - name: Run host e2e suite (Pi tests only)
+      - name: Run host e2e suite (Pi tests from mode manifest)
         env:
           NODE_ENV: ""
+          MC_E2E_MODE: ts
         run: |
           cd packages/e2e-tests
-          bun test --timeout 600000 tests/pi-*.test.ts
+          files=$(bun scripts/validate-mode-manifest.ts --mode ts --harness pi | tr '\n' ' ')
+          echo "Running Pi host tests from mode manifest: $files"
+          bun test --timeout 600000 $files
