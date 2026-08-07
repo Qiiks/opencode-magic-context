@@ -92,6 +92,23 @@ const FIELD_DEFS: FieldDef[] = [
     description: "How long Magic Context TUI toasts stay visible.",
     section: "General",
   },
+  // Mural
+  {
+    key: "mural.enabled",
+    label: "Mural Enabled",
+    type: "boolean",
+    description:
+      "Render a deterministic image of project memories that did not fit the context budget.",
+    section: "Mural",
+  },
+  {
+    key: "mural.model",
+    label: "Cue Compressor Model",
+    type: "string",
+    description:
+      "Model used to compress each memory into a mural cue. The mural image itself is rendered deterministically.",
+    section: "Mural",
+  },
   // Thresholds
   // cache_ttl and execute_threshold_percentage are rendered as custom PerModelField components
   // Tags & cleanup
@@ -214,6 +231,7 @@ function readFallbackModels(formData: Record<string, unknown>, path: string): st
 
 const SECTION_ICONS: Record<string, string> = {
   General: "⚙️",
+  Mural: "🖼️",
   Thresholds: "⚡",
   "Tags & Cleanup": "🏷️",
   Historian: "📜",
@@ -386,9 +404,10 @@ function ConfigForm(props: {
   // Section order: Tags & Cleanup goes last (rendered after agent cards)
   const SECTION_ORDER: Record<string, number> = {
     General: 0,
-    Thresholds: 1,
-    Historian: 2,
-    Memory: 3,
+    Mural: 1,
+    Thresholds: 2,
+    Historian: 3,
+    Memory: 4,
     "Tags & Cleanup": 99,
   };
 
@@ -427,6 +446,7 @@ function ConfigForm(props: {
       "sqlite",
       "system_prompt_injection",
       "caveman_text_compression",
+      "mural",
     ]) {
       if (typeof formData()[key] === "object" && formData()[key] != null) {
         merged[key] = {

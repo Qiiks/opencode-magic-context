@@ -173,9 +173,7 @@ export interface MagicContextDeps {
          *  session-hook construction boundary via isCompactionEnabled; the
          *  resolved boolean is threaded to the transform phases. */
         compaction?: { enabled?: boolean };
-        experimental?: {
-            mural?: { enabled: boolean; model?: string };
-        };
+        mural?: { enabled: boolean; model?: string };
     };
     /** Test seam for the Rust authority adapter; production creates the subc client. */
     rustModeModuleClient?: RustModeModuleClient;
@@ -978,7 +976,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         compactionOff,
         experimentalUserMemories: userMemoryCollectionEnabled(dreamerConfig),
         experimentalTemporalAwareness: deps.config.temporal_awareness === true,
-        experimentalMuralEnabled: deps.config.experimental?.mural?.enabled === true,
+        muralEnabled: deps.config.mural?.enabled === true,
         historianTwoPass: deps.config.historian?.two_pass === true,
         liveModelBySession,
         sessionDirectoryBySession,
@@ -1227,7 +1225,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               userMemoryCollectionEnabled:
                                   userMemoryCollectionEnabled(dreamerConfig),
                               language: deps.config.language,
-                              experimentalMural: deps.config.experimental?.mural,
+                              mural: deps.config.mural,
                               memoryInjectionBudgetTokens:
                                   deps.config.memory?.injection_budget_tokens,
                               transformMode: deps.config.transform_mode,

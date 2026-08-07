@@ -336,7 +336,7 @@ const server: Plugin = async (ctx) => {
                 embeddingConfig: pluginConfig.embedding,
                 memoryEnabled: pluginConfig.memory?.enabled === true,
                 memoryInjectionBudgetTokens: pluginConfig.memory?.injection_budget_tokens,
-                experimentalMural: pluginConfig.experimental?.mural,
+                mural: pluginConfig.mural,
                 gitCommitIndexing: pluginConfig.memory.git_commit_indexing?.enabled
                     ? {
                           enabled: true,

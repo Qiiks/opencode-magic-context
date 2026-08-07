@@ -15,32 +15,21 @@
       "description": "Allow Magic Context sessions launched from the exact canonical home directory. The home session uses its deterministic dir: identity so pre-gate memories reconnect. USER-LEVEL ONLY: project config is ignored. The home identity is excluded from registry seed exports, never resolves descendants by containment, and cannot join a workspace.",
       "type": "boolean"
     },
-    "experimental": {
+    "mural": {
       "default": {
-        "mural": {
-          "enabled": false
-        }
+        "enabled": false
       },
-      "description": "Experimental feature switches. User and project configuration are both accepted.",
+      "description": "Experimental mural: a single deterministically-rendered image of project memories that did not fit the context budget. Cues are compressed per-memory by the compress-cues dreamer task.",
       "type": "object",
       "properties": {
-        "mural": {
-          "default": {
-            "enabled": false
-          },
-          "description": "Experimental mural: a single deterministically-rendered image of project memories that did not fit the context budget. Cues are compressed per-memory by the compress-cues dreamer task.",
-          "type": "object",
-          "properties": {
-            "enabled": {
-              "default": false,
-              "type": "boolean"
-            },
-            "model": {
-              "description": "Model for the compress-cues task that compresses each memory into a mural cue. The mural image itself is rendered deterministically (no author model).",
-              "type": "string",
-              "minLength": 1
-            }
-          }
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "model": {
+          "description": "Model for the compress-cues task that compresses each memory into a mural cue. The mural image itself is rendered deterministically (no author model).",
+          "type": "string",
+          "minLength": 1
         }
       }
     },

@@ -957,7 +957,7 @@ export interface PiInjectionOptions {
 	injectDocs?: boolean;
 	injectionBudgetTokens: number;
 	temporalAwareness?: boolean;
-	/** experimental.mural.enabled — on-demand deterministic mural image on HARD folds. */
+	/** mural.enabled — when enabled, generate a deterministic image of memories that did not fit the context budget whenever the system performs a full (HARD) context fold. */
 	muralEnabled?: boolean;
 }
 
@@ -4034,7 +4034,7 @@ interface RunPipelineArgs {
 		 *  injection budget. Drives compartment tier demotion in renderM0Pi. */
 		historyBudgetTokens?: number;
 		temporalAwareness?: boolean;
-		/** experimental.mural.enabled — on-demand deterministic mural image on HARD folds. */
+		/** mural.enabled — when enabled, generate a deterministic image of memories that did not fit the context budget whenever the system performs a full (HARD) context fold. */
 		muralEnabled?: boolean;
 	};
 	/**

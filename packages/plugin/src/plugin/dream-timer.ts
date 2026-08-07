@@ -66,7 +66,7 @@ const BOOT_PROJECT_JITTER_SLOT_MS = 1_000;
  * Per-project work registered with the timer. The timer is a process-wide
  * singleton, but Desktop OpenCode can load the same plugin once per project
  * within one process — every load needs its directory's git commits indexed,
- * its dream schedule checked, and its experimental config respected.
+ * its dream schedule checked, and its config respected.
  */
 interface ProjectRegistration {
     directory: string;
@@ -81,7 +81,7 @@ interface ProjectRegistration {
     };
     memoryEnabled?: boolean;
     memoryInjectionBudgetTokens?: number;
-    experimentalMural?: { enabled: boolean; model?: string };
+    mural?: { enabled: boolean; model?: string };
     embeddingConfig?: { provider?: string };
     ensureRegistered: (directory: string, db: Database) => Promise<void>;
     /**
@@ -440,7 +440,7 @@ async function sweepProject(
             ensureProjectRegistered: reg.ensureRegistered,
             language: reg.language,
             dreamerModel: dreamerConfig.model,
-            experimentalMural: reg.experimentalMural,
+            mural: reg.mural,
             memoryInjectionBudgetTokens: reg.memoryInjectionBudgetTokens,
             transformMode: reg.transformMode,
             moduleClient: reg.moduleClient,

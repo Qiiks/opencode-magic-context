@@ -43,6 +43,7 @@ describe("MagicContextConfigSchema", () => {
             expect(result.dreamer).toBeUndefined();
             expect(result.sidekick).toBeUndefined();
             expect(result.pi).toBeUndefined();
+            expect(result.mural).toEqual({ enabled: false });
         });
     });
 
@@ -73,7 +74,7 @@ describe("MagicContextConfigSchema", () => {
                 enabled: true,
                 allow_home_project: false,
                 fail_closed_blocking: true,
-                experimental: { mural: { enabled: false } },
+                mural: { enabled: false },
                 transform_mode: "ts",
                 auto_update: false,
                 toast_duration_ms: 5000,

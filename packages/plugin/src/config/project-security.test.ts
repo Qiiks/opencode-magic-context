@@ -150,6 +150,28 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(warnings.some((w) => w.includes("historian.model/fallback_models"))).toBe(true);
     });
 
+    it("strips mural.model from project config but keeps the feature switch", () => {
+        const raw: Record<string, unknown> = {
+            mural: { enabled: true, model: "repo-controlled-model" },
+        };
+
+        const warnings = stripUnsafeProjectConfigFields(raw);
+
+        expect(raw.mural).toEqual({ enabled: true });
+        expect(warnings.some((w) => w.includes("mural.model"))).toBe(true);
+    });
+
+    it("strips the legacy experimental mural model before migration", () => {
+        const raw: Record<string, unknown> = {
+            experimental: { mural: { enabled: true, model: "repo-controlled-model" } },
+        };
+
+        const warnings = stripUnsafeProjectConfigFields(raw);
+
+        expect(raw.experimental).toEqual({ mural: { enabled: true } });
+        expect(warnings.some((w) => w.includes("experimental.mural.model"))).toBe(true);
+    });
+
     it("strips hidden-agent prompt/permission/tools but keeps benign fields", () => {
         const raw: Record<string, unknown> = {
             dreamer: {

@@ -1004,7 +1004,7 @@ async function startPiMagicContextRuntime(
 			injectDocs: cfg.dreamer?.inject_docs !== false,
 			injectionBudgetTokens: cfg.memory.injection_budget_tokens,
 			temporalAwareness: cfg.temporal_awareness === true,
-			muralEnabled: cfg.experimental?.mural?.enabled === true,
+			muralEnabled: cfg.mural.enabled === true,
 		},
 		scheduler: {
 			executeThresholdPercentage: cfg.execute_threshold_percentage,

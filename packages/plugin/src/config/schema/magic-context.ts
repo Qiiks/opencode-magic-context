@@ -394,22 +394,18 @@ export interface ShadowEmbeddingConfig {
     enabled: boolean;
 }
 
-export interface ExperimentalMuralConfig {
+export interface MuralConfig {
     enabled: boolean;
     /** The CUE COMPRESSOR model for the compress-cues dreamer task (the mural is
      *  now rendered deterministically, so this no longer names an author model). */
     model?: string;
 }
 
-export interface ExperimentalConfig {
-    mural: ExperimentalMuralConfig;
-}
-
 export interface MagicContextConfig {
     enabled: boolean;
     /** User-level setting that lets a session started exactly in the canonical home directory use a deterministic directory identity. */
     allow_home_project: boolean;
-    experimental: ExperimentalConfig;
+    mural: MuralConfig;
     /** Selects the runtime implementation for this project. Rust mode is experimental and requires user-level subc configuration. */
     transform_mode: "ts" | "rust";
     /** Auto-update the cached OpenCode plugin wrapper when a newer npm version is available.
@@ -581,28 +577,21 @@ export const MagicContextConfigSchema = z
             .describe(
                 "Allow Magic Context sessions launched from the exact canonical home directory. The home session uses its deterministic dir: identity so pre-gate memories reconnect. USER-LEVEL ONLY: project config is ignored. The home identity is excluded from registry seed exports, never resolves descendants by containment, and cannot join a workspace.",
             ),
-        experimental: z
+        mural: z
             .object({
-                mural: z
-                    .object({
-                        enabled: z.boolean().default(false),
-                        model: z
-                            .string()
-                            .trim()
-                            .min(1)
-                            .optional()
-                            .describe(
-                                "Model for the compress-cues task that compresses each memory into a mural cue. The mural image itself is rendered deterministically (no author model).",
-                            ),
-                    })
-                    .default({ enabled: false })
+                enabled: z.boolean().default(false),
+                model: z
+                    .string()
+                    .trim()
+                    .min(1)
+                    .optional()
                     .describe(
-                        "Experimental mural: a single deterministically-rendered image of project memories that did not fit the context budget. Cues are compressed per-memory by the compress-cues dreamer task.",
+                        "Model for the compress-cues task that compresses each memory into a mural cue. The mural image itself is rendered deterministically (no author model).",
                     ),
             })
-            .default({ mural: { enabled: false } })
+            .default({ enabled: false })
             .describe(
-                "Experimental feature switches. User and project configuration are both accepted.",
+                "Experimental mural: a single deterministically-rendered image of project memories that did not fit the context budget. Cues are compressed per-memory by the compress-cues dreamer task.",
             ),
         transform_mode: z
             .enum(["ts", "rust"])

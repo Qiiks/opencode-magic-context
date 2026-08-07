@@ -102,7 +102,7 @@ export interface DreamTaskExecutorDeps {
     transformMode?: "ts" | "rust";
     /** Rust-mode module transport; classify uses it only after MODULE authority is confirmed. */
     dreamerModel?: string;
-    experimentalMural?: { enabled: boolean; model?: string };
+    mural?: { enabled: boolean; model?: string };
     memoryInjectionBudgetTokens?: number;
     moduleClient?: ClassifyModuleClient & {
         authorityStatus?: (args: {
@@ -298,11 +298,11 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
 
         try {
             if (config.task === "compress-cues") {
-                if (deps.experimentalMural?.enabled !== true) {
+                if (deps.mural?.enabled !== true) {
                     // Config-gated no-op, but say so: a silent "completed" here
                     // reads as a successful run in /ctx-dream summaries and would
                     // otherwise mask a wiring gap.
-                    log("[dreamer] compress-cues: skipped (experimental.mural is not enabled)");
+                    log("[dreamer] compress-cues: skipped (mural is not enabled)");
                     recordRun("completed", null);
                     return { status: "completed" };
                 }
@@ -313,7 +313,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     recordRun("failed", reason);
                     return { status: "failed", transient: true, error: reason };
                 }
-                // Model ladder mirrors classify: task override → experimental.mural
+                // Model ladder mirrors classify: task override → mural
                 // model (the cue COMPRESSOR model) → dreamer model → session model.
                 const result = await runCompressCues({
                     db,
@@ -324,7 +324,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     holderId,
                     leaseKey,
                     deadline,
-                    model: config.model ?? deps.experimentalMural.model ?? deps.dreamerModel,
+                    model: config.model ?? deps.mural.model ?? deps.dreamerModel,
                     fallbackModels: config.fallbackModels,
                 });
                 log(

@@ -856,7 +856,7 @@ lookup. Pi does not warm that cache (see §14); when metadata is absent the gate
 never injects the mural image until vision metadata is available; OpenCode warms
 the cache from its SDK at startup.
 
-**Config:** both honor `experimental.mural.enabled` (and `experimental.mural.model`
+**Config:** both honor `mural.enabled` (and `mural.model`
 for the compress-cues dreamer task). No intentional per-provider image-part
 blacklist today — every Pi serializer path that accepts user image content takes
 raw base64 the same way.

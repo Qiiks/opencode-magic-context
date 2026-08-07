@@ -19,7 +19,7 @@ The mural is a complement to the text `<project-memory>` block, not a replacemen
 
 Injection is gated on all of the following:
 
-1. **`experimental.mural.enabled`** is `true`.
+1. **`mural.enabled`** is `true`.
 2. The **outgoing model accepts images** (vision capability from provider metadata). Unknown capability fails closed: text-only baseline, no error.
 3. Enough memories have **current compressed cues** (coverage gate — see below).
 4. There is a non-empty **overflow set** after the normal memory text budget trim.
@@ -33,7 +33,7 @@ Each memory needs a short **cue** before it can appear on the mural. The dreamer
 - Runs per memory (not one giant prompt for the whole pool).
 - Compresses the full memory text into a mural-sized line.
 - **Caches by content hash** — unchanged memories are not re-compressed.
-- Uses **`experimental.mural.model`** when set, otherwise the dreamer model ladder.
+- Uses **`mural.model`** when set, otherwise the dreamer model ladder.
 
 Until a memory has a current cue, it is skipped for mural selection even if it overflowed the text budget.
 
@@ -50,20 +50,18 @@ The mural does not render from a half-empty cue pool. Rendering is skipped until
 
 ```jsonc
 {
-  "experimental": {
-    "mural": {
-      "enabled": true,
-      // Optional: model for compress-cues only. The PNG itself is deterministic.
-      "model": "anthropic/claude-haiku-4-5"
-    }
+  "mural": {
+    "enabled": true,
+    // Optional: model for compress-cues only. The PNG itself is deterministic.
+    "model": "anthropic/claude-haiku-4-5"
   }
 }
 ```
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `experimental.mural.enabled` | `false` | Master switch for mural injection and compress-cues. |
-| `experimental.mural.model` | — | Model used by compress-cues. Falls back to the dreamer model when unset. |
+| `mural.enabled` | `false` | Master switch for mural injection and compress-cues. |
+| `mural.model` | — | Model used by compress-cues. Falls back to the dreamer model when unset. |
 
 ## Requirements and limits
 
