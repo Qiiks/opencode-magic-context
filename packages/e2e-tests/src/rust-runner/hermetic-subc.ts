@@ -134,14 +134,23 @@ function runCargo(
 export async function buildHermeticBinaries(subconsciousRoot: string): Promise<BuiltBinaries> {
     if (buildPromise) return buildPromise;
     buildPromise = (async () => {
-        const moduleBuild = await runCargo(
-            ["build", "--release", "-p", "mc-module"],
-            REPO_ROOT,
-        );
-        if (!moduleBuild.ok || !existsSync(CK_MC_RELEASE)) {
-            throw new Error(
-                `failed to build ck-mc (cargo build --release -p mc-module):\n${moduleBuild.stderr.slice(-4000)}`,
+        const configuredCkMc = process.env.MC_E2E_CK_MC_BIN;
+        let ckMcBin = configuredCkMc && existsSync(configuredCkMc) ? configuredCkMc : undefined;
+        if (!ckMcBin) {
+            const moduleBuild = await runCargo(
+                ["build", "--release", "-p", "mc-module"],
+                REPO_ROOT,
             );
+            if (!moduleBuild.ok || !existsSync(CK_MC_RELEASE)) {
+                throw new Error(
+                    `failed to build ck-mc (cargo build --release -p mc-module):\n${moduleBuild.stderr.slice(-4000)}`,
+                );
+            }
+            ckMcBin = CK_MC_RELEASE;
+        }
+
+        if (!ckMcBin || !existsSync(ckMcBin)) {
+            throw new Error("ck-mc binary was not resolved after prerequisite detection");
         }
 
         const ckSubcRelease = join(subconsciousRoot, "target/release/ck-subc");
@@ -158,7 +167,7 @@ export async function buildHermeticBinaries(subconsciousRoot: string): Promise<B
             }
         }
 
-        return { ckMcBin: CK_MC_RELEASE, ckSubcBin: ckSubcRelease };
+        return { ckMcBin, ckSubcBin: ckSubcRelease };
     })();
     return buildPromise;
 }

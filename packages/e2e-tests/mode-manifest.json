@@ -1,0 +1,363 @@
+{
+  "schema": 1,
+  "header": "CI intentionally runs only the manifest-derived TS invocation; the Rust invocation requires private sibling path-deps (../commons and ../subconscious) and remains a mandatory local release-gate leg.",
+  "entries": [
+    {
+      "path": "tests/cache-invariants.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "queued for both-modes migration in S2",
+      "contract_refs": ["S2-MIGRATION"]
+    },
+    {
+      "path": "tests/cache-stability.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "queued for both-modes migration in S2",
+      "contract_refs": ["S2-MIGRATION"]
+    },
+    {
+      "path": "tests/compaction-off.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "OpenCode TS harness leg",
+      "contract_refs": ["TS-HARNESS"]
+    },
+    {
+      "path": "tests/conflict-disable.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "OpenCode TS harness leg",
+      "contract_refs": ["TS-HARNESS"]
+    },
+    {
+      "path": "tests/context-limits.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "queued for both-modes migration in S2",
+      "contract_refs": ["S2-MIGRATION"]
+    },
+    {
+      "path": "tests/deferred-compaction-marker.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "OpenCode TS harness leg",
+      "contract_refs": ["TS-HARNESS"]
+    },
+    {
+      "path": "tests/emergency-blocking.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "queued for both-modes migration in S2",
+      "contract_refs": ["S2-MIGRATION"]
+    },
+    {
+      "path": "tests/historian-success.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "queued for both-modes migration in S2",
+      "contract_refs": ["S2-MIGRATION"]
+    },
+    {
+      "path": "tests/long-running-session.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "queued for both-modes migration in S2 as the temporal contract suite",
+      "contract_refs": ["S2-MIGRATION"]
+    },
+    {
+      "path": "tests/memory-injection.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "queued for both-modes migration in S2",
+      "contract_refs": ["S2-MIGRATION"]
+    },
+    {
+      "path": "tests/overflow-recovery.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "queued for both-modes migration in S2",
+      "contract_refs": ["S2-MIGRATION"]
+    },
+    {
+      "path": "tests/pi-cache-invariants.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-cache-stability.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-compaction-off.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-conflict-disable.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-context-limits.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-cross-harness.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-deferred-compaction-marker.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-drops.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-emergency-blocking.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-historian-success.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-long-running-session.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-memory-injection.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-overflow-recovery.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-session-isolation.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-short-context-overflow.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-slow-historian.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-smoke.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-subagent-behavior.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-tag-owner-collision.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-tagging.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-thinking-block-safety.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/pi-todo-synthesis.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "pi harness leg",
+      "contract_refs": ["PI-HARNESS"]
+    },
+    {
+      "path": "tests/rust-cold-start-drop-seed.test.ts",
+      "tier": "rust-only",
+      "invocation": { "ts": false, "rust": true },
+      "rationale": "existing rust-* file; hermetic Rust harness leg",
+      "contract_refs": ["RUST-E2E"]
+    },
+    {
+      "path": "tests/rust-ctx-reduce-roundtrip.test.ts",
+      "tier": "rust-only",
+      "invocation": { "ts": false, "rust": true },
+      "rationale": "existing rust-* file; hermetic Rust harness leg",
+      "contract_refs": ["RUST-E2E"]
+    },
+    {
+      "path": "tests/rust-duplicate-tool-use-id.test.ts",
+      "tier": "rust-only",
+      "invocation": { "ts": false, "rust": true },
+      "rationale": "existing rust-* file; hermetic Rust harness leg",
+      "contract_refs": ["RUST-E2E"]
+    },
+    {
+      "path": "tests/rust-fold-under-pressure.test.ts",
+      "tier": "rust-only",
+      "invocation": { "ts": false, "rust": true },
+      "rationale": "existing rust-* file; hermetic Rust harness leg",
+      "contract_refs": ["RUST-E2E"]
+    },
+    {
+      "path": "tests/rust-multi-frame-delta-perf.test.ts",
+      "tier": "rust-only",
+      "invocation": { "ts": false, "rust": true },
+      "rationale": "existing rust-* file; hermetic Rust harness leg",
+      "contract_refs": ["RUST-E2E"]
+    },
+    {
+      "path": "tests/rust-park-self-heal.test.ts",
+      "tier": "rust-only",
+      "invocation": { "ts": false, "rust": true },
+      "rationale": "existing rust-* file; hermetic Rust harness leg",
+      "contract_refs": ["RUST-E2E"]
+    },
+    {
+      "path": "tests/rust-removal-self-heal.test.ts",
+      "tier": "rust-only",
+      "invocation": { "ts": false, "rust": true },
+      "rationale": "existing rust-* file; hermetic Rust harness leg",
+      "contract_refs": ["RUST-E2E"]
+    },
+    {
+      "path": "tests/rust-smoke.test.ts",
+      "tier": "rust-only",
+      "invocation": { "ts": false, "rust": true },
+      "rationale": "existing rust-* file; hermetic Rust harness leg",
+      "contract_refs": ["RUST-E2E"]
+    },
+    {
+      "path": "tests/rust-steady-state-byte-identity.test.ts",
+      "tier": "rust-only",
+      "invocation": { "ts": false, "rust": true },
+      "rationale": "existing rust-* file; hermetic Rust harness leg",
+      "contract_refs": ["RUST-E2E"]
+    },
+    {
+      "path": "tests/rust-tail-mutation-readopt.test.ts",
+      "tier": "rust-only",
+      "invocation": { "ts": false, "rust": true },
+      "rationale": "existing rust-* file; hermetic Rust harness leg",
+      "contract_refs": ["RUST-E2E"]
+    },
+    {
+      "path": "tests/session-isolation.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "OpenCode TS harness leg",
+      "contract_refs": ["TS-HARNESS"]
+    },
+    {
+      "path": "tests/short-context-overflow.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "OpenCode TS harness leg",
+      "contract_refs": ["TS-HARNESS"]
+    },
+    {
+      "path": "tests/slow-historian.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "queued for both-modes migration in S2 as a historian contract suite",
+      "contract_refs": ["S2-MIGRATION"]
+    },
+    {
+      "path": "tests/smoke.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "OpenCode TS harness leg",
+      "contract_refs": ["TS-HARNESS"]
+    },
+    {
+      "path": "tests/subagent-behavior.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "OpenCode TS harness leg",
+      "contract_refs": ["TS-HARNESS"]
+    },
+    {
+      "path": "tests/tag-owner-collision.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "queued for both-modes migration in S2 as a tagging-related contract suite",
+      "contract_refs": ["S2-MIGRATION"]
+    },
+    {
+      "path": "tests/thinking-block-safety.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "queued for both-modes migration in S2",
+      "contract_refs": ["S2-MIGRATION"]
+    },
+    {
+      "path": "tests/todo-synthesis.test.ts",
+      "tier": "ts-only",
+      "invocation": { "ts": true, "rust": false },
+      "rationale": "queued for both-modes migration in S2",
+      "contract_refs": ["S2-MIGRATION"]
+    }
+  ]
+}

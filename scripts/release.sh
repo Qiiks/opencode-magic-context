@@ -101,10 +101,19 @@ fi
 echo "→ Running pre-release checks..."
 echo ""
 
-PLUGIN_DIR="packages/plugin"
-PI_DIR="packages/pi-plugin"
-CLI_DIR="packages/cli"
-E2E_DIR="packages/e2e-tests"
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+PLUGIN_DIR="$REPO_ROOT/packages/plugin"
+PI_DIR="$REPO_ROOT/packages/pi-plugin"
+CLI_DIR="$REPO_ROOT/packages/cli"
+E2E_DIR="$REPO_ROOT/packages/e2e-tests"
+E2E_MANIFEST_VALIDATOR="$E2E_DIR/scripts/validate-mode-manifest.ts"
+
+# The committed validator is the only source of e2e file lists. It validates
+# the live tests glob before printing a shell-safe, space-separated list.
+manifest_files() {
+  local mode="$1" harness="$2"
+  bun "$E2E_MANIFEST_VALIDATOR" --mode "$mode" --harness "$harness" | tr '\n' ' '
+}
 
 # Run `bun test` for a package and gate on a TRUE pass, not just "no fail line".
 #
@@ -190,22 +199,25 @@ bun run --cwd "$CLI_DIR" build 2>&1 || { echo "Error: CLI build failed"; exit 1;
 # normal runtime the spawned opencode subprocess expects (a stray NODE_ENV=test
 # changes plugin logging/behavior). opencode must be on PATH.
 run_e2e_group() {
-  local label="$1" files="$2" output status
-  echo "  [e2e:$label] bun test..."
+  local mode="$1" label="$2" files="$3" output status
+  echo "  [e2e:$mode:$label:start] bun test..."
   status=0
-  output=$(cd "$E2E_DIR" && NODE_ENV="" bun test --timeout 600000 $files 2>&1) || status=$?
+  output=$(cd "$E2E_DIR" && MC_E2E_MODE="$mode" NODE_ENV="" bun test --timeout 600000 $files 2>&1) || status=$?
   echo "$output"
   if echo "$output" | grep -qE "[1-9][0-9]* fail"; then
-    echo "Error: e2e ($label) failed (fail count > 0)"
-    exit 1
+    echo "Error: e2e ($mode/$label) failed (fail count > 0)"
+    echo "  [e2e:$mode:$label:end] status=fail"
+    return 1
   fi
   if ! echo "$output" | grep -qE "[1-9][0-9]* pass"; then
-    echo "Error: e2e ($label) produced no passing-test summary (crash, timeout, or zero tests collected)"
-    exit 1
+    echo "Error: e2e ($mode/$label) produced no passing-test summary (crash, timeout, or zero tests collected)"
+    echo "  [e2e:$mode:$label:end] status=fail"
+    return 1
   fi
   if [ "$status" -ne 0 ]; then
-    echo "  [e2e:$label] note: tests passed but Bun exited $status (known post-completion panic) — tolerated"
+    echo "  [e2e:$mode:$label] note: tests passed but Bun exited $status (known post-completion panic) — tolerated"
   fi
+  echo "  [e2e:$mode:$label:end] status=pass"
 }
 
 strip_leading_zeros() {
@@ -303,6 +315,13 @@ docker_available() {
 }
 
 run_host_e2e() {
+  # Resolve all lists before selecting Docker versus host execution. Both paths
+  # receive lists produced by the same validated manifest invocation.
+  E2E_OC_FILES=$(manifest_files ts opencode)
+  E2E_PI_FILES=$(manifest_files ts pi)
+  E2E_RUST_FILES=$(manifest_files rust all)
+  export E2E_OC_FILES E2E_PI_FILES E2E_RUST_FILES
+
   if [[ "$FORCE_E2E_HOST" -eq 0 ]] && docker_available; then
     echo "  [e2e] Docker is available; running both host e2e legs in the native container..."
     "$SCRIPT_DIR/release-e2e-docker.sh"
@@ -321,13 +340,36 @@ run_host_e2e() {
     echo "       Install it (curl -fsSL https://opencode.ai/install | bash) and ensure ~/.opencode/bin is on PATH."
     exit 1
   fi
-  E2E_OC_FILES=$(ls "$E2E_DIR"/tests/*.test.ts | grep -vE "/(pi-|rust-)" | sed "s#$E2E_DIR/##" | tr '\n' ' ')
-  E2E_PI_FILES=$(ls "$E2E_DIR"/tests/pi-*.test.ts | sed "s#$E2E_DIR/##" | tr '\n' ' ')
-  run_e2e_group "opencode" "$E2E_OC_FILES"
-  run_e2e_group "pi" "$E2E_PI_FILES"
+  run_e2e_group "ts" "opencode" "$E2E_OC_FILES"
+  run_e2e_group "ts" "pi" "$E2E_PI_FILES"
 }
 
+check_rust_e2e_prerequisites() {
+  local detector="$E2E_DIR/scripts/check-rust-prerequisites.ts"
+  echo "  [e2e:rust:prerequisites:start] resolving ck-mc, sibling checkouts, and cargo workspace..."
+  if ! bun "$detector" --build; then
+    echo "Error: Rust e2e prerequisite detector failed; the rust group is RED (never skipped)."
+    echo "  [e2e:rust:prerequisites:end] status=fail"
+    return 1
+  fi
+  MC_E2E_CK_MC_BIN=$(bun "$detector" --print)
+  if [[ "$MC_E2E_CK_MC_BIN" == "$REPO_ROOT/target/release/ck-mc" ]]; then
+    # The harness rebuilds the current workspace target incrementally.
+    unset MC_E2E_CK_MC_BIN
+  else
+    # A prebuilt PATH binary is accepted only when the workspace target is not
+    # available; pass that resolved path through the shared Rust stack.
+    export MC_E2E_CK_MC_BIN
+  fi
+  echo "  [e2e:rust:prerequisites] ck-mc=${MC_E2E_CK_MC_BIN:-$REPO_ROOT/target/release/ck-mc}"
+  echo "  [e2e:rust:prerequisites:end] status=pass"
+}
+
+# Rust stays on the host: the daemon and its private sibling path-dependencies
+# cross the container boundary and must be checked before this third group.
 run_host_e2e
+check_rust_e2e_prerequisites
+run_e2e_group "rust" "hermetic" "$E2E_RUST_FILES"
 
 echo "  ✓ All checks passed"
 echo ""
