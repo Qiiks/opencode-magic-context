@@ -633,6 +633,46 @@ describe("storage-db", () => {
             expect(getMigrationOnOpenRefusal()).toBeNull();
         });
 
+        it("#when a live record shares a directory with old junk #then live wins, junk is cleaned, and migration stays blocked", () => {
+            const dataHome = useTempDataHome("storage-db-live-with-junk-rpc-migration-");
+            const dbPath = resolveDbPath(dataHome);
+            mkdirSync(dirname(dbPath), { recursive: true });
+            const legacy = new Database(dbPath);
+            legacy.exec(`
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations(version) VALUES (${LATEST_SUPPORTED_VERSION - 1});
+            `);
+            legacy.close();
+
+            const portDir = join(dirname(dbPath), "rpc", "test-project");
+            mkdirSync(portDir, { recursive: true });
+            const livePortFile = join(portDir, `port-${process.pid}.json`);
+            const junkFiles = [
+                ["port-41001.json", ""],
+                ["port-41002.json", "{not-json"],
+                ["port-41003.json", JSON.stringify({ port: 43125, started_at: 1 })],
+            ].map(([name, content]) => {
+                const file = join(portDir, name);
+                writeFileSync(file, content);
+                const old = new Date(Date.now() - 11 * 60 * 1000);
+                utimesSync(file, old, old);
+                return file;
+            });
+            writeFileSync(
+                livePortFile,
+                JSON.stringify({ port: 43123, pid: process.pid, started_at: 1_200_000 }),
+            );
+            setLinuxIdentityProbe();
+
+            expect(openDatabase()).toBeNull();
+            expect(getMigrationOnOpenRefusal()).toMatchObject({
+                serverPids: [process.pid],
+            });
+            for (const junkFile of junkFiles) expect(existsSync(junkFile)).toBe(false);
+            expect(existsSync(livePortFile)).toBe(true);
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
+        });
+
         it("#when a live OpenCode server advertises a port #then refuses a pending migration", () => {
             const dataHome = useTempDataHome("storage-db-live-server-migration-");
             const dbPath = resolveDbPath(dataHome);
