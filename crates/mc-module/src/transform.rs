@@ -1742,20 +1742,31 @@ fn rebase_descent_ordinals(
     if first.ordinal == expected_first {
         return Ok(None);
     }
-    if first.ordinal != 1 {
+    // A fresh replacement array restarts at the harness assigner's origin, and
+    // both origins are live in the fleet: Pi-style assigners are 1-based while
+    // the CC-leg assigner mints ordinal 0 for the first message (measured on
+    // the rig, and the same basis every non-descent pass already accepts).
+    // Rejecting basis 0 here contradicted the module's own ingress contract.
+    if first.ordinal > 1 {
         return Err(TransformError::LineageProtocol(format!(
-            "descent replacement array starts at ordinal {}, expected fresh ordinal 1 or continued ordinal {expected_first}",
+            "descent replacement array starts at ordinal {}, expected a fresh origin (0 or 1) or continued ordinal {expected_first}",
             first.ordinal
         )));
     }
+    // Shift so the fresh array's FIRST ordinal lands at base+1 regardless of
+    // origin basis: offset = base+1-first (1-based keeps the historical +base).
+    let offset = expected_first
+        .checked_sub(first.ordinal)
+        .expect("first.ordinal <= 1 <= expected_first");
     let mut rebased = req.clone();
     for message in &mut rebased.messages {
-        if message.ordinal == 0 {
-            return Err(TransformError::LineageProtocol(
-                "descent replacement array contains ordinal 0".to_string(),
-            ));
+        if message.ordinal < first.ordinal {
+            return Err(TransformError::LineageProtocol(format!(
+                "descent replacement array contains ordinal {} below its origin {}",
+                message.ordinal, first.ordinal
+            )));
         }
-        message.ordinal = message.ordinal.checked_add(base).ok_or_else(|| {
+        message.ordinal = message.ordinal.checked_add(offset).ok_or_else(|| {
             TransformError::LineageProtocol("descent ordinal overflow".to_string())
         })?;
         message.ck.meta.ordinal = Some(message.ordinal);

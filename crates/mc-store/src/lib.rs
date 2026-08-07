@@ -9270,9 +9270,14 @@ impl McStore {
                     ))
                 }
             };
-            if anchor.ordinal != 1 && anchor.ordinal != placeholder_ordinal {
+            // Fresh-lineage anchors sit at the assigner's origin, and both live
+            // origin bases are legitimate: 1-based (Pi-style) and 0-based (the
+            // CC-leg assigner, whose first message is ordinal 0 on every pass
+            // the module already accepts). Continued lineages anchor at the
+            // placeholder. Anything else is a mid-space anchor and refuses.
+            if anchor.ordinal > 1 && anchor.ordinal != placeholder_ordinal {
                 return Ok(LineageDescentTxnOutcome::Invalid(format!(
-                    "descent anchor {} has ordinal {}, expected fresh ordinal 1 or continued ordinal {}",
+                    "descent anchor {} has ordinal {}, expected a fresh origin (0 or 1) or continued ordinal {}",
                     anchor.block_id, anchor.ordinal, placeholder_ordinal
                 )));
             }
@@ -23506,8 +23511,82 @@ mod lineage_descent_tests {
         }]
     }
 
+
+    /// The CC-leg mid assigner is zero-based: a fresh replacement array's
+    /// anchor sits at ordinal 0 (measured on the rig — ccm-0#1 carrying the
+    /// stored summary). A fresh-origin anchor at 0 must descend exactly like
+    /// the 1-based form; the placeholder still lands at prior_last+1.
     #[test]
-    fn descent_copies_verbatim_ranges_writes_real_boundary_and_replay_does_not_rebump() {
+    fn descent_accepts_a_zero_based_fresh_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_lineage(&store, "A", 10);
+        let hops = direct_hop("A", "B", 2);
+        let anchor = LineageAnchor {
+            block_id: "ccm-0#1".to_string(),
+            message_id: "ccm-0".to_string(),
+            content_hash: "abc123".to_string(),
+            ordinal: 0,
+        };
+        let outcome = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "B",
+                expected_target_row_version: None,
+                edge_id: 42,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 2,
+                constituents: &hops,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 10,
+            })
+            .unwrap();
+        assert_eq!(outcome.disposition, LineageDescentDisposition::Descended);
+        assert_eq!(outcome.prior_last_ordinal, Some(10));
+        let target = store.load("B").unwrap();
+        assert_eq!(target.meta.coverage_ordinal, Some(11));
+        assert_eq!(target.core.boundary_id, "ccm-0#1");
+    }
+
+    /// A mid-space anchor (neither a fresh origin nor the placeholder) must
+    /// refuse — the widened origin acceptance is exactly {0, 1}, not "small".
+    #[test]
+    fn descent_refuses_a_mid_space_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_lineage(&store, "A", 10);
+        let hops = direct_hop("A", "B", 2);
+        let anchor = LineageAnchor {
+            block_id: "ccm-2#0".to_string(),
+            message_id: "ccm-2".to_string(),
+            content_hash: "abc123".to_string(),
+            ordinal: 2,
+        };
+        let error = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "B",
+                expected_target_row_version: None,
+                edge_id: 43,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 2,
+                constituents: &hops,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 10,
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("expected a fresh origin (0 or 1)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+        fn descent_copies_verbatim_ranges_writes_real_boundary_and_replay_does_not_rebump() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         seed_lineage(&store, "A", 10);
