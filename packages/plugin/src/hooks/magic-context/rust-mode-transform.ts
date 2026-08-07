@@ -436,6 +436,7 @@ function formatRustPassLog(args: {
     applied: boolean;
     elapsedMs: number;
     moduleElapsedMs: number;
+    rowVersion: number;
     timings?: RustPassTimings;
 }): string {
     const timings = args.timings ?? emptyRustPassTimings();
@@ -449,7 +450,8 @@ function formatRustPassLog(args: {
         timings.apply +
         timings.lkgSnapshot;
     const unattributed = Math.max(0, args.elapsedMs - measured);
-    return `rust pass: decision=${args.decision} reason=${args.reason} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} other:${unattributed.toFixed(1)}`;
+    const rowVersion = Number.isSafeInteger(args.rowVersion) ? args.rowVersion : 0;
+    return `rust pass: decision=${args.decision} reason=${args.reason} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} row_version=${rowVersion} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} other:${unattributed.toFixed(1)}`;
 }
 
 function isSyntheticUserMessage(message: MessageLike | undefined): boolean {
@@ -1214,6 +1216,7 @@ export function createRustModeTransform(
         let materializeReason = "none";
         let servedFrom = "none";
         let moduleElapsedMs = 0;
+        let rowVersion = 0;
         let appliedAt: number | undefined;
         let emergencyFailClosed = false;
         // Parking must not hide pressure from the recovery policy. Usage is cheap to read
@@ -1279,6 +1282,7 @@ export function createRustModeTransform(
                     applied,
                     elapsedMs,
                     moduleElapsedMs,
+                    rowVersion,
                     timings,
                 }),
             );
@@ -1311,6 +1315,11 @@ export function createRustModeTransform(
             const timings = isRecord(response.timings) ? response.timings : undefined;
             const total = timings?.total;
             moduleElapsedMs = typeof total === "number" && Number.isFinite(total) ? total : 0;
+            rowVersion =
+                typeof response.row_version === "number" &&
+                Number.isSafeInteger(response.row_version)
+                    ? response.row_version
+                    : 0;
             // A slow module pass earns its stage breakdown in the log: the pass line
             // only carries the module total, which cannot distinguish a tokenizer
             // stall from a store commit stall on large sessions.
@@ -2127,6 +2136,7 @@ export function createRustModeTransform(
             if (emergencyFailClosed) {
                 // At 95% of a trusted limit, or while provider overflow recovery is armed,
                 // any adapter failure aborts. Parking controls retry cadence, not fallback admission.
+                sessionLog(sessionId, "mc_rust_emergency_refusal before_lkg");
                 markFailure(sessionId, state, error);
                 finishPass(false, false);
                 throw new EmergencyFailClosedError(

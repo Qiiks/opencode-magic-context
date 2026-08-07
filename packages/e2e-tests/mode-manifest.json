@@ -619,6 +619,84 @@
                 "parity-findings-s2.md#todo-1",
                 "ARCHITECTURE.md#synthetic-todowrite"
             ]
+        },
+        {
+            "path": "tests/rust-fm-oc-1.test.ts",
+            "tier": "rust-only",
+            "invocation": {
+                "ts": false,
+                "rust": true
+            },
+            "rationale": "FM-OC-1 real SIGKILL mid-session exercises byte-identical LKG continuation and loud failure reporting",
+            "contract_refs": [
+                "FM-OC-1",
+                "RUST-E2E"
+            ]
+        },
+        {
+            "path": "tests/rust-fm-oc-2.test.ts",
+            "tier": "rust-only",
+            "invocation": {
+                "ts": false,
+                "rust": true
+            },
+            "rationale": "FM-OC-2 real SIGKILL outage pins the shipped failure threshold and park-transition observability",
+            "contract_refs": [
+                "FM-OC-2",
+                "RUST-E2E"
+            ]
+        },
+        {
+            "path": "tests/rust-fm-oc-3.test.ts",
+            "tier": "rust-only",
+            "invocation": {
+                "ts": false,
+                "rust": true
+            },
+            "rationale": "FM-OC-3 real SIGKILL followed by module return pins bounded probe recovery and monotonic row versions",
+            "contract_refs": [
+                "FM-OC-3",
+                "RUST-E2E"
+            ]
+        },
+        {
+            "path": "tests/rust-fm-oc-4.test.ts",
+            "tier": "rust-only",
+            "invocation": {
+                "ts": false,
+                "rust": true
+            },
+            "rationale": "FM-OC-4 real SIGKILL at a provider-proven emergency limit pins typed fail-closed refusal",
+            "contract_refs": [
+                "FM-OC-4",
+                "RUST-E2E"
+            ]
+        },
+        {
+            "path": "tests/rust-fm-oc-5.test.ts",
+            "tier": "rust-only",
+            "invocation": {
+                "ts": false,
+                "rust": true
+            },
+            "rationale": "FM-OC-5 SIGSTOP/SIGCONT only exercises transport timeout classification and recovery",
+            "contract_refs": [
+                "FM-OC-5",
+                "RUST-E2E"
+            ]
+        },
+        {
+            "path": "tests/rust-fm-oc-6.test.ts",
+            "tier": "rust-only",
+            "invocation": {
+                "ts": false,
+                "rust": true
+            },
+            "rationale": "FM-OC-6 real SIGKILL with emergency recovery armed pins refusal before LKG admission",
+            "contract_refs": [
+                "FM-OC-6",
+                "RUST-E2E"
+            ]
         }
     ]
 }
