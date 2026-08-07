@@ -267,6 +267,9 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 memoryChanges?: ReturnType<typeof computeMemoryDelta>;
                 smartNotesSurfaced?: number;
                 smartNotesPending?: number;
+                /** Broad verification closes its cycle before telemetry is recorded,
+                 *  so pass the cycle-local backlog explicitly when needed. */
+                backlogAfter?: { pending: number; total: number };
             },
         ): void => {
             try {
@@ -282,7 +285,9 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                             resultChars: 0,
                             ...(error ? { error } : {}),
                             backlog: (() => {
-                                const end = getDreamTaskBacklog(db, projectIdentity, config.task);
+                                const end =
+                                    extra?.backlogAfter ??
+                                    getDreamTaskBacklog(db, projectIdentity, config.task);
                                 const processed = processedDreamTaskItems(
                                     backlogAtStart.pending,
                                     end.pending,
@@ -444,17 +449,41 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     moduleRoute,
                     onProgress: (processed) => reportProgress(processed),
                 });
+                const processed = result.verified + result.updated + result.archived;
+                const broadProgress =
+                    config.task === "verify-broad"
+                        ? `verify-broad cycle ${result.broadCycleStartAt ?? "open"}: verified ${processed}, ${result.remaining} remain`
+                        : null;
+                const backlogAfter =
+                    config.task === "verify-broad"
+                        ? { pending: result.remaining, total: backlogAtStart.total }
+                        : undefined;
                 if (!result.complete) {
+                    // A broad cycle is intentionally resumable: ordinary progress
+                    // is a successful scheduled run, even though this deadline did
+                    // not drain the complete cycle. Only a zero-progress broad run
+                    // is a failure that should raise the dashboard's red status.
+                    if (broadProgress && processed > 0) {
+                        recordRun("completed", broadProgress, {
+                            memoryChanges: computeMemoryDelta(memoryBefore),
+                            backlogAfter,
+                        });
+                        return { status: "completed", error: broadProgress };
+                    }
                     const error = incompleteMessage(result.remaining);
                     recordRun("failed", error, {
                         memoryChanges: computeMemoryDelta(memoryBefore),
+                        backlogAfter,
                     });
                     return { status: "failed", transient: true, error };
                 }
-                recordRun("completed", null, {
+                recordRun("completed", broadProgress, {
                     memoryChanges: computeMemoryDelta(memoryBefore),
+                    backlogAfter,
                 });
-                return { status: "completed" };
+                return broadProgress
+                    ? { status: "completed", error: broadProgress }
+                    : { status: "completed" };
             }
 
             if (config.task === "classify-memories") {

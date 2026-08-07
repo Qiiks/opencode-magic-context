@@ -17,6 +17,8 @@ import { ensureProjectState, getProjectState } from "../storage-project-state";
 import { getUserMemoryCandidates, insertUserMemory } from "../user-memory/storage-user-memory";
 import { acquireLease } from "./lease";
 import { applyRetrospectiveLearnings } from "./retrospective-learnings";
+import { getDreamRuns } from "./storage-dream-runs";
+import { getTaskScheduleState, seedTaskScheduleState } from "./storage-task-schedule";
 import { createDreamTaskExecutor } from "./task-executor";
 import { leaseKeyFor } from "./task-registry";
 import type { DreamTaskRuntimeConfig } from "./task-scheduler";
@@ -146,6 +148,134 @@ describe("createDreamTaskExecutor — curate", () => {
             "Write human-readable prose you author in: Turkish (Türkçe).",
         );
         expect(capturedSystem).toContain("Copy required output schemas exactly");
+    });
+});
+
+describe("createDreamTaskExecutor — verify-broad disposition", () => {
+    test("records cycle progress as a completed run result instead of an error status", async () => {
+        db = freshDb();
+        const project = "/repo/verify-broad-result";
+        seedTaskScheduleState(db, project, "verify-broad", null, null, "0 3 * * 0");
+        const memories = [];
+        for (let i = 0; i < 51; i += 1) {
+            const memory = insertMemory(db, {
+                projectPath: project,
+                category: "ARCHITECTURE",
+                content: `Mapped broad fact ${i}.`,
+            });
+            recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1_000);
+            memories.push(memory.id);
+        }
+
+        let promptCalls = 0;
+        let childCount = 0;
+        const manifests = new Map<string, string>();
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: `verify-child-${++childCount}` } })),
+                prompt: mock(
+                    async (args: {
+                        path?: { id?: string };
+                        body?: { parts?: Array<{ text?: string }> };
+                    }) => {
+                        promptCalls += 1;
+                        const prompt = args.body?.parts?.[0]?.text ?? "";
+                        const ids = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) =>
+                            Number(match[1]),
+                        );
+                        manifests.set(
+                            args.path?.id ?? "",
+                            promptCalls > 1
+                                ? "<verify>"
+                                : `<verify>${ids.map((id) => `<verified id="${id}"/>`).join("")}</verify>`,
+                        );
+                        return {};
+                    },
+                ),
+                messages: mock(async (args: { path?: { id?: string } }) => ({
+                    data: assistantMessages(
+                        manifests.get(args.path?.id ?? "") ?? "<verify></verify>",
+                    ),
+                })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+        const leaseKey = leaseKeyFor("verify-broad", project);
+        expect(acquireLease(db, "holder-broad-result", leaseKey)).toBe(true);
+
+        const result = await executor(
+            { task: "verify-broad", schedule: "0 3 * * 0", timeoutMinutes: 20 },
+            {
+                db,
+                projectIdentity: project,
+                holderId: "holder-broad-result",
+                leaseKey,
+            },
+        );
+
+        expect(result.status).toBe("completed");
+        expect(result.error).toContain("verify-broad cycle");
+        expect(result.error).toContain("remain");
+        const state = getTaskScheduleState(db, project, "verify-broad");
+        expect(state?.lastBroadRunAt).toBeGreaterThan(0);
+        const run = getDreamRuns(db, project)[0];
+        expect(run?.tasks_failed).toBe(0);
+        const task = JSON.parse(run?.tasks_json ?? "[]")[0] as {
+            error?: string;
+            backlog?: { pendingAtStart: number; pendingAtEnd: number; processed: number };
+        };
+        expect(task.error).toContain("verify-broad cycle");
+        expect(task.backlog).toMatchObject({ pendingAtStart: 51, pendingAtEnd: 1, processed: 50 });
+    });
+
+    test("keeps a zero-progress broad run failed", async () => {
+        db = freshDb();
+        const project = "/repo/verify-broad-zero";
+        seedTaskScheduleState(db, project, "verify-broad", null, null, "0 3 * * 0");
+        const memory = insertMemory(db, {
+            projectPath: project,
+            category: "ARCHITECTURE",
+            content: "Mapped fact that cannot be verified yet.",
+        });
+        recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1_000);
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => {
+                    throw new Error("provider unavailable");
+                }),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+        const leaseKey = leaseKeyFor("verify-broad", project);
+        expect(acquireLease(db, "holder-broad-zero", leaseKey)).toBe(true);
+
+        const result = await executor(
+            { task: "verify-broad", schedule: "0 3 * * 0", timeoutMinutes: 20 },
+            {
+                db,
+                projectIdentity: project,
+                holderId: "holder-broad-zero",
+                leaseKey,
+            },
+        );
+
+        expect(result.status).toBe("failed");
+        expect(result.transient).toBe(true);
+        expect(getTaskScheduleState(db, project, "verify-broad")?.lastBroadRunAt).toBeGreaterThan(
+            0,
+        );
+        expect(getDreamRuns(db, project)[0]?.tasks_failed).toBe(1);
     });
 });
 
