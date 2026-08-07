@@ -9,6 +9,9 @@ export interface DrillMutationRecord {
 	mutation: string;
 	must_fail: string;
 	failure_signal: string;
+	applied_diff_summary: string;
+	observed_failure: { exit_status: number; assertion_output: string };
+	reverted_rerun: string;
 }
 
 export interface DrillArtifact {
@@ -97,6 +100,16 @@ export function assertMutationDiscipline(
 		if (!expectedTestIds.includes(record.must_fail)) {
 			throw new Error(
 				`${artifact.drill_id}: mutation ${record.id} has no selected test`,
+			);
+		}
+		if (
+			record.applied_diff_summary.trim().length === 0 ||
+			record.observed_failure.exit_status !== 1 ||
+			record.observed_failure.assertion_output.trim().length === 0 ||
+			record.reverted_rerun !== "pass"
+		) {
+			throw new Error(
+				`${artifact.drill_id}: mutation ${record.id} lacks applied, red, or reverted evidence`,
 			);
 		}
 	}

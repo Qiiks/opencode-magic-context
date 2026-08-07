@@ -25,13 +25,27 @@
       "id": "FM-PI-4-MUTATE-RUNG-SWAP",
       "mutation": "swap provider-proof emergency continuation for ordinary raw fallthrough",
       "must_fail": "FM-PI-4-CONTINUE-95-PROVIDER",
-      "failure_signal": "the provider-proof row or emergency branch is missing for the asserted lineage"
+      "failure_signal": "the provider-proof row or emergency branch is missing for the asserted lineage",
+      "applied_diff_summary": "packages/pi-plugin/src/index.ts: inverted if (!detection.isOverflow) return to if (detection.isOverflow) return",
+      "observed_failure": {
+        "exit_status": 1,
+        "assertion_output": "error: waitFor timed out after 15000ms (FM-PI-4-CONTINUE-95-PROVIDER: provider proof and pressure)\n(fail) FM-PI-4: provider-proven pressure at the Pi refusal boundary > FM-PI-4-CONTINUE-95-PROVIDER records provider proof and continues the Pi emergency path\n0 pass\n2 filtered out\n1 fail\nRan 1 test across 1 file."
+      },
+      "reverted_rerun": "pass",
+      "reverted_rerun_command": "bun test --timeout 120000 tests/pi-rust-degradation-arc-1.test.ts tests/pi-rust-degradation-arc-4.test.ts"
     },
     {
       "id": "FM-PI-4-MUTATE-RUNG-DELETION",
-      "mutation": "delete the Pi fail-closed rethrow at the context boundary",
+      "mutation": "disable Pi fail-closed enforcement at the boot surface",
       "must_fail": "FM-PI-4-REFUSE-95-PROVIDER",
-      "failure_signal": "the explicit refusal half resolves instead of rejecting"
+      "failure_signal": "the explicit refusal half resolves instead of rejecting",
+      "applied_diff_summary": "packages/pi-plugin/src/fail-closed-pi.ts: changed controller.enforce blockingEnabled from true to false",
+      "observed_failure": {
+        "exit_status": 1,
+        "assertion_output": "error: FM-PI-4-REFUSE-95-PROVIDER: refusal must be typed\nExpected: true\nReceived: false\n(fail) FM-PI-4: provider-proven pressure at the Pi refusal boundary > FM-PI-4-REFUSE-95-PROVIDER rethrows an explicit fail-closed block\n0 pass\n2 filtered out\n1 fail\nRan 1 test across 1 file."
+      },
+      "reverted_rerun": "pass",
+      "reverted_rerun_command": "bun test --timeout 120000 tests/pi-rust-degradation-arc-1.test.ts tests/pi-rust-degradation-arc-4.test.ts"
     }
   ]
 }
