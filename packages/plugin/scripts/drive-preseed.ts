@@ -48,6 +48,7 @@ const body = {
     batch_count: 1,
     compartments: payload.compartments,
 };
+console.log(`preseed inputs: session=${session} conn=${connectionFile} payload=${payloadPath} compartments=${payload.compartments.length}`);
 const response = await client.request(route, body, { timeoutMs: 30_000 });
 console.log("state_import response:", JSON.stringify(response, null, 2));
 await client.closeRoute(route).catch(() => undefined);
