@@ -1,8 +1,8 @@
 {
   "name": "@cortexkit/opencode-magic-context",
-  "version": "0.34.0",
+  "version": "0.34.1",
   "type": "module",
-  "description": "OpenCode plugin for Magic Context \u2014 cross-session memory and context management",
+  "description": "OpenCode plugin for Magic Context — cross-session memory and context management",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "author": "ualtinok",

@@ -1,8 +1,8 @@
 {
   "name": "@cortexkit/pi-magic-context",
-  "version": "0.34.0",
+  "version": "0.34.1",
   "type": "module",
-  "description": "Pi coding agent extension for Magic Context \u2014 cross-session memory and context management",
+  "description": "Pi coding agent extension for Magic Context — cross-session memory and context management",
   "main": "dist/index.js",
   "license": "MIT",
   "author": "ualtinok",
