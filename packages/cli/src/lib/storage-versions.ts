@@ -1,8 +1,9 @@
 /**
  * Stable storage-version probe for doctor output.
  *
- * Answers the two questions fence incidents require answering: "which schema is
- * context.db actually at" and "which schema fence does this binary carry". Before
+ * Answers the two questions fence incidents require answering: "which upstream
+ * migration lane is context.db actually at" and "which lane fence does this binary
+ * carry". Before
  * this probe existed, answering them meant hand-rolled greps and raw SELECTs
  * against the DB. Field names are snake_case to mirror the `storage_versions`
  * block of the mc-module status envelope, so fleet probes parse one shape across
@@ -19,9 +20,9 @@ import {
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 
 export interface StorageVersions {
-    /** Persisted schema version of context.db (MAX of schema_migrations). */
+    /** Max applied upstream-lane migration in context.db (version < 10000). */
     context_db_schema_version: number;
-    /** Highest context.db schema version this CLI/plugin build supports. */
+    /** Highest upstream-lane migration this CLI/plugin build supports. */
     plugin_supported_version: number;
 }
 
@@ -34,8 +35,8 @@ export const STALE_BUILD_RESTART_INSTRUCTION =
     "Magic Context: plugin build is older than its database — restart OpenCode";
 
 /**
- * Classify storage_versions for doctor. A database below this build's fence only
- * means migrations are pending; only a database above the fence strands a stale
+ * Classify storage_versions for doctor. A database below this build's upstream
+ * lane fence only means migrations are pending; only a database above the fence strands a stale
  * long-running server and is therefore an alarm.
  */
 export function checkStorageVersionFence(
@@ -50,7 +51,7 @@ export function checkStorageVersionFence(
         return {
             alarm: true,
             message:
-                `Storage schema fence alarm: context.db is v${databaseVersion}, but this build supports through v${supportedVersion}. ` +
+                `Upstream migration fence alarm: context.db is v${databaseVersion}, but this build supports through v${supportedVersion}. ` +
                 `${STALE_BUILD_RESTART_INSTRUCTION}.`,
         };
     }
@@ -68,16 +69,16 @@ export function checkStorageVersionFence(
         }
         return {
             alarm: false,
-            message: `Storage schema migrations pending: context.db is v${databaseVersion}; this build supports through v${supportedVersion}.`,
+            message: `Upstream migrations pending: context.db is v${databaseVersion}; this build supports through v${supportedVersion}.`,
         };
     }
     return {
         alarm: false,
-        message: `Storage schema fence: context.db and this build are both v${supportedVersion}.`,
+        message: `Upstream migration fence: context.db and this build are both v${supportedVersion}.`,
     };
 }
 
-/** Read both probe values from an already-open context.db. Read-only. */
+/** Read the persisted upstream-lane version and pair it with this build's supported-version fence. Read-only. */
 export function readStorageVersions(db: DatabaseType): StorageVersions {
     return {
         context_db_schema_version: getPersistedSchemaVersion(db),

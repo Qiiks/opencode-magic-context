@@ -631,7 +631,8 @@ export function buildStatusDetail(
         // Safe defaults; the live context.db value is filled in the try block below.
         storage_versions: {
             // null = the probe FAILED (read threw); 0 = probe succeeded on a fresh DB
-            // with no migrations table; N = live schema version. Distinct values so a
+            // with no migrations table; N = max applied upstream-lane migration
+            // (version < 10000). Distinct values so a
             // reader never has to guess whether a falsy version means broken or empty
             // (fleet Q1 discrimination — SUBC status-surface contract).
             context_db_schema_version: null as number | null,
@@ -640,7 +641,7 @@ export function buildStatusDetail(
     };
 
     try {
-        // Storage-version probe: live DB schema vs this binary's fence. Fills the
+        // Storage-version probe: live upstream migration lane vs this binary's fence. Fills the
         // safe default from above; getPersistedSchemaVersion itself returns 0 when
         // the migrations table is absent.
         detail.storage_versions = {

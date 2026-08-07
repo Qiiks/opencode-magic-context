@@ -92,6 +92,10 @@ fn make_db_v35_missing_share_column() -> Connection {
     make_db_with_workspace_schema(35, false)
 }
 
+fn make_db_fork_only() -> Connection {
+    make_db_with_workspace_schema(10_000, true)
+}
+
 fn make_db_pre_v34() -> Connection {
     let conn = Connection::open_in_memory().expect("open");
     conn.execute_batch(
@@ -243,6 +247,21 @@ fn workspace_schema_ready_requires_share_categories_column() {
 fn workspace_schema_ready_true_at_v35() {
     let _g = env_lock();
     let conn = make_db_v35();
+    assert!(workspaces::workspace_schema_ready(&conn).unwrap());
+}
+
+#[test]
+fn workspace_schema_ready_ignores_fork_rows_until_upstream_migration_arrives() {
+    let _g = env_lock();
+    let conn = make_db_fork_only();
+    assert!(!workspaces::workspace_schema_ready(&conn).unwrap());
+
+    conn.execute(
+        "INSERT INTO schema_migrations (version) VALUES (?1)",
+        params![35_i64],
+    )
+    .expect("seed upstream migration");
+    workspaces::clear_workspace_schema_ready_cache_for_tests();
     assert!(workspaces::workspace_schema_ready(&conn).unwrap());
 }
 

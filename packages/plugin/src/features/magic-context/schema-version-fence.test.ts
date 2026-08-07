@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { LATEST_MIGRATION_VERSION } from "./migrations";
+import { FORK_MIGRATION_VERSION_FLOOR, LATEST_MIGRATION_VERSION, MIGRATIONS } from "./migrations";
 import { formatSchemaFenceBootLog, LATEST_SUPPORTED_VERSION } from "./storage-db";
 
 // Guards the #1 bug class the project already hit during v2 work: adding a
@@ -14,9 +14,16 @@ describe("schema version fence", () => {
         expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
     });
 
-    it("logs the live database version and supported fence at boot", () => {
+    it("keeps every upstream migration below the downstream floor", () => {
+        expect(LATEST_MIGRATION_VERSION).toBeLessThan(FORK_MIGRATION_VERSION_FLOOR);
+        for (const migration of MIGRATIONS) {
+            expect(migration.version).toBeLessThan(FORK_MIGRATION_VERSION_FLOOR);
+        }
+    });
+
+    it("logs the live upstream migration lane and supported fence at boot", () => {
         expect(formatSchemaFenceBootLog(71, 72)).toBe(
-            "[magic-context] storage schema at boot: database=v71, supported_fence=v72",
+            "[magic-context] upstream migration lane at boot: database=v71, supported_fence=v72",
         );
     });
 });

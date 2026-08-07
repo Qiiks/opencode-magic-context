@@ -25,7 +25,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
 import { ensureContextStoreUuid } from "./context-authority";
 import type { FailClosedBlockingProcess } from "./fail-closed-block";
-import { runMigrations, runMigrationsWithRetry } from "./migrations";
+import { FORK_MIGRATION_VERSION_FLOOR, runMigrations, runMigrationsWithRetry } from "./migrations";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import {
     loadToolDefinitionMeasurements,
@@ -36,7 +36,7 @@ import { runToolOwnerBackfill } from "./tool-owner-backfill";
 // Re-exported so existing `from "./storage-db"` importers (and tests) keep
 // resolving these; the definitions live in the leaf module to break the
 // storage-db <-> migrations import cycle.
-export { ensureColumn, healAllNullColumns };
+export { ensureColumn, FORK_MIGRATION_VERSION_FLOOR, healAllNullColumns };
 
 const databases = new Map<string, Database>();
 const pendingAsyncOpens = new Map<string, Promise<Database | null>>();
@@ -317,9 +317,11 @@ export function getPersistedSchemaVersion(db: Database): number {
     if (!hasMigrationsTable) {
         return 0;
     }
-    const row = db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as
-        | { version: number | null }
-        | undefined;
+    const row = db
+        .prepare(
+            "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations WHERE version < ?",
+        )
+        .get(FORK_MIGRATION_VERSION_FLOOR) as { version: number } | undefined;
     return row?.version ?? 0;
 }
 
@@ -330,12 +332,12 @@ export function schemaVersionIsSupported(
     return getPersistedSchemaVersion(db) <= latestSupportedVersion;
 }
 
-/** Log both versions at boot so operators can compare the database to this build's fence. */
+/** Log the upstream-lane version so operators can compare it to this build's fence. */
 export function formatSchemaFenceBootLog(
     persistedVersion: number,
     supportedVersion: number,
 ): string {
-    return `[magic-context] storage schema at boot: database=v${persistedVersion}, supported_fence=v${supportedVersion}`;
+    return `[magic-context] upstream migration lane at boot: database=v${persistedVersion}, supported_fence=v${supportedVersion}`;
 }
 
 function getRuntimeLatestSupportedVersion(options?: OpenDatabaseOptions): number {
@@ -364,7 +366,7 @@ export function enforceSchemaFence(
     }
     lastSchemaFenceRejection = { persistedVersion, supportedVersion: latestSupportedVersion };
     log(
-        `[magic-context] storage fatal: refusing to open ${dbPath}; database schema v${persistedVersion} is newer than this binary supports (max v${latestSupportedVersion}). A pinned or stale plugin is likely sharing this database with a newer instance; update or unpin Magic Context with 'npx @cortexkit/magic-context@latest doctor --force', then restart.`,
+        `[magic-context] storage fatal: refusing to open ${dbPath}; upstream migration lane v${persistedVersion} is newer than this binary supports (max v${latestSupportedVersion}). A pinned or stale plugin is likely sharing this database with a newer instance; update or unpin Magic Context with 'npx @cortexkit/magic-context@latest doctor --force', then restart.`,
     );
     return false;
 }
@@ -495,11 +497,11 @@ function enforceMigrationOnOpenGuard(
     };
     if (discovery.state === "unreadable") {
         log(
-            `[magic-context] storage fatal: refusing to migrate ${dbPath} from schema v${persistedVersion} to v${latestSupportedVersion} because RPC discovery file ${discovery.unreadableFile ?? "<unknown>"} is unreadable or invalid, so the absence of a live OpenCode server cannot be proven. Restart OpenCode, remove or repair the named discovery file, then retry this process.`,
+            `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} because RPC discovery file ${discovery.unreadableFile ?? "<unknown>"} is unreadable or invalid, so the absence of a live OpenCode server cannot be proven. Restart OpenCode, remove or repair the named discovery file, then retry this process.`,
         );
     } else {
         log(
-            `[magic-context] storage fatal: refusing to migrate ${dbPath} from schema v${persistedVersion} to v${latestSupportedVersion} while live OpenCode server PID(s) ${discovery.serverPids.join(", ")} may still use the old plugin build. Restart OpenCode, then retry this process.`,
+            `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while live OpenCode server PID(s) ${discovery.serverPids.join(", ")} may still use the old plugin build. Restart OpenCode, then retry this process.`,
         );
     }
     return false;

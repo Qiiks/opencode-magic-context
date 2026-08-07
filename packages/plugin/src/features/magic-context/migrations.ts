@@ -4,6 +4,9 @@ import type { Database } from "../../shared/sqlite";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import { bumpEpochsForWorkspaceMemberSet } from "./workspaces";
 
+/** First version reserved for downstream migrations; upstream versions stay below it. */
+export const FORK_MIGRATION_VERSION_FLOOR = 10_000;
+
 /**
  * Versioned migration framework for magic-context's SQLite database.
  *
@@ -210,7 +213,7 @@ function installLatestAuthorityTriggers(db: Database): void {
     }
 }
 
-const MIGRATIONS: Migration[] = [
+export const MIGRATIONS: Migration[] = [
     {
         version: 1,
         description: "Merge session_notes + smart_notes into unified notes table",
@@ -2764,10 +2767,16 @@ function ensureMigrationsTable(db: Database): void {
 }
 
 function getCurrentVersion(db: Database): number {
-    const row = db.prepare("SELECT MAX(version) as version FROM schema_migrations").get() as {
-        version: number | null;
-    } | null;
+    const row = db
+        .prepare(
+            "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations WHERE version < ?",
+        )
+        .get(FORK_MIGRATION_VERSION_FLOOR) as { version: number } | null;
     return row?.version ?? 0;
+}
+
+function isMigrationApplied(db: Database, version: number): boolean {
+    return db.prepare("SELECT 1 FROM schema_migrations WHERE version = ?").get(version) != null;
 }
 
 /**
@@ -2809,7 +2818,7 @@ export function isSiblingMigrationConflict(db: Database, error: unknown, version
  * Each migration runs in its own transaction — if it fails, only that migration rolls back.
  * Already-applied migrations are skipped.
  *
- * Migration application re-reads the persisted version under BEGIN IMMEDIATE
+ * Migration application re-reads the upstream-lane version under BEGIN IMMEDIATE
  * before choosing one migration. Concurrent starters therefore serialize before
  * taking a read snapshot: one applies the migration and the waiter observes the
  * advanced version instead of failing a deferred read-to-write lock upgrade.
@@ -2835,15 +2844,26 @@ export function runMigrations(db: Database): void {
             const applied = db
                 .transaction(() => {
                     currentVersion = getCurrentVersion(db);
-                    migration = MIGRATIONS.find((candidate) => candidate.version > currentVersion);
+                    // Keep the append-only version boundary for legacy databases whose
+                    // bookkeeping contains only a current-version row. Within the pending
+                    // range, check each candidate's row directly so downstream rows at or
+                    // above the reserved floor cannot make a sibling migration re-select
+                    // an already-applied version.
+                    migration = MIGRATIONS.find(
+                        (candidate) =>
+                            candidate.version > currentVersion &&
+                            !isMigrationApplied(db, candidate.version),
+                    );
                     if (!migration) return false;
 
                     if (!loggedPlan) {
                         const pendingCount = MIGRATIONS.filter(
-                            (candidate) => candidate.version > currentVersion,
+                            (candidate) =>
+                                candidate.version > currentVersion &&
+                                !isMigrationApplied(db, candidate.version),
                         ).length;
                         log(
-                            `[migrations] current schema version: ${currentVersion}, applying ${pendingCount} migration(s)`,
+                            `[migrations] current upstream migration lane: ${currentVersion}, applying ${pendingCount} migration(s)`,
                         );
                         loggedPlan = true;
                     }
@@ -2900,7 +2920,9 @@ export function runMigrations(db: Database): void {
     }
 
     if (loggedPlan) {
-        log(`[migrations] schema version now: ${MIGRATIONS[MIGRATIONS.length - 1].version}`);
+        log(
+            `[migrations] upstream migration lane now: ${MIGRATIONS[MIGRATIONS.length - 1].version}`,
+        );
     }
 }
 

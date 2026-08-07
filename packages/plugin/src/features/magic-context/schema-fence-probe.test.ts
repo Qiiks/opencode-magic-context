@@ -2,7 +2,7 @@
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { Database } from "../../shared/sqlite";
-import { runMigrations } from "./migrations";
+import { FORK_MIGRATION_VERSION_FLOOR, runMigrations } from "./migrations";
 import {
     __resetChildSpawnFenceProbeForTests,
     getChildSpawnFenceFailure,
@@ -64,6 +64,18 @@ describe("child spawn schema-fence probe", () => {
             totalFailures: 2,
             latched: true,
         });
+    });
+
+    it("ignores downstream rows when probing a fully migrated upstream lane", () => {
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        runMigrations(db);
+        db.prepare(
+            "INSERT INTO schema_migrations(version, description, applied_at) VALUES (?, ?, ?)",
+        ).run(FORK_MIGRATION_VERSION_FLOOR, "fork row", Date.now());
+        dbs.push(db);
+
+        expect(probeChildSpawnFence(db)).toEqual({ allowSpawn: true });
     });
 
     it("surfaces a latched stale-build failure only once", () => {

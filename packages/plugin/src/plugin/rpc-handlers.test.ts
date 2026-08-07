@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { replaceAllCompartmentState } from "../features/magic-context/compartment-storage";
 import { insertMemory } from "../features/magic-context/memory";
 import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
-import { runMigrations } from "../features/magic-context/migrations";
+import { FORK_MIGRATION_VERSION_FLOOR, runMigrations } from "../features/magic-context/migrations";
 import {
     getPersistedSchemaVersion,
     initializeDatabase,
@@ -47,6 +47,33 @@ describe("sidebar snapshot RPC failures", () => {
         expect(buildSidebarSnapshotRpcResponse(busyDb, "ses_busy", process.cwd())).toEqual({
             error: "sidebar snapshot unavailable",
         });
+    });
+});
+
+describe("buildStatusDetail — storage version probe", () => {
+    test("reports the upstream lane when fork rows share context.db", () => {
+        const db = createTestDb();
+        try {
+            db.prepare(
+                "INSERT INTO schema_migrations(version, description, applied_at) VALUES (?, ?, ?), (?, ?, ?)",
+            ).run(
+                FORK_MIGRATION_VERSION_FLOOR,
+                "fork migration 10000",
+                0,
+                FORK_MIGRATION_VERSION_FLOOR + 1,
+                "fork migration 10001",
+                0,
+            );
+
+            const detail = buildStatusDetail(db, "ses-storage-version", process.cwd());
+
+            expect(detail.storage_versions).toEqual({
+                context_db_schema_version: LATEST_SUPPORTED_VERSION,
+                plugin_supported_version: LATEST_SUPPORTED_VERSION,
+            });
+        } finally {
+            closeQuietly(db);
+        }
     });
 });
 

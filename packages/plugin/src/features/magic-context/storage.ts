@@ -65,6 +65,7 @@ export {
     type ContextDatabase,
     closeDatabase,
     enforceSchemaFence,
+    FORK_MIGRATION_VERSION_FLOOR,
     getDatabasePath,
     getDatabasePersistenceError,
     getPersistedSchemaVersion,

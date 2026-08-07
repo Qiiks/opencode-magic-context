@@ -21,11 +21,16 @@ import {
     setStoragePrivatePermissionEnforcement,
 } from "../../shared/storage-permissions";
 import {
+    __resetSchemaFenceStateForTests,
     __resetStoragePermissionFsForTests,
     __setStoragePermissionFsForTests,
     closeDatabase,
+    enforceSchemaFence,
+    FORK_MIGRATION_VERSION_FLOOR,
     getLiveMigrationBlockingProcesses,
     getMigrationOnOpenRefusal,
+    getPersistedSchemaVersion,
+    getSchemaFenceRejection,
     inspectRpcServerDiscovery,
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
@@ -67,10 +72,7 @@ function seedPendingMigration(dataHome: string): string {
 function readPersistedVersion(dbPath: string): number {
     const db = new Database(dbPath);
     try {
-        const row = db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as {
-            version: number;
-        };
-        return row.version;
+        return getPersistedSchemaVersion(db);
     } finally {
         closeQuietly(db);
     }
@@ -92,6 +94,7 @@ function setLinuxIdentityProbe(processStartTicks = 10_000): void {
 
 afterEach(() => {
     closeDatabase();
+    __resetSchemaFenceStateForTests();
     __resetStoragePermissionFsForTests();
     __resetRpcIdentityTestHooks();
     __resetStoragePrivatePermissionEnforcementForTests();
@@ -105,6 +108,97 @@ afterEach(() => {
         }
     }
     tempDirs.length = 0;
+});
+
+describe("upstream migration version lane", () => {
+    it("reports zero when the migrations table is absent", () => {
+        const db = new Database(":memory:");
+        try {
+            expect(getPersistedSchemaVersion(db)).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("reports zero for an empty migrations table", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)");
+            expect(getPersistedSchemaVersion(db)).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("is equivalent to the historical MAX for stock-only rows", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)");
+            db.prepare("INSERT INTO schema_migrations(version) VALUES (?)").run(1);
+            db.prepare("INSERT INTO schema_migrations(version) VALUES (?)").run(50);
+            db.prepare("INSERT INTO schema_migrations(version) VALUES (?)").run(
+                LATEST_SUPPORTED_VERSION,
+            );
+
+            const historicalMax = (
+                db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as {
+                    version: number;
+                }
+            ).version;
+            expect(getPersistedSchemaVersion(db)).toBe(historicalMax);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("counts 9999 but ignores the reserved downstream floor and above", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)");
+            db.prepare("INSERT INTO schema_migrations(version) VALUES (?)").run(
+                FORK_MIGRATION_VERSION_FLOOR - 1,
+            );
+            db.prepare("INSERT INTO schema_migrations(version) VALUES (?)").run(
+                FORK_MIGRATION_VERSION_FLOOR,
+            );
+            db.prepare("INSERT INTO schema_migrations(version) VALUES (?)").run(
+                FORK_MIGRATION_VERSION_FLOOR + 1,
+            );
+
+            expect(getPersistedSchemaVersion(db)).toBe(FORK_MIGRATION_VERSION_FLOOR - 1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("keeps future upstream rows fail-closed while allowing fork-only rows", () => {
+        const future = new Database(":memory:");
+        const forkOnly = new Database(":memory:");
+        try {
+            for (const db of [future, forkOnly]) {
+                db.exec(
+                    "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT, applied_at INTEGER)",
+                );
+            }
+            future
+                .prepare("INSERT INTO schema_migrations(version) VALUES (?)")
+                .run(LATEST_SUPPORTED_VERSION + 1);
+            forkOnly
+                .prepare("INSERT INTO schema_migrations(version) VALUES (?)")
+                .run(FORK_MIGRATION_VERSION_FLOOR);
+
+            expect(enforceSchemaFence(future, ":future:", LATEST_SUPPORTED_VERSION)).toBe(false);
+            expect(getSchemaFenceRejection()).toEqual({
+                persistedVersion: LATEST_SUPPORTED_VERSION + 1,
+                supportedVersion: LATEST_SUPPORTED_VERSION,
+            });
+            expect(enforceSchemaFence(forkOnly, ":fork:", LATEST_SUPPORTED_VERSION)).toBe(true);
+            expect(getSchemaFenceRejection()).toBeNull();
+        } finally {
+            closeQuietly(future);
+            closeQuietly(forkOnly);
+        }
+    });
 });
 
 describe("storage-db", () => {
@@ -178,6 +272,34 @@ describe("storage-db", () => {
                     [dbPath, 0o600],
                 ]),
             );
+        });
+
+        it("#when downstream rows share context.db #then opens without treating them as future upstream schema", () => {
+            const dataHome = useTempDataHome("storage-db-fork-rows-");
+            const first = openDatabase();
+            expect(first).not.toBeNull();
+            first
+                ?.prepare(
+                    "INSERT INTO schema_migrations(version, description, applied_at) VALUES (?, ?, ?), (?, ?, ?)",
+                )
+                .run(
+                    FORK_MIGRATION_VERSION_FLOOR,
+                    "fork migration 10000",
+                    0,
+                    FORK_MIGRATION_VERSION_FLOOR + 1,
+                    "fork migration 10001",
+                    0,
+                );
+            closeDatabase();
+
+            const reopened = openDatabase();
+            expect(reopened).not.toBeNull();
+            expect(readPersistedVersion(resolveDbPath(dataHome))).toBe(LATEST_SUPPORTED_VERSION);
+            expect(
+                reopened
+                    ?.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version >= ?")
+                    .get(FORK_MIGRATION_VERSION_FLOOR),
+            ).toEqual({ count: 2 });
         });
 
         it("#when called first time #then creates required tables", () => {
@@ -404,6 +526,7 @@ describe("storage-db", () => {
             legacy.exec(`
                 CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
                 INSERT INTO schema_migrations(version) VALUES (${LATEST_SUPPORTED_VERSION - 1});
+                INSERT INTO schema_migrations(version) VALUES (${FORK_MIGRATION_VERSION_FLOOR});
             `);
             legacy.close();
 
@@ -436,11 +559,13 @@ describe("storage-db", () => {
                 { harness: "OpenCode server", pid: process.pid },
             ]);
             const unchanged = new Database(dbPath);
-            const row = unchanged
-                .prepare("SELECT MAX(version) AS version FROM schema_migrations")
-                .get() as { version: number };
+            expect(getPersistedSchemaVersion(unchanged)).toBe(LATEST_SUPPORTED_VERSION - 1);
+            expect(
+                unchanged
+                    .prepare("SELECT 1 FROM schema_migrations WHERE version = ?")
+                    .get(FORK_MIGRATION_VERSION_FLOOR),
+            ).toEqual({ 1: 1 });
             unchanged.close();
-            expect(row.version).toBe(LATEST_SUPPORTED_VERSION - 1);
         });
 
         it("#when file path setup fails #then throws so callers fail closed (no in-memory fallback)", () => {

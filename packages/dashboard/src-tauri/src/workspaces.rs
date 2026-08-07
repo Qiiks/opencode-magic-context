@@ -12,6 +12,10 @@ use crate::project_identity::{basename, normalize_stored_project_path};
 
 pub const WORKSPACE_SCHEMA_VERSION: i64 = 35;
 
+// Parity assertion: keep this value equal to FORK_MIGRATION_VERSION_FLOOR in
+// packages/plugin/src/features/magic-context/migrations.ts, the TypeScript source of truth.
+const FORK_MIGRATION_VERSION_FLOOR: i64 = 10_000;
+
 const SHARE_CATEGORY_ORDER: [&str; 5] = [
     "PROJECT_RULES",
     "ARCHITECTURE",
@@ -82,8 +86,8 @@ fn compute_workspace_schema_ready(conn: &Connection) -> Result<bool, rusqlite::E
         return Ok(false);
     }
     let max_version: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-        [],
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations WHERE version < ?1",
+        [FORK_MIGRATION_VERSION_FLOOR],
         |row| row.get(0),
     )?;
     Ok(max_version >= WORKSPACE_SCHEMA_VERSION)
