@@ -295,6 +295,32 @@
             ]
         },
         {
+            "path": "tests/pi-rust-degradation-arc-1.test.ts",
+            "tier": "rust-only",
+            "invocation": {
+                "ts": false,
+                "rust": true
+            },
+            "rationale": "FM-PI-1 covers Pi-owned JSONL/branch-entry continuation and explicit refusal seams after a mid-session external-module fault",
+            "contract_refs": [
+                "FM-PI-1",
+                "pi-rust-degradation-trace.json"
+            ]
+        },
+        {
+            "path": "tests/pi-rust-degradation-arc-4.test.ts",
+            "tier": "rust-only",
+            "invocation": {
+                "ts": false,
+                "rust": true
+            },
+            "rationale": "FM-PI-4 covers Pi-owned provider-proof emergency continuation and fail-closed refusal at the 95 percent boundary",
+            "contract_refs": [
+                "FM-PI-4",
+                "pi-rust-degradation-trace.json"
+            ]
+        },
+        {
             "path": "tests/pi-session-isolation.test.ts",
             "tier": "ts-only",
             "invocation": {

@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "drill_id": "FM-PI-4",
+  "fault": "external module unavailable while provider-proven pressure is at least 95 percent",
+  "lineage_key": "session_id",
+  "supervised_precondition": {
+    "module_id": "magic-context",
+    "required": "external-provider",
+    "assertion": "the Pi drill must fail if the harness reports magic-context as a supervised module"
+  },
+  "both_halves": [
+    {
+      "test_id": "FM-PI-4-CONTINUE-95-PROVIDER",
+      "half": "continue",
+      "assertion": "provider overflow evidence is persisted under the asserted lineage and the Pi emergency path is entered without a shared Rust-adapter call"
+    },
+    {
+      "test_id": "FM-PI-4-REFUSE-95-PROVIDER",
+      "half": "bail-loudly",
+      "assertion": "a provider-proven fail-closed error is rethrown at the Pi context boundary"
+    }
+  ],
+  "mutation_records": [
+    {
+      "id": "FM-PI-4-MUTATE-RUNG-SWAP",
+      "mutation": "swap provider-proof emergency continuation for ordinary raw fallthrough",
+      "must_fail": "FM-PI-4-CONTINUE-95-PROVIDER",
+      "failure_signal": "the provider-proof row or emergency branch is missing for the asserted lineage"
+    },
+    {
+      "id": "FM-PI-4-MUTATE-RUNG-DELETION",
+      "mutation": "delete the Pi fail-closed rethrow at the context boundary",
+      "must_fail": "FM-PI-4-REFUSE-95-PROVIDER",
+      "failure_signal": "the explicit refusal half resolves instead of rejecting"
+    }
+  ]
+}
