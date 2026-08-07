@@ -17043,6 +17043,52 @@ mod tests {
     /// must refuse at the bootstrap fold: the minted boundary has to name a real
     /// live block. Pins the anchor-acceptance rule that seeded/imported sessions
     /// depend on (a synthetic-anchor seed can never compose, regardless of ranges).
+
+    /// Desk rehearsal of the drive's final seed shape: 20 live messages with a
+    /// role=system message mid-span at ordinal 1, four imported compartments
+    /// partitioning 0..=16 on real live block ids, live tail 17..=19. Must
+    /// bootstrap-HARD-fold with the last covered block as the minted boundary —
+    /// and the mid-span system ordinal must be absorbed, not rejected.
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_import_real_anchor_partition_with_midspan_system_folds() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let imported = call_dispatch_request(
+            &handler,
+            state_import_request(
+                "drive-preseed-rehearsal",
+                0,
+                1,
+                vec![
+                    imported_compartment(1, 0, 4, "ccm-4#0", "parser retry loop fixed"),
+                    imported_compartment(2, 5, 8, "ccm-8#0", "queue drain benchmark"),
+                    imported_compartment(3, 9, 12, "ccm-12#0", "log rotation ownership"),
+                    imported_compartment(4, 13, 16, "ccm-16#0", "cache warmup ordering"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(imported["imported"], json!(4));
+
+        let mut live: Vec<CkIngressMessage> = Vec::new();
+        for n in 0u64..20 {
+            let mid = format!("ccm-{n}");
+            let role = if n == 1 {
+                "system"
+            } else if n == 0 || n % 2 == 1 {
+                "user"
+            } else {
+                "assistant"
+            };
+            live.push(ck_with_role(&mid, n, role, &format!("turn {n}")));
+        }
+        let response = call_transform_request(&handler, request(live)).await;
+        assert_eq!(response["action"], "HARD", "{response}");
+        assert_eq!(response["boundary_id"], "ccm-16#0", "{response}");
+        let after = store.load("ses").unwrap();
+        assert_eq!(after.core.boundary_id, "ccm-16#0");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn state_import_synthetic_anchors_refuse_at_bootstrap_fold() {
         let producer = Arc::new(ProducerState::default());
