@@ -101,7 +101,9 @@ describe("memory injection", () => {
         const sessionId = await h.createSession();
         await h.sendPrompt(sessionId, "bootstrap turn");
         await h.waitFor(() => h.hasContextDb() && h.countTags(sessionId) > 0, {
-            timeoutMs: 5000,
+            // Rust mode starts ck-subc/ck-mc before OpenCode; allow the shared
+            // initialization condition to settle without changing the contract.
+            timeoutMs: 60_000,
             label: "plugin initialized",
         });
 

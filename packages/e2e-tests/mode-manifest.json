@@ -4,16 +4,16 @@
   "entries": [
     {
       "path": "tests/cache-invariants.test.ts",
-      "tier": "ts-only",
-      "invocation": { "ts": true, "rust": false },
-      "rationale": "queued for both-modes migration in S2",
+      "tier": "both-modes",
+      "invocation": { "ts": true, "rust": true },
+      "rationale": "shared cache-prefix replay and ctx_reduce invariants run through the mode-selected spawn seam",
       "contract_refs": ["S2-MIGRATION"]
     },
     {
       "path": "tests/cache-stability.test.ts",
-      "tier": "ts-only",
-      "invocation": { "ts": true, "rust": false },
-      "rationale": "queued for both-modes migration in S2",
+      "tier": "both-modes",
+      "invocation": { "ts": true, "rust": true },
+      "rationale": "shared defer-pass byte-stability contract runs through the mode-selected spawn seam",
       "contract_refs": ["S2-MIGRATION"]
     },
     {
@@ -32,9 +32,9 @@
     },
     {
       "path": "tests/context-limits.test.ts",
-      "tier": "ts-only",
-      "invocation": { "ts": true, "rust": false },
-      "rationale": "queued for both-modes migration in S2",
+      "tier": "both-modes",
+      "invocation": { "ts": true, "rust": true },
+      "rationale": "provider context-limit arithmetic is a shared behavioral contract",
       "contract_refs": ["S2-MIGRATION"]
     },
     {
@@ -46,38 +46,38 @@
     },
     {
       "path": "tests/emergency-blocking.test.ts",
-      "tier": "ts-only",
-      "invocation": { "ts": true, "rust": false },
-      "rationale": "queued for both-modes migration in S2",
-      "contract_refs": ["S2-MIGRATION"]
+      "tier": "both-modes",
+      "invocation": { "ts": true, "rust": true },
+      "rationale": "pressure recording is shared; historian-fold completion is excluded in Rust because the hermetic rig has no Broca runner",
+      "contract_refs": ["S2-MIGRATION", "FOLD_SKIP_REASON"]
     },
     {
       "path": "tests/historian-success.test.ts",
-      "tier": "ts-only",
-      "invocation": { "ts": true, "rust": false },
-      "rationale": "queued for both-modes migration in S2",
-      "contract_refs": ["S2-MIGRATION"]
+      "tier": "both-modes",
+      "invocation": { "ts": true, "rust": true },
+      "rationale": "fold-independent historian-trigger/session assertions run in both modes; compartment publication is excluded in Rust because the hermetic rig has no Broca runner",
+      "contract_refs": ["S2-MIGRATION", "FOLD_SKIP_REASON"]
     },
     {
       "path": "tests/long-running-session.test.ts",
-      "tier": "ts-only",
-      "invocation": { "ts": true, "rust": false },
-      "rationale": "queued for both-modes migration in S2 as the temporal contract suite",
-      "contract_refs": ["S2-MIGRATION"]
+      "tier": "both-modes",
+      "invocation": { "ts": true, "rust": true },
+      "rationale": "temporal, tagging/reduce, todo, and wrapup-adjacent replay contracts run through the mode-selected spawn seam; Rust fold portions remain observable findings",
+      "contract_refs": ["S2-MIGRATION", "FOLD_SKIP_REASON"]
     },
     {
       "path": "tests/memory-injection.test.ts",
-      "tier": "ts-only",
-      "invocation": { "ts": true, "rust": false },
-      "rationale": "queued for both-modes migration in S2",
+      "tier": "both-modes",
+      "invocation": { "ts": true, "rust": true },
+      "rationale": "zero-compartment project-memory injection is shared across transform modes",
       "contract_refs": ["S2-MIGRATION"]
     },
     {
       "path": "tests/overflow-recovery.test.ts",
-      "tier": "ts-only",
-      "invocation": { "ts": true, "rust": false },
-      "rationale": "queued for both-modes migration in S2",
-      "contract_refs": ["S2-MIGRATION"]
+      "tier": "both-modes",
+      "invocation": { "ts": true, "rust": true },
+      "rationale": "provider-overflow detection is shared; historian-fold completion is excluded in Rust because the hermetic rig has no Broca runner",
+      "contract_refs": ["S2-MIGRATION", "FOLD_SKIP_REASON"]
     },
     {
       "path": "tests/pi-cache-invariants.test.ts",
@@ -319,10 +319,10 @@
     },
     {
       "path": "tests/slow-historian.test.ts",
-      "tier": "ts-only",
-      "invocation": { "ts": true, "rust": false },
-      "rationale": "queued for both-modes migration in S2 as a historian contract suite",
-      "contract_refs": ["S2-MIGRATION"]
+      "tier": "both-modes",
+      "invocation": { "ts": true, "rust": true },
+      "rationale": "historian non-blocking ordering contract is shared; Rust fold completion is excluded because the hermetic rig has no Broca runner",
+      "contract_refs": ["S2-MIGRATION", "FOLD_SKIP_REASON"]
     },
     {
       "path": "tests/smoke.test.ts",
@@ -340,23 +340,23 @@
     },
     {
       "path": "tests/tag-owner-collision.test.ts",
-      "tier": "ts-only",
-      "invocation": { "ts": true, "rust": false },
-      "rationale": "queued for both-modes migration in S2 as a tagging-related contract suite",
+      "tier": "both-modes",
+      "invocation": { "ts": true, "rust": true },
+      "rationale": "tag-owner composite identity and drop isolation are shared storage contracts",
       "contract_refs": ["S2-MIGRATION"]
     },
     {
       "path": "tests/thinking-block-safety.test.ts",
-      "tier": "ts-only",
-      "invocation": { "ts": true, "rust": false },
-      "rationale": "queued for both-modes migration in S2",
+      "tier": "both-modes",
+      "invocation": { "ts": true, "rust": true },
+      "rationale": "signed-thinking replay and message-boundary safety are shared wire contracts",
       "contract_refs": ["S2-MIGRATION"]
     },
     {
       "path": "tests/todo-synthesis.test.ts",
-      "tier": "ts-only",
-      "invocation": { "ts": true, "rust": false },
-      "rationale": "queued for both-modes migration in S2",
+      "tier": "both-modes",
+      "invocation": { "ts": true, "rust": true },
+      "rationale": "synthetic todowrite capture, freeze, and defer replay are shared behavioral contracts",
       "contract_refs": ["S2-MIGRATION"]
     }
   ]

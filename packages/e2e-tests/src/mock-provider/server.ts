@@ -52,6 +52,8 @@ export interface MockResponse {
 
 export interface CapturedRequest {
     receivedAt: number;
+    /** Set when the mock has finished producing the response for this request. */
+    responseCompletedAt?: number;
     method: string;
     path: string;
     headers: Record<string, string>;
@@ -169,13 +171,14 @@ export class MockProvider {
                 headers[key] = value;
             });
 
-            this.captured.push({
+            const captured: CapturedRequest = {
                 receivedAt: Date.now(),
                 method,
                 path: url.pathname,
                 headers,
                 body,
-            });
+            };
+            this.captured.push(captured);
 
             // Matcher routing: first-match-wins. Matchers can return tailored
             // responses based on request body (e.g. slow down historian calls).
@@ -204,6 +207,9 @@ export class MockProvider {
             if (scripted.delayMs && scripted.delayMs > 0) {
                 await Bun.sleep(scripted.delayMs);
             }
+            // Record completion after any scripted delay. Tests can therefore
+            // prove request overlap without making wall-clock claims.
+            captured.responseCompletedAt = Date.now();
 
             // Error response: emit an Anthropic-shaped error body with the
             // requested HTTP status. This bypasses the SSE/streaming path

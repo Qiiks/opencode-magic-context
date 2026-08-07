@@ -2,6 +2,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
+import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
 
 /**
  * Slow historian, fast main agent.
@@ -30,9 +31,9 @@ import { TestHarness } from "../src/harness";
  *   2. Turn 11's response carries a big input_tokens count (~45% of 200K) so
  *      the event-handler-driven trigger sees usage >= execute_threshold AND a
  *      meaningful tail, then flips compartmentInProgress.
- *   3. Turn 12 is the one transform passes where we observe historian starting.
- *      While historian is hanging for 8s inside the mock, we measure turn 12's
- *      wall-clock latency — it must be sub-second-range; well below 5s.
+ *   3. Turn 12 is the transform pass where we observe historian starting.
+ *      The mock records response completion so the shared suite can prove the
+ *      main request overlaps the in-flight historian without a duration bound.
  *   4. Assert exactly ONE historian request was issued despite further main
  *      turns happening while the first historian run is still pending.
  */
@@ -41,7 +42,6 @@ import { TestHarness } from "../src/harness";
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 
 const HISTORIAN_DELAY_MS = 8_000;
-const MAIN_LATENCY_BUDGET_MS = 5_000;
 
 function isHistorianRequest(body: Record<string, unknown>): boolean {
     const system = body.system;
@@ -151,20 +151,9 @@ describe("slow historian vs fast main", () => {
             });
 
             // INVARIANT 1 (non-blocking): turn 12's MAIN request must be
-            // issued to the mock before the slow historian request finishes.
-            //
-            // Previously this was a wall-clock assertion
-            // (turn12Latency < MAIN_LATENCY_BUDGET_MS). That was flaky under
-            // CI load and — more importantly — wasn't actually testing the
-            // non-blocking invariant. A GC pause, cold Bun startup, or slow
-            // opencode boot could fail it even with the plugin behaving
-            // correctly, and a 4s delay that's still "blocking" could pass.
-            //
-            // The invariant that actually matters is REQUEST ORDERING: the
-            // main-turn-12 request should reach the mock while the historian
-            // request kicked off by turn 11's trigger is still in-flight
-            // (holding its 8s delay). If main was blocked on historian, the
-            // historian response would arrive first.
+            // captured while the slow historian request is still in flight.
+            // The mock records response completion separately, so this proves
+            // request overlap without making a wall-clock claim.
             const historianReqCountBeforeT12 = h.mock
                 .requests()
                 .filter((r) => isHistorianRequest(r.body)).length;
@@ -176,11 +165,9 @@ describe("slow historian vs fast main", () => {
                 "turn 12: should be fast even with historian running.",
             );
 
-            // Wait for the main-turn-12 request to appear at the mock. If main
-            // was blocked on historian, this would never happen until historian's
-            // 8s delay elapsed — we set a 3s ceiling so we can prove
-            // non-blocking behavior without relying on walltime variance.
-            const t0 = Date.now();
+            // Wait for the main-turn-12 request to appear at the mock. The
+            // harness timeout only bounds a stuck test; the contract assertion
+            // below uses request completion state, not elapsed time.
             await h.waitFor(
                 () => {
                     const reqs = h.mock.requests();
@@ -191,26 +178,41 @@ describe("slow historian vs fast main", () => {
                     );
                     return mainT12 != null;
                 },
-                { timeoutMs: 3_000, label: "main turn 12 request arrives at mock" },
-            );
-            const t12RequestArrivedAfterMs = Date.now() - t0;
-
-            console.log(
-                `[TEST] main turn 12 request arrived at mock after ${t12RequestArrivedAfterMs}ms ` +
-                    `(historian has ${HISTORIAN_DELAY_MS}ms delay)`,
+                { timeoutMs: 60_000, label: "main turn 12 request arrives at mock" },
             );
 
-            // Main-turn-12 request arrived well before the 8s historian delay
-            // would have unblocked — that's the non-blocking proof.
-            expect(t12RequestArrivedAfterMs).toBeLessThan(HISTORIAN_DELAY_MS - 2_000);
+            const mainRequestAtT12 = h.mock.requests().find(
+                (request) =>
+                    !isHistorianRequest(request.body) &&
+                    JSON.stringify(request.body).includes("turn 12:"),
+            );
+            expect(mainRequestAtT12).toBeDefined();
+
+            if (process.env.MC_E2E_MODE === "rust") {
+                // Rust's hermetic rig has no Broca runner, so module-side
+                // historian completion is excluded while the shared main-turn
+                // request still exercises the mode-selected spawn seam.
+                console.log(`[rust-e2e] slow-historian fold assertions SKIPPED: ${FOLD_SKIP_REASON}`);
+                await turn12Promise;
+                return;
+            }
+
+            await h.waitFor(
+                () => h.mock.requests().find((request) => isHistorianRequest(request.body)),
+                { timeoutMs: 60_000, label: "historian request starts" },
+            );
+            const historianRequestAtT12 = h.mock
+                .requests()
+                .find((request) => isHistorianRequest(request.body));
+            expect(historianRequestAtT12).toBeDefined();
+            expect(historianRequestAtT12?.responseCompletedAt).toBeUndefined();
 
             // Historian kicks off from turn 12's own transform pass (since
             // v0.14.1 removed the 80% emergency nudge's promptAsync that
             // previously drove a separate pass). The critical invariant is
             // that both requests fire in parallel from that transform pass —
-            // not that historian started earlier. The 3s arrival deadline
-            // above already proves non-blocking behavior regardless of when
-            // historian started.
+            // not that historian started earlier. The completion-state check
+            // above proves non-blocking behavior regardless of machine speed.
             const historianReqCountAtT12 = h.mock
                 .requests()
                 .filter((r) => isHistorianRequest(r.body)).length;
@@ -219,7 +221,6 @@ describe("slow historian vs fast main", () => {
             );
             // Whatever that count is, it must not exceed the count after
             // further turns — that would imply repeated re-triggering.
-            void historianReqCountBeforeT12;
 
             // Now finish turn 12 and drive further turns for INVARIANT 2.
             await turn12Promise;
@@ -245,9 +246,7 @@ describe("slow historian vs fast main", () => {
             // INVARIANT 3: at least one historian request was captured.
             // Implied by INVARIANT 2 equality to 1, kept explicit for clarity.
             expect(historianRequests.length).toBeGreaterThanOrEqual(1);
-            // Silence unused-constant warning: MAIN_LATENCY_BUDGET_MS is kept
-            // for context in the comment above.
-            void MAIN_LATENCY_BUDGET_MS;
+
         },
         // Bumped from 120s → 600s for CI: the test makes 12+ turns plus a slow
         // historian with an 8s mock delay. On idle local hardware this runs in

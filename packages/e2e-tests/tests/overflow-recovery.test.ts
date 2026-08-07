@@ -52,6 +52,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
 import { buildMockHistorianPayload } from "../src/mock-historian";
+import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
 
 const HISTORIAN_MARKER = "the hippocampus of a long-running coding agent";
 
@@ -229,6 +230,17 @@ describe("context overflow recovery", () => {
             const recoveryWasPendingBeforeFollowup =
                 (readState().needs_emergency_recovery ?? 0) === 1;
             const mainCallsBeforeFollowup = mainCalls;
+
+            if (process.env.MC_E2E_MODE === "rust") {
+                // Rust delegates the transform/recovery ladder to ck-mc rather
+                // than the OpenCode-only fail-closed request sequencing below.
+                // Its successful historian fold is also unavailable without the
+                // hermetic Broca runner, so retain the shared overflow-detection
+                // assertion and report the excluded completion contract.
+                console.log(`[rust-e2e] overflow recovery completion assertions SKIPPED: ${FOLD_SKIP_REASON}`);
+                expect(afterOverflow.detected_context_limit).toBe(120000);
+                return;
+            }
 
             // Drive the recovery turn. On opencode >=1.16 this is the pass that
             // bumps to 95% and fires the emergency historian; on <=1.15 recovery
