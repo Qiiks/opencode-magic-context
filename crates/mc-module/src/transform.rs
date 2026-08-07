@@ -2019,6 +2019,7 @@ fn apply_once(
     // A brand-new session has no provider-visible prefix to invalidate, so its bootstrap HARD
     // may mint and render tags immediately. Established dormant sessions still wait for the
     // coordinating identity fold before tags can change their replayed bytes.
+    // Subagents intentionally share this bootstrap arm; they have no provider-cache prefix.
     let bootstrap_tagging_active = !loaded.meta.initialized
         && matches!(serializer_profile, Some(SerializerProfile::OpencodeAiSdk));
     let tagging_active = tagging_surface_requested
@@ -2637,7 +2638,7 @@ fn apply_once(
     );
     let classify_started_at = Instant::now();
     let mut plan = classify(&ClassifierInput {
-        initialized: loaded.meta.initialized,
+        initialized: loaded.meta.initialized && !loaded.meta.bootstrap_seed_fold_pending,
         is_legacy_baseline: is_legacy_baseline(&loaded.core),
         valid_m0m1_shape: valid_m0m1_shape(&loaded.core),
         cached_m1_missing: cached_m1_missing_due,
@@ -2670,7 +2671,7 @@ fn apply_once(
         && loaded.meta.last_serializer_profile != req.serializer_profile;
     let mut materialize_reason = classify_materialize_reason(MaterializeReasonInputs {
         plan,
-        bootstrap_due: !loaded.meta.initialized,
+        bootstrap_due: !loaded.meta.initialized || loaded.meta.bootstrap_seed_fold_pending,
         legacy_baseline: is_legacy_baseline(&loaded.core),
         render_config_changed,
         profile_transition,
@@ -3065,6 +3066,7 @@ fn apply_once(
                     run_started: false,
                 });
                 meta.initialized = true;
+                meta.bootstrap_seed_fold_pending = false;
                 if meta.descent_completed {
                     meta.lineage_descent_materialized = true;
                 }
@@ -14867,6 +14869,37 @@ mod tests {
             serde_json::to_vec(first.messages()).unwrap(),
             serde_json::to_vec(replay.messages()).unwrap()
         );
+    }
+
+    #[test]
+    fn subagent_first_active_render_commits_tagged_bytes_before_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let messages = vec![
+            wire_tool_call("call-1", 1, "call_result-1"),
+            wire_tool_result(
+                "result-1",
+                2,
+                json!({ "kind": { "type": "text", "text": "tool output" } }),
+            ),
+        ];
+        let mut request = active_opencode_req("subagent-first-active", "cfg0", messages);
+        request.is_subagent = true;
+
+        let first = run(&s, &request, &spine());
+        assert!(serde_json::to_string(first.messages())
+            .unwrap()
+            .contains("§1§ tool output"));
+        let first_bytes = serde_json::to_vec(first.messages()).unwrap();
+        assert!(first.committed);
+        let committed_tags = s.load_tags_for_session("subagent-first-active").unwrap();
+        assert_eq!(committed_tags.len(), 1);
+        assert_eq!(committed_tags[0].tag_number, 1);
+        assert!(!committed_tags[0].block_id.is_empty());
+
+        let replay = run(&s, &request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(serde_json::to_vec(replay.messages()).unwrap(), first_bytes);
     }
 
     #[test]
