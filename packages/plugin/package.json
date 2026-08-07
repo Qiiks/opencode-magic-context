@@ -27,6 +27,7 @@
     "src/tui",
     "src/tui-compiled",
     "src/shared",
+    "src/config",
     "README.md"
   ],
   "scripts": {
