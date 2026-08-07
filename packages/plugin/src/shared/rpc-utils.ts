@@ -1,4 +1,6 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 export interface RpcPortFileRecord {
@@ -56,6 +58,141 @@ export function isPidAlive(pid: number): boolean {
     } catch (err) {
         return (err as NodeJS.ErrnoException).code === "EPERM";
     }
+}
+
+const RPC_IDENTITY_SKEW_TOLERANCE_MS = 120_000;
+const LINUX_CLOCK_TICKS_PER_SECOND = 100;
+const PS_PROBE_TIMEOUT_MS = 1_000;
+const OPEN_CODE_COMMAND_MARKERS = ["opencode", "node", "bun", "electron"];
+
+let rpcIdentityReadFileSync: typeof readFileSync = readFileSync;
+let rpcIdentityExecFileSync: typeof execFileSync = execFileSync;
+let rpcIdentityPlatform: NodeJS.Platform = process.platform;
+let rpcIdentityNowMs: () => number = () => Date.now();
+
+function parseLinuxProcessStartTime(statContent: string, uptimeContent: string): number | null {
+    const closingCommandName = statContent.lastIndexOf(")");
+    if (closingCommandName < 0) return null;
+
+    // The fields after the command name begin at field 3 (`state`), so field 22
+    // (`starttime`) is index 19 in this suffix. The command name can contain ')',
+    // hence the last closing parenthesis rather than the first one is significant.
+    const statFields = statContent
+        .slice(closingCommandName + 1)
+        .trim()
+        .split(/\s+/);
+    const startTimeTicks = Number(statFields[19]);
+    const uptimeSeconds = Number(uptimeContent.trim().split(/\s+/)[0]);
+    if (
+        !Number.isFinite(startTimeTicks) ||
+        startTimeTicks < 0 ||
+        !Number.isFinite(uptimeSeconds) ||
+        uptimeSeconds < 0
+    ) {
+        return null;
+    }
+
+    const processStartTime =
+        rpcIdentityNowMs() -
+        uptimeSeconds * 1_000 +
+        (startTimeTicks / LINUX_CLOCK_TICKS_PER_SECOND) * 1_000;
+    return Number.isFinite(processStartTime) ? processStartTime : null;
+}
+
+function readLinuxProcessStartTime(pid: number): number | null {
+    try {
+        const statContent = String(rpcIdentityReadFileSync(`/proc/${pid}/stat`, "utf8"));
+        const uptimeContent = String(rpcIdentityReadFileSync("/proc/uptime", "utf8"));
+        return parseLinuxProcessStartTime(statContent, uptimeContent);
+    } catch {
+        return null;
+    }
+}
+
+function readPsProcessStartTime(pid: number): number | null {
+    try {
+        const output = rpcIdentityExecFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
+            encoding: "utf8",
+            timeout: PS_PROBE_TIMEOUT_MS,
+        });
+        const processStartTime = Date.parse(String(output).trim());
+        return Number.isFinite(processStartTime) ? processStartTime : null;
+    } catch {
+        return null;
+    }
+}
+
+function readLinuxProcessCommand(pid: number): string | null {
+    try {
+        return String(rpcIdentityReadFileSync(`/proc/${pid}/cmdline`, "utf8"));
+    } catch {
+        return null;
+    }
+}
+
+function readPsProcessCommand(pid: number): string | null {
+    try {
+        const output = rpcIdentityExecFileSync("ps", ["-p", String(pid), "-o", "command="], {
+            encoding: "utf8",
+            timeout: PS_PROBE_TIMEOUT_MS,
+        });
+        return String(output);
+    } catch {
+        return null;
+    }
+}
+
+function commandLooksLikeOpenCode(command: string): boolean {
+    const normalized = command.toLowerCase();
+    return OPEN_CODE_COMMAND_MARKERS.some((marker) => normalized.includes(marker));
+}
+
+/**
+ * Verify that a live PID still belongs to the process that wrote a port record.
+ *
+ * A PID can be reused after its original process exits. On Linux, procfs gives
+ * us a process start time without spawning a helper; other platforms use `ps`
+ * only on this cold database-open guard path. Legacy records without a start
+ * time use a weaker command-name check, and every probe failure stays live so
+ * this identity check cannot weaken the migration guard on uncertainty.
+ */
+export function isPidIdentityPlausible(record: RpcPortFileRecord): boolean {
+    if (!Number.isInteger(record.pid) || record.pid <= 0) return false;
+
+    if (Number.isFinite(record.started_at) && record.started_at > 0) {
+        const processStartTime =
+            rpcIdentityPlatform === "linux"
+                ? readLinuxProcessStartTime(record.pid)
+                : readPsProcessStartTime(record.pid);
+        if (processStartTime === null) return true;
+        return processStartTime <= record.started_at + RPC_IDENTITY_SKEW_TOLERANCE_MS;
+    }
+
+    const command =
+        rpcIdentityPlatform === "linux"
+            ? readLinuxProcessCommand(record.pid)
+            : readPsProcessCommand(record.pid);
+    if (command === null) return true;
+    return commandLooksLikeOpenCode(command);
+}
+
+export function __setRpcIdentityTestHooks(hooks: {
+    readFileSync?: typeof readFileSync;
+    execFileSync?: typeof execFileSync;
+    platform?: NodeJS.Platform;
+    nowMs?: () => number;
+}): void {
+    rpcIdentityReadFileSync = hooks.readFileSync ?? readFileSync;
+    rpcIdentityExecFileSync = hooks.execFileSync ?? execFileSync;
+    rpcIdentityPlatform = hooks.platform ?? process.platform;
+    rpcIdentityNowMs = hooks.nowMs ?? (() => Date.now());
+}
+
+export function __resetRpcIdentityTestHooks(): void {
+    rpcIdentityReadFileSync = readFileSync;
+    rpcIdentityExecFileSync = execFileSync;
+    rpcIdentityPlatform = process.platform;
+    rpcIdentityNowMs = () => Date.now();
 }
 
 export function parseRpcPortFile(content: string, fallbackPid = 0): RpcPortFileRecord | null {

@@ -1,0 +1,157 @@
+/// <reference types="bun-types" />
+
+import { afterEach, describe, expect, test } from "bun:test";
+import type { execFileSync } from "node:child_process";
+import type { readFileSync } from "node:fs";
+import {
+    __resetRpcIdentityTestHooks,
+    __setRpcIdentityTestHooks,
+    isPidIdentityPlausible,
+    type RpcPortFileRecord,
+} from "./rpc-utils";
+
+const PID = 1234;
+const NOW_MS = 2_000_000;
+const UPTIME_SECONDS = 1_000;
+
+function record(startedAt: number): RpcPortFileRecord {
+    return { port: 43123, pid: PID, started_at: startedAt };
+}
+
+function procStat(startTimeTicks: number): string {
+    // After the closing command-name parenthesis, field 3 is `state` and field
+    // 22 is the twentieth value in the suffix.
+    return `${PID} (opencode) S ${Array.from({ length: 18 }, () => "0").join(" ")} ${startTimeTicks}`;
+}
+
+function linuxFiles(files: Record<string, string | Error>): typeof readFileSync {
+    return ((path: string | URL) => {
+        const value = files[String(path)];
+        if (value instanceof Error) throw value;
+        if (value === undefined) throw new Error(`unexpected read: ${String(path)}`);
+        return value;
+    }) as typeof readFileSync;
+}
+
+function psOutput(output: string | Error): typeof execFileSync {
+    return (() => {
+        if (output instanceof Error) throw output;
+        return output;
+    }) as typeof execFileSync;
+}
+
+afterEach(() => {
+    __resetRpcIdentityTestHooks();
+});
+
+describe("isPidIdentityPlausible", () => {
+    test("rejects a reused Linux PID when proc start time is substantially newer", () => {
+        const readPaths: string[] = [];
+        __setRpcIdentityTestHooks({
+            platform: "linux",
+            nowMs: () => NOW_MS,
+            readFileSync: ((path: string | URL) => {
+                readPaths.push(String(path));
+                const files = {
+                    [`/proc/${PID}/stat`]: procStat(10_000),
+                    "/proc/uptime": `${UPTIME_SECONDS}.0 0.0`,
+                };
+                return files[String(path) as keyof typeof files];
+            }) as typeof readFileSync,
+            execFileSync: (() => {
+                throw new Error("ps must not run on Linux");
+            }) as typeof execFileSync,
+        });
+
+        expect(isPidIdentityPlausible(record(500_000))).toBe(false);
+        expect(readPaths).toEqual([`/proc/${PID}/stat`, "/proc/uptime"]);
+    });
+
+    test("accepts a genuine Linux record when the process started no later than the record", () => {
+        __setRpcIdentityTestHooks({
+            platform: "linux",
+            nowMs: () => NOW_MS,
+            readFileSync: linuxFiles({
+                [`/proc/${PID}/stat`]: procStat(10_000),
+                "/proc/uptime": `${UPTIME_SECONDS}.0 0.0`,
+            }),
+        });
+
+        // The mocked process start is 1,100,000ms. The 120s tolerance is part of
+        // the contract because port-file creation follows process startup.
+        expect(isPidIdentityPlausible(record(1_000_000))).toBe(true);
+    });
+
+    test("treats an unreadable Linux start-time probe as live", () => {
+        __setRpcIdentityTestHooks({
+            platform: "linux",
+            readFileSync: linuxFiles({
+                [`/proc/${PID}/stat`]: new Error("procfs unavailable"),
+            }),
+        });
+
+        expect(isPidIdentityPlausible(record(500_000))).toBe(true);
+    });
+
+    test("uses the legacy Linux command fallback and fails closed on probe errors", () => {
+        __setRpcIdentityTestHooks({
+            platform: "linux",
+            readFileSync: linuxFiles({
+                [`/proc/${PID}/cmdline`]: "/usr/sbin/opendkim --config /etc/opendkim.conf",
+            }),
+        });
+        expect(isPidIdentityPlausible(record(0))).toBe(false);
+
+        __setRpcIdentityTestHooks({
+            platform: "linux",
+            readFileSync: linuxFiles({
+                [`/proc/${PID}/cmdline`]: "/usr/local/bin/opencode serve",
+            }),
+        });
+        expect(isPidIdentityPlausible(record(0))).toBe(true);
+
+        __setRpcIdentityTestHooks({
+            platform: "linux",
+            readFileSync: linuxFiles({
+                [`/proc/${PID}/cmdline`]: new Error("procfs unavailable"),
+            }),
+        });
+        expect(isPidIdentityPlausible(record(0))).toBe(true);
+    });
+
+    test("uses ps start time and command probes on non-Linux platforms", () => {
+        __setRpcIdentityTestHooks({
+            platform: "darwin",
+            execFileSync: psOutput("Mon Aug  7 00:00:00 1970"),
+        });
+        expect(
+            isPidIdentityPlausible(record(Date.parse("Mon Aug  7 00:00:00 1970") - 121_000)),
+        ).toBe(false);
+
+        __setRpcIdentityTestHooks({
+            platform: "darwin",
+            execFileSync: psOutput("Mon Aug  7 00:00:00 1970"),
+        });
+        expect(
+            isPidIdentityPlausible(record(Date.parse("Mon Aug  7 00:00:00 1970") - 120_000)),
+        ).toBe(true);
+
+        __setRpcIdentityTestHooks({
+            platform: "darwin",
+            execFileSync: psOutput("/usr/sbin/opendkim -f"),
+        });
+        expect(isPidIdentityPlausible(record(0))).toBe(false);
+
+        __setRpcIdentityTestHooks({
+            platform: "darwin",
+            execFileSync: psOutput("/Applications/OpenCode.app/Contents/MacOS/opencode"),
+        });
+        expect(isPidIdentityPlausible(record(0))).toBe(true);
+
+        __setRpcIdentityTestHooks({
+            platform: "darwin",
+            execFileSync: psOutput(new Error("ps unavailable")),
+        });
+        expect(isPidIdentityPlausible(record(0))).toBe(true);
+    });
+});

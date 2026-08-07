@@ -19,7 +19,7 @@ import {
 } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
-import { isPidAlive, parseRpcPortFile } from "../../shared/rpc-utils";
+import { isPidAlive, isPidIdentityPlausible, parseRpcPortFile } from "../../shared/rpc-utils";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
@@ -437,21 +437,24 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
         if (!record || !Number.isInteger(record.pid) || record.pid <= 0) {
             return unreadableDiscovery(portFile);
         }
-        if (isPidAlive(record.pid)) pids.add(record.pid);
+        if (isPidAlive(record.pid) && isPidIdentityPlausible(record)) pids.add(record.pid);
         else staleFiles.push(portFile);
     }
 
-    const serverPids = [...pids].sort((a, b) => a - b);
-    if (serverPids.length > 0) {
-        return { state: "live", serverPids, staleFiles };
-    }
-
+    // Remove stale evidence even when another record still proves that a server
+    // is live. Leaving reused-PID files behind expands the collision surface on
+    // every subsequent database-open guard pass.
     for (const staleFile of staleFiles) {
         try {
             unlinkSync(staleFile);
         } catch {
             return unreadableDiscovery(staleFile);
         }
+    }
+
+    const serverPids = [...pids].sort((a, b) => a - b);
+    if (serverPids.length > 0) {
+        return { state: "live", serverPids, staleFiles };
     }
     return { state: "stale", serverPids: [], staleFiles };
 }

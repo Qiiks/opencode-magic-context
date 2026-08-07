@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { __resetRpcIdentityTestHooks, __setRpcIdentityTestHooks } from "../../shared/rpc-utils";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
@@ -25,6 +26,7 @@ import {
     closeDatabase,
     getLiveMigrationBlockingProcesses,
     getMigrationOnOpenRefusal,
+    inspectRpcServerDiscovery,
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
     openDatabase,
@@ -74,9 +76,24 @@ function readPersistedVersion(dbPath: string): number {
     }
 }
 
+function setLinuxIdentityProbe(processStartTicks = 10_000): void {
+    __setRpcIdentityTestHooks({
+        platform: "linux",
+        nowMs: () => 2_000_000,
+        readFileSync: ((path: string | URL) => {
+            if (String(path) === `/proc/${process.pid}/stat`) {
+                return `${process.pid} (opencode) S ${Array.from({ length: 18 }, () => "0").join(" ")} ${processStartTicks}`;
+            }
+            if (String(path) === "/proc/uptime") return "1000.0 0.0";
+            throw new Error(`unexpected identity read: ${String(path)}`);
+        }) as typeof readFileSync,
+    });
+}
+
 afterEach(() => {
     closeDatabase();
     __resetStoragePermissionFsForTests();
+    __resetRpcIdentityTestHooks();
     __resetStoragePrivatePermissionEnforcementForTests();
     process.env.XDG_DATA_HOME = originalXdgDataHome;
 
@@ -354,6 +371,31 @@ describe("storage-db", () => {
             expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
         });
 
+        it("#when an alive PID is reused by a newer process #then removes the record and allows migration", () => {
+            const dataHome = useTempDataHome("storage-db-reused-pid-migration-");
+            const dbPath = seedPendingMigration(dataHome);
+            const portDir = join(dirname(dbPath), "rpc", "test-project");
+            mkdirSync(portDir, { recursive: true });
+            const portFile = join(portDir, `port-${process.pid}.json`);
+            writeFileSync(
+                portFile,
+                JSON.stringify({ port: 43123, pid: process.pid, started_at: 500_000 }),
+            );
+            setLinuxIdentityProbe();
+
+            // The mocked process starts at 1,100,000ms, far after this record's
+            // timestamp, so process.kill(pid, 0) cannot make it look live.
+            expect(inspectRpcServerDiscovery(dirname(dbPath))).toEqual({
+                state: "stale",
+                serverPids: [],
+                staleFiles: [portFile],
+            });
+            expect(existsSync(portFile)).toBe(false);
+            expect(openDatabase()).not.toBeNull();
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+            expect(getMigrationOnOpenRefusal()).toBeNull();
+        });
+
         it("#when a live OpenCode server advertises a port #then refuses a pending migration", () => {
             const dataHome = useTempDataHome("storage-db-live-server-migration-");
             const dbPath = resolveDbPath(dataHome);
@@ -367,15 +409,24 @@ describe("storage-db", () => {
 
             const portDir = join(dirname(dbPath), "rpc", "test-project");
             mkdirSync(portDir, { recursive: true });
+            const livePortFile = join(portDir, `port-${process.pid}.json`);
+            const stalePortFile = join(portDir, "port-2147483647.json");
             writeFileSync(
-                join(portDir, `port-${process.pid}.json`),
-                JSON.stringify({ port: 43123, pid: process.pid, started_at: Date.now() }),
+                livePortFile,
+                JSON.stringify({ port: 43123, pid: process.pid, started_at: 1_200_000 }),
             );
+            writeFileSync(
+                stalePortFile,
+                JSON.stringify({ port: 43124, pid: 2_147_483_647, started_at: 1 }),
+            );
+            setLinuxIdentityProbe();
 
             // The port file makes this test prove the pre-migration refusal. If the
             // guard is removed, openDatabase migrates this fixture and this assertion
             // goes red because the DB is no longer left at the previous version.
             expect(openDatabase()).toBeNull();
+            expect(existsSync(stalePortFile)).toBe(false);
+            expect(existsSync(livePortFile)).toBe(true);
             expect(getMigrationOnOpenRefusal()).toEqual({
                 persistedVersion: LATEST_SUPPORTED_VERSION - 1,
                 supportedVersion: LATEST_SUPPORTED_VERSION,
