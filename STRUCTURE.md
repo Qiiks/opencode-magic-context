@@ -80,8 +80,8 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 
 **`src/shared/`:**
 - Purpose: Keep cross-feature utilities small and dependency-light.
-- Contains: Logging, path helpers, JSONC parsing, model helpers, runtime-detected SQLite backend (`bun:sqlite` / `node:sqlite`), harness identification, RPC server/client/types/utils/notifications, conflict detection & fixer, fallback chain resolver, models.dev cache, tag-transcript primitive shared with Pi, model-suggestion-retry helper, subagent runner (Pi-only), the commit-detection utility, harness-specific provider translation, process-wide exit-abort coordination, and diagnostics numeric redaction.
-- Key files: `src/shared/logger.ts`, `src/shared/data-path.ts`, `src/shared/jsonc-parser.ts`, `src/shared/sqlite.ts`, `src/shared/rpc-server.ts`, `src/shared/rpc-client.ts`, `src/shared/conflict-detector.ts`, `src/shared/model-suggestion-retry.ts`, `src/shared/resolve-fallbacks.ts`, `src/shared/harness.ts`, `src/shared/tag-transcript.ts`, `src/shared/commit-detection.ts`, `src/shared/harness-provider-map.ts`, `src/shared/exit-abort-registry.ts`, `src/shared/redaction.ts`, `src/shared/escalation-bands.ts`, `src/shared/context-limit-provenance.ts`, `src/shared/storage-permissions.ts`
+- Contains: Logging, path helpers, JSONC parsing, model helpers, runtime-detected SQLite backend (`bun:sqlite` / `node:sqlite`), harness identification, RPC server/client/types/utils/notifications, conflict detection & fixer, fallback chain resolver, models.dev cache, tag-transcript primitive shared with Pi, model-suggestion-retry helper, subagent runner (Pi-only), the commit-detection utility, harness-specific provider translation, process-wide exit-abort coordination, diagnostics numeric redaction, and export-aware TUI runtime import specifiers mapping.
+- Key files: `src/shared/logger.ts`, `src/shared/data-path.ts`, `src/shared/jsonc-parser.ts`, `src/shared/sqlite.ts`, `src/shared/rpc-server.ts`, `src/shared/rpc-client.ts`, `src/shared/conflict-detector.ts`, `src/shared/model-suggestion-retry.ts`, `src/shared/resolve-fallbacks.ts`, `src/shared/harness.ts`, `src/shared/tag-transcript.ts`, `src/shared/commit-detection.ts`, `src/shared/harness-provider-map.ts`, `src/shared/exit-abort-registry.ts`, `src/shared/redaction.ts`, `src/shared/escalation-bands.ts`, `src/shared/context-limit-provenance.ts`, `src/shared/storage-permissions.ts`, `src/shared/tui-runtime-specifiers.ts`
 
 **`scripts/`:**
 - Purpose: Support local inspection and maintenance outside the plugin runtime.
@@ -180,7 +180,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `packages/pi-plugin/src/commands/ctx-wrapup.ts`: Implement the `/ctx-wrapup` command and orchestrator for Pi sessions.
 - `packages/pi-plugin/src/dreamer/pi-session-api.ts`: Resolve `pi-coding-agent` module and session APIs, using a memoized resolution ladder to support symlinked or nonstandard Pi installs.
 - `packages/pi-plugin/scripts/experiments/perf/`: Run performance benchmarks and regression checks against production-registered context transform hooks.
-- `crates/mc-module/src/transform.rs`: Evaluates transform passes, applies modifications like metadata tag injection and history compaction in Rust, renders temporal overlays (tag numbers and time gap markers), and strips leading model-authored tag imitation prefixes from assistant messages.
+- `crates/mc-module/src/transform.rs`: Evaluates transform passes, applies modifications like metadata tag injection and history compaction in Rust, renders temporal overlays (tag numbers and time gap markers), self-heals boundary divergence, and strips leading model-authored tag imitation prefixes from assistant messages.
 - `crates/mc-module/src/historian.rs`: Evaluates pressure and schedules/runs incremental historian summarizations in Rust.
 - `crates/mc-module/src/injection.rs`: Builds the `m0`/`m1` structures and injects synthetic message parts in Rust.
 - `crates/mc-module/src/boundary.rs`: Resolves the boundary between compactable history and the protected tail in Rust.
@@ -193,6 +193,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `crates/mc-module/src/divergence.rs`: Per-pass transform output divergence tracking and attribution.
 - `crates/mc-module/src/healing.rs`: Define serializer healing profiles and gate tail mutations for verbatim-tail consumers to prevent phantom reclaims.
 - `crates/mc-module/src/selection.rs`: Implement tail-reduction selection to decide which tail items to reduce and produce their `ReductionDecision`s.
+- `crates/mc-module/src/differential_goldens.rs`: Validate in-process Rust transform outputs against TS-generated wire fixtures (DG-1..3 goldens).
 
 **Tests:** Co-locate tests with source as `src/**/*.test.ts`, for example `src/hooks/magic-context/hook.test.ts`, `src/tools/ctx-memory/tools.test.ts`, and `src/features/magic-context/migrations-v11.test.ts`. End-to-end coverage lives in the separate `packages/e2e-tests/` workspace.
 
