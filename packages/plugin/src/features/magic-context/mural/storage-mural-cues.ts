@@ -9,10 +9,10 @@ import { type Database, withPrivilegedWriter } from "../../../shared/sqlite";
  *  resolveMural reads the hash-current ones and packs them deterministically at
  *  inject time.
  *
- * These are a LOCAL render cache derived from memory content — not a
- * module-mirrored authority column. Authority triggers still guard every update
- * to a managed memory row, so the narrow cache writer below uses an explicit
- * privilege bracket without granting callers access to authoritative content.
+ * These are derived render-cache columns, not prompt-cache bytes. TypeScript authority writes them
+ * through the narrow privileged writer; when MODULE owns memories, the dreamer sends the same
+ * column-only mutation through the module facade and the changefeed mirrors it back here. Authority
+ * triggers still guard every update to a managed memory row.
  */
 
 /**

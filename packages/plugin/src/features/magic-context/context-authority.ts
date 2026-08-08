@@ -877,6 +877,10 @@ const MEMORY_SNAPSHOT_COLUMNS = [
     "metadata_json",
     "context_store_uuid",
     "context_row_id",
+    "mural_cue",
+    "mural_cue_hash",
+    "mural_cue_at",
+    "mural_cue_rejection_count",
 ] as const;
 
 function hasSnapshotField(row: Record<string, unknown>, key: string): boolean {
@@ -1121,9 +1125,10 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
             `SELECT project_path, category, content, normalized_hash, importance, scope, shareable,
                     source_session_id, source_type, seen_count, retrieval_count, first_seen_at,
                     created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at,
-                    verification_status, verified_at, classified_at, superseded_by_memory_id,
-                    merged_from, metadata_json
-               FROM memories WHERE id = ?`,
+                     verification_status, verified_at, classified_at, superseded_by_memory_id,
+                     merged_from, metadata_json, mural_cue, mural_cue_hash, mural_cue_at,
+                     mural_cue_rejection_count
+                FROM memories WHERE id = ?`,
         ),
         memoryIdByStoreId: db.prepare("SELECT id FROM memories WHERE id = ? AND project_path = ?"),
         memoryCandidates: db.prepare(
@@ -1156,8 +1161,9 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
              importance = ?, scope = ?, shareable = ?, source_session_id = ?, source_type = ?,
              seen_count = ?, retrieval_count = ?, first_seen_at = ?, created_at = ?, updated_at = ?,
              last_seen_at = ?, last_retrieved_at = ?, status = ?, expires_at = ?,
-             verification_status = ?, verified_at = ?, classified_at = ?, superseded_by_memory_id = ?,
-             merged_from = ?, metadata_json = ? WHERE id = ?`,
+              verification_status = ?, verified_at = ?, classified_at = ?, superseded_by_memory_id = ?,
+              merged_from = ?, metadata_json = ?, mural_cue = ?, mural_cue_hash = ?, mural_cue_at = ?,
+              mural_cue_rejection_count = ? WHERE id = ?`,
         ),
         updateSuperseded: db.prepare(
             "UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?",
@@ -1475,6 +1481,10 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
               superseded_by_memory_id?: number | null;
               merged_from?: string | null;
               metadata_json?: string | null;
+              mural_cue?: string | null;
+              mural_cue_hash?: string | null;
+              mural_cue_at?: number | null;
+              mural_cue_rejection_count?: number | null;
           }
         | undefined;
     if (existing && existing.project_path !== moduleProject) {
@@ -1538,6 +1548,12 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
         hasSuperseded ? null : (existing?.superseded_by_memory_id ?? null),
         nullableString("merged_from", existing?.merged_from),
         nullableString("metadata_json", existing?.metadata_json),
+        nullableString("mural_cue", existing?.mural_cue),
+        nullableString("mural_cue_hash", existing?.mural_cue_hash),
+        nullableNumber("mural_cue_at", existing?.mural_cue_at),
+        has("mural_cue_rejection_count")
+            ? rowNumber(row, "mural_cue_rejection_count")
+            : (existing?.mural_cue_rejection_count ?? 0),
         contextId,
     );
     if (hasSuperseded && typeof row.superseded_by_memory_id === "number") {

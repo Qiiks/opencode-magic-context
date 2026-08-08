@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
 import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
@@ -12,6 +14,11 @@ import { log } from "../../../shared/logger";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { runLeaseGuardedWrite, startLeaseHeartbeat } from "../dreamer/lease";
+import {
+    DreamerModuleFailureError,
+    getModuleMemoryIdentities,
+    type DreamerModuleRoute,
+} from "../dreamer/module-apply";
 import { assertManifestCoversExactly } from "../dreamer/manifest-parser";
 import { getMemoriesByProject, type Memory } from "../memory";
 import {
@@ -34,8 +41,9 @@ import {
  * compress-cues: a NON-agentic single-shot transform (classify-memories shape).
  * For each project memory whose cue is missing or stale, the host renders one
  * prompt per chunk, a zero-tool agent emits ONE <cues> XML manifest, and the
- * host validates each cue and applies COLUMN-ONLY writes (mural_cue). No
- * per-memory tool calls; no selection/ranking/packing (those are deterministic
+ * host validates each cue and applies COLUMN-ONLY writes (mural_cue), either locally
+ * under TS authority or through the module facade when MODULE owns memories. No per-memory
+ * tool calls; no selection/ranking/packing (those are deterministic
  * in resolveMural / renderMural).
  *
  * Gate: mural_cue IS NULL OR mural_cue_hash != sha256(content). Resumable — cues
@@ -85,6 +93,8 @@ export interface CompressCuesArgs {
     model?: string;
     fallbackModels?: readonly string[];
     onProgress?: (processed: number) => void;
+    /** Present only when MODULE owns memories; cue columns must be written through the facade. */
+    moduleRoute?: DreamerModuleRoute;
 }
 
 /** How a chunk failed, used by the run loop to decide whether to keep going.
@@ -389,7 +399,9 @@ async function compressOneChunk(
             },
         );
 
-        return applyCues(args, chunk, run.validated);
+        return args.moduleRoute
+            ? await applyCuesThroughModule(args, chunk, run.validated, signal)
+            : applyCues(args, chunk, run.validated);
     } catch (error) {
         const desc = describeError(error);
         log(
@@ -493,4 +505,161 @@ export function applyCues(
         }
     });
     return { compressed, skipped };
+}
+
+interface PlannedCueUpdate {
+    contextId: number;
+    moduleId: number;
+    contentHash: string;
+    cue: string | null;
+    rejectionCount: number;
+    kind: "compressed" | "skipped";
+}
+
+/** Use the same validation and rejection-counter behavior as the local writer, but send every
+ * derived-column update to the module authority. Read only the last mirrored rejection count
+ * from the context database; the module rechecks that the content is still current and performs
+ * the durable write. */
+async function applyCuesThroughModule(
+    args: CompressCuesArgs,
+    chunk: CueCandidate[],
+    manifestText: string,
+    signal: AbortSignal,
+): Promise<{ compressed: number; skipped: number }> {
+    const route = args.moduleRoute;
+    if (!route) throw new Error("module cue apply called without a module route");
+    const byId = new Map(chunk.map((candidate) => [candidate.memory.id, candidate]));
+    const parsed = parseCuesManifest(manifestText);
+    assertManifestCoversExactly(
+        parsed.map((entry) => entry.id),
+        new Set(byId.keys()),
+        "cues",
+    );
+    const state = getMuralCueState(
+        args.db,
+        chunk.map((candidate) => candidate.memory.id),
+    );
+    const identities = getModuleMemoryIdentities(
+        args.db,
+        args.projectIdentity,
+        chunk.map((candidate) => candidate.memory.id),
+    );
+    const updates: PlannedCueUpdate[] = [];
+    for (const entry of parsed) {
+        const candidate = byId.get(entry.id);
+        if (!candidate) throw new Error(`cues manifest contains unknown id ${entry.id}`);
+        const identity = identities.get(candidate.memory.id);
+        if (!identity) {
+            throw new Error(`module mirror identity missing for memory ${candidate.memory.id}`);
+        }
+        const failure = validateCue(
+            entry.cue,
+            candidate.memory.importance ?? 50,
+            candidate.memory.id,
+        );
+        if (!failure) {
+            updates.push({
+                contextId: candidate.memory.id,
+                moduleId: identity.moduleId,
+                contentHash: candidate.contentHash,
+                cue: entry.cue.trim(),
+                rejectionCount: 0,
+                kind: "compressed",
+            });
+            continue;
+        }
+        const previous = state.get(candidate.memory.id);
+        const rejectionCount =
+            previous?.hash === candidate.contentHash ? (previous.rejectionCount ?? 0) + 1 : 1;
+        if (rejectionCount >= CUE_REJECTION_LATCH_THRESHOLD) {
+            updates.push({
+                contextId: candidate.memory.id,
+                moduleId: identity.moduleId,
+                contentHash: candidate.contentHash,
+                cue: deterministicFallbackCue(candidate, entry.cue),
+                rejectionCount: 0,
+                kind: "compressed",
+            });
+            log(
+                `[dreamer] compress-cues: fallback cue for memory ${entry.id} (${failure.reason}; ${rejectionCount} rejections; fallback)`,
+            );
+        } else {
+            updates.push({
+                contextId: candidate.memory.id,
+                moduleId: identity.moduleId,
+                contentHash: candidate.contentHash,
+                cue: null,
+                rejectionCount,
+                kind: "skipped",
+            });
+            log(
+                `[dreamer] compress-cues: skipped cue for memory ${entry.id} (${failure.reason}; rejection ${rejectionCount}/${CUE_REJECTION_LATCH_THRESHOLD})`,
+            );
+        }
+    }
+
+    const commandId = `mural-cues:${route.moduleCommandId}:${createHash("sha256")
+        .update(chunk.map((candidate) => candidate.memory.id).join(","))
+        .digest("hex")
+        .slice(0, 24)}`;
+    let response: unknown;
+    try {
+        response = await route.moduleClient.call({
+            sessionId: route.moduleSessionId,
+            projectRoot: route.moduleProjectRoot,
+            method: "memory.set_mural_cue",
+            body: {
+                name: "memory.set_mural_cue",
+                arguments: {
+                    memory_project: args.projectIdentity,
+                    context_store_uuid: route.moduleContextStoreUuid,
+                    authority_generation: route.moduleAuthorityGeneration,
+                    command_id: commandId,
+                    rows: updates.map((update) => ({
+                        memory_id: update.moduleId,
+                        content_hash_at_prompt: update.contentHash,
+                        cue: update.cue,
+                        rejection_count: update.rejectionCount,
+                    })),
+                },
+            },
+            signal,
+        });
+    } catch (error) {
+        throw new DreamerModuleFailureError("mural cue apply", error);
+    }
+    const result = (response as { result?: unknown } | null)?.result ?? response;
+    if (!result || typeof result !== "object") {
+        throw new Error("module returned invalid mural cue apply result");
+    }
+    const accepted = (result as { accepted?: unknown }).accepted;
+    if (!Array.isArray(accepted) || !accepted.every((id) => Number.isInteger(id))) {
+        throw new Error("module returned no mural cue acceptance list");
+    }
+    const acceptedIds = new Set(accepted as number[]);
+    const rejected = (result as { rejected?: unknown }).rejected;
+    const rejectedReasons = new Map<string, number>();
+    for (const row of Array.isArray(rejected) ? rejected : []) {
+        const reason =
+            row &&
+            typeof row === "object" &&
+            typeof (row as { reason?: unknown }).reason === "string"
+                ? (row as { reason: string }).reason
+                : "unknown";
+        rejectedReasons.set(reason, (rejectedReasons.get(reason) ?? 0) + 1);
+    }
+    if ([...rejectedReasons].some(([reason]) => reason !== "stale")) {
+        throw new Error(
+            `module rejected mural cues (${[...rejectedReasons]
+                .map(([reason, count]) => `${reason}=${count}`)
+                .join(", ")})`,
+        );
+    }
+    return updates.reduce(
+        (counts, update) => {
+            if (acceptedIds.has(update.moduleId)) counts[update.kind] += 1;
+            return counts;
+        },
+        { compressed: 0, skipped: 0 },
+    );
 }
