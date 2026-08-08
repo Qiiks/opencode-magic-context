@@ -24,7 +24,7 @@ use crate::injection::{
 use crate::m0_compose::compose_m0_from_store;
 use crate::m1_compose::{
     claim_and_render_notes, compose_m1_from_store, m1_revision_signal_parts_for_pass_timed,
-    M1RevisionReadTimings,
+    M1RevisionReadTimings, M1RevisionSignal,
 };
 use crate::memory_render::M1_PLACEHOLDER;
 use crate::scheduler::{
@@ -1521,11 +1521,25 @@ fn apply_once_with_estimator(
     output_cache: Option<&Mutex<SerializedOutputCache>>,
 ) -> Result<TransformWithProjection, TransformError> {
     let mut attempt = 0;
+    let mut boundary_divergence_retry = false;
     loop {
-        match apply_once(store, req, ctx, estimate_tokens, output_cache) {
+        let mut boundary_divergence_detected = false;
+        match apply_once(
+            store,
+            req,
+            ctx,
+            estimate_tokens,
+            output_cache,
+            boundary_divergence_retry,
+            &mut boundary_divergence_detected,
+        ) {
             Err(TransformError::Store(McStoreError::CasConflict { .. }))
                 if attempt < MAX_CAS_RETRIES =>
             {
+                // A historian publish can win after detection but before the transform commit.
+                // Preserve the recut intent across the mandatory reload so the new m1 watermark
+                // cannot turn the already-proven inconsistency back into an ordinary defer.
+                boundary_divergence_retry |= boundary_divergence_detected;
                 attempt += 1;
                 continue;
             }
@@ -1804,7 +1818,10 @@ fn apply_once(
     ctx: &ProducerContext<'_>,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
     output_cache: Option<&Mutex<SerializedOutputCache>>,
+    boundary_divergence_retry: bool,
+    boundary_divergence_detected: &mut bool,
 ) -> Result<TransformWithProjection, TransformError> {
+    *boundary_divergence_detected = false;
     let total_started_at = Instant::now();
     let mut timings = TransformTimings::default();
     let mut m1_revision_read_timings = M1RevisionReadTimings::default();
@@ -2324,6 +2341,21 @@ fn apply_once(
         Some(&mut m1_revision_read_timings),
     )?;
     let mut current_m1_digest = m1_signal.revision;
+    let compartment_seq_changed_since_meta = loaded.meta.initialized
+        && m1_signal.max_compartment_seq != meta_coverage_compartment_seq(&loaded.meta);
+    let boundary_divergence_recut = if req.is_subagent {
+        None
+    } else {
+        detect_boundary_divergence(
+            store,
+            &req.session_id,
+            &loaded.meta,
+            &m1_signal,
+            &live,
+            boundary_divergence_retry,
+        )?
+    };
+    *boundary_divergence_detected = boundary_divergence_recut.is_some();
     // Pre-gate memory-off sessions stored an ungated digest and have no durable gate marker.
     // The next natural bust adopts the gated digest; the mismatch does not authorize a bust now.
     let memory_gate_digest_transition = !ctx.memory_enabled
@@ -2461,8 +2493,6 @@ fn apply_once(
     // messages move into the m0 prefix before the byte-splice profile suppresses their
     // separate re-emission. The full compartment rows load only when the cheap max-seq
     // scalar says coverage may have changed since meta last recorded it.
-    let compartment_seq_changed_since_meta = loaded.meta.initialized
-        && m1_signal.max_compartment_seq != meta_coverage_compartment_seq(&loaded.meta);
     let system_absorb_hard_due = if serializer_profile
         == Some(SerializerProfile::ClaudeCodeAnthropic)
         && compartment_seq_changed_since_meta
@@ -2474,6 +2504,7 @@ fn apply_once(
         false
     };
     let hard_fold_requested = first_fold_due
+        || boundary_divergence_recut.is_some()
         || scheduler_outcome.idle_ttl_fired
         || system_absorb_hard_due
         || external_revision_changed
@@ -2686,6 +2717,9 @@ fn apply_once(
     });
     if lineage_state.force_hard {
         materialize_reason = Some("lineage_descent".to_string());
+    }
+    if boundary_divergence_recut.is_some() {
+        materialize_reason = Some("boundary_divergence_recut".to_string());
     }
 
     let mut core = loaded.core.clone();
@@ -3648,6 +3682,15 @@ fn apply_once(
             re_adoption.mid, re_adoption.old_hash_prefix, re_adoption.new_hash_prefix
         );
     }
+    if let Some(divergence) = boundary_divergence_recut {
+        eprintln!(
+            "mc-module: boundary_divergence_recut session={} old_coverage={} new_coverage={} live_tail_allowance={}",
+            req.session_id,
+            divergence.old_coverage,
+            meta.coverage_ordinal.unwrap_or(divergence.new_coverage),
+            divergence.live_tail_allowance,
+        );
+    }
     if let Some(first_divergence) = &first_divergence {
         let detail = serde_json::to_string(first_divergence).expect("divergence is serializable");
         eprintln!(
@@ -4304,6 +4347,68 @@ fn is_uncovered_leading_system(message: &CkIngressMessage, meta: &ModuleMeta) ->
         // pinned system prompt at absolute ordinal 0 rather than risk dropping it.
         None => message.ordinal == 0,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoundaryDivergenceRecut {
+    old_coverage: u64,
+    new_coverage: u64,
+    live_tail_allowance: u64,
+}
+
+fn detect_boundary_divergence(
+    store: &McStore,
+    session_id: &str,
+    meta: &ModuleMeta,
+    m1_signal: &M1RevisionSignal,
+    live: &[&FlatBlock],
+    retry_latched: bool,
+) -> Result<Option<BoundaryDivergenceRecut>, McStoreError> {
+    if !meta.initialized {
+        return Ok(None);
+    }
+
+    let max_end = store.max_compartment_end_ordinal(session_id)?;
+    let Ok(new_coverage) = u64::try_from(max_end) else {
+        return Ok(None);
+    };
+    let old_coverage = meta.coverage_ordinal.unwrap_or(0);
+
+    // A successful publication advances this trigger-only floor to the first unprocessed
+    // ordinal. The distance from that floor through the current live end is therefore the
+    // source-derived protected-tail allowance; it grows and shrinks with the real tail rather
+    // than imposing an ordinal magic number on sparse producer coordinates.
+    let protected_tail_floor = meta
+        .publication_floor_ordinal
+        .unwrap_or_else(|| old_coverage.saturating_add(1));
+    let newest_live = live
+        .iter()
+        .map(|block| block.ordinal)
+        .max()
+        .unwrap_or(old_coverage);
+    let live_tail_allowance = newest_live
+        .checked_sub(protected_tail_floor)
+        .map_or(0, |span| span.saturating_add(1));
+    let coverage_gap = new_coverage.saturating_sub(old_coverage);
+    if coverage_gap <= live_tail_allowance {
+        return Ok(None);
+    }
+
+    // Historian publish intentionally leaves render coverage untouched. Its newer max sequence
+    // first changes the m1 revision, and a later materializing pass advances coverage with the
+    // rendered delta. Do not mistake that healthy inter-pass window for corruption. Equality
+    // means the current compartment set was already acknowledged by the rendered revision while
+    // its boundary cursor still trails it. A retry latch preserves that proof if a concurrent
+    // publish wins the commit CAS and necessarily changes the freshly loaded revision.
+    if !retry_latched && m1_signal.revision != meta.m1_revision {
+        return Ok(None);
+    }
+
+    Ok(Some(BoundaryDivergenceRecut {
+        old_coverage,
+        new_coverage,
+        live_tail_allowance,
+    }))
 }
 
 fn coverage_ordinal_from_compartments(
@@ -9467,6 +9572,81 @@ mod tests {
         }
     }
 
+    fn astro_compartments() -> Vec<StoredCompartment> {
+        let mut start = 1i64;
+        let mut compartments = Vec::with_capacity(48);
+        for sequence in 0..48i64 {
+            let end = match sequence {
+                0 => 200,
+                1 => 425,
+                _ => {
+                    let slots = 48 - sequence;
+                    let remaining = 2_400 - start + 1;
+                    let size = (remaining + slots - 1) / slots;
+                    start + size - 1
+                }
+            };
+            compartments.push(comp(
+                sequence,
+                start,
+                end,
+                &format!("m{end}"),
+                &format!("ASTRO-C{sequence}"),
+            ));
+            start = end + 1;
+        }
+        assert_eq!(compartments.len(), 48);
+        assert_eq!(compartments.last().unwrap().end_message, 2_400);
+        compartments
+    }
+
+    fn astro_request(session_id: &str, tail_end: u64) -> TransformRequest {
+        let compartments = astro_compartments();
+        let mut messages = compartments
+            .iter()
+            .map(|compartment| {
+                let end = compartment.end_message as u64;
+                item(&format!("m{end}"), end, &format!("raw anchor {end}"))
+            })
+            .collect::<Vec<_>>();
+        messages.extend((2_401..=tail_end).map(|ordinal| {
+            item(
+                &format!("m{ordinal}"),
+                ordinal,
+                &format!("live tail {ordinal}"),
+            )
+        }));
+        req(session_id, "cfg0", messages)
+    }
+
+    fn seed_astro_divergence(store: &McStore, session_id: &str, tail_end: u64) -> TransformRequest {
+        store
+            .replace_compartments(session_id, &astro_compartments())
+            .unwrap();
+        let request = astro_request(session_id, tail_end);
+        let boot = run(store, &request, &spine());
+        assert_eq!(boot.action, "HARD");
+        assert_eq!(boot.coverage_ordinal, Some(2_400));
+        assert_eq!(boot.boundary_id, "m2400#0");
+
+        let loaded = store.load(session_id).unwrap();
+        let mut core = loaded.core.clone();
+        core.boundary_id = "m425#0".to_string();
+        let covered_target = astro_compartments()[2].end_message_id.clone();
+        core.frozen_units
+            .push(red_unit(&covered_target, "drop", "[dropped stale]"));
+        let mut meta = loaded.meta.clone();
+        meta.coverage_ordinal = Some(425);
+        meta.coverage_start_ordinal = Some(1);
+        meta.coverage_compartment_seq = Some(1);
+        meta.folded_compartment_seq = 1;
+        meta.publication_floor_ordinal = Some(2_401);
+        store
+            .commit(session_id, loaded.row_version, &core, &meta)
+            .unwrap();
+        request
+    }
+
     fn memory_input<'a>(
         project_path: &'a str,
         category: &'a str,
@@ -13063,6 +13243,136 @@ mod tests {
     }
 
     #[test]
+    fn astro_shape_boundary_divergence_recuts_full_compartment_set_on_first_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let request = seed_astro_divergence(&store, "astro-divergence", 2_402);
+
+        let response = run(&store, &request, &spine());
+        assert_eq!(response.action, "HARD");
+        assert_eq!(
+            response.materialize_reason.as_deref(),
+            Some("boundary_divergence_recut")
+        );
+        assert_eq!(response.boundary_id, "m2400#0");
+        assert_eq!(response.coverage_ordinal, Some(2_400));
+        assert_eq!(tail_ids(&response), vec!["m2401", "m2402"]);
+        assert!(m0_bytes(&response).contains("ASTRO-C47"));
+
+        let healed = store.load("astro-divergence").unwrap();
+        assert_eq!(healed.meta.coverage_ordinal, Some(2_400));
+        assert_eq!(healed.meta.coverage_compartment_seq, Some(47));
+        assert_eq!(healed.meta.folded_compartment_seq, 47);
+        assert_eq!(healed.core.boundary_id, "m2400#0");
+        let stale_target = astro_compartments()[2].end_message_id.clone();
+        assert!(
+            !frozen_red_targets(&healed.core).contains(&stale_target),
+            "the HARD recut must apply ordinary frozen-unit GC"
+        );
+    }
+
+    #[test]
+    fn boundary_divergence_recut_retries_after_interleaved_historian_publish() {
+        use std::cell::Cell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let request = seed_astro_divergence(&store, "astro-publish-race", 2_442);
+
+        let loaded = store.load("astro-publish-race").unwrap();
+        let selected_range_identities = vec![mc_store::HistorianSelectedMessageIdentity {
+            mid: "m2400".to_string(),
+            block_identities: loaded.meta.block_identity_by_mid["m2400"].clone(),
+        }];
+        let generation = mc_store::CompartmentSetGeneration {
+            max_sequence: 47,
+            count: 48,
+        };
+        let predicate = mc_store::HistorianPublishPredicate {
+            firing_seq: 7,
+            producer_run_id: "race-run".to_string(),
+            chunk_fingerprint: "race-fingerprint".to_string(),
+            selected_range_identities: selected_range_identities.clone(),
+            compartment_set_generation: generation,
+        };
+        let mut publishing_meta = loaded.meta.clone();
+        publishing_meta.historian = mc_store::HistorianDurableState {
+            state: mc_store::HistorianPhase::Publishing,
+            firing_seq: predicate.firing_seq,
+            chunk_range: Some(mc_store::HistorianChunkRange {
+                from_ordinal: 2_401,
+                to_ordinal: 2_440,
+            }),
+            chunk_fingerprint: predicate.chunk_fingerprint.clone(),
+            selected_range_identities,
+            producer_session_id: Some("race-producer".to_string()),
+            producer_run_id: Some(predicate.producer_run_id.clone()),
+            fired_at_ms: Some(1),
+            expected_revert_epoch: loaded.meta.revert_epoch,
+            compartment_set_generation: generation,
+            ..Default::default()
+        };
+        let publish_row_version = store
+            .commit(
+                "astro-publish-race",
+                loaded.row_version,
+                &loaded.core,
+                &publishing_meta,
+            )
+            .unwrap();
+        let published_compartment =
+            comp(48, 2_401, 2_440, "m2440", "INTERLEAVED-HISTORIAN-PUBLISH");
+        let interleaved = Cell::new(false);
+        let estimate_with_publish = |text: &str| {
+            if !interleaved.replace(true) {
+                store
+                    .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                        session_id: "astro-publish-race",
+                        expected_row_version: Some(publish_row_version),
+                        expected_revert_epoch: loaded.meta.revert_epoch,
+                        predicate: &predicate,
+                        project_path: "git:proj",
+                        compartments: std::slice::from_ref(&published_compartment),
+                        facts: &[],
+                        promote_facts: false,
+                        events: &[],
+                        primer_candidates: &[],
+                        user_memory_candidates: &[],
+                        publication_floor_ordinal: 2_441,
+                        chunk_transcript: None,
+                    })
+                    .unwrap();
+            }
+            mc_tokenizer::estimate_tokens(text)
+        };
+        let response = apply_once_with_estimator(
+            &store,
+            &request,
+            &pctx("git:proj", "/nonexistent-docs", 0),
+            estimate_with_publish,
+            None,
+        )
+        .unwrap()
+        .response;
+
+        assert!(interleaved.get());
+        assert_eq!(response.action, "HARD");
+        assert_eq!(
+            response.materialize_reason.as_deref(),
+            Some("boundary_divergence_recut")
+        );
+        assert_eq!(response.coverage_ordinal, Some(2_440));
+        assert_eq!(response.boundary_id, "m2440#0");
+        let healed = store.load("astro-publish-race").unwrap();
+        assert_eq!(healed.meta.coverage_ordinal, Some(2_440));
+        assert_eq!(healed.meta.folded_compartment_seq, 48);
+        assert_eq!(
+            store.load_compartments("astro-publish-race").unwrap().len(),
+            49
+        );
+    }
+
+    #[test]
     fn leading_coverage_gap_fails_loud_not_silent_drop() {
         // Regression: the first compartment starts at ordinal 10, but the live array still
         // carries raw messages at ordinals 1..9 (before the first compartment). Those are
@@ -13522,11 +13832,30 @@ mod tests {
         );
         assert_eq!(boot.boundary_id, "m10#0");
         assert_eq!(tail_ids(&boot), vec!["t11"]);
+        assert_eq!(
+            canonical_response_hash(&boot),
+            "e361c261f3bed5b1488bbc94b9d7ad2c2bc6cbedb4f0d9ea4abca474deae8ca7",
+            "healthy HARD bytes must match the pre-detector golden",
+        );
 
-        // C2 (covers 11..=20, end "m20") publishes → it rides m1 at P1 AND extends coverage
+        // Publishing C2 (ordinals 11..=20) creates a pending m1 delta; the next
+        // materializing pass renders that delta and extends coverage to m20.
         s.replace_compartments(
             "ses",
             &[comp(1, 1, 10, "m10", "S1"), comp(2, 11, 20, "m20", "S2")],
+        )
+        .unwrap();
+        // Publication leaves render coverage at 10 but advances the trigger-only floor to 21.
+        // The new m1 revision proves the compartment is pending render, so this positive gap is
+        // valid until the forced soft refresh below materializes it.
+        let published = s.load("ses").unwrap();
+        let mut published_meta = published.meta.clone();
+        published_meta.publication_floor_ordinal = Some(21);
+        s.commit(
+            "ses",
+            published.row_version,
+            &published.core,
+            &published_meta,
         )
         .unwrap();
         s.arm_soft_refresh("ses").unwrap();
@@ -13549,6 +13878,11 @@ mod tests {
         assert!(m1_bytes(&soft).contains("S2") && !m1_bytes(&soft).contains("title=\"C1\""));
         // coverage advanced to 20 → raw m20 trimmed, only t21 remains
         assert_eq!(tail_ids(&soft), vec!["t21"]);
+        assert_eq!(
+            canonical_response_hash(&soft),
+            "a0b8baae3d8f8cce73debbf827005d9b8b7e84280c5c23f2bd2097682875c8f1",
+            "healthy SOFT bytes must match the pre-detector golden",
+        );
 
         // a defer at the new anchor replays byte-identical
         let defer = run(&s, &req("ses", "cfg0", items), &spine());
@@ -13560,6 +13894,11 @@ mod tests {
             "m1 replays identical at b1"
         );
         assert_eq!(m0_bytes(&defer), m0_bytes(&soft));
+        assert_eq!(
+            canonical_response_hash(&defer),
+            "a0b8baae3d8f8cce73debbf827005d9b8b7e84280c5c23f2bd2097682875c8f1",
+            "healthy SOFT+ bytes must match the pre-detector golden",
+        );
 
         // A share-nothing boundary absence is not a safe re-cut target. It degrades to
         // raw pass-through and arms the pending-rewrite alarm without touching lineage.
@@ -19477,6 +19816,15 @@ mod tests {
             .iter()
             .map(|message| message.canonical_bytes().to_vec())
             .collect()
+    }
+
+    fn canonical_response_hash(response: &TransformResponse) -> String {
+        let mut hash = Sha256::new();
+        for bytes in canonical_output(response.messages()) {
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        }
+        format!("{:x}", hash.finalize())
     }
 
     #[test]
