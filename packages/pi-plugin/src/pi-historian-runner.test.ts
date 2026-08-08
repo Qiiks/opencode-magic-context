@@ -18,6 +18,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { getUserMemoryCandidates } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
 import type { ProtectedTailBoundarySnapshot } from "@magic-context/core/hooks/magic-context/protected-tail-boundary";
+import type { RawMessage } from "@magic-context/core/hooks/magic-context/read-session-raw";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import type {
 	SubagentRunner,
@@ -61,7 +62,7 @@ describe("buildPiCompactionSummary", () => {
 	});
 });
 
-function rawMessages(count = 12) {
+function rawMessages(count = 12): RawMessage[] {
 	return Array.from({ length: count }, (_, index) => {
 		const ordinal = index + 1;
 		const isUser = ordinal % 2 === 1;
@@ -79,6 +80,55 @@ function rawMessages(count = 12) {
 			],
 		};
 	});
+}
+
+function completedArcMessages(): RawMessage[] {
+	return [
+		{
+			ordinal: 1,
+			id: "m1",
+			role: "user",
+			parts: [{ type: "text", text: "Inspect the failing flow." }],
+		},
+		{
+			ordinal: 2,
+			id: "m2",
+			role: "assistant",
+			parts: [
+				{
+					type: "tool",
+					tool: "read",
+					callID: "pi-call",
+					state: { input: { path: "src/flow.ts" } },
+				},
+			],
+		},
+		{
+			ordinal: 3,
+			id: "m3",
+			role: "user",
+			parts: [
+				{
+					type: "tool",
+					tool: "read",
+					callID: "pi-call",
+					state: { output: "flow contents" },
+				},
+			],
+		},
+		{
+			ordinal: 4,
+			id: "m4",
+			role: "assistant",
+			parts: [{ type: "text", text: "Applied the fix." }],
+		},
+		{
+			ordinal: 5,
+			id: "m5",
+			role: "user",
+			parts: [{ type: "text", text: "Keep this live tail." }],
+		},
+	];
 }
 
 function successXml(fact = "Pi historian facts can promote to memory.") {
@@ -177,7 +227,7 @@ async function runHistorianWith(args: {
 	readBranchEntries?: () => unknown[];
 	boundarySnapshot?: ProtectedTailBoundarySnapshot;
 	refreshBoundarySnapshot?: () => ProtectedTailBoundarySnapshot;
-	providerMessages?: ReturnType<typeof rawMessages>;
+	providerMessages?: RawMessage[];
 	forceKeepLastCompartment?: boolean;
 	historianChunkTokens?: number;
 	beforeRun?: (db: ReturnType<typeof createTestDb>) => void;
@@ -698,6 +748,30 @@ describe("runPiHistorian", () => {
 					summary: expect.stringContaining("Initial Pi slice"),
 				}),
 			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("does not let Pi discard-last reopen a completed invocation/result arc", async () => {
+		const { db } = await runHistorianWith({
+			outputs: [twoCompartmentSuccessXml()],
+			providerMessages: completedArcMessages(),
+			boundarySnapshot: makeBoundarySnapshot({
+				protectedTailStart: 5,
+				protectedTailStartMessageId: "m5",
+				eligibleEndOrdinal: 5,
+				eligibleEndMessageId: "m4",
+				rawMessageCountAtTrigger: 5,
+				rawLastMessageIdAtTrigger: "m5",
+			}),
+		});
+		try {
+			expect(
+				getCompartments(db, "ses-historian").map(
+					(compartment) => compartment.endMessage,
+				),
+			).toEqual([2, 4]);
 		} finally {
 			closeQuietly(db);
 		}

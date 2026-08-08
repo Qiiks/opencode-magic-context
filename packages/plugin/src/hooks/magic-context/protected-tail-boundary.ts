@@ -19,6 +19,7 @@ import { hasMeaningfulUserText } from "./read-session-formatting";
 import {
     buildToolArcs,
     buildTrueRawTokenIndex,
+    completedToolArcCrossesBoundary,
     computeRawRangeFingerprint,
     fenceBoundaryForToolArcs,
     type TrueRawTokenIndex,
@@ -325,8 +326,7 @@ function fenceWrapupBoundaryForToolArcs(args: {
             }
             if (
                 arc.invOrdinal >= args.lastCompartmentEndOrdinal + 1 &&
-                arc.invOrdinal < next &&
-                next <= arc.resOrdinal
+                completedToolArcCrossesBoundary(arc.invOrdinal, arc.resOrdinal, next)
             ) {
                 next = arc.invOrdinal;
             }
