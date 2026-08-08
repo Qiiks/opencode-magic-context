@@ -1021,6 +1021,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
               : undefined,
         maybeAutoEmbedSession,
         transformMode: deps.config.transform_mode,
+        promptSurface: deps.config.prompt_surface,
         rustModeModuleClient,
         tsAuthorityRecoveryModuleClient: authorityRecoveryModuleClient,
         rustMemorySyncRequestedSessions,

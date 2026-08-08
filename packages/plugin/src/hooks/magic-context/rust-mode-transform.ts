@@ -29,6 +29,7 @@ import {
 import { writeRustTransformDecision } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
+import { resolvePromptSurface } from "../../shared/prompt-surface";
 import {
     resolveCtxReduceAvailability,
     resolveTodowriteAvailabilityFromMessages,
@@ -1017,6 +1018,10 @@ function buildTransformBody(args: {
         model_key: args.modelKey,
         provider_id: args.providerId,
         tool_present: args.passInputs.tool_present === true,
+        prompt_surface_preset: args.passInputs.prompt_surface_preset ?? "full",
+        prompt_surface_model_key: args.passInputs.prompt_surface_model_key,
+        prompt_surface_tool_descriptions:
+            args.passInputs.prompt_surface_tool_descriptions ?? {},
         effective_execute_threshold: args.passInputs.effective_execute_threshold,
         history_budget_tokens: args.passInputs.history_budget_tokens,
         clear_reasoning_age: args.passInputs.clear_reasoning_age,
@@ -1450,6 +1455,10 @@ export function createRustModeTransform(
                 overflowState.needsEmergencyRecovery &&
                 loadProtectedTailMeta(deps.db, sessionId).recoveryNoEligibleHeadCount >=
                     RECOVERY_NO_HEAD_LIMIT;
+            const promptSurface = resolvePromptSurface(
+                deps.promptSurface,
+                modelKey ?? undefined,
+            );
             const passInputs: Record<string, unknown> = {
                 now_ms: requestObservedAtMs,
                 model_key: modelKey,
@@ -1467,6 +1476,9 @@ export function createRustModeTransform(
                 system_prompt_hash: sessionMeta.systemPromptHash ?? "",
                 upgrade_state: readUpgradeState(deps.db, sessionId),
                 tool_present: toolPresent,
+                prompt_surface_preset: promptSurface.preset,
+                prompt_surface_model_key: modelKey,
+                prompt_surface_tool_descriptions: deps.promptSurface?.tool_descriptions ?? {},
                 protected_tags: deps.protectedTags ?? DEFAULT_PROTECTED_TAGS,
                 temporal_awareness: deps.experimentalTemporalAwareness === true,
                 channel2_nudge_state: getChannel2NudgeState(deps.db, sessionId),

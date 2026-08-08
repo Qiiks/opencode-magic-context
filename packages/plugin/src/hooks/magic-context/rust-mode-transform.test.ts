@@ -874,6 +874,9 @@ describe("Rust mode authority adapter", () => {
         expect(methods).toEqual(["state_sync", "transform"]);
         expect(transformRequest?.serve_native).toBe(true);
         expect(transformRequest?.tool_present).toBe(true);
+        expect(transformRequest?.prompt_surface_preset).toBe("full");
+        expect(transformRequest?.prompt_surface_model_key).toBeNull();
+        expect(transformRequest?.prompt_surface_tool_descriptions).toEqual({});
         expect(transformRequest?.native_messages).toBe(messages);
         expect(Array.isArray(transformRequest?.messages)).toBe(true);
         expect(output.messages).toEqual(native);
@@ -891,6 +894,45 @@ describe("Rust mode authority adapter", () => {
         expect((transformRequest?.messages as unknown[]).length).toBe(0);
         expect((transformRequest?.native_messages as unknown[]).length).toBe(0);
         expect(secondOutput.messages).toEqual(native);
+    });
+
+    it("forwards the model-routed prompt preset and description overrides", async () => {
+        const sessionId = `rust-prompt-surface-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installAvailabilityDb(sessionId, {});
+        installRawProvider(sessionId);
+        let transformRequest: Record<string, unknown> | undefined;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform") transformRequest = body as Record<string, unknown>;
+                return method === "transform"
+                    ? { native_messages: makeMessages(sessionId) }
+                    : { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.promptSurface = {
+            default: "full",
+            models: { "anthropic/opus": "light" },
+            tool_descriptions: { ctx_search: "Search the project memory index." },
+        };
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const messages = makeMessages(sessionId);
+        messages[0].info.model = { providerID: "anthropic", modelID: "opus" };
+
+        await transform.run(
+            sessionId,
+            messages,
+            { messages: messages as unknown[] },
+            makeMeta(db, sessionId),
+        );
+
+        expect(transformRequest?.prompt_surface_preset).toBe("light");
+        expect(transformRequest?.prompt_surface_model_key).toBe("anthropic/opus");
+        expect(transformRequest?.prompt_surface_tool_descriptions).toEqual({
+            ctx_search: "Search the project memory index.",
+        });
     });
 
     it("preserves the receiver for a class-backed compartment mirror client", async () => {

@@ -28,6 +28,7 @@ use crate::m1_compose::{
     M1RevisionReadTimings, M1RevisionSignal,
 };
 use crate::memory_render::M1_PLACEHOLDER;
+use crate::prompt_surface::{PromptSurfacePreset, PromptSurfaceSelection};
 use crate::scheduler::{
     self, BoundaryBypass, ContextUsage, DeferredExecute, ExecuteThresholdConfig, LatchState,
     SchedulerConfig, SchedulerInputs, SessionMeta, TailState,
@@ -541,6 +542,18 @@ pub struct TransformRequest {
     /// deliberately false so older callers stay on the dormant byte path.
     #[serde(default)]
     pub tool_present: bool,
+    /// Session-resolved prompt preset. Full is the wire default so older callers retain the
+    /// exact pre-prompt-surface identity.
+    #[serde(default)]
+    pub prompt_surface_preset: PromptSurfacePreset,
+    /// Optional epoch key used to freeze prompt-surface materialization. Production normally
+    /// sends the same provider/model key as `model_key`; the separate field lets callers avoid
+    /// coupling routing scope to the provider's opaque model identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_surface_model_key: Option<String>,
+    /// USER-tier top-level description replacements. IDs and schemas remain module-owned.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub prompt_surface_tool_descriptions: BTreeMap<String, String>,
     /// Ask the module to include an OpenCode-native rendering alongside canonical CK.
     /// Missing input is deliberately false so existing responses remain byte-identical.
     #[serde(default)]
@@ -673,6 +686,12 @@ struct TransformRequestWire {
     #[serde(default)]
     tool_present: bool,
     #[serde(default)]
+    prompt_surface_preset: PromptSurfacePreset,
+    #[serde(default)]
+    prompt_surface_model_key: Option<String>,
+    #[serde(default)]
+    prompt_surface_tool_descriptions: BTreeMap<String, String>,
+    #[serde(default)]
     serve_native: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     native_messages: Option<Vec<Value>>,
@@ -752,6 +771,9 @@ impl<'de> Deserialize<'de> for TransformRequest {
             caveman_enabled: wire.caveman_enabled,
             caveman_min_chars: wire.caveman_min_chars,
             tool_present: wire.tool_present,
+            prompt_surface_preset: wire.prompt_surface_preset,
+            prompt_surface_model_key: wire.prompt_surface_model_key,
+            prompt_surface_tool_descriptions: wire.prompt_surface_tool_descriptions,
             serve_native: wire.serve_native,
             native_messages: wire.native_messages,
             full_array_fingerprint: wire.full_array_fingerprint,
@@ -2029,8 +2051,12 @@ fn apply_once(
         0 => String::new(),
         epoch => format!("tfe{epoch}"),
     };
+    let prompt_surface_epoch = crate::prompt_surface::unified_content_epoch(
+        &req.system_prompt_hash,
+        &prompt_surface_selection(req),
+    );
     let effective_render_config = fold_m0_content_epoch(
-        &render_identity_base(req),
+        &render_identity_base(req, &prompt_surface_epoch),
         &M0ContentEpoch {
             workspace_fingerprint: store.workspace_fingerprint(ctx.project_path, ctx.now_ms)?,
             upgrade_state: req.upgrade_state.clone(),
@@ -2038,6 +2064,7 @@ fn apply_once(
             memory_render_epoch,
             compartment_render_epoch,
             profile_render_epoch,
+            prompt_surface_epoch,
             tagger_feature_epoch: tagger_feature_epoch.clone(),
         },
     );
@@ -4081,7 +4108,7 @@ fn render_config_base(render_config: &str) -> &str {
         .unwrap_or(render_config)
 }
 
-fn render_identity_base(req: &TransformRequest) -> String {
+fn render_identity_base(req: &TransformRequest, prompt_surface_epoch: &str) -> String {
     let mut parts = Vec::new();
     if !req.render_config.is_empty() {
         parts.push(req.render_config.clone());
@@ -4092,10 +4119,21 @@ fn render_identity_base(req: &TransformRequest) -> String {
     if let Some(model) = req.model_key.as_deref().filter(|value| !value.is_empty()) {
         parts.push(format!("model:{model}"));
     }
-    if !req.system_prompt_hash.is_empty() {
+    if prompt_surface_epoch.is_empty() && !req.system_prompt_hash.is_empty() {
         parts.push(format!("system:{}", req.system_prompt_hash));
     }
     parts.join("|")
+}
+
+fn prompt_surface_selection(req: &TransformRequest) -> PromptSurfaceSelection {
+    PromptSurfaceSelection {
+        model_key: req
+            .prompt_surface_model_key
+            .clone()
+            .or_else(|| req.model_key.clone()),
+        preset: req.prompt_surface_preset,
+        tool_descriptions: req.prompt_surface_tool_descriptions.clone(),
+    }
 }
 
 fn render_epoch_suffix(render_config: &str, ignore_upgrade: bool) -> String {
@@ -9706,6 +9744,9 @@ mod tests {
             caveman_enabled: false,
             caveman_min_chars: DEFAULT_CAVEMAN_MIN_CHARS,
             tool_present: false,
+            prompt_surface_preset: PromptSurfacePreset::Full,
+            prompt_surface_model_key: None,
+            prompt_surface_tool_descriptions: BTreeMap::new(),
             serve_native: false,
             native_messages: None,
             full_array_fingerprint: None,
@@ -18938,6 +18979,7 @@ mod tests {
                 memory_render_epoch: format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
                 compartment_render_epoch: format!("cre{}", crate::COMPARTMENT_RENDER_FORMAT_EPOCH),
                 profile_render_epoch: String::new(),
+                prompt_surface_epoch: String::new(),
                 tagger_feature_epoch: String::new(),
             },
         );
@@ -19095,6 +19137,7 @@ mod tests {
                 memory_render_epoch,
                 compartment_render_epoch,
                 profile_render_epoch,
+                prompt_surface_epoch: String::new(),
                 tagger_feature_epoch,
             },
         )
@@ -19208,6 +19251,7 @@ mod tests {
                         crate::COMPARTMENT_RENDER_FORMAT_EPOCH
                     ),
                     profile_render_epoch: String::new(),
+                    prompt_surface_epoch: String::new(),
                     tagger_feature_epoch: String::new(),
                 },
             ),
@@ -20255,6 +20299,96 @@ mod tests {
         assert!(
             matches!(drift, TransformError::IdentityDrift(ref mid) if mid == "sys0"),
             "covered system content drift must fail via IdentityDrift, got {drift:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_surface_preset_flip_takes_one_hard_then_freezes_defer_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let messages = vec![wire_item("user", "m1", 1, &["stable bytes"])];
+        let mut full = cc_req("prompt-preset-c6", "cfg", messages);
+        full.system_prompt_hash = "same-guidance-hash".to_string();
+        let baseline = run(&store, &full, &spine());
+        let steady = run(&store, &full, &spine());
+        assert_ne!(steady.action, "HARD");
+
+        let mut light = full.clone();
+        light.prompt_surface_preset = PromptSurfacePreset::Light;
+        let transition = run(&store, &light, &spine());
+        assert_eq!(transition.action, "HARD");
+        let transition_bytes = serde_json::to_vec(transition.messages()).unwrap();
+        assert_eq!(
+            transition_bytes,
+            serde_json::to_vec(baseline.messages()).unwrap()
+        );
+
+        let mut hard_count = 1;
+        for _ in 0..5 {
+            let defer = run(&store, &light, &spine());
+            hard_count += usize::from(defer.action == "HARD");
+            assert_eq!(
+                serde_json::to_vec(defer.messages()).unwrap(),
+                transition_bytes
+            );
+        }
+        assert_eq!(
+            hard_count, 1,
+            "one preset epoch may create only one HARD fold"
+        );
+    }
+
+    #[test]
+    fn guidance_and_manifest_changes_share_one_prompt_surface_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let messages = vec![wire_item("user", "m1", 1, &["stable bytes"])];
+        let mut full = cc_req("prompt-unified-r5", "cfg", messages);
+        full.system_prompt_hash = "guidance-full".to_string();
+        run(&store, &full, &spine());
+        run(&store, &full, &spine());
+
+        let mut changed = full.clone();
+        changed.system_prompt_hash = "guidance-light".to_string();
+        changed.prompt_surface_preset = PromptSurfacePreset::Light;
+        changed.prompt_surface_tool_descriptions.insert(
+            "ctx_search".to_string(),
+            "Search override for the new model epoch.".to_string(),
+        );
+        let full_selection = prompt_surface_selection(&full);
+        let changed_selection = prompt_surface_selection(&changed);
+        assert_ne!(
+            crate::prompt_surface::guidance_content_hash(
+                crate::prompt_surface::GUIDANCE_FULL_PRIMARY,
+                full_selection.preset,
+            ),
+            crate::prompt_surface::guidance_content_hash(
+                crate::prompt_surface::GUIDANCE_FULL_PRIMARY,
+                changed_selection.preset,
+            )
+        );
+        assert_ne!(
+            crate::prompt_surface::manifest_content_epoch(&full_selection),
+            crate::prompt_surface::manifest_content_epoch(&changed_selection)
+        );
+
+        let first = run(&store, &changed, &spine());
+        assert_eq!(first.action, "HARD");
+        let folded = &store
+            .load("prompt-unified-r5")
+            .unwrap()
+            .meta
+            .last_render_config;
+        assert_eq!(folded.matches("pse:").count(), 1);
+        assert!(!folded.contains("system:"));
+        assert!(!folded.contains("manifest:"));
+        assert!(!folded.contains("guidance:"));
+
+        let replay = run(&store, &changed, &spine());
+        assert_ne!(replay.action, "HARD");
+        assert_eq!(
+            serde_json::to_vec(first.messages()).unwrap(),
+            serde_json::to_vec(replay.messages()).unwrap()
         );
     }
 

@@ -78,6 +78,10 @@ pub struct M0ContentEpoch {
     /// identity, preserving byte-identical effective render_config strings for profiles
     /// whose serializer epoch is still zero.
     pub profile_render_epoch: String,
+    /// Stores guidance and tool-manifest identities in one component for the selected prompt
+    /// surface. A model-key change therefore activates both together during cache invalidation.
+    /// Empty preserves the legacy behavior for full prompts without overrides.
+    pub prompt_surface_epoch: String,
     /// The visible tagger surface epoch. A non-zero value coordinates the cache-breaking
     /// HARD fold that introduces tag bytes; empty epoch zero is omitted so the current
     /// disabled surface leaves every existing effective render identity byte-identical.
@@ -110,6 +114,9 @@ pub fn fold_m0_content_epoch(base_render_config: &str, epoch: &M0ContentEpoch) -
     }
     if !epoch.profile_render_epoch.is_empty() {
         parts.push(part("mpe", &epoch.profile_render_epoch));
+    }
+    if !epoch.prompt_surface_epoch.is_empty() {
+        parts.push(part("pse", &epoch.prompt_surface_epoch));
     }
     if !epoch.tagger_feature_epoch.is_empty() {
         parts.push(part("tfe", &epoch.tagger_feature_epoch));
@@ -271,6 +278,7 @@ mod tests {
             memory_render_epoch: String::new(),
             compartment_render_epoch: String::new(),
             profile_render_epoch: String::new(),
+            prompt_surface_epoch: String::new(),
             tagger_feature_epoch: String::new(),
         };
         let folded = fold_m0_content_epoch(base, &epoch);
@@ -293,6 +301,10 @@ mod tests {
             "profile epoch zero must not add a component"
         );
         assert!(
+            !folded.contains("pse:"),
+            "default prompt surface must leave the identity byte-identical"
+        );
+        assert!(
             !folded.contains("tfe:"),
             "tagger epoch zero must leave the identity byte-identical"
         );
@@ -313,6 +325,12 @@ mod tests {
         let profile_folded = fold_m0_content_epoch(base, &profile_epoch);
         assert!(profile_folded.contains("mpe:4:mpe1"));
         assert_ne!(folded, profile_folded);
+
+        let mut prompt_surface_epoch = epoch.clone();
+        prompt_surface_epoch.prompt_surface_epoch = "ps1".into();
+        let prompt_surface_folded = fold_m0_content_epoch(base, &prompt_surface_epoch);
+        assert!(prompt_surface_folded.contains("pse:3:ps1"));
+        assert_ne!(folded, prompt_surface_folded);
 
         let mut tagger_epoch = epoch.clone();
         tagger_epoch.tagger_feature_epoch = "tfe1".into();

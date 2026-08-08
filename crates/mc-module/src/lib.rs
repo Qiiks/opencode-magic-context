@@ -37,12 +37,13 @@ pub mod m1_compose;
 pub mod memory_render;
 pub mod memory_tool;
 pub mod project_docs;
+pub mod prompt_surface;
 pub mod scheduler;
 pub mod selection;
 pub mod session_resolver;
 pub mod transform;
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -90,6 +91,7 @@ use historian_chunk::{
     HistorianAssemblerConfig,
 };
 use historian_producer::{HistorianProducer, HistorianProducerConfig, HistorianProducerError};
+use prompt_surface::{PromptSurfacePreset, PromptSurfaceSelection};
 use scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT;
 use selection::SelKind;
 #[cfg(test)]
@@ -97,10 +99,12 @@ use session_resolver::ResolvedSession;
 use session_resolver::{
     MissingSessionResolver, RealSessionResolver, SessionResolveError, SessionResolver,
 };
+#[cfg(test)]
+use subc_protocol::manifest::ExecutionMode;
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, ConsumerRole, ExecutionMode, IdentityBinding, IdentityScope,
-        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+        Bindings, Concurrency, ConsumerRole, IdentityBinding, IdentityScope, ModuleManifest,
+        ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
     },
     ModuleHelloAckBody, PROTOCOL_VERSION,
 };
@@ -224,13 +228,8 @@ pub const fn tagger_feature_epoch(tagging_surface_active: bool) -> u32 {
 
 /// Storage namespace for the cache-state domain.
 const STORAGE_NAMESPACE: &str = "mc_cache";
-const GUIDANCE_TEXT: &str = include_str!("../assets/guidance_primary.txt");
-/// Guidance variant for surfaces where ctx_reduce is not callable: the tagging and
-/// reduction sections are removed entirely, because instructing the model to reduce
-/// with a tool it cannot reach is a model-facing coherence bug. Consumers pick the
-/// variant that matches the live tool surface; the two variants have different
-/// content hashes, so a surface widening folds the prefix by construction.
-const GUIDANCE_TEXT_NO_REDUCE: &str = include_str!("../assets/guidance_no_reduce.txt");
+#[cfg(test)]
+const GUIDANCE_TEXT: &str = prompt_surface::GUIDANCE_FULL_PRIMARY;
 const CTX_REDUCE_ACKNOWLEDGEMENT: &str = "Queued for context compaction.";
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.enabled default.
 const DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED: bool = true;
@@ -1866,6 +1865,7 @@ pub struct McHandler {
     boundary_tokens: Mutex<BoundaryTokenCache>,
     scheduler_observations: Mutex<HashMap<String, SchedulerObservation>>,
     guidance_dates: Mutex<HashMap<String, String>>,
+    prompt_surface_epochs: Mutex<HashMap<String, PromptSurfaceSelection>>,
     #[cfg(test)]
     guidance_now_ms: Mutex<Option<i64>>,
     #[cfg(test)]
@@ -2295,6 +2295,7 @@ impl McHandler {
             boundary_tokens: Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES)),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
+            prompt_surface_epochs: Mutex::new(HashMap::new()),
             #[cfg(test)]
             guidance_now_ms: Mutex::new(None),
             #[cfg(test)]
@@ -2386,6 +2387,7 @@ impl McHandler {
             boundary_tokens: Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES)),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
+            prompt_surface_epochs: Mutex::new(HashMap::new()),
             guidance_now_ms: Mutex::new(None),
             reduction_injection: Mutex::new(HashMap::new()),
             between_transform_and_prepare: Mutex::new(None),
@@ -2456,6 +2458,10 @@ impl McHandler {
             self.boundary_tokens
                 .lock()
                 .expect("boundary token cache mutex")
+                .remove(&session_id);
+            self.prompt_surface_epochs
+                .lock()
+                .expect("prompt surface epoch mutex")
                 .remove(&session_id);
         }
     }
@@ -2636,6 +2642,10 @@ impl McHandler {
             self.boundary_tokens
                 .lock()
                 .expect("boundary token cache mutex")
+                .remove(&session);
+            self.prompt_surface_epochs
+                .lock()
+                .expect("prompt surface epoch mutex")
                 .remove(&session);
         }
     }
@@ -5597,6 +5607,123 @@ impl McHandler {
         }
     }
 
+    fn freeze_prompt_surface_selection(
+        &self,
+        session_id: &str,
+        requested: PromptSurfaceSelection,
+    ) -> PromptSurfaceSelection {
+        let mut epochs = self
+            .prompt_surface_epochs
+            .lock()
+            .expect("prompt surface epoch mutex");
+        if let Some(frozen) = epochs.get(session_id) {
+            if frozen.model_key == requested.model_key {
+                return frozen.clone();
+            }
+        }
+        epochs.insert(session_id.to_string(), requested.clone());
+        requested
+    }
+
+    fn prompt_surface_selection_from_value(
+        &self,
+        request: &Value,
+    ) -> Result<PromptSurfaceSelection, HandlerOutcome> {
+        let preset = match request
+            .get("preset")
+            .or_else(|| request.get("prompt_surface_preset"))
+        {
+            None | Some(Value::Null) => PromptSurfacePreset::Full,
+            Some(Value::String(value)) if value == "full" => PromptSurfacePreset::Full,
+            Some(Value::String(value)) if value == "light" => PromptSurfacePreset::Light,
+            _ => {
+                return Err(invalid_params_error(
+                    "prompt_surface preset must be \"full\" or \"light\"",
+                ))
+            }
+        };
+        let model_key = request
+            .get("prompt_surface_model_key")
+            .or_else(|| request.get("model_key"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let descriptions = request
+            .get("tool_descriptions")
+            .or_else(|| request.get("prompt_surface_tool_descriptions"));
+        let mut tool_descriptions = BTreeMap::new();
+        if let Some(value) = descriptions.filter(|value| !value.is_null()) {
+            let Some(object) = value.as_object() else {
+                return Err(invalid_params_error(
+                    "prompt_surface tool_descriptions must be an object",
+                ));
+            };
+            for (tool_id, description) in object {
+                if !prompt_surface::is_known_tool_id(tool_id) {
+                    return Err(invalid_params_error(format!(
+                        "prompt_surface tool_descriptions contains unknown tool {tool_id:?}"
+                    )));
+                }
+                let Some(description) = description.as_str() else {
+                    return Err(invalid_params_error(format!(
+                        "prompt_surface tool_descriptions.{tool_id} must be a string"
+                    )));
+                };
+                if description.trim().is_empty() {
+                    return Err(invalid_params_error(format!(
+                        "prompt_surface tool_descriptions.{tool_id} must not be empty"
+                    )));
+                }
+                tool_descriptions.insert(tool_id.clone(), description.to_string());
+            }
+        }
+        Ok(PromptSurfaceSelection {
+            model_key,
+            preset,
+            tool_descriptions,
+        })
+    }
+
+    fn handle_prompt_surface_manifest_value(
+        &self,
+        channel: u16,
+        request: &Value,
+    ) -> HandlerOutcome {
+        let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
+            return invalid_params_error("manifest.get requires session_id");
+        };
+        if let Err(error) = self.resolve_binding(channel, session_id) {
+            return match error {
+                BindingError::Unbound => HandlerOutcome::Error {
+                    code: "route_unbound".to_string(),
+                    message: "manifest.get on a channel with no session binding".to_string(),
+                },
+                BindingError::SessionMismatch => HandlerOutcome::Error {
+                    code: "session_mismatch".to_string(),
+                    message: "request session_id does not match the channel's bound session"
+                        .to_string(),
+                },
+            };
+        }
+        let requested = match self.prompt_surface_selection_from_value(request) {
+            Ok(selection) => selection,
+            Err(error) => return error,
+        };
+        let selection = self.freeze_prompt_surface_selection(session_id, requested);
+        let tools = prompt_surface::session_tools(&selection);
+        respond(json!({
+            "ok": true,
+            "preset": selection.preset.as_str(),
+            "served_preset": "full",
+            "preset_fallback": prompt_surface::tool_manifest_falls_back(selection.preset),
+            "fallback_notice": prompt_surface::tool_manifest_falls_back(selection.preset)
+                .then_some(prompt_surface::LIGHT_FALLBACK_NOTICE),
+            "content_epoch": prompt_surface::manifest_content_epoch(&selection),
+            "tools": tools,
+        }))
+    }
+
     fn handle_guidance_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
@@ -5641,6 +5768,11 @@ impl McHandler {
                 None => return unknown_serializer_profile_error(),
             },
         };
+        let requested_selection = match self.prompt_surface_selection_from_value(request) {
+            Ok(selection) => selection,
+            Err(error) => return error,
+        };
+        let selection = self.freeze_prompt_surface_selection(session_id, requested_selection);
         let active = cc_u1_active(profile, tool_present);
         let expected_variant = if active { "full" } else { "no_reduce" };
         if let Some(variant) = request.get("variant").and_then(Value::as_str) {
@@ -5662,11 +5794,13 @@ impl McHandler {
                 }
             }
         };
-        let base_text = if active {
-            GUIDANCE_TEXT
+        let variant = if active {
+            prompt_surface::GuidanceVariant::Full
         } else {
-            GUIDANCE_TEXT_NO_REDUCE
+            prompt_surface::GuidanceVariant::NoReduce
         };
+        let asset = prompt_surface::guidance_asset(selection.preset, variant);
+        let base_text = asset.bytes;
         let language_text = request
             .get("language")
             .and_then(Value::as_str)
@@ -5682,11 +5816,16 @@ impl McHandler {
             "ok": true,
             "bytes": bytes,
             "hash": sha256_hex(bytes.as_bytes()),
-            // The guidance text is the only part reflected in render_config. The session
-            // date line changes every day, so content_hash excludes it; otherwise a
-            // date-only change would trigger cache refreshes even when guidance is
-            // unchanged.
-            "content_hash": sha256_hex(text_for_bytes.as_bytes()),
+            // The date line changes every day, so content_hash excludes it. The selected
+            // preset remains semantic identity even while light falls back to full bytes.
+            "content_hash": prompt_surface::guidance_content_hash(text_for_bytes, selection.preset),
+            "preset": selection.preset.as_str(),
+            "served_preset": "full",
+            "preset_fallback": asset.fallback,
+            "fallback_notice": asset.fallback.then_some(prompt_surface::LIGHT_FALLBACK_NOTICE),
+            "manifest_content_epoch": prompt_surface::manifest_content_epoch(&selection),
+            "manifest_preset_fallback": prompt_surface::tool_manifest_falls_back(selection.preset),
+            "tool_manifest": prompt_surface::session_tools(&selection),
         }))
     }
 
@@ -5921,6 +6060,32 @@ impl McHandler {
                 }
             }
         };
+        for (tool_id, description) in &parsed.prompt_surface_tool_descriptions {
+            if !prompt_surface::is_known_tool_id(tool_id) {
+                return invalid_params_error(format!(
+                    "prompt_surface tool_descriptions contains unknown tool {tool_id:?}"
+                ));
+            }
+            if description.trim().is_empty() {
+                return invalid_params_error(format!(
+                    "prompt_surface tool_descriptions.{tool_id} must not be empty"
+                ));
+            }
+        }
+        let requested_prompt_surface = PromptSurfaceSelection {
+            model_key: parsed
+                .prompt_surface_model_key
+                .clone()
+                .or_else(|| parsed.model_key.clone()),
+            preset: parsed.prompt_surface_preset,
+            tool_descriptions: parsed.prompt_surface_tool_descriptions.clone(),
+        };
+        let frozen_prompt_surface =
+            self.freeze_prompt_surface_selection(&parsed.session_id, requested_prompt_surface);
+        parsed.prompt_surface_preset = frozen_prompt_surface.preset;
+        parsed.prompt_surface_model_key = frozen_prompt_surface.model_key;
+        parsed.prompt_surface_tool_descriptions = frozen_prompt_surface.tool_descriptions;
+
         let lineage_root = canonical_root(&binding.project_root);
         self.transform_route_channels
             .lock()
@@ -9077,6 +9242,7 @@ impl McHandler {
                 | "authority.drain_finish" => self.handle_authority_drain_value(&request, method),
                 "mirror.pull" => self.handle_mirror_pull_value(&request),
                 "guidance.get" => self.handle_guidance_value(channel, &request),
+                "manifest.get" => self.handle_prompt_surface_manifest_value(channel, &request),
                 "dreamer.run_task" => self.handle_dreamer_run_task(channel, &request).await,
                 // Handle transform requests: decode the incoming context array, update
                 // cache state, and return the rewritten array for the caller.
@@ -11198,8 +11364,8 @@ fn ctx_note_schema() -> Value {
     })
 }
 
-/// The module manifest registered at HELLO. Slice-1 declares the transform provider
-/// role + a project-scoped sqlite storage binding; the surface widens with the spine.
+/// The module manifest registered at HELLO. The startup manifest owns stable tool IDs and schemas;
+/// bound sessions obtain preset-selected description text through `manifest.get`.
 pub fn manifest(module_id: &str) -> ModuleManifest {
     ModuleManifest {
         module_id: module_id.to_string(),
@@ -11207,64 +11373,7 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
         protocol_ver: PROTOCOL_VERSION,
         trust_tier: TrustTier::FirstParty,
         provides: vec![ProviderRole::ToolProvider {
-            tools: vec![
-                Tool {
-                    name: "transform".to_string(),
-                    description: Some(
-                        "Cache-stable context transform: folds compacted history into m0/m1 and applies frozen reductions".to_string(),
-                    ),
-                    execution_mode: ExecutionMode::Pure,
-                    schema: json!({ "type": "object" }),
-                },
-                Tool {
-                    name: "ctx_reduce".to_string(),
-                    description: Some(
-                        "Acknowledge a tagged reduction request for asynchronous delivery".to_string(),
-                    ),
-                    execution_mode: ExecutionMode::Pure,
-                    // The ADVERTISED schema must stay byte-canonical: Thalamus's
-                    // authorizer (authorized_ctx_reduce_tool) exact-matches this shape
-                    // and fails closed on ANY deviation, silently disabling the whole
-                    // tagging surface (tool_present=false → no tags, no reclaim). The
-                    // accept-don't-advertise posture for imitated args (reduced/summary)
-                    // lives in the EXECUTION unwrap, never here — loosening this schema
-                    // to "tolerate unknown args" killed CC-leg ctx_reduce fleet-wide for
-                    // two days (drift authored 2026-07-23, caught on first rig traffic
-                    // 2026-07-25 because prod CC was dark the whole window).
-                    schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "drop": { "type": "string" }
-                        },
-                        "required": ["drop"],
-                        "additionalProperties": false
-                    }),
-                },
-                Tool {
-                    name: "ctx_memory".to_string(),
-                    description: Some(ctx_memory_description()),
-                    execution_mode: ExecutionMode::Mutating,
-                    schema: ctx_memory_schema(),
-                },
-                Tool {
-                    name: "ctx_search".to_string(),
-                    description: Some(ctx_search_description()),
-                    execution_mode: ExecutionMode::Pure,
-                    schema: ctx_search_schema(),
-                },
-                Tool {
-                    name: "ctx_expand".to_string(),
-                    description: Some(ctx_expand_description()),
-                    execution_mode: ExecutionMode::Pure,
-                    schema: ctx_expand_schema(),
-                },
-                Tool {
-                    name: "ctx_note".to_string(),
-                    description: Some(ctx_note_description()),
-                    execution_mode: ExecutionMode::Mutating,
-                    schema: ctx_note_schema(),
-                },
-            ],
+            tools: prompt_surface::module_tools(&PromptSurfaceSelection::default()),
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
             concurrency: Concurrency::ModuleManaged,
             emits_push: false,
@@ -11877,6 +11986,18 @@ mod tests {
         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
             panic!("magic-context must expose a tool provider role");
         };
+        assert_eq!(
+            tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+            vec![
+                "transform",
+                "ctx_reduce",
+                "ctx_memory",
+                "ctx_expand",
+                "ctx_search",
+                "ctx_note",
+            ],
+            "the default startup manifest keeps its legacy byte order"
+        );
         let by_name = tools
             .iter()
             .map(|tool| (tool.name.as_str(), tool))
@@ -12872,7 +12993,15 @@ mod tests {
     }
 
     async fn call_dispatch_request(handler: &McHandler, request: Value) -> Value {
-        match handler.dispatch_value(7, request).await {
+        call_dispatch_request_on_channel(handler, 7, request).await
+    }
+
+    async fn call_dispatch_request_on_channel(
+        handler: &McHandler,
+        channel: u16,
+        request: Value,
+    ) -> Value {
+        match handler.dispatch_value(channel, request).await {
             HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
             other => panic!("unexpected handler outcome: {other:?}"),
         }
@@ -13781,6 +13910,153 @@ mod tests {
             )
             .await;
         assert_eq!(error_code(contradictory), "bad_request");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn guidance_presets_cover_both_variants_with_byte_identical_light_fallback() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        for (offset, tool_present) in [false, true].into_iter().enumerate() {
+            let base_channel = 20 + (offset as u16 * 3);
+            let variant = if tool_present { "full" } else { "no_reduce" };
+            let sessions = [
+                format!("preset-omitted-{offset}"),
+                format!("preset-full-{offset}"),
+                format!("preset-light-{offset}"),
+            ];
+            for (index, session) in sessions.iter().enumerate() {
+                handler.bind_route(
+                    base_channel + index as u16,
+                    binding("/tmp/project", session),
+                );
+                handler
+                    .guidance_dates
+                    .lock()
+                    .unwrap()
+                    .insert(session.clone(), "Today's date: Fri Jan 01 2016".to_string());
+            }
+            let omitted = call_dispatch_request_on_channel(
+                &handler,
+                base_channel,
+                json!({
+                    "kind": "guidance.get",
+                    "session_id": sessions[0],
+                    "serializer_profile": "claude-code-anthropic",
+                    "tool_present": tool_present,
+                    "variant": variant,
+                }),
+            )
+            .await;
+            let explicit_full = call_dispatch_request_on_channel(
+                &handler,
+                base_channel + 1,
+                json!({
+                    "kind": "guidance.get",
+                    "session_id": sessions[1],
+                    "serializer_profile": "claude-code-anthropic",
+                    "tool_present": tool_present,
+                    "variant": variant,
+                    "preset": "full",
+                }),
+            )
+            .await;
+            let light = call_dispatch_request_on_channel(
+                &handler,
+                base_channel + 2,
+                json!({
+                    "kind": "guidance.get",
+                    "session_id": sessions[2],
+                    "serializer_profile": "claude-code-anthropic",
+                    "tool_present": tool_present,
+                    "variant": variant,
+                    "preset": "light",
+                }),
+            )
+            .await;
+
+            assert_eq!(omitted["bytes"], explicit_full["bytes"]);
+            assert_eq!(omitted["bytes"], light["bytes"]);
+            assert_eq!(omitted["hash"], explicit_full["hash"]);
+            assert_eq!(omitted["hash"], light["hash"]);
+            assert_eq!(omitted["content_hash"], explicit_full["content_hash"]);
+            assert_ne!(omitted["content_hash"], light["content_hash"]);
+            assert_eq!(omitted["preset_fallback"], false);
+            assert_eq!(light["preset_fallback"], true);
+            assert_eq!(light["served_preset"], "full");
+            assert_eq!(
+                light["fallback_notice"],
+                prompt_surface::LIGHT_FALLBACK_NOTICE
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_manifest_freezes_per_model_epoch_and_keeps_ids_and_schemas_stable() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        handler.bind_route(30, binding("/tmp/project", "manifest-ses"));
+        let first = call_dispatch_request_on_channel(
+            &handler,
+            30,
+            json!({
+                "kind": "manifest.get",
+                "session_id": "manifest-ses",
+                "model_key": "provider/model-a",
+                "preset": "light",
+                "tool_descriptions": { "ctx_search": "Search override A." },
+            }),
+        )
+        .await;
+        let frozen = call_dispatch_request_on_channel(
+            &handler,
+            30,
+            json!({
+                "kind": "manifest.get",
+                "session_id": "manifest-ses",
+                "model_key": "provider/model-a",
+                "preset": "full",
+                "tool_descriptions": { "ctx_search": "Ignored mid-epoch override." },
+            }),
+        )
+        .await;
+        assert_eq!(
+            frozen, first,
+            "defer-equivalent reads must use frozen materialization"
+        );
+
+        let transitioned = call_dispatch_request_on_channel(
+            &handler,
+            30,
+            json!({
+                "kind": "manifest.get",
+                "session_id": "manifest-ses",
+                "model_key": "provider/model-b",
+                "preset": "full",
+                "tool_descriptions": { "ctx_search": "Search override B." },
+            }),
+        )
+        .await;
+        assert_ne!(transitioned["content_epoch"], first["content_epoch"]);
+        assert_eq!(transitioned["preset"], "full");
+        assert_eq!(transitioned["preset_fallback"], false);
+        assert_eq!(
+            transitioned["tools"][3]["description"],
+            "Search override B."
+        );
+
+        let expected_tools = prompt_surface::session_tools(&PromptSurfaceSelection::default());
+        for response in [&first, &transitioned] {
+            let response_tools = serde_json::from_value::<Vec<subc_protocol::manifest::Tool>>(
+                response["tools"].clone(),
+            )
+            .unwrap();
+            assert_eq!(response_tools.len(), expected_tools.len());
+            for (actual, expected) in response_tools.iter().zip(&expected_tools) {
+                assert_eq!(actual.name, expected.name);
+                assert_eq!(actual.schema, expected.schema);
+                assert_eq!(actual.execution_mode, expected.execution_mode);
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
