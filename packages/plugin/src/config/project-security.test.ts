@@ -48,6 +48,26 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(warnings.some((w) => w.includes("output_reserve"))).toBe(true);
     });
 
+    it("strips prompt-surface text overrides but keeps project routing", () => {
+        const raw: Record<string, unknown> = {
+            prompt_surface: {
+                default: "light",
+                models: { "openai/*": "full" },
+                guidance_override_path: "/repo/guidance.md",
+                tool_descriptions: { ctx_search: "repo-controlled text" },
+            },
+        };
+
+        const warnings = stripUnsafeProjectConfigFields(raw);
+
+        expect(raw.prompt_surface).toEqual({
+            default: "light",
+            models: { "openai/*": "full" },
+        });
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]).toContain("prompt_surface.guidance_override_path/tool_descriptions");
+    });
+
     it("strips language from project config", () => {
         const raw: Record<string, unknown> = { language: "tr", dreamer: { model: "x" } };
         const warnings = stripUnsafeProjectConfigFields(raw);

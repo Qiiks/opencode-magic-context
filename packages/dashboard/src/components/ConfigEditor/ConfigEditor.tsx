@@ -447,6 +447,7 @@ function ConfigForm(props: {
       "system_prompt_injection",
       "caveman_text_compression",
       "mural",
+      "prompt_surface",
     ]) {
       if (typeof formData()[key] === "object" && formData()[key] != null) {
         merged[key] = {
@@ -1149,6 +1150,150 @@ function ConfigForm(props: {
               );
             }}
           </For>
+
+          {/* Prompt surface is editable in both scopes for routing. Override text
+              is shown but locked for project config because the runtime removes
+              those user-only fields before merging repository settings. */}
+          {(() => {
+            const promptSurface = () =>
+              (getNestedValue(formData(), "prompt_surface") as
+                | Record<string, unknown>
+                | undefined) ?? {};
+            const userScope = () => (props.scope ?? "user") === "user";
+            const [modelsDraft, setModelsDraft] = createSignal<string | undefined>();
+            const [toolsDraft, setToolsDraft] = createSignal<string | undefined>();
+            const defaultPreset = () => (promptSurface().default === "light" ? "light" : "full");
+            const modelsJson = () =>
+              JSON.stringify(
+                (promptSurface().models as Record<string, unknown> | undefined) ?? {},
+                null,
+                2,
+              );
+            const toolsJson = () =>
+              JSON.stringify(
+                (promptSurface().tool_descriptions as Record<string, unknown> | undefined) ?? {},
+                null,
+                2,
+              );
+            const modelsEditorValue = () => modelsDraft() ?? modelsJson();
+            const toolsEditorValue = () => toolsDraft() ?? toolsJson();
+            const parseObject = (text: string): Record<string, unknown> | undefined => {
+              try {
+                const value = parseJsonc(text);
+                return value && typeof value === "object" && !Array.isArray(value)
+                  ? (value as Record<string, unknown>)
+                  : undefined;
+              } catch {
+                return undefined;
+              }
+            };
+            const setPromptSurface = (patch: Record<string, unknown>) =>
+              handleFieldChange("prompt_surface", { ...promptSurface(), ...patch });
+
+            return (
+              <div class="config-card full-width">
+                <div class="config-card-header">
+                  <span class="config-card-icon">🪄</span>
+                  <span class="config-card-title">Prompt Surface</span>
+                </div>
+                <div class="config-card-content">
+                  <div
+                    class="config-field-desc"
+                    style={{ "margin-bottom": "8px", opacity: "0.85" }}
+                  >
+                    Choose the built-in full or light preset. Model routes use the literal
+                    provider/model or provider/* form and are case-sensitive; additional slashes in
+                    model IDs are preserved. Guidance and tool-description overrides are user-only.
+                  </div>
+                  <div class="config-field">
+                    <div class="config-field-header">
+                      <span class="config-field-label">Default preset</span>
+                      <span class="config-field-key">prompt_surface.default</span>
+                    </div>
+                    <select
+                      class="config-input"
+                      value={defaultPreset()}
+                      onChange={(e) => setPromptSurface({ default: e.currentTarget.value })}
+                    >
+                      <option value="full">full</option>
+                      <option value="light">light</option>
+                    </select>
+                  </div>
+                  <div class="config-field">
+                    <div class="config-field-header">
+                      <span class="config-field-label">Model routes</span>
+                      <span class="config-field-key">prompt_surface.models</span>
+                    </div>
+                    <span class="config-field-desc">
+                      JSON object of provider/model or provider/* keys to full or light. Leave empty
+                      for default routing.
+                    </span>
+                    <textarea
+                      class="code-editor"
+                      rows={4}
+                      value={modelsEditorValue()}
+                      onInput={(e) => {
+                        const value = e.currentTarget.value;
+                        setModelsDraft(value);
+                        const next = parseObject(value);
+                        if (next) {
+                          setPromptSurface({ models: next });
+                          setModelsDraft(undefined);
+                        }
+                      }}
+                    />
+                  </div>
+                  <div class="config-field">
+                    <div class="config-field-header">
+                      <span class="config-field-label">Guidance override path</span>
+                      <span class="config-field-key">prompt_surface.guidance_override_path</span>
+                    </div>
+                    <span class="config-field-desc">
+                      User-only path to a complete primary guidance section. Relative paths resolve
+                      from the user config file.
+                    </span>
+                    <input
+                      class="config-input"
+                      type="text"
+                      disabled={!userScope()}
+                      value={String(promptSurface().guidance_override_path ?? "")}
+                      placeholder={userScope() ? "path/to/guidance.md" : "user config only"}
+                      onInput={(e) =>
+                        setPromptSurface({
+                          guidance_override_path: e.currentTarget.value || undefined,
+                        })
+                      }
+                    />
+                  </div>
+                  <div class="config-field">
+                    <div class="config-field-header">
+                      <span class="config-field-label">Tool-description overrides</span>
+                      <span class="config-field-key">prompt_surface.tool_descriptions</span>
+                    </div>
+                    <span class="config-field-desc">
+                      User-only JSON object keyed by tool ID. Only top-level descriptions change;
+                      IDs, parameter schemas, and parameter descriptions remain fixed.
+                    </span>
+                    <textarea
+                      class="code-editor"
+                      rows={4}
+                      disabled={!userScope()}
+                      value={toolsEditorValue()}
+                      onInput={(e) => {
+                        const value = e.currentTarget.value;
+                        setToolsDraft(value);
+                        const next = parseObject(value);
+                        if (next) {
+                          setPromptSurface({ tool_descriptions: next });
+                          setToolsDraft(undefined);
+                        }
+                      }}
+                    />
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
 
           {/* ── Agent Configuration Cards ───────────────────────── */}
 

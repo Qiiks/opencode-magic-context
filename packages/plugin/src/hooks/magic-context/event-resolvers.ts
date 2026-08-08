@@ -6,6 +6,7 @@ import {
 import { escalationBands, MAX_EXECUTE_THRESHOLD } from "../../shared/escalation-bands";
 import { log, sessionLog } from "../../shared/logger";
 import { getSdkContextLimit, isSaneLimit } from "../../shared/models-dev-cache";
+import { resolveModelConfigOrDefault } from "../../shared/prompt-surface";
 
 export { escalationBands, MAX_EXECUTE_THRESHOLD };
 export const DEFAULT_CONTEXT_LIMIT = 128_000;
@@ -129,18 +130,7 @@ export function resolveCacheTtl(cacheTtl: CacheTtlConfig, modelKey: string | und
         return cacheTtl;
     }
 
-    if (modelKey && typeof cacheTtl[modelKey] === "string") {
-        return cacheTtl[modelKey];
-    }
-
-    if (modelKey) {
-        const bareModelId = modelKey.split("/").slice(1).join("/");
-        if (bareModelId && typeof cacheTtl[bareModelId] === "string") {
-            return cacheTtl[bareModelId];
-        }
-    }
-
-    return cacheTtl.default ?? "5m";
+    return resolveModelConfigOrDefault(cacheTtl, modelKey, cacheTtl.default ?? "5m");
 }
 
 type ExecuteThresholdConfig = number | { default: number; [modelKey: string]: number };

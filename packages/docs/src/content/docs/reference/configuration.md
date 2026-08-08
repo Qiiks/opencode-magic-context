@@ -7,7 +7,7 @@ description: Every magic-context.jsonc key, with types, defaults, and where to p
     packages/plugin/src/config/schema/magic-context.ts; regenerate with
     `bun packages/plugin/scripts/build-config-docs.ts`. -->
 
-Magic Context reads `magic-context.jsonc` (or `.json`) from one shared CortexKit location, the same for both harnesses. Project config overrides user config, key by key.
+Magic Context reads `magic-context.jsonc` (or `.json`) from one shared CortexKit location, the same for both harnesses. Project config overrides user config, key by key. Prompt-surface routing is shared by both harnesses; project config may select `default` and `models`, while `guidance_override_path` and `tool_descriptions` are stripped at the project trust boundary.
 
 - **Project** — `<project>/.cortexkit/magic-context.jsonc`
 - **User-wide** — `~/.config/cortexkit/magic-context.jsonc`
@@ -43,6 +43,18 @@ Global on/off switches for the plugin and its agent-facing surface.
 | `mural` | object | — | Experimental mural: a single deterministically-rendered image of project memories that did not fit the context budget. Cues are compressed per-memory by the compress-cues dreamer task. |
 | `mural.enabled` | boolean | `false` |  |
 | `mural.model` | string | — | Model for the compress-cues task that compresses each memory into a mural cue. The mural image itself is rendered deterministically (no author model). |
+
+## Prompt surface
+
+Select the full or light built-in prompt preset. Model routes use the same progressive lookup walk as `cache_ttl`, with literal case-sensitive `provider/model` keys and the `provider/*` wildcard; guidance and tool-description overrides are user-level only.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `prompt_surface` | object | — | Prompt-surface presets: default is full; models use the literal provider/model or provider/* routing grammar. Guidance and tool-description overrides are user-level only. |
+| `prompt_surface.default` | `"full"` \\| `"light"` | `"full"` | Fallback prompt-surface preset ("full" or "light"). |
+| `prompt_surface.models` | map<string, `"full"` \\| `"light"`> | — | Literal per-model routing. Keys are provider/model or provider/*; matching is case-sensitive and preserves additional slashes in model IDs. |
+| `prompt_surface.guidance_override_path` | string | — | USER-LEVEL ONLY path to a complete primary guidance section. Relative paths resolve from the user config file. |
+| `prompt_surface.tool_descriptions` | map<string, string> | — | USER-LEVEL ONLY top-level description overrides keyed by ctx_* tool ID; parameter schemas and descriptions are unchanged. |
 
 ## Context management
 

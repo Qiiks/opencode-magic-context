@@ -52,6 +52,39 @@ Add `$schema` to your config file for autocomplete and validation in VS Code and
 
 Both setup wizards add this automatically.
 
+### Prompt surface presets
+
+`prompt_surface` selects the built-in guidance/tool surface preset. The implicit default is `full`:
+
+```jsonc
+{
+  "prompt_surface": {
+    "default": "full",
+    "models": {
+      "anthropic/claude-sonnet-4-6": "light",
+      "openai/*": "light"
+    }
+  }
+}
+```
+
+Model keys use the same progressive, case-sensitive lookup walk as `cache_ttl`: exact `provider/model` keys, less-specific model variants, then the literal `provider/*` wildcard and `default`. The first slash separates the provider; additional slashes remain part of the model ID. Missing provider/model components fall back to `default`.
+
+`guidance_override_path` and `tool_descriptions` are user-level only. A project may select `default` and `models`, but repository-supplied guidance files and tool-description text are stripped with a warning. OpenCode and Pi registered tool text is owned by the registration instance; model routes are intended for guidance routing, not in-place tool-definition mutation. CC consumes both surfaces at its session model-key boundary.
+
+```jsonc
+{
+  "prompt_surface": {
+    "guidance_override_path": "./guidance/primary.md",
+    "tool_descriptions": {
+      "ctx_search": "Search the project's durable context."
+    }
+  }
+}
+```
+
+A guidance override must be a readable complete `## Magic Context` section with exactly one marker; it does not replace shared subagent or runtime clauses. Tool overrides change only top-level descriptions and must use known tool IDs. These override fields are intentionally not available to project configuration.
+
 ### Doctor
 
 If something isn't working, run the unified doctor to auto-detect installed harnesses and fix common issues:
