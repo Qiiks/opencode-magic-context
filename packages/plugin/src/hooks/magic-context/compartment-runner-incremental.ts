@@ -60,6 +60,8 @@ import { runValidatedHistorianPass } from "./compartment-runner-historian";
 import type { CompartmentRunnerDeps } from "./compartment-runner-types";
 import {
     buildHistorianFailureNotice,
+    HISTORIAN_BOUNDARY_HEALING_SLACK,
+    shouldDiscardLastHistorianCompartment,
     validateChunkCoverage,
     validateStoredCompartments,
 } from "./compartment-runner-validation";
@@ -498,25 +500,27 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         // is re-derived next run with real following context. The existing
         // `offset = lastCompartment.end + 1` logic then re-reads its range at the
         // head — zero extra plumbing. Guards:
-        //   - k >= 2: never drop the only compartment (would make zero progress).
+        //   - at least two compartments were emitted, so one remains and publication advances.
+        //   - the retained boundary cannot split a completed invocation/result pair.
         //   - not emergency: at ≥95% recovery we need maximum relief NOW, so keep
         //     all k and accept the boundary risk (correctness > quality).
         // Self-healing: a wrong discard re-derives the same compartment next run
         // (now non-last → persisted), so erring toward more slack is safe.
-        const BOUNDARY_HEALING_SLACK = 2;
         const inEmergency = getOverflowState(db, sessionId).needsEmergencyRecovery;
         let persistedCompartments = emittedCompartments;
-        if (!inEmergency && !forceKeepLastCompartmentForChunk && emittedCompartments.length >= 2) {
+        if (
+            !inEmergency &&
+            !forceKeepLastCompartmentForChunk &&
+            shouldDiscardLastHistorianCompartment(emittedCompartments, chunk)
+        ) {
             const lastEmitted = emittedCompartments[emittedCompartments.length - 1];
             const lookaheadMargin = chunk.endIndex - lastEmitted.endMessage;
-            if (lookaheadMargin <= BOUNDARY_HEALING_SLACK) {
-                persistedCompartments = emittedCompartments.slice(0, -1);
-                telemetry.discardedLast = true;
-                sessionLog(
-                    sessionId,
-                    `historian discard-last: dropped provisional compartment ${lastEmitted.startMessage}-${lastEmitted.endMessage} (lookaheadMargin=${lookaheadMargin} <= ${BOUNDARY_HEALING_SLACK}); will re-derive from raw next run`,
-                );
-            }
+            persistedCompartments = emittedCompartments.slice(0, -1);
+            telemetry.discardedLast = true;
+            sessionLog(
+                sessionId,
+                `historian discard-last: dropped provisional compartment ${lastEmitted.startMessage}-${lastEmitted.endMessage} (lookaheadMargin=${lookaheadMargin} <= ${HISTORIAN_BOUNDARY_HEALING_SLACK}); will re-derive from raw next run`,
+            );
         }
 
         const newCompartments = persistedCompartments;

@@ -36,6 +36,15 @@ export interface ToolArc {
     resOrdinal: number | null;
 }
 
+/** True when a tail beginning at `boundary` would retain a completed result without its call. */
+export function completedToolArcCrossesBoundary(
+    invOrdinal: number,
+    resOrdinal: number,
+    boundary: number,
+): boolean {
+    return invOrdinal < boundary && boundary <= resOrdinal;
+}
+
 export interface TrueRawTokenIndexBuildOptions extends TrueRawEstimateOptions {
     cacheNamespace: string;
     /**
@@ -497,7 +506,7 @@ export function fenceBoundaryForToolArcs(
     let boundary = candidate;
     for (const arc of arcs) {
         if (arc.resOrdinal !== null) {
-            if (arc.invOrdinal < boundary && boundary <= arc.resOrdinal) {
+            if (completedToolArcCrossesBoundary(arc.invOrdinal, arc.resOrdinal, boundary)) {
                 boundary = arc.resOrdinal + 1;
             }
             continue;

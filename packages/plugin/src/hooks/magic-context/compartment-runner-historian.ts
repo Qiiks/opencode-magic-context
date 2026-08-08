@@ -32,6 +32,7 @@ import type {
 } from "./compartment-runner-types";
 import {
     buildHistorianRepairPrompt,
+    type HistorianValidationChunk,
     validateHistorianOutput,
 } from "./compartment-runner-validation";
 
@@ -102,14 +103,7 @@ export async function runValidatedHistorianPass(args: {
     parentSessionId: string;
     sessionDirectory: string;
     prompt: string;
-    chunk: {
-        startIndex: number;
-        endIndex: number;
-        lines: Array<{ ordinal: number; messageId: string }>;
-        /** Tool-only ordinal ranges — passed through to validator so gaps
-         *  inside these ranges heal regardless of size. */
-        toolOnlyRanges?: ReadonlyArray<{ start: number; end: number }>;
-    };
+    chunk: HistorianValidationChunk;
     priorCompartments: StoredCompartmentRange[];
     sequenceOffset: number;
     dumpLabelBase: string;

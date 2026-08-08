@@ -86,6 +86,8 @@ import { queueDropsForCompartmentalizedMessages } from "@magic-context/core/hook
 import {
 	buildHistorianFailureNotice,
 	buildHistorianRepairPrompt,
+	HISTORIAN_BOUNDARY_HEALING_SLACK,
+	shouldDiscardLastHistorianCompartment,
 	validateChunkCoverage,
 	validateHistorianOutput,
 	validateStoredCompartments,
@@ -1046,10 +1048,11 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			// ~the whole chunk (≤ SLACK messages of lookahead past the last
 			// compartment), drop that provisional compartment so it's re-derived
 			// next run with real following context (offset re-reads its range).
-			// Guards: k >= 2 (never zero-progress), not emergency (keep all for
-			// max relief at ≥95%). Self-healing — a wrong discard re-derives the
-			// same compartment next run.
-			const BOUNDARY_HEALING_SLACK = 2;
+			// Require at least two emitted compartments so one remains and publication
+			// advances; never leave the persisted boundary inside a completed invocation/
+			// result pair; and retain everything during emergency recovery for immediate
+			// space relief. Outside emergency recovery, the next run safely re-derives a
+			// discarded compartment with additional following context.
 			const inEmergency = getOverflowState(
 				db,
 				sessionId,
@@ -1059,17 +1062,15 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			if (
 				!inEmergency &&
 				!forceKeepLastCompartmentForChunk &&
-				emittedCompartments.length >= 2
+				shouldDiscardLastHistorianCompartment(emittedCompartments, chunk)
 			) {
 				const lastEmitted = emittedCompartments[emittedCompartments.length - 1];
 				const lookaheadMargin = chunk.endIndex - lastEmitted.endMessage;
-				if (lookaheadMargin <= BOUNDARY_HEALING_SLACK) {
-					newCompartments = emittedCompartments.slice(0, -1);
-					sessionLog(
-						sessionId,
-						`historian discard-last: dropped provisional compartment ${lastEmitted.startMessage}-${lastEmitted.endMessage} (lookaheadMargin=${lookaheadMargin} <= ${BOUNDARY_HEALING_SLACK}); will re-derive next run`,
-					);
-				}
+				newCompartments = emittedCompartments.slice(0, -1);
+				sessionLog(
+					sessionId,
+					`historian discard-last: dropped provisional compartment ${lastEmitted.startMessage}-${lastEmitted.endMessage} (lookaheadMargin=${lookaheadMargin} <= ${HISTORIAN_BOUNDARY_HEALING_SLACK}); will re-derive next run`,
+				);
 			}
 			const lastNewEnd =
 				newCompartments[newCompartments.length - 1]?.endMessage ?? 0;
