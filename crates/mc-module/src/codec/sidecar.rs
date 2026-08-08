@@ -180,6 +180,13 @@ fn stamped_block_identity(block: &CkWireBlock) -> Option<(usize, usize, &str)> {
     Some((block_index, native_index, fingerprint))
 }
 
+/// True when a decoded block still carries its exact native-part origin. Frozen rewrites retain
+/// this stamp, allowing the encoder to update the original part instead of using compatibility
+/// coalescing for an unmatched call/result shell.
+pub(crate) fn has_stamped_block_identity(block: &CkWireBlock) -> bool {
+    stamped_block_identity(block).is_some()
+}
+
 pub(crate) fn block_is_unchanged(block: &CkWireBlock, meta: &BlockMeta) -> bool {
     meta.content_fingerprint
         .as_deref()

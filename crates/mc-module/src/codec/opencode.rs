@@ -248,8 +248,8 @@ pub fn encode_opencode(
     mutation_exempt_mid: Option<&str>,
 ) -> Vec<MessageV2Json> {
     match mutation_exempt_mid {
-        Some(mid) => encode_opencode_impl(messages, sidecar, None, false, &[mid]),
-        None => encode_opencode_impl(messages, sidecar, None, false, &[]),
+        Some(mid) => encode_opencode_impl(messages, sidecar, None, false, &[mid], true),
+        None => encode_opencode_impl(messages, sidecar, None, false, &[], true),
     }
 }
 
@@ -264,8 +264,8 @@ pub fn encode_opencode_with_session(
     mutation_exempt_mid: Option<&str>,
 ) -> Vec<MessageV2Json> {
     match mutation_exempt_mid {
-        Some(mid) => encode_opencode_impl(messages, sidecar, session_id, true, &[mid]),
-        None => encode_opencode_impl(messages, sidecar, session_id, true, &[]),
+        Some(mid) => encode_opencode_impl(messages, sidecar, session_id, true, &[mid], true),
+        None => encode_opencode_impl(messages, sidecar, session_id, true, &[], true),
     }
 }
 
@@ -275,7 +275,31 @@ pub fn encode_opencode_with_session_exemptions(
     session_id: Option<&str>,
     mutation_exempt_mids: &[&str],
 ) -> Vec<MessageV2Json> {
-    encode_opencode_impl(messages, sidecar, session_id, true, mutation_exempt_mids)
+    encode_opencode_impl(
+        messages,
+        sidecar,
+        session_id,
+        true,
+        mutation_exempt_mids,
+        true,
+    )
+}
+
+pub(crate) fn encode_opencode_with_transition_state(
+    messages: &[CkWireMessage],
+    sidecar: &DecodeSidecar,
+    session_id: Option<&str>,
+    mutation_exempt_mids: &[&str],
+    transition_consumed: bool,
+) -> Vec<MessageV2Json> {
+    encode_opencode_impl(
+        messages,
+        sidecar,
+        session_id,
+        true,
+        mutation_exempt_mids,
+        transition_consumed,
+    )
 }
 
 fn encode_opencode_impl(
@@ -284,6 +308,7 @@ fn encode_opencode_impl(
     session_id: Option<&str>,
     preserve_compaction: bool,
     mutation_exempt_mids: &[&str],
+    transition_consumed: bool,
 ) -> Vec<MessageV2Json> {
     let mut encoded = Vec::with_capacity(messages.len());
     let mut index = 0;
@@ -317,7 +342,7 @@ fn encode_opencode_impl(
         let meta = meta_for_ck(sidecar, msg, index);
         encoded.push(match meta {
             Some(meta) if mutation_exempt_mids.contains(&meta.mid.as_str()) => meta.raw.clone(),
-            Some(meta) => encode_with_meta(msg, meta, preserve_compaction),
+            Some(meta) => encode_with_meta(msg, meta, preserve_compaction, transition_consumed),
             None => encode_new_message(msg, session_id),
         });
         index += 1;
@@ -558,6 +583,7 @@ fn encode_with_meta(
     msg: &CkWireMessage,
     meta: &HarnessMessageMeta,
     preserve_compaction: bool,
+    transition_consumed: bool,
 ) -> Value {
     let mut raw = meta.raw.clone();
     let mut parts = raw
@@ -602,7 +628,10 @@ fn encode_with_meta(
                     block_index += 2;
                     continue;
                 }
-                if call_native_index.is_none() && result_native_index.is_none() {
+                if transition_consumed
+                    && call_native_index.is_none()
+                    && result_native_index.is_none()
+                {
                     // OpenCode stores a completed invocation as one part, while CK expands that
                     // part into adjacent call and result blocks. Recombine an unmatched pair as
                     // one part instead of independently emitting the same callID twice.

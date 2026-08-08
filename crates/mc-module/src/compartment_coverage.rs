@@ -86,6 +86,10 @@ pub struct M0ContentEpoch {
     /// HARD fold that introduces tag bytes; empty epoch zero is omitted so the current
     /// disabled surface leaves every existing effective render identity byte-identical.
     pub tagger_feature_epoch: String,
+    /// A session-local compatibility salt used only while adopting a byte-affecting renderer
+    /// transition. The transform removes it from the committed identity after atomically
+    /// recording consumption, so it creates exactly one HARD without changing steady identity.
+    pub transition_epoch: String,
 }
 
 /// Combine the base render_config (the provider-eviction triggers: system/model/
@@ -120,6 +124,9 @@ pub fn fold_m0_content_epoch(base_render_config: &str, epoch: &M0ContentEpoch) -
     }
     if !epoch.tagger_feature_epoch.is_empty() {
         parts.push(part("tfe", &epoch.tagger_feature_epoch));
+    }
+    if !epoch.transition_epoch.is_empty() {
+        parts.push(part("xte", &epoch.transition_epoch));
     }
     format!("{base_render_config}|m0epoch[{}]", parts.join(";"))
 }
@@ -280,6 +287,7 @@ mod tests {
             profile_render_epoch: String::new(),
             prompt_surface_epoch: String::new(),
             tagger_feature_epoch: String::new(),
+            transition_epoch: String::new(),
         };
         let folded = fold_m0_content_epoch(base, &epoch);
         // the base is kept as a prefix (a provider change still alters the string) and
@@ -337,6 +345,12 @@ mod tests {
         let tagger_folded = fold_m0_content_epoch(base, &tagger_epoch);
         assert!(tagger_folded.contains("tfe:4:tfe1"));
         assert_ne!(folded, tagger_folded);
+
+        let mut transition_epoch = epoch.clone();
+        transition_epoch.transition_epoch = "renderer-transition-v1".into();
+        let transition_folded = fold_m0_content_epoch(base, &transition_epoch);
+        assert!(transition_folded.contains("xte:22:renderer-transition-v1"));
+        assert_ne!(folded, transition_folded);
         // docs hash is deliberately excluded from the fold (a docs-only edit must not
         // force a full m0 re-render)
         assert!(!folded.contains("docs"));

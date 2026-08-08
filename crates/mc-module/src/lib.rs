@@ -6381,6 +6381,7 @@ impl McHandler {
         let post_attach_started_at = Instant::now();
         let revert_epoch = result.revert_epoch;
         let reasoning_watermark = result.reasoning_watermark;
+        let transition_consumed = result.transition_consumed;
         let mutation_exempt_mid = result.mutation_exempt_mid;
         let lineage_anchor_mid = result.lineage_anchor_mid;
         let tag_numbers = result.tag_numbers;
@@ -6400,6 +6401,7 @@ impl McHandler {
                 &tag_numbers,
                 mutation_exempt_mid.as_deref(),
                 lineage_anchor_mid.as_deref(),
+                transition_consumed,
             );
         }
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
@@ -9395,6 +9397,7 @@ fn attach_native_messages(
         &std::collections::BTreeMap::new(),
         mutation_exempt_mid,
         None,
+        false,
     );
 }
 
@@ -9424,6 +9427,7 @@ fn attach_native_messages_with_tags(
     tag_numbers: &std::collections::BTreeMap<String, u64>,
     mutation_exempt_mid: Option<&str>,
     lineage_anchor_mid: Option<&str>,
+    transition_consumed: bool,
 ) {
     if !request.serve_native {
         return;
@@ -9443,11 +9447,12 @@ fn attach_native_messages_with_tags(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-    let mut native_messages = codec::encode_opencode_with_session_exemptions(
+    let mut native_messages = codec::opencode::encode_opencode_with_transition_state(
         &served_messages,
         &sidecar,
         Some(&request.session_id),
         &mutation_exempt_mids,
+        transition_consumed,
     );
     if let Some(profile) = SerializerProfile::parse(&request.serializer_profile) {
         transform::clear_served_native_reasoning_with_tags(
@@ -13549,6 +13554,7 @@ mod tests {
             &old_tag_numbers,
             None,
             None,
+            false,
         );
         assert_eq!(replay.native_messages, Some(actual_native));
     }
