@@ -30,7 +30,7 @@ describe("mode manifest validator", () => {
         const ts = filesForMode(validation, "ts");
         const rust = filesForMode(validation, "rust");
         expect(ts).toHaveLength(41);
-        expect(rust).toHaveLength(30);
+        expect(rust).toHaveLength(31);
         expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(22);
         expect(filesForMode(validation, "ts", "opencode")).toHaveLength(19);
         expect(filesForMode(validation, "ts", "pi")).toHaveLength(22);
