@@ -59,7 +59,9 @@ function ordinalRange(prompt: string): { start: number; end: number } {
         startMarker >= 0
             ? prompt.slice(startMarker + "<new_messages>".length, endMarker > startMarker ? endMarker : undefined)
             : prompt;
-    const ordinals = [...rawChunk.matchAll(/^\s*\[(\d+)\]/gm)].map((match) => Number(match[1]));
+    const ordinals = [...rawChunk.matchAll(/^\s*\[(\d+)(?:-(\d+))?\]/gm)].flatMap(
+        (match) => [Number(match[1]), Number(match[2] ?? match[1])],
+    );
     if (ordinals.length > 0) {
         return {
             start: Math.min(...ordinals),

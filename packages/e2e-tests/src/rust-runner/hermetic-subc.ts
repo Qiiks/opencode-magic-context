@@ -320,6 +320,8 @@ export interface HermeticSubcOptions {
     ckSubcBin: string;
     /** Ceiling for daemon connection-file + module registration. Default 60s. */
     startTimeoutMs?: number;
+    /** Start the deterministic Broca producer. Default true. */
+    startProducer?: boolean;
 }
 
 /**
@@ -339,6 +341,7 @@ export class HermeticSubcStack {
     private readonly producerLogPath: string;
     private readonly pidFilePath: string;
     private readonly startTimeoutMs: number;
+    private readonly startProducer: boolean;
     private pidFileCreatedAtMs = 0;
     private readonly recordedPids = new Map<RustE2eProcessRole, number>();
     private daemon: ChildProcess | null = null;
@@ -355,6 +358,7 @@ export class HermeticSubcStack {
         this.ckMcBin = opts.ckMcBin;
         this.ckSubcBin = opts.ckSubcBin;
         this.startTimeoutMs = opts.startTimeoutMs;
+        this.startProducer = opts.startProducer;
         // The plugin's Rust client reads exactly this path (getDefaultConnectionFile
         // in module-transport.ts). Pointing the daemon's XDG_RUNTIME_DIR here makes it
         // write the connection file where the plugin already looks — no config knob.
@@ -374,6 +378,7 @@ export class HermeticSubcStack {
             ckMcBin: opts.ckMcBin,
             ckSubcBin: opts.ckSubcBin,
             startTimeoutMs: opts.startTimeoutMs ?? 60_000,
+            startProducer: opts.startProducer ?? true,
         });
         try {
             await stack.boot();
@@ -444,9 +449,13 @@ export class HermeticSubcStack {
         // boot and the module's initial route is not starved by daemon startup.
         await this.spawnModule();
         await this.waitForModuleRegistration();
-        await this.spawnProducer();
-        await this.waitForProducerRegistration();
-        process.env.MC_RUST_E2E_FOLD = "1";
+        if (this.startProducer) {
+            await this.spawnProducer();
+            await this.waitForProducerRegistration();
+            process.env.MC_RUST_E2E_FOLD = "1";
+        } else {
+            delete process.env.MC_RUST_E2E_FOLD;
+        }
     }
 
     private async spawnProducer(): Promise<void> {
@@ -831,6 +840,7 @@ export class HermeticSubcStack {
         }
         if (this.daemon === daemon) this.daemon = null;
         this.forgetPid("daemon");
+        delete process.env.MC_RUST_E2E_FOLD;
         rmSync(this.pidFilePath, { force: true });
     }
 }

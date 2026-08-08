@@ -56,6 +56,12 @@ export interface RustTestHarnessOptions {
      * Default: false (boot straight into Rust mode).
      */
     startInTsMode?: boolean;
+    /**
+     * Start the deterministic Broca producer. Disable it only when a scenario
+     * must observe module state before any historian publication can supersede it.
+     * Default: true.
+     */
+    startHistorianProducer?: boolean;
 }
 
 export interface SdkClient {
@@ -178,7 +184,12 @@ export class RustTestHarness {
         // <dataDir>/cortexkit/run/ before opencode boots and the plugin's Rust
         // client connects on the first transform.
         const env = createIsolatedEnv();
-        const subc = await HermeticSubcStack.start({ dataDir: env.dataDir, ckMcBin, ckSubcBin });
+        const subc = await HermeticSubcStack.start({
+            dataDir: env.dataDir,
+            ckMcBin,
+            ckSubcBin,
+            startProducer: options.startHistorianProducer ?? true,
+        });
 
         const logPath = join(env.dataDir, "cortexkit", "magic-context-e2e.log");
 

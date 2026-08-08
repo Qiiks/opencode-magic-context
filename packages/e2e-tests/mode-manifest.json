@@ -431,9 +431,10 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
+            "rationale": "cold TS-to-Rust restart reproduces a frozen dropped-tag seed before historian publication can supersede the sentinel",
             "contract_refs": [
-                "RUST-E2E"
+                "RUST-E2E",
+                "COLD-START-DROP-SEED"
             ]
         },
         {
@@ -443,9 +444,11 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
+            "rationale": "agent drop queues in the module ledger, drains on the producer-backed bust, and remains proven after m0 supersedes the transient sentinel",
             "contract_refs": [
-                "RUST-E2E"
+                "RUST-E2E",
+                "CTX-REDUCE-ROUNDTRIP",
+                "HISTORIAN-PRODUCER"
             ]
         },
         {
@@ -467,9 +470,11 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
+            "rationale": "real content pressure lands a deterministic producer-backed fold whose materialized m0 shrinks the provider wire",
             "contract_refs": [
-                "RUST-E2E"
+                "RUST-E2E",
+                "FOLD-UNDER-PRESSURE",
+                "HISTORIAN-PRODUCER"
             ]
         },
         {

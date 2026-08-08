@@ -61,7 +61,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: fold under pressure", () => {
                         cache_creation_input_tokens: 2_000,
                     },
                 });
-                await h.sendPrompt(sessionId, `turn ${i}: ${h.ballast(2_500)}`);
+                await h.sendPrompt(sessionId, `fold-under-pressure turn ${i}: ${h.ballast(2_500)}`);
                 peakWireBytes = Math.max(peakWireBytes, h.lastMainWireBytes());
                 await Bun.sleep(200);
             }
@@ -84,7 +84,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: fold under pressure", () => {
                         cache_creation_input_tokens: 2_000,
                     },
                 });
-                await h.sendPrompt(sessionId, `turn ${i}: ${h.ballast(300)}`);
+                await h.sendPrompt(sessionId, `fold-under-pressure turn ${i}: ${h.ballast(300)}`);
                 await Bun.sleep(200);
             }
             await Bun.sleep(500);
