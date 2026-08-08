@@ -2248,6 +2248,103 @@ const MIGRATIONS: &[Migration] = &[
         DROP TABLE mc_memory_stale_generation_groups;
         "#,
     },
+    Migration {
+        version: 46,
+        // Mural cues are derived cache columns, but they must also be stored in the module's
+        // authoritative memory row so writes from the Rust-side authority path can be mirrored
+        // to the context database. Rebuild the memory-feed triggers so every snapshot includes
+        // cue state; otherwise a later ordinary update could mirror an older snapshot and
+        // overwrite the newer cue state.
+        statements: r#"
+        ALTER TABLE mc_memories ADD COLUMN mural_cue TEXT;
+        ALTER TABLE mc_memories ADD COLUMN mural_cue_hash TEXT;
+        ALTER TABLE mc_memories ADD COLUMN mural_cue_at INTEGER;
+        ALTER TABLE mc_memories ADD COLUMN mural_cue_rejection_count INTEGER NOT NULL DEFAULT 0;
+
+        DROP TRIGGER IF EXISTS mc_memories_feed_insert;
+        DROP TRIGGER IF EXISTS mc_memories_feed_update;
+        DROP TRIGGER IF EXISTS mc_memories_feed_delete;
+        CREATE TRIGGER mc_memories_feed_insert AFTER INSERT ON mc_memories BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('memories', 'insert', NEW.id,
+                json_object(
+                    'id', NEW.id, 'project_path', NEW.project_path, 'category', NEW.category,
+                    'content', NEW.content, 'normalized_hash', NEW.normalized_hash,
+                    'importance', NEW.importance, 'scope', NEW.scope, 'shareable', NEW.shareable,
+                    'source_session_id', NEW.source_session_id, 'source_type', NEW.source_type,
+                    'seen_count', NEW.seen_count, 'retrieval_count', NEW.retrieval_count,
+                    'first_seen_at', NEW.first_seen_at, 'created_at', NEW.created_at,
+                    'updated_at', NEW.updated_at, 'last_seen_at', NEW.last_seen_at,
+                    'last_retrieved_at', NEW.last_retrieved_at, 'status', NEW.status,
+                    'expires_at', NEW.expires_at, 'verification_status', NEW.verification_status,
+                    'verified_at', NEW.verified_at, 'classified_at', NEW.classified_at,
+                    'superseded_by_memory_id', NEW.superseded_by_memory_id, 'merged_from', NEW.merged_from,
+                    'metadata_json', NEW.metadata_json, 'context_store_uuid', NEW.context_store_uuid,
+                    'context_row_id', NEW.context_row_id, 'mural_cue', NEW.mural_cue,
+                    'mural_cue_hash', NEW.mural_cue_hash, 'mural_cue_at', NEW.mural_cue_at,
+                    'mural_cue_rejection_count', NEW.mural_cue_rejection_count), NEW.normalized_hash);
+        END;
+        CREATE TRIGGER mc_memories_feed_update AFTER UPDATE ON mc_memories
+        WHEN NEW.id IS NOT OLD.id OR NEW.project_path IS NOT OLD.project_path
+          OR NEW.category IS NOT OLD.category OR NEW.content IS NOT OLD.content
+          OR NEW.normalized_hash IS NOT OLD.normalized_hash OR NEW.importance IS NOT OLD.importance
+          OR NEW.scope IS NOT OLD.scope OR NEW.shareable IS NOT OLD.shareable
+          OR NEW.source_session_id IS NOT OLD.source_session_id OR NEW.source_type IS NOT OLD.source_type
+          OR NEW.seen_count IS NOT OLD.seen_count OR NEW.retrieval_count IS NOT OLD.retrieval_count
+          OR NEW.first_seen_at IS NOT OLD.first_seen_at OR NEW.created_at IS NOT OLD.created_at
+          OR NEW.updated_at IS NOT OLD.updated_at OR NEW.last_seen_at IS NOT OLD.last_seen_at
+          OR NEW.last_retrieved_at IS NOT OLD.last_retrieved_at OR NEW.status IS NOT OLD.status
+          OR NEW.expires_at IS NOT OLD.expires_at OR NEW.verification_status IS NOT OLD.verification_status
+          OR NEW.verified_at IS NOT OLD.verified_at OR NEW.classified_at IS NOT OLD.classified_at
+          OR NEW.superseded_by_memory_id IS NOT OLD.superseded_by_memory_id
+          OR NEW.merged_from IS NOT OLD.merged_from OR NEW.metadata_json IS NOT OLD.metadata_json
+          OR NEW.context_store_uuid IS NOT OLD.context_store_uuid
+          OR NEW.context_row_id IS NOT OLD.context_row_id
+          OR NEW.mural_cue IS NOT OLD.mural_cue OR NEW.mural_cue_hash IS NOT OLD.mural_cue_hash
+          OR NEW.mural_cue_at IS NOT OLD.mural_cue_at
+          OR NEW.mural_cue_rejection_count IS NOT OLD.mural_cue_rejection_count
+        BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('memories', 'update', NEW.id,
+                json_object(
+                    'id', NEW.id, 'project_path', NEW.project_path, 'category', NEW.category,
+                    'content', NEW.content, 'normalized_hash', NEW.normalized_hash,
+                    'importance', NEW.importance, 'scope', NEW.scope, 'shareable', NEW.shareable,
+                    'source_session_id', NEW.source_session_id, 'source_type', NEW.source_type,
+                    'seen_count', NEW.seen_count, 'retrieval_count', NEW.retrieval_count,
+                    'first_seen_at', NEW.first_seen_at, 'created_at', NEW.created_at,
+                    'updated_at', NEW.updated_at, 'last_seen_at', NEW.last_seen_at,
+                    'last_retrieved_at', NEW.last_retrieved_at, 'status', NEW.status,
+                    'expires_at', NEW.expires_at, 'verification_status', NEW.verification_status,
+                    'verified_at', NEW.verified_at, 'classified_at', NEW.classified_at,
+                    'superseded_by_memory_id', NEW.superseded_by_memory_id, 'merged_from', NEW.merged_from,
+                    'metadata_json', NEW.metadata_json, 'context_store_uuid', NEW.context_store_uuid,
+                    'context_row_id', NEW.context_row_id, 'mural_cue', NEW.mural_cue,
+                    'mural_cue_hash', NEW.mural_cue_hash, 'mural_cue_at', NEW.mural_cue_at,
+                    'mural_cue_rejection_count', NEW.mural_cue_rejection_count), NEW.normalized_hash);
+        END;
+        CREATE TRIGGER mc_memories_feed_delete AFTER DELETE ON mc_memories BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('memories', 'tombstone', OLD.id,
+                json_object(
+                    'id', OLD.id, 'project_path', OLD.project_path, 'category', OLD.category,
+                    'content', OLD.content, 'normalized_hash', OLD.normalized_hash,
+                    'importance', OLD.importance, 'scope', OLD.scope, 'shareable', OLD.shareable,
+                    'source_session_id', OLD.source_session_id, 'source_type', OLD.source_type,
+                    'seen_count', OLD.seen_count, 'retrieval_count', OLD.retrieval_count,
+                    'first_seen_at', OLD.first_seen_at, 'created_at', OLD.created_at,
+                    'updated_at', OLD.updated_at, 'last_seen_at', OLD.last_seen_at,
+                    'last_retrieved_at', OLD.last_retrieved_at, 'status', OLD.status,
+                    'expires_at', OLD.expires_at, 'verification_status', OLD.verification_status,
+                    'verified_at', OLD.verified_at, 'classified_at', OLD.classified_at,
+                    'superseded_by_memory_id', OLD.superseded_by_memory_id, 'merged_from', OLD.merged_from,
+                    'metadata_json', OLD.metadata_json, 'context_store_uuid', OLD.context_store_uuid,
+                    'context_row_id', OLD.context_row_id, 'mural_cue', OLD.mural_cue,
+                    'mural_cue_hash', OLD.mural_cue_hash, 'mural_cue_at', OLD.mural_cue_at,
+                    'mural_cue_rejection_count', OLD.mural_cue_rejection_count), OLD.normalized_hash);
+        END;
+        "#,
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -3693,6 +3790,14 @@ pub struct StoredMemoryFull {
     pub metadata_json: Option<String>,
     pub context_store_uuid: Option<String>,
     pub context_row_id: Option<i64>,
+    /// Compressed mural cue derived from the raw memory content.
+    pub mural_cue: Option<String>,
+    /// SHA-256 of the raw content used to produce `mural_cue`.
+    pub mural_cue_hash: Option<String>,
+    /// Epoch milliseconds when the cue state was last written.
+    pub mural_cue_at: Option<i64>,
+    /// Validation failures for the content identified by `mural_cue_hash`.
+    pub mural_cue_rejection_count: i64,
 }
 
 /// Every column that a memories changefeed snapshot must contain. Keep this list aligned with
@@ -3725,6 +3830,10 @@ pub const MEMORY_FEED_COLUMNS: &[&str] = &[
     "metadata_json",
     "context_store_uuid",
     "context_row_id",
+    "mural_cue",
+    "mural_cue_hash",
+    "mural_cue_at",
+    "mural_cue_rejection_count",
 ];
 
 /// Inputs for an additive ctx_memory write. Duplicate detection follows the plugin's
@@ -3959,6 +4068,26 @@ pub struct ClassificationUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuralCueUpdate {
+    pub memory_id: i64,
+    pub content_hash_at_prompt: String,
+    pub cue: Option<String>,
+    pub rejection_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuralCueRejected {
+    pub memory_id: i64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuralCueApplyResult {
+    pub accepted: Vec<i64>,
+    pub rejected: Vec<MuralCueRejected>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassificationRejected {
     pub memory_id: i64,
     pub reason: String,
@@ -4106,6 +4235,10 @@ pub struct ModuleMemoryRow {
     pub superseded_by_memory_id: Option<i64>,
     pub merged_from: Option<String>,
     pub metadata_json: Option<String>,
+    pub mural_cue: Option<String>,
+    pub mural_cue_hash: Option<String>,
+    pub mural_cue_at: Option<i64>,
+    pub mural_cue_rejection_count: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -4485,6 +4618,12 @@ enum MemoryMutationOutcome {
     NotFound,
     Applied(Box<Option<StoredMemoryFull>>),
     Duplicate(i64),
+}
+
+enum MuralCueTxnOutcome {
+    Applied(MuralCueApplyResult),
+    AuthorityStateMismatch(String),
+    AuthorityGenerationMismatch(u64),
 }
 
 enum ClassificationTxnOutcome {
@@ -5269,6 +5408,37 @@ impl<'a> FacadeMutationTxn<'a> {
                 Err(format!("authority_state_mismatch:{found}"))
             }
             VerificationTxnOutcome::AuthorityGenerationMismatch(found) => Err(format!(
+                "authority_generation_mismatch:{authority_generation}:{found}"
+            )),
+        }
+    }
+
+    pub fn set_memory_mural_cue(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        authority_generation: u64,
+        rows: &[MuralCueUpdate],
+        now_ms: i64,
+    ) -> Result<MuralCueApplyResult, String> {
+        match set_memory_mural_cue_tx(
+            self.tx,
+            context_store_uuid,
+            project,
+            authority_generation,
+            rows,
+            now_ms,
+        )
+        .map_err(|error| error.to_string())?
+        {
+            MuralCueTxnOutcome::Applied(result) => Ok(result),
+            MuralCueTxnOutcome::AuthorityStateMismatch(found) if found == "DRAINING" => {
+                Err("authority_draining".to_string())
+            }
+            MuralCueTxnOutcome::AuthorityStateMismatch(found) => {
+                Err(format!("authority_state_mismatch:{found}"))
+            }
+            MuralCueTxnOutcome::AuthorityGenerationMismatch(found) => Err(format!(
                 "authority_generation_mismatch:{authority_generation}:{found}"
             )),
         }
@@ -7763,6 +7933,45 @@ impl McStore {
         }
     }
 
+    /// Apply derived mural-cue columns through the memories authority. These writes update only
+    /// derived columns: they emit a complete mirror snapshot but do not record a cache mutation
+    /// or change the memory content. The normal process that folds memory updates will later
+    /// decide when to render the mural.
+    pub fn set_memory_mural_cue(
+        &self,
+        context_store_uuid: &str,
+        project: &str,
+        authority_generation: u64,
+        rows: &[MuralCueUpdate],
+        now_ms: i64,
+    ) -> Result<MuralCueApplyResult, McStoreError> {
+        let outcome = self.inner.with_conn_fenced(|tx| {
+            set_memory_mural_cue_tx(
+                tx,
+                context_store_uuid,
+                project,
+                authority_generation,
+                rows,
+                now_ms,
+            )
+        })?;
+        match outcome {
+            MuralCueTxnOutcome::Applied(result) => Ok(result),
+            MuralCueTxnOutcome::AuthorityStateMismatch(found) => {
+                Err(McStoreError::AuthorityStateMismatch {
+                    expected: "MODULE".to_string(),
+                    found,
+                })
+            }
+            MuralCueTxnOutcome::AuthorityGenerationMismatch(found) => {
+                Err(McStoreError::AuthorityGenerationMismatch {
+                    expected: authority_generation,
+                    found,
+                })
+            }
+        }
+    }
+
     /// Apply verification updates only when their authority generation and content hash still match
     /// the values used for verification. The row change, mapping snapshot feed, and any memory
     /// mutation commit together.
@@ -10096,9 +10305,10 @@ impl McStore {
                     shareable, source_session_id, source_type, seen_count, retrieval_count,
                     first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
                     status, expires_at, verification_status, verified_at, classified_at,
-                    superseded_by_memory_id, merged_from, metadata_json,
-                    context_store_uuid, context_row_id
-               FROM mc_memories
+                     superseded_by_memory_id, merged_from, metadata_json,
+                     context_store_uuid, context_row_id, mural_cue, mural_cue_hash, mural_cue_at,
+                     mural_cue_rejection_count
+                FROM mc_memories
               WHERE id IN ({placeholders})
                 AND ({visibility})"
         );
@@ -14461,7 +14671,9 @@ fn replace_authority_memories_tx(
                         first_seen_at = ?13, created_at = ?14, updated_at = ?15, last_seen_at = ?16,
                         last_retrieved_at = ?17, status = ?18, expires_at = ?19,
                         verification_status = ?20, verified_at = ?21, classified_at = ?22,
-                        superseded_by_memory_id = ?23, merged_from = ?24, metadata_json = ?25
+                        superseded_by_memory_id = ?23, merged_from = ?24, metadata_json = ?25,
+                        mural_cue = ?26, mural_cue_hash = ?27, mural_cue_at = ?28,
+                        mural_cue_rejection_count = ?29
                   WHERE id = ?1",
                 params![
                     existing_id,
@@ -14489,6 +14701,10 @@ fn replace_authority_memories_tx(
                     superseded_by_memory_id,
                     memory.merged_from.as_deref(),
                     memory.metadata_json.as_deref(),
+                    memory.mural_cue.as_deref(),
+                    memory.mural_cue_hash.as_deref(),
+                    memory.mural_cue_at,
+                    memory.mural_cue_rejection_count,
                 ],
             )?;
             continue;
@@ -14499,8 +14715,9 @@ fn replace_authority_memories_tx(
                 scope, shareable, source_session_id, source_type, seen_count, retrieval_count,
                 first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
                 status, expires_at, verification_status, verified_at, classified_at,
-                superseded_by_memory_id, merged_from, metadata_json)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
+                 superseded_by_memory_id, merged_from, metadata_json, mural_cue, mural_cue_hash,
+                 mural_cue_at, mural_cue_rejection_count)
+              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)
              ON CONFLICT(id) DO UPDATE SET
                 project_path = excluded.project_path,
                 category = excluded.category,
@@ -14523,10 +14740,14 @@ fn replace_authority_memories_tx(
                 verification_status = excluded.verification_status,
                 verified_at = excluded.verified_at,
                 classified_at = excluded.classified_at,
-                superseded_by_memory_id = excluded.superseded_by_memory_id,
-                merged_from = excluded.merged_from,
-                metadata_json = excluded.metadata_json
-              ON CONFLICT(project_path, category, normalized_hash) DO UPDATE SET
+                 superseded_by_memory_id = excluded.superseded_by_memory_id,
+                 merged_from = excluded.merged_from,
+                 metadata_json = excluded.metadata_json,
+                 mural_cue = excluded.mural_cue,
+                 mural_cue_hash = excluded.mural_cue_hash,
+                 mural_cue_at = excluded.mural_cue_at,
+                 mural_cue_rejection_count = excluded.mural_cue_rejection_count
+               ON CONFLICT(project_path, category, normalized_hash) DO UPDATE SET
                  content = excluded.content,
                  importance = excluded.importance,
                  scope = excluded.scope,
@@ -14547,7 +14768,11 @@ fn replace_authority_memories_tx(
                  classified_at = excluded.classified_at,
                  superseded_by_memory_id = excluded.superseded_by_memory_id,
                  merged_from = excluded.merged_from,
-                 metadata_json = excluded.metadata_json",
+                 metadata_json = excluded.metadata_json,
+                 mural_cue = excluded.mural_cue,
+                 mural_cue_hash = excluded.mural_cue_hash,
+                 mural_cue_at = excluded.mural_cue_at,
+                 mural_cue_rejection_count = excluded.mural_cue_rejection_count",
             params![
                 memory.id,
                 &memory.project_path,
@@ -14571,9 +14796,13 @@ fn replace_authority_memories_tx(
                 &memory.verification_status,
                 memory.verified_at,
                 memory.classified_at,
-                 superseded_by_memory_id,
-                 memory.merged_from.as_deref(),
+                superseded_by_memory_id,
+                memory.merged_from.as_deref(),
                 memory.metadata_json.as_deref(),
+                memory.mural_cue.as_deref(),
+                memory.mural_cue_hash.as_deref(),
+                memory.mural_cue_at,
+                memory.mural_cue_rejection_count,
             ],
         )?;
     }
@@ -15211,7 +15440,8 @@ const MEMORY_FULL_SELECT_COLUMNS: &str =
             first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
             status, expires_at, verification_status, verified_at, classified_at,
             superseded_by_memory_id, merged_from, metadata_json,
-            context_store_uuid, context_row_id";
+            context_store_uuid, context_row_id, mural_cue, mural_cue_hash, mural_cue_at,
+            mural_cue_rejection_count";
 
 const MEMORY_FULL_SELECT_BY_ID: &str =
     "SELECT id, project_path, category, content, normalized_hash, importance, scope,
@@ -15219,7 +15449,8 @@ const MEMORY_FULL_SELECT_BY_ID: &str =
             first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
             status, expires_at, verification_status, verified_at, classified_at,
             superseded_by_memory_id, merged_from, metadata_json,
-            context_store_uuid, context_row_id
+            context_store_uuid, context_row_id, mural_cue, mural_cue_hash, mural_cue_at,
+            mural_cue_rejection_count
        FROM mc_memories WHERE id = ?1";
 
 fn stored_memory_full_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMemoryFull> {
@@ -15255,6 +15486,10 @@ fn stored_memory_full_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Stored
         metadata_json: r.get(24)?,
         context_store_uuid: r.get(25)?,
         context_row_id: r.get(26)?,
+        mural_cue: r.get(27)?,
+        mural_cue_hash: r.get(28)?,
+        mural_cue_at: r.get(29)?,
+        mural_cue_rejection_count: r.get::<_, Option<i64>>(30)?.unwrap_or(0),
     })
 }
 
@@ -15330,6 +15565,10 @@ fn memory_feed_snapshot(memory: &StoredMemoryFull, mapping: Value) -> Value {
         "metadata_json": memory.metadata_json,
         "context_store_uuid": memory.context_store_uuid,
         "context_row_id": memory.context_row_id,
+        "mural_cue": memory.mural_cue,
+        "mural_cue_hash": memory.mural_cue_hash,
+        "mural_cue_at": memory.mural_cue_at,
+        "mural_cue_rejection_count": memory.mural_cue_rejection_count,
         "mapping": mapping,
     })
 }
@@ -15361,6 +15600,104 @@ fn emit_verification_memory_snapshot_tx(
         )?;
     }
     Ok(())
+}
+
+fn mural_cue_content_hash(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn set_memory_mural_cue_tx(
+    tx: &rusqlite::Transaction<'_>,
+    context_store_uuid: &str,
+    project: &str,
+    authority_generation: u64,
+    rows: &[MuralCueUpdate],
+    now_ms: i64,
+) -> rusqlite::Result<MuralCueTxnOutcome> {
+    let authority = tx
+        .query_row(
+            "SELECT state, generation FROM mc_authority
+              WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",
+            params![context_store_uuid, project],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+        )
+        .optional()?;
+    let Some((state, generation)) = authority else {
+        return Ok(MuralCueTxnOutcome::AuthorityStateMismatch(
+            "missing".to_string(),
+        ));
+    };
+    if state != "MODULE" {
+        return Ok(MuralCueTxnOutcome::AuthorityStateMismatch(state));
+    }
+    if generation != authority_generation {
+        return Ok(MuralCueTxnOutcome::AuthorityGenerationMismatch(generation));
+    }
+
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    for update in rows {
+        let Some(memory) = load_memory_full_tx(tx, update.memory_id)? else {
+            rejected.push(MuralCueRejected {
+                memory_id: update.memory_id,
+                reason: "not_found".to_string(),
+            });
+            continue;
+        };
+        if memory.project_path != project {
+            rejected.push(MuralCueRejected {
+                memory_id: update.memory_id,
+                reason: "not_owned".to_string(),
+            });
+            continue;
+        }
+        if mural_cue_content_hash(&memory.content) != update.content_hash_at_prompt {
+            rejected.push(MuralCueRejected {
+                memory_id: update.memory_id,
+                reason: "stale".to_string(),
+            });
+            continue;
+        }
+        if update.rejection_count < 0 {
+            rejected.push(MuralCueRejected {
+                memory_id: update.memory_id,
+                reason: "invalid_rejection_count".to_string(),
+            });
+            continue;
+        }
+        // A NULL cue means validation failed and may be retried. Recompute the rejection counter
+        // from the module row instead of trusting the mirrored count, so a lost mirror response or
+        // retried command cannot reset the durable counter. A successful or fallback cue resets it.
+        let rejection_count = if update.cue.is_none() {
+            if memory.mural_cue_hash.as_deref() == Some(update.content_hash_at_prompt.as_str()) {
+                memory.mural_cue_rejection_count.saturating_add(1)
+            } else {
+                1
+            }
+        } else {
+            0
+        };
+        tx.execute(
+            "UPDATE mc_memories
+                SET mural_cue = ?1, mural_cue_hash = ?2, mural_cue_at = ?3,
+                    mural_cue_rejection_count = ?4
+              WHERE id = ?5",
+            params![
+                update.cue.as_deref(),
+                update.content_hash_at_prompt,
+                now_ms,
+                rejection_count,
+                update.memory_id,
+            ],
+        )?;
+        accepted.push(update.memory_id);
+    }
+    Ok(MuralCueTxnOutcome::Applied(MuralCueApplyResult {
+        accepted,
+        rejected,
+    }))
 }
 
 fn set_memory_verification_tx(
@@ -16036,6 +16373,58 @@ mod tests {
 
         let v2 = store.commit("ses_a", Some(1), &core, &meta).unwrap();
         assert_eq!(v2, 2);
+    }
+
+    #[test]
+    fn boundary_divergence_counter_cas_loser_does_not_double_increment_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let session = "counter-cas";
+        let core = CoreState::default();
+        let mut initial_meta = ModuleMeta::default();
+        initial_meta.boundary_divergence_pending_count = 0;
+        store.commit(session, None, &core, &initial_meta).unwrap();
+
+        let left = store.load(session).unwrap();
+        let right = store.load(session).unwrap();
+        assert_eq!(left.row_version, Some(1));
+        assert_eq!(right.row_version, Some(1));
+
+        let mut left_meta = left.meta.clone();
+        left_meta.boundary_divergence_pending_count = 1;
+        store
+            .commit(session, left.row_version, &left.core, &left_meta)
+            .unwrap();
+
+        let mut right_meta = right.meta.clone();
+        right_meta.boundary_divergence_pending_count = 1;
+        let loser = store.commit(session, right.row_version, &right.core, &right_meta);
+        assert!(matches!(
+            loser,
+            Err(McStoreError::CasConflict {
+                expected: Some(1),
+                found: 2
+            })
+        ));
+        assert_eq!(
+            store
+                .load(session)
+                .unwrap()
+                .meta
+                .boundary_divergence_pending_count,
+            1
+        );
+
+        drop(store);
+        let reopened = McStore::open(&descriptor(dir.path())).unwrap();
+        assert_eq!(
+            reopened
+                .load(session)
+                .unwrap()
+                .meta
+                .boundary_divergence_pending_count,
+            1
+        );
     }
 
     #[test]
@@ -17923,7 +18312,7 @@ mod tests {
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=45).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=46).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -21315,7 +21704,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=45).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=46).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)
@@ -23175,6 +23564,96 @@ mod shadow_tests {
             store.load_compartments(session).unwrap()[0].end_message_id,
             "first#0"
         );
+    }
+
+    #[test]
+    fn set_memory_mural_cue_is_cache_neutral_and_emits_complete_mirror_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let authority = store
+            .authority_begin_prepare("context", "git:cues", "memories")
+            .unwrap();
+        let authority = store
+            .authority_finish_prepare(
+                "context",
+                "git:cues",
+                "memories",
+                authority.generation,
+                "digest",
+                "digest",
+                true,
+            )
+            .unwrap();
+        let id = 1;
+        store
+            .seed_memory(id, "git:cues", "CONSTRAINTS", "cue source", 1)
+            .unwrap();
+        let before_mutations = store
+            .max_memory_mutation_id(&["git:cues".to_string()])
+            .unwrap();
+        let hash = mural_cue_content_hash("cue source");
+        let result = store
+            .set_memory_mural_cue(
+                "context",
+                "git:cues",
+                authority.generation,
+                &[MuralCueUpdate {
+                    memory_id: id,
+                    content_hash_at_prompt: hash.clone(),
+                    cue: Some("cue anchor".to_string()),
+                    rejection_count: 0,
+                }],
+                42,
+            )
+            .unwrap();
+        assert_eq!(result.accepted, vec![id]);
+        assert!(result.rejected.is_empty());
+        assert_eq!(
+            store
+                .max_memory_mutation_id(&["git:cues".to_string()])
+                .unwrap(),
+            before_mutations,
+            "derived cue writes must not append cache mutations"
+        );
+        let memory = store.get_memory_full(id).unwrap().unwrap();
+        assert_eq!(memory.mural_cue.as_deref(), Some("cue anchor"));
+        assert_eq!(memory.mural_cue_hash.as_deref(), Some(hash.as_str()));
+        assert_eq!(memory.mural_cue_at, Some(42));
+        assert_eq!(memory.mural_cue_rejection_count, 0);
+        for now_ms in [43, 44] {
+            let rejected = store
+                .set_memory_mural_cue(
+                    "context",
+                    "git:cues",
+                    authority.generation,
+                    &[MuralCueUpdate {
+                        memory_id: id,
+                        content_hash_at_prompt: hash.clone(),
+                        cue: None,
+                        rejection_count: 1,
+                    }],
+                    now_ms,
+                )
+                .unwrap();
+            assert_eq!(rejected.accepted, vec![id]);
+        }
+        let retried = store.get_memory_full(id).unwrap().unwrap();
+        assert_eq!(retried.mural_cue, None);
+        assert_eq!(retried.mural_cue_rejection_count, 2);
+        let feed = store
+            .pull_changefeed("memories", 0, 100)
+            .unwrap()
+            .rows
+            .into_iter()
+            .rev()
+            .find(|row| {
+                row.module_row_id == id && row.full_row_snapshot["mural_cue"] == "cue anchor"
+            })
+            .unwrap();
+        assert_eq!(feed.full_row_snapshot["mural_cue"], "cue anchor");
+        assert_eq!(feed.full_row_snapshot["mural_cue_hash"], hash);
+        assert_eq!(feed.full_row_snapshot["mural_cue_at"], 42);
+        assert_eq!(feed.full_row_snapshot["mural_cue_rejection_count"], 0);
     }
 
     #[test]
