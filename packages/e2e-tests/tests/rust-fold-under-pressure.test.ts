@@ -10,15 +10,8 @@
  * precisely a session that climbed past threshold while every fold silently
  * failed — this invariant is the guard against that whole class.
  *
- * Gating: in the hermetic stack the Rust module runs its OWN historian, which
- * drives an LLM through a separate `broca` runner module. The current stack
- * spawns only ck-subc + ck-mc, so the module's historian firing fails
- * (`unknown_module: broca`) and no compartment is ever published — meaning no
- * fold can land here yet. Verified empirically: at 75% usage the module fires the
- * historian but it fails on the missing runner, so decisions stay SOFT+. This
- * scenario is therefore gated on `foldInfraEnabled()` (MC_RUST_E2E_FOLD=1) and
- * asserts the OUTCOME so it activates cleanly once a hermetic broca runner is
- * wired into the stack.
+ * The hermetic stack supplies a deterministic Broca producer, so this scenario
+ * runs in the Rust group and asserts the real fold outcome rather than a skip.
  *
  * Assertion style: wire-size shrink across the fold and presence of the frozen
  * m0 marker, from the fake provider's full request bodies.
@@ -26,26 +19,13 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { RustTestHarness } from "../src/rust-harness";
-import { buildMockHistorianPayload } from "../src/mock-historian";
-import {
-    FOLD_SKIP_REASON,
-    foldInfraEnabled,
-    printSkip,
-    rustPrereqs,
-} from "../src/rust-scenario-support";
-
-const active = rustPrereqs.ok && foldInfraEnabled();
+import { rustPrereqs } from "../src/rust-scenario-support";
 
 describe.skipIf(!rustPrereqs.ok)("rust invariant: fold under pressure", () => {
-    it.skipIf(active)("is gated on a hermetic broca fold runner", () => {
-        printSkip("fold-under-pressure", FOLD_SKIP_REASON);
-        expect(foldInfraEnabled()).toBe(false);
-    });
 
     let h: RustTestHarness;
 
     beforeEach(async () => {
-        if (!active) return;
         // Small context limit + a small execute threshold so a session of tens of
         // real-content turns crosses the fold trigger quickly. The module measures
         // TRUE-RAW content, so pressure must come from real ballast, not mock usage.
@@ -63,31 +43,11 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: fold under pressure", () => {
         await h?.dispose();
     });
 
-    it.skipIf(!active)(
+    it(
         "lands a fold when the session grows past the execute threshold (wire shrinks, m0 present)",
         async () => {
             const sessionId = await h.createSession();
 
-            // Historian producer: script the broca-runner reply the module's
-            // historian will request once a hermetic runner exists. When the fold
-            // runner is wired, this compartment is what gets folded into m0.
-            h.mock.addMatcher((body) => {
-                const system = JSON.stringify(body.system ?? "");
-                if (!system.includes("hippocampus of a long-running coding agent")) return null;
-                return {
-                    text: buildMockHistorianPayload({
-                        start: 1,
-                        end: 2,
-                        title: "Rust fold e2e chunk",
-                        body: "Covered the warmup turns of the fold-under-pressure session.",
-                    }),
-                    usage: {
-                        input_tokens: 500,
-                        output_tokens: 200,
-                        cache_creation_input_tokens: 500,
-                    },
-                };
-            });
 
             // Grow past the execute threshold with real content mass. Track the
             // peak wire size so the post-fold shrink can be asserted against it.

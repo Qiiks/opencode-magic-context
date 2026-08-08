@@ -237,7 +237,7 @@ describe("context overflow recovery", () => {
                 // Its successful historian fold is also unavailable without the
                 // hermetic Broca runner, so retain the shared overflow-detection
                 // assertion and report the excluded completion contract.
-                console.log(`[rust-e2e] overflow recovery completion assertions SKIPPED: ${FOLD_SKIP_REASON}`);
+                console.log(`[rust-e2e] overflow recovery mock-capture assertions SKIPPED: ${FOLD_SKIP_REASON}`);
                 expect(afterOverflow.detected_context_limit).toBe(120000);
                 return;
             }

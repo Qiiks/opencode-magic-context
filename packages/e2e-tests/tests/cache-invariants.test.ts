@@ -43,7 +43,6 @@ import {
 import { TestHarness } from "../src/harness";
 import { openTestDb } from "../src/test-db";
 import type { MockUsage } from "../src/mock-provider/server";
-import { FOLD_SKIP_REASON, foldInfraEnabled } from "../src/rust-scenario-support";
 
 const RUST_MODE = process.env.MC_E2E_MODE === "rust";
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
@@ -456,24 +455,6 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 // baseline — exactly the regression this asserts against.
                 installHistorianMatcher(h);
                 const sessionId = await h.createSession();
-
-                if (RUST_MODE) {
-                    // The hermetic Rust stack has no Broca fold runner, so a historian
-                    // publish cannot be produced here. Once that capability is enabled,
-                    // the fold-gated Rust scenario verifies that the publish survives m[1] replay.
-                    expect(foldInfraEnabled()).toBe(false);
-                    expect(FOLD_SKIP_REASON).toContain("broca");
-                    for (let turn = 1; turn <= 3; turn += 1) {
-                        setDefer(`B9 Rust replay ${turn}`);
-                        await h.sendPrompt(sessionId, `B9 Rust turn ${turn}: empty baseline replay.`);
-                    }
-                    const rustRequests = mainAgentRequests(h.mock.requests());
-                    expect(extractM0(rustRequests.at(-1)!.body)).toContain(
-                        "<session-history></session-history>",
-                    );
-                    assertNoBusts("B9-rust-no-fold-infra");
-                    return;
-                }
 
                 // Phase 1 — force an early execute pass so m[0] materializes EMPTY
                 // (0 compartments yet). A high-usage turn marks the next pass as

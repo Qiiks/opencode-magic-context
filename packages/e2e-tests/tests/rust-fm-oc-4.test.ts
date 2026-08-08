@@ -50,6 +50,7 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-4: emergency ref
             });
 
             h.subc.killModule();
+            await h.subc.waitForModuleDeath();
             try {
                 await h.sendPrompt(sessionId, `FM-OC-4 continue after SIGKILL: ${h.ballast(400)}`);
             } catch {

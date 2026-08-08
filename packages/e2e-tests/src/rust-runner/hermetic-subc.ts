@@ -39,12 +39,15 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { SubcClient, type BindIdentity } from "@cortexkit/subc-client";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 const MODULE_ID = "magic-context";
 const RUST_E2E_PID_FILE = "rust-e2e-pids.json";
+const BROCA_ID = "broca";
+const BROCA_SCRIPT = join(REPO_ROOT, "packages/e2e-tests/src/rust-runner/fake-broca.ts");
 
-type RustE2eProcessRole = "daemon" | "module";
+type RustE2eProcessRole = "daemon" | "module" | "producer";
 
 interface RustE2ePidRecord {
     pid: number;
@@ -277,6 +280,15 @@ function sleep(ms: number): Promise<void> {
     return new Promise((r) => setTimeout(r, ms));
 }
 
+function isProcessAlive(pid: number): boolean {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 async function pollUntil(
     predicate: () => boolean,
     opts: { timeoutMs: number; intervalMs?: number; label: string },
@@ -313,12 +325,17 @@ export class HermeticSubcStack {
     private readonly daemonConfigDir: string;
     private readonly daemonLogPath: string;
     private readonly moduleLogPath: string;
+    private readonly producerLogPath: string;
     private readonly pidFilePath: string;
     private readonly startTimeoutMs: number;
     private pidFileCreatedAtMs = 0;
     private readonly recordedPids = new Map<RustE2eProcessRole, number>();
     private daemon: ChildProcess | null = null;
     private module: ChildProcess | null = null;
+    private producer: ChildProcess | null = null;
+    private killedModulePid: number | null = null;
+    private moduleRouteDropBaseline = 0;
+    private killedProducerPid: number | null = null;
 
     private constructor(opts: Required<HermeticSubcOptions>) {
         this.dataDir = opts.dataDir;
@@ -333,6 +350,7 @@ export class HermeticSubcStack {
         this.daemonConfigDir = join(this.dataDir, "cortexkit", "_hermetic-daemon-config");
         this.daemonLogPath = join(this.dataDir, "cortexkit", "_hermetic-daemon.log");
         this.moduleLogPath = join(this.dataDir, "cortexkit", "_hermetic-module.log");
+        this.producerLogPath = join(this.dataDir, "cortexkit", "_hermetic-broca.log");
         this.pidFilePath = join(this.dataDir, "cortexkit", RUST_E2E_PID_FILE);
     }
 
@@ -361,6 +379,7 @@ export class HermeticSubcStack {
         rmSync(this.connectionFile, { force: true });
         rmSync(this.daemonLogPath, { force: true });
         rmSync(this.moduleLogPath, { force: true });
+        rmSync(this.producerLogPath, { force: true });
         this.pidFileCreatedAtMs = Date.now();
         this.persistPidFile();
         mkdirSync(join(this.daemonConfigDir, "cortexkit"), { recursive: true });
@@ -406,8 +425,42 @@ export class HermeticSubcStack {
         // attempts its one-shot registration handshake.
         await sleep(100);
 
+        // Register ck-mc first so its long-lived transform route is established
+        // before the independent Broca producer joins the daemon. Broca is still
+        // ready before the harness returns, so no historian request can race boot.
         await this.spawnModule();
         await this.waitForModuleRegistration();
+        await this.spawnProducer();
+        await this.waitForProducerRegistration();
+        process.env.MC_RUST_E2E_FOLD = "1";
+    }
+
+    private async spawnProducer(): Promise<void> {
+        this.producer = spawn(process.execPath, [BROCA_SCRIPT], {
+            stdio: ["ignore", "pipe", "pipe"],
+            env: {
+                ...process.env,
+                BROCA_CONNECTION_FILE: this.connectionFile,
+                BROCA_LOG_PATH: this.producerLogPath,
+                SUBC_MODULE_ID: "",
+                SUBC_LAUNCH_NONCE: "",
+                NO_COLOR: "1",
+            },
+        });
+        this.recordPid("producer", this.producer.pid);
+        this.pipeToLog(this.producer, this.producerLogPath, "producer");
+        this.producer.on("exit", (code, signal) => {
+            try {
+                appendFileSync(
+                    this.producerLogPath,
+                    `producer process exited code=${code ?? "null"} signal=${signal ?? "null"}\n`,
+                );
+            } catch {
+                // A lifecycle diagnostic must not turn teardown into a failure.
+            }
+            this.producer = null;
+            this.forgetPid("producer");
+        });
     }
 
     private async spawnModule(): Promise<void> {
@@ -417,6 +470,7 @@ export class HermeticSubcStack {
                 ...process.env,
                 NO_COLOR: "1",
                 SUBC_MODULE_ID: MODULE_ID,
+                SUBC_LAUNCH_NONCE: "",
                 // The module opens its store under this data home — the SAME dir
                 // opencode uses, matching production's shared cortexkit layout.
                 XDG_DATA_HOME: this.dataDir,
@@ -470,9 +524,22 @@ export class HermeticSubcStack {
      * it; poll that line so the first transform never races an unregistered
      * module (which the daemon rejects terminally as unknown_module).
      */
+    private async waitForProducerRegistration(): Promise<void> {
+        try {
+            await pollUntil(() => this.registrationCount(BROCA_ID) >= 1, {
+                timeoutMs: Math.min(this.startTimeoutMs, 10_000),
+                label: "Broca producer registration",
+            });
+        } catch (error) {
+            throw new Error(
+                `${String(error)}\\ndaemon log:\\n${this.daemonLog().slice(-4000)}\\nproducer log:\\n${this.producerLog().slice(-4000)}`,
+            );
+        }
+    }
+
     private async waitForModuleRegistration(): Promise<void> {
         try {
-            await pollUntil(() => this.registrationCount() >= 1, {
+            await pollUntil(() => this.registrationCount(MODULE_ID) >= 1, {
                 timeoutMs: Math.min(this.startTimeoutMs, 10_000),
                 label: "module registration",
             });
@@ -486,7 +553,7 @@ export class HermeticSubcStack {
             await this.spawnModule();
         }
         try {
-            await pollUntil(() => this.registrationCount() >= 1, {
+            await pollUntil(() => this.registrationCount(MODULE_ID) >= 1, {
                 timeoutMs: this.startTimeoutMs,
                 label: "module registration",
             });
@@ -504,10 +571,10 @@ export class HermeticSubcStack {
      * unreliable even though NO_COLOR should suppress it. Stripping makes the poll
      * robust regardless of the daemon's color configuration.
      */
-    private registrationCount(): number {
+    private registrationCount(moduleId: string): number {
         if (!existsSync(this.daemonLogPath)) return 0;
         const clean = stripAnsi(readFileSync(this.daemonLogPath, "utf8"));
-        const needle = `module registered module_id=${MODULE_ID}`;
+        const needle = `module registered module_id=${moduleId}`;
         return clean.split(needle).length - 1;
     }
 
@@ -520,6 +587,7 @@ export class HermeticSubcStack {
      */
     async restartModule(): Promise<void> {
         this.killModule();
+        await this.waitForModuleDeath();
         await sleep(200);
         await this.spawnModule();
         await this.waitForFreshModuleRegistration();
@@ -534,11 +602,79 @@ export class HermeticSubcStack {
 
     /** Kill only the module process (leaving the daemon up), for fault injection. */
     killModule(): void {
+        this.moduleRouteDropBaseline = this.routeDropCount();
+        const pid = this.module?.pid;
+        if (pid && Number.isInteger(pid) && pid > 0) this.killedModulePid = pid;
         if (this.module && this.module.exitCode === null) {
             this.module.kill("SIGKILL");
         }
         this.module = null;
         this.forgetPid("module");
+    }
+
+    /** Wait until SIGKILL has reaped the module and the daemon has dropped its route. */
+    async waitForModuleDeath(timeoutMs = 15_000): Promise<void> {
+        const pid = this.killedModulePid;
+        if (!pid) throw new Error("waitForModuleDeath called before killModule");
+        await pollUntil(
+            () => !isProcessAlive(pid) && this.routeDropLogged(),
+            { timeoutMs, label: "module death and daemon route drop" },
+        );
+    }
+
+    /** Kill the fake Broca process for the producer-outage drill. */
+    killProducer(): void {
+        const pid = this.producer?.pid;
+        if (pid && Number.isInteger(pid) && pid > 0) this.killedProducerPid = pid;
+        if (this.producer && this.producer.exitCode === null) this.producer.kill("SIGKILL");
+        this.producer = null;
+        this.forgetPid("producer");
+    }
+
+    async waitForProducerDeath(timeoutMs = 15_000): Promise<void> {
+        const pid = this.killedProducerPid;
+        if (!pid) throw new Error("waitForProducerDeath called before killProducer");
+        await pollUntil(() => !isProcessAlive(pid), {
+            timeoutMs,
+            label: "Broca producer death",
+        });
+    }
+
+    producerLog(): string {
+        try {
+            return readFileSync(this.producerLogPath, "utf8");
+        } catch {
+            return "";
+        }
+    }
+
+    producerRequestCount(): number {
+        return (this.producerLog().match(/session\.send /g) ?? []).length;
+    }
+
+    async moduleStatus(
+        sessionId: string,
+        projectRoot: string,
+        method: "status" | "session.status" = "status",
+    ): Promise<Record<string, unknown>> {
+        const identity: BindIdentity = { project_root: resolve(projectRoot), harness: "opencode", session: sessionId };
+        const client = await SubcClient.connect({
+            connectionFile: this.connectionFile,
+            identity,
+            targetKind: "tool_provider",
+        });
+        const route = await client.routeOpen(
+            { kind: "tool_provider", module_id: MODULE_ID },
+            identity,
+            { consumerIdentity: null },
+        );
+        try {
+            const response = await client.request(route, { method, v: 1, session_id: sessionId });
+            return (response && typeof response === "object" ? response : {}) as Record<string, unknown>;
+        } finally {
+            await client.closeRoute(route).catch(() => undefined);
+            client.close();
+        }
     }
 
     /** Stop the live module without killing it, so daemon timeout handling can be tested. */
@@ -578,10 +714,19 @@ export class HermeticSubcStack {
      * registration-line COUNT grows past what was present before the restart.
      */
     private registrationTarget = 1;
+    private routeDropCount(): number {
+        const clean = stripAnsi(this.daemonLog());
+        return (clean.match(/route[_ ](?:gone|dropped|closed)|(?:gone|dropped|closed).*route/gi) ?? []).length;
+    }
+
+    private routeDropLogged(): boolean {
+        return this.routeDropCount() > this.moduleRouteDropBaseline;
+    }
+
     private async waitForFreshModuleRegistration(): Promise<void> {
         this.registrationTarget += 1;
         const target = this.registrationTarget;
-        await pollUntil(() => this.registrationCount() >= target, {
+        await pollUntil(() => this.registrationCount(MODULE_ID) >= target, {
             timeoutMs: this.startTimeoutMs,
             label: "module re-registration after restart",
         });
@@ -627,6 +772,9 @@ export class HermeticSubcStack {
     /** Hard teardown. Safe to call more than once; never throws. */
     async stop(): Promise<void> {
         this.killModule();
+        if (this.producer && this.producer.exitCode === null) this.producer.kill("SIGKILL");
+        this.producer = null;
+        this.forgetPid("producer");
         if (this.daemon && this.daemon.exitCode === null) {
             this.daemon.kill("SIGKILL");
         }

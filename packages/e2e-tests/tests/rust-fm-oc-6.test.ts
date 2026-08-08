@@ -50,6 +50,7 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-6: emergency arm
             });
 
             h.subc.killModule();
+            await h.subc.waitForModuleDeath();
             try {
                 await h.sendPrompt(sessionId, `FM-OC-6 arm after SIGKILL: ${h.ballast(400)}`);
             } catch {

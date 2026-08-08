@@ -9,16 +9,8 @@
  * row is consumed. This proves reductions the agent requests actually take effect
  * on the wire in Rust mode, not just in local state.
  *
- * Gating: in Rust mode a pending drop only APPLIES on a cache-busting pass
- * (HARD/EXECUTE/fold). Verified empirically that on the current hermetic stack no
- * such bust lands under content pressure — the module's historian fold needs a
- * `broca` LLM-runner module the stack does not spawn (`unknown_module: broca`),
- * so a queued drop is never drained and `[dropped …]` never appears in the served
- * wire. (In TS mode the same drop applies and shows `[dropped …]`; the
- * cold-start-drop-seed scenario exercises that and its Rust-side seed translation
- * directly.) This scenario is therefore gated on `foldInfraEnabled()`
- * (MC_RUST_E2E_FOLD=1) and asserts the round-trip OUTCOME so it activates cleanly
- * once a hermetic broca runner is wired.
+ * The hermetic stack supplies a deterministic Broca producer, so this scenario
+ * runs in the Rust group and asserts the real drop-on-fold round trip.
  *
  * Assertion style: presence of the `[dropped §N§]` sentinel in the served wire
  * (from the fake provider's request body) plus ledger-row consumption.
@@ -26,26 +18,13 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { RustTestHarness } from "../src/rust-harness";
-import { buildMockHistorianPayload } from "../src/mock-historian";
-import {
-    FOLD_SKIP_REASON,
-    foldInfraEnabled,
-    printSkip,
-    rustPrereqs,
-} from "../src/rust-scenario-support";
-
-const active = rustPrereqs.ok && foldInfraEnabled();
+import { rustPrereqs } from "../src/rust-scenario-support";
 
 describe.skipIf(!rustPrereqs.ok)("rust invariant: ctx_reduce round-trip", () => {
-    it.skipIf(active)("is gated on a hermetic broca fold runner", () => {
-        printSkip("ctx-reduce-roundtrip", FOLD_SKIP_REASON);
-        expect(foldInfraEnabled()).toBe(false);
-    });
 
     let h: RustTestHarness;
 
     beforeEach(async () => {
-        if (!active) return;
         h = await RustTestHarness.create({
             modelContextLimit: 30_000,
             magicContextConfig: {
@@ -60,30 +39,11 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: ctx_reduce round-trip", () => 
         await h?.dispose();
     });
 
-    it.skipIf(!active)(
+    it(
         "applies an agent ctx_reduce drop on the next bust and shows [dropped N] in the wire",
         async () => {
             const sessionId = await h.createSession();
 
-            // Historian producer for the fold that will drain the pending drop
-            // (only reached once a hermetic broca runner exists).
-            h.mock.addMatcher((body) => {
-                const system = JSON.stringify(body.system ?? "");
-                if (!system.includes("hippocampus of a long-running coding agent")) return null;
-                return {
-                    text: buildMockHistorianPayload({
-                        start: 1,
-                        end: 2,
-                        title: "Rust reduce e2e chunk",
-                        body: "Covered the warmup turns before the reduce.",
-                    }),
-                    usage: {
-                        input_tokens: 500,
-                        output_tokens: 200,
-                        cache_creation_input_tokens: 500,
-                    },
-                };
-            });
 
             // Build turns with taggable content, then find a visible §N§ tag.
             for (let i = 1; i <= 3; i += 1) {

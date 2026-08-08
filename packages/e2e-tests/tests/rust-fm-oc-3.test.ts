@@ -42,6 +42,7 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-h
             const beforeCount = h.readRustPasses().length;
 
             h.subc.killModule();
+            await h.subc.waitForModuleDeath();
             await sendOutagePasses(
                 h,
                 sessionId,

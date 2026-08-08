@@ -8,13 +8,10 @@
  *     `describe.skipIf(!rustPrereqs.ok)`s when the stack cannot run, printing the
  *     reason so CI logs never green-wash a skipped lane.
  *
- *  2. Fold-infrastructure gating — the Rust module runs its OWN historian, which
- *     drives an LLM through a separate `broca` runner module the hermetic stack
- *     does not spawn. Without it no compartment is ever published, so no fold
- *     (and no drop that only applies on a fold/execute cache-bust) can land.
- *     Fold-dependent scenarios (#6 fold-under-pressure, #7 ctx-reduce-roundtrip)
- *     are gated on `foldInfraEnabled()` and assert outcomes that activate once a
- *     hermetic broca runner is wired (MC_RUST_E2E_FOLD=1).
+ *  2. Fold-infrastructure readiness — the Rust module runs its own historian and
+ *     the hermetic stack now starts a deterministic `broca` management-surface
+ *     producer. `foldInfraEnabled()` flips when that producer is booted, so fold
+ *     and drop-on-fold scenarios can assert their real outcomes.
  *
  * The tail-mutation-readopt and park-self-heal scenarios are NOT gated: the P0
  * identity-drift / park-self-heal fix is merged into this branch's base, so they
@@ -38,20 +35,18 @@ export {
 
 export const rustPrereqs = RustTestHarness.detectPrereqs();
 
-/** True once a hermetic broca LLM-runner module is wired so module-side folds can land. */
+/** True once the hermetic deterministic Broca producer is registered. */
 export function foldInfraEnabled(): boolean {
     return process.env.MC_RUST_E2E_FOLD === "1";
 }
 
 /**
- * Reason string for a fold-dependent scenario skip. The Rust module runs its own
- * historian, which drives an LLM through a separate `broca` runner module the
- * hermetic stack does not yet spawn; without it no compartment is ever published,
- * so no fold (or drop-on-fold) can land. Set MC_RUST_E2E_FOLD=1 once a hermetic
- * broca runner is added to the stack.
+ * Legacy reason retained for suites that still report a fold exclusion. The
+ * normal Rust harness starts Broca and activates those assertions; only suites
+ * that deliberately do not boot the Rust stack should use this text.
  */
 export const FOLD_SKIP_REASON =
-    "requires a hermetic broca LLM-runner module so the Rust module's historian can publish a compartment (fold); the current stack spawns only ck-subc + ck-mc (set MC_RUST_E2E_FOLD=1 once broca is wired)";
+    "requires the Rust harness's hermetic Broca producer; this suite does not boot that stack";
 
 /** Enable the duplicate-ID regression only when the stack can produce the selection refresh needed to reproduce duplicate IDs. */
 export function duplicateIdInfraEnabled(): boolean {

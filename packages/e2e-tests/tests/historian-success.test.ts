@@ -175,14 +175,14 @@ describe("historian success path", () => {
             // in v0.14.1, tests need to provide the follow-up turn explicitly.
             await h.sendPrompt(sessionId, "turn 12: post-trigger follow-up.");
 
-            // The main-agent requests and the historian trigger setup are
-            // fold-independent. Rust's hermetic rig deliberately has no Broca
-            // runner, so it cannot complete the module-side historian fold.
+            // The main-agent requests and trigger setup are fold-independent. In
+            // Rust mode the producer runs outside this mock, so completion belongs
+            // to rust-historian-producer.test.ts rather than this mock-capture test.
             const mainRequests = h.mock.requests().filter((request) => !isHistorianRequest(request.body));
             expect(mainRequests.length).toBeGreaterThanOrEqual(12);
             if (process.env.MC_E2E_MODE === "rust") {
-                // The hermetic Rust stack has no Broca runner, so its historian
-                // cannot publish a compartment; report that exclusion explicitly.
+                // The hermetic producer bypasses this OpenCode model mock; report
+                // that this mock-capture assertion is intentionally not applicable.
                 console.log(`[rust-e2e] historian publication assertions SKIPPED: ${FOLD_SKIP_REASON}`);
                 return;
             }
