@@ -1,63 +1,95 @@
 #!/usr/bin/env bun
 /**
- * Measure the agent-facing token surface: the Magic Context guidance section plus
- * every ctx_* tool description and parameter schema, per variant. Produces the
- * per-piece breakdown the #268 debloat discussion needs, and stays useful as a
- * regression check whenever agent-facing wording changes.
+ * Measure the agent-facing mutable-prose surface and its provider-visible schema
+ * overhead. `--assert` is the deterministic CI entry point; it checks the
+ * committed budget fixture and, when a light manifest is supplied, enforces the
+ * recorded ceiling without inventing counts for missing light prose or adjuncts.
  *
- * Usage: bun packages/plugin/scripts/measure-agent-surface.ts
+ * Usage:
+ *   bun packages/plugin/scripts/measure-agent-surface.ts
+ *   bun packages/plugin/scripts/measure-agent-surface.ts --assert
+ *   bun packages/plugin/scripts/measure-agent-surface.ts --assert --light-surface path.json
  */
-import Tokenizer from "ai-tokenizer";
-import * as claudeEncoding from "ai-tokenizer/encoding/claude";
-import { buildMagicContextSection } from "../src/agents/magic-context-prompt";
-import { CTX_EXPAND_DESCRIPTION } from "../src/tools/ctx-expand/constants";
-import { CTX_MEMORY_DESCRIPTION } from "../src/tools/ctx-memory/constants";
-import { CTX_NOTE_DESCRIPTION } from "../src/tools/ctx-note/constants";
-import { CTX_REDUCE_DESCRIPTION } from "../src/tools/ctx-reduce/constants";
-import { CTX_SEARCH_DESCRIPTION } from "../src/tools/ctx-search/constants";
+import { resolve } from "node:path";
+import {
+    ACTIVE_TOOL_IDS,
+    measureAgentSurface,
+    measureLightSurface,
+    readLightSurface,
+} from "./prompt-surface-measurement";
+import { validateBudgetFixture } from "./prompt-surface-fixture";
 
-type Row = { label: string; chars: number; tokens: number };
+const fixturePath = resolve(import.meta.dir, "../../..", "docs/specs/prompt-surface/budget-fixture.json");
+const args = process.argv.slice(2);
+const assertMode = args.includes("--assert");
+const lightSurfaceIndex = args.indexOf("--light-surface");
+const lightSurfacePath = lightSurfaceIndex >= 0 ? args[lightSurfaceIndex + 1] : undefined;
 
-const tokenizer = new Tokenizer(claudeEncoding);
-
-function measure(label: string, text: string): Row {
-    return { label, chars: text.length, tokens: tokenizer.count(text) };
+function formatCount(value: { chars: number; tokens: number }): string {
+    return `${value.chars} chars, ${value.tokens} tokens`;
 }
 
-const rows: Row[] = [];
+function printReport() {
+    const surface = measureAgentSurface();
+    console.log(`tokenizer: ${surface.tokenizer.package} / ${surface.tokenizer.encoding} ${surface.tokenizer.version}`);
+    console.log(`counting method: ${surface.tokenizer.method}`);
+    console.log("");
+    console.log("guidance variants");
+    for (const row of surface.guidance) {
+        console.log(`- ${row.id}: ${formatCount(row.full)}`);
+    }
+    console.log("");
+    console.log("active built-in tool descriptions and serialized parameter schemas");
+    for (const id of ACTIVE_TOOL_IDS) {
+        const tool = surface.tools[id];
+        console.log(
+            `- ${id}: description ${formatCount(tool.description)}; serialized parameter schema ${formatCount(tool.serializedParameterSchema)}`,
+        );
+    }
+    console.log("");
+    console.log(`primary mutable-prose baseline: ${surface.primary.mutableProseBaseline} tokens`);
+    console.log(
+        `primary serialized parameter-schema total: ${surface.primary.serializedParameterSchemaTotal} tokens (reported separately; excluded from the ceiling)`,
+    );
+    console.log(
+        `built-in provider-visible total: ${surface.primary.builtInProviderVisibleTotal} tokens (guidance + descriptions + serialized parameter schemas)`,
+    );
+    console.log("excluded adjuncts: project docs, profile, memory rendering, compartments, m0, temporal overlays, and USER overrides (no static counts fabricated)");
+    console.log("approximately 6.1k: one-time issue-268 all-in measurement, not this mutable-prose metric");
 
-// Guidance section variants (primary session; memory on/off; reduce on/off).
-// Signature: (agent, protectedTags, ctxReduceCallable, dreamerEnabled,
-//             temporalAwareness, caveman, subagentMode, language, memoryEnabled)
-for (const reduce of [true, false]) {
-    for (const memory of [true, false]) {
-        const section = buildMagicContextSection(null, 20, reduce, true, true, false, false, undefined, memory);
-        rows.push(measure(`guidance reduce=${reduce} memory=${memory}`, section));
+    if (lightSurfacePath) {
+        const light = measureLightSurface(readLightSurface(lightSurfacePath), surface);
+        console.log("");
+        console.log(`light candidate (${light.variant})`);
+        console.log(`- guidance: ${formatCount(light.guidance)}`);
+        for (const id of ACTIVE_TOOL_IDS) {
+            console.log(`- ${id} light description: ${formatCount(light.descriptions[id])}`);
+        }
+        console.log(`- light mutable-prose total: ${light.mutableProseTotal} tokens`);
+        console.log(`- light built-in provider-visible total: ${light.builtInProviderVisibleTotal} tokens`);
+    } else {
+        console.log("light surface: not measured (light prose is gated on ratification; no zero counts are fabricated)");
     }
 }
-rows.push(
-    measure("guidance subagent minimal", buildMagicContextSection(null, 20, true, false, false, false, true)),
-);
 
-const descriptions: [string, string][] = [
-    ["ctx_reduce", CTX_REDUCE_DESCRIPTION],
-    ["ctx_expand", CTX_EXPAND_DESCRIPTION],
-    ["ctx_note", CTX_NOTE_DESCRIPTION],
-    ["ctx_memory", CTX_MEMORY_DESCRIPTION],
-    ["ctx_search", CTX_SEARCH_DESCRIPTION],
-];
-for (const [name, desc] of descriptions) {
-    rows.push(measure(`${name} description`, desc));
+if (import.meta.main) {
+    try {
+        if (assertMode) {
+            printReport();
+            const result = validateBudgetFixture({
+                fixturePath,
+                lightSurfacePath,
+            });
+            for (const message of result.messages) console.log(message);
+            if (result.errors.length > 0) {
+                for (const error of result.errors) console.error(`ERROR: ${error}`);
+                process.exitCode = 1;
+            }
+        } else {
+            printReport();
+        }
+    } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+    }
 }
-
-console.log("piece".padEnd(40), "chars".padStart(7), "tokens".padStart(7));
-console.log("-".repeat(56));
-for (const row of rows) {
-    console.log(row.label.padEnd(40), String(row.chars).padStart(7), String(row.tokens).padStart(7));
-}
-const primary = rows.filter((r) => r.label === "guidance reduce=true memory=true" || r.label.endsWith("description"));
-const total = primary.reduce((sum, r) => sum + r.tokens, 0);
-console.log("-".repeat(56));
-console.log("TOTAL primary surface (descriptions only)".padEnd(40), "".padStart(7), String(total).padStart(7));
-console.log("\nNote: parameter schemas add provider-serialized overhead on top of");
-console.log("descriptions; the reporter's 3.7k tool measurement includes schemas.");
