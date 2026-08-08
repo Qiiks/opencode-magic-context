@@ -8,8 +8,7 @@ type CommandResult = { exit_status: number; output: string };
 const e2eRoot = resolve(import.meta.dir, "..");
 const repoRoot = resolve(e2eRoot, "../..");
 const source = resolve(e2eRoot, "src/rust-runner/fake-broca.ts");
-const oldText = "<p1>${title}</p1>";
-const replacement = "<tier1>${title}</tier1>";
+const tierPattern = /<p[1-4]>[\s\S]*?<\/p[1-4]>/g;
 const decoder = new TextDecoder();
 
 function runTest(expectBad: boolean): CommandResult {
@@ -37,20 +36,28 @@ function runTest(expectBad: boolean): CommandResult {
 }
 
 const before = readFileSync(source, "utf8");
-if (before.split(oldText).length - 1 !== 1) {
-    throw new Error("RUST_HISTORIAN_BAD_TIER: expected one tier mutation target");
+const matches = before.match(tierPattern) ?? [];
+if (matches.length !== 4) {
+    throw new Error(`RUST_HISTORIAN_BAD_TIER: expected four tier blocks, found ${matches.length}`);
 }
-const after = before.replace(oldText, replacement);
+const oldText = matches.join("\n");
+const replacement = "<tier-tags-removed>";
+const after = before.replace(tierPattern, "");
 writeFileSync(source, after);
 let observedFailure: CommandResult;
+let validationProbe: CommandResult;
 try {
-    observedFailure = runTest(true);
+    observedFailure = runTest(false);
+    validationProbe = runTest(true);
 } finally {
     writeFileSync(source, before);
 }
 const revertedRerun = runTest(false);
 if (observedFailure.exit_status === 0) {
     throw new Error("RUST_HISTORIAN_BAD_TIER: mutation did not redden the validation assertion");
+}
+if (validationProbe.exit_status !== 0) {
+    throw new Error("RUST_HISTORIAN_BAD_TIER: invalid-output probe did not observe the validation failure");
 }
 if (revertedRerun.exit_status !== 0) {
     throw new Error("RUST_HISTORIAN_BAD_TIER: reverted producer test did not pass");
@@ -69,6 +76,7 @@ const record = {
                 changed: before !== after,
             },
             observed_failure: observedFailure,
+            validation_probe: validationProbe,
             reverted_rerun: {
                 ...revertedRerun,
                 status: "pass",

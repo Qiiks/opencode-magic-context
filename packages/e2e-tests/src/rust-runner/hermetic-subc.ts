@@ -336,6 +336,8 @@ export class HermeticSubcStack {
     private killedModulePid: number | null = null;
     private moduleRouteDropBaseline = 0;
     private killedProducerPid: number | null = null;
+    private producerPid: number | null = null;
+    private statusClient: SubcClient | null = null;
 
     private constructor(opts: Required<HermeticSubcOptions>) {
         this.dataDir = opts.dataDir;
@@ -426,8 +428,9 @@ export class HermeticSubcStack {
         await sleep(100);
 
         // Register ck-mc first so its long-lived transform route is established
-        // before the independent Broca producer joins the daemon. Broca is still
-        // ready before the harness returns, so no historian request can race boot.
+        // before the independent Broca producer joins the daemon. The producer is
+        // still ready before the harness returns, so no historian request can race
+        // boot and the module's initial route is not starved by daemon startup.
         await this.spawnModule();
         await this.waitForModuleRegistration();
         await this.spawnProducer();
@@ -447,6 +450,7 @@ export class HermeticSubcStack {
                 NO_COLOR: "1",
             },
         });
+        this.producerPid = this.producer.pid ?? null;
         this.recordPid("producer", this.producer.pid);
         this.pipeToLog(this.producer, this.producerLogPath, "producer");
         this.producer.on("exit", (code, signal) => {
@@ -538,30 +542,29 @@ export class HermeticSubcStack {
     }
 
     private async waitForModuleRegistration(): Promise<void> {
-        try {
-            await pollUntil(() => this.registrationCount(MODULE_ID) >= 1, {
-                timeoutMs: Math.min(this.startTimeoutMs, 10_000),
-                label: "module registration",
-            });
-            return;
-        } catch {
-            // A fresh daemon can publish its connection file before the listener
-            // is ready. Retry the external client once rather than treating that
-            // startup race as a failed hermetic prerequisite.
-            this.killModule();
-            await sleep(200);
-            await this.spawnModule();
+        let lastError: unknown;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            if (attempt > 0) {
+                await sleep(500 * attempt);
+                await this.spawnModule();
+            }
+            try {
+                await pollUntil(() => this.registrationCount(MODULE_ID) >= 1, {
+                    timeoutMs: Math.min(this.startTimeoutMs, 10_000),
+                    label: "module registration",
+                });
+                return;
+            } catch (error) {
+                lastError = error;
+                // A fresh daemon can publish its connection file before the listener
+                // is ready. Recreate the external client for the next attempt rather
+                // than treating that startup race as a failed hermetic prerequisite.
+                this.killModule();
+            }
         }
-        try {
-            await pollUntil(() => this.registrationCount(MODULE_ID) >= 1, {
-                timeoutMs: this.startTimeoutMs,
-                label: "module registration",
-            });
-        } catch (error) {
-            throw new Error(
-                `${String(error)}\ndaemon log:\n${this.daemonLog().slice(-4000)}\nmodule log:\n${this.moduleLog().slice(-4000)}`,
-            );
-        }
+        throw new Error(
+            `${String(lastError)}\ndaemon log:\n${this.daemonLog().slice(-4000)}\nmodule log:\n${this.moduleLog().slice(-4000)}`,
+        );
     }
 
     /**
@@ -624,7 +627,7 @@ export class HermeticSubcStack {
 
     /** Kill the fake Broca process for the producer-outage drill. */
     killProducer(): void {
-        const pid = this.producer?.pid;
+        const pid = this.producer?.pid ?? this.producerPid;
         if (pid && Number.isInteger(pid) && pid > 0) this.killedProducerPid = pid;
         if (this.producer && this.producer.exitCode === null) this.producer.kill("SIGKILL");
         this.producer = null;
@@ -632,7 +635,7 @@ export class HermeticSubcStack {
     }
 
     async waitForProducerDeath(timeoutMs = 15_000): Promise<void> {
-        const pid = this.killedProducerPid;
+        const pid = this.killedProducerPid ?? this.producerPid;
         if (!pid) throw new Error("waitForProducerDeath called before killProducer");
         await pollUntil(() => !isProcessAlive(pid), {
             timeoutMs,
@@ -658,22 +661,26 @@ export class HermeticSubcStack {
         method: "status" | "session.status" = "status",
     ): Promise<Record<string, unknown>> {
         const identity: BindIdentity = { project_root: resolve(projectRoot), harness: "opencode", session: sessionId };
-        const client = await SubcClient.connect({
+        const client = this.statusClient ?? (this.statusClient = await SubcClient.connect({
             connectionFile: this.connectionFile,
             identity,
             targetKind: "tool_provider",
-        });
-        const route = await client.routeOpen(
-            { kind: "tool_provider", module_id: MODULE_ID },
-            identity,
-            { consumerIdentity: null },
-        );
+        }));
+        let route: Awaited<ReturnType<SubcClient["routeOpen"]>> | null = null;
         try {
+            route = await client.routeOpen(
+                { kind: "tool_provider", module_id: MODULE_ID },
+                identity,
+                { consumerIdentity: null },
+            );
             const response = await client.request(route, { method, v: 1, session_id: sessionId });
             return (response && typeof response === "object" ? response : {}) as Record<string, unknown>;
-        } finally {
-            await client.closeRoute(route).catch(() => undefined);
+        } catch (error) {
             client.close();
+            if (this.statusClient === client) this.statusClient = null;
+            throw error;
+        } finally {
+            if (route) await client.closeRoute(route).catch(() => undefined);
         }
     }
 
@@ -716,7 +723,11 @@ export class HermeticSubcStack {
     private registrationTarget = 1;
     private routeDropCount(): number {
         const clean = stripAnsi(this.daemonLog());
-        return (clean.match(/route[_ ](?:gone|dropped|closed)|(?:gone|dropped|closed).*route/gi) ?? []).length;
+        return (
+            clean.match(
+                /route[_ ](?:gone|dropped|closed)|(?:gone|dropped|closed).*route|supervised module exited abnormally.*exit_signal=Some\(9\)/gi,
+            ) ?? []
+        ).length;
     }
 
     private routeDropLogged(): boolean {
@@ -771,6 +782,8 @@ export class HermeticSubcStack {
 
     /** Hard teardown. Safe to call more than once; never throws. */
     async stop(): Promise<void> {
+        this.statusClient?.close();
+        this.statusClient = null;
         this.killModule();
         if (this.producer && this.producer.exitCode === null) this.producer.kill("SIGKILL");
         this.producer = null;

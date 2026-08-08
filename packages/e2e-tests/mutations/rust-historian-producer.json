@@ -1,0 +1,29 @@
+{
+  "drill": "RUST-HISTORIAN-PRODUCER",
+  "command": "MC_E2E_MODE=rust bun test --timeout 600000 --max-concurrency=1 tests/rust-historian-producer.test.ts",
+  "mutations": [
+    {
+      "name": "RUST_HISTORIAN_BAD_TIER",
+      "applied_diff": {
+        "path": "packages/e2e-tests/src/rust-runner/fake-broca.ts",
+        "before": "<p1>${title}</p1>\n<p2>Deterministic historian coverage ${start}-${end}.</p2>\n<p3>Published by the hermetic Broca producer.</p3>\n<p4>Replay is stable for this chunk.</p4>",
+        "after": "<tier-tags-removed>",
+        "changed": true
+      },
+      "observed_failure": {
+        "exit_status": 1,
+        "output": "bun test v1.3.14 (0d9b296a)\n\ntests/rust-historian-producer.test.ts:\n46 |             if (!this.closedErr)\n47 |                 this.closedErr = err;\n48 |             this.tryServe();\n49 |         };\n50 |         sock.on(\"error\", (err) => fail(err instanceof Error ? err : new Error(String(err))));\n51 |         sock.on(\"end\", () => fail(new SocketClosedError(\"subc closed the connection\")));\n                                       ^\nerror: subc closed the connection\n      at <anonymous> (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_67b5248a/node_modules/.bun/@cortexkit+subc-client@0.4.1/node_modules/@cortexkit/subc-client/dist/socket.js:51:35)\n      at emit (node:events:92:22)\n      at endReadableNT (internal:streams/readable:865:50)\n(fail) rust historian: hermetic Broca producer > publishes deterministic tiered output and records producer contact [96979.52ms]\n175 |                 if (failed.last_failure) break;\n176 |                 await Bun.sleep(100);\n177 |             }\n178 |             expect(beforeFailure).toBeGreaterThan(0);\n179 |             expect(h.subc.producerRequestCount()).toBe(beforeFailure);\n180 |             expect(failed.last_failure).toMatch(/broca|producer|connect|route|unknown/i);\n                                              ^\nerror: Received value must be a string: undefined\n      at <anonymous> (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_67b5248a/packages/e2e-tests/tests/rust-historian-producer.test.ts:180:41)\n(fail) rust historian: hermetic Broca producer > takes the loud historian failure path when Broca goes down mid-run [121527.75ms]\n\n 0 pass\n 2 fail\n 3 expect() calls\nRan 2 tests across 1 file. [222.52s]\n"
+      },
+      "validation_probe": {
+        "exit_status": 0,
+        "output": "bun test v1.3.14 (0d9b296a)\n\ntests/rust-historian-producer.test.ts:\n(pass) rust historian: hermetic Broca producer > publishes deterministic tiered output and records producer contact [10682.77ms]\n(pass) rust historian: hermetic Broca producer > takes the loud historian failure path when Broca goes down mid-run [729.09ms]\n\n 2 pass\n 0 fail\n 8 expect() calls\nRan 2 tests across 1 file. [15.52s]\n"
+      },
+      "reverted_rerun": {
+        "exit_status": 0,
+        "output": "bun test v1.3.14 (0d9b296a)\n\ntests/rust-historian-producer.test.ts:\n(pass) rust historian: hermetic Broca producer > publishes deterministic tiered output and records producer contact [6948.26ms]\n(pass) rust historian: hermetic Broca producer > takes the loud historian failure path when Broca goes down mid-run [1010.42ms]\n\n 2 pass\n 0 fail\n 8 expect() calls\nRan 2 tests across 1 file. [11.61s]\n",
+        "status": "pass"
+      },
+      "adequacy_finding": null
+    }
+  ]
+}

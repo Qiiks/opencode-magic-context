@@ -53,7 +53,13 @@ function requestSession(handle: RouteHandle): string {
 }
 
 function ordinalRange(prompt: string): { start: number; end: number } {
-    const ordinals = [...prompt.matchAll(/^\s*\[(\d+)\]/gm)].map((match) => Number(match[1]));
+    const startMarker = prompt.indexOf("<new_messages>");
+    const endMarker = prompt.indexOf("</new_messages>");
+    const rawChunk =
+        startMarker >= 0
+            ? prompt.slice(startMarker + "<new_messages>".length, endMarker > startMarker ? endMarker : undefined)
+            : prompt;
+    const ordinals = [...rawChunk.matchAll(/^\s*\[(\d+)\]/gm)].map((match) => Number(match[1]));
     if (ordinals.length > 0) {
         return {
             start: Math.min(...ordinals),
@@ -70,8 +76,11 @@ function deterministicTitle(prompt: string, start: number, end: number): string 
         ["cache-invariant", "cache-invariant chunk"],
         ["Long OpenCode e2e chunk", "Long OpenCode e2e chunk"],
         ["long-running OpenCode", "Long OpenCode e2e chunk"],
+        ["OpenCode warm-up cache-stability", "Long OpenCode e2e chunk"],
         ["Rust fold e2e chunk", "Rust fold e2e chunk"],
+        ["fold-under-pressure", "Rust fold e2e chunk"],
         ["Rust reduce e2e chunk", "Rust reduce e2e chunk"],
+        ["ctx_reduce", "Rust reduce e2e chunk"],
     ];
     for (const [needle, title] of knownLabels) {
         if (prompt.includes(needle)) return title;
@@ -82,9 +91,10 @@ function deterministicTitle(prompt: string, start: number, end: number): string 
 function deterministicOutput(prompt: string): string {
     const { start, end } = ordinalRange(prompt);
     const title = deterministicTitle(prompt, start, end);
+    const tierOne = `<p1>${title}</p1>`;
     return `<output>\n<compartments>\n` +
         `<compartment start="${start}" end="${end}" title="${title}" importance="50" episode_type="feature">\n` +
-        `<p1>${title}</p1>\n` +
+        `${tierOne}\n` +
         `<p2>Deterministic historian coverage ${start}-${end}.</p2>\n` +
         `<p3>Published by the hermetic Broca producer.</p3>\n` +
         `<p4>Replay is stable for this chunk.</p4>\n` +
@@ -183,7 +193,9 @@ const provider = await SubcProvider.connect({
 
 log(`ready module_id=${MODULE_ID}`);
 
+const keepAlive = setInterval(() => undefined, 60_000);
 const close = async (): Promise<void> => {
+    clearInterval(keepAlive);
     await provider.close();
     process.exit(0);
 };

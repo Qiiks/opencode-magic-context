@@ -44,6 +44,8 @@ export interface SpawnedOpencode {
     kill: () => Promise<void>;
     stdout: () => string;
     stderr: () => string;
+    /** The hermetic Rust stack is provisioned only when MC_E2E_MODE is set to "rust"; this property exposes it when available. */
+    rustStack?: HermeticSubcStack;
 }
 
 export interface SpawnOptions {
@@ -431,6 +433,7 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
         env,
         stdout: () => stdoutBuf,
         stderr: () => stderrBuf,
+        rustStack: resources?.stack,
         kill: async () => {
             try {
                 if (child.exitCode === null && child.signalCode === null) {

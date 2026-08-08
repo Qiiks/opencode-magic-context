@@ -47,6 +47,10 @@ import type { MockUsage } from "../src/mock-provider/server";
 const RUST_MODE = process.env.MC_E2E_MODE === "rust";
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 
+function wireValueText(value: unknown): string {
+    return typeof value === "string" ? value : JSON.stringify(value);
+}
+
 function isHistorianRequest(body: Record<string, unknown>): boolean {
     const system = body.system;
     if (typeof system === "string") return system.includes(HISTORIAN_SYSTEM_MARKER);
@@ -461,12 +465,19 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 // execute; the pass after it does the empty materialization.
                 setDefer("B9 warm 1");
                 await h.sendPrompt(sessionId, "B9 turn 1: warmup.");
-                h.mock.setDefault({ text: "B9 high", usage: EXECUTE_USAGE });
+                h.mock.setDefault({
+                    text: "B9 high",
+                    usage: RUST_MODE
+                        ? { input_tokens: 19_000, output_tokens: 20, cache_creation_input_tokens: 19_000, cache_read_input_tokens: 0 }
+                        : EXECUTE_USAGE,
+                });
                 await h.sendPrompt(sessionId, "B9 turn 2: high usage marks the next pass execute.");
                 setDefer("B9 materialize-empty");
                 await h.sendPrompt(sessionId, "B9 turn 3: execute pass materializes empty m[0].");
 
-                const m0BaselineEmpty = extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body);
+                const m0BaselineEmpty = wireValueText(
+                    extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body),
+                );
                 expect(m0BaselineEmpty).toContain("<session-history></session-history>");
 
                 // Phase 2 — build an eligible tail, then trigger + run the historian.
@@ -479,20 +490,30 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 setDefer("B9 post-trigger");
                 await h.sendPrompt(sessionId, "B9 turn 13: follow-up starts + awaits the historian publish.");
 
-                await h.waitFor(() => h.countCompartments(sessionId) >= 1, {
-                    timeoutMs: 60_000,
-                    label: "B9 compartment publishes to DB",
-                });
+                if (RUST_MODE) {
+                    await h.waitFor(
+                        () =>
+                            mainAgentRequests(h.mock.requests()).find((request) =>
+                                wireValueText(extractM1(request.body)).includes("<new-compartments>"),
+                            ),
+                        { timeoutMs: 60_000, label: "B9 Rust compartment publishes to the m[1] wire" },
+                    );
+                } else {
+                    await h.waitFor(() => h.countCompartments(sessionId) >= 1, {
+                        timeoutMs: 60_000,
+                        label: "B9 compartment publishes to DB",
+                    });
+                }
 
                 //#then — the published compartment must surface as an m[1] delta
                 // while m[0] stays the empty baseline.
                 const requests = mainAgentRequests(h.mock.requests());
                 const surfaceReq = requests.find((r) =>
-                    extractM1(r.body)?.includes("<new-compartments>"),
+                    wireValueText(extractM1(r.body)).includes("<new-compartments>"),
                 );
                 expect(surfaceReq).toBeDefined();
-                const m1 = extractM1(surfaceReq!.body)!;
-                const m0 = extractM0(surfaceReq!.body)!;
+                const m1 = wireValueText(extractM1(surfaceReq!.body));
+                const m0 = wireValueText(extractM0(surfaceReq!.body));
                 // Delta invariant: the compartment rides m[1].
                 expect(m1).toContain("<new-compartments>");
                 expect(m1).toContain("cache-invariant chunk");
@@ -513,8 +534,8 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 // the load-bearing SOFT-replay assertion: the surfaced delta is
                 // frozen, not re-rendered, on defer.
                 const after = mainAgentRequests(h.mock.requests()).slice(surfaceIdx);
-                const m1s = new Set(after.map((r) => extractM1(r.body)));
-                const m0s = new Set(after.map((r) => extractM0(r.body)));
+                const m1s = new Set(after.map((r) => wireValueText(extractM1(r.body))));
+                const m0s = new Set(after.map((r) => wireValueText(extractM0(r.body))));
                 expect(m1s.size).toBe(1);
                 expect(m0s.size).toBe(1);
 
