@@ -3093,6 +3093,10 @@ fn bool_is_false(value: &bool) -> bool {
     !*value
 }
 
+fn u8_is_zero(value: &u8) -> bool {
+    *value == 0
+}
+
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
@@ -3177,6 +3181,15 @@ pub struct ModuleMeta {
     /// cache. 0 is retained for pre-materialization metadata.
     #[serde(default)]
     pub m1_revision: u64,
+    /// Highest compartment sequence represented by the applied m1 revision. Unlike the combined
+    /// revision digest, this component is unaffected by project memories, notes, or profile churn.
+    /// `None` identifies metadata written before the component watermark was persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub m1_compartment_seq: Option<i64>,
+    /// Consecutive coherent divergence observations suppressed by a pending compartment revision.
+    /// Legacy or damaged rows eventually escalate instead of remaining excluded forever.
+    #[serde(default, skip_serializing_if = "u8_is_zero")]
+    pub boundary_divergence_pending_count: u8,
     /// The last materializing pass had cross-session memory disabled. The negative form keeps
     /// pre-field metadata and fresh default state compatible with the historical enabled mode.
     #[serde(default)]
@@ -4857,6 +4870,9 @@ enum ModuleStateSyncTxnOutcome {
 
 #[cfg(any(test, feature = "test-support"))]
 type AbandonHistorianHook = std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>>;
+#[cfg(any(test, feature = "test-support"))]
+type BeforeMaxCompartmentEndReadHook =
+    std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut(&McStore) + Send>>>>;
 
 /// The Magic Context cache-state store: one single-writer SQLite handle for the
 /// module's lifetime.
@@ -5502,6 +5518,8 @@ pub struct McStore {
     #[cfg(any(test, feature = "test-support"))]
     facade_mutation_abandon_hook: AbandonHistorianHook,
     #[cfg(any(test, feature = "test-support"))]
+    before_max_compartment_end_read_hook: BeforeMaxCompartmentEndReadHook,
+    #[cfg(any(test, feature = "test-support"))]
     authority_project_resolution_fail_once: std::sync::atomic::AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
     tag_number_query_count: std::sync::atomic::AtomicUsize,
@@ -5755,6 +5773,8 @@ impl McStore {
             abandon_historian_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
             facade_mutation_abandon_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-support"))]
+            before_max_compartment_end_read_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
             authority_project_resolution_fail_once: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
@@ -6184,6 +6204,17 @@ impl McStore {
             });
         }
         Ok(())
+    }
+
+    /// Install a one-shot callback immediately before the max-compartment-end query. It lets
+    /// detector tests place a publication after an earlier revision read without adding a
+    /// production scheduling seam.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_before_max_compartment_end_read_hook(&self, hook: Box<dyn FnMut(&McStore) + Send>) {
+        *self
+            .before_max_compartment_end_read_hook
+            .lock()
+            .expect("max compartment-end read hook mutex") = Some(hook);
     }
 
     /// Install a test callback while cleanup of a matching pending historian run holds
@@ -8772,6 +8803,17 @@ impl McStore {
     /// materializing the wide compartment rows. The migration-42 index covers both the session
     /// predicate and the aggregate value.
     pub fn max_compartment_end_ordinal(&self, session_id: &str) -> Result<i64, McStoreError> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let hook = self
+                .before_max_compartment_end_read_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(mut hook) = hook {
+                hook(self);
+            }
+        }
         self.inner
             .with_conn(|conn| {
                 conn.query_row(

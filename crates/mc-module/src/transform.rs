@@ -24,7 +24,7 @@ use crate::injection::{
 use crate::m0_compose::compose_m0_from_store;
 use crate::m1_compose::{
     claim_and_render_notes, compose_m1_from_store, m1_revision_signal_parts_for_pass_timed,
-    M1RevisionReadTimings, M1RevisionSignal,
+    M1RevisionReadTimings,
 };
 use crate::memory_render::M1_PLACEHOLDER;
 use crate::scheduler::{
@@ -60,6 +60,9 @@ use crate::ck_wire::{
 /// Max CAS retries before surfacing the conflict (the module is the single writer in
 /// the daemon case, so this rarely loops; the shared-store case re-loads and re-steps).
 const MAX_CAS_RETRIES: u32 = 8;
+/// Limit consecutive passes that may ignore a coverage gap when the applied compartment
+/// watermark is missing or stale; after this limit, the gap is repaired instead of suppressed.
+const BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT: u8 = 3;
 
 /// Reserved synthetic-block ids (never carried by a real conversation item).
 #[cfg(test)]
@@ -2340,21 +2343,93 @@ fn apply_once(
         m1_visibility_cutoff_ms,
         Some(&mut m1_revision_read_timings),
     )?;
-    let mut current_m1_digest = m1_signal.revision;
-    let compartment_seq_changed_since_meta = loaded.meta.initialized
-        && m1_signal.max_compartment_seq != meta_coverage_compartment_seq(&loaded.meta);
-    let boundary_divergence_recut = if req.is_subagent {
+    let effective_usage = effective_usage(req.usage.as_ref(), loaded.meta.last_usage.as_ref());
+    let context_limit_tokens = effective_context_limit_tokens(&effective_usage);
+    let usage_input_tokens = effective_usage.current_total_input_tokens as f64;
+    let usage_percentage = if context_limit_tokens > 0.0 {
+        usage_input_tokens / context_limit_tokens * 100.0
+    } else {
+        0.0
+    };
+    let fallback_tail_allowance = if loaded.meta.initialized
+        && !req.is_subagent
+        && loaded.meta.publication_floor_ordinal.is_none()
+    {
+        protected_tail_floor_allowance(
+            &live,
+            context_limit_tokens,
+            ctx.execute_threshold_percentage,
+        )
+    } else {
+        0
+    };
+    let mut divergence_candidate = if req.is_subagent {
         None
     } else {
-        detect_boundary_divergence(
+        detect_boundary_divergence_candidate(
             store,
             &req.session_id,
             &loaded.meta,
-            &m1_signal,
             &live,
-            boundary_divergence_retry,
+            fallback_tail_allowance,
         )?
     };
+    let mut divergence_inputs_moved = false;
+    if divergence_candidate.is_some() && !boundary_divergence_retry {
+        // The max-end aggregate is a separate store read. Re-read the revision afterward so a
+        // publication between those reads cannot pair the old acknowledgement with the new end.
+        let revalidated = m1_revision_signal_parts_for_pass_timed(
+            store,
+            ctx.project_path,
+            ctx.note_project_path,
+            &req.session_id,
+            loaded.meta.user_profile_version,
+            ctx.memory_enabled,
+            m1_visibility_cutoff_ms,
+            Some(&mut m1_revision_read_timings),
+        )?;
+        if revalidated.revision != m1_signal.revision {
+            divergence_candidate = None;
+            divergence_inputs_moved = true;
+        }
+        m1_signal = revalidated;
+    }
+    // The combined revision also contains project memories, notes, and profile state. Gate the
+    // healthy pending-publication window on its compartment component so unrelated churn cannot
+    // suppress repair. Metadata from before that component existed falls back to the combined
+    // digest, then escalates after a small number of coherent observations if it never converges.
+    let compartment_revision_matches = loaded
+        .meta
+        .m1_compartment_seq
+        .map_or(m1_signal.revision == loaded.meta.m1_revision, |applied| {
+            applied == m1_signal.max_compartment_seq
+        });
+    let mut boundary_divergence_pending_count = if req.is_subagent || divergence_inputs_moved {
+        loaded.meta.boundary_divergence_pending_count
+    } else if divergence_candidate.is_some() {
+        if boundary_divergence_retry || compartment_revision_matches {
+            0
+        } else {
+            loaded
+                .meta
+                .boundary_divergence_pending_count
+                .saturating_add(1)
+                .min(BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT)
+        }
+    } else {
+        0
+    };
+    let boundary_divergence_recut = divergence_candidate.filter(|_| {
+        boundary_divergence_retry
+            || compartment_revision_matches
+            || boundary_divergence_pending_count >= BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT
+    });
+    if boundary_divergence_recut.is_some() {
+        boundary_divergence_pending_count = 0;
+    }
+    let mut current_m1_digest = m1_signal.revision;
+    let compartment_seq_changed_since_meta = loaded.meta.initialized
+        && m1_signal.max_compartment_seq != meta_coverage_compartment_seq(&loaded.meta);
     *boundary_divergence_detected = boundary_divergence_recut.is_some();
     // Pre-gate memory-off sessions stored an ungated digest and have no durable gate marker.
     // The next natural bust adopts the gated digest; the mismatch does not authorize a bust now.
@@ -2365,14 +2440,6 @@ fn apply_once(
         && loaded.meta.m1_external_revision != 0
         && m1_signal.external_revision != loaded.meta.m1_external_revision;
     let project_memory_epoch_hard_due = loaded.meta.project_memory_epoch_pending;
-    let effective_usage = effective_usage(req.usage.as_ref(), loaded.meta.last_usage.as_ref());
-    let context_limit_tokens = effective_context_limit_tokens(&effective_usage);
-    let usage_input_tokens = effective_usage.current_total_input_tokens as f64;
-    let usage_percentage = if context_limit_tokens > 0.0 {
-        usage_input_tokens / context_limit_tokens * 100.0
-    } else {
-        0.0
-    };
     let emergency_no_head_escape =
         req.emergency_recovery_armed && req.emergency_recovery_no_head_escape;
     if emergency_no_head_escape {
@@ -2725,6 +2792,7 @@ fn apply_once(
     let mut core = loaded.core.clone();
     log_reasoning_drop_seed_skips(&core, &live, &req.session_id);
     let mut meta = loaded.meta.clone();
+    meta.boundary_divergence_pending_count = boundary_divergence_pending_count;
     if !identity_observed && coordinator_identity {
         // Persist the first provider/model/system/upgrade observation without folding. This
         // lets an already-materialized session adopt the coordinator's identity safely.
@@ -2942,9 +3010,11 @@ fn apply_once(
                 // loop serving summaries of content that may no longer exist. Fail loud
                 // instead, on EVERY hard including a reconcile-rematerialize: a rematerialize
                 // that cannot mint a presentable anchor has no path to clearing reconcile
-                // either, and the loud error repeats until the store is re-cut. A revert that
-                // clears the compartments entirely stays legitimate: coverage is then None
-                // and the fold mints the reserved empty anchor without entering this guard.
+                // either. If a hard pass cannot create a live terminal anchor, keep returning an
+                // error rather than committing an anchor that cannot be presented. A later pass
+                // can commit when the anchor returns; a permanently trimmed anchor requires the
+                // store to be re-cut. Clearing all compartments is a valid revert, yields None
+                // coverage, and mints the reserved empty anchor without entering this guard.
                 if let Some(coverage_end) = comp.coverage_ordinal {
                     let minted = comp.boundary_id.as_str();
                     validate_live_boundary_ordinal(minted, coverage_end, &live)?;
@@ -3142,6 +3212,7 @@ fn apply_once(
                     Some(&mut m1_revision_read_timings),
                 )?;
                 meta.m1_revision = applied_m1_signal.revision;
+                meta.m1_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
                 meta.m1_user_profile_version = loaded.meta.user_profile_version;
                 meta.m1_external_revision = applied_m1_signal.external_revision;
                 meta.project_memory_epoch_pending = false;
@@ -3317,6 +3388,7 @@ fn apply_once(
                         Some(&mut m1_revision_read_timings),
                     )?;
                     meta.m1_revision = applied_m1_signal.revision;
+                    meta.m1_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
                     meta.m1_user_profile_version = loaded.meta.user_profile_version;
                     meta.m1_external_revision = applied_m1_signal.external_revision;
                     meta.project_memory_epoch_pending = false;
@@ -3412,6 +3484,7 @@ fn apply_once(
                     if m1_has_content || memory_gate_digest_transition {
                         meta.m1_revision = applied_m1_signal.revision;
                     }
+                    meta.m1_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
                     if m1.profile_rendered {
                         meta.m1_user_profile_version = loaded.meta.user_profile_version;
                     }
@@ -3438,6 +3511,9 @@ fn apply_once(
                 }
             }
         }
+    }
+    if is_bust_pass {
+        meta.boundary_divergence_pending_count = 0;
     }
     if lineage_anchor_failure {
         // The soft-pressure path can preserve an existing reconcile state but cannot create
@@ -4356,13 +4432,44 @@ struct BoundaryDivergenceRecut {
     live_tail_allowance: u64,
 }
 
-fn detect_boundary_divergence(
+fn protected_tail_floor_allowance(
+    live: &[&FlatBlock],
+    context_limit: f64,
+    execute_threshold_percentage: f64,
+) -> u64 {
+    let newest_live = live.iter().map(|block| block.ordinal).max().unwrap_or(0);
+    let target =
+        crate::boundary::derive_protected_tail_token_target(&crate::boundary::BoundaryContext {
+            context_limit,
+            execute_threshold_percentage,
+            ..Default::default()
+        });
+    let floor_tokens = target.effective_floor.ceil().max(1.0) as usize;
+    let mut tokens_by_ordinal = BTreeMap::<u64, usize>::new();
+    for block in live.iter().filter(|block| block.role != "system") {
+        let tokens = mc_tokenizer::estimate_tokens(block.bytes.as_ref());
+        *tokens_by_ordinal.entry(block.ordinal).or_default() += tokens;
+    }
+    let mut accumulated = 0usize;
+    let mut floor_ordinal = newest_live;
+    for (ordinal, tokens) in tokens_by_ordinal.iter().rev() {
+        floor_ordinal = *ordinal;
+        accumulated = accumulated.saturating_add(*tokens);
+        if accumulated >= floor_tokens {
+            break;
+        }
+    }
+    newest_live
+        .checked_sub(floor_ordinal)
+        .map_or(0, |span| span.saturating_add(1))
+}
+
+fn detect_boundary_divergence_candidate(
     store: &McStore,
     session_id: &str,
     meta: &ModuleMeta,
-    m1_signal: &M1RevisionSignal,
     live: &[&FlatBlock],
-    retry_latched: bool,
+    fallback_tail_allowance: u64,
 ) -> Result<Option<BoundaryDivergenceRecut>, McStoreError> {
     if !meta.initialized {
         return Ok(None);
@@ -4373,34 +4480,25 @@ fn detect_boundary_divergence(
         return Ok(None);
     };
     let old_coverage = meta.coverage_ordinal.unwrap_or(0);
-
-    // A successful publication advances this trigger-only floor to the first unprocessed
-    // ordinal. The distance from that floor through the current live end is therefore the
-    // source-derived protected-tail allowance; it grows and shrinks with the real tail rather
-    // than imposing an ordinal magic number on sparse producer coordinates.
-    let protected_tail_floor = meta
-        .publication_floor_ordinal
-        .unwrap_or_else(|| old_coverage.saturating_add(1));
     let newest_live = live
         .iter()
         .map(|block| block.ordinal)
         .max()
         .unwrap_or(old_coverage);
-    let live_tail_allowance = newest_live
-        .checked_sub(protected_tail_floor)
-        .map_or(0, |span| span.saturating_add(1));
+
+    // Use the recorded publication floor when available. For legacy rows without one, cap the
+    // allowance with the same token floor that sizes the historian's protected tail. Treating the
+    // entire raw ordinal range as protected could hide a rewound publication floor and prevent a
+    // genuine coverage gap from being detected.
+    let live_tail_allowance =
+        meta.publication_floor_ordinal
+            .map_or(fallback_tail_allowance, |protected_tail_floor| {
+                newest_live
+                    .checked_sub(protected_tail_floor)
+                    .map_or(0, |span| span.saturating_add(1))
+            });
     let coverage_gap = new_coverage.saturating_sub(old_coverage);
     if coverage_gap <= live_tail_allowance {
-        return Ok(None);
-    }
-
-    // Historian publish intentionally leaves render coverage untouched. Its newer max sequence
-    // first changes the m1 revision, and a later materializing pass advances coverage with the
-    // rendered delta. Do not mistake that healthy inter-pass window for corruption. Equality
-    // means the current compartment set was already acknowledged by the rendered revision while
-    // its boundary cursor still trails it. A retry latch preserves that proof if a concurrent
-    // publish wins the commit CAS and necessarily changes the freshly loaded revision.
-    if !retry_latched && m1_signal.revision != meta.m1_revision {
         return Ok(None);
     }
 
@@ -9620,16 +9718,22 @@ mod tests {
     }
 
     fn seed_astro_divergence(store: &McStore, session_id: &str, tail_end: u64) -> TransformRequest {
+        seed_astro_divergence_from_request(store, astro_request(session_id, tail_end))
+    }
+
+    fn seed_astro_divergence_from_request(
+        store: &McStore,
+        request: TransformRequest,
+    ) -> TransformRequest {
         store
-            .replace_compartments(session_id, &astro_compartments())
+            .replace_compartments(&request.session_id, &astro_compartments())
             .unwrap();
-        let request = astro_request(session_id, tail_end);
         let boot = run(store, &request, &spine());
         assert_eq!(boot.action, "HARD");
         assert_eq!(boot.coverage_ordinal, Some(2_400));
         assert_eq!(boot.boundary_id, "m2400#0");
 
-        let loaded = store.load(session_id).unwrap();
+        let loaded = store.load(&request.session_id).unwrap();
         let mut core = loaded.core.clone();
         core.boundary_id = "m425#0".to_string();
         let covered_target = astro_compartments()[2].end_message_id.clone();
@@ -9640,9 +9744,13 @@ mod tests {
         meta.coverage_start_ordinal = Some(1);
         meta.coverage_compartment_seq = Some(1);
         meta.folded_compartment_seq = 1;
+        // Production row read for ses_08df2045… on 2026-08-08: initialized=1,
+        // coverage_ordinal=425, m1_revision=1644131851866052375,
+        // publication_floor_ordinal=2417 (present, not rewound), and max compartment sequence 47
+        // ending near ordinal 2400. The fixture's 2401 floor is intentionally close to that row.
         meta.publication_floor_ordinal = Some(2_401);
         store
-            .commit(session_id, loaded.row_version, &core, &meta)
+            .commit(&request.session_id, loaded.row_version, &core, &meta)
             .unwrap();
         request
     }
@@ -13370,6 +13478,321 @@ mod tests {
             store.load_compartments("astro-publish-race").unwrap().len(),
             49
         );
+    }
+
+    #[test]
+    fn publication_between_revision_and_compartment_end_reads_does_not_detect_divergence() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let request = seed_astro_divergence(&store, "astro-torn-read", 2_442);
+        let loaded = store.load("astro-torn-read").unwrap();
+        let selected_range_identities = vec![mc_store::HistorianSelectedMessageIdentity {
+            mid: "m2400".to_string(),
+            block_identities: loaded.meta.block_identity_by_mid["m2400"].clone(),
+        }];
+        let generation = mc_store::CompartmentSetGeneration {
+            max_sequence: 47,
+            count: 48,
+        };
+        let predicate = mc_store::HistorianPublishPredicate {
+            firing_seq: 8,
+            producer_run_id: "between-reads-run".to_string(),
+            chunk_fingerprint: "between-reads-fingerprint".to_string(),
+            selected_range_identities: selected_range_identities.clone(),
+            compartment_set_generation: generation,
+        };
+        let mut publishing_meta = loaded.meta.clone();
+        publishing_meta.historian = mc_store::HistorianDurableState {
+            state: mc_store::HistorianPhase::Publishing,
+            firing_seq: predicate.firing_seq,
+            chunk_range: Some(mc_store::HistorianChunkRange {
+                from_ordinal: 2_401,
+                to_ordinal: 2_440,
+            }),
+            chunk_fingerprint: predicate.chunk_fingerprint.clone(),
+            selected_range_identities,
+            producer_session_id: Some("between-reads-producer".to_string()),
+            producer_run_id: Some(predicate.producer_run_id.clone()),
+            fired_at_ms: Some(1),
+            expected_revert_epoch: loaded.meta.revert_epoch,
+            compartment_set_generation: generation,
+            ..Default::default()
+        };
+        let publish_row_version = store
+            .commit(
+                "astro-torn-read",
+                loaded.row_version,
+                &loaded.core,
+                &publishing_meta,
+            )
+            .unwrap();
+        let expected_revert_epoch = loaded.meta.revert_epoch;
+        let published_compartment = comp(48, 2_401, 2_440, "m2440", "BETWEEN-SIGNAL-READS");
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let hook_ran_for_publish = Arc::clone(&hook_ran);
+        store.set_before_max_compartment_end_read_hook(Box::new(move |store| {
+            hook_ran_for_publish.store(true, Ordering::SeqCst);
+            store
+                .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                    session_id: "astro-torn-read",
+                    expected_row_version: Some(publish_row_version),
+                    expected_revert_epoch,
+                    predicate: &predicate,
+                    project_path: "git:proj",
+                    compartments: std::slice::from_ref(&published_compartment),
+                    facts: &[],
+                    promote_facts: false,
+                    events: &[],
+                    primer_candidates: &[],
+                    user_memory_candidates: &[],
+                    publication_floor_ordinal: 2_441,
+                    chunk_transcript: None,
+                })
+                .unwrap();
+        }));
+
+        let response = run(&store, &request, &spine());
+
+        assert!(hook_ran.load(Ordering::SeqCst));
+        assert_eq!(response.action, "SOFT+");
+        assert_ne!(
+            response.materialize_reason.as_deref(),
+            Some("boundary_divergence_recut")
+        );
+        let after = store.load("astro-torn-read").unwrap();
+        assert_eq!(after.meta.coverage_ordinal, Some(425));
+        assert_eq!(after.meta.boundary_divergence_pending_count, 1);
+        assert_eq!(
+            store
+                .max_compartment_end_ordinal("astro-torn-read")
+                .unwrap(),
+            2_440
+        );
+    }
+
+    #[test]
+    fn legacy_revision_exclusion_escalates_despite_project_memory_churn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let request = seed_astro_divergence(&store, "astro-memory-churn", 2_402);
+        let loaded = store.load("astro-memory-churn").unwrap();
+        let mut legacy = loaded.meta.clone();
+        legacy.m1_compartment_seq = None;
+        store
+            .commit(
+                "astro-memory-churn",
+                loaded.row_version,
+                &loaded.core,
+                &legacy,
+            )
+            .unwrap();
+        store
+            .insert_memory(memory_input(
+                "git:proj",
+                "ARCHITECTURE",
+                "unrelated project churn",
+                1,
+            ))
+            .unwrap();
+
+        for expected_count in 1..BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT {
+            let deferred = run(&store, &request, &spine());
+            assert_eq!(deferred.action, "SOFT+");
+            assert_eq!(
+                store
+                    .load("astro-memory-churn")
+                    .unwrap()
+                    .meta
+                    .boundary_divergence_pending_count,
+                expected_count
+            );
+        }
+        let escalated = run(&store, &request, &spine());
+        assert_eq!(escalated.action, "HARD");
+        assert_eq!(
+            escalated.materialize_reason.as_deref(),
+            Some("boundary_divergence_recut")
+        );
+        assert_eq!(escalated.coverage_ordinal, Some(2_400));
+    }
+
+    #[test]
+    fn permanently_unequal_compartment_revision_escalates_on_third_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let request = seed_astro_divergence(&store, "astro-stale-component", 2_402);
+        let loaded = store.load("astro-stale-component").unwrap();
+        let mut stale = loaded.meta.clone();
+        stale.m1_revision ^= u64::MAX;
+        stale.m1_compartment_seq = Some(1);
+        store
+            .commit(
+                "astro-stale-component",
+                loaded.row_version,
+                &loaded.core,
+                &stale,
+            )
+            .unwrap();
+
+        for _ in 1..BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT {
+            let deferred = run(&store, &request, &spine());
+            assert_eq!(deferred.action, "SOFT+");
+        }
+        let escalated = run(&store, &request, &spine());
+        assert_eq!(escalated.action, "HARD");
+        assert_eq!(
+            escalated.materialize_reason.as_deref(),
+            Some("boundary_divergence_recut")
+        );
+        assert_eq!(
+            store
+                .load("astro-stale-component")
+                .unwrap()
+                .meta
+                .boundary_divergence_pending_count,
+            0
+        );
+    }
+
+    #[test]
+    fn missing_publication_floor_uses_token_floor_and_detects_astro_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut request = astro_request("astro-missing-floor", 2_402);
+        for message in &mut request.messages {
+            if let Some(ck_wire::CkKind::Text { text }) =
+                message.ck.content.first_mut().map(|block| &mut block.kind)
+            {
+                text.push_str(&" realistic raw history".repeat(512));
+            }
+        }
+        let request = seed_astro_divergence_from_request(&store, request);
+        let loaded = store.load("astro-missing-floor").unwrap();
+        let mut missing_floor = loaded.meta.clone();
+        missing_floor.publication_floor_ordinal = None;
+        store
+            .commit(
+                "astro-missing-floor",
+                loaded.row_version,
+                &loaded.core,
+                &missing_floor,
+            )
+            .unwrap();
+
+        let response = run(&store, &request, &spine());
+        assert_eq!(response.action, "HARD");
+        assert_eq!(
+            response.materialize_reason.as_deref(),
+            Some("boundary_divergence_recut")
+        );
+        assert_eq!(response.coverage_ordinal, Some(2_400));
+    }
+
+    #[test]
+    fn stale_full_state_sync_cannot_rewind_a_committed_divergence_recut() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let request = seed_astro_divergence(&store, "astro-stale-state-sync", 2_402);
+        let recut = run(&store, &request, &spine());
+        assert_eq!(recut.action, "HARD");
+        let recut_bytes = serde_json::to_vec(&recut.ck_messages).unwrap();
+        let after_recut = store.load("astro-stale-state-sync").unwrap();
+        let compartments_after_recut = store.load_compartments("astro-stale-state-sync").unwrap();
+        let mut stale_compartments = astro_compartments()[..2].to_vec();
+        for compartment in &mut stale_compartments {
+            compartment.content = format!("STALE-TS-{}", compartment.sequence);
+            compartment.p1 = Some(compartment.content.clone());
+        }
+
+        store
+            .apply_authority_state_sync(ModuleStateSyncRequest {
+                session_id: "astro-stale-state-sync",
+                project_path: "git:proj",
+                shadow_generation: after_recut.meta.shadow_generation,
+                expected_shadow_seq: after_recut.meta.shadow_seq,
+                seed_boundary_id: Some("m425#0"),
+                drop_seeds: &[],
+                drop_seed_skipped: 0,
+                pending_agent_drops: &[],
+                pending_agent_drops_skipped: 0,
+                user_hint_seeds: &[],
+                auto_search_hint_skipped: 0,
+                note_nudge_anchors: None,
+                todo_synthetic_anchor: None,
+                todo_synthetic_anchor_present: false,
+                emergency_latches: None,
+                pending_compaction_marker: None,
+                deferred_execute_state: None,
+                channel2_nudge_state: None,
+                strip_seeds: &[],
+                strip_seed_skipped: 0,
+                reasoning_cleared_through_tag: None,
+                compartments: &stale_compartments,
+                memories: &[],
+                memory_mutations: &[],
+                user_profile: &[],
+                user_profile_present: true,
+                workspace: None,
+                workspace_present: true,
+                last_todo_state: None,
+                project_memory_epoch: None,
+                user_profile_version: None,
+                acked_watermarks: Value::Null,
+            })
+            .unwrap();
+
+        let after_sync = store.load("astro-stale-state-sync").unwrap();
+        assert_eq!(after_sync.meta.coverage_ordinal, Some(2_400));
+        assert_eq!(after_sync.meta.folded_compartment_seq, 47);
+        assert_eq!(after_sync.core.boundary_id, "m2400#0");
+        assert_eq!(
+            store.load_compartments("astro-stale-state-sync").unwrap(),
+            compartments_after_recut
+        );
+        let deferred = run(&store, &request, &spine());
+        assert_eq!(deferred.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_vec(&deferred.ck_messages).unwrap(),
+            recut_bytes
+        );
+    }
+
+    #[test]
+    fn fired_divergence_with_absent_new_anchor_fails_loud_without_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let full_request = seed_astro_divergence(&store, "astro-absent-anchor", 2_402);
+        let mut missing_anchor = full_request.clone();
+        missing_anchor
+            .messages
+            .retain(|message| message.mid != "m2400");
+        let before = store.load("astro-absent-anchor").unwrap();
+        let compartments_before = store.load_compartments("astro-absent-anchor").unwrap();
+
+        let error = transform(
+            &store,
+            &missing_anchor,
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, TransformError::BoundaryNotPresent(_)));
+        let after_error = store.load("astro-absent-anchor").unwrap();
+        assert_eq!(after_error.row_version, before.row_version);
+        assert_eq!(after_error.core, before.core);
+        assert_eq!(after_error.meta, before.meta);
+        assert_eq!(
+            store.load_compartments("astro-absent-anchor").unwrap(),
+            compartments_before
+        );
+
+        // The store does not need manual repair: once the producer includes the terminal
+        // compartment anchor again, the next pass can commit the already-qualified recut.
+        let recovered = run(&store, &full_request, &spine());
+        assert_eq!(recovered.action, "HARD");
+        assert_eq!(recovered.coverage_ordinal, Some(2_400));
     }
 
     #[test]
