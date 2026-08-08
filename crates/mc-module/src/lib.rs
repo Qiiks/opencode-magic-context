@@ -5715,7 +5715,11 @@ impl McHandler {
         respond(json!({
             "ok": true,
             "preset": selection.preset.as_str(),
-            "served_preset": "full",
+            "served_preset": if prompt_surface::tool_manifest_falls_back(selection.preset) {
+                "full"
+            } else {
+                selection.preset.as_str()
+            },
             "preset_fallback": prompt_surface::tool_manifest_falls_back(selection.preset),
             "fallback_notice": prompt_surface::tool_manifest_falls_back(selection.preset)
                 .then_some(prompt_surface::LIGHT_FALLBACK_NOTICE),
@@ -5816,11 +5820,15 @@ impl McHandler {
             "ok": true,
             "bytes": bytes,
             "hash": sha256_hex(bytes.as_bytes()),
-            // The date line changes every day, so content_hash excludes it. The selected
-            // preset remains semantic identity even while light falls back to full bytes.
+            // The date line changes every day, so content_hash excludes it. Include the
+            // selected preset so a future missing-asset fallback cannot reuse the full hash.
             "content_hash": prompt_surface::guidance_content_hash(text_for_bytes, selection.preset),
             "preset": selection.preset.as_str(),
-            "served_preset": "full",
+            "served_preset": if asset.fallback {
+                "full"
+            } else {
+                selection.preset.as_str()
+            },
             "preset_fallback": asset.fallback,
             "fallback_notice": asset.fallback.then_some(prompt_surface::LIGHT_FALLBACK_NOTICE),
             "manifest_content_epoch": prompt_surface::manifest_content_epoch(&selection),
@@ -13913,7 +13921,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn guidance_presets_cover_both_variants_with_byte_identical_light_fallback() {
+    async fn guidance_presets_cover_both_authored_light_variants() {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
         for (offset, tool_present) in [false, true].into_iter().enumerate() {
@@ -13975,18 +13983,15 @@ mod tests {
             .await;
 
             assert_eq!(omitted["bytes"], explicit_full["bytes"]);
-            assert_eq!(omitted["bytes"], light["bytes"]);
+            assert_ne!(omitted["bytes"], light["bytes"]);
             assert_eq!(omitted["hash"], explicit_full["hash"]);
-            assert_eq!(omitted["hash"], light["hash"]);
+            assert_ne!(omitted["hash"], light["hash"]);
             assert_eq!(omitted["content_hash"], explicit_full["content_hash"]);
             assert_ne!(omitted["content_hash"], light["content_hash"]);
             assert_eq!(omitted["preset_fallback"], false);
-            assert_eq!(light["preset_fallback"], true);
-            assert_eq!(light["served_preset"], "full");
-            assert_eq!(
-                light["fallback_notice"],
-                prompt_surface::LIGHT_FALLBACK_NOTICE
-            );
+            assert_eq!(light["preset_fallback"], false);
+            assert_eq!(light["served_preset"], "light");
+            assert_eq!(light["fallback_notice"], Value::Null);
         }
     }
 
@@ -14007,6 +14012,9 @@ mod tests {
             }),
         )
         .await;
+        assert_eq!(first["served_preset"], "light");
+        assert_eq!(first["preset_fallback"], false);
+        assert_eq!(first["fallback_notice"], Value::Null);
         let frozen = call_dispatch_request_on_channel(
             &handler,
             30,

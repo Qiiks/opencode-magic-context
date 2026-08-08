@@ -15,11 +15,32 @@ pub const LIGHT_FALLBACK_NOTICE: &str = "prompt_surface selected light, but buil
 pub(crate) const GUIDANCE_FULL_PRIMARY: &str = include_str!("../assets/guidance_primary.txt");
 pub(crate) const GUIDANCE_FULL_NO_REDUCE: &str = include_str!("../assets/guidance_no_reduce.txt");
 
-// These optional light assets are empty because light prose has not been provided yet. Keeping
-// selection here makes callers treat the full text only as a fallback, not as the light asset.
-const GUIDANCE_LIGHT_PRIMARY: Option<&str> = None;
-const GUIDANCE_LIGHT_NO_REDUCE: Option<&str> = None;
-const TOOL_LIGHT_DESCRIPTIONS: Option<&[(&str, &str)]> = None;
+const GUIDANCE_LIGHT_PRIMARY: Option<&str> =
+    Some(include_str!("../assets/guidance_light_primary.txt"));
+const GUIDANCE_LIGHT_NO_REDUCE: Option<&str> =
+    Some(include_str!("../assets/guidance_light_no_reduce.txt"));
+const TOOL_LIGHT_DESCRIPTIONS: Option<&[(&str, &str)]> = Some(&[
+    (
+        "ctx_reduce",
+        "Queue a tagged reduction request for asynchronous delivery.",
+    ),
+    (
+        "ctx_memory",
+        "Maintain standalone durable project facts: write new knowledge, update changed facts, archive obsolete facts, and merge duplicates.",
+    ),
+    (
+        "ctx_search",
+        "Before answering from memory, keyword-search saved memories, notes, and compacted summaries; this Claude Code leg is literal, not semantic.",
+    ),
+    (
+        "ctx_expand",
+        "Recover the persisted historian U:/A:/TC: transcript for a compacted conversation range.",
+    ),
+    (
+        "ctx_note",
+        "Save or inspect future session follow-ups; surface_condition is recorded but not evaluated on this Claude Code leg.",
+    ),
+]);
 
 const CTX_REDUCE_DESCRIPTION: &str =
     "Acknowledge a tagged reduction request for asynchronous delivery";
@@ -257,20 +278,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn light_slots_fallback_to_full_bytes_with_distinct_semantic_identity() {
+    fn light_slots_serve_authored_guidance_and_descriptions() {
         for variant in [GuidanceVariant::Full, GuidanceVariant::NoReduce] {
             let full = guidance_asset(PromptSurfacePreset::Full, variant);
             let light = guidance_asset(PromptSurfacePreset::Light, variant);
-            assert_eq!(light.bytes.as_bytes(), full.bytes.as_bytes());
+            assert_ne!(light.bytes.as_bytes(), full.bytes.as_bytes());
             assert!(!full.fallback);
-            assert!(light.fallback);
+            assert!(!light.fallback);
             assert_ne!(
                 guidance_content_hash(full.bytes, PromptSurfacePreset::Full),
                 guidance_content_hash(light.bytes, PromptSurfacePreset::Light)
             );
         }
-        assert!(tool_manifest_falls_back(PromptSurfacePreset::Light));
+        assert!(!tool_manifest_falls_back(PromptSurfacePreset::Light));
         assert!(!tool_manifest_falls_back(PromptSurfacePreset::Full));
+
+        let full_tools = session_tools(&PromptSurfaceSelection::default());
+        let light_tools = session_tools(&PromptSurfaceSelection {
+            preset: PromptSurfacePreset::Light,
+            ..PromptSurfaceSelection::default()
+        });
+        assert_eq!(light_tools.len(), full_tools.len());
+        for (light, full) in light_tools.iter().zip(full_tools) {
+            assert_eq!(light.name, full.name);
+            assert_eq!(light.schema, full.schema);
+            assert_eq!(light.execution_mode, full.execution_mode);
+            assert_ne!(light.description, full.description);
+        }
     }
 
     #[test]

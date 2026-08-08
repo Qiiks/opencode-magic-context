@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
     createPromptSurfaceGuidanceEpochCache,
     createPromptSurfaceRuntime,
+    LIGHT_TOOL_DESCRIPTIONS,
 } from "./prompt-surface-runtime";
 
 const tempDirs: string[] = [];
@@ -103,7 +104,23 @@ describe("prompt-surface runtime", () => {
         expect(warnings[0]).toContain("unknown_tool");
     });
 
-    it("logs the temporary light fallback once across registration and guidance", () => {
+    it("lets a user description override the built-in light catalog", () => {
+        const runtime = createPromptSurfaceRuntime({
+            userConfigDirectory: tempDir(),
+            warn: () => undefined,
+        });
+        const registration = runtime.resolveRegistration({
+            default: "light",
+            tool_descriptions: { ctx_search: "User light search" },
+        });
+
+        expect(registration.descriptionFor("ctx_search", "Full search")).toBe("User light search");
+        expect(registration.descriptionFor("ctx_reduce", "Full reduce")).toBe(
+            LIGHT_TOOL_DESCRIPTIONS.ctx_reduce,
+        );
+    });
+
+    it("serves built-in light descriptions without a fallback notice", () => {
         const warnings: string[] = [];
         const runtime = createPromptSurfaceRuntime({
             userConfigDirectory: tempDir(),
@@ -115,9 +132,10 @@ describe("prompt-surface runtime", () => {
         const guidance = runtime.resolveGuidance(config, "provider/model");
         runtime.resolveGuidance(config, "provider/other");
 
-        expect(registration.descriptionFor("ctx_search", "Full search")).toBe("Full search");
+        expect(registration.descriptionFor("ctx_search", "Full search")).toBe(
+            LIGHT_TOOL_DESCRIPTIONS.ctx_search,
+        );
         expect(guidance.preset).toBe("light");
-        expect(warnings).toHaveLength(1);
-        expect(warnings[0]).toContain("built-in light assets are not available yet");
+        expect(warnings).toEqual([]);
     });
 });

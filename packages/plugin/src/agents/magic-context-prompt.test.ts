@@ -292,7 +292,7 @@ describe("buildMagicContextSection — compaction-off guidance variant (#266 S4)
 });
 
 describe("buildMagicContextSection — prompt-surface composition", () => {
-    it("keeps implicit full, explicit full, and temporary light fallback byte-identical", () => {
+    it("keeps full bytes stable while serving compressed light guidance", () => {
         const implicit = buildMagicContextSection(
             null,
             20,
@@ -316,7 +316,7 @@ describe("buildMagicContextSection — prompt-surface composition", () => {
             true,
             "full",
         );
-        const lightPlaceholder = buildMagicContextSection(
+        const light = buildMagicContextSection(
             null,
             20,
             true,
@@ -330,7 +330,61 @@ describe("buildMagicContextSection — prompt-surface composition", () => {
         );
 
         expect(explicitFull).toBe(implicit);
-        expect(lightPlaceholder).toBe(implicit);
+        expect(light).not.toBe(implicit);
+        expect(light).toContain("In primary sessions with ctx_reduce");
+        expect(light).toContain("NEVER narrate ctx_reduce");
+        expect(light).toContain("DO NOT mimic this style");
+        expect(light).toContain("Keep code, identifiers, file paths");
+        expect(light).not.toContain("### Reduction Triggers");
+    });
+
+    it("keeps feature-gated and shared fragments orthogonal to light", () => {
+        const light = (options: {
+            reduce?: boolean;
+            dreamer?: boolean;
+            temporal?: boolean;
+            caveman?: boolean;
+            subagent?: boolean;
+            language?: string;
+            memory?: boolean;
+        }) =>
+            buildMagicContextSection(
+                null,
+                20,
+                options.reduce ?? true,
+                options.dreamer ?? false,
+                options.temporal ?? false,
+                options.caveman ?? false,
+                options.subagent ?? false,
+                options.language,
+                options.memory ?? true,
+                "light",
+            );
+
+        const memoryOff = light({ memory: false });
+        expect(memoryOff).not.toContain("Use `ctx_memory`");
+        expect(memoryOff).toContain("ctx_search");
+
+        const noReduce = light({ reduce: false });
+        expect(noReduce).not.toContain("In primary sessions with ctx_reduce");
+        expect(noReduce).not.toContain("drop grammar");
+
+        const gatedOff = light({ dreamer: false, temporal: false, caveman: false });
+        expect(gatedOff).not.toContain("surface_condition creates");
+        expect(gatedOff).not.toContain("**Temporal awareness**");
+        expect(gatedOff).not.toContain("**BEWARE**");
+
+        const gatedOn = light({ dreamer: true, temporal: true, caveman: true, language: "tr" });
+        expect(gatedOn).toContain("surface_condition creates");
+        expect(gatedOn).toContain("**Temporal awareness**");
+        expect(gatedOn).toContain("**BEWARE**");
+        expect(gatedOn).toContain("Keep code, identifiers, file paths");
+
+        const subagent = light({ subagent: true });
+        expect(subagent).toContain("In bounded subagent sessions");
+        expect(subagent).toContain("[dropped §N§]");
+        expect(subagent).not.toContain("long-term partner");
+        expect(subagent).not.toContain("ctx_search");
     });
 
     it("appends shared runtime fragments after a complete primary override", () => {

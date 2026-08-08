@@ -6,6 +6,13 @@ import {
     cortexKitUserConfigBasePath,
     resolveLegacyConfigSourcesForHarness,
 } from "../config/migrate-config-location";
+import {
+    CTX_EXPAND_LIGHT_DESCRIPTION,
+    CTX_MEMORY_LIGHT_DESCRIPTION,
+    CTX_NOTE_LIGHT_DESCRIPTION,
+    CTX_REDUCE_LIGHT_DESCRIPTION,
+    CTX_SEARCH_LIGHT_DESCRIPTION,
+} from "../tools/light-descriptions";
 import { detectConfigFile } from "./jsonc-parser";
 import {
     type PromptSurfaceConfig,
@@ -26,9 +33,17 @@ export const PROMPT_SURFACE_TOOL_IDS = [
 
 export type PromptSurfaceToolId = (typeof PROMPT_SURFACE_TOOL_IDS)[number];
 
+export const LIGHT_TOOL_DESCRIPTIONS: Readonly<Record<PromptSurfaceToolId, string>> = {
+    ctx_reduce: CTX_REDUCE_LIGHT_DESCRIPTION,
+    ctx_expand: CTX_EXPAND_LIGHT_DESCRIPTION,
+    ctx_note: CTX_NOTE_LIGHT_DESCRIPTION,
+    ctx_memory: CTX_MEMORY_LIGHT_DESCRIPTION,
+    ctx_search: CTX_SEARCH_LIGHT_DESCRIPTION,
+};
+
 /**
- * Preserve the existing full-preset hash exactly while giving future presets a
- * distinct cache identity, even when a placeholder currently renders the same bytes.
+ * Preserve the existing full-preset hash exactly while giving other presets a
+ * distinct semantic cache identity, including during any future asset fallback.
  */
 export function promptSurfaceHashMaterial(
     systemContent: string,
@@ -42,7 +57,7 @@ export function promptSurfaceHashMaterial(
 const PROMPT_SURFACE_TOOL_ID_SET = new Set<string>(PROMPT_SURFACE_TOOL_IDS);
 
 export interface PromptSurfaceGuidanceSelection {
-    /** The configured preset. The full renderer currently handles light as a temporary fallback. */
+    /** The configured built-in preset. */
     preset: PromptSurfacePreset;
     /** Complete user-authored primary section captured when a model-key epoch starts. */
     primaryOverride?: string;
@@ -95,8 +110,8 @@ function markerCount(content: string): number {
 
 /**
  * Create one host-registration runtime. Its warning set is shared by tool
- * registration and every guidance epoch, so the temporary light fallback and a
- * bad override file are reported once instead of on every model call.
+ * registration and every guidance epoch, so invalid overrides are reported once
+ * instead of on every model call.
  */
 export function createPromptSurfaceRuntime(
     options: CreatePromptSurfaceRuntimeOptions,
@@ -108,13 +123,6 @@ export function createPromptSurfaceRuntime(
         if (warned.has(key)) return;
         warned.add(key);
         options.warn(message);
-    };
-
-    const noticeMissingLightAssets = (): void => {
-        warnOnce(
-            "light-assets-unavailable",
-            "prompt_surface selected light, but built-in light assets are not available yet; using the byte-identical full guidance and tool descriptions until light assets ship.",
-        );
     };
 
     const readGuidanceOverride = (configuredPath: string | undefined): string | undefined => {
@@ -168,7 +176,6 @@ export function createPromptSurfaceRuntime(
             // registration. Model routes are intentionally ignored here: only the
             // registration owner's default and user-tier overrides can choose text.
             const { preset } = resolvePromptSurface(config, undefined);
-            if (preset === "light") noticeMissingLightAssets();
 
             const overrides = config?.tool_descriptions ?? {};
             for (const [toolId, description] of Object.entries(overrides)) {
@@ -191,16 +198,15 @@ export function createPromptSurfaceRuntime(
                     if (!PROMPT_SURFACE_TOOL_ID_SET.has(toolId)) return fullDescription;
                     const override = overrides[toolId];
                     if (override !== undefined && override.trim().length > 0) return override;
-                    // A future light-preset catalog will supply descriptions here.
-                    // Until then both presets deliberately materialize full bytes.
-                    return fullDescription;
+                    return preset === "light"
+                        ? LIGHT_TOOL_DESCRIPTIONS[toolId as PromptSurfaceToolId]
+                        : fullDescription;
                 },
             };
         },
 
         resolveGuidance(config, modelKey) {
             const { preset } = resolvePromptSurface(config, modelKey);
-            if (preset === "light") noticeMissingLightAssets();
             return {
                 preset,
                 primaryOverride: readGuidanceOverride(config?.guidance_override_path),

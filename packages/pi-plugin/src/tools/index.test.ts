@@ -1,7 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { createPromptSurfaceRuntime } from "@magic-context/core/shared/prompt-surface-runtime";
+import {
+	createPromptSurfaceRuntime,
+	LIGHT_TOOL_DESCRIPTIONS,
+} from "@magic-context/core/shared/prompt-surface-runtime";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { createTestDb } from "../test-utils.test";
 import { registerMagicContextTools } from "./index";
@@ -324,6 +327,31 @@ describe("registerMagicContextTools — prompt-surface registration", () => {
 		} finally {
 			closeQuietly(implicitDb);
 			closeQuietly(explicitDb);
+		}
+	});
+
+	it("registers built-in light descriptions without changing parameter schemas", () => {
+		const fullDb = createTestDb();
+		const lightDb = createTestDb();
+		try {
+			const full = captureRegisteredTools({ db: fullDb });
+			const light = captureRegisteredTools({
+				db: lightDb,
+				promptSurface: { default: "light" },
+			});
+			for (const toolId of Object.keys(LIGHT_TOOL_DESCRIPTIONS)) {
+				expect(light.get(toolId)?.description).toBe(
+					LIGHT_TOOL_DESCRIPTIONS[
+						toolId as keyof typeof LIGHT_TOOL_DESCRIPTIONS
+					],
+				);
+				expect(light.get(toolId)?.parameters).toEqual(
+					full.get(toolId)?.parameters,
+				);
+			}
+		} finally {
+			closeQuietly(fullDb);
+			closeQuietly(lightDb);
 		}
 	});
 

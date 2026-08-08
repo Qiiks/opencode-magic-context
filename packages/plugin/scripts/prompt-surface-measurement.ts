@@ -4,6 +4,7 @@ import Tokenizer from "ai-tokenizer";
 import * as claudeEncoding from "ai-tokenizer/encoding/claude";
 import { buildMagicContextSection } from "../src/agents/magic-context-prompt";
 import { normalizeToolArgSchemas } from "../src/plugin/normalize-tool-arg-schemas";
+import { LIGHT_TOOL_DESCRIPTIONS } from "../src/shared/prompt-surface-runtime";
 import { createCtxExpandTools } from "../src/tools/ctx-expand/tools";
 import { createCtxMemoryTools } from "../src/tools/ctx-memory/tools";
 import { createCtxNoteTools } from "../src/tools/ctx-note/tools";
@@ -64,6 +65,25 @@ export interface LightSurfaceInput {
     variant: string;
     guidance: string;
     descriptions: Partial<Record<ToolId, string>>;
+}
+
+export function builtInLightSurface(): LightSurfaceInput {
+    return {
+        variant: PRIMARY_VARIANT_ID,
+        guidance: buildMagicContextSection(
+            null,
+            20,
+            true,
+            true,
+            true,
+            false,
+            false,
+            undefined,
+            true,
+            "light",
+        ),
+        descriptions: { ...LIGHT_TOOL_DESCRIPTIONS },
+    };
 }
 
 export interface MeasuredLightSurface {

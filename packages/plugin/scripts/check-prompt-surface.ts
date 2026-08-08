@@ -11,11 +11,14 @@
  */
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { buildMagicContextSection } from "../src/agents/magic-context-prompt";
 import { validateBudgetFixture } from "./prompt-surface-fixture";
+import { builtInLightSurface, type LightSurfaceInput } from "./prompt-surface-measurement";
 
 const rootDir = resolve(import.meta.dir, "../../..");
 const checklistPath = resolve(rootDir, "docs/specs/prompt-surface/checklist.json");
 const budgetFixturePath = resolve(rootDir, "docs/specs/prompt-surface/budget-fixture.json");
+const lightMappingPath = resolve(rootDir, "docs/specs/prompt-surface/light-mapping.md");
 const VALID_STATUSES = new Set(["compressed", "shared", "not-present"]);
 
 type Checklist = {
@@ -47,11 +50,83 @@ export interface ChecklistValidationResult {
     messages: string[];
 }
 
+export interface ChecklistValidationOptions {
+    mappingPath?: string;
+    lightAssets?: Readonly<Record<string, string>>;
+}
+
+interface LightMappingRow {
+    id: string;
+    asset: string;
+    line: string;
+    quote: string;
+}
+
+export function builtInLightMappingAssets(
+    surface: LightSurfaceInput = builtInLightSurface(),
+): Record<string, string> {
+    return {
+        "guidance:primary": surface.guidance,
+        "guidance:no-reduce": buildMagicContextSection(
+            null,
+            20,
+            false,
+            true,
+            true,
+            false,
+            false,
+            undefined,
+            true,
+            "light",
+        ),
+        "guidance:subagent": buildMagicContextSection(
+            null,
+            20,
+            true,
+            false,
+            false,
+            false,
+            true,
+            undefined,
+            false,
+            "light",
+        ),
+        ...Object.fromEntries(
+            Object.entries(surface.descriptions).map(([id, text]) => [`tool:${id}`, text ?? ""]),
+        ),
+    };
+}
+
+function readLightMapping(path: string): LightMappingRow[] {
+    return readFileSync(path, "utf8")
+        .split(/\r?\n/)
+        .flatMap((rawLine) => {
+            const line = rawLine.trim();
+            if (!line.startsWith("|") || !line.endsWith("|")) return [];
+            const columns = line
+                .slice(1, -1)
+                .split("|")
+                .map((column) => column.trim());
+            if (columns.length !== 4 || !/^[GT]-\d{3}$/.test(columns[0] ?? "")) return [];
+            return [
+                {
+                    id: columns[0] ?? "",
+                    asset: columns[1] ?? "",
+                    line: columns[2] ?? "",
+                    quote: columns[3] ?? "",
+                },
+            ];
+        });
+}
+
 function readChecklist(path = checklistPath): Checklist {
     return JSON.parse(readFileSync(path, "utf8")) as Checklist;
 }
 
-export function validateChecklist(path = checklistPath): ChecklistValidationResult {
+export function validateChecklist(
+    path = checklistPath,
+    options: ChecklistValidationOptions = {},
+): ChecklistValidationResult {
     const checklist = readChecklist(path);
     const errors: string[] = [];
     const messages: string[] = [];
@@ -61,7 +136,7 @@ export function validateChecklist(path = checklistPath): ChecklistValidationResu
     const requiredIds = checklist.requiredRuleIds ?? [];
 
     if (checklist.mappingStatus !== "PRE-LIGHT-AUTHORING") {
-        errors.push("checklist mappingStatus must remain PRE-LIGHT-AUTHORING until S3 authors light prose");
+        errors.push("the ratified checklist mappingStatus must remain PRE-LIGHT-AUTHORING; S3 mapping is a separate artifact");
     }
     if (new Set(requiredIds).size !== requiredIds.length) {
         errors.push("requiredRuleIds contains duplicates");
@@ -156,9 +231,54 @@ export function validateChecklist(path = checklistPath): ChecklistValidationResu
         }
     }
 
+    const expectedMappedIds = rules
+        .filter((rule) => {
+            const fragment = rule.sourceFragment ? fragments[rule.sourceFragment] : undefined;
+            return Object.values(fragment?.statusByVariant ?? {}).includes("compressed");
+        })
+        .map((rule) => rule.id ?? "");
+    let mappingRows: LightMappingRow[] = [];
+    try {
+        mappingRows = readLightMapping(options.mappingPath ?? lightMappingPath);
+    } catch {
+        errors.push(`light mapping is unreadable: ${options.mappingPath ?? lightMappingPath}`);
+    }
+    const mappedIds = mappingRows.map((row) => row.id);
+    const duplicateMappedIds = mappedIds.filter((id, index) => mappedIds.indexOf(id) !== index);
+    if (duplicateMappedIds.length > 0) {
+        errors.push(`light mapping contains duplicate checklist IDs: ${[...new Set(duplicateMappedIds)].join(", ")}`);
+    }
+    const missingMappedIds = expectedMappedIds.filter((id) => !mappedIds.includes(id));
+    const unexpectedMappedIds = mappedIds.filter((id) => !expectedMappedIds.includes(id));
+    if (missingMappedIds.length > 0) {
+        errors.push(`compressed checklist entries missing light mappings: ${missingMappedIds.join(", ")}`);
+    }
+    if (unexpectedMappedIds.length > 0) {
+        errors.push(`light mappings target non-compressed checklist entries: ${unexpectedMappedIds.join(", ")}`);
+    }
+
+    const lightAssets = options.lightAssets ?? builtInLightMappingAssets();
+    for (const row of mappingRows) {
+        if (!row.line || !/^L-[A-Z0-9-]+$/.test(row.line)) {
+            errors.push(`light mapping ${row.id} has invalid named line ${row.line || "<missing>"}`);
+        }
+        if (!row.quote) {
+            errors.push(`light mapping ${row.id}/${row.line} has an empty exact quote`);
+            continue;
+        }
+        const asset = lightAssets[row.asset];
+        if (asset === undefined) {
+            errors.push(`light mapping ${row.id} references unknown asset ${row.asset}`);
+            continue;
+        }
+        if (!asset.split(/\r?\n/).includes(row.quote)) {
+            errors.push(`light mapping ${row.id}/${row.line} quote does not resolve as an exact line in ${row.asset}`);
+        }
+    }
+
     messages.push(`checked ${rules.length} checklist entries across ${variantIds.length} composed variants`);
     messages.push(`derived applicability: compressed=${statuses.compressed}, shared=${statuses.shared}, not-present=${statuses["not-present"]}`);
-    messages.push("shared rows are byte-identity declarations; compressed rows await exact S3 light-line targets; not-present rows are source-derived absences");
+    messages.push(`resolved ${mappingRows.length} compressed-rule rows to named exact light lines; shared rows remain byte-identical and not-present rows remain absent`);
     if (errors.length === 0) messages.unshift("checklist completeness and source mapping passed");
     return { errors, messages };
 }

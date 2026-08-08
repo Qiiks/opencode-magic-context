@@ -1,0 +1,166 @@
+{
+  "artifactId": "prompt-surface-light-weak-model-validation",
+  "revision": "s3-r1",
+  "timestamp": "2026-08-08T19:13:53.471Z",
+  "endpoint": "https://ollama.com/api/chat",
+  "models": [
+    {
+      "label": "DeepSeek V4 Flash",
+      "route": "ollama-cloud/deepseek-v4-flash",
+      "model": "deepseek-v4-flash"
+    },
+    {
+      "label": "Gemma 4 31B",
+      "route": "ollama-cloud/gemma4:31b",
+      "model": "gemma4:31b"
+    }
+  ],
+  "presets": [
+    "full",
+    "light"
+  ],
+  "settings": {
+    "temperature": 0,
+    "seed": 268,
+    "think": false,
+    "maxOutputTokens": 128,
+    "timeoutMs": 180000,
+    "maxAttempts": 2,
+    "repetitions": 1
+  },
+  "probe": "§101§ User instruction: preserve the requested migration order.\n§102§ Assistant: I extracted the relevant code paths.\n§103§ Tool output: a large file read already analyzed and acted on.\n§104§ Tool output: an unresolved compiler error that still needs diagnosis.\n§105§ Tool output: repeated passing status already recorded elsewhere.\n\nYou have finished with §103§ and §105§, but §104§ is unresolved. Silently call ctx_reduce once with both eligible IDs in the documented drop grammar. Emit no prose or placeholder markers.",
+  "expectedDropIds": [
+    103,
+    105
+  ],
+  "rubric": [
+    "one real ctx_reduce tool call",
+    "drop parses to exactly IDs 103 and 105",
+    "no §N§ imitation in assistant output or tool arguments",
+    "no fabricated [dropped §N§] marker"
+  ],
+  "unavailableModelPolicy": "fail the harness; do not substitute a model silently",
+  "records": [
+    {
+      "model": "ollama-cloud/deepseek-v4-flash",
+      "requestedModel": "deepseek-v4-flash",
+      "preset": "full",
+      "content": "",
+      "toolCalls": [
+        {
+          "id": "call_bv1qt0t3",
+          "function": {
+            "index": 0,
+            "name": "ctx_reduce",
+            "arguments": {
+              "drop": "103,105"
+            }
+          }
+        }
+      ],
+      "drop": "103,105",
+      "checks": {
+        "oneRealCtxReduceCall": true,
+        "correctDropShape": true,
+        "noTagImitation": true,
+        "noFabricatedDroppedMarker": true
+      },
+      "passed": true,
+      "usage": {
+        "promptTokens": 2275,
+        "completionTokens": 47
+      }
+    },
+    {
+      "model": "ollama-cloud/deepseek-v4-flash",
+      "requestedModel": "deepseek-v4-flash",
+      "preset": "light",
+      "content": "",
+      "toolCalls": [
+        {
+          "id": "call_o9yyogjb",
+          "function": {
+            "index": 0,
+            "name": "ctx_reduce",
+            "arguments": {
+              "drop": "103,105"
+            }
+          }
+        }
+      ],
+      "drop": "103,105",
+      "checks": {
+        "oneRealCtxReduceCall": true,
+        "correctDropShape": true,
+        "noTagImitation": true,
+        "noFabricatedDroppedMarker": true
+      },
+      "passed": true,
+      "usage": {
+        "promptTokens": 1709,
+        "completionTokens": 47
+      }
+    },
+    {
+      "model": "ollama-cloud/gemma4:31b",
+      "requestedModel": "gemma4:31b",
+      "preset": "full",
+      "content": "",
+      "toolCalls": [
+        {
+          "id": "call_dek5c5sp",
+          "function": {
+            "index": 0,
+            "name": "ctx_reduce",
+            "arguments": {
+              "drop": "103,105"
+            }
+          }
+        }
+      ],
+      "drop": "103,105",
+      "checks": {
+        "oneRealCtxReduceCall": true,
+        "correctDropShape": true,
+        "noTagImitation": true,
+        "noFabricatedDroppedMarker": true
+      },
+      "passed": true,
+      "usage": {
+        "promptTokens": 2149,
+        "completionTokens": 21
+      }
+    },
+    {
+      "model": "ollama-cloud/gemma4:31b",
+      "requestedModel": "gemma4:31b",
+      "preset": "light",
+      "content": "",
+      "toolCalls": [
+        {
+          "id": "call_2yonjblq",
+          "function": {
+            "index": 0,
+            "name": "ctx_reduce",
+            "arguments": {
+              "drop": "103,105"
+            }
+          }
+        }
+      ],
+      "drop": "103,105",
+      "checks": {
+        "oneRealCtxReduceCall": true,
+        "correctDropShape": true,
+        "noTagImitation": true,
+        "noFabricatedDroppedMarker": true
+      },
+      "passed": true,
+      "usage": {
+        "promptTokens": 1548,
+        "completionTokens": 21
+      }
+    }
+  ],
+  "passed": true
+}

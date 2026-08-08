@@ -13,6 +13,7 @@
 import { resolve } from "node:path";
 import {
     ACTIVE_TOOL_IDS,
+    builtInLightSurface,
     measureAgentSurface,
     measureLightSurface,
     readLightSurface,
@@ -57,19 +58,18 @@ function printReport() {
     console.log("excluded adjuncts: project docs, profile, memory rendering, compartments, m0, temporal overlays, and USER overrides (no static counts fabricated)");
     console.log("approximately 6.1k: one-time issue-268 all-in measurement, not this mutable-prose metric");
 
-    if (lightSurfacePath) {
-        const light = measureLightSurface(readLightSurface(lightSurfacePath), surface);
-        console.log("");
-        console.log(`light candidate (${light.variant})`);
-        console.log(`- guidance: ${formatCount(light.guidance)}`);
-        for (const id of ACTIVE_TOOL_IDS) {
-            console.log(`- ${id} light description: ${formatCount(light.descriptions[id])}`);
-        }
-        console.log(`- light mutable-prose total: ${light.mutableProseTotal} tokens`);
-        console.log(`- light built-in provider-visible total: ${light.builtInProviderVisibleTotal} tokens`);
-    } else {
-        console.log("light surface: not measured (light prose is gated on ratification; no zero counts are fabricated)");
+    const light = measureLightSurface(
+        lightSurfacePath ? readLightSurface(lightSurfacePath) : builtInLightSurface(),
+        surface,
+    );
+    console.log("");
+    console.log(`${lightSurfacePath ? "light candidate" : "built-in light surface"} (${light.variant})`);
+    console.log(`- guidance: ${formatCount(light.guidance)}`);
+    for (const id of ACTIVE_TOOL_IDS) {
+        console.log(`- ${id} light description: ${formatCount(light.descriptions[id])}`);
     }
+    console.log(`- light mutable-prose total: ${light.mutableProseTotal} tokens`);
+    console.log(`- light built-in provider-visible total: ${light.builtInProviderVisibleTotal} tokens`);
 }
 
 if (import.meta.main) {

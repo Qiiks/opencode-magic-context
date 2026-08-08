@@ -57,6 +57,8 @@ import {
 } from "./types";
 import { runImmediateTransaction } from "./verification-recording";
 
+export { CTX_MEMORY_LIGHT_DESCRIPTION } from "../light-descriptions";
+
 const MEMORY_CATEGORIES = new Set<string>(CATEGORY_PRIORITY);
 
 function isMemoryCategory(value: string): value is MemoryCategory {

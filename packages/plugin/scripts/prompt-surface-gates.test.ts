@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { validateChecklist } from "./check-prompt-surface";
+import {
+    builtInLightMappingAssets,
+    validateChecklist,
+} from "./check-prompt-surface";
 import { validateBudgetFixture } from "./prompt-surface-fixture";
+import { builtInLightSurface } from "./prompt-surface-measurement";
 import { renderChecklist } from "./render-prompt-surface-checklist";
 
 const rootDir = resolve(import.meta.dir, "../../..");
@@ -37,25 +41,35 @@ describe("prompt-surface CI gates", () => {
     test("a light candidate above the ceiling is a red gate", () => {
         withTempDir((directory) => {
             const lightPath = join(directory, "light-surface.json");
-            const longText = "x".repeat(10_000);
-            writeFileSync(
-                lightPath,
-                JSON.stringify({
-                    variant: "primary-full-reduce-memory-on",
-                    guidance: longText,
-                    descriptions: {
-                        ctx_reduce: longText,
-                        ctx_expand: longText,
-                        ctx_note: longText,
-                        ctx_memory: longText,
-                        ctx_search: longText,
-                    },
-                }),
-            );
+            const longText = "inflate light guidance ".repeat(2_000);
+            const mutated = builtInLightSurface();
+            mutated.guidance = longText;
+            writeFileSync(lightPath, JSON.stringify(mutated));
 
             const result = validateBudgetFixture({ fixturePath, lightSurfacePath: lightPath });
             expect(result.errors.some((error) => error.includes("exceeds ceiling"))).toBe(true);
         });
+    });
+
+    test("the committed light mapping resolves every compressed checklist rule", () => {
+        const result = validateChecklist(checklistPath);
+        expect(result.errors).toEqual([]);
+        expect(result.messages.some((message) => message.includes("resolved 37"))).toBe(true);
+    });
+
+    test("deleting a mapped light line is a red mapping gate", () => {
+        const assets = builtInLightMappingAssets();
+        const mappedLine = assets["guidance:primary"]
+            .split("\n")
+            .find((line) => line.startsWith("In primary sessions with ctx_reduce"));
+        if (!mappedLine) throw new Error("mapped primary tag line is missing from the test fixture");
+        assets["guidance:primary"] = assets["guidance:primary"]
+            .split("\n")
+            .filter((line) => line !== mappedLine)
+            .join("\n");
+
+        const result = validateChecklist(checklistPath, { lightAssets: assets });
+        expect(result.errors.some((error) => error.includes("quote does not resolve"))).toBe(true);
     });
 
     test("rendered checklist matches the machine-readable artifact", () => {

@@ -21,6 +21,8 @@ import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_NOTE_DESCRIPTION } from "./constants";
 import type { CtxNoteArgs, CtxNoteReadFilter } from "./types";
 
+export { CTX_NOTE_LIGHT_DESCRIPTION } from "../light-descriptions";
+
 export interface CtxNoteToolDeps {
     db: Database;
     dreamerEnabled?: boolean;

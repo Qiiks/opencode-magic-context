@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
     ACTIVE_TOOL_IDS,
+    builtInLightSurface,
     measureAgentSurface,
     measureLightSurface,
     readLightSurface,
@@ -136,24 +137,21 @@ export function validateBudgetFixture(options: {
         );
     }
 
-    if (options.lightSurfacePath) {
-        const light = measureLightSurface(readLightSurface(options.lightSurfacePath), surface);
-        if (light.variant !== PRIMARY_VARIANT_ID) {
-            errors.push(`light surface variant must be ${PRIMARY_VARIANT_ID}, got ${light.variant}`);
-        }
-        messages.push(`measured primary light mutable-prose total: ${light.mutableProseTotal} tokens`);
-        messages.push(`ratified integer light ceiling: ${fixture.integerLightCeiling} tokens`);
-        if (light.mutableProseTotal > (fixture.integerLightCeiling ?? -1)) {
-            errors.push(
-                `primary light mutable-prose total ${light.mutableProseTotal} exceeds ceiling ${fixture.integerLightCeiling}`,
-            );
-        } else {
-            messages.push("primary light surface is at or below the ceiling");
-        }
-    } else if (fixture.lightMeasurement?.status === "PENDING-LIGHT-AUTHORING") {
-        messages.push("light ceiling enforcement is armed; no light counts are fabricated before S3 authorship");
+    const lightInput = options.lightSurfacePath
+        ? readLightSurface(options.lightSurfacePath)
+        : builtInLightSurface();
+    const light = measureLightSurface(lightInput, surface);
+    if (light.variant !== PRIMARY_VARIANT_ID) {
+        errors.push(`light surface variant must be ${PRIMARY_VARIANT_ID}, got ${light.variant}`);
+    }
+    messages.push(`measured primary light mutable-prose total: ${light.mutableProseTotal} tokens`);
+    messages.push(`ratified integer light ceiling: ${fixture.integerLightCeiling} tokens`);
+    if (light.mutableProseTotal > (fixture.integerLightCeiling ?? -1)) {
+        errors.push(
+            `primary light mutable-prose total ${light.mutableProseTotal} exceeds ceiling ${fixture.integerLightCeiling}`,
+        );
     } else {
-        errors.push("light surface manifest is required once lightMeasurement is no longer pending");
+        messages.push("primary light surface is at or below the ceiling");
     }
 
     if (errors.length === 0) {

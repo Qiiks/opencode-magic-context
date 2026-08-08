@@ -909,7 +909,7 @@ describe("OpenCode prompt-surface guidance epochs", () => {
         );
     });
 
-    it("emits one hash fold at a preset/model boundary even while light renders full", async () => {
+    it("emits one hash fold when a preset/model boundary selects authored light", async () => {
         useTempDataHome("sph-prompt-epoch-");
         const config = {
             default: "full" as const,
@@ -964,12 +964,12 @@ describe("OpenCode prompt-surface guidance epochs", () => {
 
         const changed = await run("light");
         const changedHash = getOrCreateSessionMeta(openDatabase(), sessionID).systemPromptHash;
-        expect(changed).toBe(first);
+        expect(changed).not.toBe(first);
         expect(changedHash).not.toBe(firstHash);
         expect(historyRefreshSessions.has(sessionID)).toBe(true);
         expect(systemPromptRefreshSessions.has(sessionID)).toBe(true);
         expect(pendingMaterializationSessions.has(sessionID)).toBe(true);
-        expect(warnings).toHaveLength(1);
+        expect(warnings).toEqual([]);
 
         historyRefreshSessions.clear();
         systemPromptRefreshSessions.clear();

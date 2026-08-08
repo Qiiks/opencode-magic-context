@@ -220,7 +220,7 @@ describe("Pi prompt-surface guidance epochs", () => {
 		}
 	});
 
-	it("folds once at a preset/model epoch even while light renders full", () => {
+	it("folds once when a preset/model epoch selects authored light", () => {
 		const db = createTestDb();
 		const directory = tempDir("pi-prompt-epoch-");
 		const sessionId = "ses-prompt-surface-epoch";
@@ -281,7 +281,7 @@ describe("Pi prompt-surface guidance epochs", () => {
 			);
 			expect(changedSelection.preset).toBe("light");
 			expect(changedSelection.primaryOverride).toBeUndefined();
-			expect(render(changedSelection)).toBe(firstPrompt);
+			expect(render(changedSelection)).not.toBe(firstPrompt);
 			const changed = processSystemPromptForCache({
 				db,
 				sessionId,
@@ -292,7 +292,7 @@ describe("Pi prompt-surface guidance epochs", () => {
 			expect(changed.hashChanged).toBe(true);
 			expect(changed.currentHash).not.toBe(first.currentHash);
 
-			expect(warnings).toHaveLength(1);
+			expect(warnings).toEqual([]);
 
 			for (let pass = 0; pass < 5; pass++) {
 				const stableSelection = epochs.resolve(

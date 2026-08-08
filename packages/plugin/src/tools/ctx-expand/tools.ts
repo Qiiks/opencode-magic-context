@@ -7,6 +7,8 @@ import { CTX_EXPAND_DESCRIPTION, CTX_EXPAND_TOKEN_BUDGET } from "./constants";
 import { renderMessageByOrdinal, renderVerboseRange } from "./render";
 import type { CtxExpandArgs } from "./types";
 
+export { CTX_EXPAND_LIGHT_DESCRIPTION } from "../light-descriptions";
+
 export interface CtxExpandToolDeps {
     db: ContextDatabase;
 }

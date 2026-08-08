@@ -9,7 +9,10 @@ import type { MagicContextPluginConfig } from "../config";
 import { closeDatabase, openDatabase } from "../features/magic-context/storage";
 import { resetCtxReduceRegisteredGloballyForTest } from "../hooks/magic-context/ctx-reduce-availability";
 import type { PromptSurfaceRuntime } from "../shared/prompt-surface-runtime";
-import { createPromptSurfaceRuntime } from "../shared/prompt-surface-runtime";
+import {
+    createPromptSurfaceRuntime,
+    LIGHT_TOOL_DESCRIPTIONS,
+} from "../shared/prompt-surface-runtime";
 import type { RustToolBackends } from "./rust-tool-backends";
 import { createToolRegistry, getCompactionOffRemovedToolIds } from "./tool-registry";
 import type { PluginContext } from "./types";
@@ -295,7 +298,7 @@ describe("createToolRegistry — prompt-surface registration", () => {
         expect(warnings).toEqual([]);
     });
 
-    it("falls back from a light registration to full descriptions with one notice", () => {
+    it("registers the built-in light descriptions without changing schemas", () => {
         const warnings: string[] = [];
         const runtime = createPromptSurfaceRuntime({
             userConfigDirectory: process.cwd(),
@@ -310,16 +313,13 @@ describe("createToolRegistry — prompt-surface registration", () => {
             runtime,
         );
 
-        expect(
-            Object.fromEntries(
-                Object.entries(light).map(([id, definition]) => [id, definition.description]),
-            ),
-        ).toEqual(
-            Object.fromEntries(
-                Object.entries(full).map(([id, definition]) => [id, definition.description]),
-            ),
-        );
-        expect(warnings).toHaveLength(1);
+        for (const toolId of Object.keys(LIGHT_TOOL_DESCRIPTIONS)) {
+            expect(light[toolId]?.description).toBe(
+                LIGHT_TOOL_DESCRIPTIONS[toolId as keyof typeof LIGHT_TOOL_DESCRIPTIONS],
+            );
+            expect(providerParameters(light[toolId])).toEqual(providerParameters(full[toolId]));
+        }
+        expect(warnings).toEqual([]);
     });
 });
 
