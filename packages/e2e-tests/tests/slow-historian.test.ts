@@ -189,10 +189,9 @@ describe("slow historian vs fast main", () => {
             expect(mainRequestAtT12).toBeDefined();
 
             if (process.env.MC_E2E_MODE === "rust") {
-                // Rust's hermetic rig has no Broca runner, so module-side
-                // historian completion is excluded while the shared main-turn
-                // request still exercises the mode-selected spawn seam.
-                console.log(`[rust-e2e] slow-historian fold assertions SKIPPED: ${FOLD_SKIP_REASON}`);
+                // The hermetic Broca producer is intentionally immediate, so this
+                // delay-ordering assertion remains limited to the mock-backed TS leg.
+                console.log(`[rust-e2e] slow-historian delay assertions SKIPPED: ${FOLD_SKIP_REASON}`);
                 await turn12Promise;
                 return;
             }

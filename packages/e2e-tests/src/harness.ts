@@ -66,6 +66,8 @@ export class TestHarness {
     readonly mock: MockProvider;
     readonly opencode: SpawnedOpencode;
     readonly client: SdkClient;
+    /** Provides Rust-mode-only access to the historian and status interfaces running in the module's Rust stack. */
+    readonly rustStack: SpawnedOpencode["rustStack"];
 
     private contextDbCached: Database | null = null;
 
@@ -73,6 +75,7 @@ export class TestHarness {
         this.mock = mock;
         this.opencode = opencode;
         this.client = client;
+        this.rustStack = opencode.rustStack;
     }
 
     static async create(options: TestHarnessOptions = {}): Promise<TestHarness> {

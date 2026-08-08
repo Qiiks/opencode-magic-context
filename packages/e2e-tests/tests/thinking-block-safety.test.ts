@@ -2,7 +2,6 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
-import { FOLD_SKIP_REASON, foldInfraEnabled } from "../src/rust-scenario-support";
 
 /**
  * E2E regression suite for the Anthropic 400 error family:
@@ -410,18 +409,8 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                     .map((b) => b.text ?? "")
                     .join("\n");
 
-                if (RUST_MODE) {
-                    // The hermetic Rust stack intentionally has no Broca runner, so it
-                    // cannot produce the bust that drains a queued drop. The dedicated
-                    // fold-gated round-trip suite pins the post-fold sentinel contract.
-                    expect(foldInfraEnabled()).toBe(false);
-                    expect(FOLD_SKIP_REASON).toContain("broca");
-                    expect(allUserText).toContain("ERROR: call_failed at line 42.");
-                    expect(allUserText).not.toMatch(/\[dropped \u00a7\d+\u00a7\]/);
-                } else {
-                    expect(allUserText).toMatch(/\[dropped \u00a7\d+\u00a7\]/);
-                    expect(allUserText).not.toContain("ERROR: call_failed at line 42.");
-                }
+                expect(allUserText).toMatch(/\[dropped \u00a7\d+\u00a7\]/);
+                expect(allUserText).not.toContain("ERROR: call_failed at line 42.");
 
                 // Thinking blocks from prior turns must be present and
                 // unchanged in the request.
@@ -446,7 +435,7 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                 // Structural check: the outer message array must contain the
                 // user paste shell as a distinct user message — not merged
                 // into an assistant block. Count transitions.
-                const messages = lastReq.body.messages ?? [];
+                const messages = (lastReq.body.messages ?? []) as Array<{ role: string }>;
                 const transitions: Array<{ from: string; to: string }> = [];
                 for (let i = 1; i < messages.length; i++) {
                     const prev = messages[i - 1]!;
@@ -550,14 +539,8 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                     .filter((block) => block.type === "text")
                     .map((block) => block.text ?? "")
                     .join("\n");
-                if (RUST_MODE) {
-                    expect(foldInfraEnabled()).toBe(false);
-                    expect(FOLD_SKIP_REASON).toContain("broca");
-                    expect(allUserText).toContain("see this screenshot for the bug");
-                } else {
-                    expect(allUserText).not.toContain("see this screenshot for the bug");
-                    expect(allUserText).toMatch(/\[dropped \u00a7\d+\u00a7\]/);
-                }
+                expect(allUserText).not.toContain("see this screenshot for the bug");
+                expect(allUserText).toMatch(/\[dropped \u00a7\d+\u00a7\]/);
 
                 // The user message carrying the image must also NOT have been
                 // removed from the message list (structural presence).

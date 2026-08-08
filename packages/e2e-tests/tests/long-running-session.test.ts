@@ -10,10 +10,8 @@ import { computeSyntheticCallId } from "../../plugin/src/hooks/magic-context/tod
 import { TestHarness } from "../src/harness";
 import { buildMockHistorianPayload } from "../src/mock-historian";
 import type { MockUsage } from "../src/mock-provider/server";
-import { FOLD_SKIP_REASON, foldInfraEnabled } from "../src/rust-scenario-support";
 import { openTestDb } from "../src/test-db";
 
-const RUST_MODE = process.env.MC_E2E_MODE === "rust";
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 
 const LOW_USAGE: MockUsage = {
@@ -408,28 +406,6 @@ describe("long-running OpenCode Magic Context session", () => {
         });
 
         const sessionId = await h.createSession();
-
-        if (RUST_MODE) {
-            // The composite's historian phase requires Broca, which the hermetic Rust
-            // stack intentionally does not spawn. Exercise its cache-stable warmup and
-            // assert the documented capability boundary instead of timing out on a
-            // TypeScript compartment-row observation that Rust cannot publish here.
-            for (let turn = 1; turn <= 3; turn += 1) {
-                await send(
-                    sessionId,
-                    `Rust composite warmup ${turn}: ${h.ballast(1_000)}`,
-                    `Rust composite reply ${turn}`,
-                );
-            }
-            const rustWarmup = mainRequests();
-            expect(rustWarmup.length).toBeGreaterThanOrEqual(3);
-            expect(serialize(rustWarmup[2]!.body.messages?.[0])).toBe(
-                serialize(rustWarmup[1]!.body.messages?.[0]),
-            );
-            expect(foldInfraEnabled()).toBe(false);
-            expect(FOLD_SKIP_REASON).toContain("broca");
-            return;
-        }
 
         // Phase 1: Warm-up turns 1-3 stay below threshold; the cached prefix is
         // byte-identical. Each carries ~2.5K tokens of REAL text ballast: the
