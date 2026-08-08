@@ -585,7 +585,7 @@ describe("createDreamTaskExecutor — classify-memories", () => {
 });
 
 describe("createDreamTaskExecutor — compress-cues", () => {
-    test("writes MODULE-owned cues through the facade and completes the run", async () => {
+    test("rust-authority fixture routes cues through memory.set_mural_cue and leaves no parked facade path", async () => {
         db = freshDb();
         const project = "/repo/module-cues";
         const contextStoreUuid = ensureContextStoreUuid(db);
