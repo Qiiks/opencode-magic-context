@@ -8,7 +8,7 @@
 //! store access, or ambient cache state here: the same inputs always produce the
 //! same boundary and trigger decision.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
@@ -1184,15 +1184,27 @@ impl TokenIndex {
 struct ToolArc {
     inv_ordinal: u64,
     res_ordinal: Option<u64>,
+    reasoning_bearing: bool,
 }
 
 fn build_tool_arcs(messages: &[BoundaryMsg]) -> Vec<ToolArc> {
     #[derive(Default)]
     struct PartialArc {
-        inv: Vec<u64>,
+        inv: Vec<(u64, bool)>,
         res: Vec<u64>,
     }
 
+    let reasoning_messages: HashSet<u64> = messages
+        .iter()
+        .filter(|message| message.role == Role::Assistant)
+        .filter(|message| {
+            message
+                .blocks
+                .iter()
+                .any(|block| matches!(block.kind, SelKind::Reasoning | SelKind::RedactedReasoning))
+        })
+        .map(|message| message.message_ordinal)
+        .collect();
     let mut partial: BTreeMap<String, PartialArc> = BTreeMap::new();
     for message in messages {
         for block in &message.blocks {
@@ -1204,7 +1216,10 @@ fn build_tool_arcs(messages: &[BoundaryMsg]) -> Vec<ToolArc> {
             };
             let entry = partial.entry(arc_id.clone()).or_default();
             match &block.kind {
-                SelKind::ToolCall { .. } => entry.inv.push(message.message_ordinal),
+                SelKind::ToolCall { .. } => entry.inv.push((
+                    message.message_ordinal,
+                    reasoning_messages.contains(&message.message_ordinal),
+                )),
                 SelKind::ToolResult { .. } => entry.res.push(message.message_ordinal),
                 _ => {}
             }
@@ -1215,12 +1230,13 @@ fn build_tool_arcs(messages: &[BoundaryMsg]) -> Vec<ToolArc> {
     for (_arc_id, mut entry) in partial {
         entry.inv.sort_unstable();
         entry.res.sort_unstable();
-        for inv in entry.inv {
+        for (inv, reasoning_bearing) in entry.inv {
             let res_pos = entry.res.iter().position(|res| *res >= inv);
             let res_ordinal = res_pos.map(|idx| entry.res.remove(idx));
             arcs.push(ToolArc {
                 inv_ordinal: inv,
                 res_ordinal,
+                reasoning_bearing,
             });
         }
     }
@@ -1261,7 +1277,14 @@ fn fence_boundary_for_tool_arcs(
     for arc in arcs {
         if let Some(res_ordinal) = arc.res_ordinal {
             if arc.inv_ordinal < boundary && boundary <= res_ordinal {
-                boundary = res_ordinal + 1;
+                // Keep signed reasoning and every tool sibling on one side of a cut.
+                // Ordinary arcs may close forward; reasoning-bearing arcs fence backward
+                // so later coverage changes cannot strand a signed assistant message.
+                boundary = if arc.reasoning_bearing {
+                    arc.inv_ordinal
+                } else {
+                    res_ordinal + 1
+                };
             }
             continue;
         }
@@ -1425,13 +1448,17 @@ fn apply_head_cap(args: HeadCapArgs<'_>) -> HeadCapResult {
     for arc in args.arcs {
         if let Some(res_ordinal) = arc.res_ordinal {
             if arc.inv_ordinal < end && end <= res_ordinal {
-                end = args.protected_tail_start.min(res_ordinal + 1);
-                if args
-                    .index
-                    .range_tokens(args.offset.max(arc.inv_ordinal), end)
-                    > args.cap_tokens
-                {
-                    oversize_atomic_unit = true;
+                if arc.reasoning_bearing {
+                    end = arc.inv_ordinal.max(args.offset);
+                } else {
+                    end = args.protected_tail_start.min(res_ordinal + 1);
+                    if args
+                        .index
+                        .range_tokens(args.offset.max(arc.inv_ordinal), end)
+                        > args.cap_tokens
+                    {
+                        oversize_atomic_unit = true;
+                    }
                 }
             }
             continue;
@@ -2332,6 +2359,26 @@ mod tests {
         }
     }
 
+    fn reasoning_tool_call_msg(ord: u64, arc_id: &str) -> BoundaryMsg {
+        let mut message = tool_call_msg(ord, arc_id);
+        message.blocks.insert(
+            0,
+            BoundaryBlock {
+                id: format!("{arc_id}#reasoning"),
+                ordinal: ord,
+                kind: SelKind::Reasoning,
+                provider_executed: false,
+                byte_size: 16,
+                arc_id: Some(arc_id.to_string()),
+                original: Arc::from("signed reasoning"),
+                original_token_count: estimate_tokens("signed reasoning"),
+                rendered: None,
+                ignored: false,
+            },
+        );
+        message
+    }
+
     fn tool_result_msg(ord: u64, arc_id: &str, text: &str) -> BoundaryMsg {
         BoundaryMsg {
             message_ordinal: ord,
@@ -2384,6 +2431,35 @@ mod tests {
         ctx.usage_input_tokens = 77_600.0;
         ctx.fold_is_only_reclaim = true;
         ctx
+    }
+
+    #[test]
+    fn reasoning_bearing_completed_arc_fences_a_straddling_boundary_backward() {
+        let messages = vec![
+            reasoning_tool_call_msg(2, "reasoning-arc"),
+            tool_result_msg(3, "reasoning-arc", "tool result"),
+        ];
+        let arcs = build_tool_arcs(&messages);
+
+        let fenced = fence_boundary_for_tool_arcs(3, &arcs, 1, 1);
+
+        assert_eq!(
+            fenced.boundary, 2,
+            "the fold must exclude the whole reasoning-bearing invocation instead of cutting its arc"
+        );
+    }
+
+    #[test]
+    fn ordinary_completed_arc_can_still_close_a_straddling_boundary_forward() {
+        let messages = vec![
+            tool_call_msg(2, "ordinary-arc"),
+            tool_result_msg(3, "ordinary-arc", "tool result"),
+        ];
+        let arcs = build_tool_arcs(&messages);
+
+        let fenced = fence_boundary_for_tool_arcs(3, &arcs, 1, 1);
+
+        assert_eq!(fenced.boundary, 4);
     }
 
     #[test]

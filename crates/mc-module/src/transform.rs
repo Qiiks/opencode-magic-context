@@ -34,7 +34,8 @@ use crate::scheduler::{
     SchedulerConfig, SchedulerInputs, SessionMeta, TailState,
 };
 use crate::selection::{
-    select_reductions, PassClass, SelItem, SelKind, SelectionConfig, SelectionContext,
+    filter_reasoning_ineligible_decisions, select_reductions, PassClass, SelItem, SelKind,
+    SelectionConfig, SelectionContext,
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
@@ -2074,8 +2075,8 @@ fn apply_once(
     // Subagents intentionally share this bootstrap arm; they have no provider-cache prefix.
     let bootstrap_tagging_active = !loaded.meta.initialized
         && matches!(serializer_profile, Some(SerializerProfile::OpencodeAiSdk));
-    let tagging_active = tagging_surface_requested
-        && (persisted_tagging_surface_active || bootstrap_tagging_active);
+    let tagging_active =
+        tagging_surface_requested && (persisted_tagging_surface_active || bootstrap_tagging_active);
     // Previously stored overlay rows may still replay when boundary-lineage validation
     // later forces pass-through. Decisions from this request stay in memory until the
     // final cache-state compare-and-swap accepts the pass.
@@ -2772,6 +2773,8 @@ fn apply_once(
     } else {
         ctx.injected_reductions.clone()
     };
+    let selected_reductions =
+        filter_reasoning_ineligible_decisions(&tail_for_selection, selected_reductions);
     // Fail-loud monotonicity guard, BEFORE classify and on EVERY pass: a frozen
     // reduction target re-supplied with different bytes breaks the immutable contract,
     // and the set-membership trigger would silently skip it (already frozen) and serve
@@ -7752,9 +7755,51 @@ fn surviving_strip_units(core: &CoreState, req: &TransformRequest) -> Vec<Frozen
         .collect()
 }
 
+#[derive(Default)]
+struct ReasoningMessageArcShape<'a> {
+    has_reasoning: bool,
+    has_durable_non_tool_sibling: bool,
+    tool_arc_ids: HashSet<&'a str>,
+}
+
+fn projection_reasoning_ineligible_arc_ids(projection: &FlatProjection) -> HashSet<&str> {
+    let mut messages: HashMap<&str, ReasoningMessageArcShape<'_>> = HashMap::new();
+    for block in projection
+        .blocks
+        .iter()
+        .filter(|block| block.role == "assistant")
+    {
+        let message = messages.entry(block.mid.as_str()).or_default();
+        match &block.wire.kind {
+            ck_wire::CkKind::Reasoning { .. } | ck_wire::CkKind::RedactedReasoning { .. } => {
+                message.has_reasoning = true;
+            }
+            ck_wire::CkKind::ToolCall { .. } | ck_wire::CkKind::ToolResult { .. }
+                if !block.provider_executed =>
+            {
+                if let Some(arc_id) = block.arc_id.as_deref() {
+                    message.tool_arc_ids.insert(arc_id);
+                } else {
+                    message.has_durable_non_tool_sibling = true;
+                }
+            }
+            ck_wire::CkKind::ToolCall { .. } | ck_wire::CkKind::ToolResult { .. } => {
+                message.has_durable_non_tool_sibling = true;
+            }
+            _ => message.has_durable_non_tool_sibling = true,
+        }
+    }
+    messages
+        .into_values()
+        .filter(|message| message.has_reasoning && !message.has_durable_non_tool_sibling)
+        .flat_map(|message| message.tool_arc_ids)
+        .collect()
+}
+
 fn full_drop_tool_ids(
     frozen_units: &FrozenUnitLookup<'_>,
     projection: &FlatProjection,
+    reasoning_ineligible_arcs: &HashSet<&str>,
 ) -> HashSet<String> {
     let frozen_kind = |block_id: &str| {
         frozen_units
@@ -7768,6 +7813,13 @@ fn full_drop_tool_ids(
         else {
             continue;
         };
+        if block
+            .arc_id
+            .as_deref()
+            .is_some_and(|arc_id| reasoning_ineligible_arcs.contains(arc_id))
+        {
+            continue;
+        }
         if frozen_kind(block.id()) != Some("drop") {
             continue;
         }
@@ -8343,9 +8395,10 @@ fn build_output_with_tags_inner(
 
     let blocks_by_mid_started_at = Instant::now();
     let blocks_by_mid = projection_blocks_by_mid(projection);
+    let reasoning_ineligible_arcs = projection_reasoning_ineligible_arc_ids(projection);
     build_timings.blocks_by_mid = elapsed_ms(blocks_by_mid_started_at);
     let full_drop_tool_ids_started_at = Instant::now();
-    let full_drop_ids = full_drop_tool_ids(&frozen_units, projection);
+    let full_drop_ids = full_drop_tool_ids(&frozen_units, projection, &reasoning_ineligible_arcs);
     build_timings.full_drop_tool_ids = elapsed_ms(full_drop_tool_ids_started_at);
     let output_coverage = if req.is_subagent {
         None
@@ -8464,6 +8517,12 @@ fn build_output_with_tags_inner(
                     blocks
                         .iter()
                         .filter(|block| !is_reasoning_block(&block.wire))
+                        .filter(|block| {
+                            block
+                                .arc_id
+                                .as_deref()
+                                .is_none_or(|arc_id| !reasoning_ineligible_arcs.contains(arc_id))
+                        })
                         .filter_map(|block| {
                             frozen_units
                                 .by_key(&format!("{RED_KEY_PREFIX}{}", block.id()))
@@ -12182,7 +12241,10 @@ mod tests {
             .unwrap();
         assert_eq!(untouched_assistant["parts"][0], raw[0]["parts"][0]);
         assert_eq!(untouched_assistant["parts"][1]["text"], "§1§ answer");
-        assert_eq!(untouched_assistant["parts"][1]["providerField"], "text-keep");
+        assert_eq!(
+            untouched_assistant["parts"][1]["providerField"],
+            "text-keep"
+        );
 
         let active = apply_once_with_estimator(&store, &request, &context, estimate, None).unwrap();
         assert_eq!(active.response.action, "SOFT+");
@@ -12226,7 +12288,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_reasoning_first_defer_replays_frozen_tool_reduction_natively() {
+    fn completed_reasoning_first_refuses_orphaning_tool_reduction_natively() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let raw = vec![
@@ -12283,6 +12345,11 @@ mod tests {
             apply_once_with_estimator(&store, &request, &execute_context, estimate, None).unwrap();
         assert_eq!(execute.scheduler_pass, scheduler::PassDecision::Execute);
         assert_eq!(execute.response.action, "HARD");
+        let frozen = frozen_red_targets(&store.load("reasoning-reduction").unwrap().core);
+        assert!(
+            !frozen.contains("assistant-tool#1") && !frozen.contains("assistant-tool#2"),
+            "the whole tool arc is ineligible when removing it would strand signed reasoning"
+        );
 
         request = with_usage(request, 20, 100);
         let defer = apply_once_with_estimator(&store, &request, &context, estimate, None).unwrap();
@@ -12299,10 +12366,18 @@ mod tests {
             .iter()
             .find(|message| message.meta.harness_id.as_deref() == Some("assistant-tool"))
             .unwrap();
-        assert_eq!(ck_assistant.content.len(), 1);
+        assert_eq!(ck_assistant.content.len(), 3);
         assert!(matches!(
             ck_assistant.content[0].kind,
             ck_wire::CkKind::Reasoning { .. }
+        ));
+        assert!(matches!(
+            ck_assistant.content[1].kind,
+            ck_wire::CkKind::ToolCall { .. }
+        ));
+        assert!(matches!(
+            ck_assistant.content[2].kind,
+            ck_wire::CkKind::ToolResult { .. }
         ));
         let native = crate::codec::encode_opencode_with_session(
             &served_messages,
@@ -12314,8 +12389,160 @@ mod tests {
             .iter()
             .find(|message| message["info"]["id"] == "assistant-tool")
             .unwrap();
-        assert_eq!(native_assistant["parts"].as_array().unwrap().len(), 1);
+        assert_eq!(native_assistant["parts"].as_array().unwrap().len(), 2);
         assert_eq!(native_assistant["parts"][0], raw[0]["parts"][0]);
+        assert_eq!(native_assistant["parts"][1]["type"], "tool");
+        assert_eq!(native_assistant["parts"][1]["callID"], "call-tool");
+    }
+
+    #[test]
+    fn four_arm_reasoning_tool_arc_fixture_stays_valid_after_encode() {
+        fn reasoning_call(mid: &str, ordinal: u64, call_id: &str) -> CkIngressMessage {
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    vec![
+                        ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                            text: format!("thinking-{mid}"),
+                            signature: Some(format!("signature-{mid}")),
+                        }),
+                        ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                            id: call_id.to_string(),
+                            name: "aft_outline".to_string(),
+                            input: json!({"target": ["src/model.rs"]}),
+                            provider_executed: false,
+                        }),
+                    ],
+                    None,
+                    ck_wire::ProviderExtras::new(),
+                    ck_wire::HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        fn merge_same_roles(messages: &[CkWireMessage]) -> Vec<CkWireMessage> {
+            let mut merged: Vec<CkWireMessage> = Vec::new();
+            for message in messages {
+                if let Some(previous) = merged.last_mut().filter(|prior| prior.role == message.role)
+                {
+                    previous.content.extend(message.content.clone());
+                } else {
+                    merged.push(message.clone());
+                }
+            }
+            merged
+        }
+
+        fn reasoning_count(message: &CkWireMessage) -> usize {
+            message
+                .content
+                .iter()
+                .filter(|block| is_reasoning_block(block))
+                .count()
+        }
+
+        fn has_reasoning_only_assistant(messages: &[CkWireMessage]) -> bool {
+            messages.iter().any(|message| {
+                message.role == "assistant"
+                    && !message.content.is_empty()
+                    && message.content.iter().all(is_reasoning_block)
+            })
+        }
+
+        let source = vec![
+            reasoning_call("target", 1, "target-call"),
+            tool_result("target-result", 2, "target-call", "outline result"),
+            reasoning_call("sibling", 3, "sibling-call"),
+            tool_result("sibling-result", 4, "sibling-call", "sibling result"),
+        ];
+        let mut request = cc_req("four-arm", "cfg0", source.clone());
+        request.provider_id = Some("anthropic".to_string());
+        let projection = project_messages(&request.messages).unwrap();
+        let live = projection.blocks.iter().collect::<Vec<_>>();
+        let items = tail_sel_items(&live, None, &HashMap::new());
+        let guarded = filter_reasoning_ineligible_decisions(
+            &items,
+            vec![
+                reduce("target#1", "drop", "[dropped]"),
+                reduce("target-result#0", "drop", "[dropped]"),
+            ],
+        );
+        assert!(
+            guarded.is_empty(),
+            "the target arc must be whole-message ineligible"
+        );
+
+        // Arm A is the historical as-sent failure: full removal leaves a reasoning-only
+        // assistant immediately before the next reasoning-bearing assistant.
+        let mut lone_reasoning = source[0].ck.clone();
+        lone_reasoning.content.truncate(1);
+        let arm_a = vec![
+            lone_reasoning.clone(),
+            source[2].ck.clone(),
+            source[3].ck.clone(),
+        ];
+        assert!(
+            merge_same_roles(&arm_a)
+                .iter()
+                .any(|message| reasoning_count(message) == 2),
+            "the fixture must reproduce Anthropic's same-role merge failure"
+        );
+
+        // Arm B removes the stranded message and is accepted by the duplicate-thinking rule.
+        let arm_b = arm_a[1..].to_vec();
+        assert!(merge_same_roles(&arm_b)
+            .iter()
+            .all(|message| reasoning_count(message) <= 1));
+
+        // Arm C performs the provider's merge explicitly and retains the same failure.
+        let arm_c = merge_same_roles(&arm_a);
+        assert!(arm_c.iter().any(|message| reasoning_count(message) == 2));
+
+        // Arm D removes a different assistant. It avoids duplicate thinking but leaves a
+        // reasoning-only assistant together with an unpaired ToolResult.
+        let arm_d = vec![lone_reasoning, source[3].ck.clone()];
+        assert!(has_reasoning_only_assistant(&arm_d));
+        assert!(
+            arm_d.iter().any(|message| {
+                message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }))
+            }),
+            "the different-removal arm must retain its separate tool-result violation"
+        );
+
+        let core = CoreState {
+            version: 1,
+            boundary_id: String::new(),
+            reconcile_pending: false,
+            pending_changes: Vec::new(),
+            frozen_units: guarded
+                .iter()
+                .map(|decision| red_unit(&decision.target_id, &decision.kind, &decision.payload))
+                .collect(),
+        };
+        let encoded = build_output(
+            &core,
+            &ModuleMeta::default(),
+            &projection,
+            &request,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            merge_same_roles(&encoded)
+                .iter()
+                .all(|message| reasoning_count(message) <= 1),
+            "guarded encoding must not create two thinking blocks in one merged assistant turn"
+        );
     }
 
     #[test]
@@ -14049,7 +14276,6 @@ mod tests {
             false, false, true, false, false, true,
         ));
     }
-
 
     #[test]
     fn legacy_revision_exclusion_escalates_despite_project_memory_churn() {
@@ -21419,7 +21645,10 @@ mod tests {
         // inheritance from a terminal refusal without reading our store
         // (drive round-1: consumed_id alone acked a cycle_detected refusal
         // and read as success from the proxy seat).
-        assert_eq!(first.lineage_descent_disposition.as_deref(), Some("descended"));
+        assert_eq!(
+            first.lineage_descent_disposition.as_deref(),
+            Some("descended")
+        );
         assert_eq!(first.ordinal_continuation_base, Some(10));
         assert_eq!(first.coverage_ordinal, Some(11));
         assert!(!first.reconcile_pending);
@@ -21457,7 +21686,10 @@ mod tests {
         assert_eq!(second.action, "SOFT+");
         assert_eq!(second.lineage_switch_consumed_id, Some(101));
         // The write-free replay arm also names its outcome.
-        assert_eq!(second.lineage_descent_disposition.as_deref(), Some("replay"));
+        assert_eq!(
+            second.lineage_descent_disposition.as_deref(),
+            Some("replay")
+        );
         assert!(!second.committed, "durable replay must stay write-free");
         assert_eq!(store.load("A").unwrap().meta.revert_epoch, prior_epoch + 1);
     }

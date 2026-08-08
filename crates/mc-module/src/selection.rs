@@ -20,8 +20,9 @@
 //! - **payload purity**: every payload is a pure function of (id, immutable block
 //!   bytes) with ZERO pass-varying state, so a frozen target can never be re-emitted
 //!   with different bytes.
-//! - **arc-atomic emission**: a tool reduction emits decisions for the whole arc
-//!   (ToolCall + paired ToolResult + adjacent Reasoning) together, never split.
+//! - **arc-safe emission**: a tool reduction emits decisions for its ToolCall and
+//!   paired ToolResult together. Reasoning is never rewritten, and a reasoning-bearing
+//!   assistant with no other durable sibling makes the whole tool arc ineligible.
 //! - **deterministic merge**: exactly one decision per target; `drop` beats
 //!   `edit_marker`; stable output order.
 
@@ -325,6 +326,73 @@ fn group_arcs(items: &[SelItem], frozen: &HashSet<String>) -> Vec<ToolArc> {
     out
 }
 
+#[derive(Default)]
+struct ReasoningMessageShape {
+    has_reasoning: bool,
+    has_durable_non_tool_sibling: bool,
+    tool_arc_ids: HashSet<String>,
+}
+
+fn item_message_id(item: &SelItem) -> Option<&str> {
+    let (mid, index) = item.id.rsplit_once('#')?;
+    index.parse::<usize>().ok().map(|_| mid)
+}
+
+/// Tool arcs in an assistant that consists only of native reasoning plus reducible tool blocks
+/// are not reduction candidates. Reasoning cannot be rewritten, so changing every remaining
+/// tool sibling would either strand a reasoning-only message or mutate a signed assistant turn.
+pub(crate) fn reasoning_ineligible_arc_ids(items: &[SelItem]) -> HashSet<String> {
+    let mut messages: HashMap<&str, ReasoningMessageShape> = HashMap::new();
+    for item in items {
+        let Some(mid) = item_message_id(item) else {
+            continue;
+        };
+        let message = messages.entry(mid).or_default();
+        match &item.kind {
+            SelKind::Reasoning | SelKind::RedactedReasoning => message.has_reasoning = true,
+            SelKind::ToolCall { .. } | SelKind::ToolResult { .. } if !item.provider_executed => {
+                if let Some(arc_id) = &item.arc_id {
+                    message.tool_arc_ids.insert(arc_id.clone());
+                } else {
+                    message.has_durable_non_tool_sibling = true;
+                }
+            }
+            SelKind::ToolCall { .. } | SelKind::ToolResult { .. } => {
+                message.has_durable_non_tool_sibling = true;
+            }
+            _ => message.has_durable_non_tool_sibling = true,
+        }
+    }
+
+    messages
+        .into_values()
+        .filter(|message| message.has_reasoning && !message.has_durable_non_tool_sibling)
+        .flat_map(|message| message.tool_arc_ids)
+        .collect()
+}
+
+pub(crate) fn filter_reasoning_ineligible_decisions(
+    items: &[SelItem],
+    decisions: Vec<ReductionDecision>,
+) -> Vec<ReductionDecision> {
+    let ineligible_arcs = reasoning_ineligible_arc_ids(items);
+    if ineligible_arcs.is_empty() {
+        return decisions;
+    }
+    let arc_by_block_id: HashMap<&str, &str> = items
+        .iter()
+        .filter_map(|item| Some((item.id.as_str(), item.arc_id.as_deref()?)))
+        .collect();
+    decisions
+        .into_iter()
+        .filter(|decision| {
+            arc_by_block_id
+                .get(decision.target_id.as_str())
+                .is_none_or(|arc_id| !ineligible_arcs.contains(*arc_id))
+        })
+        .collect()
+}
+
 // --- payload builders (PURE functions of the block's immutable bytes) ---
 
 /// The provider-neutral reduced-content placeholder for a fully-dropped block. Selection
@@ -480,9 +548,10 @@ fn skeleton_payload(input: &serde_json::Value) -> String {
     }
 }
 
-/// Expand a reduced arc into its per-block [`ReductionDecision`]s (arc-atomic): the
-/// ToolCall block takes the shape kind; the ToolResult and adjacent Reasoning blocks
-/// are dropped. Skips blocks that are already frozen (never re-decide) or absent.
+/// Expand a reduced arc into its per-block [`ReductionDecision`]s: the ToolCall block
+/// takes the shape kind and paired ToolResults are dropped. Reasoning stays verbatim;
+/// reasoning-only message shapes have already been excluded from the candidate pool.
+/// Skips blocks that are already frozen (never re-decide) or absent.
 fn expand_arc(
     arc: &ToolArc,
     shape: ArcShape,
@@ -783,6 +852,7 @@ pub fn select_reductions(
         .map(|item| item.id.clone())
         .collect();
     let arcs = group_arcs(items, frozen_keys);
+    let reasoning_ineligible_arcs = reasoning_ineligible_arc_ids(items);
 
     // The COMPOSED candidate pool: active (non-reduced), client-executed arcs only.
     // frozen_keys is applied per-block at emit time (expand_arc skips frozen ids); an
@@ -790,7 +860,9 @@ pub fn select_reductions(
     // never re-enters candidate/reserve/reclaim accounting.
     let active_arcs: Vec<&ToolArc> = arcs
         .iter()
-        .filter(|a| !a.reduced && !a.provider_executed)
+        .filter(|a| {
+            !a.reduced && !a.provider_executed && !reasoning_ineligible_arcs.contains(&a.arc_id)
+        })
         .collect();
 
     // Per-arc reduction intents (arc_id → shape), assembled in TS precedence order.
@@ -876,6 +948,18 @@ pub fn select_reductions(
     // ctx_reduce agent drops stay block-granular, but pass-through carriers are absent
     // from live_ids so Media and Opaque can never become reduction targets.
     select_agent_drops(ctx, &live_ids, frozen_keys, &mut out);
+
+    // Agent-directed ids can name either half of a tool arc, so apply the same whole-message
+    // guard after their block-granular decisions have been added.
+    let arc_by_block_id: HashMap<&str, &str> = items
+        .iter()
+        .filter_map(|item| Some((item.id.as_str(), item.arc_id.as_deref()?)))
+        .collect();
+    out.retain(|decision| {
+        arc_by_block_id
+            .get(decision.target_id.as_str())
+            .is_none_or(|arc_id| !reasoning_ineligible_arcs.contains(*arc_id))
+    });
 
     // Protection is block-specific, not an ordinal cutoff: remove protected targets from
     // both automatic arc decisions and agent-directed decisions before the stable merge.
@@ -975,6 +1059,30 @@ mod tests {
             byte_size: bytes,
             token_count: None,
             arc_id: Some(call_block_id(mid)),
+        }
+    }
+
+    fn reasoning_with_id(id: &str, arc_id: &str, ordinal: u64, bytes: usize) -> SelItem {
+        SelItem {
+            id: id.to_string(),
+            ordinal,
+            kind: SelKind::Reasoning,
+            provider_executed: false,
+            byte_size: bytes,
+            token_count: None,
+            arc_id: Some(arc_id.to_string()),
+        }
+    }
+
+    fn text_with_id(id: &str, ordinal: u64, bytes: usize) -> SelItem {
+        SelItem {
+            id: id.to_string(),
+            ordinal,
+            kind: SelKind::Text,
+            provider_executed: false,
+            byte_size: bytes,
+            token_count: None,
+            arc_id: None,
         }
     }
 
@@ -1372,28 +1480,103 @@ mod tests {
     }
 
     #[test]
-    fn arc_atomic_emission_targets_call_and_result_never_reasoning() {
-        // A dropped arc emits decisions for the call and result. The adjacent
-        // reasoning block stays verbatim: rewriting signed thinking discards the
-        // signature and the block can never re-encode for Anthropic, which
-        // permanently fences the session to raw serving.
-        let items = vec![
-            reasoning("c1", 1, 100),
-            tool_call("c1", 1, "bash", serde_json::json!({}), 50),
-            tool_result("c1", 1, "bash", 300),
+    fn reasoning_only_assistant_makes_the_whole_tool_arc_ineligible() {
+        let target_arc = "assistant#1";
+        let mut items = vec![
+            reasoning_with_id("assistant#0", target_arc, 1, 100),
+            tool_call_with_ids(
+                target_arc,
+                target_arc,
+                1,
+                "aft_outline",
+                serde_json::json!({"target": ["src/model.rs"]}),
+                50,
+            ),
+            tool_result_with_ids("tool-result#0", target_arc, 2, "aft_outline", 300),
         ];
+        // Keep the target arc outside the newest-20 skeleton window so the control
+        // would fully remove both tool carriers without the whole-message guard.
+        for ordinal in 3..=22 {
+            let arc = format!("new-{ordinal}#0");
+            items.push(tool_call_with_ids(
+                &arc,
+                &arc,
+                ordinal,
+                "bash",
+                serde_json::json!({}),
+                50,
+            ));
+            items.push(tool_result_with_ids(
+                &format!("new-result-{ordinal}#0"),
+                &arc,
+                ordinal,
+                "bash",
+                300,
+            ));
+        }
         let mut ctx = base_ctx(PassClass::Execute);
-        ctx.last_execute_ordinal = 1;
+        ctx.last_execute_ordinal = 22;
+
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
-        let ids: HashSet<&str> = out.iter().map(|d| d.target_id.as_str()).collect();
         assert!(
-            ids.contains(call_block_id("c1").as_str())
-                && ids.contains(result_block_id("c1").as_str()),
-            "{ids:?}"
+            out.iter().all(|decision| {
+                decision.target_id != target_arc && decision.target_id != "tool-result#0"
+            }),
+            "reasoning-bearing arc must remain byte-complete: {out:?}"
         );
         assert!(
-            !ids.contains(reasoning_block_id("c1").as_str()),
-            "reasoning must never be a reduction target: {ids:?}"
+            out.iter()
+                .all(|decision| decision.target_id != "assistant#0"),
+            "reasoning itself must never become a reduction target: {out:?}"
+        );
+        assert!(
+            !out.is_empty(),
+            "unrelated age-reclaim candidates must still reduce"
+        );
+    }
+
+    #[test]
+    fn reasoning_with_a_durable_text_sibling_keeps_tool_reclaim_eligible() {
+        let target_arc = "assistant#1";
+        let mut items = vec![
+            reasoning_with_id("assistant#0", target_arc, 1, 100),
+            tool_call_with_ids(
+                target_arc,
+                target_arc,
+                1,
+                "aft_outline",
+                serde_json::json!({"target": ["src/model.rs"]}),
+                50,
+            ),
+            text_with_id("assistant#2", 1, 20),
+            tool_result_with_ids("tool-result#0", target_arc, 2, "aft_outline", 300),
+        ];
+        for ordinal in 3..=22 {
+            let arc = format!("new-{ordinal}#0");
+            items.push(tool_call_with_ids(
+                &arc,
+                &arc,
+                ordinal,
+                "bash",
+                serde_json::json!({}),
+                50,
+            ));
+            items.push(tool_result_with_ids(
+                &format!("new-result-{ordinal}#0"),
+                &arc,
+                ordinal,
+                "bash",
+                300,
+            ));
+        }
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.last_execute_ordinal = 22;
+
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert!(
+            out.iter()
+                .any(|decision| { decision.target_id == target_arc && decision.kind == "drop" }),
+            "the durable text sibling prevents a reasoning-only assistant: {out:?}"
         );
     }
 
