@@ -113,8 +113,9 @@ const mutations: Record<string, MutationCase[]> = {
         {
             name: "FM_OC_6_RUNG_DELETION",
             source: drillFile("6"),
-            oldText: 'line.includes("mc_rust_emergency_refusal before_lkg")',
-            replacement: "",
+            oldText:
+                'const refusalIndex = after.findIndex((line) =>\n                line.includes("mc_rust_emergency_refusal before_lkg"),\n            );',
+            replacement: "const refusalIndex = -1;",
         },
     ],
 };

@@ -39,7 +39,7 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-2: park transiti
             const droppedBefore = lineageScopedTagCount(h, sessionId, "dropped");
             const outagePasses = RUST_FAILURE_PARK_THRESHOLD * 2;
 
-            h.subc.killModule();
+            await h.subc.killModuleAndWait();
             await sendOutagePasses(h, sessionId, 4, outagePasses, "FM-OC-2 outage");
             await h.waitFor(
                 () =>

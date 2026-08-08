@@ -43,6 +43,7 @@ import { dirname, join, resolve } from "node:path";
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 const MODULE_ID = "magic-context";
 const RUST_E2E_PID_FILE = "rust-e2e-pids.json";
+const RUST_E2E_STALE_PID_AGE_MS = 30 * 60 * 1_000;
 
 type RustE2eProcessRole = "daemon" | "module";
 
@@ -66,10 +67,17 @@ function processStartTimeMs(pid: number): number | null {
     return Number.isFinite(startedAt) ? startedAt : null;
 }
 
+function isStaleRustE2ePidRecord(createdAtMs: number, nowMs = Date.now()): boolean {
+    return (
+        Number.isFinite(createdAtMs) &&
+        createdAtMs <= nowMs &&
+        nowMs - createdAtMs >= RUST_E2E_STALE_PID_AGE_MS
+    );
+}
+
 /**
- * Reap only PIDs recorded by an earlier Rust harness run. The recorded process
- * start time check prevents a reused PID from turning startup cleanup into an
- * unrelated-process kill; process names are never used as identity.
+ * Reap only PIDs recorded by a stale Rust harness run. Fresh PID files can
+ * belong to active tests in other worktrees on the shared host.
  */
 function reapRecordedRustProcesses(): void {
     let candidates: string[];
@@ -83,9 +91,12 @@ function reapRecordedRustProcesses(): void {
 
     for (const pidPath of candidates) {
         if (!existsSync(pidPath)) continue;
+        let stale = false;
         try {
             const record = JSON.parse(readFileSync(pidPath, "utf8")) as RustE2ePidFile;
-            if (!Number.isFinite(record.createdAtMs) || !Array.isArray(record.pids)) continue;
+            if (!Array.isArray(record.pids)) continue;
+            stale = isStaleRustE2ePidRecord(record.createdAtMs);
+            if (!stale) continue;
             // `ps lstart` reports process start times only to whole seconds on
             // supported Unix hosts, so compare against the PID record's creation
             // time rounded down. Older processes predate this harness run and are
@@ -104,7 +115,7 @@ function reapRecordedRustProcesses(): void {
         } catch {
             // A partial PID file is not an identity proof; leave unknown processes alone.
         } finally {
-            rmSync(pidPath, { force: true });
+            if (stale) rmSync(pidPath, { force: true });
         }
     }
 }
@@ -411,7 +422,7 @@ export class HermeticSubcStack {
     }
 
     private async spawnModule(): Promise<void> {
-        this.module = spawn(this.ckMcBin, ["--subc", this.connectionFile], {
+        const module = spawn(this.ckMcBin, ["--subc", this.connectionFile], {
             stdio: ["ignore", "pipe", "pipe"],
             env: {
                 ...process.env,
@@ -422,9 +433,10 @@ export class HermeticSubcStack {
                 XDG_DATA_HOME: this.dataDir,
             },
         });
-        this.recordPid("module", this.module.pid);
-        this.pipeToLog(this.module, this.moduleLogPath, "module");
-        this.module.on("exit", (code, signal) => {
+        this.module = module;
+        this.recordPid("module", module.pid);
+        this.pipeToLog(module, this.moduleLogPath, "module");
+        module.on("exit", (code, signal) => {
             try {
                 appendFileSync(
                     this.moduleLogPath,
@@ -433,8 +445,11 @@ export class HermeticSubcStack {
             } catch {
                 // A lifecycle diagnostic must not turn teardown into a failure.
             }
-            this.module = null;
-            this.forgetPid("module");
+            // A late event from an old process must not clear a replacement module.
+            if (this.module === module) {
+                this.module = null;
+                this.forgetPid("module");
+            }
         });
     }
 
@@ -481,7 +496,7 @@ export class HermeticSubcStack {
             // A fresh daemon can publish its connection file before the listener
             // is ready. Retry the external client once rather than treating that
             // startup race as a failed hermetic prerequisite.
-            this.killModule();
+            await this.killModuleAndWait();
             await sleep(200);
             await this.spawnModule();
         }
@@ -519,7 +534,7 @@ export class HermeticSubcStack {
      * re-acquires it (mirrors real_daemon.rs's restart step).
      */
     async restartModule(): Promise<void> {
-        this.killModule();
+        await this.killModuleAndWait();
         await sleep(200);
         await this.spawnModule();
         await this.waitForFreshModuleRegistration();
@@ -539,6 +554,17 @@ export class HermeticSubcStack {
         }
         this.module = null;
         this.forgetPid("module");
+    }
+
+    /** Wait until SIGKILL is observed before driving an outage or spawning a replacement. */
+    async killModuleAndWait(): Promise<void> {
+        const module = this.module;
+        this.killModule();
+        if (!module || module.exitCode !== null || module.signalCode !== null) return;
+        await pollUntil(() => module.exitCode !== null || module.signalCode !== null, {
+            timeoutMs: 5_000,
+            label: "module process exit after SIGKILL",
+        });
     }
 
     /** Stop the live module without killing it, so daemon timeout handling can be tested. */
@@ -626,18 +652,33 @@ export class HermeticSubcStack {
 
     /** Hard teardown. Safe to call more than once; never throws. */
     async stop(): Promise<void> {
-        this.killModule();
-        if (this.daemon && this.daemon.exitCode === null) {
-            this.daemon.kill("SIGKILL");
+        try {
+            await this.killModuleAndWait();
+        } catch {
+            // SIGKILL was sent; a delayed exit notification must not make teardown fail.
         }
-        this.daemon = null;
+        const daemon = this.daemon;
+        if (daemon && daemon.exitCode === null) daemon.kill("SIGKILL");
+        if (daemon && daemon.exitCode === null && daemon.signalCode === null) {
+            try {
+                await pollUntil(() => daemon.exitCode !== null || daemon.signalCode !== null, {
+                    timeoutMs: 5_000,
+                    label: "daemon process exit after SIGKILL",
+                });
+            } catch {
+                // SIGKILL was sent; a delayed exit notification must not make teardown fail.
+            }
+        }
+        if (this.daemon === daemon) this.daemon = null;
         this.forgetPid("daemon");
         rmSync(this.pidFilePath, { force: true });
-        // Give the OS a beat to reap the processes so a following suite's daemon
-        // can rebind the runtime dir cleanly.
-        await sleep(100);
     }
 }
+
+export const __hermeticSubcTest = {
+    isStaleRustE2ePidRecord,
+    stalePidAgeMs: RUST_E2E_STALE_PID_AGE_MS,
+};
 
 /** Remove ANSI/VT100 escape sequences so plain-text substring checks are reliable. */
 function stripAnsi(input: string): string {

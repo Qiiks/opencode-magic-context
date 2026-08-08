@@ -497,7 +497,7 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
+            "rationale": "park self-heal confirms external-module exit before driving the prolonged outage, then proves the recovered process resumes real transforms",
             "contract_refs": [
                 "RUST-E2E"
             ]
@@ -655,7 +655,7 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "FM-OC-1 real SIGKILL mid-session exercises byte-identical LKG continuation and loud failure reporting",
+            "rationale": "FM-OC-1 confirms the external module exited after SIGKILL before exercising byte-identical LKG continuation and loud failure reporting",
             "contract_refs": [
                 "FM-OC-1",
                 "RUST-E2E"
@@ -668,7 +668,7 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "FM-OC-2 real SIGKILL outage pins the shipped failure threshold and waits on the park token independently of added bust passes",
+            "rationale": "FM-OC-2 confirms the external module exited after SIGKILL, then pins the shipped failure threshold and park-transition token",
             "contract_refs": [
                 "FM-OC-2",
                 "RUST-E2E",
@@ -682,7 +682,7 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "FM-OC-3 real SIGKILL followed by module return pins bounded probe recovery from the observed restore boundary and monotonic row versions",
+            "rationale": "FM-OC-3 confirms the killed module exited before replacement, then pins bounded probe recovery and monotonic row versions",
             "contract_refs": [
                 "FM-OC-3",
                 "RUST-E2E",
@@ -696,7 +696,7 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "FM-OC-4 real SIGKILL at a provider-proven emergency limit waits on typed fail-closed refusal independently of added bust passes",
+            "rationale": "FM-OC-4 confirms external-module exit before asserting typed fail-closed refusal at the provider-proven emergency limit",
             "contract_refs": [
                 "FM-OC-4",
                 "RUST-E2E",
@@ -723,7 +723,7 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "FM-OC-6 real SIGKILL with emergency recovery armed waits on the refusal token before LKG admission independently of added bust passes",
+            "rationale": "FM-OC-6 confirms external-module exit, then asserts emergency refusal before LKG admission",
             "contract_refs": [
                 "FM-OC-6",
                 "RUST-E2E",

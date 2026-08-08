@@ -41,7 +41,7 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-h
                 .filter((version) => version > 0);
             const outagePasses = RUST_FAILURE_PARK_THRESHOLD * 2;
 
-            h.subc.killModule();
+            await h.subc.killModuleAndWait();
             await sendOutagePasses(h, sessionId, 4, outagePasses, "FM-OC-3 outage");
             await h.waitFor(
                 () =>
