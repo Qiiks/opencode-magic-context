@@ -17,12 +17,14 @@ import type { getOrCreateSessionMeta } from "../../features/magic-context/storag
 import {
     casChannel2NudgeState,
     clearEmergencyRecovery,
+    clearPersistedTodoSyntheticAnchor,
     getChannel2NudgeState,
     getEmergencyRecoveryArmedAt,
     getOverflowState,
     isEmergencyRecoveryArmed,
     isProviderOverflowReconfirmed,
     loadProtectedTailMeta,
+    setPersistedTodoSyntheticAnchor,
 } from "../../features/magic-context/storage-meta-persisted";
 import { writeRustTransformDecision } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
@@ -66,6 +68,7 @@ import type { RawMessageOrdinalAnchor } from "./read-session-raw";
 import type { TransformDeps } from "./transform";
 import { resolveHistoryBudgetTokens } from "./transform";
 import { loadContextUsage } from "./transform-context-state";
+import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
 import type { MessageLike } from "./transform-operations";
 import { runRustModePostprocess } from "./transform-postprocess-phase";
 import { logTransformTiming } from "./transform-stage-logger";
@@ -872,6 +875,56 @@ async function prepareRustMemoryAuthority(args: {
     await reconcileAuthorityProject({ db, projectPath, module: authorityModule });
     state.memoryAuthorityReady = true;
     args.onProjectPrepared?.(projectPath);
+}
+
+const TODO_HEAD_ANCHOR_ID = "__magic_context_todo_head__";
+
+function syntheticTodoAnchorFromNative(messages: readonly unknown[]): {
+    callId: string;
+    messageId: string;
+    stateJson: string;
+} | null {
+    for (let index = 0; index < messages.length; index += 1) {
+        const message = messages[index];
+        if (!isRecord(message) || !Array.isArray(message.parts)) continue;
+        const part = message.parts.find(
+            (candidate) => isRecord(candidate) && candidate.syntheticTodoMarker === true,
+        );
+        if (!isRecord(part) || typeof part.callID !== "string") continue;
+        const state = isRecord(part.state) ? part.state : undefined;
+        const input = state && isRecord(state.input) ? state.input : undefined;
+        const stateJson = normalizeTodoStateJson(input?.todos);
+        if (stateJson === null || computeSyntheticCallId(stateJson) !== part.callID) continue;
+
+        const previous = messages[index - 1];
+        const previousInfo = isRecord(previous) && isRecord(previous.info) ? previous.info : undefined;
+        const messageId =
+            previousInfo && typeof previousInfo.id === "string" && previousInfo.id.length > 0
+                ? previousInfo.id
+                : TODO_HEAD_ANCHOR_ID;
+        return { callId: part.callID, messageId, stateJson };
+    }
+    return null;
+}
+
+function mirrorRustSyntheticTodoAnchor(args: {
+    db: TransformDeps["db"];
+    sessionId: string;
+    messages: readonly unknown[];
+    cacheBustingPass: boolean;
+}): void {
+    const anchor = syntheticTodoAnchorFromNative(args.messages);
+    if (anchor) {
+        setPersistedTodoSyntheticAnchor(
+            args.db,
+            args.sessionId,
+            anchor.callId,
+            anchor.messageId,
+            anchor.stateJson,
+        );
+    } else if (args.cacheBustingPass) {
+        clearPersistedTodoSyntheticAnchor(args.db, args.sessionId);
+    }
 }
 
 /** Single response-field seam for the parallel module encode-back contract. */
@@ -1928,6 +1981,20 @@ export function createRustModeTransform(
                     });
                 }
             };
+            const explicitDecision =
+                typeof response.decision === "string" ||
+                typeof response.action === "string" ||
+                typeof response.cache_bust === "boolean";
+            const decisionUpper = decision.toUpperCase();
+            const cacheBustingPass =
+                response.cache_bust === true ||
+                decisionUpper === "HARD" ||
+                decisionUpper === "MIGRATE_HARD" ||
+                decisionUpper === "EXECUTE" ||
+                // SOFT re-renders m1 (delta folds, coverage folds): the served bytes changed,
+                // so the previous last-known-good (LKG) snapshot is already stale.
+                decisionUpper === "SOFT" ||
+                !explicitDecision;
             let appliedMessages: unknown[];
             const applyStartedAt = performance.now();
             try {
@@ -1946,6 +2013,14 @@ export function createRustModeTransform(
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {
                     assertNativeBoundary(appliedMessages, sessionId, boundaryId);
                 }
+                if (!sessionMeta.isSubagent) {
+                    mirrorRustSyntheticTodoAnchor({
+                        db: deps.db,
+                        sessionId,
+                        messages: appliedMessages,
+                        cacheBustingPass,
+                    });
+                }
                 if (passInputs.emergency_recovery_armed === true) {
                     servedFinalWireEstimate = estimateFinalWireInputTokens({
                         messages: appliedMessages as MessageLike[],
@@ -1957,23 +2032,6 @@ export function createRustModeTransform(
                 }
                 logStage(sessionId, "apply", applyStartedAt, timings);
                 const lkgSnapshotStartedAt = performance.now();
-                const explicitDecision =
-                    typeof response.decision === "string" ||
-                    typeof response.action === "string" ||
-                    typeof response.cache_bust === "boolean";
-                const decisionUpper = decision.toUpperCase();
-                const cacheBustingPass =
-                    response.cache_bust === true ||
-                    decisionUpper === "HARD" ||
-                    decisionUpper === "MIGRATE_HARD" ||
-                    decisionUpper === "EXECUTE" ||
-                    // SOFT re-renders m1 (delta folds, coverage folds): the served
-                    // bytes changed, so the previous LKG snapshot is already stale.
-                    // Omitting SOFT here left the slot holding pre-fold bytes that
-                    // failed anchor validation on the next failure — and the miss
-                    // fell through to a 965K-token raw serve on a live session.
-                    decisionUpper === "SOFT" ||
-                    !explicitDecision;
                 // Slots are process-memory: after a serve restart every session has
                 // NO snapshot until its next busting pass, and any transport failure
                 // in that window falls through LKG to a raw full-array serve. The

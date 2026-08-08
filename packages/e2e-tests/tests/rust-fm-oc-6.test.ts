@@ -49,7 +49,7 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-6: emergency arm
                 };
             });
 
-            h.subc.killModule();
+            await h.subc.killModuleAndWait();
             await h.subc.waitForModuleDeath();
             try {
                 await h.sendPrompt(sessionId, `FM-OC-6 arm after SIGKILL: ${h.ballast(400)}`);
@@ -80,6 +80,13 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-6: emergency arm
                 // OpenCode may surface the refusal as a resolved session error.
             }
             await h.waitForRustPasses(passCountBeforeRefusal + 1);
+            await h.waitFor(
+                () =>
+                    sessionLogLines(h, sessionId)
+                        .slice(linesBeforeRefusal.length)
+                        .find((line) => line.includes("mc_rust_emergency_refusal before_lkg")),
+                { label: "FM-OC-6 emergency refusal before LKG" },
+            );
 
             expect(RUST_EMERGENCY_WALL_PCT).toBe(95);
             expect(h.mainRequests().length).toBe(requestCountBeforeRefusal);

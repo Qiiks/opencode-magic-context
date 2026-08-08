@@ -479,9 +479,11 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
+            "rationale": "large provider-visible tail remains intact across recut-era one-page reuse and bounded multi-page retransmission",
             "contract_refs": [
-                "RUST-E2E"
+                "RUST-E2E",
+                "BOUNDARY-DIVERGENCE-RECUT",
+                "RUST-SYNTHETIC-TODO-ANCHOR-MIRROR-BACK"
             ]
         },
         {
@@ -491,7 +493,7 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
+            "rationale": "park self-heal confirms external-module exit before driving the prolonged outage, then proves the recovered process resumes real transforms",
             "contract_refs": [
                 "RUST-E2E"
             ]
@@ -643,14 +645,14 @@
         },
         {
             "path": "tests/todo-synthesis.test.ts",
-            "tier": "ts-only",
+            "tier": "both-modes",
             "invocation": {
                 "ts": true,
-                "rust": false
+                "rust": true
             },
-            "rationale": "synthetic todowrite capture/replay is a shared behavioral contract; rust invocation is OFF pending the real parity defect adjudicated in parity-findings-s2.md (Todo 1-5: the module never emits the synthetic pair on cache-busting passes; assertions preserved red in the suite, re-enable rust:true when the state-sync/render handoff fix lands)",
+            "rationale": "synthetic todowrite state-sync, bust-time injection, anchor persistence, and defer replay are shared cache contracts",
             "contract_refs": [
-                "parity-findings-s2.md#todo-1",
+                "S2-MIGRATION",
                 "ARCHITECTURE.md#synthetic-todowrite"
             ]
         },
@@ -661,7 +663,7 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "FM-OC-1 real SIGKILL mid-session exercises byte-identical LKG continuation and loud failure reporting",
+            "rationale": "FM-OC-1 confirms the external module exited after SIGKILL before exercising byte-identical LKG continuation and loud failure reporting",
             "contract_refs": [
                 "FM-OC-1",
                 "RUST-E2E"
@@ -674,10 +676,11 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "FM-OC-2 real SIGKILL outage pins the shipped failure threshold and park-transition observability",
+            "rationale": "FM-OC-2 confirms the external module exited after SIGKILL, then pins the shipped failure threshold and park-transition token",
             "contract_refs": [
                 "FM-OC-2",
-                "RUST-E2E"
+                "RUST-E2E",
+                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
             ]
         },
         {
@@ -687,10 +690,11 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "FM-OC-3 real SIGKILL followed by module return pins bounded probe recovery and monotonic row versions",
+            "rationale": "FM-OC-3 confirms the killed module exited before replacement, then pins bounded probe recovery and monotonic row versions",
             "contract_refs": [
                 "FM-OC-3",
-                "RUST-E2E"
+                "RUST-E2E",
+                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
             ]
         },
         {
@@ -700,10 +704,11 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "FM-OC-4 real SIGKILL at a provider-proven emergency limit pins typed fail-closed refusal",
+            "rationale": "FM-OC-4 confirms external-module exit before asserting typed fail-closed refusal at the provider-proven emergency limit",
             "contract_refs": [
                 "FM-OC-4",
-                "RUST-E2E"
+                "RUST-E2E",
+                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
             ]
         },
         {
@@ -726,10 +731,11 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "FM-OC-6 real SIGKILL with emergency recovery armed pins refusal before LKG admission",
+            "rationale": "FM-OC-6 confirms external-module exit, then asserts emergency refusal before LKG admission",
             "contract_refs": [
                 "FM-OC-6",
-                "RUST-E2E"
+                "RUST-E2E",
+                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
             ]
         }
     ]

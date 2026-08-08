@@ -670,6 +670,36 @@ describe("memory authority protocol", () => {
         expect(database.prepare("SELECT content FROM memories WHERE id = 1").get()).toEqual({
             content: "new",
         });
+        applyMirrorPage({
+            db: database,
+            page: page(2, 3, [
+                {
+                    feed_seq: 3,
+                    domain: "memories",
+                    op: "update",
+                    module_row_id: 1,
+                    full_row_snapshot: snapshot(1, "new", "h2", {
+                        mural_cue: "cue → anchor",
+                        mural_cue_hash: "cue-content-sha",
+                        mural_cue_at: 42,
+                        mural_cue_rejection_count: 0,
+                    }),
+                    content_hash: "h2",
+                },
+            ]),
+        });
+        expect(
+            database
+                .prepare(
+                    "SELECT mural_cue, mural_cue_hash, mural_cue_at, mural_cue_rejection_count FROM memories WHERE id = 1",
+                )
+                .get(),
+        ).toEqual({
+            mural_cue: "cue → anchor",
+            mural_cue_hash: "cue-content-sha",
+            mural_cue_at: 42,
+            mural_cue_rejection_count: 0,
+        });
         expect(
             database
                 .prepare("SELECT COUNT(*) AS count FROM memory_embeddings WHERE memory_id = 1")
@@ -684,9 +714,9 @@ describe("memory authority protocol", () => {
         });
         applyMirrorPage({
             db: database,
-            page: page(2, 3, [
+            page: page(3, 4, [
                 {
-                    feed_seq: 3,
+                    feed_seq: 4,
                     domain: "memories",
                     op: "tombstone",
                     module_row_id: 1,

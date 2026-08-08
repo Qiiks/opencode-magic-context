@@ -567,10 +567,56 @@ fn encode_with_meta(
         .unwrap_or_default();
     let matched_metas = match_block_metas(&msg.content, &meta.blocks, block_matches_meta);
 
-    for (block, block_meta) in msg.content.iter().zip(&matched_metas.by_block) {
+    let mut block_index = 0;
+    while block_index < msg.content.len() {
+        let block = &msg.content[block_index];
+        let block_meta = matched_metas.by_block[block_index];
+
+        if let (
+            CkKind::ToolCall { id, .. },
+            Some(
+                result @ CkWireBlock {
+                    kind: CkKind::ToolResult { id: result_id, .. },
+                    ..
+                },
+            ),
+        ) = (&block.kind, msg.content.get(block_index + 1))
+        {
+            if id == result_id {
+                let result_meta = matched_metas.by_block[block_index + 1];
+                let call_native_index = block_meta.and_then(|meta| meta.native_index);
+                let result_native_index = result_meta.and_then(|meta| meta.native_index);
+                let shared_native_index = match (call_native_index, result_native_index) {
+                    (Some(call), Some(result)) if call == result => Some(call),
+                    (Some(call), None) => Some(call),
+                    (None, Some(result)) => Some(result),
+                    _ => None,
+                };
+
+                if let Some(part) = shared_native_index.and_then(|index| parts.get_mut(index)) {
+                    for (arc_block, arc_meta) in [(block, block_meta), (result, result_meta)] {
+                        if !arc_meta.is_some_and(|meta| block_is_unchanged(arc_block, meta)) {
+                            update_part_from_block(part, arc_block);
+                        }
+                    }
+                    block_index += 2;
+                    continue;
+                }
+                if call_native_index.is_none() && result_native_index.is_none() {
+                    // OpenCode stores a completed invocation as one part, while CK expands that
+                    // part into adjacent call and result blocks. Recombine an unmatched pair as
+                    // one part instead of independently emitting the same callID twice.
+                    parts.push(render_tool_pair_as_part(block, result));
+                    block_index += 2;
+                    continue;
+                }
+            }
+        }
+
         if let Some(part_index) = block_meta.and_then(|block_meta| block_meta.native_index) {
             if let Some(part) = parts.get_mut(part_index) {
                 if block_meta.is_some_and(|meta| block_is_unchanged(block, meta)) {
+                    block_index += 1;
                     continue;
                 }
                 // Reasoning parts may contain provider signatures, so changing their bytes could
@@ -582,10 +628,12 @@ fn encode_with_meta(
                 ) {
                     update_part_from_block(part, block);
                 }
+                block_index += 1;
                 continue;
             }
         }
         parts.push(render_block_as_part(block));
+        block_index += 1;
     }
 
     parts = matched_metas.remove_unretained_native_parts(parts);

@@ -456,6 +456,37 @@ jobs:
           echo "Using $notes_file as the release body."
           wc -l "$notes_file"
 
+      - name: Unwrap hard-wrapped release notes
+        # GitHub release bodies render single newlines as hard line breaks,
+        # so editor-wrapped source markdown displays as ragged short lines.
+        # Join continuation lines inside paragraphs and list items; keep
+        # headings, blank lines, and code fences verbatim.
+        run: |
+          python3 - "$GITHUB_REF_NAME" <<'PY'
+          import re, sys
+          path = f".alfonso/release-notes/{sys.argv[1]}.md"
+          src = open(path).read()
+          out, in_fence = [], False
+          for line in src.splitlines():
+              s = line.rstrip()
+              if s.lstrip().startswith("```"):
+                  in_fence = not in_fence
+                  out.append(s)
+                  continue
+              structural = (
+                  in_fence
+                  or not s.strip()
+                  or s.startswith("#")
+                  or re.match(r"^\s*([-*+]|\d+\.)\s", s)
+              )
+              if structural or not out or not out[-1].strip() \
+                      or out[-1].startswith("#") or out[-1].lstrip().startswith("```"):
+                  out.append(s)
+              else:
+                  out[-1] = out[-1].rstrip() + " " + s.strip()
+          open(path, "w").write("\n".join(out) + "\n")
+          PY
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:

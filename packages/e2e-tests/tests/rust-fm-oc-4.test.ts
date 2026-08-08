@@ -49,7 +49,7 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-4: emergency ref
                 };
             });
 
-            h.subc.killModule();
+            await h.subc.killModuleAndWait();
             await h.subc.waitForModuleDeath();
             try {
                 await h.sendPrompt(sessionId, `FM-OC-4 continue after SIGKILL: ${h.ballast(400)}`);
@@ -82,6 +82,13 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-4: emergency ref
                 // OpenCode may surface the refusal as a resolved session error.
             }
             await h.waitForRustPasses(passCountBeforeRefusal + 1);
+            await h.waitFor(
+                () =>
+                    sessionLogLines(h, sessionId).find((line) =>
+                        line.includes("mc_rust_emergency_refusal before_lkg"),
+                    ),
+                { label: "FM-OC-4 emergency refusal" },
+            );
 
             expect(RUST_EMERGENCY_WALL_PCT).toBe(95);
             expect(h.mainRequests().length).toBe(requestCountBeforeRefusal);

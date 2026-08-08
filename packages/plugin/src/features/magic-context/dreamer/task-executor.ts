@@ -349,13 +349,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     recordRun("completed", null);
                     return { status: "completed" };
                 }
-                if (moduleRoute) {
-                    const reason =
-                        "compress-cues parked: MODULE memory authority has no cue write facade";
-                    log(`[dreamer] compress-cues: skipped (${reason})`);
-                    recordRun("failed", reason);
-                    return { status: "failed", transient: true, error: reason };
-                }
                 // Model ladder mirrors classify: task override → mural
                 // model (the cue COMPRESSOR model) → dreamer model → session model.
                 const result = await runCompressCues({
@@ -369,6 +362,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     deadline,
                     model: config.model ?? deps.mural.model ?? deps.dreamerModel,
                     fallbackModels: config.fallbackModels,
+                    moduleRoute,
                     onProgress: (processed) => reportProgress(processed),
                 });
                 log(

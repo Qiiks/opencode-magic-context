@@ -1329,6 +1329,14 @@ struct ModuleMemoryWire {
     merged_from: Option<String>,
     #[serde(default)]
     metadata_json: Option<String>,
+    #[serde(default)]
+    mural_cue: Option<String>,
+    #[serde(default)]
+    mural_cue_hash: Option<String>,
+    #[serde(default)]
+    mural_cue_at: Option<i64>,
+    #[serde(default)]
+    mural_cue_rejection_count: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1432,6 +1440,10 @@ impl ModuleMemoryWire {
             superseded_by_memory_id: self.superseded_by_memory_id,
             merged_from: self.merged_from,
             metadata_json: self.metadata_json,
+            mural_cue: self.mural_cue,
+            mural_cue_hash: self.mural_cue_hash,
+            mural_cue_at: self.mural_cue_at,
+            mural_cue_rejection_count: self.mural_cue_rejection_count,
         }
     }
 }
@@ -7604,6 +7616,107 @@ impl McHandler {
         }
     }
 
+    async fn handle_memory_set_mural_cue(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let Some(args) = facade_arguments(request, &["rows"]) else {
+            return invalid_params_error("memory.set_mural_cue requires arguments");
+        };
+        let Some(memory_project) = non_empty_string_arg(&args, "memory_project") else {
+            return invalid_params_error("memory.set_mural_cue requires memory_project");
+        };
+        if let Err(outcome) = self.bind_facade_route_for_write(channel, &args, "memories") {
+            return outcome;
+        }
+        let binding = match self.facade_binding(channel) {
+            Ok(binding) => binding,
+            Err(_) => return session_unresolved_error(),
+        };
+        let route_root = binding.project_root.to_string_lossy().to_string();
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        let command_id = args
+            .get("command_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        if let Some(command_id) = command_id {
+            if let Some(replayed) =
+                replayed_memory_apply_command(store, &binding.session, "set_mural_cue", command_id)
+            {
+                return replayed;
+            }
+        }
+        let Some(context_store_uuid) = args.get("context_store_uuid").and_then(Value::as_str)
+        else {
+            return invalid_params_error("memory.set_mural_cue requires context_store_uuid");
+        };
+        let Some(authority_generation) = args.get("authority_generation").and_then(Value::as_u64)
+        else {
+            return invalid_params_error("memory.set_mural_cue requires authority_generation");
+        };
+        let Some(rows) = args.get("rows").and_then(Value::as_array) else {
+            return invalid_params_error("memory.set_mural_cue requires rows");
+        };
+        let mut updates = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some(row) = row.as_object() else {
+                return invalid_params_error("mural cue rows must be objects");
+            };
+            let Some(memory_id) = row.get("memory_id").and_then(Value::as_i64) else {
+                return invalid_params_error("mural cue row requires memory_id");
+            };
+            let Some(hash) = row.get("content_hash_at_prompt").and_then(Value::as_str) else {
+                return invalid_params_error("mural cue row requires content_hash_at_prompt");
+            };
+            let Some(rejection_count) = row.get("rejection_count").and_then(Value::as_i64) else {
+                return invalid_params_error("mural cue row requires rejection_count");
+            };
+            let cue = match row.get("cue") {
+                Some(Value::Null) | None => None,
+                Some(Value::String(cue)) => Some(cue.to_string()),
+                Some(_) => {
+                    return invalid_params_error("mural cue row cue must be a string or null")
+                }
+            };
+            updates.push(mc_store::MuralCueUpdate {
+                memory_id,
+                content_hash_at_prompt: hash.to_string(),
+                cue,
+                rejection_count,
+            });
+        }
+        let now = now_ms();
+        dream_apply_command_outcome(
+            store.with_facade_command(
+                &route_root,
+                memory_project,
+                "memories",
+                &binding.session,
+                "memory",
+                "set_mural_cue",
+                command_id,
+                |tx| {
+                    let result = tx.set_memory_mural_cue(
+                        context_store_uuid,
+                        memory_project,
+                        authority_generation,
+                        &updates,
+                        now,
+                    )?;
+                    serde_json::to_vec(&json!({
+                        "ok": true,
+                        "accepted": result.accepted,
+                        "rejected": result.rejected.iter().map(|row| json!({
+                            "memory_id": row.memory_id,
+                            "reason": row.reason,
+                        })).collect::<Vec<_>>(),
+                    }))
+                    .map_err(|error| error.to_string())
+                },
+            ),
+            "mural_cue_apply_failed",
+        )
+    }
+
     async fn handle_memory_set_verification(
         &self,
         channel: u16,
@@ -7822,6 +7935,7 @@ impl McHandler {
                 self.handle_memory_set_classification(channel, &request)
                     .await
             }
+            "memory.set_mural_cue" => self.handle_memory_set_mural_cue(channel, &request).await,
             "memory.set_verification" => {
                 self.handle_memory_set_verification(channel, &request).await
             }
