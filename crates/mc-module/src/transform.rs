@@ -13536,6 +13536,163 @@ mod tests {
     }
 
     #[test]
+    fn astro_model_switch_keeps_reduced_native_tool_arcs_single_part() {
+        let native_tool_message = json!({
+            "absolute_ordinal": 2_414,
+            "info": {
+                "id": "m2414",
+                "role": "assistant",
+                "providerField": "preserve-assistant-envelope"
+            },
+            "parts": [
+                {
+                    "type": "tool",
+                    "tool": "read",
+                    "callID": "astro-call-a",
+                    "providerField": "preserve-call-a",
+                    "state": {
+                        "status": "completed",
+                        "input": { "path": "a.txt", "detail": "x".repeat(600) },
+                        "output": "A".repeat(2_000)
+                    }
+                },
+                {
+                    "type": "tool",
+                    "tool": "read",
+                    "callID": "astro-call-b",
+                    "providerField": "preserve-call-b",
+                    "state": {
+                        "status": "completed",
+                        "input": { "path": "b.txt", "detail": "y".repeat(600) },
+                        "output": "B".repeat(2_000)
+                    }
+                }
+            ]
+        });
+        let decoded = crate::codec::decode_opencode(&[native_tool_message.clone()]);
+        let mut tool_message = decoded.messages[0].clone();
+        // The live CK ingress is projected by the host independently of the native sidecar, so it
+        // does not carry the Rust decoder's private block-origin stamps.
+        tool_message.ck.content = tool_message
+            .ck
+            .content
+            .into_iter()
+            .map(|block| ck_wire::CkWireBlock::bare(block.kind))
+            .collect();
+        tool_message.ck.mark_modified();
+
+        let mut request = astro_request("astro-native-tools", 2_416);
+        request.serializer_profile = "opencode-aisdk".to_string();
+        request.provider_id = Some("openai".to_string());
+        request.model_key = Some("openai/gpt-5.6-sol".to_string());
+        request.serve_native = true;
+        request.native_messages = Some(vec![native_tool_message.clone()]);
+        *request
+            .messages
+            .iter_mut()
+            .find(|message| message.mid == "m2414")
+            .expect("ASTRO tail includes m2414") = tool_message;
+
+        let unchanged = crate::codec::encode_opencode_with_session(
+            &[request
+                .messages
+                .iter()
+                .find(|message| message.mid == "m2414")
+                .unwrap()
+                .ck
+                .clone()],
+            &decoded.sidecar,
+            Some(&request.session_id),
+            None,
+        );
+        assert_eq!(
+            serde_json::to_vec(&unchanged).unwrap(),
+            serde_json::to_vec(&vec![native_tool_message.clone()]).unwrap(),
+            "an unreduced host-projected tool message must remain byte-identical"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let request = seed_astro_divergence_from_request(&store, request);
+        let healed = run(
+            &store,
+            &request,
+            &with_reductions(vec![
+                reduce(
+                    "m2414#0",
+                    "skeleton",
+                    r#"{"detail":"xxxxx…","path":"a.txt"}"#,
+                ),
+                reduce("m2414#1", "drop", "[dropped]"),
+                reduce(
+                    "m2414#2",
+                    "skeleton",
+                    r#"{"detail":"yyyyy…","path":"b.txt"}"#,
+                ),
+                reduce("m2414#3", "drop", "[dropped]"),
+            ]),
+        );
+        assert_eq!(healed.action, "HARD");
+        assert_eq!(
+            healed.materialize_reason.as_deref(),
+            Some("boundary_divergence_recut")
+        );
+        assert_eq!(message_index(&healed, "m2414"), 15);
+
+        let mut anthropic_request = request.clone();
+        anthropic_request.provider_id = Some("anthropic".to_string());
+        anthropic_request.model_key = Some("anthropic/claude-opus-5".to_string());
+        let switched = run(&store, &anthropic_request, &spine());
+        assert_eq!(switched.action, "HARD");
+        assert_eq!(switched.materialize_reason.as_deref(), Some("epoch_change"));
+        assert_eq!(message_index(&switched, "m2414"), 15);
+
+        let served = switched
+            .messages()
+            .iter()
+            .map(|message| (**message).clone())
+            .collect::<Vec<_>>();
+        let native = crate::codec::encode_opencode_with_session(
+            &served,
+            &decoded.sidecar,
+            Some(&anthropic_request.session_id),
+            None,
+        );
+        for message in &native {
+            let tool_ids = message["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|part| part["type"] == "tool")
+                .map(|part| part["callID"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            let unique_ids = tool_ids.iter().copied().collect::<HashSet<_>>();
+            assert_eq!(
+                tool_ids.len(),
+                unique_ids.len(),
+                "each native assistant message must own unique Anthropic tool_use ids: {tool_ids:?}"
+            );
+        }
+        let assistant = native
+            .iter()
+            .find(|message| message["info"]["id"] == "m2414")
+            .expect("served native ASTRO assistant");
+        let tool_ids = assistant["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|part| part["type"] == "tool")
+            .map(|part| part["callID"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(tool_ids, vec!["astro-call-a", "astro-call-b"]);
+        assert!(assistant["parts"].as_array().unwrap().iter().all(|part| {
+            part["state"]["status"] == "completed"
+                && part["state"]["input"]["reduced"] == true
+                && part["state"]["output"] == "[dropped]"
+        }));
+    }
+
+    #[test]
     fn boundary_divergence_recut_retries_after_interleaved_historian_publish() {
         use std::cell::Cell;
 
