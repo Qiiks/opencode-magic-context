@@ -3,11 +3,11 @@
 - **recordId:** `prompt-surface-checklist-r1`
 - **artifactId:** `prompt-surface-load-bearing-checklist`
 - **artifactRevisionOrDigest:** `sha256:e60764ee29bfb73b27d3cf891faa24bc97694834381fda5e24b8be663bd69e78`
-- **decision:** `PENDING-RATIFICATION — proposed ACCEPT for checklist completeness and applicability map`
+- **decision:** `ACCEPT`
 - **authorizedDecisionOwner:** `Ufuk`
-- **ratificationTimestamp:** `PENDING-RATIFICATION`
+- **ratificationTimestamp:** `2026-08-08T18:44:57Z`
 - **scope:** `All 49 stable rules extracted from full guidance and ctx_* tool descriptions, across the 11 guidance/tool composition variants in checklist.json, including the SUBAGENT_REDUCE_INTRO dropped-sentinel asymmetry.`
-- **status:** `PENDING-RATIFICATION`
+- **status:** `RATIFIED`
 
 ## Evidence reviewed
 

@@ -3,11 +3,11 @@
 - **recordId:** `prompt-surface-budget-r1`
 - **artifactId:** `prompt-surface-budget`
 - **artifactRevisionOrDigest:** `sha256:77082b5ff1546f45160b08e896e6c1f434654ba4f52b0806bd20b0b24cd67213`
-- **decision:** `PENDING-RATIFICATION — proposed ACCEPT for floor(0.50 × mutable-prose baseline)`
+- **decision:** `ACCEPT — floor(0.50 × mutable-prose baseline), ceiling 1825`
 - **authorizedDecisionOwner:** `Ufuk`
-- **ratificationTimestamp:** `PENDING-RATIFICATION`
+- **ratificationTimestamp:** `2026-08-08T18:44:57Z`
 - **scope:** `The primary built-in full guidance variant primary-full-reduce-memory-on and its active ctx_* descriptions; serialized parameter schemas are reported separately; adjuncts and USER overrides are excluded.`
-- **status:** `PENDING-RATIFICATION`
+- **status:** `RATIFIED`
 
 ## Proposed policy and evidence
 
