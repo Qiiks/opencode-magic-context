@@ -7,6 +7,7 @@ import type {
     AGENTIC_DREAM_TASKS,
     DreamTaskName,
 } from "../../features/magic-context/dreamer/task-registry";
+import { isValidPromptSurfaceModelKey } from "../../shared/prompt-surface";
 import { AgentOverrideConfigSchema } from "./agent-overrides";
 
 export const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE = 65;
@@ -48,6 +49,60 @@ export const PiConfigSchema = z
     })
     .optional();
 export type PiConfig = NonNullable<z.infer<typeof PiConfigSchema>>;
+
+/**
+ * Route the built-in prompt surface without changing guidance or tool registration.
+ * Project config can choose preset routing; only user config can provide override text.
+ */
+export const PromptSurfacePresetSchema = z.enum(["full", "light"]);
+export type { PromptSurfacePreset } from "../../shared/prompt-surface";
+
+const PromptSurfaceModelKeySchema = z.string().refine(isValidPromptSurfaceModelKey, {
+    message:
+        "Use a non-empty provider/model key or the literal provider/* wildcard; model IDs may contain additional slashes and matching is case-sensitive.",
+});
+// Tool-description keys must be non-empty IDs; harness-specific known-tool
+// validation can run when a user override is applied.
+const PromptSurfaceToolKeySchema = z.string().refine((value) => value.trim().length > 0, {
+    message: "tool description keys must not be empty or whitespace-only",
+});
+
+export const PromptSurfaceConfigSchema = z
+    .object({
+        default: PromptSurfacePresetSchema.default("full").describe(
+            'Fallback prompt-surface preset ("full" or "light").',
+        ),
+        models: z
+            .record(PromptSurfaceModelKeySchema, PromptSurfacePresetSchema)
+            .optional()
+            .describe(
+                "Literal per-model routing. Keys are provider/model or provider/*; matching is case-sensitive and preserves additional slashes in model IDs.",
+            ),
+        guidance_override_path: z
+            .string()
+            .refine((value) => value.trim().length > 0, {
+                message: "guidance_override_path must not be empty or whitespace-only",
+            })
+            .optional()
+            .describe(
+                "USER-LEVEL ONLY path to a complete primary guidance section. Relative paths resolve from the user config file.",
+            ),
+        tool_descriptions: z
+            .record(
+                PromptSurfaceToolKeySchema,
+                z.string().refine((value) => value.trim().length > 0, {
+                    message: "tool description values must not be empty or whitespace-only",
+                }),
+            )
+            .optional()
+            .describe(
+                "USER-LEVEL ONLY top-level description overrides keyed by ctx_* tool ID; parameter schemas and descriptions are unchanged.",
+            ),
+    })
+    .describe(
+        "Prompt-surface preset routing. Project config may select default/models, while guidance_override_path and tool_descriptions are user-level only.",
+    );
+export type PromptSurfaceConfig = z.infer<typeof PromptSurfaceConfigSchema>;
 
 /** A 5-field cron expression, or "" to disable the task. */
 const CronScheduleSchema = z
@@ -416,6 +471,8 @@ export interface MagicContextConfig {
     historian?: HistorianConfig;
     dreamer?: DreamerConfig;
     cache_ttl: string | { default: string; [modelKey: string]: string };
+    /** Preset routing for guidance and provider-visible prompt surfaces. */
+    prompt_surface: PromptSurfaceConfig;
     /** User-only output-token reservation override. Zero disables reservation. */
     output_reserve?: number | { default: number; [modelKey: string]: number };
     /** TUI toast lifetime in milliseconds for Magic Context notifications. Default: 5000. */
@@ -637,6 +694,9 @@ export const MagicContextConfigSchema = z
             .describe(
                 'Cache TTL: string (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "model-id": "10m" }). Set to "never" for lanes kept warm by an external keepwarm proxy — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time.',
             ),
+        prompt_surface: PromptSurfaceConfigSchema.default({ default: "full" }).describe(
+            "Prompt-surface presets: default is full; models use the literal provider/model or provider/* routing grammar. Guidance and tool-description overrides are user-level only.",
+        ),
         output_reserve: z
             .union([
                 z.number().min(0),

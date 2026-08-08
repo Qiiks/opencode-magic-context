@@ -16,6 +16,7 @@ import { DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE } from "./schema/magic-context";
 /** Hidden agents that run with elevated/autonomous capability. */
 const HIDDEN_AGENT_KEYS = ["historian", "dreamer", "sidekick"] as const;
 const HISTORIAN_USER_ONLY_FIELDS = ["model", "fallback_models"] as const;
+const PROMPT_SURFACE_USER_ONLY_FIELDS = ["guidance_override_path", "tool_descriptions"] as const;
 
 /**
  * Fields on a hidden-agent block that constitute a privilege-escalation /
@@ -217,6 +218,9 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *    a cloned repo cannot choose a model that sends project memory to a provider.
  *  - `pi.subagent_extensions` — a cloned repo must not choose which extensions
  *    the user's Pi child processes load.
+ *  - `prompt_surface.guidance_override_path` / `tool_descriptions` — a repository
+ *    may select a reviewed preset, but must not inject arbitrary guidance or tool
+ *    description text into the user's provider-visible prompt.
  *  - hidden-agent `prompt`/`permission`/`tools` — a repo must not reprogram or
  *    re-permission the historian/dreamer/sidekick.
  */
@@ -288,6 +292,25 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         warnings.push(
             "Ignoring storage.enforce_private_permissions from project config (security: only user-level config may opt into externally managed shared storage permissions).",
         );
+    }
+
+    // Repositories may select preset routing, but project settings cannot add
+    // guidance or tool-description text to the provider-visible prompt; those
+    // user-only fields are removed before project settings are merged.
+    const promptSurface = projectRaw.prompt_surface;
+    if (isPlainObject(promptSurface)) {
+        const removed: string[] = [];
+        for (const field of PROMPT_SURFACE_USER_ONLY_FIELDS) {
+            if (field in promptSurface) {
+                delete promptSurface[field];
+                removed.push(field);
+            }
+        }
+        if (removed.length > 0) {
+            warnings.push(
+                `Ignoring prompt_surface.${removed.join("/")} from project config (security: repositories may select prompt presets but only user config may provide guidance or tool-description text).`,
+            );
+        }
     }
 
     const pi = projectRaw.pi;

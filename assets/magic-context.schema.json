@@ -1104,6 +1104,52 @@
         }
       ]
     },
+    "prompt_surface": {
+      "default": {
+        "default": "full"
+      },
+      "description": "Prompt-surface presets: default is full; models use the literal provider/model or provider/* routing grammar. Guidance and tool-description overrides are user-level only.",
+      "type": "object",
+      "properties": {
+        "default": {
+          "default": "full",
+          "description": "Fallback prompt-surface preset (\"full\" or \"light\").",
+          "type": "string",
+          "enum": [
+            "full",
+            "light"
+          ]
+        },
+        "models": {
+          "description": "Literal per-model routing. Keys are provider/model or provider/*; matching is case-sensitive and preserves additional slashes in model IDs.",
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "enum": [
+              "full",
+              "light"
+            ]
+          }
+        },
+        "guidance_override_path": {
+          "description": "USER-LEVEL ONLY path to a complete primary guidance section. Relative paths resolve from the user config file.",
+          "type": "string"
+        },
+        "tool_descriptions": {
+          "description": "USER-LEVEL ONLY top-level description overrides keyed by ctx_* tool ID; parameter schemas and descriptions are unchanged.",
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
     "output_reserve": {
       "description": "User-only output-token reservation override. Number or per-model object ({ default: 16384, \"provider/model\": 8192 }); 0 disables reservation. When unset, Magic Context reserves the catalog output limit (capped at 25% of context) for shared-window providers and keeps proven separate-quota Google/Gemini windows unchanged.",
       "anyOf": [

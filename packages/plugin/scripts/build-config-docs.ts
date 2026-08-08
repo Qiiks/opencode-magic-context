@@ -118,6 +118,11 @@ const SECTION_ORDER: Array<{ keys: string[]; title: string; intro: string }> = [
         intro: "Global on/off switches for the plugin and its agent-facing surface.",
     },
     {
+        keys: ["prompt_surface"],
+        title: "Prompt surface",
+        intro: "Select the full or light built-in prompt preset. Model routes use the same progressive lookup walk as `cache_ttl`, with literal case-sensitive `provider/model` keys and the `provider/*` wildcard; guidance and tool-description overrides are user-level only.",
+    },
+    {
         keys: [
             "cache_ttl",
             "output_reserve",
@@ -239,7 +244,7 @@ description: Every magic-context.jsonc key, with types, defaults, and where to p
     packages/plugin/src/config/schema/magic-context.ts; regenerate with
     \`bun packages/plugin/scripts/build-config-docs.ts\`. -->
 
-Magic Context reads \`magic-context.jsonc\` (or \`.json\`) from one shared CortexKit location, the same for both harnesses. Project config overrides user config, key by key.
+Magic Context reads \`magic-context.jsonc\` (or \`.json\`) from one shared CortexKit location, the same for both harnesses. Project config overrides user config, key by key. Prompt-surface routing is shared by both harnesses; project config may select \`default\` and \`models\`, while \`guidance_override_path\` and \`tool_descriptions\` are stripped at the project trust boundary.
 
 - **Project** — \`<project>/.cortexkit/magic-context.jsonc\`
 - **User-wide** — \`~/.config/cortexkit/magic-context.jsonc\`

@@ -19,6 +19,7 @@ describe("MagicContextConfigSchema", () => {
                 transform_mode: "ts",
                 storage: { enforce_private_permissions: true },
                 cache_ttl: "5m",
+                prompt_surface: { default: "full" },
                 execute_threshold_percentage: 65,
                 protected_tags: 20,
                 clear_reasoning_age: 50,
@@ -79,6 +80,7 @@ describe("MagicContextConfigSchema", () => {
                 auto_update: false,
                 toast_duration_ms: 5000,
                 cache_ttl: "10m",
+                prompt_surface: { default: "full" },
                 protected_tags: 3,
                 execute_threshold_percentage: 75,
                 clear_reasoning_age: 60,
@@ -257,11 +259,67 @@ describe("MagicContextConfigSchema", () => {
 
             expect(result.cache_ttl).toEqual(input.cache_ttl);
         });
+
+        // Accepts preset routing, a guidance override path, and tool-description overrides.
+        it("parses prompt-surface defaults, routes, and user overrides", () => {
+            const promptSurface = {
+                default: "light" as const,
+                models: {
+                    "anthropic/claude/sonnet": "full" as const,
+                    "openai/*": "light" as const,
+                },
+                guidance_override_path: "./guidance.md",
+                tool_descriptions: { ctx_search: "Search project context" },
+            };
+
+            expect(
+                MagicContextConfigSchema.parse({ prompt_surface: promptSurface }).prompt_surface,
+            ).toEqual(promptSurface);
+        });
     });
 
     describe("validation", () => {
         it("rejects an unknown transform mode", () => {
             expect(() => MagicContextConfigSchema.parse({ transform_mode: "wasm" })).toThrow();
+        });
+
+        it("rejects malformed prompt-surface model keys and empty override text", () => {
+            const malformedKeys = [
+                "",
+                "provider",
+                "/model",
+                "provider/",
+                "provider//model",
+                "provider/model*",
+                "provider/*/nested",
+                "provider//model",
+                "provider/model/",
+                "provider/ model",
+                "*/model",
+            ];
+            for (const key of malformedKeys) {
+                expect(
+                    MagicContextConfigSchema.safeParse({
+                        prompt_surface: { models: { [key]: "light" } },
+                    }).success,
+                ).toBe(false);
+            }
+
+            expect(
+                MagicContextConfigSchema.safeParse({
+                    prompt_surface: { guidance_override_path: "  " },
+                }).success,
+            ).toBe(false);
+            expect(
+                MagicContextConfigSchema.safeParse({
+                    prompt_surface: { tool_descriptions: { ctx_search: "  " } },
+                }).success,
+            ).toBe(false);
+            expect(
+                MagicContextConfigSchema.safeParse({
+                    prompt_surface: { tool_descriptions: { "  ": "description" } },
+                }).success,
+            ).toBe(false);
         });
 
         it("rejects empty Pi subagent extension entries", () => {

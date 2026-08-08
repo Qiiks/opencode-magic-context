@@ -296,6 +296,7 @@ describe("loadPiConfig", () => {
 		expect(result.warnings.join("\n")).toContain("no longer supports");
 	});
 
+
 	it("strips hidden-agent prompt/permission from PROJECT config (privilege escalation guard)", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");
@@ -313,6 +314,45 @@ describe("loadPiConfig", () => {
 		expect(result.config.dreamer?.model).toBe("ok-model");
 		expect(result.config.dreamer?.prompt).toBeUndefined();
 		expect(result.warnings.join("\n")).toContain("dreamer.prompt");
+	});
+
+	it("strips prompt-surface text from PROJECT config but honors USER config", () => {
+		const cwd = makeTempRoot("mc-pi-cwd-");
+		const home = makeTempRoot("mc-pi-home-");
+		withHome(home);
+		writeUserConfig(
+			home,
+			JSON.stringify({
+				prompt_surface: {
+					default: "light",
+					guidance_override_path: "/user/guidance.md",
+					tool_descriptions: { ctx_search: "user text" },
+				},
+			}),
+		);
+		writeProjectConfig(
+			cwd,
+			JSON.stringify({
+				prompt_surface: {
+					default: "full",
+					models: { "openai/*": "light" },
+					guidance_override_path: "/repo/guidance.md",
+					tool_descriptions: { ctx_search: "repo text" },
+				},
+			}),
+		);
+
+		const result = loadPiConfig({ cwd });
+
+		expect(result.config.prompt_surface).toEqual({
+			default: "full",
+			models: { "openai/*": "light" },
+			guidance_override_path: "/user/guidance.md",
+			tool_descriptions: { ctx_search: "user text" },
+		});
+		expect(result.warnings.join("\\n")).toContain(
+			"prompt_surface.guidance_override_path/tool_descriptions",
+		);
 	});
 
 	it("strips language from PROJECT config but honors USER config", () => {
