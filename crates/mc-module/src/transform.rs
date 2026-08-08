@@ -3553,7 +3553,17 @@ fn apply_once(
             }
         }
     }
-    if is_bust_pass && !active_legitimate_publication_window {
+    // A todo-only SOFT splice changes neither the m0/m1 divider nor the covered tail. Keep
+    // divergence evidence across that bust so repeated todo churn cannot postpone repair. A
+    // structural boundary/coverage move, or a converged observation, still closes the episode.
+    if boundary_divergence_reset_allowed(
+        is_bust_pass,
+        active_legitimate_publication_window,
+        divergence_candidate.is_none(),
+        divergence_inputs_moved,
+        compartment_revision_matches,
+        boundary_or_coverage_state_moved(&loaded.core, &core, &loaded.meta, &meta),
+    ) {
         meta.boundary_divergence_pending_count = 0;
     }
     if lineage_anchor_failure {
@@ -4509,6 +4519,32 @@ fn post_end_revision_inputs_moved(before: &M1RevisionSignal, after: &M1RevisionS
     // Sequence is the structural publication watermark. Also compare the revision so memory,
     // note, or profile changes invalidate the aggregate observation when sequence is unchanged.
     before.max_compartment_seq != after.max_compartment_seq || before.revision != after.revision
+}
+
+fn boundary_or_coverage_state_moved(
+    before_core: &CoreState,
+    after_core: &CoreState,
+    before_meta: &ModuleMeta,
+    after_meta: &ModuleMeta,
+) -> bool {
+    before_core.boundary_id != after_core.boundary_id
+        || before_meta.coverage_ordinal != after_meta.coverage_ordinal
+        || before_meta.coverage_start_ordinal != after_meta.coverage_start_ordinal
+        || before_meta.folded_compartment_seq != after_meta.folded_compartment_seq
+}
+
+fn boundary_divergence_reset_allowed(
+    is_bust_pass: bool,
+    active_legitimate_publication_window: bool,
+    divergence_converged: bool,
+    divergence_inputs_moved: bool,
+    compartment_revision_matches: bool,
+    boundary_or_coverage_moved: bool,
+) -> bool {
+    is_bust_pass
+        && !active_legitimate_publication_window
+        && (boundary_or_coverage_moved
+            || (!divergence_inputs_moved && (divergence_converged || compartment_revision_matches)))
 }
 
 fn detect_boundary_divergence_candidate(
@@ -13914,6 +13950,65 @@ mod tests {
             "the digest remains a second revalidation leg"
         );
     }
+
+    #[test]
+    fn boundary_divergence_bust_reset_requires_structural_progress_or_convergence() {
+        let before_core = CoreState {
+            boundary_id: "old#0".to_string(),
+            ..Default::default()
+        };
+        let before_meta = ModuleMeta {
+            coverage_ordinal: Some(10),
+            coverage_start_ordinal: Some(1),
+            folded_compartment_seq: 4,
+            ..Default::default()
+        };
+        assert!(!boundary_or_coverage_state_moved(
+            &before_core,
+            &before_core,
+            &before_meta,
+            &before_meta,
+        ));
+        let mut after_core = before_core.clone();
+        after_core.boundary_id = "new#0".to_string();
+        assert!(boundary_or_coverage_state_moved(
+            &before_core,
+            &after_core,
+            &before_meta,
+            &before_meta,
+        ));
+
+        // A todo-promoted bust on a still-damaged row must retain the evidence that drives
+        // bounded repair escalation. The synthetic splice itself moves no cache boundary.
+        assert!(!boundary_divergence_reset_allowed(
+            true, false, false, false, false, false,
+        ));
+        // A torn publication read is not proof that the row converged either.
+        assert!(!boundary_divergence_reset_allowed(
+            true, false, false, true, false, false,
+        ));
+
+        // A genuine boundary/coverage move preserves the existing reset behavior.
+        assert!(boundary_divergence_reset_allowed(
+            true, false, false, false, false, true,
+        ));
+        // Once the detector observes convergence, the stale episode is complete.
+        assert!(boundary_divergence_reset_allowed(
+            true, false, true, false, false, false,
+        ));
+        assert!(boundary_divergence_reset_allowed(
+            true, false, false, false, true, false,
+        ));
+
+        // Publication windows and non-bust passes retain the counter regardless of signals.
+        assert!(!boundary_divergence_reset_allowed(
+            true, true, true, false, false, true,
+        ));
+        assert!(!boundary_divergence_reset_allowed(
+            false, false, true, false, false, true,
+        ));
+    }
+
 
     #[test]
     fn legacy_revision_exclusion_escalates_despite_project_memory_churn() {
