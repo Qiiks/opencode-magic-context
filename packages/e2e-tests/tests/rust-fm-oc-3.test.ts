@@ -39,30 +39,40 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-h
                 .readRustPasses()
                 .map((pass) => pass.rowVersion)
                 .filter((version) => version > 0);
-            const beforeCount = h.readRustPasses().length;
+            const outagePasses = RUST_FAILURE_PARK_THRESHOLD * 2;
 
             h.subc.killModule();
-            await sendOutagePasses(
-                h,
-                sessionId,
-                4,
-                RUST_FAILURE_PARK_THRESHOLD,
-                "FM-OC-3 outage",
+            await sendOutagePasses(h, sessionId, 4, outagePasses, "FM-OC-3 outage");
+            await h.waitFor(
+                () =>
+                    sessionLogLines(h, sessionId).find((line) =>
+                        line.includes("mc_rust_park_transition"),
+                    ),
+                { label: "FM-OC-3 park transition" },
             );
 
             await h.subc.restoreModule();
+            const recoveryStart = h.readRustPasses().length;
             await sendOutagePasses(
                 h,
                 sessionId,
-                4 + RUST_FAILURE_PARK_THRESHOLD,
+                4 + outagePasses,
                 RUST_PARK_RETRY_INTERVAL * 2,
                 "FM-OC-3 recovery",
             );
 
-            const passes = await h.waitForRustPasses(
-                beforeCount + RUST_FAILURE_PARK_THRESHOLD + RUST_PARK_RETRY_INTERVAL * 2,
+            const passes = await h.waitFor(
+                () => {
+                    const observed = h.readRustPasses();
+                    return observed
+                        .slice(recoveryStart)
+                        .some((pass) => pass.servedFrom === "transform")
+                        ? observed
+                        : undefined;
+                },
+                { label: "FM-OC-3 recovered transform" },
             );
-            const recovery = passes.slice(beforeCount + RUST_FAILURE_PARK_THRESHOLD);
+            const recovery = passes.slice(recoveryStart);
             expect(recovery.length).toBeLessThanOrEqual(RUST_PARK_RETRY_INTERVAL * 2);
             expect(recovery.some((pass) => pass.servedFrom === "transform")).toBe(true);
 

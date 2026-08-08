@@ -37,19 +37,19 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-2: park transiti
             await driveToSteadyState(h, sessionId, 2);
             const beforeCount = h.readRustPasses().length;
             const droppedBefore = lineageScopedTagCount(h, sessionId, "dropped");
+            const outagePasses = RUST_FAILURE_PARK_THRESHOLD * 2;
 
             h.subc.killModule();
-            await sendOutagePasses(
-                h,
-                sessionId,
-                4,
-                RUST_FAILURE_PARK_THRESHOLD + 1,
-                "FM-OC-2 outage",
+            await sendOutagePasses(h, sessionId, 4, outagePasses, "FM-OC-2 outage");
+            await h.waitFor(
+                () =>
+                    sessionLogLines(h, sessionId).find((line) =>
+                        line.includes("mc_rust_park_transition"),
+                    ),
+                { label: "FM-OC-2 park transition" },
             );
 
-            const passes = await h.waitForRustPasses(
-                beforeCount + RUST_FAILURE_PARK_THRESHOLD + 1,
-            );
+            const passes = await h.waitForRustPasses(beforeCount + outagePasses);
             const outage = passes.slice(beforeCount);
             expect(outage.every((pass) => pass.servedFrom === "lkg" || pass.servedFrom === "raw" || pass.decision === "parked")).toBe(
                 true,
