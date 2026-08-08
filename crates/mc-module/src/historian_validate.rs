@@ -14,6 +14,8 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::boundary::completed_tool_arc_crosses_boundary;
+
 const BOUNDARY_HEALING_SLACK: u64 = 2;
 
 /// A raw ordinal range, inclusive on both ends.
@@ -57,6 +59,9 @@ pub struct HistorianChunk {
     /// the omitted raw lines were tool-only transcript noise rather than narrative.
     #[serde(default)]
     pub tool_only_ranges: Vec<MessageRange>,
+    /// Completed invocation/result ranges whose terminal publication boundary must stay atomic.
+    #[serde(default)]
+    pub completed_tool_arcs: Vec<MessageRange>,
 }
 
 /// An already-persisted compartment range with the raw start and end ordinals
@@ -490,6 +495,13 @@ pub fn validate_historian_output(
         &chunk.tool_only_ranges,
         &present_ordinals,
     );
+    heal_terminal_completed_tool_arc(
+        &mut parsed.compartments,
+        &mut parsed.unprocessed_from,
+        &chunk.completed_tool_arcs,
+        &present_ordinals,
+        chunk.end_index,
+    );
 
     let emitted =
         map_parsed_compartments_to_chunk(&parsed.compartments, chunk, options.sequence_offset)
@@ -510,6 +522,16 @@ pub fn validate_historian_output(
             "Historian returned invalid compartment output: {error}"
         )));
     }
+    if parsed.compartments.last().is_some_and(|compartment| {
+        boundary_splits_completed_tool_arc(
+            compartment.end_message.saturating_add(1),
+            &chunk.completed_tool_arcs,
+        )
+    }) {
+        return Err(validation_error(
+            "Historian terminal boundary splits a completed tool invocation/result arc",
+        ));
+    }
 
     let mut compartments = emitted;
     let emitted_count = compartments.len();
@@ -523,7 +545,13 @@ pub fn validate_historian_output(
         // intentionally part of that distance, so a sparse coordinate gap still counts
         // as lookahead for boundary healing.
         let lookahead_distance = chunk.end_index.saturating_sub(last_end);
-        if lookahead_distance <= BOUNDARY_HEALING_SLACK {
+        let previous_end = compartments
+            .get(compartments.len().saturating_sub(2))
+            .map(|compartment| compartment.end_message);
+        let pop_would_split_arc = previous_end.is_some_and(|end| {
+            boundary_splits_completed_tool_arc(end.saturating_add(1), &chunk.completed_tool_arcs)
+        });
+        if lookahead_distance <= BOUNDARY_HEALING_SLACK && !pop_would_split_arc {
             compartments.pop();
             discarded_last = true;
         }
@@ -826,6 +854,46 @@ fn parse_events(text: &str) -> Vec<ParsedEvent> {
         });
     }
     events
+}
+
+fn boundary_splits_completed_tool_arc(boundary: u64, arcs: &[MessageRange]) -> bool {
+    arcs.iter()
+        .any(|arc| completed_tool_arc_crosses_boundary(arc.start, arc.end, boundary))
+}
+
+fn heal_terminal_completed_tool_arc(
+    compartments: &mut [ParsedCompartment],
+    unprocessed_from: &mut Option<u64>,
+    arcs: &[MessageRange],
+    present_ordinals: &[u64],
+    chunk_end: u64,
+) {
+    let Some(last) = compartments.last_mut() else {
+        return;
+    };
+    let original_end = last.end_message;
+    for _ in 0..=arcs.len() {
+        let boundary = last.end_message.saturating_add(1);
+        let next_end = arcs
+            .iter()
+            .filter(|arc| {
+                arc.end <= chunk_end
+                    && completed_tool_arc_crosses_boundary(arc.start, arc.end, boundary)
+            })
+            .map(|arc| arc.end)
+            .max()
+            .unwrap_or(last.end_message);
+        if next_end == last.end_message {
+            break;
+        }
+        last.end_message = next_end;
+    }
+    if last.end_message != original_end {
+        if let Some(unprocessed) = unprocessed_from.as_mut() {
+            *unprocessed = next_present_after(present_ordinals, last.end_message)
+                .unwrap_or_else(|| last.end_message.saturating_add(1));
+        }
+    }
 }
 
 fn heal_compartment_gaps(
@@ -1293,6 +1361,7 @@ mod tests {
                 .collect(),
             present_ordinals: (start..=end).collect(),
             tool_only_ranges: Vec::new(),
+            completed_tool_arcs: Vec::new(),
         }
     }
 
@@ -1531,6 +1600,7 @@ full narrative
             ],
             present_ordinals: vec![1, 1, 2],
             tool_only_ranges: Vec::new(),
+            completed_tool_arcs: Vec::new(),
         };
         let duplicate_error = validate_chunk_coverage(&duplicate).expect("duplicate rejected");
         assert!(duplicate_error.contains("duplicate raw message ordinal 1"));
@@ -1557,6 +1627,7 @@ full narrative
             ],
             present_ordinals: vec![1, 2, 3],
             tool_only_ranges: Vec::new(),
+            completed_tool_arcs: Vec::new(),
         };
         let decreasing_error = validate_chunk_coverage(&decreasing).expect("decrease rejected");
         assert!(decreasing_error.contains("chunk lines decrease from raw message 3 to 2"));
@@ -1613,6 +1684,71 @@ full narrative
     }
 
     #[test]
+    fn terminal_unprocessed_boundary_closes_a_completed_arc_forward() {
+        // This fixture models a chunk spanning ordinals 98-128 with a completed tool arc at
+        // 123-124. Its adapted bytes carry no provider verdict.
+        let mut row_chunk = chunk(98, 128);
+        row_chunk.completed_tool_arcs = vec![MessageRange {
+            start: 123,
+            end: 124,
+        }];
+        let text = xml(&[(98, 123, "covered prefix")], 124, "");
+
+        let validated = validate_historian_output(
+            &text,
+            &row_chunk,
+            &[],
+            ValidateOptions {
+                in_emergency: true,
+                ..ValidateOptions::default()
+            },
+        )
+        .expect("the terminal boundary should close the completed arc forward");
+
+        assert_eq!(validated.compartments[0].end_message, 124);
+        assert_eq!(validated.compartments[0].end_message_id, "msg-124");
+        assert_eq!(validated.unprocessed_from, 125);
+    }
+
+    #[test]
+    fn completed_arc_past_chunk_end_rejects_instead_of_publishing_half() {
+        let mut short_chunk = chunk(1, 2);
+        short_chunk.completed_tool_arcs = vec![MessageRange { start: 2, end: 3 }];
+        let text = xml(&[(1, 2, "prefix")], 3, "");
+
+        let error = validate_historian_output(
+            &text,
+            &short_chunk,
+            &[],
+            ValidateOptions {
+                in_emergency: true,
+                ..ValidateOptions::default()
+            },
+        )
+        .expect_err("an unavailable result must keep the whole arc out of durable coverage");
+
+        assert!(error.message.contains("terminal boundary splits"));
+    }
+
+    #[test]
+    fn discard_last_cannot_reopen_a_completed_arc() {
+        let mut row_chunk = chunk(98, 128);
+        row_chunk.completed_tool_arcs = vec![MessageRange {
+            start: 123,
+            end: 124,
+        }];
+        let text = xml(&[(98, 123, "prefix"), (124, 128, "lookahead")], 129, "");
+
+        let validated =
+            validate_historian_output(&text, &row_chunk, &[], ValidateOptions::default())
+                .expect("discard-last healing must preserve the whole completed arc");
+
+        assert!(!validated.discarded_last);
+        assert_eq!(validated.compartments.len(), 2);
+        assert_eq!(validated.compartments.last().unwrap().end_message, 128);
+    }
+
+    #[test]
     fn discard_last_uses_numeric_sparse_ordinal_distance() {
         let sparse = HistorianChunk {
             start_index: 1,
@@ -1627,6 +1763,7 @@ full narrative
                 .collect(),
             present_ordinals: vec![1, 2, 100],
             tool_only_ranges: Vec::new(),
+            completed_tool_arcs: Vec::new(),
         };
         let text = xml(&[(1, 1, "first"), (2, 2, "provisional")], 100, "");
 

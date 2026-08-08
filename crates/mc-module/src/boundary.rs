@@ -8,7 +8,7 @@
 //! store access, or ambient cache state here: the same inputs always produce the
 //! same boundary and trigger decision.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
@@ -512,6 +512,11 @@ fn resolve_protected_tail_boundary_with_index(
         protected_tail_start = protected_tail_start.min(newest_floor).max(offset);
         protected_tail_start = index.clamp_ordinal(protected_tail_start);
     }
+
+    // Runtime floors, semantic snapping, and the newest-message guard can each move a previously
+    // safe candidate. Pairing is the final boundary invariant, so re-fence after all of them.
+    protected_tail_start =
+        fence_boundary_for_completed_tool_arcs(protected_tail_start, &arcs, offset);
 
     let per_run_cap = select_per_run_cap(
         usage_percentage,
@@ -1184,27 +1189,26 @@ impl TokenIndex {
 struct ToolArc {
     inv_ordinal: u64,
     res_ordinal: Option<u64>,
-    reasoning_bearing: bool,
+}
+
+/// True when a tail beginning at `boundary` would retain a completed result without its call.
+/// Every boundary rule uses this predicate so signed-reasoning protection and ordinary tool
+/// pairing cannot disagree about whether an arc is whole.
+pub(crate) fn completed_tool_arc_crosses_boundary(
+    inv_ordinal: u64,
+    res_ordinal: u64,
+    boundary: u64,
+) -> bool {
+    inv_ordinal < boundary && boundary <= res_ordinal
 }
 
 fn build_tool_arcs(messages: &[BoundaryMsg]) -> Vec<ToolArc> {
     #[derive(Default)]
     struct PartialArc {
-        inv: Vec<(u64, bool)>,
+        inv: Vec<u64>,
         res: Vec<u64>,
     }
 
-    let reasoning_messages: HashSet<u64> = messages
-        .iter()
-        .filter(|message| message.role == Role::Assistant)
-        .filter(|message| {
-            message
-                .blocks
-                .iter()
-                .any(|block| matches!(block.kind, SelKind::Reasoning | SelKind::RedactedReasoning))
-        })
-        .map(|message| message.message_ordinal)
-        .collect();
     let mut partial: BTreeMap<String, PartialArc> = BTreeMap::new();
     for message in messages {
         for block in &message.blocks {
@@ -1216,10 +1220,7 @@ fn build_tool_arcs(messages: &[BoundaryMsg]) -> Vec<ToolArc> {
             };
             let entry = partial.entry(arc_id.clone()).or_default();
             match &block.kind {
-                SelKind::ToolCall { .. } => entry.inv.push((
-                    message.message_ordinal,
-                    reasoning_messages.contains(&message.message_ordinal),
-                )),
+                SelKind::ToolCall { .. } => entry.inv.push(message.message_ordinal),
                 SelKind::ToolResult { .. } => entry.res.push(message.message_ordinal),
                 _ => {}
             }
@@ -1230,13 +1231,12 @@ fn build_tool_arcs(messages: &[BoundaryMsg]) -> Vec<ToolArc> {
     for (_arc_id, mut entry) in partial {
         entry.inv.sort_unstable();
         entry.res.sort_unstable();
-        for (inv, reasoning_bearing) in entry.inv {
+        for inv in entry.inv {
             let res_pos = entry.res.iter().position(|res| *res >= inv);
             let res_ordinal = res_pos.map(|idx| entry.res.remove(idx));
             arcs.push(ToolArc {
                 inv_ordinal: inv,
                 res_ordinal,
-                reasoning_bearing,
             });
         }
     }
@@ -1267,47 +1267,90 @@ struct FenceResult {
     open_arc: bool,
 }
 
+fn fence_boundary_for_completed_tool_arcs(candidate: u64, arcs: &[ToolArc], floor: u64) -> u64 {
+    let completed = arcs
+        .iter()
+        .filter_map(|arc| arc.res_ordinal.map(|result| (arc.inv_ordinal, result)))
+        .collect::<Vec<_>>();
+    let mut component = completed
+        .iter()
+        .copied()
+        .filter(|(invocation, result)| {
+            completed_tool_arc_crosses_boundary(*invocation, *result, candidate)
+        })
+        .collect::<Vec<_>>();
+    if component.is_empty() {
+        return candidate;
+    }
+
+    // Overlapping arcs form one atomic interval: moving to either edge of only the first arc could
+    // cut a neighbor. Expand the whole component before choosing its safe side.
+    for _ in 0..=completed.len() {
+        let min_invocation = component
+            .iter()
+            .map(|(invocation, _)| *invocation)
+            .min()
+            .unwrap_or(candidate);
+        let max_result = component
+            .iter()
+            .map(|(_, result)| *result)
+            .max()
+            .unwrap_or(candidate);
+        let previous_len = component.len();
+        for arc in &completed {
+            if arc.0 <= max_result && arc.1 >= min_invocation && !component.contains(arc) {
+                component.push(*arc);
+            }
+        }
+        if component.len() == previous_len {
+            break;
+        }
+    }
+
+    let min_invocation = component
+        .iter()
+        .map(|(invocation, _)| *invocation)
+        .min()
+        .unwrap_or(candidate);
+    let max_result = component
+        .iter()
+        .map(|(_, result)| *result)
+        .max()
+        .unwrap_or(candidate);
+    if min_invocation < floor {
+        // An invocation below the publication floor is already summarized. Moving backward cannot
+        // reunite that pair, so close the entire overlapping component forward instead.
+        max_result.saturating_add(1)
+    } else {
+        min_invocation
+    }
+}
+
 fn fence_boundary_for_tool_arcs(
     candidate: u64,
     arcs: &[ToolArc],
     publication_floor_ordinal: u64,
     recent_open_arc_cutoff: u64,
 ) -> FenceResult {
-    let mut boundary = candidate;
+    let mut boundary =
+        fence_boundary_for_completed_tool_arcs(candidate, arcs, publication_floor_ordinal);
+    let mut open_arc = false;
     for arc in arcs {
-        if let Some(res_ordinal) = arc.res_ordinal {
-            if arc.inv_ordinal < boundary && boundary <= res_ordinal {
-                // Keep signed reasoning and every tool sibling on one side of a cut.
-                // Ordinary arcs may close forward; reasoning-bearing arcs fence backward
-                // so later coverage changes cannot strand a signed assistant message.
-                boundary = if arc.reasoning_bearing {
-                    arc.inv_ordinal
-                } else {
-                    res_ordinal + 1
-                };
-            }
+        if arc.res_ordinal.is_some() || arc.inv_ordinal < recent_open_arc_cutoff {
             continue;
         }
-        if arc.inv_ordinal < recent_open_arc_cutoff {
-            continue;
-        }
-        if arc.inv_ordinal >= publication_floor_ordinal && arc.inv_ordinal < boundary {
-            return FenceResult {
-                boundary: arc.inv_ordinal,
-                open_arc: true,
-            };
-        }
-        if arc.inv_ordinal >= boundary {
-            return FenceResult {
-                boundary: arc.inv_ordinal,
-                open_arc: true,
-            };
+        if (arc.inv_ordinal >= publication_floor_ordinal && arc.inv_ordinal < boundary)
+            || arc.inv_ordinal >= boundary
+        {
+            boundary = arc.inv_ordinal;
+            open_arc = true;
+            break;
         }
     }
-    FenceResult {
-        boundary,
-        open_arc: false,
-    }
+    // An open-arc adjustment can move the cut into an overlapping completed arc. Reapply the
+    // same whole-arc predicate to the final candidate rather than trusting iteration order.
+    boundary = fence_boundary_for_completed_tool_arcs(boundary, arcs, publication_floor_ordinal);
+    FenceResult { boundary, open_arc }
 }
 
 fn fence_wrapup_boundary_for_tool_arcs(candidate: u64, arcs: &[ToolArc], offset: u64) -> u64 {
@@ -1442,25 +1485,12 @@ fn apply_head_cap(args: HeadCapArgs<'_>) -> HeadCapResult {
     let mut end =
         args.index
             .find_head_end_for_cap(args.offset, args.protected_tail_start, args.cap_tokens);
-    let mut oversize_atomic_unit =
+    let oversize_atomic_unit =
         end == args.offset + 1 && args.index.token_for_ordinal(args.offset) > args.cap_tokens;
+    end = fence_boundary_for_completed_tool_arcs(end, args.arcs, args.offset);
     let mut fenced_by_open_arc = false;
     for arc in args.arcs {
-        if let Some(res_ordinal) = arc.res_ordinal {
-            if arc.inv_ordinal < end && end <= res_ordinal {
-                if arc.reasoning_bearing {
-                    end = arc.inv_ordinal.max(args.offset);
-                } else {
-                    end = args.protected_tail_start.min(res_ordinal + 1);
-                    if args
-                        .index
-                        .range_tokens(args.offset.max(arc.inv_ordinal), end)
-                        > args.cap_tokens
-                    {
-                        oversize_atomic_unit = true;
-                    }
-                }
-            }
+        if arc.res_ordinal.is_some() {
             continue;
         }
         if arc.inv_ordinal >= args.recent_open_arc_cutoff
@@ -1471,6 +1501,7 @@ fn apply_head_cap(args: HeadCapArgs<'_>) -> HeadCapResult {
             fenced_by_open_arc = true;
         }
     }
+    end = fence_boundary_for_completed_tool_arcs(end, args.arcs, args.offset);
     if end <= args.offset && args.offset < args.protected_tail_start {
         return HeadCapResult {
             eligible_end_ordinal: args.offset,
@@ -2450,7 +2481,87 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_completed_arc_can_still_close_a_straddling_boundary_forward() {
+    fn backward_reasoning_fence_closes_forward_when_the_invocation_is_already_covered() {
+        let messages = vec![
+            reasoning_tool_call_msg(123, "covered-arc"),
+            tool_result_msg(124, "covered-arc", "tool result"),
+        ];
+        let arcs = build_tool_arcs(&messages);
+        let publication_floor = 124;
+
+        let pre_deploy_boundary = arcs.iter().fold(124, |boundary, arc| {
+            arc.res_ordinal.map_or(boundary, |result| {
+                if completed_tool_arc_crosses_boundary(arc.inv_ordinal, result, boundary) {
+                    result.saturating_add(1)
+                } else {
+                    boundary
+                }
+            })
+        });
+        let deployed_backward_then_floor = arcs
+            .iter()
+            .fold(124, |boundary, arc| {
+                arc.res_ordinal.map_or(boundary, |result| {
+                    if completed_tool_arc_crosses_boundary(arc.inv_ordinal, result, boundary) {
+                        arc.inv_ordinal
+                    } else {
+                        boundary
+                    }
+                })
+            })
+            .max(publication_floor);
+        let repaired = fence_boundary_for_tool_arcs(124, &arcs, publication_floor, 124);
+
+        assert_eq!(pre_deploy_boundary, 125);
+        assert_eq!(
+            deployed_backward_then_floor, 124,
+            "the deployed backward fence plus the publication floor split the completed arc"
+        );
+        assert_eq!(
+            repaired.boundary, 125,
+            "an already-covered invocation can only be reunited by folding its result forward"
+        );
+    }
+
+    #[test]
+    fn eligible_end_beyond_the_result_is_unchanged_by_the_backward_fence() {
+        let messages = vec![
+            reasoning_tool_call_msg(123, "covered-arc"),
+            tool_result_msg(124, "covered-arc", "tool result"),
+        ];
+        let arcs = build_tool_arcs(&messages);
+        // A chunk through ordinal 128 has exclusive eligible end 129, so the 123-124 arc is
+        // wholly inside the head and neither the forward nor backward fence moves its boundary.
+        let candidate = 129;
+        let pre_deploy = arcs.iter().fold(candidate, |boundary, arc| {
+            arc.res_ordinal.map_or(boundary, |result| {
+                if completed_tool_arc_crosses_boundary(arc.inv_ordinal, result, boundary) {
+                    result.saturating_add(1)
+                } else {
+                    boundary
+                }
+            })
+        });
+        let deployed_backward = arcs.iter().fold(candidate, |boundary, arc| {
+            arc.res_ordinal.map_or(boundary, |result| {
+                if completed_tool_arc_crosses_boundary(arc.inv_ordinal, result, boundary) {
+                    arc.inv_ordinal
+                } else {
+                    boundary
+                }
+            })
+        });
+
+        assert_eq!(pre_deploy, candidate);
+        assert_eq!(deployed_backward, candidate);
+        assert_eq!(
+            fence_boundary_for_tool_arcs(candidate, &arcs, 98, candidate).boundary,
+            candidate
+        );
+    }
+
+    #[test]
+    fn ordinary_completed_arc_fences_a_straddling_boundary_backward() {
         let messages = vec![
             tool_call_msg(2, "ordinary-arc"),
             tool_result_msg(3, "ordinary-arc", "tool result"),
@@ -2459,21 +2570,43 @@ mod tests {
 
         let fenced = fence_boundary_for_tool_arcs(3, &arcs, 1, 1);
 
-        assert_eq!(fenced.boundary, 4);
+        assert_eq!(
+            fenced.boundary, 2,
+            "ordinary completed arcs must obey the same whole-arc rule as reasoning-bearing arcs"
+        );
     }
 
     #[test]
-    fn fold_only_guard_keeps_newest_tool_result_out_of_eligible_head() {
+    fn backward_reasoning_fence_cannot_split_a_neighboring_ordinary_arc() {
+        let messages = vec![
+            tool_call_msg(122, "ordinary-arc"),
+            reasoning_tool_call_msg(123, "reasoning-arc"),
+            tool_result_msg(124, "ordinary-arc", "ordinary result"),
+            tool_result_msg(125, "reasoning-arc", "reasoning result"),
+        ];
+        let arcs = build_tool_arcs(&messages);
+
+        let fenced = fence_boundary_for_tool_arcs(125, &arcs, 1, 1);
+
+        assert_eq!(fenced.boundary, 122);
+        assert!(arcs
+            .iter()
+            .filter_map(|arc| arc.res_ordinal.map(|result| (arc.inv_ordinal, result)))
+            .all(|(invocation, result)| {
+                !completed_tool_arc_crosses_boundary(invocation, result, fenced.boundary)
+            }));
+    }
+
+    #[test]
+    fn completed_arc_rule_keeps_newest_tool_result_out_of_eligible_head() {
         let tail = completed_newest_tool_arc_tail();
         let terminal_ordinal = 4;
         let newest_ordinal = 3;
         let mut pre_guard_ctx = fold_only_pressure_ctx();
         pre_guard_ctx.fold_is_only_reclaim = false;
         let pre_guard = resolve_protected_tail_boundary(&tail, &pre_guard_ctx);
-        assert_eq!(
-            pre_guard.eligible_head.end, terminal_ordinal,
-            "control case must exercise the old terminal eligible-head path"
-        );
+        assert_eq!(pre_guard.protected_start_ordinal, 2);
+        assert_eq!(pre_guard.eligible_head.end, 2);
 
         let boundary = resolve_protected_tail_boundary(&tail, &fold_only_pressure_ctx());
 
@@ -2530,15 +2663,15 @@ mod tests {
     }
 
     #[test]
-    fn newest_guard_is_off_by_default() {
+    fn completed_arc_pairing_is_on_without_fold_only_guard() {
         let tail = completed_newest_tool_arc_tail();
         let mut ctx = fold_only_pressure_ctx();
         ctx.fold_is_only_reclaim = false;
 
         let boundary = resolve_protected_tail_boundary(&tail, &ctx);
 
-        assert_eq!(boundary.protected_start_ordinal, 4);
-        assert_eq!(boundary.eligible_head.end, 4);
+        assert_eq!(boundary.protected_start_ordinal, 2);
+        assert_eq!(boundary.eligible_head.end, 2);
     }
 
     #[test]

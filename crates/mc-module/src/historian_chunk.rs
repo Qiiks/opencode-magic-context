@@ -308,6 +308,45 @@ impl Builder {
     }
 }
 
+fn completed_tool_arc_ranges(blocks: &[FlatBlock]) -> Vec<MessageRange> {
+    #[derive(Default)]
+    struct PartialArc {
+        invocations: Vec<u64>,
+        results: Vec<u64>,
+    }
+
+    let mut partial = BTreeMap::<&str, PartialArc>::new();
+    for block in blocks.iter().filter(|block| !block.provider_executed) {
+        let Some(arc_id) = block.arc_id.as_deref() else {
+            continue;
+        };
+        let entry = partial.entry(arc_id).or_default();
+        match block.kind_tag.as_str() {
+            "tool_call" => entry.invocations.push(block.ordinal),
+            "tool_result" => entry.results.push(block.ordinal),
+            _ => {}
+        }
+    }
+
+    let mut ranges = Vec::new();
+    for mut arc in partial.into_values() {
+        arc.invocations.sort_unstable();
+        arc.results.sort_unstable();
+        for invocation in arc.invocations {
+            let Some(result_index) = arc.results.iter().position(|result| *result >= invocation)
+            else {
+                continue;
+            };
+            ranges.push(MessageRange {
+                start: invocation,
+                end: arc.results.remove(result_index),
+            });
+        }
+    }
+    ranges.sort_by_key(|range| (range.start, range.end));
+    ranges
+}
+
 pub fn build_historian_chunk(
     messages: &[CkIngressMessage],
     blocks: &[FlatBlock],
@@ -400,6 +439,7 @@ pub fn build_historian_chunk(
             lines: builder.line_meta,
             present_ordinals,
             tool_only_ranges,
+            completed_tool_arcs: completed_tool_arc_ranges(blocks),
         },
         snapshot,
         end_message_id: builder.last_message_id,
@@ -1369,6 +1409,13 @@ mod tests {
         assert_eq!(
             built.text,
             "[1-4] A: TC: read(one.rs) / TC: read(one.rs) / TC: read(two.rs) / TC: read(two.rs)"
+        );
+        assert_eq!(
+            built.chunk.completed_tool_arcs,
+            vec![
+                MessageRange { start: 1, end: 2 },
+                MessageRange { start: 3, end: 4 },
+            ]
         );
     }
 

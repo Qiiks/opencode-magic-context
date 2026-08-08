@@ -1955,6 +1955,7 @@ mod tests {
             ],
             present_ordinals: vec![1, 2, 3, 4],
             tool_only_ranges: vec![],
+            completed_tool_arcs: vec![],
         }
     }
 
@@ -3615,6 +3616,7 @@ mod tests {
                 .collect(),
             present_ordinals: (1..=9).collect(),
             tool_only_ranges: vec![],
+            completed_tool_arcs: vec![],
         };
         let prior = prior_ranges();
         let models = vec!["prov/model-a".to_string()];
@@ -3722,6 +3724,7 @@ mod tests {
             ],
             present_ordinals: vec![1, 2, 3, 4],
             tool_only_ranges: vec![],
+            completed_tool_arcs: vec![],
         };
         let prior = [crate::historian_validate::StoredCompartmentRange {
             start_message: 1,

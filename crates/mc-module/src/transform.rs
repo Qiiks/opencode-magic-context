@@ -80,8 +80,9 @@ const RED_KEY_PREFIX: &str = "red:";
 /// Durable sentinel proving this session has adopted the renderer transition. It is stored in the
 /// existing cache-state row and never emitted; preserving it avoids a schema migration or hot-path
 /// state read while keeping the pass commit under the normal row-version CAS.
-const TRANSITION_CONSUMED_KEY: &str = "migration:renderer-transition-v1";
-const TRANSITION_EPOCH: &str = "renderer-transition-v1";
+const LEGACY_TRANSITION_CONSUMED_KEY: &str = "migration:renderer-transition-v1";
+const TRANSITION_CONSUMED_KEY: &str = "migration:renderer-transition-v2";
+const TRANSITION_EPOCH: &str = "renderer-transition-v2";
 /// Frozen text-compression units. The suffix is the stable CK text-block id.
 const CAV_KEY_PREFIX: &str = "cav:";
 /// Repeated pending/raw ↔ present interleaving should be impossible with correctly
@@ -2019,7 +2020,16 @@ fn apply_once(
     let loaded = transform_snapshot.loaded;
     let overlay_frontier = transform_snapshot.overlay_frontier;
     let transition_detection_started_at = Instant::now();
-    let transition_shapes = renderer_transition_shapes(&projection, &loaded.core.frozen_units);
+    let transition_shapes = renderer_transition_shapes(
+        &projection,
+        &loaded.core.frozen_units,
+        loaded.meta.coverage_ordinal,
+        loaded
+            .meta
+            .synthetic_todo
+            .as_ref()
+            .and_then(|pair| pair.anchor_mid.as_deref()),
+    );
     let transition_was_consumed = transition_consumed(&loaded.core);
     let transition_due = loaded.meta.initialized
         && !req.is_subagent
@@ -3661,10 +3671,21 @@ fn apply_once(
     let transition_post_detection_started_at = Instant::now();
     let transition_newly_consumed = is_bust_pass
         && !transition_was_consumed
-        && renderer_transition_shapes(&projection, &core.frozen_units).affected();
+        && renderer_transition_shapes(
+            &projection,
+            &core.frozen_units,
+            meta.coverage_ordinal,
+            meta.synthetic_todo
+                .as_ref()
+                .and_then(|pair| pair.anchor_mid.as_deref()),
+        )
+        .affected();
     timings.transition_detection += elapsed_ms(transition_post_detection_started_at);
-    let transition_committed = transition_was_consumed || transition_newly_consumed;
-    preserve_transition_consumed_marker(&mut core, transition_committed);
+    let transition_committed = transition_renderer_active(&core) || transition_newly_consumed;
+    preserve_transition_consumed_marker(
+        &mut core,
+        transition_was_consumed || transition_newly_consumed,
+    );
     if transition_newly_consumed {
         // Record consumption after any bust that renders an affected shape. If the shape first
         // appeared during a pass that was already invalidating the cache for another reason, its
@@ -3813,6 +3834,8 @@ fn apply_once(
         cache_stats: output_cache_stats,
         timings: build_timings,
     } = built_output;
+    #[cfg(test)]
+    assert_no_orphaned_tool_arcs(&ck_messages);
     timings.build_output = elapsed_ms(build_output_started_at);
     timings.blocks_by_mid = build_timings.blocks_by_mid;
     timings.build_frozen_unit_index = build_timings.frozen_unit_index;
@@ -4338,7 +4361,10 @@ fn cached_m1_missing(core: &CoreState) -> bool {
             || u.key.starts_with(RED_KEY_PREFIX)
             || u.key.starts_with("strip:")
             || u.key.starts_with(CAV_KEY_PREFIX)
-            || u.key == TRANSITION_CONSUMED_KEY
+            || matches!(
+                u.key.as_str(),
+                LEGACY_TRANSITION_CONSUMED_KEY | TRANSITION_CONSUMED_KEY
+            )
     });
     m0 == 1 && m1 == 0 && rest_ok
 }
@@ -4352,7 +4378,10 @@ fn valid_m0m1_shape(core: &CoreState) -> bool {
             || u.key.starts_with(RED_KEY_PREFIX)
             || u.key.starts_with("strip:")
             || u.key.starts_with(CAV_KEY_PREFIX)
-            || u.key == TRANSITION_CONSUMED_KEY
+            || matches!(
+                u.key.as_str(),
+                LEGACY_TRANSITION_CONSUMED_KEY | TRANSITION_CONSUMED_KEY
+            )
     });
     m0 == 1 && m1 == 1 && rest_ok
 }
@@ -7881,15 +7910,131 @@ fn projection_reasoning_ineligible_arc_ids(projection: &FlatProjection) -> HashS
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplitCoverageToolArc {
+    arc_id: String,
+    invocation_mid: String,
+    result_mid: String,
+    result_ordinal: u64,
+}
+
+fn split_coverage_tool_arcs(
+    projection: &FlatProjection,
+    coverage_ordinal: Option<u64>,
+) -> Vec<SplitCoverageToolArc> {
+    #[derive(Default)]
+    struct PartialArc<'a> {
+        invocations: Vec<&'a FlatBlock>,
+        results: Vec<&'a FlatBlock>,
+    }
+
+    let Some(boundary) = coverage_ordinal.and_then(|ordinal| ordinal.checked_add(1)) else {
+        return Vec::new();
+    };
+    let mut partial = BTreeMap::<&str, PartialArc<'_>>::new();
+    for block in projection
+        .blocks
+        .iter()
+        .filter(|block| !block.provider_executed)
+    {
+        let Some(arc_id) = block.arc_id.as_deref() else {
+            continue;
+        };
+        let entry = partial.entry(arc_id).or_default();
+        match block.kind_tag.as_str() {
+            "tool_call" => entry.invocations.push(block),
+            "tool_result" => entry.results.push(block),
+            _ => {}
+        }
+    }
+
+    let mut split = BTreeSet::new();
+    for (arc_id, mut partial) in partial {
+        partial
+            .invocations
+            .sort_by_key(|block| (block.ordinal, block.block_index));
+        partial
+            .results
+            .sort_by_key(|block| (block.ordinal, block.block_index));
+        for invocation in partial.invocations {
+            let Some(result_index) = partial
+                .results
+                .iter()
+                .position(|result| result.ordinal >= invocation.ordinal)
+            else {
+                continue;
+            };
+            let result = partial.results.remove(result_index);
+            if crate::boundary::completed_tool_arc_crosses_boundary(
+                invocation.ordinal,
+                result.ordinal,
+                boundary,
+            ) {
+                split.insert((
+                    arc_id.to_string(),
+                    invocation.mid.clone(),
+                    result.mid.clone(),
+                    result.ordinal,
+                ));
+            }
+        }
+    }
+    split
+        .into_iter()
+        .map(
+            |(arc_id, invocation_mid, result_mid, result_ordinal)| SplitCoverageToolArc {
+                arc_id,
+                invocation_mid,
+                result_mid,
+                result_ordinal,
+            },
+        )
+        .collect()
+}
+
+fn synthetic_todo_split_arcs(
+    projection: &FlatProjection,
+    anchor_mid: Option<&str>,
+) -> Vec<SplitCoverageToolArc> {
+    let Some(anchor_mid) = anchor_mid else {
+        return Vec::new();
+    };
+    let Some(anchor_ordinal) = projection
+        .blocks
+        .iter()
+        .find(|block| block.mid == anchor_mid)
+        .map(|block| block.ordinal)
+    else {
+        return Vec::new();
+    };
+    split_coverage_tool_arcs(projection, Some(anchor_ordinal))
+        .into_iter()
+        .filter(|arc| arc.invocation_mid == anchor_mid)
+        .collect()
+}
+
+fn synthetic_todo_render_anchor_mid(projection: &FlatProjection, anchor_mid: &str) -> String {
+    synthetic_todo_split_arcs(projection, Some(anchor_mid))
+        .into_iter()
+        .max_by_key(|arc| arc.result_ordinal)
+        .map(|arc| arc.result_mid)
+        .unwrap_or_else(|| anchor_mid.to_string())
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct RendererTransitionShapes {
     poisoned_reasoning_arc_ids: Vec<String>,
     unmatched_tool_pair_call_ids: Vec<String>,
+    split_coverage_arc_ids: Vec<String>,
+    synthetic_anchor_split_arc_ids: Vec<String>,
 }
 
 impl RendererTransitionShapes {
     fn affected(&self) -> bool {
-        !self.poisoned_reasoning_arc_ids.is_empty() || !self.unmatched_tool_pair_call_ids.is_empty()
+        !self.poisoned_reasoning_arc_ids.is_empty()
+            || !self.unmatched_tool_pair_call_ids.is_empty()
+            || !self.split_coverage_arc_ids.is_empty()
+            || !self.synthetic_anchor_split_arc_ids.is_empty()
     }
 }
 
@@ -7900,13 +8045,28 @@ impl RendererTransitionShapes {
 fn renderer_transition_shapes(
     projection: &FlatProjection,
     frozen_units: &[FrozenUnit],
+    coverage_ordinal: Option<u64>,
+    synthetic_todo_anchor_mid: Option<&str>,
 ) -> RendererTransitionShapes {
     let frozen_targets = frozen_units
         .iter()
         .filter_map(|unit| unit.key.strip_prefix(RED_KEY_PREFIX))
         .collect::<HashSet<_>>();
+    let split_coverage_arc_ids = split_coverage_tool_arcs(projection, coverage_ordinal)
+        .into_iter()
+        .map(|arc| arc.arc_id)
+        .collect();
+    let synthetic_anchor_split_arc_ids =
+        synthetic_todo_split_arcs(projection, synthetic_todo_anchor_mid)
+            .into_iter()
+            .map(|arc| arc.arc_id)
+            .collect();
     if frozen_targets.is_empty() {
-        return RendererTransitionShapes::default();
+        return RendererTransitionShapes {
+            split_coverage_arc_ids,
+            synthetic_anchor_split_arc_ids,
+            ..Default::default()
+        };
     }
 
     let reasoning_ineligible_arcs = projection_reasoning_ineligible_arc_ids(projection);
@@ -7954,6 +8114,8 @@ fn renderer_transition_shapes(
     RendererTransitionShapes {
         poisoned_reasoning_arc_ids,
         unmatched_tool_pair_call_ids,
+        split_coverage_arc_ids,
+        synthetic_anchor_split_arc_ids,
     }
 }
 
@@ -7961,6 +8123,15 @@ fn transition_consumed(core: &CoreState) -> bool {
     core.frozen_units
         .iter()
         .any(|unit| unit.key == TRANSITION_CONSUMED_KEY)
+}
+
+fn transition_renderer_active(core: &CoreState) -> bool {
+    core.frozen_units.iter().any(|unit| {
+        matches!(
+            unit.key.as_str(),
+            LEGACY_TRANSITION_CONSUMED_KEY | TRANSITION_CONSUMED_KEY
+        )
+    })
 }
 
 fn transition_consumed_unit() -> FrozenUnit {
@@ -8285,6 +8456,62 @@ fn duplicate_tool_use_locations(messages: &[ServedMessage]) -> Vec<(String, usiz
     duplicates
 }
 
+#[cfg(test)]
+fn assert_no_orphaned_tool_arcs(messages: &[ServedMessage]) {
+    let external_calls = |message: &ServedMessage| {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match &block.kind {
+                ck_wire::CkKind::ToolCall {
+                    id,
+                    provider_executed: false,
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let external_results = |message: &ServedMessage| {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match &block.kind {
+                ck_wire::CkKind::ToolResult { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut seen_calls = HashMap::<String, usize>::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        let calls = external_calls(message);
+        for id in &calls {
+            *seen_calls.entry(id.clone()).or_default() += 1;
+        }
+        for id in external_results(message) {
+            let count = seen_calls.entry(id.clone()).or_default();
+            assert!(
+                *count > 0,
+                "unexpected tool_use_id found in tool_result blocks: {id}. Each tool_result block must have a corresponding tool_use."
+            );
+            *count -= 1;
+        }
+
+        let same_message_results = external_results(message);
+        let next_message_results = messages
+            .get(message_index + 1)
+            .map(&external_results)
+            .unwrap_or_default();
+        for id in calls {
+            assert!(
+                same_message_results.contains(&id) || next_message_results.contains(&id),
+                "tool_use ids were found without tool_result blocks immediately after: {id}. Each tool_use block must have a corresponding tool_result block in the next message."
+            );
+        }
+    }
+}
+
 /// Last-resort provider-validity belt. The normal ingress and render paths must keep tool-use ids
 /// unique; debug and test builds fail at the first violation so the originating path is fixed.
 /// Release builds report every violation and remove only later owners (plus an otherwise orphaned
@@ -8425,7 +8652,7 @@ fn build_output(
         &BTreeMap::new(),
         meta.reasoning_cleared_through_tag
             .max(meta.reasoning_cleared_through_ordinal),
-        transition_consumed(core),
+        transition_renderer_active(core),
         None,
         true,
     )
@@ -8598,6 +8825,14 @@ fn build_output_with_tags_inner(
     } else {
         meta.coverage_ordinal
     };
+    let split_coverage_invocation_mids = if renderer_transition_active {
+        split_coverage_tool_arcs(projection, output_coverage)
+            .into_iter()
+            .map(|arc| arc.invocation_mid)
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
     let serializer_profile = SerializerProfile::parse(&req.serializer_profile);
 
     if synthetic_todo_enabled {
@@ -8631,6 +8866,11 @@ fn build_output_with_tags_inner(
         }
     }
 
+    let synthetic_todo_render_anchor = meta
+        .synthetic_todo
+        .as_ref()
+        .and_then(|pair| pair.anchor_mid.as_deref())
+        .map(|anchor| synthetic_todo_render_anchor_mid(projection, anchor));
     let mut inserted_synthetic_todo = false;
     let tail_loop_started_at = Instant::now();
     for msg in req
@@ -8646,7 +8886,12 @@ fn build_output_with_tags_inner(
             .as_deref()
             .and_then(split_block_id)
             .is_some_and(|(anchor_mid, _)| anchor_mid == msg.mid);
-        if !is_tail(msg.ordinal, output_coverage) && !keep_leading_system && !keep_lineage_anchor {
+        let keep_split_invocation = split_coverage_invocation_mids.contains(msg.mid.as_str());
+        if !is_tail(msg.ordinal, output_coverage)
+            && !keep_leading_system
+            && !keep_lineage_anchor
+            && !keep_split_invocation
+        {
             continue;
         }
 
@@ -8852,11 +9097,10 @@ fn build_output_with_tags_inner(
         out.push(served);
 
         if synthetic_todo_enabled && !inserted_synthetic_todo {
-            if let Some(pair) = meta
-                .synthetic_todo
-                .as_ref()
-                .filter(|pair| pair.anchor_mid.as_deref() == Some(msg.mid.as_str()))
-            {
+            if let Some(pair) = meta.synthetic_todo.as_ref().filter(|pair| {
+                pair.anchor_mid.is_some()
+                    && synthetic_todo_render_anchor.as_deref() == Some(msg.mid.as_str())
+            }) {
                 for (suffix, message) in [("call", &pair.assistant_msg), ("result", &pair.tool_msg)]
                 {
                     let key = format!("todo:{}:{suffix}", pair.call_id);
@@ -10224,7 +10468,7 @@ mod tests {
 
     fn todowrite_arc(mid: &str, call_ordinal: u64) -> Vec<CkIngressMessage> {
         vec![
-            todowrite_call(mid, call_ordinal, json!([])),
+            open_todowrite_call(mid, call_ordinal, json!([])),
             tool_result(
                 &format!("{mid}_result"),
                 call_ordinal + 1,
@@ -10243,11 +10487,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn served_arc_assertion_rejects_both_provider_refusal_shapes() {
+        let orphan_result = vec![ServedMessage::from_message(
+            tool_result("orphan-result", 2, "missing-call", "output").ck,
+        )];
+        assert!(std::panic::catch_unwind(|| assert_no_orphaned_tool_arcs(&orphan_result)).is_err());
+
+        let unanswered_call = vec![
+            ServedMessage::from_message(assistant_tool_call("call", 1, "missing-result").ck),
+            ServedMessage::from_message(item("next", 2, "next message").ck),
+        ];
+        assert!(
+            std::panic::catch_unwind(|| assert_no_orphaned_tool_arcs(&unanswered_call)).is_err()
+        );
+
+        let answered = vec![
+            ServedMessage::from_message(assistant_tool_call("call", 1, "paired").ck),
+            ServedMessage::from_message(tool_result("result", 2, "paired", "output").ck),
+        ];
+        assert_no_orphaned_tool_arcs(&answered);
+    }
+
     fn run(s: &McStore, req: &TransformRequest, d: &[ReductionDecision]) -> TransformResponse {
         let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
         ctx.injected_reductions = d.to_vec();
         let response = transform(s, req, &ctx).unwrap();
         assert_no_duplicate_tool_use_ids(response.messages());
+        assert_no_orphaned_tool_arcs(response.messages());
         response
     }
 
@@ -10661,7 +10928,8 @@ mod tests {
         }
     }
 
-    fn todowrite_call(mid: &str, ordinal: u64, todos: Value) -> CkIngressMessage {
+    /// Call-only half used only by fixtures that append the answering result as the next message.
+    fn open_todowrite_call(mid: &str, ordinal: u64, todos: Value) -> CkIngressMessage {
         CkIngressMessage {
             mid: mid.to_string(),
             ordinal,
@@ -10681,6 +10949,23 @@ mod tests {
                 },
             ),
         }
+    }
+
+    /// Completed OpenCode tool-part shape: decode projects its call and result into one CK message.
+    fn todowrite_call(mid: &str, ordinal: u64, todos: Value) -> CkIngressMessage {
+        let mut message = open_todowrite_call(mid, ordinal, todos);
+        message
+            .ck
+            .content
+            .push(ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolResult {
+                id: format!("call_{mid}"),
+                tool_name: "todowrite".to_string(),
+                output: ck_wire::CkToolOutput::bare(ck_wire::CkOutputKind::Text {
+                    text: "completed todowrite".to_string(),
+                }),
+                provider_executed: false,
+            }));
+        message
     }
 
     fn empty_message(mid: &str, ordinal: u64) -> CkIngressMessage {
@@ -21269,6 +21554,81 @@ mod tests {
     }
 
     #[test]
+    fn stored_split_coverage_arc_salts_once_and_never_serves_an_orphaned_result() {
+        // These adapted messages model coverage ending at call 123 while its result remains live at
+        // 124, making that result the first real tail message. Adapted bytes carry no provider verdict.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let call = assistant_tool_call("split-call", 123, "toolu_split");
+        store
+            .replace_compartments(
+                "split-coverage",
+                &[comp(
+                    1,
+                    1,
+                    123,
+                    "split-call#0",
+                    "historical coverage ending at the invocation",
+                )],
+            )
+            .unwrap();
+
+        let initial = cc_req("split-coverage", "cfg0", vec![call.clone()]);
+        assert_eq!(run(&store, &initial, &spine()).action, "HARD");
+        let damaged = store.load("split-coverage").unwrap();
+        assert_eq!(damaged.meta.coverage_ordinal, Some(123));
+        assert!(!transition_consumed(&damaged.core));
+
+        let completed_messages = vec![
+            call,
+            tool_result("split-result", 124, "toolu_split", "completed tool output"),
+        ];
+        let request = cc_req("split-coverage", "cfg0", completed_messages.clone());
+        let projection = project_messages(&completed_messages).unwrap();
+        let hypothetical_old = build_output(
+            &damaged.core,
+            &damaged.meta,
+            &projection,
+            &request,
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(hypothetical_old.len(), 3);
+        assert!(matches!(
+            hypothetical_old[2].content[0].kind,
+            ck_wire::CkKind::ToolResult { .. }
+        ));
+        assert!(hypothetical_old[..2].iter().all(|message| {
+            message
+                .content
+                .iter()
+                .all(|block| !matches!(block.kind, ck_wire::CkKind::ToolCall { .. }))
+        }));
+
+        let repaired = run(&store, &request, &spine());
+        assert_eq!(repaired.action, "HARD");
+        assert_eq!(
+            repaired.materialize_reason.as_deref(),
+            Some("renderer_transition")
+        );
+        assert!(transition_consumed(
+            &store.load("split-coverage").unwrap().core
+        ));
+        assert!(message_index(&repaired, "split-call") < message_index(&repaired, "split-result"));
+        assert_no_orphaned_tool_arcs(repaired.messages());
+
+        let replay = run(&store, &request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_vec(replay.messages()).unwrap(),
+            serde_json::to_vec(repaired.messages()).unwrap()
+        );
+        assert_no_orphaned_tool_arcs(replay.messages());
+    }
+
+    #[test]
     fn poisoned_reasoning_transition_salts_one_hard_and_preserves_row_version_monotonicity() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -21402,7 +21762,7 @@ mod tests {
         let started = Instant::now();
         for _ in 0..10_000 {
             assert_eq!(
-                renderer_transition_shapes(&large_projection, &ordinary_units),
+                renderer_transition_shapes(&large_projection, &ordinary_units, None, None),
                 RendererTransitionShapes::default()
             );
         }
@@ -21866,7 +22226,14 @@ mod tests {
         let warm =
             apply_once_with_estimator(&store, &replay_request, &context, estimate, Some(&cache))
                 .unwrap();
-        assert_eq!(warm.response.action, "SOFT+");
+        // Replay would insert the stored synthetic pair between a live call and its result.
+        // Return HARD instead of the previous unchanged response so later arrays keep that live
+        // tool exchange adjacent, as required by the gateway's immediate-answer contract.
+        assert_eq!(warm.response.action, "HARD");
+        assert_eq!(
+            warm.response.materialize_reason.as_deref(),
+            Some("renderer_transition")
+        );
         assert_no_duplicate_tool_use_ids(warm.response.messages());
         assert!(
             cache
