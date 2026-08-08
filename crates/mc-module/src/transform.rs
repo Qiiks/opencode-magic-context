@@ -2030,11 +2030,11 @@ fn apply_once(
             .as_ref()
             .and_then(|pair| pair.anchor_mid.as_deref()),
     );
-    let transition_was_consumed = transition_consumed(&loaded.core);
+    let detected_transition_classes = transition_shapes.classes();
+    let consumed_transition_classes = transition_consumed_classes(&loaded.core);
     let transition_due = loaded.meta.initialized
         && !req.is_subagent
-        && !transition_was_consumed
-        && transition_shapes.affected();
+        && !detected_transition_classes.is_subset(&consumed_transition_classes);
     timings.transition_detection = elapsed_ms(transition_detection_started_at);
     let lineage_anchor_mid = loaded
         .meta
@@ -3669,24 +3669,32 @@ fn apply_once(
         core.reconcile_pending = true;
     }
     let transition_post_detection_started_at = Instant::now();
-    let transition_newly_consumed = is_bust_pass
-        && !transition_was_consumed
-        && renderer_transition_shapes(
-            &projection,
-            &core.frozen_units,
-            meta.coverage_ordinal,
-            meta.synthetic_todo
-                .as_ref()
-                .and_then(|pair| pair.anchor_mid.as_deref()),
-        )
-        .affected();
+    let post_transition_classes = renderer_transition_shapes(
+        &projection,
+        &core.frozen_units,
+        meta.coverage_ordinal,
+        meta.synthetic_todo
+            .as_ref()
+            .and_then(|pair| pair.anchor_mid.as_deref()),
+    )
+    .classes();
+    let mut newly_consumed_transition_classes = BTreeSet::new();
+    if is_bust_pass {
+        newly_consumed_transition_classes.extend(
+            detected_transition_classes
+                .union(&post_transition_classes)
+                .filter(|class| !consumed_transition_classes.contains(class))
+                .copied(),
+        );
+    }
     timings.transition_detection += elapsed_ms(transition_post_detection_started_at);
+    let transition_newly_consumed = !newly_consumed_transition_classes.is_empty();
     let transition_committed = transition_renderer_active(&core) || transition_newly_consumed;
-    preserve_transition_consumed_marker(
-        &mut core,
-        transition_was_consumed || transition_newly_consumed,
-    );
     if transition_newly_consumed {
+        let mut committed_transition_classes = consumed_transition_classes.clone();
+        committed_transition_classes.extend(newly_consumed_transition_classes);
+        preserve_transition_consumed_marker(&mut core, &committed_transition_classes);
+
         // Record consumption after any bust that renders an affected shape. If the shape first
         // appeared during a pass that was already invalidating the cache for another reason, its
         // changed bytes rode that invalidation and replay must not trigger a second one.
@@ -8021,6 +8029,24 @@ fn synthetic_todo_render_anchor_mid(projection: &FlatProjection, anchor_mid: &st
         .unwrap_or_else(|| anchor_mid.to_string())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RendererTransitionClass {
+    PoisonedReasoning,
+    UnmatchedPair,
+    SplitCoverage,
+    SyntheticAnchorSplit,
+}
+
+fn v1_transition_classes() -> BTreeSet<RendererTransitionClass> {
+    [
+        RendererTransitionClass::PoisonedReasoning,
+        RendererTransitionClass::UnmatchedPair,
+    ]
+    .into_iter()
+    .collect()
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct RendererTransitionShapes {
     poisoned_reasoning_arc_ids: Vec<String>,
@@ -8030,11 +8056,21 @@ struct RendererTransitionShapes {
 }
 
 impl RendererTransitionShapes {
-    fn affected(&self) -> bool {
-        !self.poisoned_reasoning_arc_ids.is_empty()
-            || !self.unmatched_tool_pair_call_ids.is_empty()
-            || !self.split_coverage_arc_ids.is_empty()
-            || !self.synthetic_anchor_split_arc_ids.is_empty()
+    fn classes(&self) -> BTreeSet<RendererTransitionClass> {
+        let mut classes = BTreeSet::new();
+        if !self.poisoned_reasoning_arc_ids.is_empty() {
+            classes.insert(RendererTransitionClass::PoisonedReasoning);
+        }
+        if !self.unmatched_tool_pair_call_ids.is_empty() {
+            classes.insert(RendererTransitionClass::UnmatchedPair);
+        }
+        if !self.split_coverage_arc_ids.is_empty() {
+            classes.insert(RendererTransitionClass::SplitCoverage);
+        }
+        if !self.synthetic_anchor_split_arc_ids.is_empty() {
+            classes.insert(RendererTransitionClass::SyntheticAnchorSplit);
+        }
+        classes
     }
 }
 
@@ -8119,10 +8155,33 @@ fn renderer_transition_shapes(
     }
 }
 
+fn transition_consumed_classes(core: &CoreState) -> BTreeSet<RendererTransitionClass> {
+    let mut classes = BTreeSet::new();
+    for unit in &core.frozen_units {
+        if unit.key == LEGACY_TRANSITION_CONSUMED_KEY {
+            classes.extend(v1_transition_classes());
+            continue;
+        }
+        if unit.key != TRANSITION_CONSUMED_KEY {
+            continue;
+        }
+
+        // An empty payload is the legacy boolean representation. It records only poisoned-reasoning
+        // and unmatched-pair adoption, leaving split-coverage classes eligible for invalidation.
+        if unit.frozen_payload.trim().is_empty() {
+            classes.extend(v1_transition_classes());
+            continue;
+        }
+        match serde_json::from_str::<BTreeSet<RendererTransitionClass>>(&unit.frozen_payload) {
+            Ok(recorded) => classes.extend(recorded),
+            Err(_) => classes.extend(v1_transition_classes()),
+        }
+    }
+    classes
+}
+
 fn transition_consumed(core: &CoreState) -> bool {
-    core.frozen_units
-        .iter()
-        .any(|unit| unit.key == TRANSITION_CONSUMED_KEY)
+    !transition_consumed_classes(core).is_empty()
 }
 
 fn transition_renderer_active(core: &CoreState) -> bool {
@@ -8134,19 +8193,30 @@ fn transition_renderer_active(core: &CoreState) -> bool {
     })
 }
 
-fn transition_consumed_unit() -> FrozenUnit {
+fn transition_consumed_unit(classes: &BTreeSet<RendererTransitionClass>) -> FrozenUnit {
     FrozenUnit {
         key: TRANSITION_CONSUMED_KEY.to_string(),
         kind: "migration-marker".to_string(),
-        frozen_payload: String::new(),
+        frozen_payload: serde_json::to_string(classes)
+            .expect("renderer transition classes are serializable"),
         durability_class: mc_core::DurabilityClass::Lineage,
         reset_rule: String::new(),
     }
 }
 
-fn preserve_transition_consumed_marker(core: &mut CoreState, consumed: bool) {
-    if consumed && !transition_consumed(core) {
-        core.frozen_units.push(transition_consumed_unit());
+fn preserve_transition_consumed_marker(
+    core: &mut CoreState,
+    classes: &BTreeSet<RendererTransitionClass>,
+) {
+    let payload = serde_json::to_string(classes).expect("renderer transition classes serialize");
+    if let Some(unit) = core
+        .frozen_units
+        .iter_mut()
+        .find(|unit| unit.key == TRANSITION_CONSUMED_KEY)
+    {
+        unit.frozen_payload = payload;
+    } else {
+        core.frozen_units.push(transition_consumed_unit(classes));
     }
 }
 
@@ -10528,6 +10598,12 @@ mod tests {
         store
             .commit(session_id, loaded.row_version, &loaded.core, &loaded.meta)
             .unwrap()
+    }
+
+    fn boolean_v1_transition_consumed_unit() -> FrozenUnit {
+        let mut unit = transition_consumed_unit(&v1_transition_classes());
+        unit.frozen_payload.clear();
+        unit
     }
 
     #[test]
@@ -21607,15 +21683,32 @@ mod tests {
                 .all(|block| !matches!(block.kind, ck_wire::CkKind::ToolCall { .. }))
         }));
 
+        let pre_resalt_row = append_historical_frozen_reductions(
+            &store,
+            "split-coverage",
+            &[boolean_v1_transition_consumed_unit()],
+        );
+        assert_eq!(
+            transition_consumed_classes(&store.load("split-coverage").unwrap().core),
+            v1_transition_classes(),
+            "the deployed boolean marker must consume only v1 shape classes"
+        );
+
         let repaired = run(&store, &request, &spine());
         assert_eq!(repaired.action, "HARD");
         assert_eq!(
             repaired.materialize_reason.as_deref(),
             Some("renderer_transition")
         );
-        assert!(transition_consumed(
-            &store.load("split-coverage").unwrap().core
-        ));
+        let repaired_state = store.load("split-coverage").unwrap();
+        let repaired_row = repaired_state.row_version.unwrap();
+        assert!(pre_resalt_row < repaired_row);
+        let mut expected_classes = v1_transition_classes();
+        expected_classes.insert(RendererTransitionClass::SplitCoverage);
+        assert_eq!(
+            transition_consumed_classes(&repaired_state.core),
+            expected_classes
+        );
         assert!(message_index(&repaired, "split-call") < message_index(&repaired, "split-result"));
         assert_no_orphaned_tool_arcs(repaired.messages());
 
@@ -21625,6 +21718,7 @@ mod tests {
             serde_json::to_vec(replay.messages()).unwrap(),
             serde_json::to_vec(repaired.messages()).unwrap()
         );
+        assert!(store.load("split-coverage").unwrap().row_version.unwrap() >= repaired_row);
         assert_no_orphaned_tool_arcs(replay.messages());
     }
 
@@ -21723,6 +21817,97 @@ mod tests {
                 .unwrap()
                 >= post_salt_row
         );
+    }
+
+    #[test]
+    fn consumed_v1_shape_without_v2_shape_does_not_refire_or_change_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let messages = vec![
+            reasoning_tool_shell_message("consumed-reasoning-call", 1, "consumed-call", false),
+            tool_result(
+                "consumed-reasoning-result",
+                2,
+                "consumed-call",
+                "historical tool output",
+            ),
+            item("consumed-tail", 3, "stable tail"),
+        ];
+        let request = opencode_req("consumed-v1-only", "cfg0", messages.clone());
+        assert_eq!(run(&store, &request, &spine()).action, "HARD");
+        append_historical_frozen_reductions(
+            &store,
+            "consumed-v1-only",
+            &[
+                red_unit(
+                    "consumed-reasoning-call#1",
+                    "skeleton",
+                    "[historical call reduction]",
+                ),
+                red_unit(
+                    "consumed-reasoning-result#0",
+                    "drop",
+                    "[historical result reduction]",
+                ),
+                boolean_v1_transition_consumed_unit(),
+            ],
+        );
+
+        let before = store.load("consumed-v1-only").unwrap();
+        assert_eq!(
+            transition_consumed_classes(&before.core),
+            v1_transition_classes()
+        );
+        let projection = project_messages(&messages).unwrap();
+        let golden = build_output(
+            &before.core,
+            &before.meta,
+            &projection,
+            &request,
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        let golden_bytes = serde_json::to_vec(&golden).unwrap();
+
+        let replay =
+            transform_with_projection(&store, &request, &pctx("git:proj", "/nonexistent-docs", 0))
+                .unwrap();
+        assert_eq!(replay.response.action, "SOFT+");
+        assert_ne!(
+            replay.response.materialize_reason.as_deref(),
+            Some("renderer_transition")
+        );
+        assert_eq!(
+            serde_json::to_vec(replay.response.messages()).unwrap(),
+            golden_bytes
+        );
+        let after = store.load("consumed-v1-only").unwrap();
+        assert!(after.row_version.unwrap() >= before.row_version.unwrap());
+        assert_eq!(
+            transition_consumed_classes(&after.core),
+            v1_transition_classes()
+        );
+        assert!(after
+            .core
+            .frozen_units
+            .iter()
+            .find(|unit| unit.key == TRANSITION_CONSUMED_KEY)
+            .is_some_and(|unit| unit.frozen_payload.is_empty()));
+    }
+
+    #[test]
+    fn legacy_transition_consumed_units_parse_as_the_v1_class_set() {
+        for key in [LEGACY_TRANSITION_CONSUMED_KEY, TRANSITION_CONSUMED_KEY] {
+            let mut core = CoreState::default();
+            let mut unit = boolean_v1_transition_consumed_unit();
+            unit.key = key.to_string();
+            core.frozen_units.push(unit);
+
+            assert_eq!(transition_consumed_classes(&core), v1_transition_classes());
+            assert!(transition_consumed(&core));
+        }
     }
 
     #[test]
@@ -21901,9 +22086,9 @@ mod tests {
     }
 
     #[test]
-    fn combined_reasoning_and_unmatched_pair_share_one_transition_fold() {
+    fn combined_v1_and_v2_shapes_share_one_transition_fold() {
         let native_message = json!({
-            "absolute_ordinal": 1,
+            "absolute_ordinal": 3,
             "info": { "id": "combined-message", "role": "assistant" },
             "parts": [
                 {
@@ -21935,12 +22120,26 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        let request = active_opencode_req(
-            "combined-transition",
-            "cfg0",
-            vec![projected, item("combined-tail", 2, "stable tail")],
+        let split_call = assistant_tool_call("combined-split-call", 1, "combined-split-id");
+        store
+            .replace_compartments(
+                "combined-transition",
+                &[comp(
+                    1,
+                    1,
+                    1,
+                    "combined-split-call#0",
+                    "historical coverage ending at the invocation",
+                )],
+            )
+            .unwrap();
+        let initial = active_opencode_req("combined-transition", "cfg0", vec![split_call.clone()]);
+        assert_eq!(run(&store, &initial, &spine()).action, "HARD");
+        assert!(
+            transition_consumed_classes(&store.load("combined-transition").unwrap().core)
+                .is_empty()
         );
-        assert_eq!(run(&store, &request, &spine()).action, "HARD");
+
         append_historical_frozen_reductions(
             &store,
             "combined-transition",
@@ -21949,23 +22148,61 @@ mod tests {
                 red_unit("combined-message#2", "drop", "poisoned result"),
             ],
         );
+        let request = active_opencode_req(
+            "combined-transition",
+            "cfg0",
+            vec![
+                split_call,
+                tool_result(
+                    "combined-split-result",
+                    2,
+                    "combined-split-id",
+                    "completed split output",
+                ),
+                projected,
+                item("combined-tail", 4, "stable tail"),
+            ],
+        );
+        let before = store.load("combined-transition").unwrap();
+        let projection = project_messages(&request.messages).unwrap();
+        let detected = renderer_transition_shapes(
+            &projection,
+            &before.core.frozen_units,
+            before.meta.coverage_ordinal,
+            None,
+        )
+        .classes();
+        let mut expected_classes = v1_transition_classes();
+        expected_classes.insert(RendererTransitionClass::SplitCoverage);
+        assert_eq!(detected, expected_classes);
 
         let folded =
             transform_with_projection(&store, &request, &pctx("git:proj", "/nonexistent-docs", 0))
                 .unwrap();
         assert_eq!(folded.response.action, "HARD");
-        assert!(folded.transition_consumed);
         assert_eq!(
-            store
-                .load("combined-transition")
-                .unwrap()
+            folded.response.materialize_reason.as_deref(),
+            Some("renderer_transition")
+        );
+        assert!(folded.transition_consumed);
+        let folded_state = store.load("combined-transition").unwrap();
+        assert_eq!(
+            transition_consumed_classes(&folded_state.core),
+            expected_classes
+        );
+        assert_eq!(
+            folded_state
                 .core
                 .frozen_units
                 .iter()
                 .filter(|unit| unit.key == TRANSITION_CONSUMED_KEY)
                 .count(),
             1,
-            "both affected shapes must share one durable transition fold"
+            "all affected classes must share one durable transition fold"
+        );
+        assert!(
+            message_index(&folded.response, "combined-split-call")
+                < message_index(&folded.response, "combined-split-result")
         );
         let served_json = serde_json::to_string(folded.response.messages()).unwrap();
         assert!(served_json.contains("signed transition reasoning"));
