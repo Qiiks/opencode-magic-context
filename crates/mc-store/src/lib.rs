@@ -3186,8 +3186,9 @@ pub struct ModuleMeta {
     /// `None` identifies metadata written before the component watermark was persisted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub m1_compartment_seq: Option<i64>,
-    /// Consecutive coherent divergence observations suppressed by a pending compartment revision.
-    /// Legacy or damaged rows eventually escalate instead of remaining excluded forever.
+    /// Counted coherent divergence observations suppressed by a pending compartment revision.
+    /// Active historian and wrapup publication windows retain this value without incrementing or
+    /// resetting it; legacy or damaged rows resume escalation after those bounded windows close.
     #[serde(default, skip_serializing_if = "u8_is_zero")]
     pub boundary_divergence_pending_count: u8,
     /// The last materializing pass had cross-session memory disabled. The negative form keeps

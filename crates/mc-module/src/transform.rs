@@ -24,7 +24,7 @@ use crate::injection::{
 use crate::m0_compose::compose_m0_from_store;
 use crate::m1_compose::{
     claim_and_render_notes, compose_m1_from_store, m1_revision_signal_parts_for_pass_timed,
-    M1RevisionReadTimings,
+    M1RevisionReadTimings, M1RevisionSignal,
 };
 use crate::memory_render::M1_PLACEHOLDER;
 use crate::scheduler::{
@@ -442,6 +442,10 @@ pub struct ProducerContext<'a> {
     /// Ordinary reductions and deferred m1 consumption yield so publication is coalesced
     /// into the next materializing pass.
     pub historian_active: bool,
+    /// True while `session.wrapup` owns this session's process-local round latch. The latch guard
+    /// is bounded by the 3,800-second `historian::MAX_WRAPUP_REQUEST_BUDGET` and is released on
+    /// every terminal path, so a damaged row delayed by this signal becomes eligible afterward.
+    pub wrapup_active: bool,
     #[cfg(test)]
     pub injected_reductions: Vec<ReductionDecision>,
 }
@@ -2388,7 +2392,7 @@ fn apply_once(
             m1_visibility_cutoff_ms,
             Some(&mut m1_revision_read_timings),
         )?;
-        if revalidated.revision != m1_signal.revision {
+        if post_end_revision_inputs_moved(&m1_signal, &revalidated) {
             divergence_candidate = None;
             divergence_inputs_moved = true;
         }
@@ -2404,27 +2408,35 @@ fn apply_once(
         .map_or(m1_signal.revision == loaded.meta.m1_revision, |applied| {
             applied == m1_signal.max_compartment_seq
         });
-    let mut boundary_divergence_pending_count = if req.is_subagent || divergence_inputs_moved {
-        loaded.meta.boundary_divergence_pending_count
-    } else if divergence_candidate.is_some() {
-        if boundary_divergence_retry || compartment_revision_matches {
-            0
+    // A non-idle durable historian phase and the process-local wrapup latch are state proofs that
+    // publication may legitimately be ahead of rendered coverage. Retain prior evidence while
+    // either proof holds: incrementing would manufacture a provider-cache bust, while resetting
+    // would forget a genuinely damaged row. A damaged row seen during wrapup waits for the latch
+    // guard to end, bounded by the 3,800-second wrapup request budget documented on the context.
+    let active_legitimate_publication_window = ctx.historian_active || ctx.wrapup_active;
+    let mut boundary_divergence_pending_count =
+        if req.is_subagent || divergence_inputs_moved || active_legitimate_publication_window {
+            loaded.meta.boundary_divergence_pending_count
+        } else if divergence_candidate.is_some() {
+            if boundary_divergence_retry || compartment_revision_matches {
+                0
+            } else {
+                loaded
+                    .meta
+                    .boundary_divergence_pending_count
+                    .saturating_add(1)
+                    .min(BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT)
+            }
         } else {
-            loaded
-                .meta
-                .boundary_divergence_pending_count
-                .saturating_add(1)
-                .min(BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT)
-        }
-    } else {
-        0
-    };
+            0
+        };
     let boundary_divergence_recut = divergence_candidate.filter(|_| {
         boundary_divergence_retry
             || compartment_revision_matches
-            || boundary_divergence_pending_count >= BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT
+            || (!active_legitimate_publication_window
+                && boundary_divergence_pending_count >= BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT)
     });
-    if boundary_divergence_recut.is_some() {
+    if boundary_divergence_recut.is_some() && !active_legitimate_publication_window {
         boundary_divergence_pending_count = 0;
     }
     let mut current_m1_digest = m1_signal.revision;
@@ -3512,7 +3524,7 @@ fn apply_once(
             }
         }
     }
-    if is_bust_pass {
+    if is_bust_pass && !active_legitimate_publication_window {
         meta.boundary_divergence_pending_count = 0;
     }
     if lineage_anchor_failure {
@@ -4462,6 +4474,12 @@ fn protected_tail_floor_allowance(
     newest_live
         .checked_sub(floor_ordinal)
         .map_or(0, |span| span.saturating_add(1))
+}
+
+fn post_end_revision_inputs_moved(before: &M1RevisionSignal, after: &M1RevisionSignal) -> bool {
+    // Sequence is the structural publication watermark. Also compare the revision so memory,
+    // note, or profile changes invalidate the aggregate observation when sequence is unchanged.
+    before.max_compartment_seq != after.max_compartment_seq || before.revision != after.revision
 }
 
 fn detect_boundary_divergence_candidate(
@@ -9797,6 +9815,7 @@ mod tests {
             observed_last_response_at_ms: None,
             guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
             historian_active: false,
+            wrapup_active: false,
             injected_reductions: Vec::new(),
         }
     }
@@ -13573,6 +13592,36 @@ mod tests {
     }
 
     #[test]
+    fn post_end_revalidation_detects_a_sequence_move_even_when_the_digest_collides() {
+        let before = M1RevisionSignal {
+            revision: 0xfeed,
+            external_revision: 0xbeef,
+            max_compartment_seq: 47,
+            max_memory_id: 9,
+            max_memory_mutation_id: 3,
+            note_status_version: 2,
+            user_profile_version: 1,
+        };
+        let sequence_collision = M1RevisionSignal {
+            max_compartment_seq: 48,
+            ..before
+        };
+        assert!(
+            post_end_revision_inputs_moved(&before, &sequence_collision),
+            "the structural sequence watermark must not be hidden by a digest collision"
+        );
+
+        let digest_only_move = M1RevisionSignal {
+            revision: before.revision + 1,
+            ..before
+        };
+        assert!(
+            post_end_revision_inputs_moved(&before, &digest_only_move),
+            "the digest remains a second revalidation leg"
+        );
+    }
+
+    #[test]
     fn legacy_revision_exclusion_escalates_despite_project_memory_churn() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -13649,6 +13698,84 @@ mod tests {
         assert_eq!(
             store
                 .load("astro-stale-component")
+                .unwrap()
+                .meta
+                .boundary_divergence_pending_count,
+            0
+        );
+    }
+
+    #[test]
+    fn active_wrapup_retains_divergence_count_until_the_window_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let request = seed_astro_divergence(&store, "astro-wrapup-window", 2_402);
+        let loaded = store.load("astro-wrapup-window").unwrap();
+        let mut stale = loaded.meta.clone();
+        stale.m1_revision ^= u64::MAX;
+        stale.m1_compartment_seq = Some(1);
+        store
+            .commit(
+                "astro-wrapup-window",
+                loaded.row_version,
+                &loaded.core,
+                &stale,
+            )
+            .unwrap();
+
+        let first_counted = run(&store, &request, &spine());
+        assert_eq!(first_counted.action, "SOFT+");
+        assert_eq!(
+            store
+                .load("astro-wrapup-window")
+                .unwrap()
+                .meta
+                .boundary_divergence_pending_count,
+            1
+        );
+
+        let mut context = pctx("git:proj", "/nonexistent-docs", 0);
+        context.wrapup_active = true;
+        for _ in 0..usize::from(BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT) + 1 {
+            let deferred = transform(&store, &request, &context).unwrap();
+            assert_eq!(deferred.action, "SOFT+");
+            assert_ne!(
+                deferred.materialize_reason.as_deref(),
+                Some("boundary_divergence_recut")
+            );
+            assert_eq!(
+                store
+                    .load("astro-wrapup-window")
+                    .unwrap()
+                    .meta
+                    .boundary_divergence_pending_count,
+                1,
+                "an active wrapup retains rather than increments or resets the counter"
+            );
+        }
+
+        context.wrapup_active = false;
+        for expected_count in 2..BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT {
+            let deferred = transform(&store, &request, &context).unwrap();
+            assert_eq!(deferred.action, "SOFT+");
+            assert_eq!(
+                store
+                    .load("astro-wrapup-window")
+                    .unwrap()
+                    .meta
+                    .boundary_divergence_pending_count,
+                expected_count
+            );
+        }
+        let escalated = transform(&store, &request, &context).unwrap();
+        assert_eq!(escalated.action, "HARD");
+        assert_eq!(
+            escalated.materialize_reason.as_deref(),
+            Some("boundary_divergence_recut")
+        );
+        assert_eq!(
+            store
+                .load("astro-wrapup-window")
                 .unwrap()
                 .meta
                 .boundary_divergence_pending_count,

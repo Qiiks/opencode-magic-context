@@ -1837,6 +1837,7 @@ mod tests {
             observed_last_response_at_ms: None,
             guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
             historian_active: false,
+            wrapup_active: false,
             injected_reductions: Vec::new(),
         }
     }

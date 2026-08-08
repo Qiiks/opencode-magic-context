@@ -2782,6 +2782,13 @@ impl McHandler {
             .unwrap_or(false)
     }
 
+    fn wrapup_active(&self, session_id: &str) -> bool {
+        self.wrapup_sessions
+            .lock()
+            .expect("wrapup sessions mutex")
+            .contains_key(session_id)
+    }
+
     fn observed_last_response_at_ms(&self, store: &McStore, session_id: &str) -> Option<i64> {
         let mut observations = self
             .scheduler_observations
@@ -5998,6 +6005,7 @@ impl McHandler {
                     .observed_last_response_at_ms(&store, &parsed.session_id),
                 guidance_date: Some(self.guidance_date_for_transform(&parsed.session_id, pass_now)),
                 historian_active: self.historian_active(&store, &parsed.session_id),
+                wrapup_active: self.wrapup_active(&parsed.session_id),
                 #[cfg(test)]
                 injected_reductions: self
                     .reduction_injection
@@ -18538,6 +18546,7 @@ mod tests {
         let guard = handler
             .try_claim_wrapup_session("ses")
             .expect("first claim");
+        assert!(handler.wrapup_active("ses"));
         let busy = tool_body(
             handler
                 .dispatch_value(
@@ -18547,6 +18556,7 @@ mod tests {
                 .await,
         );
         drop(guard);
+        assert!(!handler.wrapup_active("ses"));
         assert_eq!(busy["disposition"], json!("already_in_progress"), "{busy}");
         assert!(
             busy["rounds"].is_u64(),
@@ -19748,6 +19758,7 @@ mod tests {
                 observed_last_response_at_ms: None,
                 guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
                 historian_active: false,
+                wrapup_active: false,
                 injected_reductions: Vec::new(),
             },
         )
@@ -20520,6 +20531,7 @@ mod tests {
                 observed_last_response_at_ms: None,
                 guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
                 historian_active: false,
+                wrapup_active: false,
                 injected_reductions: Vec::new(),
             },
         )
