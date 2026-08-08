@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 
 import { detectConfigFile, parseJsonc } from "../shared/jsonc-parser";
 import { setOutputReserveConfig } from "../shared/models-dev-cache";
+import type { PromptSurfaceConfig } from "../shared/prompt-surface";
 import { isCompactionEnabled, migrateLegacyAgentEnabledInMemory } from "./agent-disable";
 import {
     cortexKitProjectConfigBasePath,
@@ -82,6 +83,8 @@ export type LoadOutcome =
 
 export interface LoadResultDetailed {
     config: MagicContextPluginConfig & { configWarnings?: string[] };
+    /** USER-tier default/overrides captured before project routing is merged. */
+    registrationPromptSurface: PromptSurfaceConfig;
     loadOutcome: LoadOutcome;
     sources: {
         userConfig: LoadOutcome;
@@ -593,6 +596,7 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
 
     return {
         config,
+        registrationPromptSurface: trustedBaseConfig.prompt_surface,
         loadOutcome: combinedOutcome({ sources, substitutionFailures, recoveredTopLevelKeys }),
         sources,
         substitutionFailures,

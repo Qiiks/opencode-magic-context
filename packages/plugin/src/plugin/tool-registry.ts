@@ -11,6 +11,9 @@ import {
 import { setCtxReduceRegisteredGlobally } from "../hooks/magic-context/ctx-reduce-availability";
 import { getErrorMessage } from "../shared/error-message";
 import { log } from "../shared/logger";
+import type { PromptSurfaceConfig } from "../shared/prompt-surface";
+import type { PromptSurfaceRuntime } from "../shared/prompt-surface-runtime";
+import { createPromptSurfaceRuntime } from "../shared/prompt-surface-runtime";
 import type { Database } from "../shared/sqlite";
 import { createCtxExpandTools } from "../tools/ctx-expand";
 import { CTX_MEMORY_ACTIONS, createCtxMemoryTools } from "../tools/ctx-memory";
@@ -52,6 +55,8 @@ export function createToolRegistry(args: {
     ctx: PluginContext;
     pluginConfig: MagicContextPluginConfig;
     rustToolBackends?: RustToolBackends;
+    promptSurfaceRuntime?: PromptSurfaceRuntime;
+    registrationPromptSurface?: PromptSurfaceConfig;
 }): Record<string, ToolDefinition> {
     const { ctx, pluginConfig, rustToolBackends } = args;
 
@@ -161,11 +166,34 @@ export function createToolRegistry(args: {
             : {}),
     };
 
+    const promptSurfaceRuntime =
+        args.promptSurfaceRuntime ??
+        createPromptSurfaceRuntime({
+            harness: "opencode",
+            directory: ctx.directory,
+            warn: (message) => console.warn(`[magic-context] config warning: ${message}`),
+        });
+    // OpenCode materializes this map once per plugin process. Resolve only the
+    // registration owner's default here: model/session routes cannot safely swap
+    // provider tool text because the host exposes no session identity at this seam.
+    const registration = promptSurfaceRuntime.resolveRegistration(
+        args.registrationPromptSurface ?? pluginConfig.prompt_surface,
+    );
+    const surfacedTools = Object.fromEntries(
+        Object.entries(allTools).map(([toolId, definition]) => [
+            toolId,
+            {
+                ...definition,
+                description: registration.descriptionFor(toolId, definition.description ?? ""),
+            },
+        ]),
+    ) as Record<string, ToolDefinition>;
+
     // Patch arg schemas so property-level .describe() text survives JSON Schema serialization.
     // Without this, the LLM sees bare types with no description for each parameter.
-    for (const toolDefinition of Object.values(allTools)) {
+    for (const toolDefinition of Object.values(surfacedTools)) {
         normalizeToolArgSchemas(toolDefinition);
     }
 
-    return allTools;
+    return surfacedTools;
 }

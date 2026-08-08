@@ -92,6 +92,10 @@ import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path"
 import { setHarness } from "@magic-context/core/shared/harness";
 import { setKeepSubagents } from "@magic-context/core/shared/keep-subagents";
 import { log } from "@magic-context/core/shared/logger";
+import {
+	createPromptSurfaceGuidanceEpochCache,
+	createPromptSurfaceRuntime,
+} from "@magic-context/core/shared/prompt-surface-runtime";
 import { resolveFallbackChain } from "@magic-context/core/shared/resolve-fallbacks";
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
 
@@ -893,9 +897,17 @@ async function startPiMagicContextRuntime(
 	// them in the magic-context log. Loading never throws — bad config
 	// gracefully degrades to defaults.
 	ensureConfigLocationsMigrated(projectDir);
-	const { config, warnings, loadedFromPaths } = loadPiConfig({
-		cwd: projectDir,
+	const { config, warnings, loadedFromPaths, registrationPromptSurface } =
+		loadPiConfig({
+			cwd: projectDir,
+		});
+	const promptSurfaceRuntime = createPromptSurfaceRuntime({
+		harness: "pi",
+		directory: projectDir,
+		warn: (message) => warn(`config: ${message}`),
 	});
+	const promptSurfaceGuidanceEpochs =
+		createPromptSurfaceGuidanceEpochCache(promptSurfaceRuntime);
 	const projectIdentity =
 		resolveProjectIdentityForSession(projectDir, config.allow_home_project) ??
 		"";
@@ -1154,6 +1166,8 @@ async function startPiMagicContextRuntime(
 			resolveCurrentProjectDeps(ctx).dreamerEnabled,
 		todowriteEnabled,
 		compactionOff,
+		promptSurface: registrationPromptSurface,
+		promptSurfaceRuntime,
 	});
 	info(
 		compactionOff
@@ -1692,6 +1706,27 @@ async function startPiMagicContextRuntime(
 				? hasSystemPromptRefresh(sessionId)
 				: true; // first-pass-no-session: act as cache-busting (force fresh read)
 
+			const promptSurfaceModel = (
+				ctx as { model?: { provider?: unknown; id?: unknown } }
+			).model;
+			const promptSurfaceModelKey =
+				typeof promptSurfaceModel?.provider === "string" &&
+				promptSurfaceModel.provider.length > 0 &&
+				typeof promptSurfaceModel.id === "string" &&
+				promptSurfaceModel.id.length > 0
+					? `${promptSurfaceModel.provider}/${promptSurfaceModel.id}`
+					: undefined;
+			const promptSurface = sessionId
+				? promptSurfaceGuidanceEpochs.resolve(
+						sessionId,
+						effectiveConfig.prompt_surface,
+						promptSurfaceModelKey,
+					)
+				: promptSurfaceRuntime.resolveGuidance(
+						effectiveConfig.prompt_surface,
+						promptSurfaceModelKey,
+					);
+
 			const block = buildMagicContextBlock({
 				db,
 				cwd: currentProject.projectDir,
@@ -1705,6 +1740,8 @@ async function startPiMagicContextRuntime(
 				cavemanTextCompressionEnabled:
 					effectiveConfig.caveman_text_compression?.enabled === true,
 				language: effectiveConfig.language,
+				promptSurfacePreset: promptSurface.preset,
+				primaryGuidanceOverride: promptSurface.primaryOverride,
 				// Stable user memories rendered as <user-profile> — dreamer
 				// promotes recurring observations into this set, then the
 				// system prompt surfaces them across all sessions in the
@@ -1738,12 +1775,12 @@ async function startPiMagicContextRuntime(
 				sessionId,
 				systemPrompt: composedPrompt,
 				isCacheBusting,
+				promptSurfacePreset: promptSurface.preset,
 			});
 
 			if (result.hashChanged) {
-				// Real prompt-content change. Cache prefix is already
-				// busted on this turn. Signal all three independent
-				// refresh sets so the next pi.on("context") event
+				// Real prompt-content or preset change. Signal all three
+				// independent refresh sets so the next pi.on("context") event
 				// rebuilds <session-history> + lets queued ops
 				// materialize, AND the next before_agent_start refreshes
 				// adjuncts (since this turn's adjunct read used the
@@ -2259,6 +2296,7 @@ async function startPiMagicContextRuntime(
 				typeof sm?.getSessionId === "function" ? sm.getSessionId() : undefined;
 			if (typeof sessionId === "string" && sessionId.length > 0) {
 				clearPiSystemPromptSession(sessionId);
+				promptSurfaceGuidanceEpochs.clear(sessionId);
 				// Drain context-handler session-keyed maps too. Without
 				// this, sessions accumulate state across `session_shutdown`
 				// in long-lived Pi processes that re-init the extension.
@@ -2308,6 +2346,7 @@ async function startPiMagicContextRuntime(
 				// it lets a switch-back reuse the cached prefix instead of forcing a
 				// full m[0] re-materialization (an avoidable prompt-cache bust).
 				clearPiSystemPromptSession(outgoingSessionId);
+				promptSurfaceGuidanceEpochs.clear(outgoingSessionId);
 				clearContextHandlerSession(outgoingSessionId);
 			}
 		} catch {

@@ -6,6 +6,13 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { sessionLog } from "../../shared/logger";
+import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
+import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
+import {
+    createPromptSurfaceGuidanceEpochCache,
+    createPromptSurfaceRuntime,
+    promptSurfaceHashMaterial,
+} from "../../shared/prompt-surface-runtime";
 import { resolveCtxReduceAvailability } from "./ctx-reduce-availability";
 
 import { estimateTokens } from "./read-session-formatting";
@@ -112,9 +119,9 @@ export function isMagicContextInternalAgent(systemPromptContent: string): boolea
  *    Skips injection if guidance is already present (e.g., baked into the
  *    agent prompt by oh-my-opencode).
  *
- * 2. Detect system prompt changes for cache-flush triggering.
- *    If the hash changes between turns, the Anthropic prompt-cache prefix is
- *    already busted, so we flush queued operations immediately.
+ * 2. Detect system-prompt content or prompt-surface preset changes for
+ *    cache-flush triggering. The hash transition is the semantic boundary at
+ *    which queued operations can ride the same HARD fold.
  */
 export function createSystemPromptHashHandler(deps: {
     db: ContextDatabase;
@@ -127,6 +134,10 @@ export function createSystemPromptHashHandler(deps: {
     memoryEnabled?: boolean;
     /** Optional language from user config for the main agent's generated text. */
     language?: string;
+    promptSurface?: PromptSurfaceConfig;
+    promptSurfaceRuntime?: PromptSurfaceRuntime;
+    /** Recover the session's latest model when the transform input omits it. */
+    resolveModel?: (sessionId: string) => { providerID: string; modelID: string } | undefined;
     /**
      * One-shot signal that disk-backed adjuncts (user profile, key files,
      * sticky date) need to be re-read on this pass.
@@ -136,8 +147,9 @@ export function createSystemPromptHashHandler(deps: {
      */
     systemPromptRefreshSessions: Set<string>;
     /**
-     * Producer side: when this handler detects a real prompt-content hash
-     * change, it adds the session to all three sets so downstream consumers
+     * Producer side: when this handler detects a real prompt-content or
+     * prompt-surface-preset hash change, it adds the session to all three sets
+     * so downstream consumers
      * (transform `prepareCompartmentInjection`, postprocess heuristics)
      * react on the same cycle. The hash change usually pairs with a new
      * agent identity, so all three are appropriate.
@@ -180,16 +192,33 @@ export function createSystemPromptHashHandler(deps: {
      *  agent doesn't mimic its own caveman-compressed past output. */
     experimentalCavemanTextCompression?: boolean;
 }): {
-    handler: (input: { sessionID?: string }, output: { system: string[] }) => Promise<void>;
+    handler: (
+        input: {
+            sessionID?: string;
+            model?: { providerID?: string; modelID?: string };
+        },
+        output: { system: string[] },
+    ) => Promise<void>;
     clearSession: (sessionId: string) => void;
 } {
+    const promptSurfaceRuntime =
+        deps.promptSurfaceRuntime ??
+        createPromptSurfaceRuntime({
+            userConfigDirectory: process.cwd(),
+            warn: (message) => console.warn(`[magic-context] config warning: ${message}`),
+        });
+    const guidanceEpochs = createPromptSurfaceGuidanceEpochCache(promptSurfaceRuntime);
+
     // Per-session sticky date: we freeze the date string from the system prompt
     // and only update it on cache-busting passes. This prevents a midnight date
     // flip from causing an unnecessary flush + cache rebuild.
     const stickyDateBySession = new Map<string, string>();
 
     const handler = async (
-        input: { sessionID?: string },
+        input: {
+            sessionID?: string;
+            model?: { providerID?: string; modelID?: string };
+        },
         output: { system: string[] },
     ): Promise<void> => {
         const sessionId = input.sessionID;
@@ -305,6 +334,16 @@ export function createSystemPromptHashHandler(deps: {
         const effectiveCtxReduceEnabled = isSubagentSession ? false : ctxReduceCallable;
         // A subagent without callable ctx_reduce gets no MC guidance.
         const skipGuidanceForDisabledSubagent = isSubagentSession && !ctxReduceCallable;
+        const inputModel = input.model;
+        const liveModel =
+            inputModel?.providerID && inputModel.modelID
+                ? { providerID: inputModel.providerID, modelID: inputModel.modelID }
+                : deps.resolveModel?.(sessionId);
+        const modelKey =
+            liveModel?.providerID && liveModel.modelID
+                ? `${liveModel.providerID}/${liveModel.modelID}`
+                : undefined;
+        const promptSurface = guidanceEpochs.resolve(sessionId, deps.promptSurface, modelKey);
         const fullPrompt = output.system.join("\n");
         if (
             fullPrompt.length > 0 &&
@@ -321,6 +360,8 @@ export function createSystemPromptHashHandler(deps: {
                 subagentReduceMode,
                 deps.language,
                 deps.memoryEnabled !== false,
+                promptSurface.preset,
+                promptSurface.primaryOverride,
             );
             output.system.push(guidance);
             sessionLog(
@@ -370,7 +411,7 @@ export function createSystemPromptHashHandler(deps: {
             break;
         }
 
-        // ── Step 3: Detect system prompt changes ──
+        // ── Step 3: Detect system prompt or preset changes ──
         const systemContent = output.system.join("\n");
         if (systemContent.length === 0) return;
 
@@ -386,7 +427,9 @@ export function createSystemPromptHashHandler(deps: {
         // causing precision loss on read-back and infinite hash-change flushes.
         // node:crypto MD5 produces identical digests to Bun.CryptoHasher("md5"),
         // so persisted hashes remain stable across the Bun→Node runtime swap.
-        const currentHash = createHash("md5").update(systemContent).digest("hex");
+        const currentHash = createHash("md5")
+            .update(promptSurfaceHashMaterial(systemContent, promptSurface.preset))
+            .digest("hex");
 
         // Reuse sessionMetaEarly from Step 1 — no code path between that read
         // and here mutates session_meta for this session, so a second DB read
@@ -404,10 +447,10 @@ export function createSystemPromptHashHandler(deps: {
                 sessionId,
                 `system prompt hash changed: ${previousHash} → ${currentHash} (len=${systemContent.length}), triggering flush`,
             );
-            // Real prompt-content change: signal all three independent
-            // refresh lifetimes. The Anthropic prompt-cache prefix is already
-            // busted on this turn, so we want history rebuild + adjunct
-            // refresh + materialization on the same cycle.
+            // Real prompt-content or preset change: signal all three independent
+            // refresh lifetimes. The semantic prompt epoch changed on this turn,
+            // so history rebuild, adjunct refresh, and materialization should ride
+            // the same cycle.
             deps.historyRefreshSessions.add(sessionId);
             deps.systemPromptRefreshSessions.add(sessionId);
             deps.pendingMaterializationSessions.add(sessionId);
@@ -486,6 +529,7 @@ export function createSystemPromptHashHandler(deps: {
     return {
         handler,
         clearSession: (sessionId: string) => {
+            guidanceEpochs.clear(sessionId);
             clearSystemPromptHashSession(sessionId, {
                 stickyDateBySession,
                 cachedDocsBySession: new Map(),

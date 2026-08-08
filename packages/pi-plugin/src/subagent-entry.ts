@@ -86,7 +86,9 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 			// Load shared config before opening storage so a trusted-group deployment
 			// never has its externally managed permissions re-tightened by a child.
 			const directory = process.cwd();
-			const { config: cfg } = loadPiConfig({ cwd: directory });
+			const { config: cfg, registrationPromptSurface } = loadPiConfig({
+				cwd: directory,
+			});
 			setStoragePrivatePermissionEnforcement(
 				cfg.storage.enforce_private_permissions,
 			);
@@ -116,6 +118,7 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 				sessionScopedToolsDisabled: true,
 				todowriteEnabled: cfg.todowrite.enabled !== false,
 				todowriteCommandEnabled: false,
+				promptSurface: registrationPromptSurface,
 			});
 
 			log(

@@ -17,6 +17,8 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { sessionLog } from "@magic-context/core/shared/logger";
+import type { PromptSurfacePreset } from "@magic-context/core/shared/prompt-surface";
+import { promptSurfaceHashMaterial } from "@magic-context/core/shared/prompt-surface-runtime";
 
 const PROJECT_DOCS_MARKER = "<project-docs>";
 const USER_PROFILE_MARKER = "<user-profile>";
@@ -44,6 +46,8 @@ export interface BuildMagicContextBlockOptions {
 	temporalAwarenessEnabled?: boolean;
 	cavemanTextCompressionEnabled?: boolean;
 	language?: string;
+	promptSurfacePreset?: PromptSurfacePreset;
+	primaryGuidanceOverride?: string;
 	/** Reserved for compatibility; user profile now lives in m[0]. */
 	userMemoriesEnabled?: boolean;
 	existingSystemPrompt?: string;
@@ -76,15 +80,17 @@ export function buildMagicContextBlock(
 		// Drop ctx_memory guidance when memory is off (the tool is gated via
 		// registerMagicContextTools memoryToolEnabled). ctx_search guidance stays.
 		opts.memoryEnabled !== false,
+		opts.promptSurfacePreset,
+		opts.primaryGuidanceOverride,
 	);
 }
 
 export interface SystemPromptHashResult {
 	/** The system prompt to send to the LLM, possibly with date frozen. */
 	systemPrompt: string;
-	/** Whether the prompt content (ignoring any frozen-date replacement) changed vs persisted hash. */
+	/** Whether prompt content or prompt-surface preset changed vs the persisted hash. */
 	hashChanged: boolean;
-	/** The new hash, persisted to session_meta.system_prompt_hash. */
+	/** The new content + prompt-surface preset hash persisted to session_meta. */
 	currentHash: string;
 }
 
@@ -93,10 +99,10 @@ const DATE_PATTERN = /Today's date: .+/;
 /**
  * Process the assembled system prompt for cache stability:
  *
- *  1. Detect hash change vs persisted `session_meta.system_prompt_hash`.
- *     If changed, the prefix cache is already busted on this turn — we
- *     return `hashChanged=true` so the caller can signal downstream
- *     refresh sets and let the rest of the pipeline rebuild.
+ *  1. Detect content or prompt-surface preset change vs the persisted
+ *     `session_meta.system_prompt_hash`. The transition marks the semantic
+ *     prompt epoch boundary, so we return `hashChanged=true` and let the caller
+ *     signal downstream refresh sets.
  *
  *  2. Freeze `Today's date: ...` to the first observed value, UNLESS
  *     this turn is already cache-busting (either the caller flagged
@@ -110,6 +116,7 @@ export function processSystemPromptForCache(args: {
 	systemPrompt: string;
 	/** When true, the caller has already determined this turn is busting cache. */
 	isCacheBusting: boolean;
+	promptSurfacePreset?: PromptSurfacePreset;
 }): SystemPromptHashResult {
 	const { db, sessionId, systemPrompt, isCacheBusting } = args;
 
@@ -164,9 +171,12 @@ export function processSystemPromptForCache(args: {
 		}
 	}
 
-	// Hash the (possibly date-frozen) prompt — this matches what the
-	// LLM provider sees and what the cache prefix is keyed on.
-	const currentHash = createHash("md5").update(frozenPrompt).digest("hex");
+	// Hash the date-frozen prompt plus its semantic preset identity. The full
+	// preset adds no salt so its existing hash stays stable; placeholder light
+	// still gets a distinct identity while it renders the same provider bytes.
+	const currentHash = createHash("md5")
+		.update(promptSurfaceHashMaterial(frozenPrompt, args.promptSurfacePreset))
+		.digest("hex");
 	const hashChanged = !isFirstHash && currentHash !== previousHash;
 
 	if (hashChanged) {

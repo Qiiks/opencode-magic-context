@@ -1,13 +1,15 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import type { MagicContextPluginConfig } from "../config";
 import { closeDatabase, openDatabase } from "../features/magic-context/storage";
 import { resetCtxReduceRegisteredGloballyForTest } from "../hooks/magic-context/ctx-reduce-availability";
+import type { PromptSurfaceRuntime } from "../shared/prompt-surface-runtime";
+import { createPromptSurfaceRuntime } from "../shared/prompt-surface-runtime";
 import type { RustToolBackends } from "./rust-tool-backends";
 import { createToolRegistry, getCompactionOffRemovedToolIds } from "./tool-registry";
 import type { PluginContext } from "./types";
@@ -45,11 +47,15 @@ const ctx = { directory: process.cwd() } as unknown as PluginContext;
 function buildRegistry(
     config: Partial<MagicContextPluginConfig>,
     rustToolBackends?: RustToolBackends,
+    promptSurfaceRuntime?: PromptSurfaceRuntime,
+    registrationPromptSurface?: MagicContextPluginConfig["prompt_surface"],
 ): Record<string, ToolDefinition> {
     return createToolRegistry({
         ctx,
         pluginConfig: { enabled: true, ...config } as MagicContextPluginConfig,
         rustToolBackends,
+        promptSurfaceRuntime,
+        registrationPromptSurface,
     });
 }
 
@@ -189,5 +195,158 @@ describe("createToolRegistry — compaction-off mode (#266 S4)", () => {
             tool.schema.object(tools.ctx_expand?.args ?? {}),
         ) as { properties?: Record<string, unknown> };
         expect(Object.keys(expandSchema.properties ?? {})).toContain("start");
+    });
+});
+
+type GoldenTool = { description: string; parameters: Record<string, unknown> };
+
+function readA1GoldenTools(): Record<string, GoldenTool> {
+    const document = readFileSync(
+        join(import.meta.dir, "../shared/prompt-surface-a1-golden.md"),
+        "utf8",
+    );
+    const toolSection = document.slice(
+        document.indexOf("## 2. Tool surface"),
+        document.indexOf("## 3. System-prompt hash baseline"),
+    );
+    const headings = [...toolSection.matchAll(/^### (ctx_[a-z_]+) —.*$/gm)];
+    return Object.fromEntries(
+        headings.map((heading, index) => {
+            const start = (heading.index ?? 0) + heading[0].length;
+            const end = headings[index + 1]?.index ?? toolSection.length;
+            const body = toolSection.slice(start, end);
+            const description = body.match(/\*\*Description:\*\*\s+```\n([\s\S]*?)\n```/)?.[1];
+            const parameters = body.match(
+                /\*\*Parameters \(JSON Schema per parameter, as serialized to the provider\):\*\*\s+```json\n([\s\S]*?)\n```/,
+            )?.[1];
+            if (description === undefined || parameters === undefined) {
+                throw new Error(`Malformed A1 golden tool section: ${heading[1]}`);
+            }
+            return [
+                heading[1],
+                { description, parameters: JSON.parse(parameters) as Record<string, unknown> },
+            ];
+        }),
+    );
+}
+
+function providerParameters(definition: ToolDefinition): Record<string, unknown> {
+    return Object.fromEntries(
+        Object.entries(definition.args ?? {}).map(([name, schema]) => {
+            const serializable = schema as { _zod?: { toJSONSchema?: () => unknown } };
+            return [
+                name,
+                serializable._zod?.toJSONSchema
+                    ? serializable._zod.toJSONSchema()
+                    : "<no toJSONSchema>",
+            ];
+        }),
+    );
+}
+
+describe("createToolRegistry — prompt-surface registration", () => {
+    it("matches the A1 golden for no config and explicit full", () => {
+        const golden = readA1GoldenTools();
+        isolateDb();
+        const implicit = buildRegistry({});
+        isolateDb();
+        const explicit = buildRegistry({
+            prompt_surface: { default: "full" },
+        } as Partial<MagicContextPluginConfig>);
+
+        expect(Object.keys(implicit).sort()).toEqual(Object.keys(golden).sort());
+        expect(Object.keys(explicit).sort()).toEqual(Object.keys(golden).sort());
+        for (const [toolId, expected] of Object.entries(golden)) {
+            expect(implicit[toolId]?.description).toBe(expected.description);
+            expect(explicit[toolId]?.description).toBe(expected.description);
+            expect(providerParameters(implicit[toolId])).toEqual(expected.parameters);
+            expect(providerParameters(explicit[toolId])).toEqual(expected.parameters);
+        }
+    });
+
+    it("applies only top-level user descriptions and ignores model routes", () => {
+        const warnings: string[] = [];
+        const runtime = createPromptSurfaceRuntime({
+            userConfigDirectory: process.cwd(),
+            warn: (warning) => warnings.push(warning),
+        });
+        isolateDb();
+        const baseline = buildRegistry({});
+        isolateDb();
+        const overridden = buildRegistry(
+            {
+                prompt_surface: {
+                    default: "full",
+                    models: { "provider/model": "light" },
+                    tool_descriptions: { ctx_search: "Custom search surface" },
+                },
+            } as Partial<MagicContextPluginConfig>,
+            undefined,
+            runtime,
+        );
+
+        expect(overridden.ctx_search.description).toBe("Custom search surface");
+        expect(overridden.ctx_reduce.description).toBe(baseline.ctx_reduce.description);
+        for (const toolId of Object.keys(baseline)) {
+            expect(providerParameters(overridden[toolId])).toEqual(
+                providerParameters(baseline[toolId]),
+            );
+        }
+        expect(warnings).toEqual([]);
+    });
+
+    it("falls back from a light registration to full descriptions with one notice", () => {
+        const warnings: string[] = [];
+        const runtime = createPromptSurfaceRuntime({
+            userConfigDirectory: process.cwd(),
+            warn: (warning) => warnings.push(warning),
+        });
+        isolateDb();
+        const full = buildRegistry({});
+        isolateDb();
+        const light = buildRegistry(
+            { prompt_surface: { default: "light" } } as Partial<MagicContextPluginConfig>,
+            undefined,
+            runtime,
+        );
+
+        expect(
+            Object.fromEntries(
+                Object.entries(light).map(([id, definition]) => [id, definition.description]),
+            ),
+        ).toEqual(
+            Object.fromEntries(
+                Object.entries(full).map(([id, definition]) => [id, definition.description]),
+            ),
+        );
+        expect(warnings).toHaveLength(1);
+    });
+});
+
+describe("createToolRegistry — user-owned registration default", () => {
+    it("does not let a project-routed default select process-scoped tool text", () => {
+        const warnings: string[] = [];
+        const runtime = createPromptSurfaceRuntime({
+            userConfigDirectory: process.cwd(),
+            warn: (warning) => warnings.push(warning),
+        });
+        isolateDb();
+        const registry = buildRegistry(
+            {
+                prompt_surface: {
+                    default: "light",
+                    tool_descriptions: { ctx_search: "User-owned search description" },
+                },
+            } as Partial<MagicContextPluginConfig>,
+            undefined,
+            runtime,
+            {
+                default: "full",
+                tool_descriptions: { ctx_search: "User-owned search description" },
+            },
+        );
+
+        expect(registry.ctx_search.description).toBe("User-owned search description");
+        expect(warnings).toEqual([]);
     });
 });

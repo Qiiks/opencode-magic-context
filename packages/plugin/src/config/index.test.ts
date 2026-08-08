@@ -934,3 +934,56 @@ describe("transform_mode resolution", () => {
         expect(result.subc?.connection_file).not.toContain("project-controlled.sock");
     });
 });
+
+describe("loadPluginConfigDetailed — prompt-surface registration owner", () => {
+    it("captures the user default before project guidance routing is merged", () => {
+        const xdg = mkdtempSync(join(tmpdir(), "mc-config-prompt-surface-"));
+        const projectDir = mkdtempSync(join(tmpdir(), "mc-project-prompt-surface-"));
+        const fs = require("node:fs") as typeof import("node:fs");
+        const userDir = join(xdg, "cortexkit");
+        const projectConfigDir = join(projectDir, ".cortexkit");
+        fs.mkdirSync(userDir, { recursive: true });
+        fs.mkdirSync(projectConfigDir, { recursive: true });
+        writeFileSync(
+            join(userDir, "magic-context.jsonc"),
+            JSON.stringify({
+                prompt_surface: {
+                    default: "light",
+                    guidance_override_path: "guidance.md",
+                    tool_descriptions: { ctx_search: "user text" },
+                },
+            }),
+        );
+        writeFileSync(
+            join(projectConfigDir, "magic-context.jsonc"),
+            JSON.stringify({
+                prompt_surface: {
+                    default: "full",
+                    models: { "openai/*": "light" },
+                },
+            }),
+        );
+        const originalXdg = process.env.XDG_CONFIG_HOME;
+        process.env.XDG_CONFIG_HOME = xdg;
+
+        try {
+            const result = loadPluginConfigDetailed(projectDir);
+            expect(result.config.prompt_surface).toEqual({
+                default: "full",
+                models: { "openai/*": "light" },
+                guidance_override_path: "guidance.md",
+                tool_descriptions: { ctx_search: "user text" },
+            });
+            expect(result.registrationPromptSurface).toEqual({
+                default: "light",
+                guidance_override_path: "guidance.md",
+                tool_descriptions: { ctx_search: "user text" },
+            });
+        } finally {
+            if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+            else process.env.XDG_CONFIG_HOME = originalXdg;
+            rmSync(xdg, { recursive: true, force: true });
+            rmSync(projectDir, { recursive: true, force: true });
+        }
+    });
+});

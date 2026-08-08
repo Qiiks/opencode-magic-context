@@ -296,7 +296,6 @@ describe("loadPiConfig", () => {
 		expect(result.warnings.join("\n")).toContain("no longer supports");
 	});
 
-
 	it("strips hidden-agent prompt/permission from PROJECT config (privilege escalation guard)", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");
@@ -347,6 +346,11 @@ describe("loadPiConfig", () => {
 		expect(result.config.prompt_surface).toEqual({
 			default: "full",
 			models: { "openai/*": "light" },
+			guidance_override_path: "/user/guidance.md",
+			tool_descriptions: { ctx_search: "user text" },
+		});
+		expect(result.registrationPromptSurface).toEqual({
+			default: "light",
 			guidance_override_path: "/user/guidance.md",
 			tool_descriptions: { ctx_search: "user text" },
 		});

@@ -290,3 +290,93 @@ describe("buildMagicContextSection — compaction-off guidance variant (#266 S4)
         expect(reduce).toContain("tagged with §N§ identifiers");
     });
 });
+
+describe("buildMagicContextSection — prompt-surface composition", () => {
+    it("keeps implicit full, explicit full, and temporary light fallback byte-identical", () => {
+        const implicit = buildMagicContextSection(
+            null,
+            20,
+            true,
+            true,
+            true,
+            true,
+            false,
+            "tr",
+            true,
+        );
+        const explicitFull = buildMagicContextSection(
+            null,
+            20,
+            true,
+            true,
+            true,
+            true,
+            false,
+            "tr",
+            true,
+            "full",
+        );
+        const lightPlaceholder = buildMagicContextSection(
+            null,
+            20,
+            true,
+            true,
+            true,
+            true,
+            false,
+            "tr",
+            true,
+            "light",
+        );
+
+        expect(explicitFull).toBe(implicit);
+        expect(lightPlaceholder).toBe(implicit);
+    });
+
+    it("appends shared runtime fragments after a complete primary override", () => {
+        const override = "## Magic Context\n\nUser-owned primary guidance.";
+        const output = buildMagicContextSection(
+            null,
+            20,
+            true,
+            true,
+            true,
+            true,
+            false,
+            "tr",
+            true,
+            "full",
+            override,
+        );
+
+        expect(output.startsWith(override)).toBe(true);
+        expect(output.match(/^## Magic Context$/gm)).toHaveLength(1);
+        expect(output).toContain("**Temporal awareness**");
+        expect(output).toContain("**BEWARE**: History compression is on");
+        expect(output).toContain("Use Turkish (Türkçe) for your natural-language replies");
+        expect(output.indexOf("**Temporal awareness**")).toBeGreaterThan(
+            output.indexOf("User-owned primary guidance."),
+        );
+        expect(output).not.toContain("### Reduction Triggers");
+        expect(output).not.toContain("surface_condition");
+    });
+
+    it("keeps subagent guidance independent from a primary override", () => {
+        const output = buildMagicContextSection(
+            null,
+            20,
+            true,
+            false,
+            false,
+            false,
+            true,
+            undefined,
+            true,
+            "full",
+            "## Magic Context\n\nPrimary override must not reach subagents.",
+        );
+
+        expect(output).toContain("§N§ identifiers");
+        expect(output).not.toContain("Primary override must not reach subagents");
+    });
+});

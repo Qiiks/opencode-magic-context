@@ -22,6 +22,7 @@ import {
 } from "@magic-context/core/config/schema/magic-context";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import { setOutputReserveConfig } from "@magic-context/core/shared/models-dev-cache";
+import type { PromptSurfaceConfig } from "@magic-context/core/shared/prompt-surface";
 import { parse as parseJsonc } from "comment-json";
 
 export interface LoadPiConfigOptions {
@@ -30,6 +31,8 @@ export interface LoadPiConfigOptions {
 
 export interface LoadPiConfigResult {
 	config: MagicContextConfig;
+	/** USER-tier default/overrides captured before project routing is merged. */
+	registrationPromptSurface: PromptSurfaceConfig;
 	warnings: string[];
 	loadedFromPaths: string[];
 }
@@ -388,6 +391,7 @@ export function loadPiConfig(
 
 	return {
 		config: parsed.config,
+		registrationPromptSurface: trustedBaseConfig.prompt_surface,
 		warnings,
 		loadedFromPaths: loadedFiles.map((loaded) => loaded.path),
 	};
@@ -576,6 +580,7 @@ export function loadPiConfigDetailed(
 
 	return {
 		config: parsed.config,
+		registrationPromptSurface: trustedBaseConfig.prompt_surface,
 		warnings,
 		loadedFromPaths: loadedFiles.map((loaded) => loaded.path),
 		loadOutcome: combinedOutcome({

@@ -1,5 +1,6 @@
 /** Generic magic context system prompt section shared by all agents. */
 
+import type { PromptSurfacePreset } from "../shared/prompt-surface";
 import { buildPrimaryLanguageDirective } from "./language-directive";
 
 /**
@@ -154,6 +155,8 @@ export function buildMagicContextSection(
     subagentMode = false,
     language?: string,
     memoryEnabled = true,
+    _preset: PromptSurfacePreset = "full",
+    primaryOverride?: string,
 ): string {
     // Subagent sessions: minimal §N§ + ctx_reduce mechanics only. Bypasses the
     // long-term-partner frame, memory/search/note guidance, and the reduction
@@ -174,6 +177,13 @@ export function buildMagicContextSection(
     const cavemanWarning = cavemanTextCompressionEnabled ? CAVEMAN_COMPRESSION_WARNING : "";
     const languageDirective = buildPrimaryLanguageDirective(language);
     const languageGuidance = languageDirective ? `\n\n${languageDirective}` : "";
+
+    if (primaryOverride !== undefined) {
+        // A user override owns the complete primary section. Runtime clauses stay
+        // composer-owned so an override cannot suppress temporal guidance, the
+        // warning against overly compressed prose, or the language directive.
+        return `${primaryOverride}${temporalGuidance}${cavemanWarning}${languageGuidance}`;
+    }
 
     if (!ctxReduceCallable) {
         return `## Magic Context\n\n${LONG_TERM_PARTNER_FRAME}\n${PARTNER_FRAME_CLOSER_NO_REDUCE}\n\n${BASE_INTRO_NO_REDUCE(memoryEnabled)}${smartNoteGuidance}${temporalGuidance}${cavemanWarning}${languageGuidance}`;

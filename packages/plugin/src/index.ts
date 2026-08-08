@@ -5,7 +5,7 @@ import {
     buildHiddenAgentRegistrations,
 } from "./agents/hidden-agent-registrations";
 import { withContentLanguageDirective } from "./agents/language-directive";
-import { loadPluginConfig } from "./config";
+import { loadPluginConfigDetailed } from "./config";
 import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
@@ -57,6 +57,7 @@ import { registerExitAbort, unregisterExitAbort } from "./shared/exit-abort-regi
 import { setKeepSubagents } from "./shared/keep-subagents";
 import { log } from "./shared/logger";
 import { refreshModelLimitsFromApi } from "./shared/models-dev-cache";
+import { createPromptSurfaceRuntime } from "./shared/prompt-surface-runtime";
 import { MagicContextRpcServer } from "./shared/rpc-server";
 import { closeQuietly } from "./shared/sqlite-helpers";
 import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";
@@ -71,7 +72,13 @@ const server: Plugin = async (ctx) => {
         warn: (m) => log(`[magic-context] ${m}`),
         info: (m) => log(`[magic-context] ${m}`),
     });
-    const pluginConfig = loadPluginConfig(ctx.directory);
+    const loadedPluginConfig = loadPluginConfigDetailed(ctx.directory);
+    const pluginConfig = loadedPluginConfig.config;
+    const promptSurfaceRuntime = createPromptSurfaceRuntime({
+        harness: "opencode",
+        directory: ctx.directory,
+        warn: (message) => log(`[magic-context] config warning: ${message}`),
+    });
     if (configMigrationWarnings.length > 0) {
         pluginConfig.configWarnings = [
             ...configMigrationWarnings,
@@ -177,6 +184,7 @@ const server: Plugin = async (ctx) => {
         pluginConfig,
         liveSessionState,
         rustModeModuleClient,
+        promptSurfaceRuntime,
     });
 
     // Mutable holder so a healed storage reopen can install real hooks without
@@ -216,6 +224,7 @@ const server: Plugin = async (ctx) => {
                 pluginConfig,
                 liveSessionState,
                 rustModeModuleClient,
+                promptSurfaceRuntime,
             });
             if (!reopened.magicContext) return false;
             magicContextRuntime.magicContext = reopened.magicContext;
@@ -233,6 +242,8 @@ const server: Plugin = async (ctx) => {
         ctx,
         pluginConfig,
         rustToolBackends: magicContextRuntime.rustToolBackends,
+        promptSurfaceRuntime,
+        registrationPromptSurface: loadedPluginConfig.registrationPromptSurface,
     });
 
     // v22 deferred legacy-memory identity backfill. createSessionHooks() opens

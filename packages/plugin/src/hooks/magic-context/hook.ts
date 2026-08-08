@@ -62,6 +62,8 @@ import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../plugin/types";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
+import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
+import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
 import { resolveFallbackChain } from "../../shared/resolve-fallbacks";
 import { isTuiConnected, pushNotification } from "../../shared/rpc-notifications";
 import type { Database } from "../../shared/sqlite";
@@ -136,6 +138,7 @@ export interface MagicContextDeps {
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
         execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
         cache_ttl: string | Record<string, string>;
+        prompt_surface?: PromptSurfaceConfig;
 
         historian?: HistorianConfig;
         history_budget_percentage?: number;
@@ -175,6 +178,8 @@ export interface MagicContextDeps {
         compaction?: { enabled?: boolean };
         mural?: { enabled: boolean; model?: string };
     };
+    /** Registration-owned prompt-surface loader shared with the tool registry. */
+    promptSurfaceRuntime?: PromptSurfaceRuntime;
     /** Test seam for the Rust authority adapter; production creates the subc client. */
     rustModeModuleClient?: RustModeModuleClient;
     /** Test and async-boot seam for supplying a database already opened by the caller. */
@@ -1279,6 +1284,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // ctx_memory TOOL is gated in tool-registry.ts on the same flag).
         memoryEnabled: deps.config.memory?.enabled !== false,
         language: deps.config.language,
+        promptSurface: deps.config.prompt_surface,
+        promptSurfaceRuntime: deps.promptSurfaceRuntime,
+        resolveModel: resolveLiveModel,
         // System-prompt-hash handler reads systemPromptRefreshSessions to
         // decide whether to re-read disk-backed adjuncts (profile, key files,
         // sticky date), and adds to all three sets when it

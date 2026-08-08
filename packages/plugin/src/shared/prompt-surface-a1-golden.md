@@ -455,4 +455,4 @@ The hash handler persists the MD5 of `output.system.join("\\n")`. The values bel
 | PRIMARY reduce-off | 6471 | `f5e8089b0ec037f8a81c648edd141913` |
 | SUBAGENT minimal | 691 | `83d69748f204fff98249565d5a31aa99` |
 
-A1 is intentionally a source snapshot, not a consumer: no runtime call site reads prompt-surface configuration in this slice.
+The OpenCode and Pi runtime compatibility tests consume this snapshot for omitted `prompt_surface` and explicit `{ default: "full" }`: both assert guidance, registered tool descriptions, tool IDs, and hashes; OpenCode also asserts these parameter schemas directly, while Pi asserts its TypeBox-owned schemas stay byte-identical across both config forms.
