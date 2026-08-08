@@ -19,7 +19,8 @@ use crate::compartment_coverage::{fold_m0_content_epoch, resolve_coverage, M0Con
 use crate::divergence::{self, FirstDivergence};
 use crate::healing::{self, quirk_residual, SerializerProfile};
 use crate::injection::{
-    advance_injection_from_meta, capture_todo_state_on_bust, is_synthetic_todo_id, InjectionOutcome,
+    advance_injection_from_meta, capture_todo_state_on_bust, injection_pending_after_capture,
+    is_synthetic_todo_id, InjectionOutcome,
 };
 use crate::m0_compose::compose_m0_from_store;
 use crate::m1_compose::{
@@ -2645,6 +2646,16 @@ fn apply_once(
         .collect();
     let tail_for_selection =
         tail_sel_items(&live, loaded.meta.coverage_ordinal, &tag_tokens_by_block);
+    // Todo state is deferred work just like an m1 or reduction delta: it may ride an
+    // independently scheduled bust, but it never authorizes provider-visible bytes by itself.
+    // Compute only the call-id transition here; the complete pair is built after classification.
+    let todo_injection_pending = tail_reclaim_enabled
+        && !req.is_subagent
+        && injection_pending_after_capture(
+            &loaded.meta,
+            &tail_for_selection,
+            loaded.meta.synthetic_todo.as_ref(),
+        );
     let mut protected_block_ids = if tagging_surface_requested {
         newest_active_tag_block_ids(
             &loaded.core,
@@ -2747,6 +2758,11 @@ fn apply_once(
         loaded.meta.coverage_ordinal,
     );
     let classify_started_at = Instant::now();
+    let independent_bust_opportunity =
+        (matches!(scheduler_outcome.pass, scheduler::PassDecision::Execute)
+            && !ordinary_historian_veto)
+            || pass_already_busting;
+    let bust_opportunity = independent_bust_opportunity || reductions_pending_now;
     let mut plan = classify(&ClassifierInput {
         initialized: loaded.meta.initialized && !loaded.meta.bootstrap_seed_fold_pending,
         is_legacy_baseline: is_legacy_baseline(&loaded.core),
@@ -2757,16 +2773,26 @@ fn apply_once(
         boundary_present,
         reconcile_pending: loaded.core.reconcile_pending,
         m1_revision_changed: current_m1_digest != loaded.meta.m1_revision
-            || loaded.meta.soft_refresh_pending,
+            || loaded.meta.soft_refresh_pending
+            || todo_injection_pending,
         reductions_pending: reductions_pending_now,
         // Scheduler Execute is a genuine deferred-work consumption opportunity even when
         // no reduction was selected. An active historian is the one ordinary-pass veto;
         // hard/force/emergency arms bypass it.
-        bust_opportunity: (matches!(scheduler_outcome.pass, scheduler::PassDecision::Execute)
-            && !ordinary_historian_veto)
-            || pass_already_busting
-            || reductions_pending_now,
+        bust_opportunity,
     });
+    // A todo-only delta does not need a coverage anchor: it inserts a frozen pair between the
+    // existing prefix and tail without moving the m0/m1 boundary. The generic classifier blocks
+    // boundaryless m1 deltas because they cannot splice safely, so promote only its ordinary
+    // defer result when an independent bust opportunity already exists. Reconcile defers remain
+    // untouched because they must clear or rebuild the boundary state first.
+    if todo_injection_pending
+        && independent_bust_opportunity
+        && !loaded.core.reconcile_pending
+        && matches!(plan, PassPlan::Defer)
+    {
+        plan = PassPlan::Soft;
+    }
     timings.decide += elapsed_ms(classify_started_at);
     if req.is_subagent {
         plan = if matches!(scheduler_outcome.pass, scheduler::PassDecision::Defer) {
@@ -2794,6 +2820,9 @@ fn apply_once(
         explicit_flush: loaded.meta.soft_refresh_pending,
         reductions_pending: reductions_pending_now,
     });
+    if todo_injection_pending && matches!(plan, PassPlan::Soft) && materialize_reason.is_none() {
+        materialize_reason = Some("synthetic_todo".to_string());
+    }
     if lineage_state.force_hard {
         materialize_reason = Some("lineage_descent".to_string());
     }
@@ -10330,6 +10359,21 @@ mod tests {
         )
     }
 
+    fn opencode_native_bytes(r: &TransformResponse, session_id: &str) -> Vec<u8> {
+        let messages = r
+            .messages()
+            .iter()
+            .map(|message| message.deref().clone())
+            .collect::<Vec<_>>();
+        serde_json::to_vec(&crate::codec::encode_opencode_with_session(
+            &messages,
+            &crate::codec::DecodeSidecar::new("opencode"),
+            Some(session_id),
+            None,
+        ))
+        .unwrap()
+    }
+
     /// Cross-repo drift pin for the shared CK wire fixture. Three parties ride
     /// this exact byte shape (llm-runner produces it, this module parses it,
     /// the thalamus gateway produces it), and each repo vendors its own copy, so a
@@ -11445,7 +11489,9 @@ mod tests {
         let boot_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 90, 100);
         let boot = run(&s, &boot_req, &spine());
         assert_eq!(boot.action, "HARD");
+        assert!(s.load("ses").unwrap().meta.last_todo_state.is_none());
         let before = serde_json::to_vec(&boot.ck_messages).unwrap();
+        let before_native = opencode_native_bytes(&boot, "ses");
         let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
         ctx.observed_last_response_at_ms = Some(0);
         let execute = transform(&s, &boot_req, &ctx).unwrap();
@@ -11453,6 +11499,7 @@ mod tests {
         // two-pass watermark stamps this tail as the next execute's candidate set.
         assert_eq!(execute.action, "SOFT+");
         assert_eq!(serde_json::to_vec(&execute.ck_messages).unwrap(), before);
+        assert_eq!(opencode_native_bytes(&execute, "ses"), before_native);
         let meta = s.load("ses").unwrap().meta;
         assert_eq!(
             meta.last_execute_ordinal, 1,
@@ -11462,6 +11509,96 @@ mod tests {
         let again = transform(&s, &boot_req, &ctx).unwrap();
         assert!(!again.committed);
         assert_eq!(serde_json::to_vec(&again.ck_messages).unwrap(), before);
+    }
+
+    #[test]
+    fn state_sync_todo_pending_rides_execute_to_native_wire_and_defers_identically() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let request = req("todo-sync", "cfg0", vec![item("a", 1, "raw")]);
+        assert_eq!(run(&s, &request, &spine()).action, "HARD");
+
+        let state_json =
+            r#"[{"content":"State sync todo","status":"in_progress","priority":"high"}]"#;
+        let loaded = s.load("todo-sync").unwrap();
+        s.apply_authority_state_sync(ModuleStateSyncRequest {
+            session_id: "todo-sync",
+            project_path: "git:proj",
+            shadow_generation: loaded.meta.shadow_generation,
+            expected_shadow_seq: loaded.meta.shadow_seq,
+            seed_boundary_id: None,
+            drop_seeds: &[],
+            drop_seed_skipped: 0,
+            strip_seeds: &[],
+            strip_seed_skipped: 0,
+            reasoning_cleared_through_tag: None,
+            compartments: &[],
+            memories: &[],
+            memory_mutations: &[],
+            user_profile: &[],
+            user_profile_present: false,
+            workspace: None,
+            workspace_present: false,
+            last_todo_state: Some(state_json.to_string()),
+            project_memory_epoch: None,
+            user_profile_version: None,
+            pending_agent_drops: &[],
+            pending_agent_drops_skipped: 0,
+            user_hint_seeds: &[],
+            auto_search_hint_skipped: 0,
+            note_nudge_anchors: None,
+            todo_synthetic_anchor: None,
+            todo_synthetic_anchor_present: false,
+            emergency_latches: None,
+            pending_compaction_marker: None,
+            deferred_execute_state: None,
+            channel2_nudge_state: None,
+            acked_watermarks: serde_json::Value::Null,
+        })
+        .unwrap();
+
+        let bust = run(&s, &with_usage(request.clone(), 70, 100), &spine());
+        assert_eq!(bust.action, "SOFT");
+        let expected_call_id = "mc_synthetic_todo_c4a22134ee90be17";
+        assert_eq!(synthetic_todo_call_id(&bust), expected_call_id);
+        let bust_pair = synthetic_todo_pair_bytes(&bust);
+        let bust_messages = bust
+            .messages()
+            .iter()
+            .map(|message| message.deref().clone())
+            .collect::<Vec<_>>();
+        let bust_native = crate::codec::encode_opencode_with_session(
+            &bust_messages,
+            &crate::codec::DecodeSidecar::new("opencode"),
+            Some("todo-sync"),
+            None,
+        );
+        assert!(bust_native.iter().any(|message| {
+            message["parts"].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part["callID"] == expected_call_id && part["syntheticTodoMarker"] == true
+                })
+            })
+        }));
+
+        let defer = run(&s, &with_usage(request, 10, 100), &spine());
+        assert_eq!(defer.action, "SOFT+");
+        assert_eq!(synthetic_todo_pair_bytes(&defer), bust_pair);
+        let defer_messages = defer
+            .messages()
+            .iter()
+            .map(|message| message.deref().clone())
+            .collect::<Vec<_>>();
+        let defer_native = crate::codec::encode_opencode_with_session(
+            &defer_messages,
+            &crate::codec::DecodeSidecar::new("opencode"),
+            Some("todo-sync"),
+            None,
+        );
+        assert_eq!(
+            serde_json::to_vec(&defer_native).unwrap(),
+            serde_json::to_vec(&bust_native).unwrap()
+        );
     }
 
     #[test]

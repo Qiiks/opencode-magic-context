@@ -230,6 +230,35 @@ pub fn advance_injection_from_meta(
     advance_injection(meta.last_todo_state.as_deref(), frozen, is_bust_pass)
 }
 
+/// Return whether the next eligible bust would replace or clear the frozen todo pair.
+///
+/// This predicate computes only the normalized state and call id. It deliberately avoids
+/// building provider-visible tool messages before the pass classifier grants a bust. A visible
+/// real `todowrite` takes precedence over older state-sync metadata, matching bust-time capture.
+pub fn injection_pending_after_capture(
+    meta: &ModuleMeta,
+    tail: &[SelItem],
+    frozen: Option<&FrozenSyntheticTodoPair>,
+) -> bool {
+    let visible_state = newest_todowrite_state_json(tail).map(|(_, state_json)| state_json);
+    let persisted_state = visible_state.as_deref().or(meta.last_todo_state.as_deref());
+    let Some(normalized) = persisted_state.and_then(normalize_todo_state_json) else {
+        return false;
+    };
+    let Some(todos) = parse_todo_state(&normalized) else {
+        return false;
+    };
+    let next_call_id = (!todos.is_empty()
+        && !todos.iter().all(|todo| is_terminal_status(&todo.status)))
+    .then(|| synthetic_call_id(&normalized));
+
+    match (next_call_id.as_deref(), frozen) {
+        (Some(call_id), Some(current)) => current.call_id != call_id,
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
+    }
+}
+
 /// Capture (if this is a bust pass) before composing the synthetic-todo transition.
 ///
 /// This ordering lets a first-ever todowrite be captured and injected in the same cache

@@ -635,14 +635,14 @@
         },
         {
             "path": "tests/todo-synthesis.test.ts",
-            "tier": "ts-only",
+            "tier": "both-modes",
             "invocation": {
                 "ts": true,
-                "rust": false
+                "rust": true
             },
-            "rationale": "synthetic todowrite capture/replay is a shared behavioral contract; rust invocation is OFF pending the real parity defect adjudicated in parity-findings-s2.md (Todo 1-5: the module never emits the synthetic pair on cache-busting passes; assertions preserved red in the suite, re-enable rust:true when the state-sync/render handoff fix lands)",
+            "rationale": "synthetic todowrite state-sync, bust-time injection, anchor persistence, and defer replay are shared cache contracts",
             "contract_refs": [
-                "parity-findings-s2.md#todo-1",
+                "S2-MIGRATION",
                 "ARCHITECTURE.md#synthetic-todowrite"
             ]
         },
