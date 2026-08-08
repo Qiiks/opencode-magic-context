@@ -97,7 +97,6 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: park self-heal", () 
             // Prolonged outage: kill the module and keep it down across several
             // passes so the adapter crosses its three-failure park threshold.
             await h.subc.killModuleAndWait();
-            await h.subc.waitForModuleDeath();
             for (let i = 4; i <= 8; i += 1) {
                 h.mock.setDefault({
                     text: `outage assistant ${i}`,

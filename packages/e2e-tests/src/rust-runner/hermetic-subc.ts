@@ -605,7 +605,6 @@ export class HermeticSubcStack {
      */
     async restartModule(): Promise<void> {
         await this.killModuleAndWait();
-        await this.waitForModuleDeath();
         await sleep(200);
         await this.spawnModule();
         await this.waitForFreshModuleRegistration();

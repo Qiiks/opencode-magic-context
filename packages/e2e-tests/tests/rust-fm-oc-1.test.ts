@@ -47,7 +47,6 @@ describe.skipIf(!active)("rust failure-mode drill FM-OC-1: LKG after SIGKILL", (
             const priorWire = JSON.parse(h.lastMainWireSerialized()) as unknown[];
 
             await h.subc.killModuleAndWait();
-            await h.subc.waitForModuleDeath();
             await h.sendPrompt(sessionId, `FM-OC-1 after SIGKILL: ${h.ballast(400)}`);
 
             const passes = await h.waitForRustPasses(beforeCount + 1);
