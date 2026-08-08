@@ -483,9 +483,11 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
+            "rationale": "large provider-visible tail remains intact across recut-era one-page reuse and bounded multi-page retransmission",
             "contract_refs": [
-                "RUST-E2E"
+                "RUST-E2E",
+                "BOUNDARY-DIVERGENCE-RECUT",
+                "RUST-SYNTHETIC-TODO-ANCHOR-MIRROR-BACK"
             ]
         },
         {
@@ -666,10 +668,11 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "FM-OC-2 real SIGKILL outage pins the shipped failure threshold and park-transition observability",
+            "rationale": "FM-OC-2 real SIGKILL outage pins the shipped failure threshold and waits on the park token independently of added bust passes",
             "contract_refs": [
                 "FM-OC-2",
-                "RUST-E2E"
+                "RUST-E2E",
+                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
             ]
         },
         {
@@ -679,10 +682,11 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "FM-OC-3 real SIGKILL followed by module return pins bounded probe recovery and monotonic row versions",
+            "rationale": "FM-OC-3 real SIGKILL followed by module return pins bounded probe recovery from the observed restore boundary and monotonic row versions",
             "contract_refs": [
                 "FM-OC-3",
-                "RUST-E2E"
+                "RUST-E2E",
+                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
             ]
         },
         {
@@ -692,10 +696,11 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "FM-OC-4 real SIGKILL at a provider-proven emergency limit pins typed fail-closed refusal",
+            "rationale": "FM-OC-4 real SIGKILL at a provider-proven emergency limit waits on typed fail-closed refusal independently of added bust passes",
             "contract_refs": [
                 "FM-OC-4",
-                "RUST-E2E"
+                "RUST-E2E",
+                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
             ]
         },
         {
@@ -718,10 +723,11 @@
                 "ts": false,
                 "rust": true
             },
-            "rationale": "FM-OC-6 real SIGKILL with emergency recovery armed pins refusal before LKG admission",
+            "rationale": "FM-OC-6 real SIGKILL with emergency recovery armed waits on the refusal token before LKG admission independently of added bust passes",
             "contract_refs": [
                 "FM-OC-6",
-                "RUST-E2E"
+                "RUST-E2E",
+                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
             ]
         }
     ]
