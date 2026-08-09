@@ -695,7 +695,7 @@ export const MagicContextConfigSchema = z
                 'Cache TTL: string (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "model-id": "10m" }). Set to "never" for lanes kept warm by an external keepwarm proxy — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time.',
             ),
         prompt_surface: PromptSurfaceConfigSchema.default({ default: "full" }).describe(
-            "Prompt-surface presets: default is full; models use the literal provider/model or provider/* routing grammar. Guidance and tool-description overrides are user-level only.",
+            "Prompt-surface presets: default is full; models use the literal provider/model or provider/* routing grammar. Guidance and tool-description overrides are user-level only. On OpenCode and Pi, per-model routing applies to the guidance block only: tool descriptions are registered once per process, so they follow the default preset (a v1 plugin-surface limitation; per-model tool descriptions are planned for the OpenCode v2 plugin API once the SDK stabilizes).",
         ),
         output_reserve: z
             .union([
