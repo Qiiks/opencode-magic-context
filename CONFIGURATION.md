@@ -70,7 +70,9 @@ Both setup wizards add this automatically.
 
 Model keys use the same progressive, case-sensitive lookup walk as `cache_ttl`: exact `provider/model` keys, less-specific model variants, then the literal `provider/*` wildcard and `default`. The first slash separates the provider; additional slashes remain part of the model ID. Missing provider/model components fall back to `default`.
 
-`guidance_override_path` and `tool_descriptions` are user-level only. A project may select `default` and `models`, but repository-supplied guidance files and tool-description text are stripped with a warning. OpenCode and Pi registered tool text is owned by the registration instance; model routes are intended for guidance routing, not in-place tool-definition mutation. CC consumes both surfaces at its session model-key boundary.
+> **OpenCode/Pi v1 limitation:** per-model routing in `models` applies to the guidance block only. Tool descriptions are registered once per process by the v1 plugin API, so they always follow `prompt_surface.default`. Per-model tool descriptions are planned for the OpenCode v2 plugin API once the SDK stabilizes (tracked in [#260](https://github.com/cortexkit/magic-context/issues/260)).
+
+`guidance_override_path` and `tool_descriptions` are user-level only. A project may select `default` and `models`, but repository-supplied guidance files and tool-description text are stripped with a warning.
 
 ```jsonc
 {

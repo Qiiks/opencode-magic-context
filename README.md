@@ -284,7 +284,9 @@ It reads directly from Magic Context's SQLite database. No extra server, no API.
 
 ## Configuration
 
-Settings live in `magic-context.jsonc`. Most settings have sensible defaults, but `historian.model` is required for history compacting; project config merges on top of user-wide settings. For the full reference — cache TTL tuning, per-model execute thresholds, historian and dreamer model selection, embedding providers, and memory settings — see **[CONFIGURATION.md](./CONFIGURATION.md)** or the **[configuration reference on docs.cortexkit.io](https://docs.cortexkit.io/magic-context/reference/configuration/)**.
+Settings live in `magic-context.jsonc`. Most settings have sensible defaults, but `historian.model` is required for history compacting; project config merges on top of user-wide settings. For the full reference — cache TTL tuning, per-model execute thresholds, historian and dreamer model selection, embedding providers, memory settings, and prompt-surface presets (`full`/`light`) — see **[CONFIGURATION.md](./CONFIGURATION.md)** or the **[configuration reference on docs.cortexkit.io](https://docs.cortexkit.io/magic-context/reference/configuration/)**.
+
+> **Note on per-model settings (OpenCode/Pi):** settings that route per model — like `prompt_surface.models` — apply to the injected guidance block. Tool descriptions are registered once per process by the current (v1) plugin API and follow the default preset; per-model tool descriptions arrive with the OpenCode v2 plugin API once the SDK stabilizes ([#260](https://github.com/cortexkit/magic-context/issues/260)).
 
 **Config locations** (one shared CortexKit location, project overrides user):
 1. `<project-root>/.cortexkit/magic-context.jsonc`
