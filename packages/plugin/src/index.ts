@@ -759,6 +759,7 @@ const server: Plugin = async (ctx) => {
                         reg.overrides,
                         reg.id,
                         reg.lockPermissions === true,
+                        reg.description,
                     );
                 }
                 config.agent = agentConfig;

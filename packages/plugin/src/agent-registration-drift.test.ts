@@ -14,6 +14,7 @@ import {
 import {
     buildHiddenAgentConfig,
     buildHiddenAgentRegistrations,
+    HIDDEN_AGENT_DESCRIPTION_MARKER,
 } from "./agents/hidden-agent-registrations";
 import {
     HISTORIAN_AGENT,
@@ -70,6 +71,16 @@ describe("hidden-agent registration drift guard", () => {
                 SIDEKICK_AGENT,
             ].sort(),
         );
+    });
+
+    test("every hidden agent has an internal-only task-routing description", () => {
+        expect(regs).toHaveLength(12);
+        for (const registration of regs) {
+            expect(registration.description, registration.id).toContain(
+                HIDDEN_AGENT_DESCRIPTION_MARKER,
+            );
+            expect(registration.description, registration.id).toContain("do not select");
+        }
     });
 
     test("classifier is a zero-tool locked pure transform", () => {
