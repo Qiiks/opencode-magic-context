@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { COMMIT_VERB_PATTERN, createCommitHashExtractPattern } from "../../shared/commit-detection";
 import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker";
 import { isSystemDirective, removeSystemReminders } from "../../shared/system-directive";
@@ -109,17 +110,33 @@ function truncateArg(value: string, maxLen = 60): string {
     return `${value.slice(0, maxLen)}…`;
 }
 
-// Real Claude tokenizer (ai-tokenizer with Claude encoding). Static ESM
-// import — ai-tokenizer is a hard runtime dependency and is used on every
-// transform pass, so there's no reason to lazy-load it. The previous
-// dynamic `eval("require")` pattern silently failed in Bun's ESM runtime
-// and fell back to `Math.ceil(text.length / 3.5)`, which over-counted
-// base64 thinking signatures and under-counted JSON tool content, making
-// the sidebar's "Tool Defs + Overhead" residual wrong on long sessions.
-import Tokenizer from "ai-tokenizer";
-import * as claudeEncoding from "ai-tokenizer/encoding/claude";
+// Keep ai-tokenizer out of the eager module graph. Pi imports this module through
+// its system-prompt path during cold start, while token estimates are not needed
+// until the first real prompt is processed. createRequire keeps construction
+// synchronous so estimateTokens keeps its existing API and defers both package
+// loads until that first non-empty call.
+type TokenizerLike = {
+    encode: (text: string, allowedSpecial: string) => number[];
+};
+type TokenizerConstructor = new (encoding: unknown) => TokenizerLike;
 
-const tokenizer = new Tokenizer(claudeEncoding);
+const requireFromThisModule = createRequire(import.meta.url);
+let tokenizer: TokenizerLike | undefined;
+
+function getTokenizer(): TokenizerLike {
+    if (tokenizer) return tokenizer;
+
+    const tokenizerModule = requireFromThisModule("ai-tokenizer") as {
+        default?: TokenizerConstructor;
+        Tokenizer?: TokenizerConstructor;
+    };
+    const Tokenizer = tokenizerModule.default ?? tokenizerModule.Tokenizer;
+    if (!Tokenizer) throw new Error("ai-tokenizer does not expose a Tokenizer constructor");
+
+    const claudeEncoding = requireFromThisModule("ai-tokenizer/encoding/claude");
+    tokenizer = new Tokenizer(claudeEncoding);
+    return tokenizer;
+}
 
 export function estimateTokens(text: string): number {
     if (!text) return 0;
@@ -132,7 +149,7 @@ export function estimateTokens(text: string): number {
     // vector. Token counts for content WITHOUT special-token substrings are
     // identical; for content WITH them we now count the literal bytes (correct,
     // since the wire carries the literal string, not a real control token).
-    return tokenizer.encode(text, "all").length;
+    return getTokenizer().encode(text, "all").length;
 }
 
 export function normalizeText(text: string): string {
