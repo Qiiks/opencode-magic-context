@@ -37,16 +37,22 @@ import { buildMockHistorianPayload } from "../src/mock-historian";
  * canonical state for "did historian publish write a pending blob".
  */
 
-const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
+const HISTORIAN_SYSTEM_MARKER =
+    "the hippocampus of a long-running coding agent";
+const RUST_MODE = process.env.MC_E2E_MODE === "rust";
 
 function isHistorianRequest(body: Record<string, unknown>): boolean {
     const system = body.system;
-    if (typeof system === "string") return system.includes(HISTORIAN_SYSTEM_MARKER);
+    if (typeof system === "string")
+        return system.includes(HISTORIAN_SYSTEM_MARKER);
     if (Array.isArray(system)) {
         for (const block of system) {
             if (block && typeof block === "object") {
                 const text = (block as { text?: unknown }).text;
-                if (typeof text === "string" && text.includes(HISTORIAN_SYSTEM_MARKER)) {
+                if (
+                    typeof text === "string" &&
+                    text.includes(HISTORIAN_SYSTEM_MARKER)
+                ) {
                     return true;
                 }
             }
@@ -55,8 +61,12 @@ function isHistorianRequest(body: Record<string, unknown>): boolean {
     return false;
 }
 
-function findOrdinalRange(body: Record<string, unknown>): { start: number; end: number } | null {
-    const messages = body.messages as Array<{ role: string; content: unknown }> | undefined;
+function findOrdinalRange(
+    body: Record<string, unknown>,
+): { start: number; end: number } | null {
+    const messages = body.messages as
+        | Array<{ role: string; content: unknown }>
+        | undefined;
     if (!messages) return null;
     for (const m of messages) {
         const contentArr = Array.isArray(m.content) ? m.content : [];
@@ -103,9 +113,7 @@ afterAll(async () => {
 });
 
 describe("deferred compaction marker (plan v6)", () => {
-    it(
-        "writes pending blob in-tx on publish and holds it across defer passes",
-        async () => {
+    it("writes pending blob in-tx on publish and holds it across defer passes", async () => {
             h.mock.reset();
 
             // Mock historian: return a valid response that covers the actual
@@ -191,58 +199,83 @@ describe("deferred compaction marker (plan v6)", () => {
             await h.sendPrompt(sessionId, "turn 12: post-trigger follow-up.");
 
             // ── ASSERTION 1: pending blob populated after publish ─────────
+        if (RUST_MODE) {
+            // a5b7d61d moved Rust publication and its pending delta into the
+            // module transaction. `pending_m1_delta` is the authority-level
+            // equivalent of the legacy context.db marker blob.
+            const stack = h.rustStack;
+            if (!stack)
+                throw new Error("Rust marker check requires the hermetic module stack");
+            const deadline = Date.now() + 60_000;
+            let afterPublish: Record<string, unknown> = {};
+            while (Date.now() < deadline) {
+                afterPublish = await stack.moduleStatus(
+                    sessionId,
+                    h.opencode.env.workdir,
+                    "session.status",
+                );
+                if (
+                    Number(afterPublish.compartment_count ?? 0) > 0 &&
+                    afterPublish.pending_m1_delta === true
+                ) {
+                    break;
+                }
+                await Bun.sleep(100);
+            }
+            expect(Number(afterPublish.compartment_count ?? 0)).toBeGreaterThan(0);
+            expect(afterPublish.pending_m1_delta).toBe(true);
+
+            await h.sendPrompt(sessionId, "small defer turn — no mutation expected");
+            const pendingAfter = await stack.moduleStatus(
+                sessionId,
+                h.opencode.env.workdir,
+                "session.status",
+            );
+            const unchanged = pendingAfter.pending_m1_delta === true;
+            const drained =
+                pendingAfter.pending_m1_delta === false &&
+                JSON.stringify(h.mock.lastRequest()?.body ?? {}).includes(
+                    "<session-history>",
+                );
+            expect(unchanged || drained).toBe(true);
+        } else {
             await h.waitFor(
                 () => {
                     const row = readMarkerState(h, sessionId);
-                    return row?.pending_compaction_marker_state != null
-                        && row.pending_compaction_marker_state.length > 0;
+                    return (
+                        row?.pending_compaction_marker_state != null &&
+                        row.pending_compaction_marker_state.length > 0
+                    );
                 },
-                { timeoutMs: 30_000, label: "pending_compaction_marker_state set after publish" },
+                {
+                    timeoutMs: 30_000,
+                    label: "pending_compaction_marker_state set after publish",
+                },
             );
 
             const afterPublish = readMarkerState(h, sessionId);
             expect(afterPublish).not.toBeNull();
             expect(afterPublish?.pending_compaction_marker_state).toBeTruthy();
 
-            // Pending blob is JSON with ordinal/endMessageId/publishedAt.
-            const pendingBlob = JSON.parse(afterPublish?.pending_compaction_marker_state ?? "{}");
+            const pendingBlob = JSON.parse(
+                afterPublish?.pending_compaction_marker_state ?? "{}",
+            );
             expect(typeof pendingBlob.ordinal).toBe("number");
             expect(pendingBlob.ordinal).toBeGreaterThan(0);
             expect(typeof pendingBlob.endMessageId).toBe("string");
             expect(pendingBlob.endMessageId.length).toBeGreaterThan(0);
             expect(typeof pendingBlob.publishedAt).toBe("number");
 
-            console.log(
-                `[TEST] pending blob written: ordinal=${pendingBlob.ordinal} endMessageId=${pendingBlob.endMessageId}`,
-            );
-
-            // ── ASSERTION 2: defer passes don't mutate pending blob ───────
-            // Send a small turn that stays well under threshold — should be
-            // a defer pass per pressure (we're now low because cache_read
-            // dominates and the small response keeps us there).
             const pendingBefore = afterPublish?.pending_compaction_marker_state;
             await h.sendPrompt(sessionId, "small defer turn — no mutation expected");
-
-            // Give the transform a moment to settle, then re-read.
             const pendingAfter = readMarkerState(h, sessionId);
-            console.log(
-                `[TEST] after defer turn: pending=${pendingAfter?.pending_compaction_marker_state?.slice(0, 40)} applied=${pendingAfter?.compaction_marker_state?.slice(0, 40)}`,
-            );
-            // The pending blob should still match the post-publish snapshot.
-            // It either stays equal OR the drain has already fired (applied
-            // populated, pending cleared) if the small turn happened to be
-            // an execute pass. Either is correct behavior; only "drained
-            // without applying" or "pending changed mid-flight" would be a
-            // regression. Assert one of these two valid states:
             const drained =
-                pendingAfter?.pending_compaction_marker_state == null
-                && pendingAfter?.compaction_marker_state != null
-                && pendingAfter.compaction_marker_state.length > 0;
+                pendingAfter?.pending_compaction_marker_state == null &&
+                pendingAfter?.compaction_marker_state != null &&
+                pendingAfter.compaction_marker_state.length > 0;
             const unchanged =
                 pendingAfter?.pending_compaction_marker_state === pendingBefore;
             expect(drained || unchanged).toBe(true);
-
-        },
-        90_000,
-    );
+        }
+    }, 90_000);
 });

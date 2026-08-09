@@ -63,7 +63,7 @@ beforeAll(async () => {
             // an 80-char fragment of the paste back into the next user message —
             // a timing coin-flip that failed 3 of 20 serial runs. This suite
             // tests thinking-block safety, not search recall.
-            auto_search: { enabled: false },
+            memory: { auto_search: { enabled: false } },
         },
         modelContextLimit: 50_000,
     });
@@ -93,7 +93,9 @@ interface RequestWithMessages {
 /** Cast the loosely-typed `CapturedRequest` to our Anthropic shape. The mock
  * preserves the raw JSON body as-is, so this is safe — it's the same bytes
  * that @ai-sdk/anthropic produced and that the real API would validate. */
-function asAnthropic(req: { body: Record<string, unknown> }): RequestWithMessages {
+function asAnthropic(req: {
+    body: Record<string, unknown>;
+}): RequestWithMessages {
     return req as unknown as RequestWithMessages;
 }
 
@@ -109,12 +111,17 @@ function capturedUsers(req: RequestWithMessages): AnthropicMessage[] {
 }
 
 function mainRequests(): Array<{ body: Record<string, unknown> }> {
-    return h.mock.requests().filter((request) =>
+    return h.mock
+        .requests()
+        .filter((request) =>
         JSON.stringify(request.body.system ?? "").includes("## Magic Context"),
     );
 }
 
-function toolName(body: Record<string, unknown>, pattern: RegExp): string | null {
+function toolName(
+    body: Record<string, unknown>,
+    pattern: RegExp,
+): string | null {
     const tools = body.tools;
     if (!Array.isArray(tools)) return null;
     for (const tool of tools) {
@@ -128,7 +135,11 @@ function toolName(body: Record<string, unknown>, pattern: RegExp): string | null
 function emitCtxReduceOnce(tag: number): () => boolean {
     let emitted = false;
     h.mock.addMatcher((body) => {
-        if (emitted || !JSON.stringify(body.system ?? "").includes("## Magic Context")) return null;
+        if (
+            emitted ||
+            !JSON.stringify(body.system ?? "").includes("## Magic Context")
+        )
+            return null;
         const name = toolName(body, /^ctx_reduce$/);
         if (!name) return null;
         emitted = true;
@@ -155,7 +166,8 @@ function emitCtxReduceOnce(tag: number): () => boolean {
 
 function tagForText(body: Record<string, unknown>, needle: string): number {
     const messages = body.messages;
-    if (!Array.isArray(messages)) throw new Error("captured request omitted messages");
+    if (!Array.isArray(messages))
+        throw new Error("captured request omitted messages");
     for (const message of messages) {
         if (!message || typeof message !== "object") continue;
         const content = (message as { content?: unknown }).content;
@@ -234,9 +246,7 @@ function findThinkingBlocks(req: RequestWithMessages): AnthropicContentBlock[] {
 
 describe("thinking-block safety (Anthropic 400 regression)", () => {
     describe("Bug A: nudge anchor on a thinking-bearing assistant", () => {
-        it(
-            "does not inject nudge <instruction> text into an assistant that has a thinking block",
-            async () => {
+        it("does not inject nudge <instruction> text into an assistant that has a thinking block", async () => {
                 h.mock.reset();
 
                 const signedThinking = "Let me work through this carefully step by step.";
@@ -264,11 +274,17 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
 
                 // Establish a nudge placement pointing at the latest assistant
                 // by running a second turn at the same usage.
-                await h.sendPrompt(sessionId, "turn 2 — give nudge logic a chance to anchor");
+            await h.sendPrompt(
+                sessionId,
+                "turn 2 — give nudge logic a chance to anchor",
+            );
 
                 // Third turn — the defer pass now sees the anchored placement
                 // (if any) and MUST NOT mutate the signed assistant's text.
-                await h.sendPrompt(sessionId, "turn 3 — defer pass must not mutate signed msg");
+            await h.sendPrompt(
+                sessionId,
+                "turn 3 — defer pass must not mutate signed msg",
+            );
 
                 const mainReqs = h.mock.requests().filter((r) => {
                     const sys = r.body.system;
@@ -299,7 +315,7 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                     // the thinking signature.
                     for (const block of asst.content) {
                         if (block.type !== "text") continue;
-                        expect(block.text ?? "").not.toContain("<instruction name=\"context_");
+                    expect(block.text ?? "").not.toContain('<instruction name="context_');
                         expect(block.text ?? "").not.toContain("context_iteration");
                         expect(block.text ?? "").not.toContain("context_warning");
                         expect(block.text ?? "").not.toContain("context_critical");
@@ -319,21 +335,21 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                     expect(findThinkingBlocks(asAnthropic(lastReq))).toHaveLength(0);
                     for (const assistant of assistants) {
                         const serialized = JSON.stringify(assistant.content);
-                        expect(serialized).not.toContain("<instruction name=\"context_");
+                    expect(serialized).not.toContain('<instruction name="context_');
                     }
                 } else {
                     // TypeScript preserves historical signed reasoning, so this branch must
                     // inspect at least one real signature rather than passing vacuously.
                     expect(inspected).toBeGreaterThan(0);
                 }
-            },
-            90_000,
-        );
+        }, 90_000);
     });
 
     describe("Bug B: user-message turn boundary preserved when text tag is dropped", () => {
         it(
-            "keeps the user shell as [dropped §N§] so adjacent assistants are not merged",
+            RUST_MODE
+                ? "keeps provider roles safe when whole-arc history supersedes the dropped shell"
+                : "keeps the user shell as [dropped §N§] so adjacent assistants are not merged",
             async () => {
                 h.mock.reset();
 
@@ -391,7 +407,10 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
 
                 // Resolve the public §N§ handle from the exact wire bytes, then drop it
                 // through ctx_reduce. This avoids coupling either mode to its private store.
-                const pasteTag = tagForText(mainRequests().at(-1)!.body, "Here is a log of the failing session:");
+            const pasteTag = tagForText(
+                mainRequests().at(-1)!.body,
+                "Here is a log of the failing session:",
+            );
                 await ageTagBeyondProtectedWindow(sessionId);
                 const reduced = await dropAndMaterialize(sessionId, pasteTag);
                 expect(reduced.dropEmitted).toBe(true);
@@ -409,8 +428,15 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                     .map((b) => b.text ?? "")
                     .join("\n");
 
-                expect(allUserText).toMatch(/\[dropped \u00a7\d+\u00a7\]/);
                 expect(allUserText).not.toContain("ERROR: call_failed at line 42.");
+            if (RUST_MODE) {
+                // a5b7d61d enabled deterministic out-of-band Rust publication.
+                // Once the target turn is covered, m0 supersedes its transient
+                // dropped shell and the historical assistants with one safe summary.
+                expect(allUserText).toContain("<session-history>");
+            } else {
+                expect(allUserText).toMatch(/\[dropped \u00a7\d+\u00a7\]/);
+            }
 
                 // Thinking blocks from prior turns must be present and
                 // unchanged in the request.
@@ -432,10 +458,19 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                     if (t.signature === sigB) expect(t.thinking).toBe(signedThinkingB);
                 }
 
-                // Structural check: the outer message array must contain the
-                // user paste shell as a distinct user message — not merged
-                // into an assistant block. Count transitions.
                 const messages = (lastReq.body.messages ?? []) as Array<{ role: string }>;
+            if (RUST_MODE) {
+                // Covered history no longer has raw turn shells, but it must also
+                // never expose adjacent assistants for the adapter to merge.
+                for (let i = 1; i < messages.length; i++) {
+                    expect([messages[i - 1]!.role, messages[i]!.role]).not.toEqual([
+                        "assistant",
+                        "assistant",
+                    ]);
+                }
+            } else {
+                // The raw user paste shell remains a distinct boundary. Count
+                // transitions to prove adjacent assistants were not merged.
                 const transitions: Array<{ from: string; to: string }> = [];
                 for (let i = 1; i < messages.length; i++) {
                     const prev = messages[i - 1]!;
@@ -444,20 +479,19 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                         transitions.push({ from: prev.role, to: cur.role });
                     }
                 }
-                // We must see at least 2 user→assistant transitions in the
-                // history, proving the user paste DID act as a boundary.
                 const userToAsst = transitions.filter(
                     (t) => t.from === "user" && t.to === "assistant",
                 );
                 expect(userToAsst.length).toBeGreaterThanOrEqual(2);
-            },
-            120_000,
-        );
+            }
+        }, 120_000);
     });
 
     describe("Bug C: file/image part survives when companion text is dropped", () => {
         it(
-            "keeps a user message with an image part even after its text tag is dropped",
+            RUST_MODE
+                ? "allows whole-arc history to supersede the image without partial stripping"
+                : "keeps a user message with an image part even after its text tag is dropped",
             async () => {
                 h.mock.reset();
                 h.mock.setDefault({
@@ -476,7 +510,9 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                 // We bypass the SdkClient helper (text-only) and call the raw
                 // client to include a file part.
                 const sdk = await import("@opencode-ai/sdk");
-                const rawClient = sdk.createOpencodeClient({ baseUrl: h.opencode.url }) as unknown as {
+            const rawClient = sdk.createOpencodeClient({
+                baseUrl: h.opencode.url,
+            }) as unknown as {
                     session: {
                         prompt: (opts: {
                             path: { id: string };
@@ -534,24 +570,32 @@ describe("thinking-block safety (Anthropic 400 regression)", () => {
                     Array.isArray(u.content) ? u.content : [],
                 );
                 const imageBlocks = allUserBlocks.filter((b) => b.type === "image");
-                expect(imageBlocks.length).toBeGreaterThan(0);
                 const allUserText = allUserBlocks
                     .filter((block) => block.type === "text")
                     .map((block) => block.text ?? "")
                     .join("\n");
                 expect(allUserText).not.toContain("see this screenshot for the bug");
+
+            const coveredByRustHistory =
+                RUST_MODE && allUserText.includes("<session-history>");
+            if (coveredByRustHistory) {
+                // a5b7d61d made the shared Rust lane publish deterministic m0.
+                // A published history range owns every raw block it covers, so the
+                // summary legitimately supersedes both the text shell and image.
+                expect(imageBlocks).toHaveLength(0);
+            } else {
+                expect(imageBlocks.length).toBeGreaterThan(0);
                 expect(allUserText).toMatch(/\[dropped \u00a7\d+\u00a7\]/);
 
-                // The user message carrying the image must also NOT have been
-                // removed from the message list (structural presence).
+                // Before coverage, the user message carrying the image must remain
+                // structurally present after dropping only its companion text.
                 const userWithImage = users.find(
                     (u) =>
                         Array.isArray(u.content) &&
                         u.content.some((b) => b.type === "image"),
                 );
                 expect(userWithImage).toBeDefined();
-            },
-            90_000,
-        );
+            }
+        }, 90_000);
     });
 });

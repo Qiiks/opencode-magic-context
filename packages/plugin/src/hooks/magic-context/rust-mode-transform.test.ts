@@ -1235,6 +1235,7 @@ describe("Rust mode authority adapter", () => {
         const db = makeDb();
         installRawProvider(sessionId);
         const transformBodies: Array<Record<string, unknown>> = [];
+        const deleteSession = mock(async () => {});
         const closeSession = mock(() => {});
         const moduleClient: RustModeModuleClient = {
             call: async ({ method, body }) => {
@@ -1243,9 +1244,13 @@ describe("Rust mode authority adapter", () => {
                     ? { decision: "PASSTHROUGH", native_messages: [] }
                     : { ok: true };
             },
+            deleteSession,
             closeSession,
         };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            projectRoot: "/tmp/rust-clear-session-project",
+        });
         for (let pass = 0; pass < 2; pass += 1) {
             const input = makeMessages(sessionId);
             await transform.run(
@@ -1258,6 +1263,8 @@ describe("Rust mode authority adapter", () => {
         expect(transformBodies[1]?.tail_delta).toBeDefined();
 
         transform.clearSession(sessionId);
+        await Bun.sleep(0);
+        expect(deleteSession).toHaveBeenCalledWith(sessionId, "/tmp/rust-clear-session-project");
         expect(closeSession).toHaveBeenCalledWith(sessionId);
         const afterClear = makeMessages(sessionId);
         await transform.run(

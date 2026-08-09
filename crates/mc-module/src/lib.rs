@@ -4554,6 +4554,38 @@ impl McHandler {
         }
     }
 
+    fn handle_session_delete_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let (session_id, binding) = match self.management_binding(channel, request, "session.delete") {
+            Ok(scope) => scope,
+            Err(outcome) => return outcome,
+        };
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        match store.delete_session(&session_id, &binding.project_root.to_string_lossy()) {
+            Ok(deleted_rows) => {
+                self.reattaching_sessions
+                    .lock()
+                    .expect("reattaching sessions mutex")
+                    .remove(&session_id);
+                self.wrapup_sessions
+                    .lock()
+                    .expect("wrapup sessions mutex")
+                    .remove(&session_id);
+                self.recomp_sessions
+                    .lock()
+                    .expect("recomp sessions mutex")
+                    .remove(&session_id);
+                respond(json!({ "ok": true, "deleted_rows": deleted_rows }))
+            }
+            Err(error) => HandlerOutcome::Error {
+                code: "store_write_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
     fn handle_session_status_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let (session_id, binding) =
             match self.management_binding(channel, request, "session.status") {
@@ -4730,6 +4762,7 @@ impl McHandler {
             "compartment_count": compartment_count,
             "compartment_tokens": compartment_tokens,
             "pending_drop_count": pending_drop_count,
+            "tag_count": tag_count,
             "pending_m1_delta": pending_m1_delta,
             "pending_m1_age_ms": pending_m1_age_ms,
             "historian": {
@@ -9515,6 +9548,7 @@ impl McHandler {
                 "session.flush" => self.handle_session_flush_value(channel, &request),
                 "session.recomp" => self.handle_session_recomp_value(channel, &request),
                 "session.status" => self.handle_session_status_value(channel, &request),
+                "session.delete" => self.handle_session_delete_value(channel, &request),
                 "session.wrapup" => self.handle_session_wrapup_value(channel, &request).await,
                 // Explicit wire-debugging echo. Opt-in only: echoing every
                 // unrecognized body would silently swallow misrouted requests
@@ -18586,10 +18620,48 @@ mod tests {
         assert!(summary.contains("2 tags"));
         assert!(summary.contains("pending m1 delta true age_ms=0"));
         assert!(summary.contains("last historian: published seq 3"));
+        assert_eq!(body["tag_count"], json!(2));
         assert_eq!(body["pending_m1_delta"], json!(true));
         assert_eq!(body["pending_m1_age_ms"], json!(0));
         assert_eq!(body["tail_identity_re_adopt_count"], json!(0));
         assert!(summary.ends_with("surface active"));
+    }
+
+    #[test]
+    fn session_delete_clears_durable_state_for_the_bound_lineage() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) = handler_with_store(producer, default_test_config());
+        let session_id = "ses-delete";
+        handler.bind_route(7, binding(project.to_str().unwrap(), session_id));
+        store
+            .commit(
+                session_id,
+                None,
+                &CoreState::default(),
+                &ModuleMeta::default(),
+            )
+            .unwrap();
+        store
+            .seed_tags_for_test(
+                session_id,
+                &[TagMintInput {
+                    block_id: "m1#0".to_string(),
+                    kind: "message".to_string(),
+                    token_count: 1,
+                    source_bytes: b"one".to_vec(),
+                }],
+                1,
+            )
+            .unwrap();
+
+        let deleted = tool_body(handler.handle_session_delete_value(
+            7,
+            &json!({ "method": "session.delete", "v": 1, "session_id": session_id }),
+        ));
+        assert_eq!(deleted["ok"], json!(true));
+        assert!(deleted["deleted_rows"].as_u64().unwrap() >= 2);
+        assert!(!store.has_cache_state(session_id).unwrap());
+        assert!(store.load_tags_for_session(session_id).unwrap().is_empty());
     }
 
     #[test]

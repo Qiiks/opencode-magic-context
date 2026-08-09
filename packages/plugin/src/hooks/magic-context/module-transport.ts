@@ -262,6 +262,7 @@ export class SubcModuleTransport {
             | "state_sync"
             | "transform"
             | "session.status"
+            | "session.delete"
             | "session.flush"
             | "session.recomp"
             | "session.wrapup"
@@ -476,6 +477,15 @@ export class SubcModuleTransport {
         );
         if (!isRecord(response.page)) throw new Error("mirror.pull omitted page");
         return { page: response.page as unknown as ChangefeedPage };
+    }
+
+    async deleteSession(sessionId: string, projectRoot: string): Promise<void> {
+        await this.call({
+            sessionId,
+            projectRoot,
+            method: "session.delete",
+            body: { method: "session.delete", v: 1, session_id: sessionId },
+        });
     }
 
     closeSession(sessionId: string): void {

@@ -111,6 +111,7 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
         live_only?: boolean;
         projectRoot?: string;
     }): Promise<{ page: import("../../features/magic-context/context-authority").ChangefeedPage }>;
+    deleteSession?(sessionId: string, projectRoot: string): Promise<void>;
     closeSession?(sessionId: string): void;
     getCompartmentsAfter?(
         sessionId: string,
@@ -2232,10 +2233,21 @@ export function createRustModeTransform(
     return {
         run,
         clearSession(sessionId: string): void {
+            const projectRoot =
+                states.get(sessionId)?.memoryAuthorityRoot ?? options.projectRoot ?? null;
             dropSlot(sessionId, "session-deleted");
             states.delete(sessionId);
             wireCaches.delete(sessionId);
-            options.moduleClient.closeSession?.(sessionId);
+            if (projectRoot && options.moduleClient.deleteSession) {
+                void options.moduleClient
+                    .deleteSession(sessionId, projectRoot)
+                    .catch((error) => {
+                        sessionLog(sessionId, "rust module session deletion failed:", error);
+                    })
+                    .finally(() => options.moduleClient.closeSession?.(sessionId));
+            } else {
+                options.moduleClient.closeSession?.(sessionId);
+            }
         },
         invalidateWireState,
         getState(sessionId: string): Readonly<RustSessionState> {

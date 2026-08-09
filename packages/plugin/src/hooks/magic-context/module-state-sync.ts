@@ -1492,6 +1492,7 @@ export interface ModuleStateSyncClient {
             | "state_sync"
             | "transform"
             | "session.status"
+            | "session.delete"
             | "session.flush"
             | "session.recomp"
             | "session.wrapup"

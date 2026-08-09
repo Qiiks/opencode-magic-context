@@ -13,6 +13,7 @@ import type { MockUsage } from "../src/mock-provider/server";
 import { openTestDb } from "../src/test-db";
 
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
+const RUST_MODE = process.env.MC_E2E_MODE === "rust";
 
 const LOW_USAGE: MockUsage = {
     input_tokens: 1_000,
@@ -475,61 +476,100 @@ describe("long-running OpenCode Magic Context session", () => {
         // The 15-minute cooldown uses process-local wall-clock time; this long test cannot advance it without sleeping.
 
         // Phase 4: ctx_reduce queues a real drop; the next execute materializes a dropped shell and suppresses cleanup nudges.
-        const reduceTarget = await h.waitFor(
-            () => {
-                const row = h
-                    .contextDb()
-                    .prepare(
-                        "SELECT t.tag_number AS tag FROM tags t JOIN source_contents s ON s.session_id = t.session_id AND s.tag_id = t.tag_number WHERE t.session_id = ? AND t.status = 'active' AND s.content LIKE 'phase 1 assistant%' ORDER BY t.tag_number ASC LIMIT 1",
-                    )
-                    .get(sessionId) as { tag: number } | null;
-                return row?.tag ?? 0;
-            },
-            { label: "assistant tag for ctx_reduce" },
-        );
+        let reduceTarget: number;
+        let reduceNeedle: string;
+        if (RUST_MODE) {
+            // 20ac0630 moved tag authority out of context.db. Select a live tag
+            // from the actual provider wire so this remains a non-vacuous drop.
+            const wire = JSON.stringify(mainRequests().at(-1)!.body.messages ?? []);
+            const match = wire.match(/§(\d+)§ (phase 1 assistant \d+)/);
+            expect(match).not.toBeNull();
+            reduceTarget = Number(match![1]);
+            reduceNeedle = match![2]!;
+        } else {
+            reduceTarget = await h.waitFor(
+                () => {
+                    const row = h
+                        .contextDb()
+                        .prepare(
+                            "SELECT t.tag_number AS tag FROM tags t JOIN source_contents s ON s.session_id = t.session_id AND s.tag_id = t.tag_number WHERE t.session_id = ? AND t.status = 'active' AND s.content LIKE 'phase 1 assistant%' ORDER BY t.tag_number ASC LIMIT 1",
+                        )
+                        .get(sessionId) as { tag: number } | null;
+                    return row?.tag ?? 0;
+                },
+                { label: "assistant tag for ctx_reduce" },
+            );
+            reduceNeedle = "phase 1 assistant 1";
+        }
         emitToolOnce(/^ctx_reduce$/, { drop: String(reduceTarget) });
         await send(sessionId, `turn 13: drop old assistant tag ${reduceTarget} with ctx_reduce`, "phase 4 after ctx_reduce");
         await send(sessionId, "turn 14: pressure after ctx_reduce so pending op applies next", "phase 4 pressure", FORCE_CLEANUP_USAGE);
         await send(sessionId, "turn 15: materialize ctx_reduce pending op", "phase 4 materialize");
-        await h.waitFor(() => {
-            const row = h.contextDb().prepare("SELECT status FROM tags WHERE session_id = ? AND tag_number = ?").get(sessionId, reduceTarget) as { status: string } | null;
-            return row?.status === "dropped";
-        }, { label: "ctx_reduce target dropped" });
+        if (!RUST_MODE) {
+            await h.waitFor(
+                () => {
+                    const row = h
+                        .contextDb()
+                        .prepare("SELECT status FROM tags WHERE session_id = ? AND tag_number = ?")
+                        .get(sessionId, reduceTarget) as { status: string } | null;
+                    return row?.status === "dropped";
+                },
+                { label: "ctx_reduce target dropped" },
+            );
+        }
         const reducedBody = JSON.stringify(mainRequests().at(-1)!.body);
-        expect(reducedBody).not.toContain("phase 1 assistant 1");
+        expect(reducedBody).not.toContain(reduceNeedle);
         expect(reducedBody).not.toContain("ctx_reduce_turn_cleanup");
         await send(sessionId, "turn 16: ctx_reduce defer replay remains stable", "phase 4 stable replay");
-        expect(JSON.stringify(mainRequests().at(-1)!.body)).not.toContain("phase 1 assistant 1");
+        expect(JSON.stringify(mainRequests().at(-1)!.body)).not.toContain(reduceNeedle);
 
         // Phase 5: Historian publishes; OpenCode writes a deferred marker that drains only on a later execute pass.
         await send(sessionId, "turn 17: historian trigger pressure with eligible long tail", "phase 5 historian trigger", HISTORIAN_TRIGGER_USAGE);
         await send(sessionId, "turn 18: follow-up starts historian publication", "phase 5 historian follow-up");
-        await h.waitFor(
-            () => {
-                const row = h
-                    .contextDb()
-                    .prepare("SELECT COUNT(*) AS n FROM compartments WHERE session_id = ?")
-                    .get(sessionId) as { n: number } | null;
-                return (row?.n ?? 0) > 0;
-            },
-            // Bumped from 30s → 300s for CI: OpenCode historian publishes
-            // via background subagent which has its own LLM round-trip
-            // through the mock; slow on CI cold runners.
-            { timeoutMs: 300_000, label: "historian compartment published" },
-        );
-        const compartment = h
-            .contextDb()
-            .prepare("SELECT start_message, end_message, title FROM compartments WHERE session_id = ? ORDER BY sequence DESC LIMIT 1")
-            .get(sessionId) as { start_message: number; end_message: number; title: string };
-        expect(historianRange).not.toBeNull();
-        expect(compartment.start_message).toBe(historianRange!.start);
-        expect(compartment.end_message).toBe(historianRange!.end);
-        const markerAfterPublish = readMeta<{ pending_compaction_marker_state: string | null; compaction_marker_state: string | null }>(
-            sessionId,
-            "pending_compaction_marker_state, compaction_marker_state",
-        );
-        expect(Boolean(markerAfterPublish?.pending_compaction_marker_state) || Boolean(markerAfterPublish?.compaction_marker_state)).toBe(true);
-        const pendingBeforeDefer = markerAfterPublish?.pending_compaction_marker_state ?? null;
+        let pendingBeforeDefer: string | null = null;
+        if (RUST_MODE) {
+            // a5b7d61d publishes through the out-of-band module stack; context.db
+            // is not the Rust compartment authority. Observe the committed count
+            // directly rather than waiting on a legacy TypeScript mirror row.
+            const stack = h.rustStack;
+            if (!stack) throw new Error("Rust historian check requires the hermetic module stack");
+            const deadline = Date.now() + 120_000;
+            let compartmentCount = 0;
+            while (Date.now() < deadline) {
+                const status = await stack.moduleStatus(sessionId, h.opencode.env.workdir, "session.status");
+                compartmentCount = Number(status.compartment_count ?? 0);
+                if (compartmentCount > 0) break;
+                await Bun.sleep(100);
+            }
+            expect(compartmentCount).toBeGreaterThan(0);
+        } else {
+            await h.waitFor(
+                () => {
+                    const row = h
+                        .contextDb()
+                        .prepare("SELECT COUNT(*) AS n FROM compartments WHERE session_id = ?")
+                        .get(sessionId) as { n: number } | null;
+                    return (row?.n ?? 0) > 0;
+                },
+                { timeoutMs: 300_000, label: "historian compartment published" },
+            );
+            const compartment = h
+                .contextDb()
+                .prepare("SELECT start_message, end_message, title FROM compartments WHERE session_id = ? ORDER BY sequence DESC LIMIT 1")
+                .get(sessionId) as { start_message: number; end_message: number; title: string };
+            expect(historianRange).not.toBeNull();
+            expect(compartment.start_message).toBe(historianRange!.start);
+            expect(compartment.end_message).toBe(historianRange!.end);
+            const markerAfterPublish = readMeta<{
+                pending_compaction_marker_state: string | null;
+                compaction_marker_state: string | null;
+            }>(sessionId, "pending_compaction_marker_state, compaction_marker_state");
+            expect(
+                Boolean(markerAfterPublish?.pending_compaction_marker_state) ||
+                    Boolean(markerAfterPublish?.compaction_marker_state),
+            ).toBe(true);
+            pendingBeforeDefer = markerAfterPublish?.pending_compaction_marker_state ?? null;
+        }
 
         // Phase 6: Synthetic todowrite rides the next cache-busting pass, while the marker drains with that pass.
         emitToolOnce(/todo.*write|write.*todo|todowrite/i, { todos: ACTIVE_TODOS });
@@ -560,7 +600,25 @@ describe("long-running OpenCode Magic Context session", () => {
         }
 
         // Phase 7: Auto-search hint from a seeded memory is appended and persisted for same-turn replay.
-        seedMemory("zebra cache ritual: when debugging long sessions, inspect prefix bytes before changing runtime code");
+        const autoSearchMemory =
+            "zebra cache ritual: when debugging long sessions, inspect prefix bytes before changing runtime code";
+        if (RUST_MODE) {
+            // f5a0f403 routed Rust memory writes through the module backend. Use
+            // the public tool, then verify the local read-model mirror caught up.
+            emitToolOnce(/^ctx_memory$/, {
+                action: "write",
+                category: "PROJECT_RULES",
+                content: autoSearchMemory,
+            });
+            await send(sessionId, "turn 22b: save the zebra cache ritual memory", "phase 7 memory write");
+            const mirroredMemory = h
+                .contextDb()
+                .prepare("SELECT COUNT(*) AS n FROM memories WHERE content = ?")
+                .get(autoSearchMemory) as { n: number } | null;
+            expect(mirroredMemory?.n ?? 0).toBe(1);
+        } else {
+            seedMemory(autoSearchMemory);
+        }
         const beforeAutoSearch = h.mock.requests().length;
         emitToolOnce(/^ctx_note$/, { action: "read" });
         await send(
