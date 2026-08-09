@@ -76,6 +76,8 @@ describe("hidden-agent registration drift guard", () => {
     test("every hidden agent has an internal-only task-routing description", () => {
         expect(regs).toHaveLength(12);
         for (const registration of regs) {
+            expect(registration.mode, registration.id).toBe("primary");
+            expect(registration.hidden, registration.id).toBe(true);
             expect(registration.description, registration.id).toContain(
                 HIDDEN_AGENT_DESCRIPTION_MARKER,
             );
