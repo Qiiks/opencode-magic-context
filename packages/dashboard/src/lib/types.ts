@@ -258,7 +258,7 @@ export interface Note {
 export interface SessionMetaRow {
   session_id: string;
   last_response_time: number | null;
-  cache_ttl: string | null;
+  cache_ttl: string | number | null;
   counter: number;
   last_nudge_tokens: number;
   last_nudge_band: string;

@@ -2,9 +2,9 @@ import { type JSX, Show } from "solid-js";
 
 /**
  * One dreamer task rendered as a card: an icon, the friendly label + schedule,
- * a last-run traffic light, an on/off toggle, and (when the last run failed) an
- * inline error container. Presentational — the parent owns config read/write and
- * passes `onToggle` + `busy` + `canToggle`.
+ * a last-run traffic light, an on/off toggle, and an inline status container.
+ * Presentational — the parent owns config read/write and passes `onToggle` +
+ * `busy` + `canToggle`.
  */
 
 export type TaskLight = "green" | "amber" | "red" | "gray";
@@ -16,13 +16,16 @@ interface DreamerTaskCardProps {
   scheduleText: string;
   nextDueText: string | null;
   enabled: boolean;
-  /** Icon tint = "is this task active?" — green when enabled, red when enabled
-   *  but its last run failed, gray when disabled. Distinct from `light` (the
+  /** Icon tint = "is this task active?" — green when enabled, red for a hard
+   *  failure, and gray when disabled. A resumable broad-verification cycle stays
+   *  green because it is still making progress. Distinct from `light` (the
    *  status dot's finer last-run health), so an enabled-but-not-yet-run task
    *  still reads as on. */
   iconTint: "green" | "red" | "gray";
   light: TaskLight;
   lastError: string | null;
+  /** True when verify-broad has banked progress and will continue on a later run. */
+  resumable?: boolean;
   /** False when the project has no resolvable worktree to write config to. */
   canToggle: boolean;
   busy: boolean;
@@ -180,6 +183,21 @@ export default function DreamerTaskCard(props: DreamerTaskCardProps) {
         </Show>
       </div>
 
+      <Show when={props.resumable}>
+        <div
+          class="dreamer-task-card-error"
+          style={{
+            color: "var(--amber)",
+            "border-color": "color-mix(in srgb, var(--amber) 35%, transparent)",
+            background: "color-mix(in srgb, var(--amber) 10%, transparent)",
+          }}
+        >
+          <span aria-hidden="true">↻</span>
+          <span class="dreamer-task-card-error-text">
+            Verification is in progress and will resume automatically.
+          </span>
+        </div>
+      </Show>
       <Show when={props.lastError}>
         {(message) => (
           <div class="dreamer-task-card-error" title={message()}>

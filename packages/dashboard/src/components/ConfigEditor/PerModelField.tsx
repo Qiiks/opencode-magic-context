@@ -1,4 +1,4 @@
-import { createSignal, Index, Show } from "solid-js";
+import { createSignal, For, Index, Show } from "solid-js";
 import ModelSelect from "./ModelSelect";
 
 interface PerModelFieldProps {
@@ -19,6 +19,8 @@ interface PerModelFieldProps {
   alwaysObject?: boolean;
   /** When set, text input values are coerced to numbers on save (blank → undefined). */
   numericText?: boolean;
+  /** Optional quick values shown beside text inputs (for example, the `never` TTL sentinel). */
+  textOptions?: readonly { value: string; label: string }[];
 }
 
 /**
@@ -122,6 +124,41 @@ export default function PerModelField(props: PerModelFieldProps) {
     return props.models.filter((m) => !used.has(m));
   };
 
+  const renderTextInput = (
+    value: string | number | undefined,
+    onInput: (value: string) => void,
+  ) => {
+    const options = props.textOptions ?? [];
+    const selectedOption = options.some((option) => option.value === String(value ?? ""))
+      ? String(value)
+      : "";
+    return (
+      <div style={{ display: "flex", gap: "6px", flex: "1" }}>
+        <Show when={options.length > 0}>
+          <select
+            class="config-input"
+            value={selectedOption}
+            style={{ "flex-shrink": "0", width: "150px" }}
+            onChange={(e) => onInput(e.currentTarget.value)}
+          >
+            <option value="">Custom…</option>
+            <For each={options}>
+              {(option) => <option value={option.value}>{option.label}</option>}
+            </For>
+          </select>
+        </Show>
+        <input
+          class="config-input"
+          type="text"
+          style={{ flex: "1" }}
+          value={String(value ?? "")}
+          placeholder={props.defaultPlaceholder}
+          onInput={(e) => onInput(e.currentTarget.value)}
+        />
+      </div>
+    );
+  };
+
   return (
     <div class="config-field">
       <div class="config-field-header">
@@ -158,14 +195,7 @@ export default function PerModelField(props: PerModelFieldProps) {
             </span>
           </div>
         ) : (
-          <input
-            class="config-input"
-            type="text"
-            style={{ flex: "1" }}
-            value={String(normalized().defaultVal ?? "")}
-            placeholder={props.defaultPlaceholder}
-            onInput={(e) => setDefault(e.currentTarget.value || undefined)}
-          />
+          renderTextInput(normalized().defaultVal, (value) => setDefault(value || undefined))
         )}
       </div>
 
@@ -203,13 +233,7 @@ export default function PerModelField(props: PerModelFieldProps) {
                       </span>
                     </div>
                   ) : (
-                    <input
-                      class="config-input"
-                      type="text"
-                      style={{ flex: "1" }}
-                      value={String(val())}
-                      onInput={(e) => setOverride(model(), e.currentTarget.value)}
-                    />
+                    renderTextInput(val(), (value) => setOverride(model(), value))
                   )}
                   <button
                     type="button"
