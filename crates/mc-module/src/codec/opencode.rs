@@ -308,7 +308,7 @@ fn encode_opencode_impl(
     session_id: Option<&str>,
     preserve_compaction: bool,
     mutation_exempt_mids: &[&str],
-    transition_consumed: bool,
+    _transition_consumed: bool,
 ) -> Vec<MessageV2Json> {
     let mut encoded = Vec::with_capacity(messages.len());
     let mut index = 0;
@@ -342,12 +342,43 @@ fn encode_opencode_impl(
         let meta = meta_for_ck(sidecar, msg, index);
         encoded.push(match meta {
             Some(meta) if mutation_exempt_mids.contains(&meta.mid.as_str()) => meta.raw.clone(),
-            Some(meta) => encode_with_meta(msg, meta, preserve_compaction, transition_consumed),
+            Some(meta) => encode_with_meta(msg, meta, preserve_compaction),
             None => encode_new_message(msg, session_id),
         });
         index += 1;
     }
+    assert_unique_tool_use_ids(&encoded);
     encoded
+}
+
+fn duplicate_tool_use_locations(messages: &[MessageV2Json]) -> Vec<(String, usize, usize)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut duplicates = Vec::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        let Some(parts) = message.get("parts").and_then(Value::as_array) else {
+            continue;
+        };
+        for (part_index, part) in parts.iter().enumerate() {
+            if part.get("type").and_then(Value::as_str) != Some("tool") {
+                continue;
+            }
+            let Some(call_id) = part.get("callID").and_then(Value::as_str) else {
+                continue;
+            };
+            if !seen.insert(call_id.to_string()) {
+                duplicates.push((call_id.to_string(), message_index, part_index));
+            }
+        }
+    }
+    duplicates
+}
+
+fn assert_unique_tool_use_ids(messages: &[MessageV2Json]) {
+    let duplicates = duplicate_tool_use_locations(messages);
+    debug_assert!(
+        duplicates.is_empty(),
+        "OpenCode serialization produced duplicate tool_use ids: {duplicates:?}"
+    );
 }
 
 fn decode_tool_part(
@@ -583,7 +614,6 @@ fn encode_with_meta(
     msg: &CkWireMessage,
     meta: &HarnessMessageMeta,
     preserve_compaction: bool,
-    transition_consumed: bool,
 ) -> Value {
     let mut raw = meta.raw.clone();
     let mut parts = raw
@@ -628,13 +658,11 @@ fn encode_with_meta(
                     block_index += 2;
                     continue;
                 }
-                if transition_consumed
-                    && call_native_index.is_none()
-                    && result_native_index.is_none()
-                {
+                if call_native_index.is_none() && result_native_index.is_none() {
                     // OpenCode stores a completed invocation as one part, while CK expands that
-                    // part into adjacent call and result blocks. Recombine an unmatched pair as
-                    // one part instead of independently emitting the same callID twice.
+                    // part into adjacent call and result blocks. This provider-validity invariant
+                    // cannot depend on whether an older renderer-transition marker was persisted:
+                    // two independently emitted shells carry the same callID.
                     parts.push(render_tool_pair_as_part(block, result));
                     block_index += 2;
                     continue;
@@ -1856,6 +1884,140 @@ mod tests {
             &["summary", "latest"],
         );
         assert_eq!(served, raw);
+    }
+
+    #[test]
+    fn hard_epoch_fold_with_head_todo_coalesces_unmatched_reduced_tool_arc() {
+        let raw = vec![json!({
+            "absolute_ordinal": 2_752,
+            "info": { "id": "first-tail-assistant", "role": "assistant" },
+            "parts": [
+                { "type": "step-start" },
+                {
+                    "type": "reasoning",
+                    "text": "signed transition reasoning",
+                    "metadata": { "signature": "transition-signature" }
+                },
+                {
+                    "type": "tool",
+                    "tool": "aft_zoom",
+                    "callID": "call_uRXFDXYYs6UiMIkmAVDWZDzX",
+                    "state": {
+                        "status": "completed",
+                        "input": { "path": "src/lib.rs", "symbols": ["target"] },
+                        "output": "historical output"
+                    }
+                },
+                { "type": "step-finish", "reason": "tool-calls" }
+            ]
+        })];
+        let decoded = decode_opencode(&raw);
+        assert!(matches!(
+            decoded.messages[0].ck.content[2].kind,
+            CkKind::ToolCall { ref id, .. } if id == "call_uRXFDXYYs6UiMIkmAVDWZDzX"
+        ));
+        assert!(matches!(
+            decoded.messages[0].ck.content[3].kind,
+            CkKind::ToolResult { ref id, .. } if id == "call_uRXFDXYYs6UiMIkmAVDWZDzX"
+        ));
+        let mut reduced_tail = decoded.messages[0].ck.clone();
+        reduced_tail.content = reduced_tail
+            .content
+            .into_iter()
+            .map(|block| {
+                let reduced = match &block.kind {
+                    CkKind::ToolCall { .. } => {
+                        crate::ck_wire::reduced_block(&block, "reduced call skeleton", None)
+                    }
+                    CkKind::ToolResult { .. } => {
+                        crate::ck_wire::reduced_block(&block, "[dropped]", None)
+                    }
+                    _ => block,
+                };
+                CkWireBlock::bare(reduced.kind)
+            })
+            .collect();
+        reduced_tail.mark_modified();
+
+        let active_todo = crate::injection::build_synthetic_todo_pair(
+            r#"[{"content":"Inspect contributor issue","status":"in_progress","priority":"high"}]"#,
+        )
+        .unwrap();
+        let served = vec![
+            CkWireMessage::synthetic_user_text("m0"),
+            CkWireMessage::synthetic_user_text("m1"),
+            active_todo.assistant_msg,
+            active_todo.tool_msg,
+            reduced_tail,
+        ];
+
+        // A hard request triggered by an epoch change can be the first request after a renderer
+        // deployment, before the session row contains a transition marker. The codec must still
+        // produce a valid request when that marker is absent.
+        let encoded = encode_opencode_with_transition_state(
+            &served,
+            &decoded.sidecar,
+            Some("astro-epoch-change"),
+            &[],
+            false,
+        );
+        let tool_ids = encoded
+            .iter()
+            .flat_map(|message| message["parts"].as_array().into_iter().flatten())
+            .filter(|part| part["type"] == "tool")
+            .filter_map(|part| part["callID"].as_str())
+            .collect::<Vec<_>>();
+        let unique_ids = tool_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(
+            tool_ids.len(),
+            unique_ids.len(),
+            "a reduced call/result shell must serialize as one native tool part: {tool_ids:?}"
+        );
+        assert_eq!(
+            tool_ids
+                .iter()
+                .filter(|id| **id == "call_uRXFDXYYs6UiMIkmAVDWZDzX")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn whole_array_tool_use_guard_rejects_both_id_collision_directions() {
+        let valid = vec![
+            json!({
+                "info": { "id": "first", "role": "assistant" },
+                "parts": [{
+                    "type": "tool",
+                    "tool": "read",
+                    "callID": "call-first",
+                    "state": { "status": "pending", "input": {} }
+                }]
+            }),
+            json!({
+                "info": { "id": "second", "role": "assistant" },
+                "parts": [{
+                    "type": "tool",
+                    "tool": "read",
+                    "callID": "call-second",
+                    "state": { "status": "pending", "input": {} }
+                }]
+            }),
+        ];
+        assert_unique_tool_use_ids(&valid);
+
+        for (source, target) in [(0, 1), (1, 0)] {
+            let mut collided = valid.clone();
+            collided[target]["parts"][0]["callID"] = collided[source]["parts"][0]["callID"].clone();
+            assert!(
+                std::panic::catch_unwind(|| assert_unique_tool_use_ids(&collided)).is_err(),
+                "copying the id from message {source} to message {target} must trip the guard"
+            );
+        }
     }
 
     #[test]

@@ -21960,7 +21960,7 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_native_pair_changes_once_on_salted_bust_then_replays() {
+    fn unmatched_native_pair_is_unique_before_transition_and_replays_after_salted_bust() {
         let native_message = json!({
             "absolute_ordinal": 1,
             "info": { "id": "pair-message", "role": "assistant" },
@@ -22025,7 +22025,11 @@ mod tests {
             .iter()
             .find(|message| message["info"]["id"] == "pair-message")
             .expect("historical pair remains in native output");
-        assert_eq!(old_pair["parts"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            old_pair["parts"].as_array().unwrap().len(),
+            1,
+            "even a pre-transition serialization must not emit provider-invalid duplicate ids"
+        );
 
         let salted =
             transform_with_projection(&store, &request, &pctx("git:proj", "/nonexistent-docs", 0))
@@ -22045,12 +22049,15 @@ mod tests {
             &[],
             salted.transition_consumed,
         );
-        assert_ne!(salted_native, old_native);
         let salted_pair = salted_native
             .iter()
             .find(|message| message["info"]["id"] == "pair-message")
             .expect("salted pair remains in native output");
         assert_eq!(salted_pair["parts"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            salted_pair, old_pair,
+            "the transition may persist compatibility state, but native tool identity is already valid"
+        );
 
         let replay =
             transform_with_projection(&store, &request, &pctx("git:proj", "/nonexistent-docs", 0))
