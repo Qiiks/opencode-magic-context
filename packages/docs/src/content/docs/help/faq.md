@@ -28,7 +28,7 @@ Yes. Most features have explicit toggles. See the [configuration reference](/ref
 | Memory (cross-session) | `memory.enabled` | `true` |
 | Auto-search hints | `memory.auto_search.enabled` | `true` |
 | Temporal markers | `temporal_awareness` | `true` |
-| Dreamer (overnight consolidation) | `dreamer.enabled` | `false` |
+| Dreamer scheduling | `dreamer.disable`, `dreamer.tasks.<task>.schedule` | enabled; task schedules vary |
 | Embeddings | `embedding.provider` | `"local"` |
 
 To hide agent-driven reduction for a specific agent, deny or omit `ctx_reduce` in that agent's tool allow-list. The historian and heuristic cleanup still run.
@@ -70,10 +70,9 @@ Check the token breakdown in the TUI sidebar or `/ctx-status`: if **Tool Calls**
 
 ## What happens when context hits 85% or 95%?
 
-Magic Context's execute threshold is configurable (default: 65% of the model's context window). When usage crosses it, the system runs heuristic cleanup and applies any queued `ctx_reduce` drops, and the historian compresses settled conversation into compartments.
+Magic Context's execute threshold is configurable from 20% through **90%** (default: 65% of the model's usable context window). When usage crosses it, the system runs heuristic cleanup and applies any queued `ctx_reduce` drops, and the historian compresses settled conversation into compartments. The usable window is resolved from the active harness's model/provider metadata and can be narrowed by a smaller observed limit or by `output_reserve`.
 
 At **85%**, a tiered emergency drop sheds tool outputs oldest-first (this is the automatic backstop for tool output that `ctx_reduce` didn't reach). At **95%**, the session blocks new messages and runs emergency recovery — a last resort that normal operation rarely reaches.
-
 You can check the current state with `/ctx-status` and force a flush with `/ctx-flush`.
 
 ## How does it work with subagents?

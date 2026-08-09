@@ -122,7 +122,7 @@ If Magic Context is already installed and something isn't working, run the docto
 npx @cortexkit/magic-context@latest doctor
 ```
 
-Doctor auto-detects your harnesses and checks: plugin registration, config validity, conflicts, database integrity, and the embedding endpoint. It prints a `PASS X / WARN Y / FAIL Z` summary.
+Doctor auto-detects your harnesses and checks: plugin registration, config validity, conflicts, database integrity, and the embedding endpoint. It prints a `PASS X / WARN Y / FAIL Z` summary. If both OpenCode and Pi are installed, doctor asks which harnesses to diagnose; use `--harness opencode` or `--harness pi` to select one without prompting. When it finds multiple OpenCode installations, it prints a table with the active path, version, and source so a shadowed binary is visible.
 
 Add `--force` to automatically fix what doctor can — it clears stale plugin caches and repairs common config issues. Add `--issue` to generate a sanitized bug report ready to file.
 
