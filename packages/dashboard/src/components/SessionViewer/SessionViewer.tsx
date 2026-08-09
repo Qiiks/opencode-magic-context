@@ -42,6 +42,14 @@ const PROJECT_FILTER_KEY = "mc_sessions_project_filter";
 const HARNESS_FILTER_KEY = "mc_sessions_harness_filter";
 const PAGE_SIZE = 50;
 
+function formatSessionCacheTtl(ttl: string | number | null): string {
+  if (ttl == null || String(ttl).trim() === "") return "—";
+  const value = String(ttl).trim();
+  // The RPC/storage contract uses -1 as a sentinel for an intentionally
+  // unbounded cache. Display it as “Never” instead of showing -1 as a duration.
+  return value === "-1" || value.toLowerCase() === "never" ? "Never" : value;
+}
+
 /**
  * v2 importance (decay-rate, 1–100) → user-facing band label + `.pill` color.
  *
@@ -1737,19 +1745,17 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                       <td>Input tokens</td>
                       <td>{metaData().last_input_tokens.toLocaleString()}</td>
                     </tr>
-                    {/* v0.21.8 ships a single "Total tokens" row while we
-                        figure out how to present new-work / reprocessed
-                        without confusing users. The underlying columns
-                        (new_work_tokens, total_input_tokens) are still
-                        populated by the runtime; only the UI is simplified
-                        for now. */}
                     <tr>
-                      <td>Total tokens</td>
+                      <td>New work tokens</td>
+                      <td>{metaData().new_work_tokens.toLocaleString()}</td>
+                    </tr>
+                    <tr>
+                      <td>Total input tokens</td>
                       <td>{metaData().total_input_tokens.toLocaleString()}</td>
                     </tr>
                     <tr>
                       <td>Cache TTL</td>
-                      <td>{metaData().cache_ttl ?? "—"}</td>
+                      <td>{formatSessionCacheTtl(metaData().cache_ttl)}</td>
                     </tr>
                     <tr>
                       <td>Nudge tokens</td>
