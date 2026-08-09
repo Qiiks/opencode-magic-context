@@ -1,3 +1,6 @@
+import { createRequire } from "node:module";
+import type TokenizerType from "ai-tokenizer";
+import type * as ClaudeEncodingType from "ai-tokenizer/encoding/claude";
 import { COMMIT_VERB_PATTERN, createCommitHashExtractPattern } from "../../shared/commit-detection";
 import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker";
 import { isSystemDirective, removeSystemReminders } from "../../shared/system-directive";
@@ -109,17 +112,28 @@ function truncateArg(value: string, maxLen = 60): string {
     return `${value.slice(0, maxLen)}…`;
 }
 
-// Real Claude tokenizer (ai-tokenizer with Claude encoding). Static ESM
-// import — ai-tokenizer is a hard runtime dependency and is used on every
-// transform pass, so there's no reason to lazy-load it. The previous
-// dynamic `eval("require")` pattern silently failed in Bun's ESM runtime
-// and fell back to `Math.ceil(text.length / 3.5)`, which over-counted
-// base64 thinking signatures and under-counted JSON tool content, making
-// the sidebar's "Tool Defs + Overhead" residual wrong on long sessions.
-import Tokenizer from "ai-tokenizer";
-import * as claudeEncoding from "ai-tokenizer/encoding/claude";
+// Keep these specifiers non-literal so Bun does not include the Claude
+// tokenizer vocabulary in the eager plugin bundle. Unlike the prior
+// `eval("require")` fallback, createRequire works in Bun's ESM runtime.
+const lazyRequire = createRequire(import.meta.url);
+let cachedTokenizer: InstanceType<typeof TokenizerType> | null = null;
 
-const tokenizer = new Tokenizer(claudeEncoding);
+function getTokenizer(): InstanceType<typeof TokenizerType> {
+    if (cachedTokenizer) return cachedTokenizer;
+
+    const tokenizerModule = lazyRequire("ai-" + "tokenizer") as {
+        default?: typeof TokenizerType;
+        Tokenizer?: typeof TokenizerType;
+    };
+    const Tokenizer = tokenizerModule.default ?? tokenizerModule.Tokenizer;
+    if (!Tokenizer) throw new Error("ai-tokenizer does not export Tokenizer");
+
+    const claudeEncoding = lazyRequire(
+        "ai-tokenizer/encoding/" + "claude",
+    ) as typeof ClaudeEncodingType;
+    cachedTokenizer = new Tokenizer(claudeEncoding);
+    return cachedTokenizer;
+}
 
 export function estimateTokens(text: string): number {
     if (!text) return 0;
@@ -132,7 +146,7 @@ export function estimateTokens(text: string): number {
     // vector. Token counts for content WITHOUT special-token substrings are
     // identical; for content WITH them we now count the literal bytes (correct,
     // since the wire carries the literal string, not a real control token).
-    return tokenizer.encode(text, "all").length;
+    return getTokenizer().encode(text, "all").length;
 }
 
 export function normalizeText(text: string): string {
