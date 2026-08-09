@@ -33,6 +33,36 @@ Add `--force` to auto-fix what it can. Add `--issue` to generate a sanitized bug
 
 ---
 
+## Doctor finds more than one installation
+
+The doctor reports every detected OpenCode installation in a table with an `[active]` marker, path, version, and source. The first entry is the active path (PATH is checked first). If both harnesses are installed, use `--harness opencode` or `--harness pi` to select which doctor to run without a prompt.
+
+```bash
+npx @cortexkit/magic-context@latest doctor --harness opencode
+```
+
+---
+
+## Merge split project identities
+
+If the same project has memories under two project identities, preview a merge before changing the shared database:
+
+```bash
+npx @cortexkit/magic-context@latest doctor merge-identity \
+  --from <source-id> --to <target-id> --dry-run
+```
+
+The preview lists the project-scoped tables and rows that would be considered. A write requires an explicit confirmation flag:
+
+```bash
+npx @cortexkit/magic-context@latest doctor merge-identity \
+  --from <source-id> --to <target-id> --yes
+```
+
+Without `--dry-run` or `--yes`, the command refuses to mutate `context.db`.
+
+---
+
 ## Storage unavailable / schema fence error
 
 **Symptom:** After downgrading the plugin, you see a message like "schema fence: database was written by a newer version" or "Magic Context disabled itself — storage unavailable." Magic Context refuses to start.
