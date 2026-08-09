@@ -66,10 +66,10 @@ import {
 import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { findLastAssistantModelFromOpenCodeDb, isMidTurn } from "./read-session-db";
 import type { RawMessageOrdinalAnchor } from "./read-session-raw";
+import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
 import type { TransformDeps } from "./transform";
 import { resolveHistoryBudgetTokens } from "./transform";
 import { loadContextUsage } from "./transform-context-state";
-import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
 import type { MessageLike } from "./transform-operations";
 import { runRustModePostprocess } from "./transform-postprocess-phase";
 import { logTransformTiming } from "./transform-stage-logger";
@@ -898,7 +898,8 @@ function syntheticTodoAnchorFromNative(messages: readonly unknown[]): {
         if (stateJson === null || computeSyntheticCallId(stateJson) !== part.callID) continue;
 
         const previous = messages[index - 1];
-        const previousInfo = isRecord(previous) && isRecord(previous.info) ? previous.info : undefined;
+        const previousInfo =
+            isRecord(previous) && isRecord(previous.info) ? previous.info : undefined;
         const messageId =
             previousInfo && typeof previousInfo.id === "string" && previousInfo.id.length > 0
                 ? previousInfo.id
@@ -1020,8 +1021,7 @@ function buildTransformBody(args: {
         tool_present: args.passInputs.tool_present === true,
         prompt_surface_preset: args.passInputs.prompt_surface_preset ?? "full",
         prompt_surface_model_key: args.passInputs.prompt_surface_model_key,
-        prompt_surface_tool_descriptions:
-            args.passInputs.prompt_surface_tool_descriptions ?? {},
+        prompt_surface_tool_descriptions: args.passInputs.prompt_surface_tool_descriptions ?? {},
         effective_execute_threshold: args.passInputs.effective_execute_threshold,
         history_budget_tokens: args.passInputs.history_budget_tokens,
         clear_reasoning_age: args.passInputs.clear_reasoning_age,
@@ -1455,10 +1455,7 @@ export function createRustModeTransform(
                 overflowState.needsEmergencyRecovery &&
                 loadProtectedTailMeta(deps.db, sessionId).recoveryNoEligibleHeadCount >=
                     RECOVERY_NO_HEAD_LIMIT;
-            const promptSurface = resolvePromptSurface(
-                deps.promptSurface,
-                modelKey ?? undefined,
-            );
+            const promptSurface = resolvePromptSurface(deps.promptSurface, modelKey ?? undefined);
             const passInputs: Record<string, unknown> = {
                 now_ms: requestObservedAtMs,
                 model_key: modelKey,
