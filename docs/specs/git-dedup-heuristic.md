@@ -229,3 +229,32 @@ It builds all synthetic cases with real git, validates every generated case by
 calling `resolveProjectIdentityStrict`, and compares an existing fixture's
 serialized bytes before accepting regeneration. Run it twice and compare the
 fixture bytes; the committed fixture must be byte-identical across runs.
+
+## Fixture content pin (cross-repo consumers)
+
+The golden fixture `git-dedup-goldens.json` is consumed across repositories
+(entorhinal's Rust dedup arm golden-tests against it by path reference). A
+path-referenced golden with no content pin can drift silently: a
+regeneration here changes what the consumer asserts without any commit on
+the consumer's side, and CI stays green on both because each repo is
+internally consistent — while the fixture's whole job is to catch exactly
+a two-implementation divergence.
+
+Rule (precedent: the CK-wire golden drift between broca and magic-context):
+
+- Current fixture SHA-256:
+  `ffced5697238bd60f58cc9e9be48ff7fcad01950313985fb5b97dc3ac45dfd49`
+- Every consuming test in another repository MUST pin this hash as a
+  constant and fail loud on mismatch.
+- Any regeneration of the fixture MUST update this section's hash in the
+  same commit, and the consuming repositories' pins are updated in a
+  coordinated change. A pin mismatch in a consumer is the intended loud
+  signal that the contract moved.
+
+Scope note on path-variant coverage: the path-variant cases in THIS fixture
+assert git-anchor invariance (the derivation reaches the same anchor from
+`/p`, `/p/`, and a symlink to `/p`). They do NOT exercise cortexkit-paths
+ancestor-canonicalisation of vanished paths — that is a different function
+with a different failure mode, covered by the subconscious-side fixture
+(SUBC's claimed item from the cutover D2 finding). Two fixtures, two
+properties; neither substitutes for the other.

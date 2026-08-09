@@ -320,3 +320,25 @@ try {
     __resetProjectIdentityForTests();
     rmSync(tempRoot, { recursive: true, force: true });
 }
+
+// Cross-repo pin guard: the spec's "Fixture content pin" section must carry
+// the SHA-256 of the fixture this generator just wrote. A regeneration that
+// forgets to update the spec pin would let path-referenced consumers
+// (entorhinal) silently assert against a moved target, so the generator
+// fails loud on mismatch instead of relying on the rule being remembered.
+import { createHash as __pinHash } from "node:crypto";
+import { readFileSync as __pinRead } from "node:fs";
+{
+    const fixtureBytes = __pinRead(fixturePath);
+    const actual = __pinHash("sha256").update(fixtureBytes).digest("hex");
+    const specPath = join(dirname(fixturePath), "git-dedup-heuristic.md");
+    const spec = __pinRead(specPath, "utf-8");
+    if (!spec.includes(actual)) {
+        console.error(
+            `PIN MISMATCH: fixture sha256 ${actual} is not present in ${specPath}.\n` +
+                "Update the 'Fixture content pin' section in the same commit as this regeneration.",
+        );
+        process.exit(1);
+    }
+    console.log(`pin verified: ${actual.slice(0, 16)}… present in spec`);
+}
