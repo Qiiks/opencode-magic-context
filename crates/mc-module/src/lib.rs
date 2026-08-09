@@ -48,6 +48,7 @@ use std::future::Future;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -74,7 +75,8 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use subc_client_rs::{
-    async_trait, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest, RouteHandle,
+    async_trait, HandlerOutcome, HealthReport, HealthStatus, ModuleHandler, RequestCtx,
+    RouteBindRequest, RouteHandle,
 };
 
 use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
@@ -154,6 +156,169 @@ pub enum BindingError {
 
 /// Canonical module id (overridable via `SUBC_MODULE_ID_ENV` at boot).
 pub const DEFAULT_MODULE_ID: &str = "magic-context";
+
+const TRANSFORM_HEALTH_LANE: &str = "transform";
+const TRANSFORM_WEDGE_THRESHOLD_MS: u64 = 120_000;
+
+/// The transform heartbeat is deliberately process-wide: the SDK health callback runs on
+/// the channel-0 control path and must be able to observe the data-plane lane without
+/// borrowing a handler lock or touching the store.
+struct DispatchHealth {
+    last_dispatch_started_at_ms: AtomicU64,
+    last_dispatch_completed_at_ms: AtomicU64,
+    in_flight_count: AtomicU64,
+    oldest_queued_at_ms: AtomicU64,
+    consecutive_error_count: AtomicU64,
+}
+
+impl DispatchHealth {
+    const fn new() -> Self {
+        Self {
+            last_dispatch_started_at_ms: AtomicU64::new(0),
+            last_dispatch_completed_at_ms: AtomicU64::new(0),
+            in_flight_count: AtomicU64::new(0),
+            oldest_queued_at_ms: AtomicU64::new(0),
+            consecutive_error_count: AtomicU64::new(0),
+        }
+    }
+
+    fn report(&self, now_ms: u64) -> HealthReport {
+        let started = self.last_dispatch_started_at_ms.load(Ordering::Relaxed);
+        let completed = self.last_dispatch_completed_at_ms.load(Ordering::Relaxed);
+        let in_flight = self.in_flight_count.load(Ordering::Relaxed);
+        let oldest_queued = self.oldest_queued_at_ms.load(Ordering::Relaxed);
+        let consecutive_errors = self.consecutive_error_count.load(Ordering::Relaxed);
+        let completion_lag_ms = started.saturating_sub(completed);
+        let heartbeat_age_ms = if started == 0 {
+            0
+        } else if completed == 0 {
+            now_ms.saturating_sub(started)
+        } else {
+            now_ms.saturating_sub(completed)
+        };
+        let heartbeat_stale = if in_flight > 0 {
+            heartbeat_age_ms > TRANSFORM_WEDGE_THRESHOLD_MS
+        } else {
+            completion_lag_ms > TRANSFORM_WEDGE_THRESHOLD_MS
+        };
+        let oldest_queued_age_ms =
+            (oldest_queued != 0).then(|| now_ms.saturating_sub(oldest_queued));
+        let queue_stale =
+            oldest_queued_age_ms.is_some_and(|age| age > TRANSFORM_WEDGE_THRESHOLD_MS);
+        let stale = heartbeat_stale || queue_stale;
+        let stale_age_ms = if queue_stale {
+            oldest_queued_age_ms.unwrap_or(0)
+        } else if heartbeat_stale {
+            heartbeat_age_ms.max(completion_lag_ms)
+        } else {
+            0
+        };
+        let status = if stale {
+            HealthStatus::Degraded
+        } else {
+            HealthStatus::Ok
+        };
+        let detail = if stale {
+            if queue_stale && !heartbeat_stale {
+                format!(
+                    "{TRANSFORM_HEALTH_LANE} lane queue stale; oldest queued item is {stale_age_ms}ms old; in-flight={in_flight}; consecutive errors={consecutive_errors}"
+                )
+            } else {
+                format!(
+                    "{TRANSFORM_HEALTH_LANE} lane heartbeat stale by {stale_age_ms}ms; in-flight={in_flight}; consecutive errors={consecutive_errors}"
+                )
+            }
+        } else if consecutive_errors > 0 {
+            format!(
+                "{TRANSFORM_HEALTH_LANE} lane advancing but erroring; in-flight={in_flight}; consecutive errors={consecutive_errors}"
+            )
+        } else if in_flight == 0 {
+            format!("{TRANSFORM_HEALTH_LANE} lane advancing; idle; in-flight=0")
+        } else {
+            format!("{TRANSFORM_HEALTH_LANE} lane advancing; in-flight={in_flight}")
+        };
+        HealthReport {
+            status,
+            detail: Some(detail),
+            metrics: Some(json!({
+                "lane": TRANSFORM_HEALTH_LANE,
+                "last_dispatch_started_at_ms": started,
+                "last_dispatch_completed_at_ms": completed,
+                "in_flight_count": in_flight,
+                "consecutive_error_count": consecutive_errors,
+                "completion_lag_ms": completion_lag_ms,
+                "heartbeat_age_ms": heartbeat_age_ms,
+                "heartbeat_stale": heartbeat_stale,
+                "oldest_queued_age_ms": oldest_queued_age_ms,
+                "queue_stale": queue_stale,
+                "stale": stale,
+                "stale_age_ms": stale_age_ms,
+            })),
+        }
+    }
+}
+
+static DISPATCH_HEALTH: DispatchHealth = DispatchHealth::new();
+
+struct TransformDispatchTicket<'a> {
+    health: &'a DispatchHealth,
+    accepted: AtomicBool,
+    finished: AtomicBool,
+}
+
+impl<'a> TransformDispatchTicket<'a> {
+    fn new(health: &'a DispatchHealth) -> Self {
+        Self {
+            health,
+            accepted: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+        }
+    }
+
+    fn accept(&self) {
+        if self.accepted.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.health.in_flight_count.fetch_add(1, Ordering::Relaxed);
+        self.health
+            .last_dispatch_started_at_ms
+            .store(now_ms().max(0) as u64, Ordering::Relaxed);
+    }
+
+    fn finish(&self, errored: bool) {
+        if !self.accepted.load(Ordering::Acquire) || self.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // This is the completion point, after the handler has produced its outcome. A panic
+        // skips this method and is handled by Drop, so it cannot falsely advance the heartbeat.
+        self.health
+            .last_dispatch_completed_at_ms
+            .store(now_ms().max(0) as u64, Ordering::Relaxed);
+        if errored {
+            self.health
+                .consecutive_error_count
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.health
+                .consecutive_error_count
+                .store(0, Ordering::Relaxed);
+        }
+        self.health.in_flight_count.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for TransformDispatchTicket<'_> {
+    fn drop(&mut self) {
+        if self.accepted.load(Ordering::Acquire)
+            && !self.finished.load(Ordering::Acquire)
+            && self.accepted.swap(false, Ordering::AcqRel)
+        {
+            // A panic unwinds through this guard. Decrement the count, but do not stamp a
+            // completion: a panicking dispatch did not prove that the lane advanced.
+            self.health.in_flight_count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
 
 /// Render-config epoch members, co-owned with the byte-splice consumer (thalamus gateway).
 /// Consumers fold these into the opaque render_config string they populate per
@@ -658,6 +823,7 @@ struct PendingTransformPage {
     digests: Vec<String>,
     pages: Vec<Value>,
     bytes: usize,
+    queued_at_ms: u64,
 }
 
 #[derive(Debug)]
@@ -772,6 +938,18 @@ impl TransformPageCoordinator {
             .phase = phase;
     }
 
+    fn oldest_queued_at_ms(&self) -> Option<u64> {
+        self.sessions
+            .values()
+            .filter_map(|session| {
+                let TransformPagePhase::Collecting(pending) = &session.phase else {
+                    return None;
+                };
+                Some(pending.queued_at_ms)
+            })
+            .min()
+    }
+
     fn completed(&self, session_id: &str, transform_id: &str) -> Option<&CompletedTransformPage> {
         self.sessions
             .get(session_id)
@@ -791,6 +969,7 @@ impl TransformPageCoordinator {
         page: Value,
         page_bytes: usize,
         page_complete: bool,
+        queued_at_ms: u64,
     ) -> Result<TransformPageStageAction, TransformPageStageError> {
         if self.pending_transform_count >= self.max_pending_transforms
             && !self.sessions.contains_key(session_id)
@@ -842,6 +1021,7 @@ impl TransformPageCoordinator {
                             digests: vec![page_digest],
                             pages: vec![page],
                             bytes: page_bytes,
+                            queued_at_ms,
                         }),
                     );
                     Ok(TransformPageStageAction::Ack(1))
@@ -2443,6 +2623,7 @@ impl McHandler {
                 .lock()
                 .expect("transform page mutex")
                 .discard(&session_id);
+            self.refresh_oldest_queued_at_ms();
             self.state_imports
                 .lock()
                 .expect("state import mutex")
@@ -2512,11 +2693,24 @@ impl McHandler {
             .discard_pending(session_id);
     }
 
+    fn refresh_oldest_queued_at_ms(&self) {
+        let oldest = self
+            .transform_pages
+            .lock()
+            .expect("transform page mutex")
+            .oldest_queued_at_ms()
+            .unwrap_or(0);
+        DISPATCH_HEALTH
+            .oldest_queued_at_ms
+            .store(oldest, Ordering::Relaxed);
+    }
+
     fn discard_transform_pages(&self, session_id: &str) {
         self.transform_pages
             .lock()
             .expect("transform page mutex")
             .discard(session_id);
+        self.refresh_oldest_queued_at_ms();
     }
 
     /// Reconstruct a full ingress snapshot from the last successful request plus a
@@ -5965,13 +6159,32 @@ impl McHandler {
         }))
     }
 
-    async fn handle_transform_value(
+    async fn handle_transform_dispatch(
         &self,
         channel: u16,
         request: Value,
         inbound_bytes: Option<usize>,
     ) -> HandlerOutcome {
-        self.handle_transform_unpaged_value(channel, request, false, inbound_bytes)
+        let ticket = TransformDispatchTicket::new(&DISPATCH_HEALTH);
+        let outcome = if has_transform_page_fields(&request) {
+            self.handle_transform_page_value(channel, request, TransformLane::Authority, &ticket)
+                .await
+        } else {
+            self.handle_transform_value(channel, request, inbound_bytes, &ticket)
+                .await
+        };
+        ticket.finish(matches!(outcome, HandlerOutcome::Error { .. }));
+        outcome
+    }
+
+    async fn handle_transform_value(
+        &self,
+        channel: u16,
+        request: Value,
+        inbound_bytes: Option<usize>,
+        ticket: &TransformDispatchTicket<'_>,
+    ) -> HandlerOutcome {
+        self.handle_transform_unpaged_value(channel, request, false, inbound_bytes, ticket)
             .await
     }
 
@@ -5981,6 +6194,7 @@ impl McHandler {
         request: Value,
         from_page_apply: bool,
         inbound_bytes: Option<usize>,
+        ticket: &TransformDispatchTicket<'_>,
     ) -> HandlerOutcome {
         let mut parsed: TransformRequest = match serde_json::from_value(request) {
             Ok(req) => req,
@@ -6009,6 +6223,7 @@ impl McHandler {
             // The established historian namespace remains accepted for compatibility with
             // existing producer sessions. Dreamer IDs instead require registration and route
             // validation before they may bypass the transform.
+            ticket.accept();
             let mut response = transform::TransformResponse::passthrough(
                 parsed.messages.iter().map(|m| m.ck.clone()).collect(),
                 parsed.full_array_fingerprint.clone(),
@@ -6021,6 +6236,7 @@ impl McHandler {
             // before trusting it so a stale or cross-project channel cannot bypass transform.
             match self.resolve_binding(channel, &parsed.session_id) {
                 Ok(_) => {
+                    ticket.accept();
                     let mut response = transform::TransformResponse::passthrough(
                         parsed.messages.iter().map(|m| m.ck.clone()).collect(),
                         parsed.full_array_fingerprint.clone(),
@@ -6115,6 +6331,7 @@ impl McHandler {
                 message: "transform is blocked until all transform pages arrive".to_string(),
             };
         }
+        ticket.accept();
         // A newer full transform invalidates the prior wrapup snapshot before any store
         // mutation. If this pass later rejects, wrapup must not pair old raw bytes with
         // the state that the rejected pass may already have re-cut.
@@ -6449,7 +6666,7 @@ impl McHandler {
         let inbound_bytes = serde_json::to_vec(&request)
             .map(|bytes| bytes.len())
             .unwrap_or(MAX_TRANSFORM_FRAME_BYTES);
-        self.handle_transform_value(channel, request, Some(inbound_bytes))
+        self.handle_transform_dispatch(channel, request, Some(inbound_bytes))
             .await
     }
 
@@ -6460,7 +6677,7 @@ impl McHandler {
         request: Value,
         inbound_bytes: usize,
     ) -> HandlerOutcome {
-        self.handle_transform_value(channel, request, Some(inbound_bytes))
+        self.handle_transform_dispatch(channel, request, Some(inbound_bytes))
             .await
     }
 
@@ -7203,6 +7420,7 @@ impl McHandler {
         channel: u16,
         request: Value,
         lane: TransformLane,
+        ticket: &TransformDispatchTicket<'_>,
     ) -> HandlerOutcome {
         let present = TRANSFORM_PAGE_FIELDS
             .iter()
@@ -7324,9 +7542,10 @@ impl McHandler {
                 );
             }
         }
-        let action = {
+        let queued_at_ms = now_ms().max(0) as u64;
+        let staged = {
             let mut transforms = self.transform_pages.lock().expect("transform page mutex");
-            match transforms.stage(
+            transforms.stage(
                 &binding.session,
                 transform_id,
                 generation,
@@ -7336,31 +7555,37 @@ impl McHandler {
                 request,
                 page_bytes,
                 page_complete,
-            ) {
-                Ok(action) => action,
-                Err(error) => {
-                    let (suffix, message) = match error {
-                        TransformPageStageError::AttemptMismatch => (
-                            "attempt_mismatch",
-                            "transform page generation or envelope changed during collection",
-                        ),
-                        TransformPageStageError::DigestMismatch => {
-                            ("digest_mismatch", "redriven transform page content changed")
-                        }
-                        TransformPageStageError::OrderMismatch => (
-                            "order_mismatch",
-                            "transform pages must arrive in strict index order",
-                        ),
-                        TransformPageStageError::BufferOverflow => (
-                            "buffer_overflow",
-                            "transform page staging exceeded the handler-wide byte cap",
-                        ),
-                        TransformPageStageError::InProgress => {
-                            ("in_progress", "the final transform page is being applied")
-                        }
-                    };
-                    return transform_page_error(lane, suffix, message);
-                }
+                queued_at_ms,
+            )
+        };
+        self.refresh_oldest_queued_at_ms();
+        let action = match staged {
+            Ok(action) => {
+                ticket.accept();
+                action
+            }
+            Err(error) => {
+                let (suffix, message) = match error {
+                    TransformPageStageError::AttemptMismatch => (
+                        "attempt_mismatch",
+                        "transform page generation or envelope changed during collection",
+                    ),
+                    TransformPageStageError::DigestMismatch => {
+                        ("digest_mismatch", "redriven transform page content changed")
+                    }
+                    TransformPageStageError::OrderMismatch => (
+                        "order_mismatch",
+                        "transform pages must arrive in strict index order",
+                    ),
+                    TransformPageStageError::BufferOverflow => (
+                        "buffer_overflow",
+                        "transform page staging exceeded the handler-wide byte cap",
+                    ),
+                    TransformPageStageError::InProgress => {
+                        ("in_progress", "the final transform page is being applied")
+                    }
+                };
+                return transform_page_error(lane, suffix, message);
             }
         };
         match action {
@@ -7384,7 +7609,13 @@ impl McHandler {
                     }
                 };
                 let outcome = self
-                    .handle_transform_unpaged_value(channel, assembled, true, Some(inbound_bytes))
+                    .handle_transform_unpaged_value(
+                        channel,
+                        assembled,
+                        true,
+                        Some(inbound_bytes),
+                        ticket,
+                    )
                     .await;
                 let completed_result = match &outcome {
                     HandlerOutcome::Response(bytes) => Some(bytes.clone()),
@@ -7422,6 +7653,8 @@ impl McHandler {
                     }
                     current => transforms.set_phase(&binding.session, current),
                 }
+                drop(transforms);
+                self.refresh_oldest_queued_at_ms();
                 outcome
             }
         }
@@ -9170,6 +9403,12 @@ impl ModuleHandler for McHandler {
         }
     }
 
+    /// Return the transform lane's atomics-only liveness snapshot. The SDK invokes this on
+    /// its separate channel-0 health task; no store read or handler lock is allowed here.
+    async fn health(&self) -> HealthReport {
+        DISPATCH_HEALTH.report(now_ms().max(0) as u64)
+    }
+
     /// Record the route's {project_root, session} so the transform path can resolve the
     /// project from the daemon-controlled channel (never a per-pass request field). Accept
     /// every route — project resolution, not authorization, is the concern here.
@@ -9257,13 +9496,8 @@ impl McHandler {
                 // Handle transform requests: decode the incoming context array, update
                 // cache state, and return the rewritten array for the caller.
                 "transform" => {
-                    if has_transform_page_fields(&request) {
-                        self.handle_transform_page_value(channel, request, TransformLane::Authority)
-                            .await
-                    } else {
-                        self.handle_transform_value(channel, request, inbound_bytes)
-                            .await
-                    }
+                    self.handle_transform_dispatch(channel, request, inbound_bytes)
+                        .await
                 }
                 "state_sync" => self.handle_state_sync_value(channel, request),
                 "state_import" => self.handle_state_import_value(channel, request),
@@ -13168,7 +13402,119 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    // drive-fault fault-shape tests. These only exist under `--features drive-fault`
+    #[test]
+    fn transform_health_idle_is_ok_and_empty_queue_is_explicit_null() {
+        let health = DispatchHealth::new();
+        let report = health.report(10_000);
+        assert_eq!(report.status, HealthStatus::Ok);
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["in_flight_count"], json!(0));
+        assert_eq!(metrics["oldest_queued_age_ms"], Value::Null);
+    }
+
+    #[test]
+    fn transform_health_reports_oldest_queue_age_as_a_structured_metric() {
+        let health = DispatchHealth::new();
+        health.oldest_queued_at_ms.store(100, Ordering::Relaxed);
+        let report = health.report(250);
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["oldest_queued_age_ms"], json!(150));
+        assert_eq!(metrics["queue_stale"], json!(false));
+    }
+
+    #[test]
+    fn transform_health_wedge_reports_lane_and_structured_staleness() {
+        let health = DispatchHealth::new();
+        health
+            .last_dispatch_started_at_ms
+            .store(200_000, Ordering::Relaxed);
+        health
+            .last_dispatch_completed_at_ms
+            .store(50_000, Ordering::Relaxed);
+        health.in_flight_count.store(1, Ordering::Relaxed);
+
+        let report = health.report(200_001);
+        assert_eq!(report.status, HealthStatus::Degraded);
+        assert!(report
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("transform lane")));
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["heartbeat_stale"], json!(true));
+        assert_eq!(metrics["in_flight_count"], json!(1));
+        assert_eq!(metrics["completion_lag_ms"], json!(150_000));
+    }
+
+    #[test]
+    fn transform_health_normal_advance_is_ok_and_errors_still_advance() {
+        let health = DispatchHealth::new();
+        let ticket = TransformDispatchTicket::new(&health);
+        ticket.accept();
+        assert_eq!(health.in_flight_count.load(Ordering::Relaxed), 1);
+        ticket.finish(false);
+
+        let normal_report = health.report(now_ms().max(0) as u64);
+        assert_eq!(normal_report.status, HealthStatus::Ok);
+        assert_eq!(health.in_flight_count.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            normal_report.metrics.as_ref().unwrap()["consecutive_error_count"],
+            json!(0)
+        );
+
+        let error_ticket = TransformDispatchTicket::new(&health);
+        error_ticket.accept();
+        error_ticket.finish(true);
+        let error_report = health.report(now_ms().max(0) as u64);
+        assert_eq!(error_report.status, HealthStatus::Ok);
+        assert_eq!(
+            error_report.metrics.as_ref().unwrap()["consecutive_error_count"],
+            json!(1)
+        );
+        assert!(error_report
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("advancing but erroring")));
+    }
+
+    #[test]
+    fn transform_health_refusal_does_not_advance_a_stale_completion_heartbeat() {
+        let health = DispatchHealth::new();
+        health
+            .last_dispatch_started_at_ms
+            .store(200_000, Ordering::Relaxed);
+        health
+            .last_dispatch_completed_at_ms
+            .store(50_000, Ordering::Relaxed);
+        {
+            // A refused item never calls accept, so dropping its ticket cannot make the
+            // refusal loop look like completed transform work.
+            let _refused = TransformDispatchTicket::new(&health);
+        }
+
+        let report = health.report(200_001);
+        assert_eq!(report.status, HealthStatus::Degraded);
+        assert_eq!(
+            health.last_dispatch_completed_at_ms.load(Ordering::Relaxed),
+            50_000
+        );
+    }
+
+    #[test]
+    fn transform_dispatch_panic_drop_guard_decrements_without_completion_stamp() {
+        let health = DispatchHealth::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let ticket = TransformDispatchTicket::new(&health);
+            ticket.accept();
+            panic!("simulated transform dispatch panic");
+        }));
+        assert!(result.is_err());
+        assert_eq!(health.in_flight_count.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            health.last_dispatch_completed_at_ms.load(Ordering::Relaxed),
+            0
+        );
+    }
+
     // (the same gate as the corruption path itself); a default build has neither the arm
     // nor these tests. They exercise `apply_drive_fault`/`parse_drive_fault` directly
     // rather than setting MC_DRIVE_FAULT, so they never touch process-global env or the
@@ -20853,7 +21199,7 @@ mod tests {
             "render_config": "cfg0",
             "messages": messages.iter().map(|m| serde_json::to_value(m).unwrap()).collect::<Vec<_>>(),
         });
-        let out = handler.handle_transform_value(9, req, None).await;
+        let out = handler.handle_transform_dispatch(9, req, None).await;
         let HandlerOutcome::Response(bytes) = out else {
             panic!("pass-through must be a response");
         };
