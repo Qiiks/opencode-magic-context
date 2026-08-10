@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+
 import {
     type AuthorityDrainResponse,
     type AuthorityModuleClient,
@@ -46,8 +47,17 @@ import {
     captureSlot,
     dropSlot,
     getSlot,
+    LKG_SNAPSHOT_ARRAY,
+    LKG_SNAPSHOT_BOOLEAN,
+    LKG_SNAPSHOT_KEY,
+    LKG_SNAPSHOT_NULL,
+    LKG_SNAPSHOT_NUMBER,
+    LKG_SNAPSHOT_OBJECT,
+    LKG_SNAPSHOT_STRING,
+    LKG_SNAPSHOT_UNDEFINED,
+    type LkgContentField,
     type LkgEntryNote,
-    lkgContentDigest,
+    lkgContentDigestFromFields,
     noteEntry,
 } from "./lkg-slot";
 import {
@@ -120,11 +130,21 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
     ): Promise<ModuleCompartmentMirrorResponse>;
 }
 
-type MessageContentField = string | number | boolean | symbol;
-
 interface MessageContentSnapshot {
     signature: string;
-    fields: MessageContentField[];
+    fields: LkgContentField[];
+}
+
+interface RustLkgCapturePlan {
+    sessionId: string;
+    inputIds: string[];
+    inputSnapshots: readonly MessageContentSnapshot[];
+    jsonPrefix: string;
+    modelKey: string | null;
+    providerKey: string | null;
+    capturedAt: number;
+    rowVersion: number;
+    captureSequence: number;
 }
 
 interface RustWireCache {
@@ -169,6 +189,9 @@ interface RustSessionState extends ModuleStateSyncState {
     memoryAuthorityRoot: string | null;
     memoryAuthorityReady: boolean;
     authorityMemorySyncSkipLogged?: boolean;
+    lkgCaptureSequence: number;
+    lkgLastCapturedRowVersion: number;
+    lkgSyncCaptureRequired: boolean;
 }
 
 export interface RustModeTransformOptions {
@@ -186,6 +209,8 @@ export interface RustModeTransformOptions {
     onProjectPrepared?: (projectPath: string) => void;
     /** Test-only escape hatch for transform-wire tests without an authority transport. */
     allowAuthorityProtocolBypassForTests?: boolean;
+    /** Override only for deterministic capture scheduling in tests. */
+    scheduleLkgCapture?: (capture: () => void) => void;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -225,17 +250,8 @@ function updateFnv1a32(hash: number, value: string): number {
     return next;
 }
 
-const SNAPSHOT_ARRAY = Symbol("array");
-const SNAPSHOT_OBJECT = Symbol("object");
-const SNAPSHOT_KEY = Symbol("key");
-const SNAPSHOT_STRING = Symbol("string");
-const SNAPSHOT_NUMBER = Symbol("number");
-const SNAPSHOT_BOOLEAN = Symbol("boolean");
-const SNAPSHOT_NULL = Symbol("null");
-const SNAPSHOT_UNDEFINED = Symbol("undefined");
-
 interface MessageContentFieldVisitor {
-    field(value: MessageContentField): boolean;
+    field(value: LkgContentField): boolean;
     beginObject(): number | undefined;
     endObject(token: number, entryCount: number): boolean;
 }
@@ -245,28 +261,28 @@ function isSnapshotObjectChild(value: unknown): boolean {
 }
 
 function visitMessageContentFields(value: unknown, visitor: MessageContentFieldVisitor): boolean {
-    if (value === null) return visitor.field(SNAPSHOT_NULL);
+    if (value === null) return visitor.field(LKG_SNAPSHOT_NULL);
     if (typeof value === "string") {
-        return visitor.field(SNAPSHOT_STRING) && visitor.field(value);
+        return visitor.field(LKG_SNAPSHOT_STRING) && visitor.field(value);
     }
     if (typeof value === "number") {
-        return visitor.field(SNAPSHOT_NUMBER) && visitor.field(value);
+        return visitor.field(LKG_SNAPSHOT_NUMBER) && visitor.field(value);
     }
     if (typeof value === "boolean") {
-        return visitor.field(SNAPSHOT_BOOLEAN) && visitor.field(value);
+        return visitor.field(LKG_SNAPSHOT_BOOLEAN) && visitor.field(value);
     }
     if (value === undefined || typeof value === "function" || typeof value === "symbol") {
-        return visitor.field(SNAPSHOT_UNDEFINED);
+        return visitor.field(LKG_SNAPSHOT_UNDEFINED);
     }
     if (Array.isArray(value)) {
-        if (!visitor.field(SNAPSHOT_ARRAY) || !visitor.field(value.length)) return false;
+        if (!visitor.field(LKG_SNAPSHOT_ARRAY) || !visitor.field(value.length)) return false;
         for (const item of value) {
             if (!visitMessageContentFields(item, visitor)) return false;
         }
         return true;
     }
     if (typeof value === "object") {
-        if (!visitor.field(SNAPSHOT_OBJECT)) return false;
+        if (!visitor.field(LKG_SNAPSHOT_OBJECT)) return false;
         const objectToken = visitor.beginObject();
         if (objectToken === undefined) return false;
         let entryCount = 0;
@@ -276,7 +292,7 @@ function visitMessageContentFields(value: unknown, visitor: MessageContentFieldV
             if (!isSnapshotObjectChild(child)) continue;
             entryCount += 1;
             if (
-                !visitor.field(SNAPSHOT_KEY) ||
+                !visitor.field(LKG_SNAPSHOT_KEY) ||
                 !visitor.field(key) ||
                 !visitMessageContentFields(child, visitor)
             ) {
@@ -285,11 +301,11 @@ function visitMessageContentFields(value: unknown, visitor: MessageContentFieldV
         }
         return visitor.endObject(objectToken, entryCount);
     }
-    return visitor.field(SNAPSHOT_UNDEFINED);
+    return visitor.field(LKG_SNAPSHOT_UNDEFINED);
 }
 
-function messageContentFields(message: MessageLike): MessageContentField[] {
-    const fields: MessageContentField[] = [];
+function messageContentFields(message: MessageLike): LkgContentField[] {
+    const fields: LkgContentField[] = [];
     const complete = visitMessageContentFields(message, {
         field(value) {
             fields.push(value);
@@ -309,7 +325,7 @@ function messageContentFields(message: MessageLike): MessageContentField[] {
     return fields;
 }
 
-function signatureForFields(fields: readonly MessageContentField[]): string {
+function signatureForFields(fields: readonly LkgContentField[]): string {
     let hash = FNV1A_32_OFFSET;
     for (const field of fields) {
         const value = typeof field === "symbol" ? (field.description ?? "") : String(field);
@@ -570,6 +586,9 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             memoryAuthorityRoot: null,
             memoryAuthorityReady: false,
             authorityMemorySyncSkipLogged: false,
+            lkgCaptureSequence: 0,
+            lkgLastCapturedRowVersion: 0,
+            lkgSyncCaptureRequired: false,
         };
         states.set(sessionId, state);
     }
@@ -1060,6 +1079,8 @@ export function createRustModeTransform(
 } {
     const states = new Map<string, RustSessionState>();
     const wireCaches = new Map<string, RustWireCache>();
+    const scheduleLkgCapture =
+        options.scheduleLkgCapture ?? ((capture: () => void) => setImmediate(capture));
     const timeoutMs = Math.max(1, options.moduleTimeoutMs ?? RUST_SEND_TIMEOUT_MS);
 
     const logStage = (
@@ -1220,34 +1241,70 @@ export function createRustModeTransform(
         return true;
     };
 
-    const captureRustResponse = (
+    const prepareRustCapture = (
+        state: RustSessionState,
         sessionId: string,
         input: MessageLike[],
+        inputSnapshots: readonly MessageContentSnapshot[],
         response: Record<string, unknown>,
-    ): boolean => {
-        const ids = input.map((message) => message.info.id);
+        responseRowVersion: number,
+    ): RustLkgCapturePlan | null => {
+        state.lkgCaptureSequence += 1;
+        const inputIds = input.map((message) => message.info.id);
         if (
-            ids.some((id) => typeof id !== "string") ||
-            new Set(ids).size !== ids.length ||
-            ids.length === 0
+            inputIds.some((id) => typeof id !== "string") ||
+            new Set(inputIds).size !== inputIds.length ||
+            inputIds.length === 0 ||
+            inputSnapshots.length !== inputIds.length
         ) {
-            return false;
+            return null;
         }
-        const inputContentDigests = input.map((message) => lkgContentDigest(message));
-        if (inputContentDigests.some((digest) => digest === null)) return false;
         const native = response.native_messages;
         const jsonPrefix = typeof native === "string" ? native : JSON.stringify(native);
-        if (typeof jsonPrefix !== "string") return false;
+        if (typeof jsonPrefix !== "string") return null;
         const keys = resolveLkgModelKeys(input);
-        return captureSlot(sessionId, {
+        return {
+            sessionId,
+            inputIds: inputIds as string[],
+            inputSnapshots,
             jsonPrefix,
-            inputIdSeq: ids as string[],
-            inputContentDigests: inputContentDigests as string[],
-            lastInputMessageId: ids[ids.length - 1] as string,
             modelKey: keys.modelKey,
             providerKey: keys.providerKey,
             capturedAt: Date.now(),
+            rowVersion: responseRowVersion,
+            captureSequence: state.lkgCaptureSequence,
+        };
+    };
+
+    const commitRustCapture = (
+        state: RustSessionState,
+        plan: RustLkgCapturePlan,
+    ): "captured" | "superseded" => {
+        if (
+            states.get(plan.sessionId) !== state ||
+            plan.captureSequence !== state.lkgCaptureSequence ||
+            plan.rowVersion < state.lkgLastCapturedRowVersion
+        ) {
+            return "superseded";
+        }
+        const inputContentDigests = plan.inputSnapshots.map((snapshot) =>
+            lkgContentDigestFromFields(snapshot.fields),
+        );
+        const captured = captureSlot(plan.sessionId, {
+            jsonPrefix: plan.jsonPrefix,
+            inputIdSeq: plan.inputIds,
+            inputContentDigests,
+            lastInputMessageId: plan.inputIds[plan.inputIds.length - 1] as string,
+            modelKey: plan.modelKey,
+            providerKey: plan.providerKey,
+            capturedAt: plan.capturedAt,
+            rowVersion: plan.rowVersion,
+            captureSequence: plan.captureSequence,
         });
+        if (!captured) throw new Error("LKG slot rejected the prepared snapshot");
+        state.lkgLastCapturedRowVersion = plan.rowVersion;
+        state.lkgSyncCaptureRequired = false;
+        return "captured";
     };
 
     const run = async (
@@ -1404,19 +1461,50 @@ export function createRustModeTransform(
                     ? response.materialize_reason
                     : "none";
             const timings = isRecord(response.timings) ? response.timings : undefined;
-            const total = timings?.total;
-            moduleElapsedMs = typeof total === "number" && Number.isFinite(total) ? total : 0;
+            const applyOnceTotal = timings?.total;
+            const handlerTotal = timings?.handler_total;
+            moduleElapsedMs =
+                typeof handlerTotal === "number" && Number.isFinite(handlerTotal)
+                    ? handlerTotal
+                    : typeof applyOnceTotal === "number" && Number.isFinite(applyOnceTotal)
+                      ? applyOnceTotal
+                      : 0;
             rowVersion =
                 typeof response.row_version === "number" &&
                 Number.isSafeInteger(response.row_version)
                     ? response.row_version
                     : 0;
-            // A slow module pass earns its stage breakdown in the log: the pass line
-            // only carries the module total, which cannot distinguish a tokenizer
-            // stall from a store commit stall on large sessions.
+            if (
+                timings &&
+                (typeof timings.handler_total === "number" ||
+                    typeof timings.native_cache_reused_messages === "number" ||
+                    typeof timings.native_cache_encoded_messages === "number")
+            ) {
+                const stage = (name: string): string => {
+                    const value = timings[name];
+                    return typeof value === "number" && Number.isFinite(value)
+                        ? value.toFixed(1)
+                        : "n/a";
+                };
+                sessionLog(
+                    sessionId,
+                    `rust module stages: handler=${stage("handler_total")} apply_once=${stage("total")} ` +
+                        `request_to_handler=${stage("request_observed_to_handler")} ` +
+                        `projection=${stage("projection")} selection=${stage("selection")} ` +
+                        `build_output=${stage("build_output")} store_commit=${stage("store_commit")} ` +
+                        `post_attach=${stage("post_attach")} response_encode=${stage("response_encode")} ` +
+                        `native_cache_reused=${stage("native_cache_reused_messages")} ` +
+                        `native_cache_encoded=${stage("native_cache_encoded_messages")}`,
+                );
+            }
+            // If the module took at least one second, log every other numeric timing
+            // field so the slow stage can be identified.
             if (timings && moduleElapsedMs >= 1000) {
                 const detail = Object.entries(timings)
-                    .filter(([key, value]) => key !== "total" && typeof value === "number")
+                    .filter(
+                        ([key, value]) =>
+                            key !== "total" && key !== "handler_total" && typeof value === "number",
+                    )
                     .map(([key, value]) => `${key}:${(value as number).toFixed(1)}`)
                     .join(" ");
                 if (detail) sessionLog(sessionId, `rust module stages (slow pass): ${detail}`);
@@ -2087,16 +2175,69 @@ export function createRustModeTransform(
                 }
                 logStage(sessionId, "apply", applyStartedAt, timings);
                 const lkgSnapshotStartedAt = performance.now();
-                // Treat every successfully applied response as the new last-known-good snapshot,
-                // including incremental passes where only the growing tail changed.
-                const captured = captureRustResponse(sessionId, messages, response);
-                if (!captured) dropSlot(sessionId, "lkg_refresh_declined");
+                // Reuse the wire-cache field snapshots for this input. Serialize the served
+                // response here, but defer hashing so LKG work does not block installing the result.
+                const capturePlan = prepareRustCapture(
+                    state,
+                    sessionId,
+                    messages,
+                    pendingWireCache.rawContentSnapshots,
+                    response,
+                    rowVersion,
+                );
+                let captureMode = "async";
+                const captureFailed = (mode: "async" | "sync", error: unknown): void => {
+                    if (
+                        states.get(sessionId) !== state ||
+                        (capturePlan && capturePlan.captureSequence !== state.lkgCaptureSequence)
+                    ) {
+                        return;
+                    }
+                    dropSlot(sessionId, `lkg_${mode}_capture_failed`);
+                    state.lkgSyncCaptureRequired = true;
+                    sessionLog(
+                        sessionId,
+                        `LKG ${mode.toUpperCase()} CAPTURE FAILED; forcing synchronous capture on the next applied pass:`,
+                        error,
+                    );
+                };
+                if (!capturePlan) {
+                    captureMode = "declined";
+                    captureFailed("async", new Error("LKG snapshot preparation was rejected"));
+                } else if (state.lkgSyncCaptureRequired) {
+                    captureMode = "sync_recovery";
+                    try {
+                        commitRustCapture(state, capturePlan);
+                    } catch (error) {
+                        captureFailed("sync", error);
+                    }
+                } else {
+                    try {
+                        scheduleLkgCapture(() => {
+                            const asyncStartedAt = performance.now();
+                            try {
+                                const result = commitRustCapture(state, capturePlan);
+                                logTransformTiming(
+                                    sessionId,
+                                    "rust.lkg_snapshot_async",
+                                    asyncStartedAt,
+                                    `result=${result} row_version=${capturePlan.rowVersion}`,
+                                );
+                            } catch (error) {
+                                captureFailed("async", error);
+                            }
+                        });
+                    } catch (error) {
+                        captureMode = "schedule_failed";
+                        captureFailed("async", error);
+                    }
+                }
                 logStage(
                     sessionId,
                     "lkgSnapshot",
                     lkgSnapshotStartedAt,
                     timings,
-                    `captured=${captured}`,
+                    `mode=${captureMode} row_version=${rowVersion}`,
                 );
                 const applyReplaceStartedAt = performance.now();
                 replaceMessagesInPlace(output, appliedMessages);
@@ -2319,14 +2460,14 @@ export const __rustModeTransformTest = {
     applyNativeMessagesVerbatim,
     contentSnapshotsFor,
     snapshotTags: {
-        array: SNAPSHOT_ARRAY,
-        object: SNAPSHOT_OBJECT,
-        key: SNAPSHOT_KEY,
-        string: SNAPSHOT_STRING,
-        number: SNAPSHOT_NUMBER,
-        boolean: SNAPSHOT_BOOLEAN,
-        null: SNAPSHOT_NULL,
-        undefined: SNAPSHOT_UNDEFINED,
+        array: LKG_SNAPSHOT_ARRAY,
+        object: LKG_SNAPSHOT_OBJECT,
+        key: LKG_SNAPSHOT_KEY,
+        string: LKG_SNAPSHOT_STRING,
+        number: LKG_SNAPSHOT_NUMBER,
+        boolean: LKG_SNAPSHOT_BOOLEAN,
+        null: LKG_SNAPSHOT_NULL,
+        undefined: LKG_SNAPSHOT_UNDEFINED,
     },
     messageContentSnapshot,
     messageMatchesContentSnapshot,

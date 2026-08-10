@@ -902,6 +902,10 @@ pub struct TransformTimings {
     #[serde(default)]
     pub total: f64,
     #[serde(default)]
+    pub handler_total: f64,
+    #[serde(default)]
+    pub request_observed_to_handler: f64,
+    #[serde(default)]
     pub projection: f64,
     #[serde(default)]
     pub store_cache_state: f64,
@@ -1024,7 +1028,7 @@ pub fn format_pass_timing_line(
             .collect()
     };
     format!(
-        "mc-pass-timing session={session} total={:.1} projection={:.1} \
+        "mc-pass-timing session={session} total={:.1} handler_total={:.1} request_observed_to_handler={:.1} projection={:.1} \
          store_cache_state={:.1} store_tags={:.1} store_temporal={:.1} \
          store_user_hints={:.1} store_channel1={:.1} store_overlay_frontier={:.1} \
          store_notes={:.1} store_memories={:.1} pending_drops={:.1} coverage_resolve={:.1} \
@@ -1041,6 +1045,8 @@ pub fn format_pass_timing_line(
            projection_blocks={} tail_messages_emitted={} build_identity_messages={} \
            cache_hits={} cache_misses={} cache_dirty_skips={}",
         timings.total,
+        timings.handler_total,
+        timings.request_observed_to_handler,
         timings.projection,
         timings.store_cache_state,
         timings.store_tags,
@@ -1914,12 +1920,14 @@ fn apply_once(
     // OpenCode transports the frozen todo pair as one marked tool part. Older adapters did not
     // copy that marker into CK metadata, so recognize the reserved call-id namespace here too.
     // Normalizing before projection keeps the replayed pair out of selection, coverage, and output.
+    let projection_started_at = Instant::now();
     let normalized_req = normalize_synthetic_todo_ingress(req);
     let ingress_req = normalized_req.as_ref().unwrap_or(req);
     // Recognition uses the canonical block projection before overlays, field stripping, or
     // ordinal rewriting. Hash only the matched continuation block so changes to sibling blocks
     // cannot invalidate the persisted anchor.
     let initial_projection = project_messages(&ingress_req.messages)?;
+    timings.projection = elapsed_ms(projection_started_at);
     if ingress_req.lineage_switched && ingress_req.is_subagent {
         return Ok(lineage_protocol_passthrough(
             ingress_req,
@@ -1992,13 +2000,14 @@ fn apply_once(
     let req = rebased_req.as_ref().unwrap_or(ingress_req);
 
     // --- ingress: CK messages -> flat blocks, then strip synthetic before cache logic ---
-    let projection_started_at = Instant::now();
     let projection = if rebased_req.is_some() {
-        project_messages(&req.messages)?
+        let rebase_projection_started_at = Instant::now();
+        let projection = project_messages(&req.messages)?;
+        timings.projection += elapsed_ms(rebase_projection_started_at);
+        projection
     } else {
         initial_projection
     };
-    timings.projection = elapsed_ms(projection_started_at);
     timings.projection_blocks = projection.blocks.len();
     if let Some(id) = duplicate_ids(&projection.blocks) {
         return Err(TransformError::DuplicateBlockId(id));
@@ -9814,6 +9823,8 @@ mod tests {
         assert_eq!(fields.get("session"), Some(&"-"));
         for key in [
             "total",
+            "handler_total",
+            "request_observed_to_handler",
             "projection",
             "store_cache_state",
             "store_notes",

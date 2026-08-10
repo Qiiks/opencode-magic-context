@@ -6404,6 +6404,14 @@ impl McHandler {
         inbound_bytes: Option<usize>,
         ticket: &TransformDispatchTicket<'_>,
     ) -> HandlerOutcome {
+        let handler_started_at = Instant::now();
+        const REQUEST_OBSERVED_KEY: &str = "request_observed_at_ms";
+        let request_observed_to_handler = request
+            .get(REQUEST_OBSERVED_KEY)
+            .and_then(Value::as_u64)
+            .and_then(|observed| i64::try_from(observed).ok())
+            .map(|observed| now_ms().saturating_sub(observed) as f64)
+            .unwrap_or(0.0);
         let mut parsed: TransformRequest = match serde_json::from_value(request) {
             Ok(req) => req,
             Err(e) => {
@@ -6861,6 +6869,8 @@ impl McHandler {
                 retained_bytes,
             );
         if let Some(timings) = response.timings.as_mut() {
+            timings.handler_total = handler_started_at.elapsed().as_secs_f64() * 1_000.0;
+            timings.request_observed_to_handler = request_observed_to_handler;
             timings.trigger_ms = trigger_timings.elapsed_ms;
             timings.trigger_tokenized_blocks = trigger_timings.tokenized_blocks;
             timings.native_cache_reused_messages = native_cache_stats.reused_messages;
@@ -14392,6 +14402,13 @@ mod tests {
         assert!(response["timings"]["trigger_ms"].is_number());
         assert_eq!(response["timings"]["trigger_tokenized_blocks"], 1);
         assert!(response["timings"]["post_attach"].is_number());
+        assert!(
+            response["timings"]["handler_total"]
+                .as_f64()
+                .unwrap_or_default()
+                > 0.0
+        );
+        assert!(response["timings"]["request_observed_to_handler"].is_number());
         let warm = call_transform_request(&handler, request(vec![ck("m1", 1, "hello")])).await;
         assert_eq!(warm["timings"]["trigger_tokenized_blocks"], 0);
         assert_eq!(

@@ -55,6 +55,7 @@ const createRustModeTransform = (
     createRustModeTransformImpl(deps, {
         ...options,
         allowAuthorityProtocolBypassForTests: true,
+        scheduleLkgCapture: options.scheduleLkgCapture ?? ((capture) => capture()),
     });
 
 const sessions: string[] = [];
@@ -1574,6 +1575,146 @@ describe("Rust mode authority adapter", () => {
 
         expect(secondSlot?.jsonPrefix).toContain("applied response 2");
         expect(secondSlot?.inputContentDigests).not.toEqual(firstSlot?.inputContentDigests);
+    });
+
+    it("keeps an applied pass at most one immediate turn ahead of its LKG slot", async () => {
+        const sessionId = `rust-lkg-async-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const scheduled: Array<() => void> = [];
+        let pass = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                pass += 1;
+                return {
+                    decision: pass === 1 ? "HARD" : "SOFT+",
+                    row_version: pass,
+                    native_messages: [
+                        {
+                            info: { id: "served", role: "assistant", sessionID: sessionId },
+                            parts: [{ type: "text", text: `async response ${pass}` }],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            scheduleLkgCapture: (capture) => scheduled.push(capture),
+        });
+        const input = makeMessages(sessionId);
+
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        expect(getSlot(sessionId)).toBeUndefined();
+        expect(scheduled).toHaveLength(1);
+        scheduled.shift()?.();
+        expect(getSlot(sessionId)?.jsonPrefix).toContain("async response 1");
+
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        expect(getSlot(sessionId)?.jsonPrefix).toContain("async response 1");
+        expect(scheduled).toHaveLength(1);
+        scheduled.shift()?.();
+        expect(getSlot(sessionId)?.jsonPrefix).toContain("async response 2");
+    });
+
+    it("does not let an older async capture overwrite a newer model-switch capture", async () => {
+        const sessionId = `rust-lkg-order-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const scheduled: Array<() => void> = [];
+        let pass = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                pass += 1;
+                return {
+                    decision: "HARD",
+                    row_version: pass,
+                    native_messages: [
+                        {
+                            info: { id: "served", role: "assistant", sessionID: sessionId },
+                            parts: [{ type: "text", text: `ordered response ${pass}` }],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            scheduleLkgCapture: (capture) => scheduled.push(capture),
+        });
+        const firstInput = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            firstInput,
+            { messages: [...firstInput] },
+            makeMeta(db, sessionId),
+        );
+        const switchedInput = makeMessages(sessionId);
+        switchedInput[0]!.info.model = { providerID: "anthropic", modelID: "switched" };
+        await transform.run(
+            sessionId,
+            switchedInput,
+            { messages: [...switchedInput] },
+            makeMeta(db, sessionId),
+        );
+
+        expect(scheduled).toHaveLength(2);
+        scheduled[1]?.();
+        scheduled[0]?.();
+        const slot = getSlot(sessionId);
+        expect(slot?.jsonPrefix).toContain("ordered response 2");
+        expect(slot?.modelKey).toBe("anthropic/switched");
+        expect(slot?.rowVersion).toBe(2);
+    });
+
+    it("re-arms a synchronous capture after an async capture is rejected", async () => {
+        const sessionId = `rust-lkg-rearm-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const scheduled: Array<() => void> = [];
+        let pass = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                pass += 1;
+                return {
+                    decision: "HARD",
+                    row_version: pass,
+                    native_messages: [
+                        {
+                            role: "assistant",
+                            parts: [
+                                {
+                                    type: "text",
+                                    text:
+                                        pass === 1
+                                            ? "x".repeat(12 * 1024 * 1024 + 1_000)
+                                            : "recovered synchronously",
+                                },
+                            ],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            scheduleLkgCapture: (capture) => scheduled.push(capture),
+        });
+        const input = makeMessages(sessionId);
+
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        scheduled.shift()?.();
+        expect(getSlot(sessionId)).toBeUndefined();
+
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        expect(scheduled).toHaveLength(0);
+        expect(getSlot(sessionId)?.jsonPrefix).toContain("recovered synchronously");
     });
 
     it("throws locally instead of serving raw above a known context limit", async () => {
