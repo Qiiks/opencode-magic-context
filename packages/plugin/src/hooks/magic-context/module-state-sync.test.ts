@@ -437,6 +437,150 @@ describe("module state sync section deltas", () => {
         expect(body).not.toHaveProperty("user_profile");
         expect(body).not.toHaveProperty("workspace");
     });
+
+    it("does not issue session.status for a no-change pass with cached capabilities", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-state-sync-capability-cache";
+        const state = {
+            ...syncState(),
+            lastAckedWatermarks: loadModuleWatermarks({ db, sessionId }),
+            seedPassPending: false,
+        };
+        const transportMethods: string[] = [];
+        const transport = {
+            getCachedStateSyncCapabilities: () => ({ state_sync_deltas: true }),
+            async stateSyncCapabilities() {
+                transportMethods.push("session.status");
+                return { state_sync_deltas: true };
+            },
+            async call(args: { method: string }) {
+                transportMethods.push(args.method);
+                return { result: { shadow_seq: 1 } };
+            },
+        };
+
+        await expect(
+            syncModuleState({
+                client: transport,
+                state,
+                pass: { db, sessionId, nowMs: 1 },
+                projectRoot: "/tmp/project",
+                force: false,
+            }),
+        ).resolves.toEqual({ status: "no_change" });
+
+        expect(transportMethods).not.toContain("session.status");
+        expect(transportMethods).toHaveLength(0);
+    });
+
+    it("re-probes once after the transport capability generation changes", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-state-sync-capability-generation";
+        const state = {
+            ...syncState(),
+            lastAckedWatermarks: loadModuleWatermarks({ db, sessionId }),
+            seedPassPending: false,
+        };
+        let generation = 1;
+        let cached = {
+            generation,
+            capabilities: { state_sync_deltas: true },
+        };
+        let statusCalls = 0;
+        const transport = {
+            getCachedStateSyncCapabilities: () =>
+                cached.generation === generation ? cached.capabilities : undefined,
+            async stateSyncCapabilities() {
+                statusCalls += 1;
+                const capabilities = { state_sync_deltas: true };
+                cached = { generation, capabilities };
+                return capabilities;
+            },
+            async call() {
+                return { result: { shadow_seq: 1 } };
+            },
+        };
+        const sync = () =>
+            syncModuleState({
+                client: transport,
+                state,
+                pass: { db, sessionId, nowMs: 1 },
+                projectRoot: "/tmp/project",
+                force: false,
+            });
+
+        await expect(sync()).resolves.toEqual({ status: "no_change" });
+        generation += 1;
+        await expect(sync()).resolves.toEqual({ status: "no_change" });
+        await expect(sync()).resolves.toEqual({ status: "no_change" });
+
+        expect(statusCalls).toBe(1);
+    });
+
+    it("uses a re-probed capability shape without leaking module-owned memories", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-state-sync-capability-reprobe";
+        createWorkspace(db);
+        insertUserMemory(db, "likes capability deltas", []);
+        setProjectState(db, "__global__", { projectUserProfileVersion: 1 });
+        const state = {
+            ...syncState(),
+            lastAckedWatermarks: loadModuleWatermarks({
+                db,
+                sessionId,
+                projectPath: "/tmp/project",
+            }),
+            seedPassPending: false,
+        };
+        let generation = 1;
+        let cached = {
+            generation,
+            capabilities: { state_sync_deltas: true },
+        };
+        let statusCalls = 0;
+        const stateSyncBodies: Record<string, unknown>[] = [];
+        const transport = {
+            getCachedStateSyncCapabilities: () =>
+                cached.generation === generation ? cached.capabilities : undefined,
+            async stateSyncCapabilities() {
+                statusCalls += 1;
+                const capabilities = { state_sync_deltas: false };
+                cached = { generation, capabilities };
+                return capabilities;
+            },
+            async call(args: { body: unknown }) {
+                stateSyncBodies.push(args.body as Record<string, unknown>);
+                return { result: { shadow_seq: 1 } };
+            },
+        };
+        const sync = () =>
+            syncModuleState({
+                client: transport,
+                state,
+                pass: { db, sessionId, projectPath: "/tmp/project", nowMs: 1 },
+                projectRoot: "/tmp/project",
+                force: false,
+                options: { authority: true, authorityState: "MODULE" },
+            });
+
+        updateSessionMeta(db, sessionId, { lastTodoState: '[{"content":"first"}]' });
+        await expect(sync()).resolves.toMatchObject({ status: "acked" });
+        const deltaBody = stateSyncBodies.at(-1);
+        expect(deltaBody).not.toHaveProperty("user_profile");
+        expect(deltaBody).not.toHaveProperty("workspace");
+        expect(deltaBody).not.toHaveProperty("memories");
+        expect(deltaBody).not.toHaveProperty("memory_mutations");
+
+        generation += 1;
+        updateSessionMeta(db, sessionId, { lastTodoState: '[{"content":"second"}]' });
+        await expect(sync()).resolves.toMatchObject({ status: "acked" });
+        const legacyBody = stateSyncBodies.at(-1);
+        expect(statusCalls).toBe(1);
+        expect(legacyBody).toHaveProperty("user_profile");
+        expect(legacyBody).toHaveProperty("workspace");
+        expect(legacyBody).not.toHaveProperty("memories");
+        expect(legacyBody).not.toHaveProperty("memory_mutations");
+    });
 });
 
 describe("module state authority direction", () => {

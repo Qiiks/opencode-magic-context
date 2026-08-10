@@ -1133,7 +1133,11 @@ describe("Rust mode authority adapter", () => {
         const native = [{ role: "assistant", parts: [] }];
         const transformBodies: Array<Record<string, unknown>> = [];
         let retryStarted = false;
+        let capabilityInvalidations = 0;
         const moduleClient: RustModeModuleClient = {
+            invalidateStateSyncCapabilities: () => {
+                capabilityInvalidations += 1;
+            },
             call: async ({ method, body }) => {
                 if (method !== "transform") return { ok: true };
                 const page = body as Record<string, unknown>;
@@ -1165,6 +1169,7 @@ describe("Rust mode authority adapter", () => {
             ),
         ).toBe(true);
         expect(transformBodies.at(-1)?.tool_present).toBe(true);
+        expect(capabilityInvalidations).toBe(1);
         expect(output.messages).toEqual(native);
     });
 
