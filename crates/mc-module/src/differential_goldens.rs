@@ -1,9 +1,14 @@
 //! DG-1..3 differential goldens: TS emits fixtures, Rust consumes them in-process.
 
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 
-use crate::ck_wire::CkWireMessage;
+use crate::ck_wire::{CkIngressMessage, CkWireMessage};
+use crate::transform::{TransformRequest, TransformResponse};
+
+use super::{attach_native_messages_incremental, NativeAttachmentCache, NativeCacheKeyMode};
 
 #[derive(Debug, Deserialize)]
 struct Golden {
@@ -100,6 +105,84 @@ fn dg_golden_vacuity_guard_rejects_one_byte_fixture_perturbation_per_family() {
         observed += 1;
     }
     assert_eq!(observed, 3, "every DG family needs a vacuity mutation");
+}
+
+#[test]
+fn dg_goldens_exercise_incremental_native_differential_mode() {
+    let golden: Golden = serde_json::from_str(include_str!("../testdata/differential-golden.json"))
+        .expect("parse differential golden");
+    for case in &golden.cases {
+        let wire = case
+            .input
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("every DG input has messages");
+        let served: Vec<CkWireMessage> =
+            serde_json::from_value(Value::Array(wire.clone())).expect("canonical DG CK wire");
+        let ingress = served
+            .iter()
+            .enumerate()
+            .map(|(index, message)| CkIngressMessage {
+                mid: message
+                    .meta
+                    .harness_id
+                    .clone()
+                    .unwrap_or_else(|| format!("dg-{index}")),
+                ordinal: index as u64 + 1,
+                ck: message.clone(),
+            })
+            .collect::<Vec<_>>();
+        let request: TransformRequest = serde_json::from_value(json!({
+            "kind": "transform",
+            "v": 2,
+            "serializer_profile": "opencode-aisdk",
+            "session_id": format!("dg-native-{}", case.id),
+            "render_config": "dg",
+            "serve_native": true,
+            "messages": ingress,
+            "full_array_fingerprint": format!("fp-{}", case.id),
+        }))
+        .expect("DG native transform request");
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let mut first =
+            TransformResponse::passthrough(served.clone(), request.full_array_fingerprint.clone());
+        attach_native_messages_incremental(
+            &mut first,
+            &request,
+            0,
+            &BTreeMap::new(),
+            None,
+            None,
+            false,
+            None,
+            0,
+            &cache,
+            NativeCacheKeyMode::Normal,
+        );
+        let mut replay =
+            TransformResponse::passthrough(served.clone(), request.full_array_fingerprint.clone());
+        let stats = attach_native_messages_incremental(
+            &mut replay,
+            &request,
+            0,
+            &BTreeMap::new(),
+            None,
+            None,
+            false,
+            None,
+            0,
+            &cache,
+            NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(
+            serde_json::to_vec(&first.native_messages).unwrap(),
+            serde_json::to_vec(&replay.native_messages).unwrap(),
+            "native replay drift in {}",
+            case.id
+        );
+        assert_eq!(stats.encoded_messages, 0, "{} missed cache", case.id);
+        assert_eq!(stats.reused_messages, served.len(), "{} prefix", case.id);
+    }
 }
 
 #[cfg(test)]

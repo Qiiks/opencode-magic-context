@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
@@ -242,6 +243,43 @@ pub fn decode_opencode_with_sidecar_and_base(
     }
 }
 
+pub(crate) fn decode_opencode_sidecar_incremental(
+    messages: &[MessageV2Json],
+    prior: &DecodeSidecar,
+    replace_from: usize,
+) -> DecodeSidecar {
+    debug_assert!(replace_from <= messages.len());
+    debug_assert!(replace_from <= prior.order.len());
+    if replace_from == messages.len() && replace_from == prior.order.len() {
+        return prior.clone();
+    }
+
+    let suffix = decode_opencode_with_sidecar_and_base(
+        &messages[replace_from..],
+        Some(prior),
+        replace_from as u64,
+    )
+    .sidecar;
+    let mut sidecar = DecodeSidecar::new(HARNESS);
+    sidecar.mid_pins = suffix.mid_pins;
+    for mid in prior.order.iter().take(replace_from) {
+        if let Some(meta) = prior.messages.get(mid) {
+            sidecar.order.push(mid.clone());
+            sidecar.messages.insert(mid.clone(), Arc::clone(meta));
+        }
+    }
+    for mid in suffix.order {
+        let Some(meta) = suffix.messages.get(&mid) else {
+            continue;
+        };
+        if !sidecar.messages.contains_key(&mid) {
+            sidecar.order.push(mid.clone());
+        }
+        sidecar.messages.insert(mid, Arc::clone(meta));
+    }
+    sidecar
+}
+
 pub fn encode_opencode(
     messages: &[CkWireMessage],
     sidecar: &DecodeSidecar,
@@ -302,34 +340,76 @@ pub(crate) fn encode_opencode_with_transition_state(
     )
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct EncodedOpencodeChunk {
+    pub(crate) start_index: usize,
+    pub(crate) end_index: usize,
+    pub(crate) value: MessageV2Json,
+}
+
 fn encode_opencode_impl(
     messages: &[CkWireMessage],
     sidecar: &DecodeSidecar,
     session_id: Option<&str>,
     preserve_compaction: bool,
     mutation_exempt_mids: &[&str],
-    _transition_consumed: bool,
+    transition_consumed: bool,
 ) -> Vec<MessageV2Json> {
+    let encoded = encode_opencode_chunks_with_transition_state(
+        messages,
+        sidecar,
+        session_id,
+        preserve_compaction,
+        mutation_exempt_mids,
+        transition_consumed,
+        0,
+    )
+    .into_iter()
+    .map(|chunk| chunk.value)
+    .collect::<Vec<_>>();
+    assert_unique_tool_use_ids(&encoded);
+    encoded
+}
+
+pub(crate) fn encode_opencode_chunks_with_transition_state(
+    messages: &[CkWireMessage],
+    sidecar: &DecodeSidecar,
+    session_id: Option<&str>,
+    preserve_compaction: bool,
+    mutation_exempt_mids: &[&str],
+    _transition_consumed: bool,
+    base_index: usize,
+) -> Vec<EncodedOpencodeChunk> {
     let mut encoded = Vec::with_capacity(messages.len());
     let mut index = 0;
     while index < messages.len() {
+        let absolute_index = base_index.saturating_add(index);
         if let Some(next) = messages.get(index + 1) {
             if let Some(part) = render_synthetic_todo_pair(&messages[index], next) {
                 let info = synthetic_message_info(&messages[index], session_id);
-                encoded.push(json!({
-                    "info": info,
-                    "parts": [part],
-                }));
+                encoded.push(EncodedOpencodeChunk {
+                    start_index: absolute_index,
+                    end_index: absolute_index.saturating_add(2),
+                    value: json!({
+                        "info": info,
+                        "parts": [part],
+                    }),
+                });
                 index += 2;
                 continue;
             }
-            let call_is_fresh = meta_for_ck(sidecar, &messages[index], index).is_none();
-            let result_is_fresh = meta_for_ck(sidecar, next, index + 1).is_none();
+            let call_is_fresh = meta_for_ck(sidecar, &messages[index], absolute_index).is_none();
+            let result_is_fresh =
+                meta_for_ck(sidecar, next, absolute_index.saturating_add(1)).is_none();
             if call_is_fresh && result_is_fresh {
                 if let Some(part) = render_adjacent_tool_pair(&messages[index], next) {
                     let mut message = encode_new_message(&messages[index], session_id);
                     set_value(&mut message, "parts", Value::Array(vec![part]));
-                    encoded.push(message);
+                    encoded.push(EncodedOpencodeChunk {
+                        start_index: absolute_index,
+                        end_index: absolute_index.saturating_add(2),
+                        value: message,
+                    });
                     index += 2;
                     continue;
                 }
@@ -339,22 +419,28 @@ fn encode_opencode_impl(
         // Decoded input messages retain their harness id, so metadata can be rebound by
         // identity. A positional synthetic fallback can instead attach an input nudge's
         // native envelope to a fresh module-authored m0/m1 message.
-        let meta = meta_for_ck(sidecar, msg, index);
-        encoded.push(match meta {
+        let meta = meta_for_ck(sidecar, msg, absolute_index);
+        let value = match meta {
             Some(meta) if mutation_exempt_mids.contains(&meta.mid.as_str()) => meta.raw.clone(),
             Some(meta) => encode_with_meta(msg, meta, preserve_compaction),
             None => encode_new_message(msg, session_id),
+        };
+        encoded.push(EncodedOpencodeChunk {
+            start_index: absolute_index,
+            end_index: absolute_index.saturating_add(1),
+            value,
         });
         index += 1;
     }
-    assert_unique_tool_use_ids(&encoded);
     encoded
 }
 
-fn duplicate_tool_use_locations(messages: &[MessageV2Json]) -> Vec<(String, usize, usize)> {
+fn duplicate_tool_use_locations<'a>(
+    messages: impl IntoIterator<Item = &'a MessageV2Json>,
+) -> Vec<(String, usize, usize)> {
     let mut seen = std::collections::HashSet::new();
     let mut duplicates = Vec::new();
-    for (message_index, message) in messages.iter().enumerate() {
+    for (message_index, message) in messages.into_iter().enumerate() {
         let Some(parts) = message.get("parts").and_then(Value::as_array) else {
             continue;
         };
@@ -373,7 +459,9 @@ fn duplicate_tool_use_locations(messages: &[MessageV2Json]) -> Vec<(String, usiz
     duplicates
 }
 
-fn assert_unique_tool_use_ids(messages: &[MessageV2Json]) {
+pub(crate) fn assert_unique_tool_use_ids<'a>(
+    messages: impl IntoIterator<Item = &'a MessageV2Json>,
+) {
     let duplicates = duplicate_tool_use_locations(messages);
     debug_assert!(
         duplicates.is_empty(),

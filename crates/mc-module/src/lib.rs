@@ -2027,6 +2027,160 @@ impl BoundaryTokenCache {
     }
 }
 
+const NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeDeltaFrontier {
+    after: String,
+    native_replace_from: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeAttachmentContext {
+    session_id: String,
+    serializer_profile: String,
+    render_config: String,
+    profile_epoch: u32,
+    transition_consumed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct NativeEncodedChunk {
+    start_index: usize,
+    end_index: usize,
+    value: Arc<Value>,
+    retained_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct NativeAttachmentCacheStats {
+    reused_messages: usize,
+    encoded_messages: usize,
+}
+
+#[derive(Debug, Clone)]
+struct NativeAttachmentCacheSnapshot {
+    context: NativeAttachmentContext,
+    full_array_fingerprint: Option<String>,
+    sidecar: Arc<codec::DecodeSidecar>,
+    message_keys: Vec<[u8; 32]>,
+    sidecar_hashes: HashMap<String, [u8; 32]>,
+    chunks: Vec<NativeEncodedChunk>,
+}
+
+#[derive(Debug)]
+struct NativeAttachmentCacheSession {
+    revert_epoch: u64,
+    retained_bytes: usize,
+    snapshot: NativeAttachmentCacheSnapshot,
+    #[cfg_attr(not(test), allow(dead_code))]
+    stats: NativeAttachmentCacheStats,
+}
+
+#[derive(Debug)]
+struct NativeAttachmentCache {
+    sessions: HashMap<String, NativeAttachmentCacheSession>,
+    lru: VecDeque<String>,
+    retained_bytes: usize,
+    max_retained_bytes: usize,
+}
+
+impl Default for NativeAttachmentCache {
+    fn default() -> Self {
+        Self::new(NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES)
+    }
+}
+
+impl NativeAttachmentCache {
+    fn new(max_retained_bytes: usize) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            lru: VecDeque::new(),
+            retained_bytes: 0,
+            max_retained_bytes,
+        }
+    }
+
+    fn remove(&mut self, session_id: &str) {
+        if let Some(session) = self.sessions.remove(session_id) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+        }
+        self.lru.retain(|candidate| candidate != session_id);
+    }
+
+    fn snapshot(
+        &mut self,
+        session_id: &str,
+        revert_epoch: u64,
+    ) -> Option<NativeAttachmentCacheSnapshot> {
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.revert_epoch != revert_epoch)
+        {
+            self.remove(session_id);
+        }
+        let snapshot = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.snapshot.clone());
+        if snapshot.is_some() {
+            self.lru.retain(|candidate| candidate != session_id);
+            self.lru.push_back(session_id.to_string());
+        }
+        snapshot
+    }
+
+    fn replace(
+        &mut self,
+        session_id: &str,
+        revert_epoch: u64,
+        snapshot: NativeAttachmentCacheSnapshot,
+        stats: NativeAttachmentCacheStats,
+        served_bytes: usize,
+    ) {
+        self.remove(session_id);
+        let encoded_bytes = snapshot
+            .chunks
+            .iter()
+            .map(|chunk| chunk.retained_bytes)
+            .sum::<usize>();
+        // The sidecar retains one native input tree per served message. Charge a second copy of
+        // the canonical CK bytes as a conservative proxy without serializing the full native array.
+        let retained_bytes = encoded_bytes.saturating_add(served_bytes.saturating_mul(2));
+        if retained_bytes > self.max_retained_bytes {
+            return;
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.sessions.insert(
+            session_id.to_string(),
+            NativeAttachmentCacheSession {
+                revert_epoch,
+                retained_bytes,
+                snapshot,
+                stats,
+            },
+        );
+        self.lru.push_back(session_id.to_string());
+        while self.retained_bytes > self.max_retained_bytes {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            if let Some(session) = self.sessions.remove(&oldest) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn stats(&self, session_id: &str) -> NativeAttachmentCacheStats {
+        self.sessions
+            .get(session_id)
+            .map(|session| session.stats)
+            .unwrap_or_default()
+    }
+}
+
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (route channel → {project, session}).
 pub struct McHandler {
@@ -2042,6 +2196,7 @@ pub struct McHandler {
     recomp_sessions: Arc<Mutex<HashSet<String>>>,
     transform_snapshots: Arc<Mutex<TransformSnapshotCache>>,
     serialized_outputs: Mutex<SerializedOutputCache>,
+    native_attachments: Mutex<NativeAttachmentCache>,
     boundary_tokens: Mutex<BoundaryTokenCache>,
     scheduler_observations: Mutex<HashMap<String, SchedulerObservation>>,
     guidance_dates: Mutex<HashMap<String, String>>,
@@ -2472,6 +2627,7 @@ impl McHandler {
                 TRANSFORM_SNAPSHOT_BUDGET_BYTES,
             ))),
             serialized_outputs: Mutex::new(SerializedOutputCache::default()),
+            native_attachments: Mutex::new(NativeAttachmentCache::default()),
             boundary_tokens: Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES)),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
@@ -2564,6 +2720,7 @@ impl McHandler {
                 TRANSFORM_SNAPSHOT_BUDGET_BYTES,
             ))),
             serialized_outputs: Mutex::new(SerializedOutputCache::default()),
+            native_attachments: Mutex::new(NativeAttachmentCache::default()),
             boundary_tokens: Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES)),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
@@ -2635,6 +2792,10 @@ impl McHandler {
             self.serialized_outputs
                 .lock()
                 .expect("serialized output cache mutex")
+                .remove(&session_id);
+            self.native_attachments
+                .lock()
+                .expect("native attachment cache mutex")
                 .remove(&session_id);
             self.boundary_tokens
                 .lock()
@@ -2713,64 +2874,50 @@ impl McHandler {
         self.refresh_oldest_queued_at_ms();
     }
 
-    /// Reconstruct a full ingress snapshot from the last successful request plus a
-    /// caller-provided tail. The adapter only uses this after the module has acknowledged
-    /// the exact prefix fingerprint, so a missing/restarted cache remains fail-open via
-    /// NEED_FULL_SYNC instead of silently accepting an ambiguous prefix.
-    fn expand_transform_tail_delta(&self, parsed: &mut TransformRequest) -> bool {
-        let Some(delta) = parsed.tail_delta.as_ref().and_then(Value::as_object) else {
-            return false;
-        };
-        let Some(after) = delta.get("after").and_then(Value::as_str) else {
-            return false;
-        };
-        let Some(replace_from) = delta
+    /// Reconstruct a full ingress snapshot from the last successful request plus a validated
+    /// caller tail. The returned native frontier remains request-local and is never persisted as
+    /// authority; the incremental attachment cache rechecks its `after` fingerprint before reuse.
+    fn expand_transform_tail_delta(
+        &self,
+        parsed: &mut TransformRequest,
+    ) -> Option<NativeDeltaFrontier> {
+        let delta = parsed.tail_delta.as_ref().and_then(Value::as_object)?;
+        let after = delta.get("after").and_then(Value::as_str)?.to_string();
+        let replace_from = delta
             .get("replace_from")
             .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-        else {
-            return false;
-        };
-        let Some(native_replace_from) = delta
+            .and_then(|value| usize::try_from(value).ok())?;
+        let native_replace_from = delta
             .get("native_replace_from")
             .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-        else {
-            return false;
-        };
-        if parsed.full_array_fingerprint.is_none() {
-            return false;
-        }
-        let Some(request) = self
+            .and_then(|value| usize::try_from(value).ok())?;
+        parsed.full_array_fingerprint.as_ref()?;
+        let request = self
             .transform_snapshots
             .lock()
             .expect("transform snapshots mutex")
-            .ready_request_clone(&parsed.session_id)
-        else {
-            return false;
-        };
-        if request.full_array_fingerprint.as_deref() != Some(after)
+            .ready_request_clone(&parsed.session_id)?;
+        if request.full_array_fingerprint.as_deref() != Some(after.as_str())
             || replace_from > request.messages.len()
         {
-            return false;
+            return None;
         }
-        let Some(current_native) = parsed.native_messages.take() else {
-            return false;
-        };
-        let Some(previous_native) = request.native_messages.as_ref() else {
-            return false;
-        };
+        let mut current_native = parsed.native_messages.take()?;
+        let previous_native = request.native_messages.as_ref()?;
         if native_replace_from > previous_native.len() {
-            return false;
+            return None;
         }
         let mut messages = request.messages[..replace_from].to_vec();
         messages.append(&mut parsed.messages);
         let mut native_messages = previous_native[..native_replace_from].to_vec();
-        native_messages.extend(current_native);
+        native_messages.append(&mut current_native);
         parsed.messages = messages;
         parsed.native_messages = Some(native_messages);
         parsed.tail_delta = None;
-        true
+        Some(NativeDeltaFrontier {
+            after,
+            native_replace_from,
+        })
     }
 
     fn transform_page_in_progress(&self, session_id: &str) -> bool {
@@ -2832,6 +2979,10 @@ impl McHandler {
             self.serialized_outputs
                 .lock()
                 .expect("serialized output cache mutex")
+                .remove(&session);
+            self.native_attachments
+                .lock()
+                .expect("native attachment cache mutex")
                 .remove(&session);
             self.boundary_tokens
                 .lock()
@@ -4530,6 +4681,10 @@ impl McHandler {
         self.serialized_outputs
             .lock()
             .expect("serialized output cache mutex")
+            .remove(&session_id);
+        self.native_attachments
+            .lock()
+            .expect("native attachment cache mutex")
             .remove(&session_id);
         self.boundary_tokens
             .lock()
@@ -6354,9 +6509,14 @@ impl McHandler {
             .entry(binding.session.clone())
             .or_default()
             .insert(lineage_root);
-        if parsed.tail_delta.is_some() && !self.expand_transform_tail_delta(&mut parsed) {
-            return need_full_sync_response(parsed.full_array_fingerprint.clone());
-        }
+        let native_delta_frontier = if parsed.tail_delta.is_some() {
+            let Some(frontier) = self.expand_transform_tail_delta(&mut parsed) else {
+                return need_full_sync_response(parsed.full_array_fingerprint.clone());
+            };
+            Some(frontier)
+        } else {
+            None
+        };
         let parsed = Arc::new(parsed);
         if !from_page_apply && self.transform_page_in_progress(&binding.session) {
             return HandlerOutcome::Error {
@@ -6643,8 +6803,8 @@ impl McHandler {
                 .remove(&parsed.session_id);
         }
         response.historian = Some(diagnostics);
-        if parsed.serve_native {
-            attach_native_messages_with_tags(
+        let native_cache_stats = if parsed.serve_native {
+            attach_native_messages_incremental(
                 &mut response,
                 &parsed,
                 reasoning_watermark,
@@ -6652,8 +6812,14 @@ impl McHandler {
                 mutation_exempt_mid.as_deref(),
                 lineage_anchor_mid.as_deref(),
                 transition_consumed,
-            );
-        }
+                native_delta_frontier.as_ref(),
+                revert_epoch,
+                &self.native_attachments,
+                NativeCacheKeyMode::Normal,
+            )
+        } else {
+            NativeAttachmentCacheStats::default()
+        };
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
         self.record_response_observation(&parsed.session_id, now_ms());
         // The decoded request retains the same payload represented by its inbound JSON body, so
@@ -6677,6 +6843,8 @@ impl McHandler {
         if let Some(timings) = response.timings.as_mut() {
             timings.trigger_ms = trigger_timings.elapsed_ms;
             timings.trigger_tokenized_blocks = trigger_timings.tokenized_blocks;
+            timings.native_cache_reused_messages = native_cache_stats.reused_messages;
+            timings.native_cache_encoded_messages = native_cache_stats.encoded_messages;
             timings.post_attach = post_attach_started_at.elapsed().as_secs_f64() * 1_000.0;
         }
         respond_transform(&parsed.session_id, response)
@@ -9688,11 +9856,19 @@ fn message_tag_numbers(rows: Vec<TagNumberRow>) -> std::collections::BTreeMap<St
     by_message
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeCacheKeyMode {
+    Normal,
+    #[cfg(test)]
+    CorruptSidecarForTest,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn attach_native_messages_with_tags(
     response: &mut transform::TransformResponse,
     request: &TransformRequest,
     reasoning_watermark: u64,
-    tag_numbers: &std::collections::BTreeMap<String, u64>,
+    tag_numbers: &BTreeMap<String, u64>,
     mutation_exempt_mid: Option<&str>,
     lineage_anchor_mid: Option<&str>,
     transition_consumed: bool,
@@ -9700,14 +9876,171 @@ fn attach_native_messages_with_tags(
     if !request.serve_native {
         return;
     }
+    let native_messages = encode_full_native_messages(
+        response.messages(),
+        request,
+        reasoning_watermark,
+        tag_numbers,
+        mutation_exempt_mid,
+        lineage_anchor_mid,
+        transition_consumed,
+    );
+    response.native_messages = Some(native_messages.into_iter().map(Arc::new).collect());
+}
+
+fn native_attachment_context(
+    request: &TransformRequest,
+    transition_consumed: bool,
+) -> NativeAttachmentContext {
+    let profile = SerializerProfile::parse(&request.serializer_profile);
+    NativeAttachmentContext {
+        session_id: request.session_id.clone(),
+        serializer_profile: request.serializer_profile.clone(),
+        render_config: request.render_config.clone(),
+        profile_epoch: profile.map(profile_render_epoch).unwrap_or_default(),
+        transition_consumed,
+    }
+}
+
+fn validated_native_prefix(
+    request: &TransformRequest,
+    snapshot: &NativeAttachmentCacheSnapshot,
+    frontier: Option<&NativeDeltaFrontier>,
+) -> usize {
+    let native_len = request.native_messages.as_deref().map_or(0, <[Value]>::len);
+    frontier
+        .filter(|frontier| {
+            Some(frontier.after.as_str()) == snapshot.full_array_fingerprint.as_deref()
+        })
+        .map(|frontier| frontier.native_replace_from)
+        .filter(|replace_from| *replace_from <= native_len)
+        .unwrap_or(0)
+}
+
+fn native_sidecar(
+    request: &TransformRequest,
+    snapshot: Option<&NativeAttachmentCacheSnapshot>,
+    trusted_prefix: usize,
+) -> Arc<codec::DecodeSidecar> {
+    let native_messages = request.native_messages.as_deref().unwrap_or_default();
+    let Some(snapshot) = snapshot else {
+        return Arc::new(codec::decode_opencode(native_messages).sidecar);
+    };
+    if trusted_prefix == native_messages.len() && trusted_prefix == snapshot.sidecar.order.len() {
+        return Arc::clone(&snapshot.sidecar);
+    }
+    if trusted_prefix > 0 && trusted_prefix <= snapshot.sidecar.order.len() {
+        return Arc::new(codec::opencode::decode_opencode_sidecar_incremental(
+            native_messages,
+            &snapshot.sidecar,
+            trusted_prefix,
+        ));
+    }
+    Arc::new(codec::decode_opencode(native_messages).sidecar)
+}
+
+fn native_sidecar_hash(meta: &codec::sidecar::HarnessMessageMeta) -> [u8; 32] {
+    let bytes = serde_json::to_vec(meta).expect("OpenCode sidecar metadata must serialize");
+    Sha256::digest(bytes).into()
+}
+
+fn native_digest_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(bytes.len().to_le_bytes());
+    hasher.update(bytes);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn native_message_key(
+    served: &transform::ServedMessage,
+    position: usize,
+    sidecar_hash: Option<&[u8; 32]>,
+    tag_number: u64,
+    reasoning_should_clear: bool,
+    mutation_exempt: bool,
+    mode: NativeCacheKeyMode,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    let (output_identity, canonical_hash) = served.native_identity_basis();
+    native_digest_field(&mut hasher, output_identity.as_bytes());
+    native_digest_field(&mut hasher, canonical_hash);
+    native_digest_field(&mut hasher, &position.to_le_bytes());
+    #[cfg(test)]
+    let include_sidecar = mode != NativeCacheKeyMode::CorruptSidecarForTest;
+    #[cfg(not(test))]
+    let include_sidecar = {
+        let _ = mode;
+        true
+    };
+    if include_sidecar {
+        native_digest_field(
+            &mut hasher,
+            sidecar_hash.map(|hash| hash.as_slice()).unwrap_or_default(),
+        );
+    }
+    native_digest_field(&mut hasher, &tag_number.to_le_bytes());
+    native_digest_field(&mut hasher, &[reasoning_should_clear as u8]);
+    native_digest_field(&mut hasher, &[mutation_exempt as u8]);
+    hasher.finalize().into()
+}
+
+fn native_value_retained_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => std::mem::size_of::<Value>(),
+        Value::String(text) => std::mem::size_of::<Value>().saturating_add(text.len()),
+        Value::Array(values) => std::mem::size_of::<Value>().saturating_add(
+            values
+                .iter()
+                .map(native_value_retained_bytes)
+                .sum::<usize>(),
+        ),
+        Value::Object(object) => std::mem::size_of::<Value>().saturating_add(
+            object
+                .iter()
+                .map(|(key, value)| key.len().saturating_add(native_value_retained_bytes(value)))
+                .sum::<usize>(),
+        ),
+    }
+}
+
+fn native_reasoning_should_clear(
+    served: &transform::ServedMessage,
+    request: &TransformRequest,
+    reasoning_watermark: u64,
+    tag_numbers: &BTreeMap<String, u64>,
+    newest_assistant_mid: Option<&str>,
+) -> (u64, bool) {
+    let Some(mid) = served.meta.harness_id.as_deref() else {
+        return (0, false);
+    };
+    let Some(ingress) = request.messages.iter().find(|message| message.mid == mid) else {
+        return (0, false);
+    };
+    let tag_number = tag_numbers.get(mid).copied().unwrap_or(ingress.ordinal);
+    let should_clear = served.role == "assistant"
+        && !served.meta.synthetic
+        && reasoning_watermark > 0
+        && transform::request_accepts_empty_content(request)
+        && tag_number <= reasoning_watermark
+        && !(request.mid_turn && newest_assistant_mid == Some(mid));
+    (tag_number, should_clear)
+}
+
+fn encode_full_native_messages(
+    served: &[transform::ServedMessage],
+    request: &TransformRequest,
+    reasoning_watermark: u64,
+    tag_numbers: &BTreeMap<String, u64>,
+    mutation_exempt_mid: Option<&str>,
+    lineage_anchor_mid: Option<&str>,
+    transition_consumed: bool,
+) -> Vec<Value> {
     let sidecar = request
         .native_messages
         .as_deref()
         .map(codec::decode_opencode)
         .map(|decoded| decoded.sidecar)
         .unwrap_or_else(|| codec::DecodeSidecar::new("opencode"));
-    let served_messages = response
-        .messages()
+    let served_messages = served
         .iter()
         .map(|message| message.deref().clone())
         .collect::<Vec<_>>();
@@ -9734,7 +10067,244 @@ fn attach_native_messages_with_tags(
             tag_numbers,
         );
     }
+    native_messages
+}
+
+fn native_attachment_differential_enabled() -> bool {
+    cfg!(test)
+        || (cfg!(debug_assertions)
+            && std::env::var("MC_NATIVE_ATTACHMENT_DIFFERENTIAL").as_deref() == Ok("1"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attach_native_messages_incremental(
+    response: &mut transform::TransformResponse,
+    request: &TransformRequest,
+    reasoning_watermark: u64,
+    tag_numbers: &BTreeMap<String, u64>,
+    mutation_exempt_mid: Option<&str>,
+    lineage_anchor_mid: Option<&str>,
+    transition_consumed: bool,
+    native_delta_frontier: Option<&NativeDeltaFrontier>,
+    revert_epoch: u64,
+    cache: &Mutex<NativeAttachmentCache>,
+    mode: NativeCacheKeyMode,
+) -> NativeAttachmentCacheStats {
+    if !request.serve_native {
+        return NativeAttachmentCacheStats::default();
+    }
+
+    let cached = cache
+        .lock()
+        .expect("native attachment cache mutex")
+        .snapshot(&request.session_id, revert_epoch);
+    let trusted_prefix = cached
+        .as_ref()
+        .map(|snapshot| validated_native_prefix(request, snapshot, native_delta_frontier))
+        .unwrap_or(0);
+    let sidecar = native_sidecar(request, cached.as_ref(), trusted_prefix);
+    let sidecar_positions = sidecar
+        .order
+        .iter()
+        .enumerate()
+        .map(|(index, mid)| (mid.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let context = native_attachment_context(request, transition_consumed);
+    let mutation_exempt_mids = [mutation_exempt_mid, lineage_anchor_mid]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let newest_assistant_mid = request
+        .messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic && message.ck.role == "assistant")
+        .max_by_key(|message| message.ordinal)
+        .map(|message| message.mid.as_str());
+
+    let mut sidecar_hashes = HashMap::new();
+    let mut message_keys = Vec::with_capacity(response.messages().len());
+    for (position, served) in response.messages().iter().enumerate() {
+        let meta = codec::sidecar::meta_for_ck(&sidecar, served, position);
+        let sidecar_hash = meta.map(|meta| {
+            let slot = meta.mid.clone();
+            let trusted = sidecar_positions
+                .get(meta.mid.as_str())
+                .is_some_and(|index| *index < trusted_prefix);
+            let hash = if trusted {
+                cached
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.sidecar_hashes.get(&slot))
+                    .copied()
+                    .unwrap_or_else(|| native_sidecar_hash(meta))
+            } else {
+                native_sidecar_hash(meta)
+            };
+            sidecar_hashes.insert(slot, hash);
+            hash
+        });
+        let meta_mid = meta.map(|meta| meta.mid.as_str());
+        let mutation_exempt = meta_mid.is_some_and(|mid| mutation_exempt_mids.contains(&mid));
+        let (tag_number, reasoning_should_clear) = native_reasoning_should_clear(
+            served,
+            request,
+            reasoning_watermark,
+            tag_numbers,
+            newest_assistant_mid,
+        );
+        message_keys.push(native_message_key(
+            served,
+            position,
+            sidecar_hash.as_ref(),
+            tag_number,
+            reasoning_should_clear,
+            mutation_exempt,
+            mode,
+        ));
+    }
+
+    let cache_compatible = cached
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.context == context);
+    let common = if cache_compatible {
+        cached
+            .as_ref()
+            .expect("compatible native cache has a snapshot")
+            .message_keys
+            .iter()
+            .zip(&message_keys)
+            .take_while(|(previous, current)| previous == current)
+            .count()
+    } else {
+        0
+    };
+    let exact_hit = cache_compatible
+        && cached
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.message_keys.len() == message_keys.len())
+        && common == message_keys.len();
+    let suffix_start = if exact_hit {
+        message_keys.len()
+    } else if common == 0 {
+        0
+    } else {
+        let restart_at = common.saturating_sub(1);
+        cached
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .chunks
+                    .iter()
+                    .find(|chunk| chunk.end_index > restart_at)
+                    .map(|chunk| chunk.start_index)
+            })
+            .unwrap_or(0)
+    };
+
+    let mut chunks = if cache_compatible {
+        cached
+            .as_ref()
+            .expect("compatible native cache has a snapshot")
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.end_index <= suffix_start)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let served_suffix = response.messages()[suffix_start..]
+        .iter()
+        .map(|message| message.deref().clone())
+        .collect::<Vec<_>>();
+    let encoded_suffix = codec::opencode::encode_opencode_chunks_with_transition_state(
+        &served_suffix,
+        &sidecar,
+        Some(&request.session_id),
+        true,
+        &mutation_exempt_mids,
+        transition_consumed,
+        suffix_start,
+    );
+    let mut suffix_values = encoded_suffix
+        .iter()
+        .map(|chunk| chunk.value.clone())
+        .collect::<Vec<_>>();
+    if let Some(profile) = SerializerProfile::parse(&request.serializer_profile) {
+        transform::clear_served_native_reasoning_from_served(
+            profile,
+            transform::request_accepts_empty_content(request),
+            &mut suffix_values,
+            response.messages(),
+            &request.messages,
+            reasoning_watermark,
+            request.mid_turn,
+            tag_numbers,
+        );
+    }
+    chunks.extend(
+        encoded_suffix
+            .into_iter()
+            .zip(suffix_values)
+            .map(|(chunk, value)| NativeEncodedChunk {
+                start_index: chunk.start_index,
+                end_index: chunk.end_index,
+                retained_bytes: native_value_retained_bytes(&value),
+                value: Arc::new(value),
+            }),
+    );
+    codec::opencode::assert_unique_tool_use_ids(chunks.iter().map(|chunk| chunk.value.as_ref()));
+    let native_messages = chunks
+        .iter()
+        .map(|chunk| Arc::clone(&chunk.value))
+        .collect::<Vec<_>>();
+
+    if native_attachment_differential_enabled() {
+        let full = encode_full_native_messages(
+            response.messages(),
+            request,
+            reasoning_watermark,
+            tag_numbers,
+            mutation_exempt_mid,
+            lineage_anchor_mid,
+            transition_consumed,
+        );
+        let full_bytes = serde_json::to_vec(&full).expect("full native output must serialize");
+        let incremental_bytes =
+            serde_json::to_vec(&native_messages).expect("incremental native output must serialize");
+        assert_eq!(
+            incremental_bytes, full_bytes,
+            "incremental native attachment cache drift"
+        );
+    }
+
+    let stats = NativeAttachmentCacheStats {
+        reused_messages: suffix_start,
+        encoded_messages: message_keys.len().saturating_sub(suffix_start),
+    };
+    let served_bytes = response
+        .messages()
+        .iter()
+        .map(|message| message.canonical_bytes().len())
+        .sum();
+    cache
+        .lock()
+        .expect("native attachment cache mutex")
+        .replace(
+            &request.session_id,
+            revert_epoch,
+            NativeAttachmentCacheSnapshot {
+                context,
+                full_array_fingerprint: request.full_array_fingerprint.clone(),
+                sidecar,
+                message_keys,
+                sidecar_hashes,
+                chunks,
+            },
+            stats,
+            served_bytes,
+        );
     response.native_messages = Some(native_messages);
+    stats
 }
 
 fn state_import_validation_error(error: StateImportValidationError) -> HandlerOutcome {
@@ -13825,6 +14395,14 @@ mod tests {
         let second = call_transform_request(&handler, request).await;
         assert_eq!(second["status"], "ok");
         assert_eq!(second["action"], "SOFT+");
+        assert!(
+            second["timings"]["native_cache_reused_messages"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "steady native defer must reuse its encoded prefix"
+        );
+        assert_eq!(second["timings"]["native_cache_encoded_messages"], 0);
         assert_eq!(
             second["native_messages"]
                 .as_array()
@@ -13832,6 +14410,323 @@ mod tests {
                 .last()
                 .unwrap()["info"]["customInfo"],
             "preserve-me"
+        );
+    }
+
+    fn native_cache_request(
+        session_id: &str,
+        messages: Vec<CkIngressMessage>,
+        native_messages: Vec<Value>,
+        fingerprint: &str,
+    ) -> TransformRequest {
+        serde_json::from_value(json!({
+            "kind": "transform",
+            "v": 2,
+            "serializer_profile": "opencode-aisdk",
+            "session_id": session_id,
+            "render_config": "cfg0",
+            "provider_id": "anthropic",
+            "serve_native": true,
+            "messages": messages,
+            "native_messages": native_messages,
+            "full_array_fingerprint": fingerprint,
+        }))
+        .unwrap()
+    }
+
+    fn native_text_message(mid: &str, role: &str, text: &str) -> Value {
+        json!({
+            "info": { "id": mid, "role": role },
+            "parts": [{ "type": "text", "text": text }],
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_native_cache_pass(
+        cache: &Mutex<NativeAttachmentCache>,
+        request: &TransformRequest,
+        served: Vec<CkWireMessage>,
+        tag_numbers: &BTreeMap<String, u64>,
+        transition_consumed: bool,
+        revert_epoch: u64,
+        mode: NativeCacheKeyMode,
+    ) -> (transform::TransformResponse, NativeAttachmentCacheStats) {
+        let mut response = transform::TransformResponse::passthrough(
+            served,
+            request.full_array_fingerprint.clone(),
+        );
+        let native_delta_frontier = request
+            .tail_delta
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|delta| {
+                Some(NativeDeltaFrontier {
+                    after: delta.get("after")?.as_str()?.to_string(),
+                    native_replace_from: usize::try_from(
+                        delta.get("native_replace_from")?.as_u64()?,
+                    )
+                    .ok()?,
+                })
+            });
+        let stats = attach_native_messages_incremental(
+            &mut response,
+            request,
+            1,
+            tag_numbers,
+            None,
+            None,
+            transition_consumed,
+            native_delta_frontier.as_ref(),
+            revert_epoch,
+            cache,
+            mode,
+        );
+        (response, stats)
+    }
+
+    #[test]
+    fn incremental_native_cache_replays_complex_prefix_and_encodes_only_tail() {
+        let todo = injection::build_synthetic_todo_pair(
+            r#"[{"content":"Keep the pair","status":"in_progress","priority":"high"}]"#,
+        )
+        .unwrap();
+        let frozen_call = assistant_tool_call("call-frozen", 1);
+        let frozen_result = tool_result("result-frozen", 2, "[dropped]");
+        let reasoning = ck_reasoning("assistant-old", 3, "signed historical thinking");
+        let user = ck("user-one", 4, "prompt");
+        let mut served = vec![
+            CkWireMessage::synthetic_user_text("frozen m0".to_string()),
+            todo.assistant_msg,
+            todo.tool_msg,
+            frozen_call.ck.clone(),
+            frozen_result.ck.clone(),
+            reasoning.ck.clone(),
+            user.ck.clone(),
+        ];
+        let native = vec![
+            json!({
+                "info": { "id": "assistant-old", "role": "assistant" },
+                "parts": [
+                    { "type": "reasoning", "text": "signed historical thinking", "metadata": { "signature": "sig" } },
+                    { "type": "compaction", "summary": "keep marker representation" }
+                ]
+            }),
+            native_text_message("user-one", "user", "prompt"),
+        ];
+        let messages = vec![frozen_call, frozen_result, reasoning, user];
+        let first_request =
+            native_cache_request("native-complex", messages.clone(), native.clone(), "fp-1");
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let tags = BTreeMap::from([("assistant-old".to_string(), 1)]);
+        let (_first, first_stats) = run_native_cache_pass(
+            &cache,
+            &first_request,
+            served.clone(),
+            &tags,
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(first_stats.reused_messages, 0);
+
+        let appended = ck("user-two", 5, "second prompt");
+        served.push(appended.ck.clone());
+        let mut next_messages = messages;
+        next_messages.push(appended);
+        let mut next_native = native;
+        next_native.push(native_text_message("user-two", "user", "second prompt"));
+        let mut second_request =
+            native_cache_request("native-complex", next_messages, next_native, "fp-2");
+        second_request.tail_delta = Some(json!({
+            "after": "fp-1",
+            "replace_from": 4,
+            "native_replace_from": 2,
+        }));
+        let (second, second_stats) = run_native_cache_pass(
+            &cache,
+            &second_request,
+            served,
+            &tags,
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert!(second_stats.reused_messages >= 5, "{second_stats:?}");
+        assert!(second_stats.encoded_messages <= 2, "{second_stats:?}");
+        let native = second.native_messages.expect("incremental native output");
+        let encoded = serde_json::to_string(&native).unwrap();
+        assert!(encoded.contains("syntheticTodoMarker"));
+        assert!(encoded.contains("keep marker representation"));
+        assert!(encoded.contains("[dropped]"));
+        assert!(native.iter().any(|message| {
+            message["parts"].as_array().is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| part["type"] == json!("reasoning") && part["text"] == json!(""))
+            })
+        }));
+        assert_eq!(cache.lock().unwrap().stats("native-complex"), second_stats);
+    }
+
+    #[test]
+    fn incremental_native_cache_invalidates_every_byte_affecting_input() {
+        let ingress = vec![ck("m1", 1, "one"), ck("m2", 2, "two"), ck("m3", 3, "three")];
+        let native = vec![
+            native_text_message("m1", "user", "one"),
+            native_text_message("m2", "user", "two"),
+            native_text_message("m3", "user", "three"),
+        ];
+        let baseline_request =
+            native_cache_request("native-invalidations", ingress.clone(), native, "fp-base");
+        let baseline_served = ingress
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+
+        for trigger in [
+            "fold",
+            "coverage",
+            "reduction",
+            "transition_salt",
+            "render_epoch",
+            "revert_epoch",
+            "tag_mutation",
+            "sidecar_meta",
+            "profile",
+        ] {
+            let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+            run_native_cache_pass(
+                &cache,
+                &baseline_request,
+                baseline_served.clone(),
+                &BTreeMap::new(),
+                false,
+                0,
+                NativeCacheKeyMode::Normal,
+            );
+            let mut request = baseline_request.clone();
+            let mut served = baseline_served.clone();
+            let mut tags = BTreeMap::new();
+            let mut transition_consumed = false;
+            let mut revert_epoch = 0;
+            match trigger {
+                "fold" => {
+                    served[0] = CkWireMessage::synthetic_user_text("folded prefix".to_string());
+                }
+                "coverage" => {
+                    served.remove(0);
+                }
+                "reduction" => {
+                    served[2].content[0] = CkWireBlock::bare(CkKind::Text {
+                        text: "[dropped]".to_string(),
+                    });
+                    served[2].mark_modified();
+                }
+                "transition_salt" => transition_consumed = true,
+                "render_epoch" => request.render_config = "cfg1".to_string(),
+                "revert_epoch" => revert_epoch = 1,
+                "tag_mutation" => {
+                    tags.insert("m3".to_string(), 7);
+                }
+                "sidecar_meta" => {
+                    request.native_messages.as_mut().unwrap()[2]["info"]["custom"] = json!(true);
+                }
+                "profile" => request.serializer_profile = "opencode-aisdk-next".to_string(),
+                _ => unreachable!(),
+            }
+            let (_response, stats) = run_native_cache_pass(
+                &cache,
+                &request,
+                served,
+                &tags,
+                transition_consumed,
+                revert_epoch,
+                NativeCacheKeyMode::Normal,
+            );
+            assert!(
+                stats.encoded_messages > 0,
+                "{trigger} did not invalidate the native cache: {stats:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "incremental native attachment cache drift")]
+    fn differential_assert_catches_corrupt_sidecar_key_derivation() {
+        let ingress = vec![ck("m1", 1, "one")];
+        let request = native_cache_request(
+            "native-key-mutation",
+            ingress.clone(),
+            vec![native_text_message("m1", "user", "one")],
+            "fp-1",
+        );
+        let served = vec![ingress[0].ck.clone()];
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        run_native_cache_pass(
+            &cache,
+            &request,
+            served.clone(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::CorruptSidecarForTest,
+        );
+
+        let mut mutated = request;
+        mutated.native_messages.as_mut().unwrap()[0]["info"]["custom"] = json!("changed");
+        run_native_cache_pass(
+            &cache,
+            &mutated,
+            served,
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::CorruptSidecarForTest,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "OpenCode serialization produced duplicate tool_use ids")]
+    fn duplicate_tool_use_assert_covers_incremental_native_suffix() {
+        let text = ck("lead", 1, "lead");
+        let call = assistant_tool_call("call-dup", 2);
+        let result = tool_result("result-dup", 3, "first");
+        let baseline = vec![text.clone(), call.clone(), result.clone()];
+        let request = native_cache_request("native-dup", baseline.clone(), Vec::new(), "fp-1");
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        run_native_cache_pass(
+            &cache,
+            &request,
+            baseline.iter().map(|message| message.ck.clone()).collect(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+
+        let mut duplicate_call = call;
+        duplicate_call.mid = "call-dup-again".to_string();
+        duplicate_call.ck.meta.harness_id = Some(duplicate_call.mid.clone());
+        let mut duplicate_result = result;
+        duplicate_result.mid = "result-dup-again".to_string();
+        duplicate_result.ck.meta.harness_id = Some(duplicate_result.mid.clone());
+        let mut next = baseline;
+        next.push(duplicate_call);
+        next.push(duplicate_result);
+        let mut next_request = native_cache_request("native-dup", next.clone(), Vec::new(), "fp-2");
+        next_request.tail_delta = Some(json!({
+            "after": "fp-1",
+            "replace_from": 3,
+            "native_replace_from": 0,
+        }));
+        run_native_cache_pass(
+            &cache,
+            &next_request,
+            next.iter().map(|message| message.ck.clone()).collect(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
         );
     }
 
@@ -13936,7 +14831,15 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(replay.native_messages, Some(actual_native));
+        assert_eq!(
+            replay
+                .native_messages
+                .expect("native replay")
+                .iter()
+                .map(|message| message.as_ref().clone())
+                .collect::<Vec<_>>(),
+            actual_native
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
