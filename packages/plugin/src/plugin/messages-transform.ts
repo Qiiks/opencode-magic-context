@@ -13,6 +13,7 @@ import { updateSessionMeta } from "../features/magic-context/storage-meta-sessio
 import { EmergencyFailClosedError } from "../hooks/magic-context/emergency-fail-closed";
 import { replayLkg, resolveLkgModelKeys } from "../hooks/magic-context/lkg-replay";
 import { dropSlot, getSlot, noteEntry } from "../hooks/magic-context/lkg-slot";
+import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
 import type { MessageLike } from "../hooks/magic-context/transform-operations";
 import { log, sessionLog } from "../shared/logger";
 
@@ -49,9 +50,9 @@ function replaceMessagesInPlace(output: MessagesTransformOutput, next: MessageWi
  *
  * Error handling is tiered:
  *
- * - **FailClosedBlockingError / EmergencyFailClosedError**: Intentional loud
- *   aborts. Rethrown so the TUI surfaces the message and the turn does not
- *   silently fall through to native compaction.
+ * - **FailClosedBlockingError / EmergencyFailClosedError / RawFallbackContextLimitError**:
+ *   Intentional loud aborts. Rethrown so the TUI surfaces the message and the turn does not
+ *   silently fall through to native compaction or a provider-rejected raw prompt.
  *
  * - **SQLITE_BUSY**: Transient, expected from concurrent plugin processes
  *   (second OpenCode instance, long dreamer/historian child session, slow
@@ -71,8 +72,8 @@ function replaceMessagesInPlace(output: MessagesTransformOutput, next: MessageWi
  *     3. Return with messages unmodified for this pass.
  *
  * Ordinary transform failures are not rethrown because OpenCode's Effect pipeline
- * turns thrown errors into user-visible prompt failures. FailClosedBlockingError
- * and EmergencyFailClosedError are the intentional exceptions and are rethrown.
+ * turns thrown errors into user-visible prompt failures. FailClosedBlockingError,
+ * EmergencyFailClosedError, and RawFallbackContextLimitError are intentional exceptions.
  * We accept degraded behavior (no injection / no drops this turn) rather than
  * blocking the user for ordinary bugs — but deterministic inoperability must
  * block loudly when fail_closed_blocking is on.
@@ -170,6 +171,7 @@ export function createMessagesTransformHandler(args: {
             await magicContext?.["experimental.chat.messages.transform"]?.(input, output);
             return output.messages;
         } catch (error) {
+            if (error instanceof RawFallbackContextLimitError) throw error;
             if (error instanceof EmergencyFailClosedError || isFailClosedBlockingError(error)) {
                 if (!args.compactionOff) throw error;
                 // Inert by design: log a diagnostic and hand the harness back its

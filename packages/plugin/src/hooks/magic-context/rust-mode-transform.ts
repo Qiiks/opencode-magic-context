@@ -64,6 +64,7 @@ import {
     resolveOrdinalsForModule,
 } from "./module-wire";
 import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
+import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { findLastAssistantModelFromOpenCodeDb, isMidTurn } from "./read-session-db";
 import type { RawMessageOrdinalAnchor } from "./read-session-raw";
 import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
@@ -1327,6 +1328,37 @@ export function createRustModeTransform(
                 overflowState.emergencyRecoveryOrigin === "provider_overflow" &&
                 hasProviderProof;
         }
+        const serveRawFallback = (cause?: unknown): void => {
+            const contextLimit =
+                resolvedContextLimit ??
+                (overflowState && overflowState.detectedContextLimit > 0
+                    ? overflowState.detectedContextLimit
+                    : undefined);
+            if (contextLimit !== undefined) {
+                try {
+                    const estimate = estimateFinalWireInputTokens({
+                        messages,
+                        systemPromptTokens: sessionMeta.systemPromptTokens,
+                        providerID: model?.providerID,
+                        modelID: model?.modelID,
+                        agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                    });
+                    if (estimate.tokens > contextLimit) {
+                        sessionLog(
+                            sessionId,
+                            `raw_fallback_over_context_limit estimated=${estimate.tokens} limit=${contextLimit}`,
+                        );
+                        throw new RawFallbackContextLimitError(estimate.tokens, contextLimit, {
+                            cause,
+                        });
+                    }
+                } catch (error) {
+                    if (error instanceof RawFallbackContextLimitError) throw error;
+                    // An unavailable estimate leaves the ordinary raw fail-open contract intact.
+                }
+            }
+            replaceMessagesInPlace(output, messages);
+        };
         const finishPass = (applied: boolean, served = true): void => {
             const elapsedAt = applied && appliedAt !== undefined ? appliedAt : performance.now();
             const elapsedMs = Math.max(0, elapsedAt - passStartedAt);
@@ -1410,7 +1442,12 @@ export function createRustModeTransform(
                     servedFrom = "lkg";
                 } else {
                     servedFrom = "raw";
-                    replaceMessagesInPlace(output, messages);
+                    try {
+                        serveRawFallback();
+                    } catch (error) {
+                        finishPass(false, false);
+                        throw error;
+                    }
                 }
                 finishPass(false);
                 return;
@@ -2050,22 +2087,16 @@ export function createRustModeTransform(
                 }
                 logStage(sessionId, "apply", applyStartedAt, timings);
                 const lkgSnapshotStartedAt = performance.now();
-                // Slots are process-memory: after a serve restart every session has
-                // NO snapshot until its next busting pass, and any transport failure
-                // in that window falls through LKG to a raw full-array serve. The
-                // first applied pass of a process seeds the slot unconditionally.
-                if (cacheBustingPass || !getSlot(sessionId)) {
-                    const captured = captureRustResponse(sessionId, messages, response);
-                    if (cacheBustingPass && !captured) {
-                        dropSlot(sessionId, "lkg_refresh_declined");
-                    }
-                }
+                // Treat every successfully applied response as the new last-known-good snapshot,
+                // including incremental passes where only the growing tail changed.
+                const captured = captureRustResponse(sessionId, messages, response);
+                if (!captured) dropSlot(sessionId, "lkg_refresh_declined");
                 logStage(
                     sessionId,
                     "lkgSnapshot",
                     lkgSnapshotStartedAt,
                     timings,
-                    cacheBustingPass ? "captured=true" : "captured=false",
+                    `captured=${captured}`,
                 );
                 const applyReplaceStartedAt = performance.now();
                 replaceMessagesInPlace(output, appliedMessages);
@@ -2228,11 +2259,18 @@ export function createRustModeTransform(
                 output,
                 sessionMeta.systemPromptTokens,
             );
-            if (!replayed) replaceMessagesInPlace(output, messages);
             servedFrom = replayed ? "lkg" : "raw";
             if (decision.toLowerCase() !== "need_full_sync") decision = "error";
             materializeReason = "none";
             markFailure(sessionId, state, error);
+            if (!replayed) {
+                try {
+                    serveRawFallback(error);
+                } catch (rawFallbackError) {
+                    finishPass(false, false);
+                    throw rawFallbackError;
+                }
+            }
             finishPass(false);
             return;
         }
