@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/magic-context",
-  "version": "0.35.1",
+  "version": "0.36.0",
   "description": "Unified CLI for Magic Context — setup, doctor, and migration across OpenCode, Pi, and OMP",
   "keywords": [
     "opencode",
