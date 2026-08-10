@@ -40,7 +40,6 @@
     "prepublishOnly": "bun run build"
   },
   "dependencies": {
-    "@cortexkit/retina-local-fs": "workspace:*",
     "@huggingface/transformers": "^4.1.0",
     "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
     "ai-tokenizer": "^1.0.6",
@@ -50,6 +49,7 @@
     "zod": "^4.1.8"
   },
   "devDependencies": {
+    "@cortexkit/retina-local-fs": "workspace:*",
     "@biomejs/biome": "^2.5.1",
     "@earendil-works/pi-coding-agent": "^0.80.2",
     "@earendil-works/pi-tui": "^0.80.2",

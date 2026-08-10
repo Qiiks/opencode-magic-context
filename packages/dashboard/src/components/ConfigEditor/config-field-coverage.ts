@@ -97,6 +97,8 @@ export const OMITTED_BY_DESIGN: Readonly<Record<string, string>> = {
     "experimental project-wide Rust runtime cutover; requires user-level subc configuration and is not exposed in the dashboard yet",
   fail_closed_blocking:
     "user-only inoperability policy; raw JSONC because project configs cannot change it",
+  "smart_notes.retina_handoff":
+    "external-events plane flip; stays raw JSONC until the retina consumer ships and the flag has a user-facing meaning",
 };
 
 /**
