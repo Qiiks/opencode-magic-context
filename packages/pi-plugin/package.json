@@ -2,13 +2,15 @@
   "name": "@cortexkit/pi-magic-context",
   "version": "0.35.1",
   "type": "module",
-  "description": "Pi coding agent extension for Magic Context — cross-session memory and context management",
+  "description": "Pi and OMP coding agent extension for Magic Context — cross-session memory and context management",
   "main": "dist/index.js",
   "license": "MIT",
   "author": "ualtinok",
   "keywords": [
     "pi",
     "pi-coding-agent",
+    "omp",
+    "oh-my-pi",
     "extension",
     "context",
     "memory",
@@ -27,6 +29,7 @@
   ],
   "scripts": {
     "build": "rm -f dist/index.js dist/subagent-entry.js dist/*-*.js && bun build src/index.ts src/subagent-entry.ts --outdir dist --target node --format esm --splitting --external @earendil-works/pi-coding-agent --external @earendil-works/pi-tui --external @huggingface/transformers --external node:sqlite",
+    "build:e2e-argv": "bun build src/subagent-runner.ts --outfile ../../tests/docker/.generated/subagent-runner-e2e.mjs --target node --format esm --external node:sqlite",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "lint": "biome check src",
@@ -59,12 +62,25 @@
     "@earendil-works/pi-coding-agent": "^0.80.2",
     "@earendil-works/pi-tui": "^0.80.2"
   },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
+  },
   "exports": {
     ".": {
       "import": "./dist/index.js"
     }
   },
   "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "omp": {
     "extensions": [
       "./dist/index.js"
     ]
