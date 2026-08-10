@@ -2,7 +2,7 @@
 
 ## Cache shape and frontier
 
-`McHandler` owns a 64 MiB LRU cache per session. A session entry is fenced by the durable `revert_epoch` and stores:
+`McHandler` owns one 64 MiB process-local LRU budget shared by all cached sessions. A session entry is fenced by the durable `revert_epoch` and stores:
 
 - the last acknowledged full-array fingerprint;
 - an `Arc<DecodeSidecar>` whose unchanged prefix metadata is also shared through `Arc`;
@@ -33,7 +33,17 @@ Each served-message key hashes:
 - reasoning-clear eligibility;
 - mutation-exemption state for the live assistant or lineage anchor.
 
-The sidecar digest covers retained raw OpenCode fields and block metadata, not only CK-visible content.
+The sidecar digest covers retained raw OpenCode fields and block metadata, not only CK-visible content. Incremental suffix decoding calls the ordinary decoder with the prior sidecar, so the decoder first clones all prior `mid_pins` and then adds suffix pins. Assigning the resulting pin map to the merged sidecar therefore preserves prior pins; there is no separate merge with a conflicting value. A three-generation regression compares this behavior with a full decode and proves that clearing inherited pins produces a different identity.
+
+## Budget accounting and RSS bound
+
+The 64 MiB limit bounds the cache's **charged estimate**, not process RSS. For each retained session the charge is `E + 2S + N`:
+
+- `E` is the recursive retained-size estimate for encoded native `Value` chunks;
+- `S` is the canonical served-CK byte count; `2S` conservatively proxies the served-message objects and shared canonical storage;
+- `N` is the sidecar charge: twice each serialized message-meta size plus the meta struct, sidecar map/order/pin string payloads, and the sidecar struct itself. Prefix `N` values are reused and suffix values are computed alongside the existing sidecar hash.
+
+The limit does not precisely charge allocator bucket/capacity overhead, `Arc`/map node overhead, transient serialization buffers, or every non-string container allocation. During replacement, the old snapshot and new snapshot can coexist until the request-local old snapshot drops; unchanged `Arc` data is shared, but changed trees can temporarily exist twice. Operationally, use **4× the configured budget as a conservative RSS headline** (256 MiB for the default 64 MiB) for this cache during replacement. That multiplier is guidance, not an enforced memory ceiling.
 
 ## Invalidation matrix
 

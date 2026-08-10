@@ -16198,6 +16198,70 @@ mod tests {
         assert_eq!(healed.len(), 2);
         assert_eq!(healed[0].meta.harness_id.as_deref(), Some("one"));
         assert_eq!(healed[1].meta.harness_id.as_deref(), Some("one-result"));
+
+        let healed_ck = healed
+            .iter()
+            .map(|message| message.deref().clone())
+            .collect::<Vec<_>>();
+        let mut request = req(
+            "belt-release-native",
+            "cfg0",
+            ingress_from_ck(healed_ck.clone()),
+        );
+        request.serializer_profile = "opencode-aisdk".to_string();
+        request.serve_native = true;
+        request.full_array_fingerprint = Some("belt-release-fp".to_string());
+        let cache = Mutex::new(crate::NativeAttachmentCache::new(1024 * 1024));
+        let mut first = TransformResponse::passthrough(
+            healed_ck.clone(),
+            request.full_array_fingerprint.clone(),
+        );
+        let first_stats = crate::attach_native_messages_incremental(
+            &mut first,
+            &request,
+            0,
+            &BTreeMap::new(),
+            None,
+            None,
+            true,
+            None,
+            0,
+            &cache,
+            crate::NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(first_stats.encoded_messages, healed_ck.len());
+        let native = first.native_messages.as_ref().unwrap();
+        let tool_ids = native
+            .iter()
+            .flat_map(|message| message["parts"].as_array().into_iter().flatten())
+            .filter_map(|part| part["callID"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_ids.len(),
+            tool_ids.iter().copied().collect::<HashSet<_>>().len()
+        );
+        assert_eq!(tool_ids, vec!["duplicate"]);
+
+        let mut replay = TransformResponse::passthrough(
+            healed_ck.clone(),
+            request.full_array_fingerprint.clone(),
+        );
+        let replay_stats = crate::attach_native_messages_incremental(
+            &mut replay,
+            &request,
+            0,
+            &BTreeMap::new(),
+            None,
+            None,
+            true,
+            None,
+            0,
+            &cache,
+            crate::NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(replay_stats.reused_messages, healed_ck.len());
+        assert_eq!(replay_stats.encoded_messages, 0);
+        assert_eq!(replay.native_messages, first.native_messages);
     }
 
     #[test]
@@ -16339,6 +16403,75 @@ mod tests {
                 .as_ref()
                 .and_then(|pair| pair.anchor_mid.as_deref()),
             Some("t3")
+        );
+
+        let cache = Mutex::new(crate::NativeAttachmentCache::new(1024 * 1024));
+        let mut first_request = req(
+            "keep-fold-native",
+            "cfg0",
+            vec![item("a", 1, "raw"), todowrite_call("todo", 2, json!([]))],
+        );
+        first_request.serializer_profile = "opencode-aisdk".to_string();
+        first_request.serve_native = true;
+        first_request.full_array_fingerprint = Some("todo-fold-fp-1".to_string());
+        let mut first_native = first.clone();
+        crate::attach_native_messages_incremental(
+            &mut first_native,
+            &first_request,
+            0,
+            &BTreeMap::new(),
+            None,
+            None,
+            true,
+            None,
+            0,
+            &cache,
+            crate::NativeCacheKeyMode::Normal,
+        );
+
+        let mut moved_request = req(
+            "keep-fold-native",
+            "cfg0",
+            vec![
+                item("a", 1, "raw"),
+                todowrite_call("todo", 2, json!([])),
+                assistant_form("t3", 3, &["new tail end"]),
+            ],
+        );
+        moved_request.serializer_profile = "opencode-aisdk".to_string();
+        moved_request.serve_native = true;
+        moved_request.full_array_fingerprint = Some("todo-fold-fp-2".to_string());
+        let mut moved_native = moved.clone();
+        let stats = crate::attach_native_messages_incremental(
+            &mut moved_native,
+            &moved_request,
+            0,
+            &BTreeMap::new(),
+            None,
+            None,
+            true,
+            None,
+            0,
+            &cache,
+            crate::NativeCacheKeyMode::Normal,
+        );
+        assert!(stats.encoded_messages > 0);
+        let native = moved_native.native_messages.unwrap();
+        let tail_index = native
+            .iter()
+            .position(|message| message["info"]["id"] == "t3")
+            .unwrap();
+        let todo_index = native
+            .iter()
+            .position(|message| {
+                message["parts"].as_array().is_some_and(|parts| {
+                    parts.iter().any(|part| part["syntheticTodoMarker"] == true)
+                })
+            })
+            .unwrap();
+        assert!(
+            todo_index > tail_index,
+            "coverage fold must move todo after t3"
         );
     }
 

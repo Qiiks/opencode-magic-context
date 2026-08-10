@@ -2065,6 +2065,7 @@ struct NativeAttachmentCacheSnapshot {
     sidecar: Arc<codec::DecodeSidecar>,
     message_keys: Vec<[u8; 32]>,
     sidecar_hashes: HashMap<String, [u8; 32]>,
+    sidecar_sizes: HashMap<String, usize>,
     chunks: Vec<NativeEncodedChunk>,
 }
 
@@ -2145,9 +2146,28 @@ impl NativeAttachmentCache {
             .iter()
             .map(|chunk| chunk.retained_bytes)
             .sum::<usize>();
-        // The sidecar retains one native input tree per served message. Charge a second copy of
-        // the canonical CK bytes as a conservative proxy without serializing the full native array.
-        let retained_bytes = encoded_bytes.saturating_add(served_bytes.saturating_mul(2));
+        let sidecar_structure_bytes = std::mem::size_of::<codec::DecodeSidecar>()
+            .saturating_add(snapshot.sidecar.order.iter().map(String::len).sum())
+            .saturating_add(snapshot.sidecar.messages.keys().map(String::len).sum())
+            .saturating_add(
+                snapshot
+                    .sidecar
+                    .mid_pins
+                    .iter()
+                    .map(|(key, value)| key.len().saturating_add(value.len()))
+                    .sum(),
+            );
+        let sidecar_bytes = snapshot
+            .sidecar_sizes
+            .values()
+            .copied()
+            .sum::<usize>()
+            .saturating_add(sidecar_structure_bytes);
+        // Encoded canonical bytes stand in for shared served-message allocations (hence the ×2).
+        // Native sidecar trees are charged on top of the size estimate computed during hashing.
+        let retained_bytes = encoded_bytes
+            .saturating_add(served_bytes.saturating_mul(2))
+            .saturating_add(sidecar_bytes);
         if retained_bytes > self.max_retained_bytes {
             return;
         }
@@ -9939,9 +9959,10 @@ fn native_sidecar(
     Arc::new(codec::decode_opencode(native_messages).sidecar)
 }
 
-fn native_sidecar_hash(meta: &codec::sidecar::HarnessMessageMeta) -> [u8; 32] {
+fn native_sidecar_hash_and_size(meta: &codec::sidecar::HarnessMessageMeta) -> ([u8; 32], usize) {
     let bytes = serde_json::to_vec(meta).expect("OpenCode sidecar metadata must serialize");
-    Sha256::digest(bytes).into()
+    let retained_bytes = std::mem::size_of_val(meta).saturating_add(bytes.len().saturating_mul(2));
+    (Sha256::digest(&bytes).into(), retained_bytes)
 }
 
 fn native_digest_field(hasher: &mut Sha256, bytes: &[u8]) {
@@ -10122,6 +10143,7 @@ fn attach_native_messages_incremental(
         .map(|message| message.mid.as_str());
 
     let mut sidecar_hashes = HashMap::new();
+    let mut sidecar_sizes = HashMap::new();
     let mut message_keys = Vec::with_capacity(response.messages().len());
     for (position, served) in response.messages().iter().enumerate() {
         let meta = codec::sidecar::meta_for_ck(&sidecar, served, position);
@@ -10130,16 +10152,21 @@ fn attach_native_messages_incremental(
             let trusted = sidecar_positions
                 .get(meta.mid.as_str())
                 .is_some_and(|index| *index < trusted_prefix);
-            let hash = if trusted {
+            let (hash, retained_bytes) = if trusted {
                 cached
                     .as_ref()
-                    .and_then(|snapshot| snapshot.sidecar_hashes.get(&slot))
-                    .copied()
-                    .unwrap_or_else(|| native_sidecar_hash(meta))
+                    .and_then(|snapshot| {
+                        Some((
+                            *snapshot.sidecar_hashes.get(&slot)?,
+                            *snapshot.sidecar_sizes.get(&slot)?,
+                        ))
+                    })
+                    .unwrap_or_else(|| native_sidecar_hash_and_size(meta))
             } else {
-                native_sidecar_hash(meta)
+                native_sidecar_hash_and_size(meta)
             };
-            sidecar_hashes.insert(slot, hash);
+            sidecar_hashes.insert(slot.clone(), hash);
+            sidecar_sizes.insert(slot, retained_bytes);
             hash
         });
         let meta_mid = meta.map(|meta| meta.mid.as_str());
@@ -10160,6 +10187,29 @@ fn attach_native_messages_incremental(
             mutation_exempt,
             mode,
         ));
+    }
+    for (slot, meta) in &sidecar.messages {
+        if sidecar_sizes.contains_key(slot) {
+            continue;
+        }
+        let trusted = sidecar_positions
+            .get(slot.as_str())
+            .is_some_and(|index| *index < trusted_prefix);
+        let (hash, retained_bytes) = if trusted {
+            cached
+                .as_ref()
+                .and_then(|snapshot| {
+                    Some((
+                        *snapshot.sidecar_hashes.get(slot)?,
+                        *snapshot.sidecar_sizes.get(slot)?,
+                    ))
+                })
+                .unwrap_or_else(|| native_sidecar_hash_and_size(meta))
+        } else {
+            native_sidecar_hash_and_size(meta)
+        };
+        sidecar_hashes.insert(slot.clone(), hash);
+        sidecar_sizes.insert(slot.clone(), retained_bytes);
     }
 
     let cache_compatible = cached
@@ -10298,6 +10348,7 @@ fn attach_native_messages_incremental(
                 sidecar,
                 message_keys,
                 sidecar_hashes,
+                sidecar_sizes,
                 chunks,
             },
             stats,
@@ -14451,6 +14502,29 @@ mod tests {
         revert_epoch: u64,
         mode: NativeCacheKeyMode,
     ) -> (transform::TransformResponse, NativeAttachmentCacheStats) {
+        run_native_cache_pass_with_watermark(
+            cache,
+            request,
+            served,
+            1,
+            tag_numbers,
+            transition_consumed,
+            revert_epoch,
+            mode,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_native_cache_pass_with_watermark(
+        cache: &Mutex<NativeAttachmentCache>,
+        request: &TransformRequest,
+        served: Vec<CkWireMessage>,
+        reasoning_watermark: u64,
+        tag_numbers: &BTreeMap<String, u64>,
+        transition_consumed: bool,
+        revert_epoch: u64,
+        mode: NativeCacheKeyMode,
+    ) -> (transform::TransformResponse, NativeAttachmentCacheStats) {
         let mut response = transform::TransformResponse::passthrough(
             served,
             request.full_array_fingerprint.clone(),
@@ -14471,7 +14545,7 @@ mod tests {
         let stats = attach_native_messages_incremental(
             &mut response,
             request,
-            1,
+            reasoning_watermark,
             tag_numbers,
             None,
             None,
@@ -14651,6 +14725,483 @@ mod tests {
     }
 
     #[test]
+    fn renderer_transition_class_sets_invalidate_with_consumed_boolean_stable() {
+        let reasoning = ck_reasoning("transition-reasoning", 1, "signed");
+        let call = assistant_tool_call("call-transition", 2);
+        let result = tool_result("result-transition", 3, "result");
+        let tail = ck("transition-tail", 4, "tail");
+        let todo = injection::build_synthetic_todo_pair(
+            r#"[{"content":"transition","status":"in_progress","priority":"high"}]"#,
+        )
+        .unwrap();
+        let baseline_ingress = vec![
+            reasoning.clone(),
+            call.clone(),
+            result.clone(),
+            tail.clone(),
+        ];
+        let baseline = vec![
+            reasoning.ck,
+            call.ck,
+            result.ck,
+            tail.ck,
+            todo.assistant_msg,
+            todo.tool_msg,
+        ];
+        let request = native_cache_request(
+            "native-transition-classes",
+            baseline_ingress,
+            Vec::new(),
+            "transition-fp",
+        );
+
+        for class_set in [
+            "poisoned_reasoning",
+            "unmatched_pair",
+            "split_coverage",
+            "synthetic_anchor_split",
+            "poisoned_reasoning+synthetic_anchor_split",
+        ] {
+            let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+            run_native_cache_pass(
+                &cache,
+                &request,
+                baseline.clone(),
+                &BTreeMap::new(),
+                true,
+                0,
+                NativeCacheKeyMode::Normal,
+            );
+            let mut changed = baseline.clone();
+            match class_set {
+                "poisoned_reasoning" => {
+                    changed[0].content[0] = CkWireBlock::bare(CkKind::Text {
+                        text: String::new(),
+                    });
+                    changed[0].mark_modified();
+                }
+                "unmatched_pair" => {
+                    if let CkKind::ToolResult { id, .. } = &mut changed[2].content[0].kind {
+                        *id = "call-transition-unmatched".to_string();
+                    }
+                    changed[2].mark_modified();
+                }
+                "split_coverage" => {
+                    changed.remove(1);
+                }
+                "synthetic_anchor_split" => {
+                    let result = changed.pop().unwrap();
+                    let call = changed.pop().unwrap();
+                    changed.insert(3, call);
+                    changed.insert(4, result);
+                }
+                "poisoned_reasoning+synthetic_anchor_split" => {
+                    changed[0].content[0] = CkWireBlock::bare(CkKind::Text {
+                        text: String::new(),
+                    });
+                    changed[0].mark_modified();
+                    let result = changed.pop().unwrap();
+                    let call = changed.pop().unwrap();
+                    changed.insert(3, call);
+                    changed.insert(4, result);
+                }
+                _ => unreachable!(),
+            }
+            let (_response, stats) = run_native_cache_pass(
+                &cache,
+                &request,
+                changed,
+                &BTreeMap::new(),
+                true,
+                0,
+                NativeCacheKeyMode::Normal,
+            );
+            assert!(
+                stats.encoded_messages > 0,
+                "transition class set {class_set} reused stale native bytes"
+            );
+        }
+    }
+
+    fn rewrite_first_tool_result(messages: &mut [CkWireMessage], text: &str) {
+        let block = messages
+            .iter_mut()
+            .flat_map(|message| message.content.iter_mut())
+            .find(|block| matches!(block.kind, CkKind::ToolResult { .. }))
+            .expect("tool result block");
+        let CkKind::ToolResult { output, .. } = &mut block.kind else {
+            unreachable!()
+        };
+        *output = CkToolOutput::bare(CkOutputKind::Text {
+            text: text.to_string(),
+        });
+        block.mark_modified();
+    }
+
+    #[test]
+    fn reduced_shell_rematches_across_three_incremental_sidecar_generations() {
+        let raw_tool = json!({
+            "info": { "id": "shell", "role": "assistant" },
+            "parts": [{
+                "type": "tool",
+                "callID": "call-shell",
+                "tool": "bash",
+                "state": { "status": "completed", "input": {}, "output": "original" }
+            }]
+        });
+        let decoded = codec::decode_opencode(std::slice::from_ref(&raw_tool));
+        let mut served = decoded
+            .messages
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        rewrite_first_tool_result(&mut served, "[dropped gen1]");
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let first_request = native_cache_request(
+            "native-shell-rematch",
+            decoded.messages.clone(),
+            vec![raw_tool.clone()],
+            "shell-fp-1",
+        );
+        run_native_cache_pass(
+            &cache,
+            &first_request,
+            served.clone(),
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+
+        let user_2 = ck("shell-user-2", 2, "second");
+        served.push(user_2.ck.clone());
+        let mut generation_2_messages = decoded.messages.clone();
+        generation_2_messages.push(user_2);
+        let mut generation_2_native = vec![raw_tool.clone()];
+        generation_2_native.push(native_text_message("shell-user-2", "user", "second"));
+        let mut generation_2 = native_cache_request(
+            "native-shell-rematch",
+            generation_2_messages,
+            generation_2_native,
+            "shell-fp-2",
+        );
+        generation_2.tail_delta = Some(json!({
+            "after": "shell-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 1,
+        }));
+        rewrite_first_tool_result(&mut served, "[dropped gen2]");
+        run_native_cache_pass(
+            &cache,
+            &generation_2,
+            served.clone(),
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+
+        let user_3 = ck("shell-user-3", 3, "third");
+        served.push(user_3.ck.clone());
+        let mut generation_3_messages = generation_2.messages.clone();
+        generation_3_messages.push(user_3);
+        let mut generation_3_native = generation_2.native_messages.clone().unwrap();
+        generation_3_native.push(native_text_message("shell-user-3", "user", "third"));
+        let mut generation_3 = native_cache_request(
+            "native-shell-rematch",
+            generation_3_messages,
+            generation_3_native,
+            "shell-fp-3",
+        );
+        generation_3.tail_delta = Some(json!({
+            "after": "shell-fp-2",
+            "replace_from": 2,
+            "native_replace_from": 2,
+        }));
+        rewrite_first_tool_result(&mut served, "[dropped gen3]");
+        let (response, _stats) = run_native_cache_pass(
+            &cache,
+            &generation_3,
+            served,
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        let native = response.native_messages.unwrap();
+        let shell = native
+            .iter()
+            .find(|message| message["info"]["id"] == "shell")
+            .expect("rematched shell");
+        assert_eq!(shell["parts"].as_array().unwrap().len(), 1);
+        assert_eq!(shell["parts"][0]["callID"], "call-shell");
+        assert_eq!(shell["parts"][0]["state"]["output"], "[dropped gen3]");
+    }
+
+    #[test]
+    fn marker_representation_reconciles_after_changed_native_frontier() {
+        let first_native = vec![
+            native_text_message("marker-1", "user", "one"),
+            native_text_message("marker-2", "user", "two"),
+            json!({
+                "info": { "id": "marker-3", "role": "assistant" },
+                "parts": [
+                    { "type": "text", "text": "three" },
+                    { "type": "compaction", "summary": "marker-v1", "custom": 1 }
+                ]
+            }),
+        ];
+        let decoded = codec::decode_opencode(&first_native);
+        let served = decoded
+            .messages
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let first_request = native_cache_request(
+            "native-marker-frontier",
+            decoded.messages.clone(),
+            first_native.clone(),
+            "marker-fp-1",
+        );
+        run_native_cache_pass(
+            &cache,
+            &first_request,
+            served.clone(),
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+
+        let mut changed_native = first_native;
+        changed_native[2]["parts"][1]["summary"] = json!("marker-v2");
+        changed_native[2]["parts"][1]["custom"] = json!(2);
+        let mut changed_request = native_cache_request(
+            "native-marker-frontier",
+            decoded.messages,
+            changed_native,
+            "marker-fp-2",
+        );
+        changed_request.tail_delta = Some(json!({
+            "after": "marker-fp-1",
+            "replace_from": 2,
+            "native_replace_from": 2,
+        }));
+        let (response, stats) = run_native_cache_pass(
+            &cache,
+            &changed_request,
+            served,
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert!(stats.reused_messages > 0, "{stats:?}");
+        let marker = response
+            .native_messages
+            .unwrap()
+            .into_iter()
+            .find(|message| message["info"]["id"] == "marker-3")
+            .unwrap();
+        assert_eq!(marker["parts"][1]["summary"], "marker-v2");
+        assert_eq!(marker["parts"][1]["custom"], 2);
+    }
+
+    #[test]
+    fn newest_reasoning_becomes_historical_after_watermark_tail_advance() {
+        let first_ingress = vec![ck_reasoning("reasoning-1", 1, "signed-1")];
+        let first_native = vec![json!({
+            "info": { "id": "reasoning-1", "role": "assistant" },
+            "parts": [{ "type": "reasoning", "text": "signed-1", "metadata": { "signature": "sig-1" } }]
+        })];
+        let mut first_request = native_cache_request(
+            "native-reasoning-movement",
+            first_ingress.clone(),
+            first_native.clone(),
+            "reasoning-fp-1",
+        );
+        first_request.mid_turn = true;
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let (first, _) = run_native_cache_pass_with_watermark(
+            &cache,
+            &first_request,
+            vec![first_ingress[0].ck.clone()],
+            0,
+            &BTreeMap::from([("reasoning-1".to_string(), 1)]),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(
+            first.native_messages.unwrap()[0]["parts"][0]["text"],
+            "signed-1"
+        );
+
+        let newest = ck_reasoning("reasoning-2", 2, "signed-2");
+        let mut second_ingress = first_ingress;
+        second_ingress.push(newest.clone());
+        let mut second_native = first_native;
+        second_native.push(json!({
+            "info": { "id": "reasoning-2", "role": "assistant" },
+            "parts": [{ "type": "reasoning", "text": "signed-2", "metadata": { "signature": "sig-2" } }]
+        }));
+        let mut second_request = native_cache_request(
+            "native-reasoning-movement",
+            second_ingress.clone(),
+            second_native,
+            "reasoning-fp-2",
+        );
+        second_request.mid_turn = true;
+        second_request.tail_delta = Some(json!({
+            "after": "reasoning-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 1,
+        }));
+        let (second, stats) = run_native_cache_pass_with_watermark(
+            &cache,
+            &second_request,
+            second_ingress
+                .iter()
+                .map(|message| message.ck.clone())
+                .collect(),
+            1,
+            &BTreeMap::from([
+                ("reasoning-1".to_string(), 1),
+                ("reasoning-2".to_string(), 2),
+            ]),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert!(stats.encoded_messages > 0);
+        let native = second.native_messages.unwrap();
+        assert_eq!(
+            native[0]["parts"][0],
+            json!({ "type": "reasoning", "text": "" })
+        );
+        assert_eq!(native[1]["parts"][0]["text"], "signed-2");
+    }
+
+    #[test]
+    fn frontier_vacuity_covers_opaque_repeats_eviction_and_same_length_edits() {
+        let baseline_ingress = vec![ck("frontier-1", 1, "aaa"), ck("frontier-2", 2, "bbb")];
+        let baseline_native = vec![
+            json!({ "info": { "id": "frontier-1", "role": "user", "meta": "aaa" }, "parts": [{ "type": "text", "text": "aaa" }] }),
+            json!({ "info": { "id": "frontier-2", "role": "user", "meta": "bbb" }, "parts": [{ "type": "text", "text": "bbb" }] }),
+        ];
+        let baseline_request = native_cache_request(
+            "native-frontier-vacuity",
+            baseline_ingress.clone(),
+            baseline_native,
+            "opaque-repeat",
+        );
+        let baseline_served = baseline_ingress
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        run_native_cache_pass(
+            &cache,
+            &baseline_request,
+            baseline_served.clone(),
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+
+        let mut edited_request = baseline_request.clone();
+        edited_request.messages[1] = ck("frontier-2", 2, "ccc");
+        edited_request.native_messages.as_mut().unwrap()[1]["info"]["meta"] = json!("ccc");
+        edited_request.native_messages.as_mut().unwrap()[1]["parts"][0]["text"] = json!("ccc");
+        let mut edited_served = baseline_served;
+        edited_served[1] = edited_request.messages[1].ck.clone();
+        let (edited, stats) = run_native_cache_pass(
+            &cache,
+            &edited_request,
+            edited_served.clone(),
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert!(stats.encoded_messages > 0, "same-length edit was reused");
+        assert_eq!(edited.native_messages.unwrap()[1]["info"]["meta"], "ccc");
+
+        let evicting_cache = Mutex::new(NativeAttachmentCache::new(1));
+        run_native_cache_pass(
+            &evicting_cache,
+            &edited_request,
+            edited_served.clone(),
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        let (_after_eviction, evicted_stats) = run_native_cache_pass(
+            &evicting_cache,
+            &edited_request,
+            edited_served,
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(evicted_stats.reused_messages, 0);
+        assert!(evicted_stats.encoded_messages > 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "incremental native attachment cache drift")]
+    fn differential_assert_rejects_frontier_inside_mutated_native_region() {
+        let ingress = vec![ck("inside-1", 1, "one"), ck("inside-2", 2, "two")];
+        let native = vec![
+            native_text_message("inside-1", "user", "one"),
+            native_text_message("inside-2", "user", "two"),
+        ];
+        let first_request = native_cache_request(
+            "native-inside-frontier",
+            ingress.clone(),
+            native,
+            "inside-fp-1",
+        );
+        let served = ingress
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        run_native_cache_pass(
+            &cache,
+            &first_request,
+            served.clone(),
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+
+        let mut malformed = first_request;
+        malformed.full_array_fingerprint = Some("inside-fp-2".to_string());
+        malformed.native_messages.as_mut().unwrap()[0]["info"]["custom"] =
+            json!("mutated-before-frontier");
+        malformed.tail_delta = Some(json!({
+            "after": "inside-fp-1",
+            "replace_from": 2,
+            "native_replace_from": 1,
+        }));
+        run_native_cache_pass(
+            &cache,
+            &malformed,
+            served,
+            &BTreeMap::new(),
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+    }
+
+    #[test]
     #[should_panic(expected = "incremental native attachment cache drift")]
     fn differential_assert_catches_corrupt_sidecar_key_derivation() {
         let ingress = vec![ck("m1", 1, "one")];
@@ -14685,6 +15236,7 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "OpenCode serialization produced duplicate tool_use ids")]
     fn duplicate_tool_use_assert_covers_incremental_native_suffix() {
