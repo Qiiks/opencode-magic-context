@@ -19,6 +19,7 @@
  */
 import { createRequire } from "node:module";
 import { isPromptCancelledError } from "./lib/prompts";
+import { runSqlitePreflight } from "./lib/sqlite-preflight";
 
 function getVersion(): string {
     const req = createRequire(import.meta.url);
@@ -107,6 +108,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         }
 
         if (command === "doctor") {
+            if (!(await runSqlitePreflight())) return 1;
+
             if (rest[0] === "drain-authority") {
                 const projectRoot = rest[1];
                 if (!projectRoot || projectRoot.startsWith("-")) {
