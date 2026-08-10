@@ -5,7 +5,7 @@
     "": {},
     "packages/cli": {
       "name": "@cortexkit/magic-context",
-      "version": "0.34.2",
+      "version": "0.35.1",
       "bin": {
         "magic-context": "dist/index.js",
       },
@@ -69,7 +69,7 @@
     },
     "packages/pi-plugin": {
       "name": "@cortexkit/pi-magic-context",
-      "version": "0.34.2",
+      "version": "0.35.1",
       "dependencies": {
         "@huggingface/transformers": "^4.1.0",
         "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
@@ -95,7 +95,7 @@
     },
     "packages/plugin": {
       "name": "@cortexkit/opencode-magic-context",
-      "version": "0.34.2",
+      "version": "0.35.1",
       "dependencies": {
         "@cortexkit/subc-client": "0.4.1",
         "@huggingface/transformers": "^4.1.0",
@@ -120,6 +120,19 @@
       },
       "peerDependencies": {
         "@opencode-ai/plugin": ">=1.15.0",
+      },
+    },
+    "packages/retina-local-fs": {
+      "name": "@cortexkit/retina-local-fs",
+      "version": "0.0.0",
+      "bin": {
+        "retina-local-fs": "src/cli.ts",
+      },
+      "devDependencies": {
+        "@biomejs/biome": "^2.5.1",
+        "@types/bun": "^1.3.10",
+        "@types/node": "^22.20.0",
+        "typescript": "^5.8.0",
       },
     },
   },
@@ -341,6 +354,8 @@
     "@cortexkit/opencode-magic-context-e2e": ["@cortexkit/opencode-magic-context-e2e@workspace:packages/e2e-tests"],
 
     "@cortexkit/pi-magic-context": ["@cortexkit/pi-magic-context@workspace:packages/pi-plugin"],
+
+    "@cortexkit/retina-local-fs": ["@cortexkit/retina-local-fs@workspace:packages/retina-local-fs"],
 
     "@cortexkit/subc-client": ["@cortexkit/subc-client@0.4.1", "", {}, "sha512-kHLx5L/iefnbR/fiETQsCGGCegoQ/rcr70J7r/RfPakci6G1lEcTcK5V67o6WGWs4IOizkCM2tPa4ew8cp1tzA=="],
 
