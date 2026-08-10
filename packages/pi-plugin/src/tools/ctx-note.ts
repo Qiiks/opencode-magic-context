@@ -21,7 +21,15 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { getLastIndexedOrdinal } from "@magic-context/core/features/magic-context/message-index";
-import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
+import {
+	compileSurfaceCondition,
+	conditionCompileReplySuffix,
+	conditionCompileStorageFields,
+} from "@magic-context/core/features/magic-context/smart-notes/condition-compiler";
+import type {
+	ContextDatabase,
+	UpdateNoteOptions,
+} from "@magic-context/core/features/magic-context/storage";
 import {
 	addNote,
 	dismissNote,
@@ -246,15 +254,19 @@ export function createCtxNoteTool(
 							"Error: Could not resolve project identity for smart note.",
 						);
 					}
+					const compilation = await compileSurfaceCondition(surfaceCondition, {
+						projectPath: ctx.cwd,
+					});
 					const note = addNote(deps.db, "smart", {
 						content,
 						sessionId,
 						projectPath: projectIdentity,
 						surfaceCondition,
 						anchorOrdinal,
+						...conditionCompileStorageFields(compilation),
 					});
 					return ok(
-						`Created smart note #${note.id}. Dreamer will evaluate the condition during nightly runs:\n- Content: ${content}\n- Condition: ${surfaceCondition}`,
+						`Created smart note #${note.id}. Dreamer will evaluate the condition during nightly runs:\n- Content: ${content}\n- Condition: ${surfaceCondition}${conditionCompileReplySuffix(compilation)}`,
 					);
 				}
 
@@ -291,10 +303,19 @@ export function createCtxNoteTool(
 				if (typeof params.note_id !== "number") {
 					return err("Error: 'note_id' is required when action is 'update'.");
 				}
-				const updates: { content?: string; surfaceCondition?: string } = {};
+				const updates: UpdateNoteOptions = {};
 				if (params.content?.trim()) updates.content = params.content.trim();
-				if (params.surface_condition?.trim())
-					updates.surfaceCondition = params.surface_condition.trim();
+				let compilation:
+					| Awaited<ReturnType<typeof compileSurfaceCondition>>
+					| undefined;
+				if (params.surface_condition?.trim()) {
+					const surfaceCondition = params.surface_condition.trim();
+					updates.surfaceCondition = surfaceCondition;
+					compilation = await compileSurfaceCondition(surfaceCondition, {
+						projectPath: ctx.cwd,
+					});
+					Object.assign(updates, conditionCompileStorageFields(compilation));
+				}
 				if (!updates.content && !updates.surfaceCondition) {
 					return err(
 						"Error: Provide 'content' and/or 'surface_condition' to update.",
@@ -319,7 +340,9 @@ export function createCtxNoteTool(
 				if (updates.content) parts.push(`content: ${updates.content}`);
 				if (updates.surfaceCondition)
 					parts.push(`condition: ${updates.surfaceCondition}`);
-				return ok(`Updated note #${params.note_id}\n- ${parts.join("\n- ")}`);
+				return ok(
+					`Updated note #${params.note_id}\n- ${parts.join("\n- ")}${compilation ? conditionCompileReplySuffix(compilation) : ""}`,
+				);
 			}
 
 			// read — IMPORTANT: pass through `undefined` as the default

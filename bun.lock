@@ -71,6 +71,7 @@
       "name": "@cortexkit/pi-magic-context",
       "version": "0.35.1",
       "dependencies": {
+        "@cortexkit/retina-local-fs": "workspace:*",
         "@huggingface/transformers": "^4.1.0",
         "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
         "ai-tokenizer": "^1.0.6",
@@ -97,6 +98,7 @@
       "name": "@cortexkit/opencode-magic-context",
       "version": "0.35.1",
       "dependencies": {
+        "@cortexkit/retina-local-fs": "workspace:*",
         "@cortexkit/subc-client": "0.4.1",
         "@huggingface/transformers": "^4.1.0",
         "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",

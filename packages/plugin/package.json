@@ -48,6 +48,7 @@
     "prepublishOnly": "bun run build && bun run build:tui"
   },
   "dependencies": {
+    "@cortexkit/retina-local-fs": "workspace:*",
     "@cortexkit/subc-client": "0.4.1",
     "@huggingface/transformers": "^4.1.0",
     "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",

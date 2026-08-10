@@ -16,7 +16,9 @@ to stderr: `{"code":"...","message":"..."}`.
 ## Configuration
 
 A request's `config` is one atomic predicate or `{ "any": [...] }` containing one to four
-atomic predicates. Unknown fields are rejected.
+atomic predicates. Unknown fields are rejected. Every atomic predicate may also carry the optional
+authoring audit field `resolved_path_exists`; authoring sets it to `false` when the source path was
+relative or the resolved path did not exist yet, and the provider otherwise ignores it.
 
 | Kind | Fields | Fires when |
 | --- | --- | --- |

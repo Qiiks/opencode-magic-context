@@ -1,20 +1,38 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { access, lstat, readFile, readlink, realpath, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { access, readFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
+import { ProviderError } from "./errors";
+import { resolveAndFenceProviderPath } from "./path-fence";
+
+export { ProviderError } from "./errors";
+export { isFencedPath } from "./path-fence";
 
 const execFileAsync = promisify(execFile);
 const SCALAR_VERSION = 1;
 
+interface PredicateAudit {
+    /** Authoring-time audit marker. False means the source was relative or absent at write time. */
+    resolved_path_exists?: boolean;
+}
+
 export type AtomicPredicate =
-    | { kind: "file_contains"; path: string; needle: string; absent?: boolean }
-    | { kind: "path_exists"; path: string; gone?: boolean }
-    | { kind: "mtime_after"; path: string; since_ms: number }
-    | { kind: "git_commit_after"; repo_path: string; ref?: string; sha: string }
-    | { kind: "git_tag_matching"; repo_path: string; pattern: string; above?: string };
+    | (PredicateAudit & { kind: "file_contains"; path: string; needle: string; absent?: boolean })
+    | (PredicateAudit & { kind: "path_exists"; path: string; gone?: boolean })
+    | (PredicateAudit & { kind: "mtime_after"; path: string; since_ms: number })
+    | (PredicateAudit & {
+          kind: "git_commit_after";
+          repo_path: string;
+          ref?: string;
+          sha: string;
+      })
+    | (PredicateAudit & {
+          kind: "git_tag_matching";
+          repo_path: string;
+          pattern: string;
+          above?: string;
+      });
 
 export type ProviderConfig = AtomicPredicate | { any: readonly AtomicPredicate[] };
 
@@ -53,16 +71,6 @@ interface EvaluatedPredicate {
     events: Array<{ marker: string; observed: Record<string, unknown> }>;
 }
 
-export class ProviderError extends Error {
-    constructor(
-        readonly code: string,
-        message: string,
-    ) {
-        super(message);
-        this.name = "ProviderError";
-    }
-}
-
 export async function runProvider(
     input: unknown,
     options: EvaluationOptions = {},
@@ -77,10 +85,12 @@ export async function runProvider(
     for (const [index, predicate] of predicates.entries()) {
         const predicateHash = sha256(canonicalJson(predicate));
         const scalarKey = `${index}:${predicateHash}`;
-        const canonicalPath = await canonicalizeAndFence(
+        const canonicalPath = await resolveAndFenceProviderPath(
             "repo_path" in predicate ? predicate.repo_path : predicate.path,
-            predicate.kind === "path_exists",
-            options.homeDirectory,
+            {
+                allowMissing: predicate.kind === "path_exists",
+                homeDirectory: options.homeDirectory,
+            },
         );
         const evaluated = await evaluatePredicate(predicate, canonicalPath, previous[scalarKey]);
         next.predicates[scalarKey] = {
@@ -212,97 +222,6 @@ function evaluateBooleanState(
         occurrence,
         events: matches && transitioned ? [{ marker: `${state}:${occurrence}`, observed }] : [],
     };
-}
-
-async function canonicalizeAndFence(
-    configuredPath: string,
-    allowMissing: boolean,
-    configuredHome?: string,
-): Promise<string> {
-    const configuredHomePath = resolve(configuredHome ?? process.env.HOME ?? homedir());
-    let home: string;
-    try {
-        home = await realpath(configuredHomePath);
-    } catch (error) {
-        throw fsError(configuredHomePath, error);
-    }
-    const expanded = configuredPath.startsWith("~/")
-        ? join(home, configuredPath.slice(2))
-        : configuredPath;
-    const absolute = isAbsolute(expanded) ? resolve(expanded) : resolve(process.cwd(), expanded);
-    const canonical = await canonicalPath(absolute, allowMissing);
-    if (isFencedPath(canonical, home)) {
-        throw new ProviderError("fenced_path", `Refusing fenced path: ${canonical}`);
-    }
-    return canonical;
-}
-
-async function canonicalPath(path: string, allowMissing: boolean): Promise<string> {
-    try {
-        return await realpath(path);
-    } catch (error) {
-        if (!allowMissing || !isMissingError(error)) {
-            throw fsError(path, error);
-        }
-
-        const suffix: string[] = [];
-        let candidate = path;
-        while (true) {
-            try {
-                const metadata = await lstat(candidate);
-                if (metadata.isSymbolicLink()) {
-                    const target = await readlink(candidate);
-                    const resolvedTarget = resolve(dirname(candidate), target);
-                    return canonicalPath(join(resolvedTarget, ...suffix), true);
-                }
-            } catch (candidateError) {
-                if (!isMissingError(candidateError)) {
-                    throw fsError(path, candidateError);
-                }
-            }
-
-            const parent = dirname(candidate);
-            if (parent === candidate) {
-                throw fsError(path, error);
-            }
-            suffix.unshift(basename(candidate));
-            candidate = parent;
-            try {
-                return join(await realpath(candidate), ...suffix);
-            } catch (parentError) {
-                if (!isMissingError(parentError)) {
-                    throw fsError(path, parentError);
-                }
-            }
-        }
-    }
-}
-
-export function isFencedPath(canonicalPath: string, homeDirectory: string): boolean {
-    const home = resolve(homeDirectory);
-    const cortexkitRoot = join(home, ".local", "share", "cortexkit");
-    const relativeToCortexkit = relative(cortexkitRoot, canonicalPath);
-    const insideCortexkit =
-        relativeToCortexkit !== "" &&
-        relativeToCortexkit !== ".." &&
-        !relativeToCortexkit.startsWith(`..${sep}`) &&
-        !isAbsolute(relativeToCortexkit);
-    const parts = insideCortexkit ? relativeToCortexkit.split(sep) : [];
-    const pathParts = canonicalPath.split(sep).filter(Boolean);
-    const name = basename(canonicalPath);
-
-    const catalogDirectoryCarveIn = pathParts.includes("catalog");
-    const moduleBinCarveIn = parts.length >= 2 && parts[1] === "bin";
-    const catalogJsonCarveIn = name.endsWith(".json") && name.includes("catalog");
-    if (catalogDirectoryCarveIn || moduleBinCarveIn || catalogJsonCarveIn) {
-        return false;
-    }
-
-    const inFencedRoot =
-        insideCortexkit && ["plexus", "claustrum", "staging"].includes(parts[0] ?? "");
-    const fencedBasename = name.includes("binding-key") || name.endsWith(".handle");
-    const plexusStore = insideCortexkit && parts[0] === "plexus" && name.startsWith("store.db");
-    return inFencedRoot || fencedBasename || plexusStore;
 }
 
 async function readUtf8(path: string): Promise<string> {
@@ -469,6 +388,22 @@ function compareSemver(left: Semver, right: Semver): number {
     return 0;
 }
 
+export type ProviderConfigValidation =
+    | { success: true; config: ProviderConfig }
+    | { success: false; reason: string };
+
+/** The provider's declared config schema gate, shared with authoring clients. */
+export function validateProviderConfig(input: unknown): ProviderConfigValidation {
+    try {
+        return { success: true, config: parseConfig(input) };
+    } catch (error) {
+        return {
+            success: false,
+            reason: error instanceof Error ? error.message : String(error),
+        };
+    }
+}
+
 function parseInput(input: unknown): { config: ProviderConfig; scalar: ProviderScalar | null } {
     const request = requireObject(input, "request");
     requireOnlyKeys(request, ["scalar", "config"], "request");
@@ -500,7 +435,11 @@ function parseAtomicPredicate(value: unknown): AtomicPredicate {
     }
     switch (predicate.kind) {
         case "file_contains":
-            requireOnlyKeys(predicate, ["kind", "path", "needle", "absent"], predicate.kind);
+            requireOnlyKeys(
+                predicate,
+                ["kind", "path", "needle", "absent", "resolved_path_exists"],
+                predicate.kind,
+            );
             return {
                 kind: predicate.kind,
                 path: requireString(predicate.path, "path"),
@@ -508,25 +447,40 @@ function parseAtomicPredicate(value: unknown): AtomicPredicate {
                 ...(optionalBoolean(predicate.absent, "absent") === undefined
                     ? {}
                     : { absent: predicate.absent as boolean }),
+                ...predicateAudit(predicate),
             };
         case "path_exists":
-            requireOnlyKeys(predicate, ["kind", "path", "gone"], predicate.kind);
+            requireOnlyKeys(
+                predicate,
+                ["kind", "path", "gone", "resolved_path_exists"],
+                predicate.kind,
+            );
             return {
                 kind: predicate.kind,
                 path: requireString(predicate.path, "path"),
                 ...(optionalBoolean(predicate.gone, "gone") === undefined
                     ? {}
                     : { gone: predicate.gone as boolean }),
+                ...predicateAudit(predicate),
             };
         case "mtime_after":
-            requireOnlyKeys(predicate, ["kind", "path", "since_ms"], predicate.kind);
+            requireOnlyKeys(
+                predicate,
+                ["kind", "path", "since_ms", "resolved_path_exists"],
+                predicate.kind,
+            );
             return {
                 kind: predicate.kind,
                 path: requireString(predicate.path, "path"),
                 since_ms: requireFiniteNumber(predicate.since_ms, "since_ms"),
+                ...predicateAudit(predicate),
             };
         case "git_commit_after":
-            requireOnlyKeys(predicate, ["kind", "repo_path", "ref", "sha"], predicate.kind);
+            requireOnlyKeys(
+                predicate,
+                ["kind", "repo_path", "ref", "sha", "resolved_path_exists"],
+                predicate.kind,
+            );
             return {
                 kind: predicate.kind,
                 repo_path: requireString(predicate.repo_path, "repo_path"),
@@ -534,9 +488,14 @@ function parseAtomicPredicate(value: unknown): AtomicPredicate {
                 ...(predicate.ref === undefined
                     ? {}
                     : { ref: requireString(predicate.ref, "ref") }),
+                ...predicateAudit(predicate),
             };
         case "git_tag_matching": {
-            requireOnlyKeys(predicate, ["kind", "repo_path", "pattern", "above"], predicate.kind);
+            requireOnlyKeys(
+                predicate,
+                ["kind", "repo_path", "pattern", "above", "resolved_path_exists"],
+                predicate.kind,
+            );
             const above =
                 predicate.above === undefined ? undefined : requireString(predicate.above, "above");
             if (above !== undefined) {
@@ -547,6 +506,7 @@ function parseAtomicPredicate(value: unknown): AtomicPredicate {
                 repo_path: requireString(predicate.repo_path, "repo_path"),
                 pattern: requireString(predicate.pattern, "pattern"),
                 ...(above === undefined ? {} : { above }),
+                ...predicateAudit(predicate),
             };
         }
         default:
@@ -598,6 +558,13 @@ function requireString(value: unknown, field: string, allowEmpty = false): strin
         invalid(`${field} must be ${allowEmpty ? "a string" : "a non-empty string"}`);
     }
     return value as string;
+}
+
+function predicateAudit(
+    predicate: Record<string, unknown>,
+): Pick<AtomicPredicate, "resolved_path_exists"> {
+    const exists = optionalBoolean(predicate.resolved_path_exists, "resolved_path_exists");
+    return exists === undefined ? {} : { resolved_path_exists: exists };
 }
 
 function optionalBoolean(value: unknown, field: string): boolean | undefined {

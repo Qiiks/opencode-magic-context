@@ -352,6 +352,7 @@ const server: Plugin = async (ctx) => {
                 memoryEnabled: pluginConfig.memory?.enabled === true,
                 memoryInjectionBudgetTokens: pluginConfig.memory?.injection_budget_tokens,
                 mural: pluginConfig.mural,
+                retinaHandoff: pluginConfig.smart_notes.retina_handoff,
                 gitCommitIndexing: pluginConfig.memory.git_commit_indexing?.enabled
                     ? {
                           enabled: true,

@@ -86,6 +86,7 @@ interface ProjectRegistration {
     memoryEnabled?: boolean;
     memoryInjectionBudgetTokens?: number;
     mural?: { enabled: boolean; model?: string };
+    retinaHandoff?: boolean;
     embeddingConfig?: { provider?: string };
     ensureRegistered: (directory: string, db: Database) => Promise<void>;
     /**
@@ -447,6 +448,7 @@ async function sweepProject(
             dreamerModel: dreamerConfig.model,
             mural: reg.mural,
             memoryInjectionBudgetTokens: reg.memoryInjectionBudgetTokens,
+            retinaHandoff: reg.retinaHandoff,
             transformMode: reg.transformMode,
             moduleClient: reg.moduleClient,
             onProgress: (progress, completedTask) =>
@@ -502,6 +504,7 @@ async function runCompiledSmartNoteSweep(reg: ProjectRegistration, db: Database)
             db,
             projectIdentity: reg.projectIdentity,
             projectRoot: reg.directory,
+            retinaHandoff: reg.retinaHandoff,
         });
         if (result.ran > 0) {
             log(

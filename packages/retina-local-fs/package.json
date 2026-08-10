@@ -6,6 +6,10 @@
     "bin": {
         "retina-local-fs": "src/cli.ts"
     },
+    "exports": {
+        "./provider": "./src/provider.ts",
+        "./path-fence": "./src/path-fence.ts"
+    },
     "scripts": {
         "test": "bun test",
         "typecheck": "tsc --noEmit",
