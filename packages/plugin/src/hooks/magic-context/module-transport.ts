@@ -137,11 +137,29 @@ export class SubcModuleTransport {
     private authorityBindRoot = "";
     private backoffMs = CONNECT_BACKOFF_INITIAL_MS;
     private connectionGeneration = 0;
+    private stateSyncCapabilityCache: {
+        generation: number;
+        capabilities: { state_sync_deltas?: boolean };
+    } | null = null;
+
+    /** Returns the capability snapshot for the currently live SUBC connection. */
+    getCachedStateSyncCapabilities(): { state_sync_deltas?: boolean } | undefined {
+        const cached = this.stateSyncCapabilityCache;
+        if (!cached || cached.generation !== this.connectionGeneration) return undefined;
+        return cached.capabilities;
+    }
+
+    /** Clears the snapshot after a module signal that can change its wire capabilities. */
+    invalidateStateSyncCapabilities(): void {
+        this.stateSyncCapabilityCache = null;
+    }
 
     async stateSyncCapabilities(args: {
         sessionId: string;
         projectRoot: string;
     }): Promise<{ state_sync_deltas?: boolean }> {
+        const cached = this.getCachedStateSyncCapabilities();
+        if (cached) return cached;
         const response = await this.call({
             sessionId: args.sessionId,
             projectRoot: args.projectRoot,
@@ -151,7 +169,9 @@ export class SubcModuleTransport {
         const raw = isRecord(response) ? response : {};
         const value = isRecord(raw.result) ? raw.result : raw;
         const epochs = isRecord(value.epochs) ? value.epochs : {};
-        return { state_sync_deltas: epochs.state_sync_deltas === true };
+        const capabilities = { state_sync_deltas: epochs.state_sync_deltas === true };
+        this.stateSyncCapabilityCache = { generation: this.connectionGeneration, capabilities };
+        return capabilities;
     }
 
     constructor(
@@ -624,6 +644,7 @@ export class SubcModuleTransport {
     private invalidateConnection(client: SubcClient | null = this.client): void {
         if (client && this.client && client !== this.client) return;
         this.connectionGeneration += 1;
+        this.invalidateStateSyncCapabilities();
         this.client = null;
         this.routes.clear();
         client?.close();

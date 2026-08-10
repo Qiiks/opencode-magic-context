@@ -362,6 +362,26 @@ describe("SubcModuleTransport", () => {
         expect(internals.canonicalRootCache.has("/missing-canonical-root-1")).toBe(false);
     });
 
+    it("does not expose state-sync capabilities from an earlier connection generation", () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const internals = transport as unknown as {
+            connectionGeneration: number;
+            stateSyncCapabilityCache: {
+                generation: number;
+                capabilities: { state_sync_deltas?: boolean };
+            } | null;
+        };
+        internals.connectionGeneration = 1;
+        internals.stateSyncCapabilityCache = {
+            generation: 1,
+            capabilities: { state_sync_deltas: true },
+        };
+
+        expect(transport.getCachedStateSyncCapabilities()).toEqual({ state_sync_deltas: true });
+        internals.connectionGeneration = 2;
+        expect(transport.getCachedStateSyncCapabilities()).toBeUndefined();
+    });
+
     it("does not reuse a route cached under an earlier connection generation", async () => {
         const transport = new SubcModuleTransport("unused-connection-file");
         const oldRoute = { channel: 7, epoch: 77 } as RouteHandle;

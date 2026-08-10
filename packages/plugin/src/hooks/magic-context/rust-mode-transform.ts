@@ -1665,10 +1665,15 @@ export function createRustModeTransform(
                         };
                     }
                 }
+                const getCachedStateSyncCapabilities =
+                    options.moduleClient.getCachedStateSyncCapabilities;
                 const stateSyncCapabilities = options.moduleClient.stateSyncCapabilities;
                 const stateSyncResult = await syncModuleState({
                     client: {
                         call: callModule,
+                        getCachedStateSyncCapabilities: getCachedStateSyncCapabilities
+                            ? () => getCachedStateSyncCapabilities.call(options.moduleClient)
+                            : undefined,
                         stateSyncCapabilities: stateSyncCapabilities
                             ? (capabilityArgs) =>
                                   stateSyncCapabilities.call(options.moduleClient, capabilityArgs)
@@ -1832,6 +1837,9 @@ export function createRustModeTransform(
             if (!response) throw new Error("rust module returned no transform response");
             captureResponseTelemetry(response);
             if (isNeedFullSync(response)) {
+                // A module restart can retain durable state while changing the accepted
+                // state-sync shape, so the next sync must re-probe its capabilities.
+                options.moduleClient.invalidateStateSyncCapabilities?.();
                 // need_full_sync is a WIRE-layer miss: the module (often freshly
                 // restarted, with its process-local Ready snapshot gone) cannot
                 // reconstruct the array from a tail delta. It says nothing about
