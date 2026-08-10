@@ -143,6 +143,10 @@ fn dg_goldens_exercise_incremental_native_differential_mode() {
             "full_array_fingerprint": format!("fp-{}", case.id),
         }))
         .expect("DG native transform request");
+        let projection = std::sync::Arc::new(
+            crate::ck_wire::project_messages(&request.messages)
+                .expect("DG projection must succeed"),
+        );
         let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
         let mut first =
             TransformResponse::passthrough(served.clone(), request.full_array_fingerprint.clone());
@@ -157,6 +161,7 @@ fn dg_goldens_exercise_incremental_native_differential_mode() {
             None,
             0,
             &cache,
+            Some(std::sync::Arc::clone(&projection)),
             NativeCacheKeyMode::Normal,
         );
         let mut replay =
@@ -172,6 +177,7 @@ fn dg_goldens_exercise_incremental_native_differential_mode() {
             None,
             0,
             &cache,
+            Some(std::sync::Arc::clone(&projection)),
             NativeCacheKeyMode::Normal,
         );
         assert_eq!(
@@ -182,6 +188,23 @@ fn dg_goldens_exercise_incremental_native_differential_mode() {
         );
         assert_eq!(stats.encoded_messages, 0, "{} missed cache", case.id);
         assert_eq!(stats.reused_messages, served.len(), "{} prefix", case.id);
+
+        let mut appended = request.messages.clone();
+        appended.push(CkIngressMessage {
+            mid: format!("dg-{}-tail", case.id),
+            ordinal: appended
+                .last()
+                .map_or(1, |message| message.ordinal.saturating_add(1)),
+            ck: CkWireMessage::synthetic_user_text("differential projection tail"),
+        });
+        let incremental = crate::ck_wire::project_messages_incremental(
+            &appended,
+            &projection,
+            request.messages.len(),
+        )
+        .expect("DG incremental projection must succeed");
+        crate::transform::assert_prefix_projection_equivalent(&incremental, &appended)
+            .expect("DG full projection must succeed");
     }
 }
 

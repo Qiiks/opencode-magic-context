@@ -57,8 +57,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::ck_wire::{
-    duplicate_ids, project_messages, reduced_block, split_block_id, CkIngressMessage, CkWireBlock,
-    CkWireError, CkWireMessage, FlatBlock, FlatProjection,
+    duplicate_ids, project_messages, project_messages_incremental, reduced_block, split_block_id,
+    CkIngressMessage, CkWireBlock, CkWireError, CkWireMessage, FlatBlock, FlatProjection,
 };
 
 /// Max CAS retries before surfacing the conflict (the module is the single writer in
@@ -168,7 +168,10 @@ impl ServedMessage {
                         .copied()
                         .or_else(|| {
                             // Full-drop paths compact content indexes; match by wire value.
-                            blocks.iter().copied().find(|flat| &flat.wire == block)
+                            blocks
+                                .iter()
+                                .copied()
+                                .find(|flat| flat.wire.as_ref() == block)
                         })
                 });
                 if let Some(fp) = ck_wire::fingerprint_from_projected_wire(block, projected) {
@@ -908,6 +911,10 @@ pub struct TransformTimings {
     #[serde(default)]
     pub projection: f64,
     #[serde(default)]
+    pub projection_reused_messages: usize,
+    #[serde(default)]
+    pub projection_projected_messages: usize,
+    #[serde(default)]
     pub store_cache_state: f64,
     #[serde(default)]
     pub store_tags: f64,
@@ -1029,7 +1036,7 @@ pub fn format_pass_timing_line(
     };
     format!(
         "mc-pass-timing session={session} total={:.1} handler_total={:.1} request_observed_to_handler={:.1} projection={:.1} \
-         store_cache_state={:.1} store_tags={:.1} store_temporal={:.1} \
+         projection_reused_messages={} projection_projected_messages={} store_cache_state={:.1} store_tags={:.1} store_temporal={:.1} \
          store_user_hints={:.1} store_channel1={:.1} store_overlay_frontier={:.1} \
          store_notes={:.1} store_memories={:.1} pending_drops={:.1} coverage_resolve={:.1} \
          tag_overlay={:.1} unit_mint={:.1} \
@@ -1048,6 +1055,8 @@ pub fn format_pass_timing_line(
         timings.handler_total,
         timings.request_observed_to_handler,
         timings.projection,
+        timings.projection_reused_messages,
+        timings.projection_projected_messages,
         timings.store_cache_state,
         timings.store_tags,
         timings.store_temporal,
@@ -1263,6 +1272,12 @@ pub struct HistorianTriggerProgress {
     pub tail_size_bar: f64,
     pub protected_tail_n_tokens: f64,
     pub protected_start_ordinal: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectionCacheInput {
+    pub projection: Arc<FlatProjection>,
+    pub replace_from: usize,
 }
 
 pub struct TransformWithProjection {
@@ -1571,13 +1586,15 @@ pub(crate) fn transform_with_projection_cached(
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
     output_cache: &Mutex<SerializedOutputCache>,
+    projection_cache: Option<&ProjectionCacheInput>,
 ) -> Result<TransformWithProjection, TransformError> {
-    let result = apply_once_with_estimator(
+    let result = apply_once_with_estimator_and_projection(
         store,
         req,
         ctx,
         mc_tokenizer::estimate_tokens,
         Some(output_cache),
+        projection_cache,
     );
     record_stable_pass_trace(store, req, ctx, &result);
     result
@@ -1611,6 +1628,17 @@ fn apply_once_with_estimator(
     estimate_tokens: impl Fn(&str) -> usize + Copy,
     output_cache: Option<&Mutex<SerializedOutputCache>>,
 ) -> Result<TransformWithProjection, TransformError> {
+    apply_once_with_estimator_and_projection(store, req, ctx, estimate_tokens, output_cache, None)
+}
+
+fn apply_once_with_estimator_and_projection(
+    store: &McStore,
+    req: &TransformRequest,
+    ctx: &ProducerContext<'_>,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+    output_cache: Option<&Mutex<SerializedOutputCache>>,
+    projection_cache: Option<&ProjectionCacheInput>,
+) -> Result<TransformWithProjection, TransformError> {
     let mut attempt = 0;
     let mut boundary_divergence_retry = false;
     loop {
@@ -1621,6 +1649,7 @@ fn apply_once_with_estimator(
             ctx,
             estimate_tokens,
             output_cache,
+            projection_cache,
             boundary_divergence_retry,
             &mut boundary_divergence_detected,
         ) {
@@ -1637,6 +1666,29 @@ fn apply_once_with_estimator(
             other => return other,
         }
     }
+}
+
+fn prefix_projection_differential_enabled() -> bool {
+    cfg!(test)
+        || (cfg!(debug_assertions)
+            && std::env::var("MC_PREFIX_PROJECTION_DIFFERENTIAL").as_deref() == Ok("1"))
+}
+
+pub(crate) fn assert_prefix_projection_equivalent(
+    incremental: &FlatProjection,
+    messages: &[CkIngressMessage],
+) -> Result<(), CkWireError> {
+    let full = project_messages(messages)?;
+    assert_eq!(
+        incremental.differential_bytes(),
+        full.differential_bytes(),
+        "incremental prefix projection byte drift"
+    );
+    assert_eq!(
+        incremental, &full,
+        "incremental prefix projection state drift"
+    );
+    Ok(())
 }
 
 fn served_output_fingerprints(messages: &[ServedMessage]) -> Vec<ServedBlockFingerprint> {
@@ -1904,12 +1956,14 @@ fn lineage_protocol_passthrough(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_once(
     store: &McStore,
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
     output_cache: Option<&Mutex<SerializedOutputCache>>,
+    projection_cache: Option<&ProjectionCacheInput>,
     boundary_divergence_retry: bool,
     boundary_divergence_detected: &mut bool,
 ) -> Result<TransformWithProjection, TransformError> {
@@ -1926,8 +1980,25 @@ fn apply_once(
     // Recognition uses the canonical block projection before overlays, field stripping, or
     // ordinal rewriting. Hash only the matched continuation block so changes to sibling blocks
     // cannot invalidate the persisted anchor.
-    let initial_projection = project_messages(&ingress_req.messages)?;
+    let reusable_projection = projection_cache.filter(|cache| {
+        !ingress_req.lineage_switched
+            && cache.replace_from <= ingress_req.messages.len()
+            && cache.replace_from <= cache.projection.message_count()
+    });
+    let initial_projection = if let Some(cache) = reusable_projection {
+        project_messages_incremental(&ingress_req.messages, &cache.projection, cache.replace_from)?
+    } else {
+        project_messages(&ingress_req.messages)?
+    };
     timings.projection = elapsed_ms(projection_started_at);
+    timings.projection_reused_messages = reusable_projection.map_or(0, |cache| cache.replace_from);
+    timings.projection_projected_messages = ingress_req
+        .messages
+        .len()
+        .saturating_sub(timings.projection_reused_messages);
+    if reusable_projection.is_some() && prefix_projection_differential_enabled() {
+        assert_prefix_projection_equivalent(&initial_projection, &ingress_req.messages)?;
+    }
     if ingress_req.lineage_switched && ingress_req.is_subagent {
         return Ok(lineage_protocol_passthrough(
             ingress_req,
@@ -16238,6 +16309,7 @@ mod tests {
             None,
             0,
             &cache,
+            None,
             crate::NativeCacheKeyMode::Normal,
         );
         assert_eq!(first_stats.encoded_messages, healed_ck.len());
@@ -16268,6 +16340,7 @@ mod tests {
             None,
             0,
             &cache,
+            None,
             crate::NativeCacheKeyMode::Normal,
         );
         assert_eq!(replay_stats.reused_messages, healed_ck.len());
@@ -16437,6 +16510,7 @@ mod tests {
             None,
             0,
             &cache,
+            None,
             crate::NativeCacheKeyMode::Normal,
         );
 
@@ -16464,6 +16538,7 @@ mod tests {
             None,
             0,
             &cache,
+            None,
             crate::NativeCacheKeyMode::Normal,
         );
         assert!(stats.encoded_messages > 0);
@@ -22760,7 +22835,7 @@ mod tests {
     #[test]
     #[ignore = "run manually to profile a production-sized module pass"]
     fn full_module_pass_timing_fixture() {
-        const MESSAGE_COUNT: usize = 1_800;
+        const MESSAGE_COUNT: usize = 2_500;
         const FROZEN_UNIT_COUNT: usize = 47_075;
         const NEW_TAG_COUNT: usize = 5;
         const PAYLOAD_BYTES: usize = 4_096;
@@ -22773,8 +22848,32 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let request = req("perf-full-module-pass", "cfg0", messages);
+        let mut request = req("perf-full-module-pass", "cfg0", messages);
+        request.serializer_profile = "opencode-aisdk".to_string();
+        request.serve_native = true;
+        request.full_array_fingerprint = Some("perf-full-module-pass-0".to_string());
+        let projection_started_at = Instant::now();
         let projection = project_messages(&request.messages).unwrap();
+        let full_projection_ms = elapsed_ms(projection_started_at);
+        let mut changed_messages = request.messages.clone();
+        let changed = changed_messages
+            .last_mut()
+            .expect("large timing fixture has a tail message");
+        let ck_wire::CkKind::Text { text } = &mut changed.ck.content[0].kind else {
+            panic!("large timing fixture tail must be text");
+        };
+        text.push_str(" changed");
+        let cached_projection_started_at = Instant::now();
+        let cached_projection =
+            project_messages_incremental(&changed_messages, &projection, MESSAGE_COUNT - 1)
+                .unwrap();
+        let cached_projection_ms = elapsed_ms(cached_projection_started_at);
+        let full_changed_projection = project_messages(&changed_messages).unwrap();
+        assert_eq!(cached_projection, full_changed_projection);
+        assert!(
+            cached_projection_ms * 10.0 < full_projection_ms,
+            "cached projection must be at least 10x faster: first={full_projection_ms:.3}ms cached={cached_projection_ms:.3}ms"
+        );
         let mut frozen_units = vec![
             synth_region("m0", "m0 fixture".to_string()),
             synth_region("m1", "m1 fixture".to_string()),
@@ -22919,9 +23018,26 @@ mod tests {
             cache_dirty_skips: replay.timings.cache_dirty_skips,
             ..Default::default()
         };
+        let served = replay
+            .messages
+            .iter()
+            .map(|message| message.deref().clone())
+            .collect::<Vec<_>>();
+        let mut response =
+            TransformResponse::passthrough(served, request.full_array_fingerprint.clone());
+        let attach_started_at = Instant::now();
+        crate::attach_native_messages(&mut response, &request, 0, None);
+        let attach_ms = elapsed_ms(attach_started_at);
+        let encode_started_at = Instant::now();
+        let _encoded = serde_json::to_vec(&response).unwrap();
+        let encode_ms = elapsed_ms(encode_started_at);
+        eprintln!(
+            "full-module-pass-decomposition n={MESSAGE_COUNT} projection_ms={full_projection_ms:.3} cached_projection_ms={cached_projection_ms:.3} apply_ms={:.3} attach_ms={attach_ms:.3} encode_ms={encode_ms:.3}",
+            replay.timings.total,
+        );
         eprintln!(
             "{}",
-            format_pass_timing_line("perf-full-module-pass", &timings, 0.0)
+            format_pass_timing_line("perf-full-module-pass", &timings, encode_ms)
         );
     }
 

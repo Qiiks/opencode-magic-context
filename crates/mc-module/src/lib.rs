@@ -119,7 +119,8 @@ pub mod test_support;
 #[cfg(test)]
 mod differential_goldens;
 use transform::{
-    transform_with_projection_cached, HistorianDiagnostics, SerializedOutputCache, TransformRequest,
+    transform_with_projection_cached, HistorianDiagnostics, ProjectionCacheInput,
+    SerializedOutputCache, TransformRequest,
 };
 
 /// The per-route binding: the project, harness, session-slot value, and fallback render
@@ -1842,9 +1843,19 @@ impl TransformSnapshotCache {
         }
     }
 
+    #[cfg(test)]
     fn ready_request_clone(&self, session_id: &str) -> Option<Arc<TransformRequest>> {
+        self.ready_delta_base(session_id)
+            .map(|(request, _)| request)
+    }
+
+    fn ready_delta_base(&self, session_id: &str) -> Option<(Arc<TransformRequest>, u64)> {
         match self.entries.get(session_id) {
-            Some(TransformSnapshot::Ready { request, .. }) => Some(Arc::clone(request)),
+            Some(TransformSnapshot::Ready {
+                request,
+                revert_epoch,
+                ..
+            }) => Some((Arc::clone(request), *revert_epoch)),
             _ => None,
         }
     }
@@ -2029,10 +2040,11 @@ impl BoundaryTokenCache {
 
 const NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct NativeDeltaFrontier {
     after: String,
     native_replace_from: usize,
+    projection_cache: Option<ProjectionCacheInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2067,6 +2079,7 @@ struct NativeAttachmentCacheSnapshot {
     sidecar_hashes: HashMap<String, [u8; 32]>,
     sidecar_sizes: HashMap<String, usize>,
     chunks: Vec<NativeEncodedChunk>,
+    projection: Option<Arc<crate::ck_wire::FlatProjection>>,
 }
 
 #[derive(Debug)]
@@ -2165,9 +2178,14 @@ impl NativeAttachmentCache {
             .saturating_add(sidecar_structure_bytes);
         // Encoded canonical bytes stand in for shared served-message allocations (hence the ×2).
         // Native sidecar trees are charged on top of the size estimate computed during hashing.
+        let projection_bytes = snapshot
+            .projection
+            .as_deref()
+            .map_or(0, crate::ck_wire::FlatProjection::retained_bytes);
         let retained_bytes = encoded_bytes
             .saturating_add(served_bytes.saturating_mul(2))
-            .saturating_add(sidecar_bytes);
+            .saturating_add(sidecar_bytes)
+            .saturating_add(projection_bytes);
         if retained_bytes > self.max_retained_bytes {
             return;
         }
@@ -2895,8 +2913,9 @@ impl McHandler {
     }
 
     /// Reconstruct a full ingress snapshot from the last successful request plus a validated
-    /// caller tail. The returned native frontier remains request-local and is never persisted as
-    /// authority; the incremental attachment cache rechecks its `after` fingerprint before reuse.
+    /// caller tail. The returned native frontier is used only for this request and is never stored
+    /// as authoritative cache state. Native attachment and prefix projection each verify the same
+    /// cache entry and `after` identity before reusing it.
     fn expand_transform_tail_delta(
         &self,
         parsed: &mut TransformRequest,
@@ -2912,16 +2931,30 @@ impl McHandler {
             .and_then(Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())?;
         parsed.full_array_fingerprint.as_ref()?;
-        let request = self
+        let (request, revert_epoch) = self
             .transform_snapshots
             .lock()
             .expect("transform snapshots mutex")
-            .ready_request_clone(&parsed.session_id)?;
+            .ready_delta_base(&parsed.session_id)?;
         if request.full_array_fingerprint.as_deref() != Some(after.as_str())
             || replace_from > request.messages.len()
         {
             return None;
         }
+        let projection_cache = self
+            .native_attachments
+            .lock()
+            .expect("native attachment cache mutex")
+            .snapshot(&parsed.session_id, revert_epoch)
+            .and_then(|snapshot| {
+                validated_projection_cache_input(
+                    parsed,
+                    &snapshot,
+                    &after,
+                    replace_from,
+                    ProjectionCacheKeyMode::Normal,
+                )
+            });
         let mut current_native = parsed.native_messages.take()?;
         let previous_native = request.native_messages.as_ref()?;
         if native_replace_from > previous_native.len() {
@@ -2937,6 +2970,7 @@ impl McHandler {
         Some(NativeDeltaFrontier {
             after,
             native_replace_from,
+            projection_cache,
         })
     }
 
@@ -6642,6 +6676,9 @@ impl McHandler {
                 &parsed,
                 &producer_ctx,
                 &self.serialized_outputs,
+                native_delta_frontier
+                    .as_ref()
+                    .and_then(|frontier| frontier.projection_cache.as_ref()),
             )
         };
         let reject_transform = |e: crate::transform::TransformError| {
@@ -6823,6 +6860,7 @@ impl McHandler {
         let mutation_exempt_mid = result.mutation_exempt_mid;
         let lineage_anchor_mid = result.lineage_anchor_mid;
         let tag_numbers = result.tag_numbers;
+        let projection = Arc::new(result.projection);
         let mut response = result.response;
         if response.committed {
             self.guidance_dates
@@ -6843,6 +6881,7 @@ impl McHandler {
                 native_delta_frontier.as_ref(),
                 revert_epoch,
                 &self.native_attachments,
+                Some(Arc::clone(&projection)),
                 NativeCacheKeyMode::Normal,
             )
         } else {
@@ -9893,6 +9932,13 @@ enum NativeCacheKeyMode {
     CorruptSidecarForTest,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionCacheKeyMode {
+    Normal,
+    #[cfg(test)]
+    CorruptFrontierForTest,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attach_native_messages_with_tags(
     response: &mut transform::TransformResponse,
@@ -9930,6 +9976,44 @@ fn native_attachment_context(
         profile_epoch: profile.map(profile_render_epoch).unwrap_or_default(),
         transition_consumed,
     }
+}
+
+/// Select the ingress projection using the same immutable cache snapshot that supplies native
+/// attachments.
+///
+/// Include the cached transition salt when comparing cache inputs because a transition found by
+/// the upcoming transform affects served rendering but not the ingress CK projection. Reuse a
+/// cached prefix only when the request's profile and rendering fields also match.
+fn validated_projection_cache_input(
+    request: &TransformRequest,
+    snapshot: &NativeAttachmentCacheSnapshot,
+    after: &str,
+    replace_from: usize,
+    mode: ProjectionCacheKeyMode,
+) -> Option<ProjectionCacheInput> {
+    if snapshot.full_array_fingerprint.as_deref() != Some(after) {
+        return None;
+    }
+    let current_context = native_attachment_context(request, snapshot.context.transition_consumed);
+    if current_context != snapshot.context {
+        return None;
+    }
+    let projection = Arc::clone(snapshot.projection.as_ref()?);
+    #[cfg(test)]
+    let prefix = if mode == ProjectionCacheKeyMode::CorruptFrontierForTest {
+        replace_from.saturating_add(1)
+    } else {
+        replace_from
+    };
+    #[cfg(not(test))]
+    let prefix = {
+        let _ = mode;
+        replace_from
+    };
+    (prefix <= projection.message_count()).then_some(ProjectionCacheInput {
+        projection,
+        replace_from: prefix,
+    })
 }
 
 fn validated_native_prefix(
@@ -10119,6 +10203,7 @@ fn attach_native_messages_incremental(
     native_delta_frontier: Option<&NativeDeltaFrontier>,
     revert_epoch: u64,
     cache: &Mutex<NativeAttachmentCache>,
+    projection: Option<Arc<crate::ck_wire::FlatProjection>>,
     mode: NativeCacheKeyMode,
 ) -> NativeAttachmentCacheStats {
     if !request.serve_native {
@@ -10360,6 +10445,7 @@ fn attach_native_messages_incremental(
                 sidecar_hashes,
                 sidecar_sizes,
                 chunks,
+                projection,
             },
             stats,
             served_bytes,
@@ -11978,7 +12064,7 @@ fn sel_kind_for_flat(block: &crate::ck_wire::FlatBlock) -> SelKind {
     match block.kind_tag.as_str() {
         "tool_call" => SelKind::ToolCall {
             name: block.name.clone().unwrap_or_default(),
-            input: block.tool_input.clone().unwrap_or(Value::Null),
+            input: block.tool_input.as_deref().cloned().unwrap_or(Value::Null),
         },
         "tool_result" => SelKind::ToolResult {
             tool_name: block.name.clone().unwrap_or_default(),
@@ -14557,6 +14643,7 @@ mod tests {
                         delta.get("native_replace_from")?.as_u64()?,
                     )
                     .ok()?,
+                    projection_cache: None,
                 })
             });
         let stats = attach_native_messages_incremental(
@@ -14570,6 +14657,10 @@ mod tests {
             native_delta_frontier.as_ref(),
             revert_epoch,
             cache,
+            Some(Arc::new(
+                crate::ck_wire::project_messages(&request.messages)
+                    .expect("native cache test projection must succeed"),
+            )),
             mode,
         );
         (response, stats)
@@ -15253,6 +15344,129 @@ mod tests {
         );
     }
 
+    #[test]
+    fn projected_prefix_is_charged_to_the_shared_native_lru_budget() {
+        let ingress = vec![ck("budget-projection", 1, &"x".repeat(4096))];
+        let request = native_cache_request(
+            "projection-budget",
+            ingress.clone(),
+            vec![native_text_message(
+                "budget-projection",
+                "user",
+                &"x".repeat(4096),
+            )],
+            "projection-budget-fp",
+        );
+        let served = vec![ingress[0].ck.clone()];
+        let projection = Arc::new(
+            crate::ck_wire::project_messages(&request.messages)
+                .expect("budget projection must succeed"),
+        );
+        let without_projection = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let mut without_response = transform::TransformResponse::passthrough(
+            served.clone(),
+            request.full_array_fingerprint.clone(),
+        );
+        attach_native_messages_incremental(
+            &mut without_response,
+            &request,
+            0,
+            &BTreeMap::new(),
+            None,
+            None,
+            false,
+            None,
+            0,
+            &without_projection,
+            None,
+            NativeCacheKeyMode::Normal,
+        );
+        let without_charge = without_projection
+            .lock()
+            .expect("native attachment cache mutex")
+            .retained_bytes;
+
+        let with_projection = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let mut with_response = transform::TransformResponse::passthrough(
+            served,
+            request.full_array_fingerprint.clone(),
+        );
+        attach_native_messages_incremental(
+            &mut with_response,
+            &request,
+            0,
+            &BTreeMap::new(),
+            None,
+            None,
+            false,
+            None,
+            0,
+            &with_projection,
+            Some(Arc::clone(&projection)),
+            NativeCacheKeyMode::Normal,
+        );
+        let with_charge = with_projection
+            .lock()
+            .expect("native attachment cache mutex")
+            .retained_bytes;
+        assert_eq!(
+            with_charge.saturating_sub(without_charge),
+            projection.retained_bytes()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "incremental prefix projection byte drift")]
+    fn projection_differential_catches_corrupt_first_changed_position() {
+        let ingress = vec![ck("p1", 1, "one"), ck("p2", 2, "two")];
+        let request = native_cache_request(
+            "projection-key-mutation",
+            ingress.clone(),
+            vec![
+                native_text_message("p1", "user", "one"),
+                native_text_message("p2", "user", "two"),
+            ],
+            "projection-fp-1",
+        );
+        let served = ingress
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        run_native_cache_pass(
+            &cache,
+            &request,
+            served,
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        let snapshot = cache
+            .lock()
+            .expect("native attachment cache mutex")
+            .snapshot(&request.session_id, 0)
+            .expect("projection cache snapshot");
+        let mut changed = request;
+        changed.messages[1] = ck("p2", 2, "changed");
+        changed.full_array_fingerprint = Some("projection-fp-2".to_string());
+        let corrupt = validated_projection_cache_input(
+            &changed,
+            &snapshot,
+            "projection-fp-1",
+            1,
+            ProjectionCacheKeyMode::CorruptFrontierForTest,
+        )
+        .expect("corrupt projection cache key");
+        let incremental = crate::ck_wire::project_messages_incremental(
+            &changed.messages,
+            &corrupt.projection,
+            corrupt.replace_from,
+        )
+        .expect("corrupt incremental projection still parses");
+        transform::assert_prefix_projection_equivalent(&incremental, &changed.messages).unwrap();
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "OpenCode serialization produced duplicate tool_use ids")]
@@ -15297,6 +15511,73 @@ mod tests {
             0,
             NativeCacheKeyMode::Normal,
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_tail_delta_reuses_projected_prefix_across_tool_arc_and_reasoning() {
+        let (handler, _store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let initial_messages = vec![
+            ck_reasoning("reasoning-old", 1, "signed reasoning"),
+            assistant_tool_call("call-project", 2),
+            tool_result("result-project", 3, "first result"),
+        ];
+        let initial = native_cache_request(
+            "ses",
+            initial_messages,
+            Vec::new(),
+            "projection-handler-fp-1",
+        );
+        let first = call_transform_request(&handler, serde_json::to_value(initial).unwrap()).await;
+        assert_eq!(first["status"], "ok", "{first}");
+
+        let mut delta = native_cache_request(
+            "ses",
+            vec![tool_result("result-project", 3, "changed result")],
+            Vec::new(),
+            "projection-handler-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "projection-handler-fp-1",
+            "replace_from": 2,
+            "native_replace_from": 0,
+        }));
+        let second = call_transform_request(&handler, serde_json::to_value(delta).unwrap()).await;
+        assert_eq!(second["status"], "ok", "{second}");
+        assert_eq!(second["timings"]["projection_reused_messages"], 2);
+        assert_eq!(second["timings"]["projection_projected_messages"], 1);
+        let result = second["ck_messages"]
+            .as_array()
+            .expect("CK response array")
+            .iter()
+            .find(|message| message["meta"]["harness_id"] == "result-project")
+            .expect("changed result message");
+        assert_eq!(
+            result["content"][0]["kind"]["output"]["kind"]["text"],
+            "changed result"
+        );
+        let native = second["native_messages"]
+            .as_array()
+            .expect("native response array");
+        codec::opencode::assert_unique_tool_use_ids(native.iter());
+
+        let mut changed_context = native_cache_request(
+            "ses",
+            vec![tool_result("result-project", 3, "changed again")],
+            Vec::new(),
+            "projection-handler-fp-3",
+        );
+        changed_context.render_config = "cfg1".to_string();
+        changed_context.tail_delta = Some(json!({
+            "after": "projection-handler-fp-2",
+            "replace_from": 2,
+            "native_replace_from": 0,
+        }));
+        let third =
+            call_transform_request(&handler, serde_json::to_value(changed_context).unwrap()).await;
+        assert_eq!(third["status"], "ok", "{third}");
+        assert_eq!(third["timings"]["projection_reused_messages"], 0);
+        assert_eq!(third["timings"]["projection_projected_messages"], 3);
     }
 
     #[tokio::test(flavor = "current_thread")]
