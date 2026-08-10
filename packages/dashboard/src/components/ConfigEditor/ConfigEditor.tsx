@@ -78,6 +78,14 @@ const FIELD_DEFS: FieldDef[] = [
     section: "General",
   },
   {
+    key: "allow_home_project",
+    label: "Allow Home Directory Sessions",
+    type: "boolean",
+    description:
+      "Allow sessions started exactly from your home directory to use a durable Magic Context project identity. User-level only.",
+    section: "General",
+  },
+  {
     key: "language",
     label: "Output Language",
     type: "string",
@@ -172,6 +180,11 @@ const FIELD_DEFS: FieldDef[] = [
     section: "Memory",
   },
 ];
+
+// These fields are valid only in trusted user configuration. They remain in the
+// schema coverage manifest because the user form renders them, but project forms
+// must not present controls for settings the runtime strips from repositories.
+const USER_ONLY_FORM_FIELDS = new Set(["language", "allow_home_project", "mural.model"]);
 
 // ── Nested value access helpers ─────────────────────────────
 
@@ -271,6 +284,7 @@ function ConfigForm(props: {
     ok: boolean;
     message: string;
   } | null>(null);
+  const isUserScope = () => (props.scope ?? "user") === "user";
 
   /**
    * Structured outcome returned by the Rust probe (mirrors the `EmbeddingProbeOutcome`
@@ -422,6 +436,9 @@ function ConfigForm(props: {
     );
   });
 
+  const fieldsForScope = (fields: FieldDef[]) =>
+    isUserScope() ? fields : fields.filter((field) => !USER_ONLY_FORM_FIELDS.has(field.key));
+
   const handleFieldChange = (key: string, value: unknown) => {
     const updated = setNestedValue(formData(), key, value);
     setFormData(updated);
@@ -448,6 +465,9 @@ function ConfigForm(props: {
       "caveman_text_compression",
       "mural",
       "prompt_surface",
+      "storage",
+      "compaction",
+      "pi",
     ]) {
       if (typeof formData()[key] === "object" && formData()[key] != null) {
         merged[key] = {
@@ -477,7 +497,7 @@ function ConfigForm(props: {
   ): { min: number; max: number; step: number; suffix: string; defaultValue: number } => {
     switch (fieldKey) {
       case "execute_threshold_percentage":
-        return { min: 20, max: 80, step: 1, suffix: "%", defaultValue: 65 };
+        return { min: 20, max: 90, step: 1, suffix: "%", defaultValue: 65 };
       case "history_budget_percentage":
         return { min: 0.05, max: 0.5, step: 0.01, suffix: "", defaultValue: 0.15 };
       case "protected_tags":
@@ -699,11 +719,13 @@ function ConfigForm(props: {
                           return (v as string) || "local";
                         };
                         const isRemote = () => embeddingProvider() === "openai-compatible";
+                        const localDtype = () =>
+                          String(getNestedValue(formData(), "embedding.local_dtype") ?? "fp32");
                         return (
                           <div class="config-card-two-col">
                             {/* Left: Memory settings */}
                             <div class="config-card-content">
-                              <For each={fields}>{renderField}</For>
+                              <For each={fieldsForScope(fields)}>{renderField}</For>
                             </div>
                             {/* Right: Embedding settings. Hidden for project
                                 configs: the runtime strips embedding
@@ -753,6 +775,50 @@ function ConfigForm(props: {
                                     >
                                       Uses Xenova/all-MiniLM-L6-v2 locally — no configuration needed
                                     </span>
+                                  </Show>
+                                  <Show when={embeddingProvider() === "local"}>
+                                    <div class="config-field">
+                                      <div class="config-field-header">
+                                        <span class="config-field-label">Model dtype</span>
+                                        <span class="config-field-key">embedding.local_dtype</span>
+                                      </div>
+                                      <span class="config-field-desc">
+                                        ONNX dtype for the local embedding model. The default fp32
+                                        keeps today's behavior; quantized choices use less memory.
+                                      </span>
+                                      <select
+                                        class="config-input"
+                                        value={localDtype()}
+                                        onChange={(e) =>
+                                          handleFieldChange(
+                                            "embedding.local_dtype",
+                                            e.currentTarget.value === "fp32"
+                                              ? undefined
+                                              : e.currentTarget.value,
+                                          )
+                                        }
+                                      >
+                                        <For
+                                          each={[
+                                            "auto",
+                                            "fp32",
+                                            "fp16",
+                                            "q8",
+                                            "int8",
+                                            "uint8",
+                                            "q4",
+                                            "bnb4",
+                                            "q4f16",
+                                            "q2",
+                                            "q2f16",
+                                            "q1",
+                                            "q1f16",
+                                          ]}
+                                        >
+                                          {(dtype) => <option value={dtype}>{dtype}</option>}
+                                        </For>
+                                      </select>
+                                    </div>
                                   </Show>
                                 </div>
 
@@ -916,97 +982,112 @@ function ConfigForm(props: {
                       })()
                     ) : sectionName === "Historian" ? (
                       <div class="config-card-two-col">
-                        {/* Left: Model + Fallbacks */}
-                        <div class="config-card-content">
-                          <div class="config-field">
-                            <div class="config-field-header">
-                              <span class="config-field-label">Model</span>
-                            </div>
-                            <span class="config-field-desc">Primary model for historian agent</span>
-                            {manualModelHint()}
-                            <ModelSelect
-                              models={models() ?? []}
-                              value={
-                                getNestedValue(formData(), "historian.model") as string | undefined
-                              }
-                              onChange={(v) => handleFieldChange("historian.model", v || undefined)}
-                              placeholder="— Use fallback chain —"
-                            />
-                          </div>
-                          <div class="config-field">
-                            <div class="config-field-header">
-                              <span class="config-field-label">Fallback Models</span>
-                            </div>
-                            <span class="config-field-desc">Models to try if primary fails</span>
-                            <div class="model-chain-list">
-                              <Show
-                                when={
-                                  readFallbackModels(formData(), "historian.fallback_models")
-                                    .length > 0
-                                }
-                                fallback={
-                                  <span class="model-chain-empty">
-                                    Using built-in fallback chain
-                                  </span>
-                                }
-                              >
-                                <For
-                                  each={readFallbackModels(formData(), "historian.fallback_models")}
-                                >
-                                  {(model, index) => (
-                                    <div class="model-chain-item">
-                                      <span class="mono" style={{ flex: 1 }}>
-                                        {model}
-                                      </span>
-                                      <button
-                                        type="button"
-                                        class="btn sm danger"
-                                        onClick={() => {
-                                          const current = readFallbackModels(
-                                            formData(),
-                                            "historian.fallback_models",
-                                          );
-                                          const next = current.filter((_, i) => i !== index());
-                                          handleFieldChange(
-                                            "historian.fallback_models",
-                                            next.length > 0 ? next : undefined,
-                                          );
-                                        }}
-                                      >
-                                        ✕
-                                      </button>
-                                    </div>
-                                  )}
-                                </For>
-                              </Show>
-                            </div>
-                            <div class="model-chain-add">
+                        <Show when={isUserScope()}>
+                          {/* Historian model selection is user-level only; project configs may
+                               still tune the scheduling and history settings shown on the right. */}
+                          <div class="config-card-content">
+                            <div class="config-field">
+                              <div class="config-field-header">
+                                <span class="config-field-label">Model</span>
+                              </div>
+                              <span class="config-field-desc">
+                                Primary model for historian agent
+                              </span>
+                              {manualModelHint()}
                               <ModelSelect
-                                models={(models() ?? []).filter(
-                                  (m) =>
-                                    !readFallbackModels(
-                                      formData(),
-                                      "historian.fallback_models",
-                                    ).includes(m),
-                                )}
-                                value={undefined}
-                                onChange={(v) => {
-                                  if (v) {
-                                    const current = readFallbackModels(
-                                      formData(),
-                                      "historian.fallback_models",
-                                    );
-                                    handleFieldChange("historian.fallback_models", [...current, v]);
-                                  }
-                                }}
-                                placeholder="— Add fallback model —"
+                                models={models() ?? []}
+                                value={
+                                  getNestedValue(formData(), "historian.model") as
+                                    | string
+                                    | undefined
+                                }
+                                onChange={(v) =>
+                                  handleFieldChange("historian.model", v || undefined)
+                                }
+                                placeholder="— Use fallback chain —"
                               />
                             </div>
+                            <div class="config-field">
+                              <div class="config-field-header">
+                                <span class="config-field-label">Fallback Models</span>
+                              </div>
+                              <span class="config-field-desc">Models to try if primary fails</span>
+                              <div class="model-chain-list">
+                                <Show
+                                  when={
+                                    readFallbackModels(formData(), "historian.fallback_models")
+                                      .length > 0
+                                  }
+                                  fallback={
+                                    <span class="model-chain-empty">
+                                      Using built-in fallback chain
+                                    </span>
+                                  }
+                                >
+                                  <For
+                                    each={readFallbackModels(
+                                      formData(),
+                                      "historian.fallback_models",
+                                    )}
+                                  >
+                                    {(model, index) => (
+                                      <div class="model-chain-item">
+                                        <span class="mono" style={{ flex: 1 }}>
+                                          {model}
+                                        </span>
+                                        <button
+                                          type="button"
+                                          class="btn sm danger"
+                                          onClick={() => {
+                                            const current = readFallbackModels(
+                                              formData(),
+                                              "historian.fallback_models",
+                                            );
+                                            const next = current.filter((_, i) => i !== index());
+                                            handleFieldChange(
+                                              "historian.fallback_models",
+                                              next.length > 0 ? next : undefined,
+                                            );
+                                          }}
+                                        >
+                                          ✕
+                                        </button>
+                                      </div>
+                                    )}
+                                  </For>
+                                </Show>
+                              </div>
+                              <div class="model-chain-add">
+                                <ModelSelect
+                                  models={(models() ?? []).filter(
+                                    (m) =>
+                                      !readFallbackModels(
+                                        formData(),
+                                        "historian.fallback_models",
+                                      ).includes(m),
+                                  )}
+                                  value={undefined}
+                                  onChange={(v) => {
+                                    if (v) {
+                                      const current = readFallbackModels(
+                                        formData(),
+                                        "historian.fallback_models",
+                                      );
+                                      handleFieldChange("historian.fallback_models", [
+                                        ...current,
+                                        v,
+                                      ]);
+                                    }
+                                  }}
+                                  placeholder="— Add fallback model —"
+                                />
+                              </div>
+                            </div>
                           </div>
-                        </div>
+                        </Show>
                         {/* Right: Settings sliders */}
                         <div class="config-card-content">
-                          <For each={fields}>{renderField}</For>
+                          <For each={fieldsForScope(fields)}>{renderField}</For>
 
                           {/* Commit Cluster Trigger */}
                           {(() => {
@@ -1083,7 +1164,7 @@ function ConfigForm(props: {
                       </div>
                     ) : (
                       <div class="config-card-content">
-                        <For each={fields}>{renderField}</For>
+                        <For each={fieldsForScope(fields)}>{renderField}</For>
                       </div>
                     )}
                   </div>
@@ -1107,11 +1188,12 @@ function ConfigForm(props: {
                           models={models() ?? []}
                           inputType="text"
                           defaultPlaceholder="5m"
+                          textOptions={[{ value: "never", label: "Never (keep warm)" }]}
                         />
                         <PerModelField
                           label="Execute Threshold %"
                           configKey="execute_threshold_percentage"
-                          description="Context usage percentage (20–80) at which queued drops execute. Max 80."
+                          description="Context usage percentage (20–90) at which queued drops execute. The safe-window cap is 90%."
                           value={
                             getNestedValue(formData(), "execute_threshold_percentage") ??
                             getNestedValue(parsed(), "execute_threshold_percentage")
@@ -1121,7 +1203,7 @@ function ConfigForm(props: {
                           inputType="slider"
                           sliderConfig={{
                             min: 20,
-                            max: 80,
+                            max: 90,
                             step: 1,
                             suffix: "%",
                             defaultValue: 65,
@@ -1131,7 +1213,7 @@ function ConfigForm(props: {
                         <PerModelField
                           label="Execute Threshold (tokens)"
                           configKey="execute_threshold_tokens"
-                          description="Optional absolute-tokens threshold. When set for a model, overrides the percentage above. Per-model map only (use 'default' key for a fallback across all unlisted models). Clamped to 80% × context_limit at runtime."
+                          description="Optional absolute-tokens threshold. When set for a model, overrides the percentage above. Per-model map only (use 'default' key for a fallback across all unlisted models). Clamped to 90% × context_limit at runtime."
                           value={
                             getNestedValue(formData(), "execute_threshold_tokens") ??
                             getNestedValue(parsed(), "execute_threshold_tokens")
@@ -1143,6 +1225,22 @@ function ConfigForm(props: {
                           numericText
                           defaultPlaceholder="150000"
                         />
+                        <Show when={isUserScope()}>
+                          <PerModelField
+                            label="Output Reserve"
+                            configKey="output_reserve"
+                            description="Reserve output tokens from the shared context window. Set 0 to disable the reservation. User-level only."
+                            value={
+                              getNestedValue(formData(), "output_reserve") ??
+                              getNestedValue(parsed(), "output_reserve")
+                            }
+                            onChange={(v) => handleFieldChange("output_reserve", v)}
+                            models={models() ?? []}
+                            inputType="text"
+                            numericText
+                            defaultPlaceholder="16384"
+                          />
+                        </Show>
                       </div>
                     </div>
                   )}
@@ -1243,53 +1341,57 @@ function ConfigForm(props: {
                       }}
                     />
                   </div>
-                  <div class="config-field">
-                    <div class="config-field-header">
-                      <span class="config-field-label">Guidance override path</span>
-                      <span class="config-field-key">prompt_surface.guidance_override_path</span>
-                    </div>
-                    <span class="config-field-desc">
-                      User-only path to a complete primary guidance section. Relative paths resolve
-                      from the user config file.
-                    </span>
-                    <input
-                      class="config-input"
-                      type="text"
-                      disabled={!userScope()}
-                      value={String(promptSurface().guidance_override_path ?? "")}
-                      placeholder={userScope() ? "path/to/guidance.md" : "user config only"}
-                      onInput={(e) =>
-                        setPromptSurface({
-                          guidance_override_path: e.currentTarget.value || undefined,
-                        })
-                      }
-                    />
-                  </div>
-                  <div class="config-field">
-                    <div class="config-field-header">
-                      <span class="config-field-label">Tool-description overrides</span>
-                      <span class="config-field-key">prompt_surface.tool_descriptions</span>
-                    </div>
-                    <span class="config-field-desc">
-                      User-only JSON object keyed by tool ID. Only top-level descriptions change;
-                      IDs, parameter schemas, and parameter descriptions remain fixed.
-                    </span>
-                    <textarea
-                      class="code-editor"
-                      rows={4}
-                      disabled={!userScope()}
-                      value={toolsEditorValue()}
-                      onInput={(e) => {
-                        const value = e.currentTarget.value;
-                        setToolsDraft(value);
-                        const next = parseObject(value);
-                        if (next) {
-                          setPromptSurface({ tool_descriptions: next });
-                          setToolsDraft(undefined);
+                  <Show when={userScope()}>
+                    <div class="config-field">
+                      <div class="config-field-header">
+                        <span class="config-field-label">Guidance override path</span>
+                        <span class="config-field-key">prompt_surface.guidance_override_path</span>
+                      </div>
+                      <span class="config-field-desc">
+                        User-only path to a complete primary guidance section. Relative paths
+                        resolve from the user config file.
+                      </span>
+                      <input
+                        class="config-input"
+                        type="text"
+                        disabled={!userScope()}
+                        value={String(promptSurface().guidance_override_path ?? "")}
+                        placeholder={userScope() ? "path/to/guidance.md" : "user config only"}
+                        onInput={(e) =>
+                          setPromptSurface({
+                            guidance_override_path: e.currentTarget.value || undefined,
+                          })
                         }
-                      }}
-                    />
-                  </div>
+                      />
+                    </div>
+                  </Show>
+                  <Show when={userScope()}>
+                    <div class="config-field">
+                      <div class="config-field-header">
+                        <span class="config-field-label">Tool-description overrides</span>
+                        <span class="config-field-key">prompt_surface.tool_descriptions</span>
+                      </div>
+                      <span class="config-field-desc">
+                        User-only JSON object keyed by tool ID. Only top-level descriptions change;
+                        IDs, parameter schemas, and parameter descriptions remain fixed.
+                      </span>
+                      <textarea
+                        class="code-editor"
+                        rows={4}
+                        disabled={!userScope()}
+                        value={toolsEditorValue()}
+                        onInput={(e) => {
+                          const value = e.currentTarget.value;
+                          setToolsDraft(value);
+                          const next = parseObject(value);
+                          if (next) {
+                            setPromptSurface({ tool_descriptions: next });
+                            setToolsDraft(undefined);
+                          }
+                        }}
+                      />
+                    </div>
+                  </Show>
                 </div>
               </div>
             );
@@ -1935,6 +2037,21 @@ function ConfigForm(props: {
               const v = getNestedValue(formData(), "system_prompt_injection.enabled");
               return v == null ? true : Boolean(v);
             };
+            const compactionEnabled = () => {
+              const v = getNestedValue(formData(), "compaction.enabled");
+              return v == null ? true : Boolean(v);
+            };
+            const storagePrivatePermissions = () => {
+              const v = getNestedValue(formData(), "storage.enforce_private_permissions");
+              return v == null ? true : Boolean(v);
+            };
+            const piExtensions = () => {
+              const value = getNestedValue(formData(), "pi.subagent_extensions");
+              return Array.isArray(value)
+                ? value.filter((entry): entry is string => typeof entry === "string")
+                : [];
+            };
+            const piExtensionsText = () => piExtensions().join("\n");
 
             return (
               <div class="config-card full-width">
@@ -1950,27 +2067,31 @@ function ConfigForm(props: {
                     Power-user and debug settings. Most users never need these.
                   </div>
 
-                  {/* Auto update */}
-                  <div class="config-field">
-                    <div class="config-field-header">
-                      <span class="config-field-label">Auto Update</span>
-                      <span class="config-field-key">auto_update</span>
+                  <Show when={isUserScope()}>
+                    {/* Auto update */}
+                    <div class="config-field">
+                      <div class="config-field-header">
+                        <span class="config-field-label">Auto Update</span>
+                        <span class="config-field-key">auto_update</span>
+                      </div>
+                      <span class="config-field-desc">
+                        Automatically self-update the OpenCode plugin to the latest published
+                        version on startup. On by default. (User-config only — project configs
+                        cannot change it.)
+                      </span>
+                      <label class="toggle-switch">
+                        <input
+                          type="checkbox"
+                          checked={autoUpdate()}
+                          onChange={(e) =>
+                            handleFieldChange("auto_update", e.currentTarget.checked)
+                          }
+                        />
+                        <span class="toggle-slider" />
+                        <span class="toggle-label">{autoUpdate() ? "Enabled" : "Disabled"}</span>
+                      </label>
                     </div>
-                    <span class="config-field-desc">
-                      Automatically self-update the OpenCode plugin to the latest published version
-                      on startup. On by default. (User-config only — project configs cannot change
-                      it.)
-                    </span>
-                    <label class="toggle-switch">
-                      <input
-                        type="checkbox"
-                        checked={autoUpdate()}
-                        onChange={(e) => handleFieldChange("auto_update", e.currentTarget.checked)}
-                      />
-                      <span class="toggle-slider" />
-                      <span class="toggle-label">{autoUpdate() ? "Enabled" : "Disabled"}</span>
-                    </label>
-                  </div>
+                  </Show>
 
                   {/* Keep subagents */}
                   <div class="config-field">
@@ -2046,6 +2167,85 @@ function ConfigForm(props: {
                     </div>
                   </Show>
 
+                  <Show when={isUserScope()}>
+                    <div class="config-field">
+                      <div class="config-field-header">
+                        <span class="config-field-label">Compaction Management</span>
+                        <span class="config-field-key">compaction.enabled</span>
+                      </div>
+                      <span class="config-field-desc">
+                        Let Magic Context manage the context window. Turn this off to keep memory
+                        and search features while native compaction (or nothing) owns the window.
+                        Requires a restart and applies only to user configuration.
+                      </span>
+                      <label class="toggle-switch">
+                        <input
+                          type="checkbox"
+                          checked={compactionEnabled()}
+                          onChange={(e) =>
+                            handleFieldChange("compaction.enabled", e.currentTarget.checked)
+                          }
+                        />
+                        <span class="toggle-slider" />
+                        <span class="toggle-label">
+                          {compactionEnabled() ? "Enabled" : "Disabled"}
+                        </span>
+                      </label>
+                    </div>
+                    <div class="config-field">
+                      <div class="config-field-header">
+                        <span class="config-field-label">Private Storage Permissions</span>
+                        <span class="config-field-key">storage.enforce_private_permissions</span>
+                      </div>
+                      <span class="config-field-desc">
+                        Keep Magic Context directories owner-only (0700) and files owner-only
+                        (0600). Disable only when a trusted group manages permissions externally.
+                      </span>
+                      <label class="toggle-switch">
+                        <input
+                          type="checkbox"
+                          checked={storagePrivatePermissions()}
+                          onChange={(e) =>
+                            handleFieldChange(
+                              "storage.enforce_private_permissions",
+                              e.currentTarget.checked,
+                            )
+                          }
+                        />
+                        <span class="toggle-slider" />
+                        <span class="toggle-label">
+                          {storagePrivatePermissions() ? "Enabled" : "Disabled"}
+                        </span>
+                      </label>
+                    </div>
+                    <div class="config-field">
+                      <div class="config-field-header">
+                        <span class="config-field-label">Pi Subagent Extensions</span>
+                        <span class="config-field-key">pi.subagent_extensions</span>
+                      </div>
+                      <span class="config-field-desc">
+                        Optional user-level allowlist for extensions loaded by Pi subagent children.
+                        Enter one extension path or package per line.
+                      </span>
+                      <textarea
+                        class="code-editor"
+                        rows={4}
+                        value={piExtensionsText()}
+                        placeholder="extensions/my-tools.ts"
+                        onInput={(e) => {
+                          const entries = e.currentTarget.value
+                            .split("\n")
+                            .map((entry) => entry.trim())
+                            .filter(Boolean);
+                          handleFieldChange(
+                            "pi.subagent_extensions",
+                            entries.length > 0 ? entries : undefined,
+                          );
+                        }}
+                      />
+                    </div>
+                  </Show>
+
                   {/* Smart drops */}
                   <div class="config-field">
                     <div class="config-field-header">
@@ -2100,53 +2300,55 @@ function ConfigForm(props: {
                     </label>
                   </div>
 
-                  {/* SQLite tuning */}
-                  <div class="config-field">
-                    <div class="config-field-header">
-                      <span class="config-field-label">SQLite Cache (MB)</span>
-                      <span class="config-field-key">sqlite.cache_size_mb</span>
+                  <Show when={isUserScope()}>
+                    {/* SQLite tuning */}
+                    <div class="config-field">
+                      <div class="config-field-header">
+                        <span class="config-field-label">SQLite Cache (MB)</span>
+                        <span class="config-field-key">sqlite.cache_size_mb</span>
+                      </div>
+                      <span class="config-field-desc">
+                        Per-connection page-cache size in MB. Higher reduces disk reads on large
+                        databases at the cost of memory. Range 8–1024, default 64.
+                      </span>
+                      <input
+                        class="config-input"
+                        type="number"
+                        min={8}
+                        max={1024}
+                        value={sqliteCacheMb()}
+                        onInput={(e) => {
+                          const v = e.currentTarget.value;
+                          setSqlite({
+                            cache_size_mb: v ? Math.max(8, Math.min(1024, Number(v))) : 64,
+                          });
+                        }}
+                      />
                     </div>
-                    <span class="config-field-desc">
-                      Per-connection page-cache size in MB. Higher reduces disk reads on large
-                      databases at the cost of memory. Range 8–1024, default 64.
-                    </span>
-                    <input
-                      class="config-input"
-                      type="number"
-                      min={8}
-                      max={1024}
-                      value={sqliteCacheMb()}
-                      onInput={(e) => {
-                        const v = e.currentTarget.value;
-                        setSqlite({
-                          cache_size_mb: v ? Math.max(8, Math.min(1024, Number(v))) : 64,
-                        });
-                      }}
-                    />
-                  </div>
-                  <div class="config-field">
-                    <div class="config-field-header">
-                      <span class="config-field-label">SQLite mmap (MB)</span>
-                      <span class="config-field-key">sqlite.mmap_size_mb</span>
+                    <div class="config-field">
+                      <div class="config-field-header">
+                        <span class="config-field-label">SQLite mmap (MB)</span>
+                        <span class="config-field-key">sqlite.mmap_size_mb</span>
+                      </div>
+                      <span class="config-field-desc">
+                        Memory-mapped I/O size in MB. 0 disables mmap. Can speed up large reads on
+                        some filesystems. Range 0–4096, default 0.
+                      </span>
+                      <input
+                        class="config-input"
+                        type="number"
+                        min={0}
+                        max={4096}
+                        value={sqliteMmapMb()}
+                        onInput={(e) => {
+                          const v = e.currentTarget.value;
+                          setSqlite({
+                            mmap_size_mb: v ? Math.max(0, Math.min(4096, Number(v))) : 0,
+                          });
+                        }}
+                      />
                     </div>
-                    <span class="config-field-desc">
-                      Memory-mapped I/O size in MB. 0 disables mmap. Can speed up large reads on
-                      some filesystems. Range 0–4096, default 0.
-                    </span>
-                    <input
-                      class="config-input"
-                      type="number"
-                      min={0}
-                      max={4096}
-                      value={sqliteMmapMb()}
-                      onInput={(e) => {
-                        const v = e.currentTarget.value;
-                        setSqlite({
-                          mmap_size_mb: v ? Math.max(0, Math.min(4096, Number(v))) : 0,
-                        });
-                      }}
-                    />
-                  </div>
+                  </Show>
                 </div>
               </div>
             );

@@ -39,6 +39,8 @@ export interface EvaluateSmartNotesArgs {
     deadline: number;
     model?: string;
     fallbackModels?: readonly string[];
+    /** When true, authoring-compiled provider conditions are owned by retina. */
+    retinaHandoff?: boolean;
     onLeaseLost?: (phase: string, error?: unknown) => void;
 }
 
@@ -89,7 +91,11 @@ export async function evaluateSmartNotes(
     const projectRoot = args.sessionDirectory ?? args.projectIdentity;
     const moduleBridge = getModuleNoteEvaluationBridge(args.projectIdentity);
     await moduleBridge?.sync();
-    const pendingAtStart = getPendingSmartNotes(args.db, args.projectIdentity).length;
+    const pendingNotes = () =>
+        getPendingSmartNotes(args.db, args.projectIdentity).filter(
+            (note) => !args.retinaHandoff || note.compileStatus !== "compiled",
+        );
+    const pendingAtStart = pendingNotes().length;
     if (pendingAtStart === 0) {
         log("[dreamer] smart notes: no pending notes");
         return { surfaced: 0, pending: 0, ran: false };
@@ -116,10 +122,7 @@ export async function evaluateSmartNotes(
     let didWork = false;
     try {
         if (moduleBridge) {
-            const candidates = getPendingSmartNotes(args.db, args.projectIdentity).slice(
-                0,
-                MAX_COMPILE_PER_RUN,
-            );
+            const candidates = pendingNotes().slice(0, MAX_COMPILE_PER_RUN);
             for (const note of candidates) {
                 if (Date.now() >= args.deadline) break;
                 assertLeaseHeld("module evaluation start");
@@ -146,7 +149,7 @@ export async function evaluateSmartNotes(
                 if (met) surfaced += 1;
             }
             await moduleBridge.sync();
-            const pending = getPendingSmartNotes(args.db, args.projectIdentity).length;
+            const pending = pendingNotes().length;
             return { surfaced, pending, ran: didWork };
         }
         const dueRun = await runDueCompiledSmartNoteChecks({
@@ -157,6 +160,7 @@ export async function evaluateSmartNotes(
             sweepBudgetMs: 10_000,
             leaseHeld,
             signal: leaseAbortController.signal,
+            retinaHandoff: args.retinaHandoff,
         });
         surfaced += dueRun.surfaced;
         didWork ||= dueRun.ran > 0;
@@ -166,6 +170,7 @@ export async function evaluateSmartNotes(
             args.projectIdentity,
             Date.now(),
             MAX_COMPILE_PER_RUN,
+            args.retinaHandoff,
         );
         for (const note of candidates) {
             if (Date.now() >= args.deadline) break;
@@ -187,6 +192,7 @@ export async function evaluateSmartNotes(
             args.projectIdentity,
             Date.now(),
             MAX_FALLBACK_PER_RUN,
+            args.retinaHandoff,
         );
         for (const note of stale) {
             if (Date.now() >= args.deadline) break;
@@ -203,7 +209,7 @@ export async function evaluateSmartNotes(
             if (met) surfaced += 1;
         }
 
-        const fallbackNotes = getPendingSmartNotes(args.db, args.projectIdentity)
+        const fallbackNotes = pendingNotes()
             .filter((note) => note.checkStatus === "fallback")
             .slice(0, MAX_FALLBACK_PER_RUN);
         for (const note of fallbackNotes) {

@@ -1,13 +1,19 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import type { MagicContextPluginConfig } from "../config";
 import { closeDatabase, openDatabase } from "../features/magic-context/storage";
 import { resetCtxReduceRegisteredGloballyForTest } from "../hooks/magic-context/ctx-reduce-availability";
+import {
+    A1_HASH_BASELINE_HEADING,
+    A1_TOOL_SECTION_HEADING,
+    a1GoldenSectionOffset,
+    readA1GoldenDocument,
+} from "../shared/prompt-surface-a1-golden";
 import type { PromptSurfaceRuntime } from "../shared/prompt-surface-runtime";
 import {
     createPromptSurfaceRuntime,
@@ -204,13 +210,10 @@ describe("createToolRegistry — compaction-off mode (#266 S4)", () => {
 type GoldenTool = { description: string; parameters: Record<string, unknown> };
 
 function readA1GoldenTools(): Record<string, GoldenTool> {
-    const document = readFileSync(
-        join(import.meta.dir, "../shared/prompt-surface-a1-golden.md"),
-        "utf8",
-    );
+    const document = readA1GoldenDocument();
     const toolSection = document.slice(
-        document.indexOf("## 2. Tool surface"),
-        document.indexOf("## 3. System-prompt hash baseline"),
+        a1GoldenSectionOffset(document, A1_TOOL_SECTION_HEADING),
+        a1GoldenSectionOffset(document, A1_HASH_BASELINE_HEADING),
     );
     const headings = [...toolSection.matchAll(/^### (ctx_[a-z_]+) —.*$/gm)];
     return Object.fromEntries(

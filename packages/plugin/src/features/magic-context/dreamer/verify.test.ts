@@ -23,6 +23,7 @@ import {
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { acquireLease } from "./lease";
+import { DreamerProviderOutputFailureError } from "./provider-output-failure";
 import { getTaskScheduleState, seedTaskScheduleState } from "./storage-task-schedule";
 import { applyVerifyManifest, runVerify, type VerifyArgs } from "./verify";
 
@@ -74,6 +75,74 @@ function assistantMessages(text: string) {
             parts: [{ type: "text", text }],
         },
     ];
+}
+
+function tokenizedAssistantMessages(
+    text: string,
+    created: number,
+    tokens: { output: number; reasoning: number },
+) {
+    return [
+        {
+            info: {
+                role: "assistant",
+                time: { created },
+                finish: "stop",
+                error: null,
+                tokens,
+            },
+            parts: [{ type: "text", text }],
+        },
+    ];
+}
+
+type ScriptedVerifyResponse = { kind: "manifest" } | { kind: "provider-failure"; text: string };
+
+function scriptedVerifyClient(responseFor: (promptCall: number) => ScriptedVerifyResponse): {
+    client: unknown;
+    promptCalls: () => number;
+} {
+    let promptCalls = 0;
+    let childCount = 0;
+    const messages = new Map<string, unknown[]>();
+    return {
+        client: {
+            session: {
+                create: async () => ({ data: { id: `verify-child-${++childCount}` } }),
+                prompt: async (args: {
+                    path?: { id?: string };
+                    body?: { parts?: Array<{ text?: string }> };
+                }) => {
+                    promptCalls += 1;
+                    const prompt = args.body?.parts?.[0]?.text ?? "";
+                    const ids = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) =>
+                        Number(match[1]),
+                    );
+                    const response = responseFor(promptCalls);
+                    const text =
+                        response.kind === "manifest"
+                            ? `<verify>${ids.map((id) => `<verified id="${id}"/>`).join("")}</verify>`
+                            : response.text;
+                    messages.set(
+                        args.path?.id ?? "",
+                        tokenizedAssistantMessages(
+                            text,
+                            promptCalls,
+                            response.kind === "manifest"
+                                ? { output: Math.max(40, ids.length * 4), reasoning: 100 }
+                                : { output: 8, reasoning: 0 },
+                        ),
+                    );
+                    return {};
+                },
+                messages: async (args: { path?: { id?: string } }) => ({
+                    data: messages.get(args.path?.id ?? "") ?? [],
+                }),
+                delete: async () => ({}),
+            },
+        },
+        promptCalls: () => promptCalls,
+    };
 }
 
 function successfulVerifyClient(onPrompt?: () => void) {
@@ -180,6 +249,107 @@ describe("runVerify disposition", () => {
             expect(second.verified).toBe(1);
             expect(second.remaining).toBe(0);
             expect(second.complete).toBe(true);
+            expect(
+                getTaskScheduleState(db, projectIdentity, "verify-broad")?.lastBroadRunAt,
+            ).toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("classifies outage text before manifest parsing and retries every fallback model", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-provider-outage";
+            const dir = tempProject();
+            addMappedMemories(db, projectIdentity, 1);
+            seedTaskScheduleState(db, projectIdentity, "verify-broad", null, null, "0 3 * * 0");
+            const scripted = scriptedVerifyClient(() => ({
+                kind: "provider-failure",
+                text: "All Antigravity endpoints failed",
+            }));
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.forceBroad = true;
+            args.model = "antigravity/primary";
+            args.fallbackModels = ["antigravity/fallback-a", "antigravity/fallback-b"];
+            args.client = scripted.client as never;
+
+            let failure: unknown;
+            try {
+                await runVerify(args);
+            } catch (error) {
+                failure = error;
+            }
+
+            expect(failure).toBeInstanceOf(DreamerProviderOutputFailureError);
+            expect(String(failure)).toContain("provider-outage completion");
+            expect(String(failure)).not.toContain("manifest missing");
+            expect(scripted.promptCalls()).toBe(3);
+            expect(
+                getTaskScheduleState(db, projectIdentity, "verify-broad")?.lastBroadRunAt,
+            ).toBeGreaterThan(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("aborts after two identical provider-failure batches", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-provider-circuit";
+            const dir = tempProject();
+            addMappedMemories(db, projectIdentity, 101);
+            seedTaskScheduleState(db, projectIdentity, "verify-broad", null, null, "0 3 * * 0");
+            const scripted = scriptedVerifyClient(() => ({
+                kind: "provider-failure",
+                text: "All Antigravity endpoints failed",
+            }));
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.forceBroad = true;
+            args.client = scripted.client as never;
+
+            await expect(runVerify(args)).rejects.toBeInstanceOf(DreamerProviderOutputFailureError);
+            expect(scripted.promptCalls()).toBe(2);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("banks completed batches before an outage and resumes the open broad cycle", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-provider-resume";
+            const dir = tempProject();
+            addMappedMemories(db, projectIdentity, 51);
+            seedTaskScheduleState(db, projectIdentity, "verify-broad", null, null, "0 3 * * 0");
+            const scripted = scriptedVerifyClient((promptCall) =>
+                promptCall === 1
+                    ? { kind: "manifest" }
+                    : {
+                          kind: "provider-failure",
+                          text: "All Antigravity endpoints failed",
+                      },
+            );
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.forceBroad = true;
+            args.client = scripted.client as never;
+
+            await expect(runVerify(args)).rejects.toBeInstanceOf(DreamerProviderOutputFailureError);
+            expect(scripted.promptCalls()).toBe(2);
+            const cycleStart = getTaskScheduleState(
+                db,
+                projectIdentity,
+                "verify-broad",
+            )?.lastBroadRunAt;
+            expect(cycleStart).toBeGreaterThan(0);
+
+            args.client = successfulVerifyClient() as never;
+            args.deadline = Date.now() + 60_000;
+            const resumed = await runVerify(args);
+            expect(resumed.inScope).toBe(1);
+            expect(resumed.verified).toBe(1);
+            expect(resumed.remaining).toBe(0);
+            expect(resumed.complete).toBe(true);
             expect(
                 getTaskScheduleState(db, projectIdentity, "verify-broad")?.lastBroadRunAt,
             ).toBeNull();

@@ -1467,6 +1467,7 @@ async function startPiMagicContextRuntime(
 			// useless on Pi.
 			embeddingConfig: bootProjectDeps.config.embedding,
 			memoryEnabled: bootProjectDeps.config.memory.enabled,
+			retinaHandoff: bootProjectDeps.config.smart_notes.retina_handoff,
 			language: bootProjectDeps.config.language,
 			gitCommitIndexing: bootProjectDeps.config.memory.git_commit_indexing,
 			onAdjunctsRefreshNeeded: signalPiSystemPromptRefreshForProject,
@@ -1567,6 +1568,7 @@ async function startPiMagicContextRuntime(
 						config: effectiveDreamerConfig,
 						embeddingConfig: effectiveConfig.embedding,
 						memoryEnabled: effectiveConfig.memory.enabled,
+						retinaHandoff: effectiveConfig.smart_notes.retina_handoff,
 						language: effectiveConfig.language,
 						gitCommitIndexing: effectiveConfig.memory.git_commit_indexing,
 						onAdjunctsRefreshNeeded: signalPiSystemPromptRefreshForProject,

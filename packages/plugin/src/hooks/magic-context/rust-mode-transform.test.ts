@@ -32,6 +32,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import { getSlot } from "./lkg-slot";
 import { MODULE_PAGE_MAX_BYTES } from "./module-wire";
+import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
 import {
@@ -54,6 +55,7 @@ const createRustModeTransform = (
     createRustModeTransformImpl(deps, {
         ...options,
         allowAuthorityProtocolBypassForTests: true,
+        scheduleLkgCapture: options.scheduleLkgCapture ?? ((capture) => capture()),
     });
 
 const sessions: string[] = [];
@@ -1133,7 +1135,11 @@ describe("Rust mode authority adapter", () => {
         const native = [{ role: "assistant", parts: [] }];
         const transformBodies: Array<Record<string, unknown>> = [];
         let retryStarted = false;
+        let capabilityInvalidations = 0;
         const moduleClient: RustModeModuleClient = {
+            invalidateStateSyncCapabilities: () => {
+                capabilityInvalidations += 1;
+            },
             call: async ({ method, body }) => {
                 if (method !== "transform") return { ok: true };
                 const page = body as Record<string, unknown>;
@@ -1165,6 +1171,7 @@ describe("Rust mode authority adapter", () => {
             ),
         ).toBe(true);
         expect(transformBodies.at(-1)?.tool_present).toBe(true);
+        expect(capabilityInvalidations).toBe(1);
         expect(output.messages).toEqual(native);
     });
 
@@ -1235,6 +1242,7 @@ describe("Rust mode authority adapter", () => {
         const db = makeDb();
         installRawProvider(sessionId);
         const transformBodies: Array<Record<string, unknown>> = [];
+        const deleteSession = mock(async () => {});
         const closeSession = mock(() => {});
         const moduleClient: RustModeModuleClient = {
             call: async ({ method, body }) => {
@@ -1243,9 +1251,13 @@ describe("Rust mode authority adapter", () => {
                     ? { decision: "PASSTHROUGH", native_messages: [] }
                     : { ok: true };
             },
+            deleteSession,
             closeSession,
         };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            projectRoot: "/tmp/rust-clear-session-project",
+        });
         for (let pass = 0; pass < 2; pass += 1) {
             const input = makeMessages(sessionId);
             await transform.run(
@@ -1258,6 +1270,8 @@ describe("Rust mode authority adapter", () => {
         expect(transformBodies[1]?.tail_delta).toBeDefined();
 
         transform.clearSession(sessionId);
+        await Bun.sleep(0);
+        expect(deleteSession).toHaveBeenCalledWith(sessionId, "/tmp/rust-clear-session-project");
         expect(closeSession).toHaveBeenCalledWith(sessionId);
         const afterClear = makeMessages(sessionId);
         await transform.run(
@@ -1515,6 +1529,258 @@ describe("Rust mode authority adapter", () => {
         );
 
         expect(getSlot(sessionId)).toBeUndefined();
+    });
+
+    it("refreshes the LKG snapshot after an applied SOFT+ pass", async () => {
+        const sessionId = `rust-lkg-soft-plus-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let pass = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                pass += 1;
+                return {
+                    decision: pass === 1 ? "HARD" : "SOFT+",
+                    native_messages: [
+                        {
+                            info: { id: "served", role: "assistant", sessionID: sessionId },
+                            parts: [{ type: "text", text: `applied response ${pass}` }],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const firstInput = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            firstInput,
+            { messages: [...firstInput] },
+            makeMeta(db, sessionId),
+        );
+        const firstSlot = getSlot(sessionId);
+        expect(firstSlot?.jsonPrefix).toContain("applied response 1");
+
+        const secondInput = makeMessages(sessionId);
+        (secondInput[0]?.parts[0] as { text: string }).text = "new live tail state";
+        await transform.run(
+            sessionId,
+            secondInput,
+            { messages: [...secondInput] },
+            makeMeta(db, sessionId),
+        );
+        const secondSlot = getSlot(sessionId);
+
+        expect(secondSlot?.jsonPrefix).toContain("applied response 2");
+        expect(secondSlot?.inputContentDigests).not.toEqual(firstSlot?.inputContentDigests);
+    });
+
+    it("keeps an applied pass at most one immediate turn ahead of its LKG slot", async () => {
+        const sessionId = `rust-lkg-async-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const scheduled: Array<() => void> = [];
+        let pass = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                pass += 1;
+                return {
+                    decision: pass === 1 ? "HARD" : "SOFT+",
+                    row_version: pass,
+                    native_messages: [
+                        {
+                            info: { id: "served", role: "assistant", sessionID: sessionId },
+                            parts: [{ type: "text", text: `async response ${pass}` }],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            scheduleLkgCapture: (capture) => scheduled.push(capture),
+        });
+        const input = makeMessages(sessionId);
+
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        expect(getSlot(sessionId)).toBeUndefined();
+        expect(scheduled).toHaveLength(1);
+        scheduled.shift()?.();
+        expect(getSlot(sessionId)?.jsonPrefix).toContain("async response 1");
+
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        expect(getSlot(sessionId)?.jsonPrefix).toContain("async response 1");
+        expect(scheduled).toHaveLength(1);
+        scheduled.shift()?.();
+        expect(getSlot(sessionId)?.jsonPrefix).toContain("async response 2");
+    });
+
+    it("does not let an older async capture overwrite a newer model-switch capture", async () => {
+        const sessionId = `rust-lkg-order-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const scheduled: Array<() => void> = [];
+        let pass = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                pass += 1;
+                return {
+                    decision: "HARD",
+                    row_version: pass,
+                    native_messages: [
+                        {
+                            info: { id: "served", role: "assistant", sessionID: sessionId },
+                            parts: [{ type: "text", text: `ordered response ${pass}` }],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            scheduleLkgCapture: (capture) => scheduled.push(capture),
+        });
+        const firstInput = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            firstInput,
+            { messages: [...firstInput] },
+            makeMeta(db, sessionId),
+        );
+        const switchedInput = makeMessages(sessionId);
+        switchedInput[0]!.info.model = { providerID: "anthropic", modelID: "switched" };
+        await transform.run(
+            sessionId,
+            switchedInput,
+            { messages: [...switchedInput] },
+            makeMeta(db, sessionId),
+        );
+
+        expect(scheduled).toHaveLength(2);
+        scheduled[1]?.();
+        scheduled[0]?.();
+        const slot = getSlot(sessionId);
+        expect(slot?.jsonPrefix).toContain("ordered response 2");
+        expect(slot?.modelKey).toBe("anthropic/switched");
+        expect(slot?.rowVersion).toBe(2);
+    });
+
+    it("re-arms a synchronous capture after an async capture is rejected", async () => {
+        const sessionId = `rust-lkg-rearm-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const scheduled: Array<() => void> = [];
+        let pass = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                pass += 1;
+                return {
+                    decision: "HARD",
+                    row_version: pass,
+                    native_messages: [
+                        {
+                            role: "assistant",
+                            parts: [
+                                {
+                                    type: "text",
+                                    text:
+                                        pass === 1
+                                            ? "x".repeat(12 * 1024 * 1024 + 1_000)
+                                            : "recovered synchronously",
+                                },
+                            ],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            scheduleLkgCapture: (capture) => scheduled.push(capture),
+        });
+        const input = makeMessages(sessionId);
+
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        scheduled.shift()?.();
+        expect(getSlot(sessionId)).toBeUndefined();
+
+        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
+        expect(scheduled).toHaveLength(0);
+        expect(getSlot(sessionId)?.jsonPrefix).toContain("recovered synchronously");
+    });
+
+    it("throws locally instead of serving raw above a known context limit", async () => {
+        const sessionId = `rust-raw-limit-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordDetectedContextLimit(db, sessionId, 1_000, "test-provider/test-model");
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method === "transform") throw new Error("client closed");
+                return { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = [
+            {
+                info: {
+                    id: "m1",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: randomText(seededRandom(7), 20_000) }],
+            },
+        ] as MessageLike[];
+        const output = { messages: [] as unknown[] };
+
+        await expect(
+            transform.run(sessionId, input, output, makeMeta(db, sessionId)),
+        ).rejects.toBeInstanceOf(RawFallbackContextLimitError);
+        expect(output.messages).toEqual([]);
+    });
+
+    it("preserves raw fail-open when the estimate fits the known context limit", async () => {
+        const sessionId = `rust-raw-fits-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordDetectedContextLimit(db, sessionId, 10_000, "test-provider/test-model");
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method === "transform") throw new Error("client closed");
+                return { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = [
+            {
+                info: {
+                    id: "m1",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: "small raw prompt" }],
+            },
+        ] as MessageLike[];
+        const output = { messages: [] as unknown[] };
+
+        await expect(
+            transform.run(sessionId, input, output, makeMeta(db, sessionId)),
+        ).resolves.toBeUndefined();
+        expect(output.messages).toEqual(input);
     });
 
     it("passes through raw input, parks after three failures, then probes on the fifth pass", async () => {
@@ -1800,7 +2066,7 @@ describe("Rust mode authority adapter", () => {
         expect(transform.getState(sessionId).consecutiveFailures).toBe(1);
     });
 
-    it("refuses an LKG prefix plus pristine tail that exceeds the current limit", async () => {
+    it("refuses both oversized LKG replay and the guaranteed-oversized raw fallback", async () => {
         const sessionId = `rust-lkg-limit-${Date.now()}`;
         sessions.push(sessionId);
         const db = makeDb();
@@ -1852,16 +2118,14 @@ describe("Rust mode authority adapter", () => {
             },
         ] as MessageLike[];
         failTransform = true;
-        const output = { messages: [...appended] as unknown[] };
+        const output = { messages: [] as unknown[] };
         const failureMeta = makeMeta(db, sessionId);
         failureMeta.systemPromptTokens = 100;
-        await transform.run(sessionId, appended, output, failureMeta);
+        await expect(
+            transform.run(sessionId, appended, output, failureMeta),
+        ).rejects.toBeInstanceOf(RawFallbackContextLimitError);
 
-        expect(output.messages).toEqual(appended);
-        expect((output.messages[0] as MessageLike).parts[0]).toEqual({
-            type: "text",
-            text: "current prefix",
-        });
+        expect(output.messages).toEqual([]);
     });
 });
 

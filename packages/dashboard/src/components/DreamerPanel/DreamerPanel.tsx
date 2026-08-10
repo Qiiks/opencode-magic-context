@@ -31,6 +31,7 @@ import DreamerTaskCard from "./DreamerTaskCard";
 // e.g. maintain-docs. Keeps the toggle's "on" meaningful for every task. Users
 // fine-tune the exact cron via the gear dialog.
 const ENABLE_FALLBACK_CRON = "0 3 * * *";
+const CANONICAL_TASK_NAMES = new Set(TASKS.map((task) => task.name));
 
 function taskMeta(taskName: string): {
   label: string;
@@ -124,6 +125,15 @@ function getProjectLabel(project: ProjectInfo | undefined, projectPath: string):
 function hasMemoryChanges(changes: DreamRunMemoryChanges | null): changes is DreamRunMemoryChanges {
   if (!changes) return false;
   return Object.values(changes).some((value) => (value ?? 0) > 0);
+}
+
+/** A broad verification cycle may be split across scheduled runs. Older runs
+ * record a failed status while still banking processed memories, which is a
+ * resumable warning rather than a task failure. */
+function isResumableBroadFailure(task: DreamerProjectTask): boolean {
+  if (task.task !== "verify-broad" || task.last_status !== "failed") return false;
+  const progress = task.last_error?.match(/(?:processed|verified)\s+(\d+)/i);
+  return Number(progress?.[1] ?? 0) > 0;
 }
 
 interface DreamerPanelProps {
@@ -262,22 +272,28 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
     };
   };
 
-  // Project cards: every tracked project with at least one scheduled task,
+  // Project cards: every tracked project with at least one canonical task,
   // sorted by name. Enabled tasks (schedule set) come first within a card.
   // When embedded, scope to the one project this detail view is about.
+  // Schedule-state rows can outlive a retired registry task. The dashboard must
+  // follow the plugin registry rather than showing a stale toggle from storage.
+  const visibleTasks = (p: DreamerProject) =>
+    p.tasks.filter((task) => CANONICAL_TASK_NAMES.has(task.task));
+  const isTaskEnabled = (t: DreamerProjectTask) => (t.schedule ?? "").trim() !== "";
+
   const cards = createMemo<DreamerProject[]>(() => {
     const all = [...(dreamerProjects() ?? [])].sort((a, b) => a.label.localeCompare(b.label));
     const locked = props.project?.identity;
-    return locked ? all.filter((p) => p.identity === locked) : all;
+    const scoped = locked ? all.filter((p) => p.identity === locked) : all;
+    return scoped.filter((p) => visibleTasks(p).length > 0);
   });
-
-  const isTaskEnabled = (t: DreamerProjectTask) => (t.schedule ?? "").trim() !== "";
-  const enabledTasks = (p: DreamerProject) => p.tasks.filter(isTaskEnabled);
+  const enabledTasks = (p: DreamerProject) => visibleTasks(p).filter(isTaskEnabled);
 
   // Traffic-light for a task's last run: green ok, red failed, gray never-run /
   // disabled. Amber = scheduled+enabled but not yet run, or retrying.
   type Light = "green" | "amber" | "red" | "gray";
   const taskLight = (t: DreamerProjectTask): Light => {
+    if (isResumableBroadFailure(t)) return "amber";
     if (t.last_status === "failed") return "red";
     if (t.last_status === "completed") return "green";
     if (t.last_status === "skipped") return "gray";
@@ -290,14 +306,15 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
   const cardHealth = (p: DreamerProject): Light => {
     const on = enabledTasks(p);
     if (on.length === 0) return "gray";
-    if (on.some((t) => t.last_status === "failed")) return "red";
+    if (on.some((t) => t.last_status === "failed" && !isResumableBroadFailure(t))) return "red";
+    if (on.some(isResumableBroadFailure)) return "amber";
     if (on.some((t) => t.last_run_at == null && t.last_status == null)) return "amber";
     if (on.some((t) => t.last_status === "completed")) return "green";
     return "gray";
   };
 
   const failedCount = (p: DreamerProject) =>
-    p.tasks.filter((t) => t.last_status === "failed").length;
+    p.tasks.filter((t) => t.last_status === "failed" && !isResumableBroadFailure(t)).length;
 
   const toggleCard = (identity: string) => {
     setExpandedCards((previous) => {
@@ -324,7 +341,9 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
 
   const lightTitle = (t: DreamerProjectTask): string => {
     const when = t.last_run_at != null ? formatRelativeTime(t.last_run_at) : "never run";
-    const status = t.last_status ?? (isTaskEnabled(t) ? "pending" : "disabled");
+    const status = isResumableBroadFailure(t)
+      ? "resumable"
+      : (t.last_status ?? (isTaskEnabled(t) ? "pending" : "disabled"));
     const err = t.last_error ? ` — ${t.last_error}` : "";
     return `${status} · ${when}${err}`;
   };
@@ -480,7 +499,7 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
                 </Show>
 
                 <div class="dreamer-task-card-grid">
-                  <For each={project.tasks}>
+                  <For each={visibleTasks(project)}>
                     {(task) => {
                       const meta = taskMeta(task.task);
                       const enabled = isTaskEnabled(task);
@@ -498,11 +517,10 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
                           scheduleText={enabled ? describeCron(task.schedule ?? "") : "Disabled"}
                           nextDueText={nextDue()}
                           enabled={enabled}
-                          iconTint={
-                            !enabled ? "gray" : task.last_status === "failed" ? "red" : "green"
-                          }
+                          iconTint={!enabled ? "gray" : taskLight(task) === "red" ? "red" : "green"}
                           light={taskLight(task)}
-                          lastError={task.last_error}
+                          lastError={isResumableBroadFailure(task) ? null : task.last_error}
+                          resumable={isResumableBroadFailure(task)}
                           canToggle={project.worktree != null}
                           busy={togglingTasks().has(`${project.identity}::${task.task}`)}
                           onToggle={(enable) => void toggleTask(project, task.task, enable)}
@@ -568,7 +586,7 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
 
                   <Show when={isCardExpanded(project.identity)}>
                     <div class="dreamer-task-list">
-                      <For each={project.tasks}>
+                      <For each={visibleTasks(project)}>
                         {(task) => (
                           <div class="dreamer-task-line">
                             <span
@@ -586,7 +604,10 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
                                   : "· overdue"}
                               </span>
                             </Show>
-                            <Show when={task.last_error}>
+                            <Show when={isResumableBroadFailure(task)}>
+                              <span class="dreamer-task-next">· resumable</span>
+                            </Show>
+                            <Show when={task.last_error && !isResumableBroadFailure(task)}>
                               <span class="dreamer-task-err" title={task.last_error ?? ""}>
                                 {task.last_error}
                               </span>

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+	A1_HASH_BASELINE_HEADING,
+	A1_TOOL_SECTION_HEADING,
+	a1GoldenSectionOffset,
+	readA1GoldenDocument,
+} from "@magic-context/core/shared/prompt-surface-a1-golden";
 import {
 	createPromptSurfaceRuntime,
 	LIGHT_TOOL_DESCRIPTIONS,
@@ -240,16 +244,10 @@ function readA1GoldenTools(): Record<
 	string,
 	{ description: string; parameters: Record<string, unknown> }
 > {
-	const document = readFileSync(
-		join(
-			import.meta.dir,
-			"../../../plugin/src/shared/prompt-surface-a1-golden.md",
-		),
-		"utf8",
-	);
+	const document = readA1GoldenDocument();
 	const toolSection = document.slice(
-		document.indexOf("## 2. Tool surface"),
-		document.indexOf("## 3. System-prompt hash baseline"),
+		a1GoldenSectionOffset(document, A1_TOOL_SECTION_HEADING),
+		a1GoldenSectionOffset(document, A1_HASH_BASELINE_HEADING),
 	);
 	const headings = [...toolSection.matchAll(/^### (ctx_[a-z_]+) —.*$/gm)];
 	return Object.fromEntries(

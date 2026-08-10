@@ -1,6 +1,4 @@
 import { createRequire } from "node:module";
-import type TokenizerType from "ai-tokenizer";
-import type * as ClaudeEncodingType from "ai-tokenizer/encoding/claude";
 import { COMMIT_VERB_PATTERN, createCommitHashExtractPattern } from "../../shared/commit-detection";
 import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker";
 import { isSystemDirective, removeSystemReminders } from "../../shared/system-directive";
@@ -112,27 +110,35 @@ function truncateArg(value: string, maxLen = 60): string {
     return `${value.slice(0, maxLen)}…`;
 }
 
-// Keep these specifiers non-literal so Bun does not include the Claude
-// tokenizer vocabulary in the eager plugin bundle. Unlike the prior
-// `eval("require")` fallback, createRequire works in Bun's ESM runtime.
-const lazyRequire = createRequire(import.meta.url);
-let cachedTokenizer: InstanceType<typeof TokenizerType> | null = null;
+// Keep ai-tokenizer out of the eager module graph. Pi imports this module through
+// its system-prompt path during cold start, while token estimates are not needed
+// until the first real prompt is processed. createRequire keeps construction
+// synchronous so estimateTokens keeps its existing API and defers both package
+// loads until that first non-empty call.
+type TokenizerLike = {
+    encode: (text: string, allowedSpecial: string) => number[];
+};
+type TokenizerConstructor = new (encoding: unknown) => TokenizerLike;
 
-function getTokenizer(): InstanceType<typeof TokenizerType> {
-    if (cachedTokenizer) return cachedTokenizer;
+const requireFromThisModule = createRequire(import.meta.url);
+let tokenizer: TokenizerLike | undefined;
 
-    const tokenizerModule = lazyRequire("ai-" + "tokenizer") as {
-        default?: typeof TokenizerType;
-        Tokenizer?: typeof TokenizerType;
+function getTokenizer(): TokenizerLike {
+    if (tokenizer) return tokenizer;
+
+    // Non-literal specifiers keep Bun's bundler static analysis from folding
+    // the Claude vocabulary into the eager chunk (same convention as the
+    // sqlite backend selector).
+    const tokenizerModule = requireFromThisModule("ai-" + "tokenizer") as {
+        default?: TokenizerConstructor;
+        Tokenizer?: TokenizerConstructor;
     };
     const Tokenizer = tokenizerModule.default ?? tokenizerModule.Tokenizer;
-    if (!Tokenizer) throw new Error("ai-tokenizer does not export Tokenizer");
+    if (!Tokenizer) throw new Error("ai-tokenizer does not expose a Tokenizer constructor");
 
-    const claudeEncoding = lazyRequire(
-        "ai-tokenizer/encoding/" + "claude",
-    ) as typeof ClaudeEncodingType;
-    cachedTokenizer = new Tokenizer(claudeEncoding);
-    return cachedTokenizer;
+    const claudeEncoding = requireFromThisModule("ai-tokenizer/encoding/" + "claude");
+    tokenizer = new Tokenizer(claudeEncoding);
+    return tokenizer;
 }
 
 export function estimateTokens(text: string): number {

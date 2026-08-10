@@ -202,7 +202,11 @@ run_e2e_group() {
   local mode="$1" label="$2" files="$3" output status
   echo "  [e2e:$mode:$label:start] bun test..."
   status=0
-  output=$(cd "$E2E_DIR" && MC_E2E_MODE="$mode" NODE_ENV="" bun test --timeout 600000 $files 2>&1) || status=$?
+  # --max-concurrency=1: the hermetic stacks spawn real daemons/servers per
+  # test file; parallel stacks on one box cross-contaminate (ports, module
+  # sockets, timing drills) and produce flaky failures that pass serially.
+  # This matches the dedicated test:rust-e2e script's serial invocation.
+  output=$(cd "$E2E_DIR" && MC_E2E_MODE="$mode" NODE_ENV="" bun test --timeout 600000 --max-concurrency=1 $files 2>&1) || status=$?
   echo "$output"
   if echo "$output" | grep -qE "[1-9][0-9]* fail"; then
     echo "Error: e2e ($mode/$label) failed (fail count > 0)"

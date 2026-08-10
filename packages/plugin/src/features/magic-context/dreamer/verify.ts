@@ -35,6 +35,10 @@ import {
     type DreamerModuleRoute,
     getModuleMemoryIdentities,
 } from "./module-apply";
+import {
+    DreamerProviderOutputFailureError,
+    providerOutputFailureFromInvalidManifest,
+} from "./provider-output-failure";
 import { getTaskScheduleState, writeTaskScheduleState } from "./storage-task-schedule";
 import { partitionVerifyScope } from "./verify-gate";
 import {
@@ -62,6 +66,17 @@ import {
 // Verify reads deeper than map → smaller batch keeps peak context under a 128K
 // window with margin (harness: 96 mapped → ~177K on a large-window model).
 const VERIFY_BATCH_SIZE = 50;
+// One batch already exhausts the configured model fallback chain. A second
+// identical provider-shaped completion means continuing this run only hammers
+// the same outage, so leave the remaining memories for the scheduler retry.
+const IDENTICAL_PROVIDER_FAILURE_BATCH_LIMIT = 2;
+
+interface VerifyBatchResult {
+    verified: number;
+    updated: number;
+    archived: number;
+    providerFailure?: DreamerProviderOutputFailureError;
+}
 
 export interface VerifyArgs {
     db: Database;
@@ -156,6 +171,9 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
         abortController.abort(),
     );
 
+    let consecutiveProviderFailures = 0;
+    let priorProviderFailureFingerprint: string | null = null;
+    let lastProviderFailure: DreamerProviderOutputFailureError | null = null;
     try {
         for (let i = 0; i < batches.length; i += 1) {
             const remainingMs = Math.max(0, args.deadline - Date.now());
@@ -170,7 +188,31 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
             result.remaining -= counts.verified + counts.updated + counts.archived;
             result.batches += 1;
             args.onProgress?.(result.verified + result.updated + result.archived);
+
+            if (counts.providerFailure) {
+                lastProviderFailure = counts.providerFailure;
+                if (counts.providerFailure.fingerprint === priorProviderFailureFingerprint) {
+                    consecutiveProviderFailures += 1;
+                } else {
+                    priorProviderFailureFingerprint = counts.providerFailure.fingerprint;
+                    consecutiveProviderFailures = 1;
+                }
+                if (consecutiveProviderFailures >= IDENTICAL_PROVIDER_FAILURE_BATCH_LIMIT) {
+                    log(
+                        `[dreamer] verify run aborting after ${consecutiveProviderFailures} identical provider-failure batches`,
+                    );
+                    throw counts.providerFailure;
+                }
+            } else {
+                priorProviderFailureFingerprint = null;
+                consecutiveProviderFailures = 0;
+            }
         }
+        // A single-batch project cannot reach the circuit-breaker threshold. Still
+        // surface its provider failure so the scheduler hot-retries instead of
+        // recording a generic incomplete-manifest result.
+        if (lastProviderFailure) throw lastProviderFailure;
+
         result.complete = result.remaining === 0;
         if (result.complete) closeBroadCycle(args, gate.broadCycleStartAt);
         log(
@@ -187,7 +229,7 @@ async function verifyOneBatch(
     batch: VerifyPromptMemory[],
     sliceMs: number,
     signal: AbortSignal,
-): Promise<{ verified: number; updated: number; archived: number }> {
+): Promise<VerifyBatchResult> {
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     try {
@@ -241,7 +283,16 @@ async function verifyOneBatch(
                     }
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("verify returned no output");
-                    parseVerifyManifest(text);
+                    try {
+                        parseVerifyManifest(text);
+                    } catch (error) {
+                        const providerFailure = providerOutputFailureFromInvalidManifest(
+                            messages,
+                            text,
+                        );
+                        if (providerFailure) throw providerFailure;
+                        throw error;
+                    }
                     return text;
                 },
             },
@@ -251,13 +302,15 @@ async function verifyOneBatch(
         return await applyVerifyManifest(args, batch, run.validated);
     } catch (error) {
         const desc = describeError(error);
+        const providerFailure =
+            error instanceof DreamerProviderOutputFailureError ? error : undefined;
         log(
-            `[dreamer] verify batch failed: ${desc.brief}`,
+            `[dreamer] verify batch ${providerFailure ? "provider failure" : "failed"}: ${desc.brief}`,
             desc.stackHead ? { stackHead: desc.stackHead } : undefined,
         );
         recordInvocation(args, startedAt, { status: "failed", error });
         if (error instanceof DreamerModuleFailureError || signal.aborted) throw error;
-        return { verified: 0, updated: 0, archived: 0 };
+        return { verified: 0, updated: 0, archived: 0, providerFailure };
     } finally {
         // Delete the child regardless of success/failure (a FAILED child still
         // holds the memory-pool snapshot fed into the prompt — leaving it only on

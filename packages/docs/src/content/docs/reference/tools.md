@@ -5,7 +5,7 @@ description: What Magic Context tools your agent calls mean in transcripts and h
 
 Magic Context registers tools for your agent, not for you. You will see `ctx_reduce`, `ctx_search`, and others in transcripts when the model trims context or looks something up. This page explains each tool, when the agent tends to use it, and how to read typical results.
 
-For reduction behavior see [Context reduction](/concepts/context-reduction/). For durable facts vs session notes see [Memory](/concepts/memory/).
+For reduction behavior see [Context reduction](/concepts/context-reduction/). For durable facts vs session notes see [Memory](/concepts/memory/). Tool registration follows the active mode: `compaction.enabled: false` removes only `ctx_reduce`; `ctx_expand`, `ctx_note`, `ctx_search`, and `ctx_memory` keep their normal gates. With `memory.enabled: false`, `ctx_memory` is omitted while `ctx_search` still covers conversation and enabled git-commit sources. Pi's `todowrite` registration is controlled separately by `todowrite.enabled`.
 
 ## ctx_reduce
 
@@ -23,7 +23,7 @@ Tool: Dropped tags: 4, 5, 6. Changes take effect on next message.
 ```
 
 :::note
-`ctx_reduce` is part of the normal primary-session tool surface. If an agent's tool allow-list denies it, Magic Context also hides `§N§` prefixes and reduce nudges for that session.
+`ctx_reduce` is part of the normal primary-session tool surface. It is not registered when `compaction.enabled` is `false`, and an agent's tool allow-list can deny it in either harness. When it is unavailable, Magic Context also hides `§N§` prefixes and reduce nudges for that session.
 :::
 
 ## ctx_expand
@@ -39,7 +39,7 @@ Tool: Dropped tags: 4, 5, 6. Changes take effect on next message.
 | `verbose` | With `start`/`end`: list each message separately with its ordinal `[N]` and a per-part preview (each tool call shown with its output size). |
 | `message` | Full untruncated recovery of one message by its ordinal — every text part and every tool call's complete input/output. |
 
-Output is capped near 15K tokens. Ordinals after the last compartment are the live tail (already visible, not expandable).
+Output is capped near 15K tokens. Ordinals after the last compartment are the live tail (already visible, not expandable). `ctx_expand` remains available in compaction-off mode.
 
 ```text
 Agent: ctx_expand({ "start": 120, "end": 245 })
@@ -67,7 +67,7 @@ Tool: [120] U: Can we rename the handler?
 | `filter` | For `read`: `all`, `active`, `pending`, `ready`, `dismissed`. |
 | `limit` / `offset` | Page `read` results (newest first). |
 
-**Smart notes** need dreamer enabled. Conditions must be externally checkable (GitHub, files, git, web) — not “when the user says X”.
+**Smart notes** need Dreamer to be runnable (not `dreamer.disable: true`) and are evaluated only when the `evaluate-smart-notes` task is scheduled. Conditions must be externally checkable (GitHub, files, git, web) — not “when the user says X”.
 
 **`@msg` anchor.** Notes tied to a message show `↳ @msg 512` on `read` so the agent can `ctx_expand` to that point.
 

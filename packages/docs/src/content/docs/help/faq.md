@@ -28,7 +28,7 @@ Yes. Most features have explicit toggles. See the [configuration reference](/ref
 | Memory (cross-session) | `memory.enabled` | `true` |
 | Auto-search hints | `memory.auto_search.enabled` | `true` |
 | Temporal markers | `temporal_awareness` | `true` |
-| Dreamer (overnight consolidation) | `dreamer.enabled` | `false` |
+| Dreamer scheduling | `dreamer.disable`, `dreamer.tasks.<task>.schedule` | enabled; task schedules vary |
 | Embeddings | `embedding.provider` | `"local"` |
 
 To hide agent-driven reduction for a specific agent, deny or omit `ctx_reduce` in that agent's tool allow-list. The historian and heuristic cleanup still run.
@@ -41,7 +41,7 @@ All Magic Context state lives in one place:
 ~/.local/share/cortexkit/magic-context/context.db
 ```
 
-On Windows, this resolves to the XDG-equivalent path. The database is shared between OpenCode and Pi — memories and compartments are scoped by harness and project, not by which terminal you're using.
+On Windows, this resolves to the XDG-equivalent path. The database is shared by OpenCode, Pi, and OMP — memories and compartments are scoped by harness and project, not by which terminal you use.
 
 The local embedding model cache (if using `embedding.provider: "local"`) is stored at:
 
@@ -70,10 +70,9 @@ Check the token breakdown in the TUI sidebar or `/ctx-status`: if **Tool Calls**
 
 ## What happens when context hits 85% or 95%?
 
-Magic Context's execute threshold is configurable (default: 65% of the model's context window). When usage crosses it, the system runs heuristic cleanup and applies any queued `ctx_reduce` drops, and the historian compresses settled conversation into compartments.
+Magic Context's execute threshold is configurable from 20% through **90%** (default: 65% of the model's usable context window). When usage crosses it, the system runs heuristic cleanup and applies any queued `ctx_reduce` drops, and the historian compresses settled conversation into compartments. The usable window is resolved from the active harness's model/provider metadata and can be narrowed by a smaller observed limit or by `output_reserve`.
 
 At **85%**, a tiered emergency drop sheds tool outputs oldest-first (this is the automatic backstop for tool output that `ctx_reduce` didn't reach). At **95%**, the session blocks new messages and runs emergency recovery — a last resort that normal operation rarely reaches.
-
 You can check the current state with `/ctx-status` and force a flush with `/ctx-flush`.
 
 ## How does it work with subagents?
@@ -88,16 +87,16 @@ Not currently. The database is local to one machine. Memories, compartments, and
 
 If you work across machines, you can manually copy `~/.local/share/cortexkit/magic-context/context.db` between them — they share the same schema and project identity (git root hash), so memories written on one machine will appear on the other after a copy. There is no automatic sync.
 
-## Can I move a session from OpenCode to Pi?
+## Can I move a session from OpenCode to Pi or OMP?
 
-Yes. `doctor migrate` converts an existing OpenCode session into a Pi session file, carrying messages, compartments, and session facts with it. Project memories are already shared (same database, no migration needed).
+Yes. `doctor migrate` converts an existing OpenCode session into a Pi-compatible session file, carrying messages, compartments, and session facts with it. Project memories are already shared (same database, no migration needed).
 
 ```bash
 npx @cortexkit/magic-context@latest doctor migrate \
   --from opencode --to pi --session <session-id>
 ```
 
-Add `--dry-run` to preview without writing, or `--max-messages N` to migrate only the most recent N messages. See [Migrating between harnesses](/getting-started/migrating-between-harnesses/) for the full walkthrough. Migration currently supports OpenCode → Pi only.
+Use `--to omp` for OMP. Add `--dry-run` to preview without writing, or `--max-messages N` to migrate only the most recent N messages. See [Migrating between harnesses](/getting-started/migrating-between-harnesses/) for the full walkthrough. Reverse migration is not yet supported.
 
 ## The dashboard shows no models / I'm on OpenCode Desktop only
 

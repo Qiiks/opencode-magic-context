@@ -14,7 +14,22 @@ import { TestHarness } from "../src/harness";
  *     rows for deleted sessions.
  */
 
+const RUST_MODE = process.env.MC_E2E_MODE === "rust";
+
 let h: TestHarness;
+
+async function rustSessionStatus(
+    sessionId: string,
+): Promise<Record<string, unknown>> {
+    const stack = h.rustStack;
+    if (!stack)
+        throw new Error("Rust lifecycle check requires the hermetic module stack");
+    return stack.moduleStatus(
+        sessionId,
+        h.opencode.env.workdir,
+        "session.status",
+    );
+}
 
 beforeAll(async () => {
     h = await TestHarness.create({
@@ -50,8 +65,12 @@ describe("session lifecycle", () => {
 
         // Each session gets its own tags and session_meta row. The plugin
         // must not mix them even in the same project/workdir.
-        const tagsA = h.countTags(a);
-        const tagsB = h.countTags(b);
+        const tagsA = RUST_MODE
+            ? Number((await rustSessionStatus(a)).tag_count ?? 0)
+            : h.countTags(a);
+        const tagsB = RUST_MODE
+            ? Number((await rustSessionStatus(b)).tag_count ?? 0)
+            : h.countTags(b);
         console.log(`[TEST] tags A=${tagsA} B=${tagsB}`);
 
         expect(tagsA).toBeGreaterThan(0);
@@ -61,18 +80,14 @@ describe("session lifecycle", () => {
 
         const metaRows = h
             .contextDb()
-            .prepare(
-                "SELECT session_id FROM session_meta WHERE session_id IN (?, ?)",
-            )
+            .prepare("SELECT session_id FROM session_meta WHERE session_id IN (?, ?)")
             .all(a, b) as Array<{ session_id: string }>;
         const seen = new Set(metaRows.map((r) => r.session_id));
         expect(seen.has(a)).toBe(true);
         expect(seen.has(b)).toBe(true);
     }, 60_000);
 
-    it(
-        "session deletion clears tags and session_meta",
-        async () => {
+    it("session deletion clears tags and session_meta", async () => {
             h.mock.reset();
             h.mock.setDefault({
                 text: "ok",
@@ -88,8 +103,12 @@ describe("session lifecycle", () => {
             await h.sendPrompt(sessionId, "lifecycle turn 1");
             await h.sendPrompt(sessionId, "lifecycle turn 2");
 
-            // Sanity: session is populated.
-            expect(h.countTags(sessionId)).toBeGreaterThan(0);
+            // Verify tags in the store that owns them for this mode: module
+            // state in Rust mode, or context.db in TypeScript mode.
+        const tagCountBefore = RUST_MODE
+            ? Number((await rustSessionStatus(sessionId)).tag_count ?? 0)
+            : h.countTags(sessionId);
+        expect(tagCountBefore).toBeGreaterThan(0);
             const metaBefore = h
                 .contextDb()
                 .prepare("SELECT COUNT(*) AS n FROM session_meta WHERE session_id = ?")
@@ -106,18 +125,30 @@ describe("session lifecycle", () => {
 
             // Plugin's session.deleted handler runs asynchronously; allow a
             // beat for the event to propagate.
-            await h.waitFor(
-                () => h.countTags(sessionId) === 0,
-                { timeoutMs: 5_000, label: "tags cleared" },
+        if (RUST_MODE) {
+            // 20ac0630 moved tag ownership into the module. Deletion must
+            // clear that durable session state before the route is discarded.
+            const deadline = Date.now() + 15_000;
+            let tagCountAfter = tagCountBefore;
+            while (Date.now() < deadline) {
+                tagCountAfter = Number(
+                    (await rustSessionStatus(sessionId)).tag_count ?? 0,
             );
-
+                if (tagCountAfter === 0) break;
+                await Bun.sleep(100);
+            }
+            expect(tagCountAfter).toBe(0);
+        } else {
+            await h.waitFor(() => h.countTags(sessionId) === 0, {
+                timeoutMs: 5_000,
+                label: "tags cleared",
+            });
             expect(h.countTags(sessionId)).toBe(0);
+        }
             const metaAfter = h
                 .contextDb()
                 .prepare("SELECT COUNT(*) AS n FROM session_meta WHERE session_id = ?")
                 .get(sessionId) as { n: number };
             expect(metaAfter.n).toBe(0);
-        },
-        60_000,
-    );
+    }, 60_000);
 });

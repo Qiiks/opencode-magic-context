@@ -1,9 +1,9 @@
 ---
 title: Memory mural
-description: An experimental single image of overflow project memories, injected into the cached context baseline when the model can see images.
+description: An opt-in single image of overflow project memories, injected into the cached context baseline when the model can see images.
 ---
 
-The **memory mural** is an experimental feature that turns project memories that did not fit the text injection budget into **one deterministic PNG**. When enabled, and when the active model accepts images, that image is attached to the cached context baseline on a hard cache fold so the agent can still "see" the overflow pool without spending the full text budget on every memory.
+The **memory mural** is an opt-in feature that turns project memories that did not fit the text injection budget into **one deterministic PNG**. When enabled, and when the active model accepts images, that image is attached to the cached context baseline on a hard cache fold so the agent can still "see" the overflow pool without spending the full text budget on every memory.
 
 ## What it is
 
@@ -24,7 +24,7 @@ Injection is gated on all of the following:
 3. Enough memories have **current compressed cues** (coverage gate — see below).
 4. There is a non-empty **overflow set** after the normal memory text budget trim.
 
-The image is resolved and attached only when the cached context baseline is **rebuilt** (a hard fold: model change, system-prompt change, idle past cache TTL, and similar). Ordinary defer turns **replay the same baked-in image bytes** so a background cue update cannot silently swap the picture mid-session and bust the prompt cache.
+The image is resolved and attached only when the cached context baseline is **rebuilt** (a hard fold: model change, system-prompt change, idle past cache TTL, and similar). Ordinary defer turns **replay the same baked-in image bytes** so a background cue update cannot silently swap the picture mid-session and bust the prompt cache. There is no scheduled `render-mural` task; rendering is deterministic and happens on demand at the fold.
 
 ## Compress-cues (dreamer task)
 
@@ -39,12 +39,12 @@ Until a memory has a current cue, it is skipped for mural selection even if it o
 
 ## Coverage gate
 
-The mural does not render from a half-empty cue pool. Rendering is skipped until either:
+The mural does not render from a half-empty cue pool. Rendering starts when either of these is true:
 
-- a minimum number of active/permanent memories have current cues, or
-- a minimum fraction of that pool is cued
+- at least **15** active/permanent memories have current cues, or
+- current cues cover at least **50%** of the active/permanent pool
 
-(whichever the implementation threshold is — both exist so small and large projects behave sensibly). Below the gate, the baseline stays text-only.
+The gate keeps small projects from waiting forever while avoiding a mostly empty image on large projects. Below the gate, the baseline stays text-only.
 
 ## Config
 
@@ -66,8 +66,8 @@ The mural does not render from a half-empty cue pool. Rendering is skipped until
 ## Requirements and limits
 
 - **Vision model required** for the image part. Non-vision models get the same text baseline as with the feature off (no mural marker, no image).
-- **Experimental** — opt-in; defaults off.
-- Works on **OpenCode and Pi** with the same config and shared store. The image envelope differs by harness (file part vs native image content); the PNG and the fold/replay rules match.
+- **Opt-in** — disabled by default.
+- Works on **OpenCode, Pi, and OMP** with the same config and shared store. The image envelope differs between OpenCode and the Pi-compatible hosts (file part vs native image content); the PNG and the fold/replay rules match.
 
 ## How it connects
 

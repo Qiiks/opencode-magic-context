@@ -249,6 +249,140 @@ describe("SubcModuleTransport", () => {
         expect(__moduleTransportTest.isConnectionFailure(foreignStaleRouteError)).toBe(true);
     });
 
+    it("reconnects once when a cached client reports that it closed", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 100);
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        let connectionCount = 0;
+        let firstCloseCount = 0;
+        const clients = [
+            {
+                routeOpen: async () => route,
+                request: async () => {
+                    throw new Error("client closed");
+                },
+                close: () => {
+                    firstCloseCount += 1;
+                },
+            },
+            {
+                routeOpen: async () => route,
+                request: async () => ({ result: { reconnected: true } }),
+                close: () => undefined,
+            },
+        ] as unknown as SubcClient[];
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureConnected(): Promise<SubcClient>;
+        };
+        internals.ensureConnected = async () => {
+            const client = clients[connectionCount++];
+            if (!client) throw new Error("unexpected third connection attempt");
+            internals.client = client;
+            return client;
+        };
+
+        await expect(
+            transport.call({
+                sessionId: "session-client-closed",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1 },
+            }),
+        ).resolves.toEqual({ result: { reconnected: true } });
+        expect(connectionCount).toBe(2);
+        expect(firstCloseCount).toBe(1);
+    });
+
+    it("bounds a half-open route and stops after one fresh-connection retry", async () => {
+        const timeoutMs = 30;
+        const transport = new SubcModuleTransport(
+            "unused-connection-file",
+            "magic-context",
+            timeoutMs,
+        );
+        let connectionCount = 0;
+        let routeOpenCount = 0;
+        const clients = [0, 1].map(
+            () =>
+                ({
+                    routeOpen: () => {
+                        routeOpenCount += 1;
+                        return new Promise<never>(() => undefined);
+                    },
+                    close: () => undefined,
+                }) as unknown as SubcClient,
+        );
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureConnected(): Promise<SubcClient>;
+        };
+        internals.ensureConnected = async () => {
+            const client = clients[connectionCount++];
+            if (!client) throw new Error("unexpected third connection attempt");
+            internals.client = client;
+            return client;
+        };
+        const startedAt = performance.now();
+
+        const failure = transport.call({
+            sessionId: "session-half-open-client",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform", v: 1 },
+        });
+
+        await expect(failure).rejects.toMatchObject({ code: "ETIMEDOUT" });
+        expect(performance.now() - startedAt).toBeLessThan(1_000);
+        expect(connectionCount).toBe(2);
+        expect(routeOpenCount).toBe(2);
+    });
+
+    it("bounds hung transform attempts and stops after one fresh-connection retry", async () => {
+        const timeoutMs = 30;
+        const transport = new SubcModuleTransport(
+            "unused-connection-file",
+            "magic-context",
+            timeoutMs,
+        );
+        const route = { channel: 8, epoch: 88 } as RouteHandle;
+        let connectionCount = 0;
+        let requestCount = 0;
+        const clients = [0, 1].map(
+            () =>
+                ({
+                    routeOpen: async () => route,
+                    request: () => {
+                        requestCount += 1;
+                        return new Promise<never>(() => undefined);
+                    },
+                    close: () => undefined,
+                }) as unknown as SubcClient,
+        );
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureConnected(): Promise<SubcClient>;
+        };
+        internals.ensureConnected = async () => {
+            const client = clients[connectionCount++];
+            if (!client) throw new Error("unexpected third connection attempt");
+            internals.client = client;
+            return client;
+        };
+        const startedAt = performance.now();
+
+        const failure = transport.call({
+            sessionId: "session-hung-client",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform", v: 1 },
+        });
+
+        await expect(failure).rejects.toMatchObject({ code: "ETIMEDOUT" });
+        expect(performance.now() - startedAt).toBeLessThan(1_000);
+        expect(connectionCount).toBe(2);
+        expect(requestCount).toBe(2);
+    });
+
     it("reopens a route and retries when a restarted module leaves a stale route token", async () => {
         const tempDir = mkdtempSync(join(tmpdir(), "module-subc-restart-"));
         const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
@@ -360,6 +494,26 @@ describe("SubcModuleTransport", () => {
         expect(internals.canonicalRootCache.size).toBe(256);
         expect(internals.canonicalRootCache.has("/missing-canonical-root-0")).toBe(true);
         expect(internals.canonicalRootCache.has("/missing-canonical-root-1")).toBe(false);
+    });
+
+    it("does not expose state-sync capabilities from an earlier connection generation", () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const internals = transport as unknown as {
+            connectionGeneration: number;
+            stateSyncCapabilityCache: {
+                generation: number;
+                capabilities: { state_sync_deltas?: boolean };
+            } | null;
+        };
+        internals.connectionGeneration = 1;
+        internals.stateSyncCapabilityCache = {
+            generation: 1,
+            capabilities: { state_sync_deltas: true },
+        };
+
+        expect(transport.getCachedStateSyncCapabilities()).toEqual({ state_sync_deltas: true });
+        internals.connectionGeneration = 2;
+        expect(transport.getCachedStateSyncCapabilities()).toBeUndefined();
     });
 
     it("does not reuse a route cached under an earlier connection generation", async () => {

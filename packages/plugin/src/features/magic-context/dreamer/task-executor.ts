@@ -111,6 +111,7 @@ export interface DreamTaskExecutorDeps {
     dreamerModel?: string;
     mural?: { enabled: boolean; model?: string };
     memoryInjectionBudgetTokens?: number;
+    retinaHandoff?: boolean;
     /** Process-local progress callback for user-facing status displays; it never reads from or writes to the prompt/result cache. */
     onProgress?: (progress: DreamTaskProgress | null, completedTask?: DreamTaskName) => void;
     moduleClient?: ClassifyModuleClient & {
@@ -614,6 +615,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     deadline,
                     model: config.model,
                     fallbackModels: config.fallbackModels,
+                    retinaHandoff: deps.retinaHandoff,
                 });
                 recordRun("completed", null, {
                     smartNotesSurfaced: result.surfaced,

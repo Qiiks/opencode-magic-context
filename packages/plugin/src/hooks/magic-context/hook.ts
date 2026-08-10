@@ -161,6 +161,7 @@ export interface MagicContextDeps {
         };
         sidekick?: SidekickConfig;
         dreamer?: DreamerConfig;
+        smart_notes?: { retina_handoff?: boolean };
         commit_cluster_trigger?: { enabled: boolean; min_clusters: number };
         /** Issue #53: per-agent system-prompt injection opt-out. Optional in
          *  the inline type so legacy tests/callers don't have to construct it;
@@ -720,6 +721,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             const client: RustModeModuleClient = {
                 call: (args) => transport.call(args),
                 stateSyncCapabilities: (args) => transport.stateSyncCapabilities(args),
+                deleteSession: (sessionId, projectRoot) =>
+                    transport.deleteSession(sessionId, projectRoot),
                 closeSession: (sessionId) => transport.closeSession(sessionId),
                 authorityStatus: (args) => transport.authorityStatus(args),
                 authorityPrepare: (args) => transport.authorityPrepare(args),
@@ -758,6 +761,21 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         })();
     const rustModeModuleClient =
         deps.config.transform_mode === "rust" ? authorityRecoveryModuleClient : undefined;
+    const syncModuleDomain = async (domain: "memories" | "notes"): Promise<void> => {
+        if (!rustModeModuleClient?.mirrorPull) return;
+        for (;;) {
+            const cursor = getMirrorCursor(db, domain);
+            const response = await rustModeModuleClient.mirrorPull({
+                domain,
+                cursor,
+                limit: 1000,
+            });
+            const next = applyMirrorPage({ db, page: response.page });
+            if (!response.page.has_more || next === cursor) break;
+        }
+    };
+    const syncModuleNotes = (): Promise<void> => syncModuleDomain("notes");
+    const syncModuleMemories = (): Promise<void> => syncModuleDomain("memories");
     const rustToolBackends: RustToolBackends | undefined =
         deps.config.transform_mode === "rust" && rustModeModuleClient
             ? {
@@ -784,7 +802,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               command_id: commandId,
                           },
                       }),
-                  note: ({
+                  note: async ({
                       commandId,
                       sessionId,
                       projectRoot,
@@ -796,8 +814,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       limit,
                       offset,
                       noteId,
-                  }) =>
-                      rustModeModuleClient.call({
+                  }) => {
+                      const response = await rustModeModuleClient.call({
                           sessionId,
                           projectRoot,
                           method: "ctx_note",
@@ -815,8 +833,13 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                                   note_id: noteId,
                               },
                           },
-                      }),
-                  memory: ({
+                      });
+                      // The module is authoritative, but context.db remains the local
+                      // read model for note nudges and dashboard/RPC consumers.
+                      await syncModuleNotes();
+                      return response;
+                  },
+                  memory: async ({
                       commandId,
                       sessionId,
                       projectRoot,
@@ -826,8 +849,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       category,
                       ids,
                       reason,
-                  }) =>
-                      rustModeModuleClient.call({
+                  }) => {
+                      const response = await rustModeModuleClient.call({
                           sessionId,
                           projectRoot,
                           method: "ctx_memory",
@@ -843,7 +866,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                                   memory_project: memoryProject,
                               },
                           },
-                      }),
+                      });
+                      // Auto-search and local RPC/dashboard reads consume the mirror,
+                      // so publish the module mutation to that read model before return.
+                      await syncModuleMemories();
+                      return response;
+                  },
                   noteEvaluationAvailable: (evaluationProjectPath: string) =>
                       getModuleNoteEvaluationBridge(evaluationProjectPath) !== undefined,
                   memorySync: (sessionId: string) => {
@@ -858,19 +886,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const ensureModuleNoteEvaluationBridge = (bridgeProjectPath: string): void => {
         if (!rustModeModuleClient?.mirrorPull) return;
         if (getModuleNoteEvaluationBridge(bridgeProjectPath)) return;
-        const syncModuleNotes = async (): Promise<void> => {
-            for (;;) {
-                const cursor = getMirrorCursor(db, "notes");
-                const response = await rustModeModuleClient.mirrorPull?.({
-                    domain: "notes",
-                    cursor,
-                    limit: 1000,
-                });
-                if (!response) throw new Error("mirror.pull is unavailable for notes");
-                const next = applyMirrorPage({ db, page: response.page });
-                if (!response.page.has_more || next === cursor) break;
-            }
-        };
         registerModuleNoteEvaluationBridge(bridgeProjectPath, {
             sync: syncModuleNotes,
             async evaluate({ contextNoteId, sessionId, verdict }): Promise<void> {
@@ -1123,6 +1138,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 }),
             userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreaming),
             language: deps.config.language,
+            retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
             transformMode: deps.config.transform_mode,
             // Scheduled/message-triggered runs must share the same direct
             // authority.status transport as the transform path. The
@@ -1255,6 +1271,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               mural: deps.config.mural,
                               memoryInjectionBudgetTokens:
                                   deps.config.memory?.injection_budget_tokens,
+                              retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
                               transformMode: deps.config.transform_mode,
                               // Manual /ctx-dream uses the same live authority
                               // lookup and module transport as scheduled runs.
