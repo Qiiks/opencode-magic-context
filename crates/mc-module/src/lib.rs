@@ -119,7 +119,8 @@ pub mod test_support;
 #[cfg(test)]
 mod differential_goldens;
 use transform::{
-    transform_with_projection_cached, HistorianDiagnostics, SerializedOutputCache, TransformRequest,
+    transform_with_projection_cached, HistorianDiagnostics, ProjectionCacheInput,
+    SerializedOutputCache, TransformRequest,
 };
 
 /// The per-route binding: the project, harness, session-slot value, and fallback render
@@ -1842,7 +1843,12 @@ impl TransformSnapshotCache {
         }
     }
 
+    #[cfg(test)]
     fn ready_request_clone(&self, session_id: &str) -> Option<Arc<TransformRequest>> {
+        self.ready_delta_request(session_id)
+    }
+
+    fn ready_delta_request(&self, session_id: &str) -> Option<Arc<TransformRequest>> {
         match self.entries.get(session_id) {
             Some(TransformSnapshot::Ready { request, .. }) => Some(Arc::clone(request)),
             _ => None,
@@ -2029,10 +2035,11 @@ impl BoundaryTokenCache {
 
 const NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct NativeDeltaFrontier {
     after: String,
     native_replace_from: usize,
+    projection_cache: Option<ProjectionCacheInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2067,6 +2074,7 @@ struct NativeAttachmentCacheSnapshot {
     sidecar_hashes: HashMap<String, [u8; 32]>,
     sidecar_sizes: HashMap<String, usize>,
     chunks: Vec<NativeEncodedChunk>,
+    projection: Option<Arc<crate::ck_wire::FlatProjection>>,
 }
 
 #[derive(Debug)]
@@ -2165,9 +2173,14 @@ impl NativeAttachmentCache {
             .saturating_add(sidecar_structure_bytes);
         // Encoded canonical bytes stand in for shared served-message allocations (hence the ×2).
         // Native sidecar trees are charged on top of the size estimate computed during hashing.
+        let projection_bytes = snapshot
+            .projection
+            .as_deref()
+            .map_or(0, crate::ck_wire::FlatProjection::retained_bytes);
         let retained_bytes = encoded_bytes
             .saturating_add(served_bytes.saturating_mul(2))
-            .saturating_add(sidecar_bytes);
+            .saturating_add(sidecar_bytes)
+            .saturating_add(projection_bytes);
         if retained_bytes > self.max_retained_bytes {
             return;
         }
@@ -2895,8 +2908,9 @@ impl McHandler {
     }
 
     /// Reconstruct a full ingress snapshot from the last successful request plus a validated
-    /// caller tail. The returned native frontier remains request-local and is never persisted as
-    /// authority; the incremental attachment cache rechecks its `after` fingerprint before reuse.
+    /// caller tail. The returned native frontier is used only for this request and is never stored
+    /// as authoritative cache state. Native attachment and prefix projection each verify the same
+    /// cache entry and `after` identity before reusing it.
     fn expand_transform_tail_delta(
         &self,
         parsed: &mut TransformRequest,
@@ -2916,12 +2930,36 @@ impl McHandler {
             .transform_snapshots
             .lock()
             .expect("transform snapshots mutex")
-            .ready_request_clone(&parsed.session_id)?;
+            .ready_delta_request(&parsed.session_id)?;
         if request.full_array_fingerprint.as_deref() != Some(after.as_str())
             || replace_from > request.messages.len()
         {
             return None;
         }
+        // A store-side rewrite can advance the epoch without updating this process's request
+        // snapshot. Load the persisted epoch first, then inspect the shared native/projection
+        // cache, so stale request state cannot select an outdated entry.
+        let current_revert_epoch = self
+            .store
+            .get()?
+            .load(&parsed.session_id)
+            .ok()?
+            .meta
+            .revert_epoch;
+        let projection_cache = self
+            .native_attachments
+            .lock()
+            .expect("native attachment cache mutex")
+            .snapshot(&parsed.session_id, current_revert_epoch)
+            .and_then(|snapshot| {
+                validated_projection_cache_input(
+                    parsed,
+                    &snapshot,
+                    &after,
+                    replace_from,
+                    ProjectionCacheKeyMode::Normal,
+                )
+            });
         let mut current_native = parsed.native_messages.take()?;
         let previous_native = request.native_messages.as_ref()?;
         if native_replace_from > previous_native.len() {
@@ -2937,6 +2975,7 @@ impl McHandler {
         Some(NativeDeltaFrontier {
             after,
             native_replace_from,
+            projection_cache,
         })
     }
 
@@ -6642,6 +6681,9 @@ impl McHandler {
                 &parsed,
                 &producer_ctx,
                 &self.serialized_outputs,
+                native_delta_frontier
+                    .as_ref()
+                    .and_then(|frontier| frontier.projection_cache.as_ref()),
             )
         };
         let reject_transform = |e: crate::transform::TransformError| {
@@ -6823,6 +6865,7 @@ impl McHandler {
         let mutation_exempt_mid = result.mutation_exempt_mid;
         let lineage_anchor_mid = result.lineage_anchor_mid;
         let tag_numbers = result.tag_numbers;
+        let projection = Arc::new(result.projection);
         let mut response = result.response;
         if response.committed {
             self.guidance_dates
@@ -6843,6 +6886,7 @@ impl McHandler {
                 native_delta_frontier.as_ref(),
                 revert_epoch,
                 &self.native_attachments,
+                Some(Arc::clone(&projection)),
                 NativeCacheKeyMode::Normal,
             )
         } else {
@@ -9893,6 +9937,13 @@ enum NativeCacheKeyMode {
     CorruptSidecarForTest,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionCacheKeyMode {
+    Normal,
+    #[cfg(test)]
+    CorruptFrontierForTest,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attach_native_messages_with_tags(
     response: &mut transform::TransformResponse,
@@ -9930,6 +9981,44 @@ fn native_attachment_context(
         profile_epoch: profile.map(profile_render_epoch).unwrap_or_default(),
         transition_consumed,
     }
+}
+
+/// Select the ingress projection using the same immutable cache snapshot that supplies native
+/// attachments.
+///
+/// Include the cached transition salt when comparing cache inputs because a transition found by
+/// the upcoming transform affects served rendering but not the ingress CK projection. Reuse a
+/// cached prefix only when the request's profile and rendering fields also match.
+fn validated_projection_cache_input(
+    request: &TransformRequest,
+    snapshot: &NativeAttachmentCacheSnapshot,
+    after: &str,
+    replace_from: usize,
+    mode: ProjectionCacheKeyMode,
+) -> Option<ProjectionCacheInput> {
+    if snapshot.full_array_fingerprint.as_deref() != Some(after) {
+        return None;
+    }
+    let current_context = native_attachment_context(request, snapshot.context.transition_consumed);
+    if current_context != snapshot.context {
+        return None;
+    }
+    let projection = Arc::clone(snapshot.projection.as_ref()?);
+    #[cfg(test)]
+    let prefix = if mode == ProjectionCacheKeyMode::CorruptFrontierForTest {
+        replace_from.saturating_add(1)
+    } else {
+        replace_from
+    };
+    #[cfg(not(test))]
+    let prefix = {
+        let _ = mode;
+        replace_from
+    };
+    (prefix <= projection.message_count()).then_some(ProjectionCacheInput {
+        projection,
+        replace_from: prefix,
+    })
 }
 
 fn validated_native_prefix(
@@ -10101,10 +10190,13 @@ fn encode_full_native_messages(
     native_messages
 }
 
+static NATIVE_ATTACHMENT_DIFFERENTIAL: OnceLock<bool> = OnceLock::new();
+
 fn native_attachment_differential_enabled() -> bool {
     cfg!(test)
-        || (cfg!(debug_assertions)
-            && std::env::var("MC_NATIVE_ATTACHMENT_DIFFERENTIAL").as_deref() == Ok("1"))
+        || *NATIVE_ATTACHMENT_DIFFERENTIAL.get_or_init(|| {
+            std::env::var("MC_NATIVE_ATTACHMENT_DIFFERENTIAL").as_deref() == Ok("1")
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10119,6 +10211,7 @@ fn attach_native_messages_incremental(
     native_delta_frontier: Option<&NativeDeltaFrontier>,
     revert_epoch: u64,
     cache: &Mutex<NativeAttachmentCache>,
+    projection: Option<Arc<crate::ck_wire::FlatProjection>>,
     mode: NativeCacheKeyMode,
 ) -> NativeAttachmentCacheStats {
     if !request.serve_native {
@@ -10360,6 +10453,7 @@ fn attach_native_messages_incremental(
                 sidecar_hashes,
                 sidecar_sizes,
                 chunks,
+                projection,
             },
             stats,
             served_bytes,
@@ -11978,7 +12072,7 @@ fn sel_kind_for_flat(block: &crate::ck_wire::FlatBlock) -> SelKind {
     match block.kind_tag.as_str() {
         "tool_call" => SelKind::ToolCall {
             name: block.name.clone().unwrap_or_default(),
-            input: block.tool_input.clone().unwrap_or(Value::Null),
+            input: block.tool_input.as_deref().cloned().unwrap_or(Value::Null),
         },
         "tool_result" => SelKind::ToolResult {
             tool_name: block.name.clone().unwrap_or_default(),
@@ -14557,6 +14651,7 @@ mod tests {
                         delta.get("native_replace_from")?.as_u64()?,
                     )
                     .ok()?,
+                    projection_cache: None,
                 })
             });
         let stats = attach_native_messages_incremental(
@@ -14570,9 +14665,47 @@ mod tests {
             native_delta_frontier.as_ref(),
             revert_epoch,
             cache,
+            Some(Arc::new(
+                crate::ck_wire::project_messages(&request.messages)
+                    .expect("native cache test projection must succeed"),
+            )),
             mode,
         );
         (response, stats)
+    }
+
+    fn seed_handler_delta_snapshot(
+        handler: &McHandler,
+        request: &TransformRequest,
+        revert_epoch: u64,
+    ) {
+        let served = request
+            .messages
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        run_native_cache_pass(
+            &handler.native_attachments,
+            request,
+            served,
+            &BTreeMap::new(),
+            false,
+            revert_epoch,
+            NativeCacheKeyMode::Normal,
+        );
+        let retained_bytes = serde_json::to_vec(request).unwrap().len();
+        let mut snapshots = handler
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex");
+        let generation = snapshots.begin(&request.session_id);
+        snapshots.finish_ready(
+            &request.session_id,
+            generation,
+            Arc::new(request.clone()),
+            revert_epoch,
+            retained_bytes,
+        );
     }
 
     #[test]
@@ -15253,6 +15386,256 @@ mod tests {
         );
     }
 
+    #[test]
+    fn projected_prefix_is_charged_to_the_shared_native_lru_budget() {
+        let ingress = vec![ck("budget-projection", 1, &"x".repeat(4096))];
+        let request = native_cache_request(
+            "projection-budget",
+            ingress.clone(),
+            vec![native_text_message(
+                "budget-projection",
+                "user",
+                &"x".repeat(4096),
+            )],
+            "projection-budget-fp",
+        );
+        let served = vec![ingress[0].ck.clone()];
+        let projection = Arc::new(
+            crate::ck_wire::project_messages(&request.messages)
+                .expect("budget projection must succeed"),
+        );
+        let without_projection = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let mut without_response = transform::TransformResponse::passthrough(
+            served.clone(),
+            request.full_array_fingerprint.clone(),
+        );
+        attach_native_messages_incremental(
+            &mut without_response,
+            &request,
+            0,
+            &BTreeMap::new(),
+            None,
+            None,
+            false,
+            None,
+            0,
+            &without_projection,
+            None,
+            NativeCacheKeyMode::Normal,
+        );
+        let without_charge = without_projection
+            .lock()
+            .expect("native attachment cache mutex")
+            .retained_bytes;
+
+        let with_projection = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let mut with_response = transform::TransformResponse::passthrough(
+            served,
+            request.full_array_fingerprint.clone(),
+        );
+        attach_native_messages_incremental(
+            &mut with_response,
+            &request,
+            0,
+            &BTreeMap::new(),
+            None,
+            None,
+            false,
+            None,
+            0,
+            &with_projection,
+            Some(Arc::clone(&projection)),
+            NativeCacheKeyMode::Normal,
+        );
+        let with_charge = with_projection
+            .lock()
+            .expect("native attachment cache mutex")
+            .retained_bytes;
+        assert_eq!(
+            with_charge.saturating_sub(without_charge),
+            projection.retained_bytes()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_small_lru_evicts_projection_and_attachment_together_then_runs_cold() {
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let session_a = "projection-lru-a";
+        let session_b = "projection-lru-b";
+        let session_c = "projection-lru-oversized";
+        handler.bind_route(7, binding(project.to_str().unwrap(), session_a));
+        handler.bind_route(8, binding(project.to_str().unwrap(), session_b));
+        handler.bind_route(9, binding(project.to_str().unwrap(), session_c));
+
+        let initial_a = native_cache_request(
+            session_a,
+            vec![
+                ck("lru-a-prefix", 1, &"a".repeat(4096)),
+                ck("lru-a-tail", 2, "before"),
+            ],
+            Vec::new(),
+            "lru-a-fp-1",
+        );
+        let response_a = call_transform_request_on_channel(
+            &handler,
+            7,
+            serde_json::to_value(initial_a).unwrap(),
+        )
+        .await;
+        assert_eq!(response_a["status"], "ok", "{response_a}");
+        let (entry_charge, projection_weak, attachment_weak) = {
+            let mut cache = handler.native_attachments.lock().unwrap();
+            let entry = &cache.sessions[session_a];
+            let projection = entry.snapshot.projection.as_ref().unwrap();
+            let chunk = entry
+                .snapshot
+                .chunks
+                .first()
+                .expect("encoded attachment chunk");
+            let values = (
+                entry.retained_bytes,
+                Arc::downgrade(projection),
+                Arc::downgrade(&chunk.value),
+            );
+            cache.max_retained_bytes = entry.retained_bytes;
+            values
+        };
+
+        let initial_b = native_cache_request(
+            session_b,
+            vec![
+                ck("lru-b-prefix", 1, &"b".repeat(4096)),
+                ck("lru-b-tail", 2, "before"),
+            ],
+            Vec::new(),
+            "lru-b-fp-1",
+        );
+        let response_b = call_transform_request_on_channel(
+            &handler,
+            8,
+            serde_json::to_value(initial_b).unwrap(),
+        )
+        .await;
+        assert_eq!(response_b["status"], "ok", "{response_b}");
+        {
+            let cache = handler.native_attachments.lock().unwrap();
+            assert!(!cache.sessions.contains_key(session_a));
+            assert!(cache.sessions.contains_key(session_b));
+        }
+        assert!(projection_weak.upgrade().is_none());
+        assert!(attachment_weak.upgrade().is_none());
+
+        assert!(entry_charge > 1);
+        handler
+            .native_attachments
+            .lock()
+            .unwrap()
+            .max_retained_bytes = entry_charge - 1;
+        let oversized = native_cache_request(
+            session_c,
+            vec![
+                ck("lru-c-prefix", 1, &"c".repeat(4096)),
+                ck("lru-c-tail", 2, "before"),
+            ],
+            Vec::new(),
+            "lru-c-fp-1",
+        );
+        let response_c = call_transform_request_on_channel(
+            &handler,
+            9,
+            serde_json::to_value(oversized).unwrap(),
+        )
+        .await;
+        assert_eq!(response_c["status"], "ok", "{response_c}");
+        assert!(!handler
+            .native_attachments
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key(session_c));
+
+        let mut cold_delta = native_cache_request(
+            session_a,
+            vec![ck("lru-a-tail", 2, "after")],
+            Vec::new(),
+            "lru-a-fp-2",
+        );
+        cold_delta.tail_delta = Some(json!({
+            "after": "lru-a-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        }));
+        let cold = call_transform_request_on_channel(
+            &handler,
+            7,
+            serde_json::to_value(cold_delta).unwrap(),
+        )
+        .await;
+        assert_eq!(cold["status"], "ok", "{cold}");
+        assert_eq!(cold["timings"]["projection_reused_messages"], 0);
+        assert_eq!(cold["timings"]["projection_projected_messages"], 2);
+        assert_eq!(cold["timings"]["native_cache_reused_messages"], 0);
+        assert!(
+            cold["timings"]["native_cache_encoded_messages"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "incremental prefix projection byte drift")]
+    fn projection_differential_catches_corrupt_first_changed_position() {
+        let ingress = vec![ck("p1", 1, "one"), ck("p2", 2, "two")];
+        let request = native_cache_request(
+            "projection-key-mutation",
+            ingress.clone(),
+            vec![
+                native_text_message("p1", "user", "one"),
+                native_text_message("p2", "user", "two"),
+            ],
+            "projection-fp-1",
+        );
+        let served = ingress
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        run_native_cache_pass(
+            &cache,
+            &request,
+            served,
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        let snapshot = cache
+            .lock()
+            .expect("native attachment cache mutex")
+            .snapshot(&request.session_id, 0)
+            .expect("projection cache snapshot");
+        let mut changed = request;
+        changed.messages[1] = ck("p2", 2, "changed");
+        changed.full_array_fingerprint = Some("projection-fp-2".to_string());
+        let corrupt = validated_projection_cache_input(
+            &changed,
+            &snapshot,
+            "projection-fp-1",
+            1,
+            ProjectionCacheKeyMode::CorruptFrontierForTest,
+        )
+        .expect("corrupt projection cache key");
+        let incremental = crate::ck_wire::project_messages_incremental(
+            &changed.messages,
+            &corrupt.projection,
+            corrupt.replace_from,
+        )
+        .expect("corrupt incremental projection still parses");
+        transform::assert_prefix_projection_equivalent(&incremental, &changed.messages).unwrap();
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "OpenCode serialization produced duplicate tool_use ids")]
@@ -15297,6 +15680,599 @@ mod tests {
             0,
             NativeCacheKeyMode::Normal,
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_tail_delta_cross_frontier_tool_arc_matches_full_control() {
+        let (cached_handler, cached_store, _cached_dir, _cached_project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let (control_handler, control_store, _control_dir, _control_project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let initial_messages = vec![
+            ck_reasoning("reasoning-old", 1, "signed reasoning"),
+            assistant_tool_call("call-project", 2),
+            tool_result("result-project", 3, "first result"),
+        ];
+        for handler in [&cached_handler, &control_handler] {
+            let initial = native_cache_request(
+                "ses",
+                initial_messages.clone(),
+                Vec::new(),
+                "projection-handler-fp-1",
+            );
+            let response =
+                call_transform_request(handler, serde_json::to_value(initial).unwrap()).await;
+            assert_eq!(response["status"], "ok", "{response}");
+        }
+
+        let changed_messages = vec![
+            ck_reasoning("reasoning-old", 1, "signed reasoning"),
+            assistant_tool_call("call-project", 2),
+            tool_result("result-project", 3, "changed result"),
+        ];
+        let mut delta = native_cache_request(
+            "ses",
+            vec![changed_messages[2].clone()],
+            Vec::new(),
+            "projection-handler-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "projection-handler-fp-1",
+            "replace_from": 2,
+            "native_replace_from": 0,
+        }));
+        let cached =
+            call_transform_request(&cached_handler, serde_json::to_value(delta).unwrap()).await;
+        let full = call_transform_request(
+            &control_handler,
+            serde_json::to_value(native_cache_request(
+                "ses",
+                changed_messages,
+                Vec::new(),
+                "projection-handler-fp-2",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(cached["status"], "ok", "{cached}");
+        assert_eq!(full["status"], "ok", "{full}");
+        assert_eq!(cached["timings"]["projection_reused_messages"], 2);
+        assert_eq!(cached["timings"]["projection_projected_messages"], 1);
+        assert_eq!(full["timings"]["projection_reused_messages"], 0);
+        assert_eq!(full["timings"]["projection_projected_messages"], 3);
+
+        for field in [
+            "action",
+            "decision",
+            "materialize_reason",
+            "boundary_id",
+            "coverage_ordinal",
+            "historian",
+            "ck_messages",
+            "native_messages",
+        ] {
+            assert_eq!(cached[field], full[field], "full-control drift in {field}");
+        }
+        let result = cached["ck_messages"]
+            .as_array()
+            .expect("CK response array")
+            .iter()
+            .find(|message| message["meta"]["harness_id"] == "result-project")
+            .expect("changed result message");
+        assert_eq!(
+            result["content"][0]["kind"]["output"]["kind"]["text"],
+            "changed result"
+        );
+        codec::opencode::assert_unique_tool_use_ids(
+            cached["native_messages"]
+                .as_array()
+                .expect("native response array")
+                .iter(),
+        );
+
+        let cached_projection = cached_handler
+            .native_attachments
+            .lock()
+            .expect("cached native attachment mutex")
+            .snapshot("ses", cached_store.load("ses").unwrap().meta.revert_epoch)
+            .and_then(|snapshot| snapshot.projection)
+            .expect("cached projection snapshot");
+        let full_projection = control_handler
+            .native_attachments
+            .lock()
+            .expect("control native attachment mutex")
+            .snapshot("ses", control_store.load("ses").unwrap().meta.revert_epoch)
+            .and_then(|snapshot| snapshot.projection)
+            .expect("full projection snapshot");
+        assert_eq!(cached_projection, full_projection);
+        assert_eq!(
+            cached_projection.differential_bytes(),
+            full_projection.differential_bytes(),
+            "projected bytes must match the full control"
+        );
+        let cached_state = cached_store.load("ses").unwrap();
+        let full_state = control_store.load("ses").unwrap();
+        assert_eq!(cached_state.core, full_state.core, "selection/core drift");
+        assert_eq!(
+            cached_state.meta.historian, full_state.meta.historian,
+            "historian boundary math drift"
+        );
+
+        let mut changed_context = native_cache_request(
+            "ses",
+            vec![tool_result("result-project", 3, "changed again")],
+            Vec::new(),
+            "projection-handler-fp-3",
+        );
+        changed_context.render_config = "cfg1".to_string();
+        changed_context.tail_delta = Some(json!({
+            "after": "projection-handler-fp-2",
+            "replace_from": 2,
+            "native_replace_from": 0,
+        }));
+        let third = call_transform_request(
+            &cached_handler,
+            serde_json::to_value(changed_context).unwrap(),
+        )
+        .await;
+        assert_eq!(third["status"], "ok", "{third}");
+        assert_eq!(third["timings"]["projection_reused_messages"], 0);
+        assert_eq!(third["timings"]["projection_projected_messages"], 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_delta_rechecks_durable_revert_epoch_before_projection_reuse() {
+        let session = "projection-revert-epoch";
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        let initial = native_cache_request(
+            session,
+            vec![
+                ck("epoch-prefix", 1, "prefix"),
+                ck("epoch-tail", 2, "before"),
+            ],
+            Vec::new(),
+            "epoch-fp-1",
+        );
+        let first = call_transform_request(&handler, serde_json::to_value(initial).unwrap()).await;
+        assert_eq!(first["status"], "ok", "{first}");
+        let loaded = store.load(session).unwrap();
+        let mut bumped = loaded.meta.clone();
+        bumped.revert_epoch = bumped.revert_epoch.saturating_add(1);
+        store
+            .commit(session, loaded.row_version, &loaded.core, &bumped)
+            .unwrap();
+
+        let mut delta = native_cache_request(
+            session,
+            vec![ck("epoch-tail", 2, "after")],
+            Vec::new(),
+            "epoch-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "epoch-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        }));
+        let response = call_transform_request(&handler, serde_json::to_value(delta).unwrap()).await;
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_eq!(response["timings"]["projection_reused_messages"], 0);
+        assert_eq!(response["timings"]["projection_projected_messages"], 2);
+        let cache = handler
+            .native_attachments
+            .lock()
+            .expect("native attachment cache mutex");
+        assert_eq!(cache.sessions[session].revert_epoch, bumped.revert_epoch);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_delta_reconcile_recut_refreshes_projection_epoch_and_frontier() {
+        let session = "projection-reconcile-recut";
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        store
+            .replace_compartments(
+                session,
+                &[
+                    stored_comp(1, 1, 1, "a", "S0"),
+                    stored_comp(2, 2, 2, "t2", "S1"),
+                ],
+            )
+            .unwrap();
+        let initial_messages = vec![
+            ck("a", 1, "raw"),
+            ck("t2", 2, "turn two"),
+            ck("t3", 3, "tail"),
+        ];
+        let initial = native_cache_request(session, initial_messages, Vec::new(), "reconcile-fp-1");
+        let boot = call_transform_request(&handler, serde_json::to_value(initial).unwrap()).await;
+        assert_eq!(boot["action"], "HARD", "{boot}");
+
+        let mut reverted = native_cache_request(
+            session,
+            vec![ck("t4", 2, "new turn")],
+            Vec::new(),
+            "reconcile-fp-2",
+        );
+        reverted.tail_delta = Some(json!({
+            "after": "reconcile-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        }));
+        let soft = call_transform_request(&handler, serde_json::to_value(reverted).unwrap()).await;
+        assert_eq!(soft["reconcile_pending"], true, "{soft}");
+        let loaded = store.load(session).unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.last_execute_ordinal = 99;
+        store
+            .commit(session, loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+
+        let mut recut = native_cache_request(
+            session,
+            vec![ck("t4", 2, "new turn")],
+            Vec::new(),
+            "reconcile-fp-3",
+        );
+        recut.tail_delta = Some(json!({
+            "after": "reconcile-fp-2",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        }));
+        let hard = call_transform_request(&handler, serde_json::to_value(recut).unwrap()).await;
+        assert_eq!(hard["action"], "HARD", "{hard}");
+        assert_eq!(hard["boundary_id"], "a#0");
+        assert_eq!(hard["coverage_ordinal"], 1);
+        assert_eq!(hard["reconcile_pending"], false);
+        assert_eq!(hard["timings"]["projection_reused_messages"], 1);
+        let durable = store.load(session).unwrap();
+        assert_eq!(durable.meta.revert_epoch, 1);
+        let acknowledged = handler
+            .transform_snapshots
+            .lock()
+            .unwrap()
+            .ready_request_clone(session)
+            .unwrap();
+        let expected = crate::ck_wire::project_messages(&acknowledged.messages).unwrap();
+        let cache = handler
+            .native_attachments
+            .lock()
+            .expect("native attachment cache mutex");
+        let cached = &cache.sessions[session];
+        assert_eq!(cached.revert_epoch, durable.meta.revert_epoch);
+        assert_eq!(cached.snapshot.projection.as_deref(), Some(&expected));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_delta_boundary_divergence_recut_retries_cas_without_stale_projection() {
+        let session = "projection-boundary-recut-cas";
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        let mut previous = crate::transform::tests::seed_astro_divergence(&store, session, 2_442);
+        previous.serializer_profile = "opencode-aisdk".to_string();
+        previous.serve_native = true;
+        previous.native_messages = Some(Vec::new());
+        previous.full_array_fingerprint = Some("boundary-recut-fp-1".to_string());
+        let epoch = store.load(session).unwrap().meta.revert_epoch;
+        seed_handler_delta_snapshot(&handler, &previous, epoch);
+
+        let hook_fired = Arc::new(AtomicBool::new(false));
+        let hook_flag = Arc::clone(&hook_fired);
+        let hook_store = Arc::clone(&store);
+        let hook_session = session.to_string();
+        crate::transform::install_transform_attempt_hook(session, move || {
+            assert!(!hook_flag.swap(true, Ordering::SeqCst));
+            let loaded = hook_store.load(&hook_session).unwrap();
+            hook_store
+                .commit(
+                    &hook_session,
+                    loaded.row_version,
+                    &loaded.core,
+                    &loaded.meta,
+                )
+                .unwrap();
+        });
+
+        let replace_from = previous.messages.len() - 1;
+        let mut delta = native_cache_request(
+            session,
+            vec![previous.messages[replace_from].clone()],
+            Vec::new(),
+            "boundary-recut-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "boundary-recut-fp-1",
+            "replace_from": replace_from,
+            "native_replace_from": 0,
+        }));
+        let response = call_transform_request(&handler, serde_json::to_value(delta).unwrap()).await;
+        assert_eq!(response["status"], "ok", "{response}");
+        assert!(hook_fired.load(Ordering::SeqCst));
+        assert_eq!(response["action"], "HARD");
+        assert_eq!(response["materialize_reason"], "boundary_divergence_recut");
+        assert_eq!(response["boundary_id"], "m2400#0");
+        assert_eq!(response["coverage_ordinal"], 2400);
+        assert_eq!(
+            response["timings"]["projection_reused_messages"],
+            replace_from
+        );
+        let acknowledged = handler
+            .transform_snapshots
+            .lock()
+            .unwrap()
+            .ready_request_clone(session)
+            .unwrap();
+        let expected = crate::ck_wire::project_messages(&acknowledged.messages).unwrap();
+        let cache = handler.native_attachments.lock().unwrap();
+        let cached = cache.sessions[session]
+            .snapshot
+            .projection
+            .as_deref()
+            .expect("post-retry projection");
+        assert_eq!(cached, &expected);
+        assert_eq!(cached.differential_bytes(), expected.differential_bytes());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_delta_tail_mutation_re_adopts_identity_from_cached_prefix() {
+        let session = "projection-tail-readopt";
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        store
+            .replace_compartments(session, &[stored_comp(1, 1, 1, "covered", "SUMMARY")])
+            .unwrap();
+        let initial = native_cache_request(
+            session,
+            vec![ck("covered", 1, "covered"), ck("tail", 2, "before")],
+            Vec::new(),
+            "readopt-fp-1",
+        );
+        let first = call_transform_request(&handler, serde_json::to_value(initial).unwrap()).await;
+        assert_eq!(first["status"], "ok", "{first}");
+        let old_identity = store.load(session).unwrap().meta.block_identity_by_mid["tail"].clone();
+
+        let mut delta = native_cache_request(
+            session,
+            vec![ck("tail", 2, "after")],
+            Vec::new(),
+            "readopt-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "readopt-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        }));
+        let adopted = call_transform_request(&handler, serde_json::to_value(delta).unwrap()).await;
+        assert_eq!(adopted["status"], "ok", "{adopted}");
+        assert_eq!(adopted["timings"]["projection_reused_messages"], 1);
+        assert_eq!(adopted["first_divergence"]["kind"], "content_changed");
+        let durable = store.load(session).unwrap();
+        assert_eq!(durable.meta.tail_identity_re_adopt_count, 1);
+        assert_ne!(durable.meta.block_identity_by_mid["tail"], old_identity);
+        let acknowledged = handler
+            .transform_snapshots
+            .lock()
+            .unwrap()
+            .ready_request_clone(session)
+            .unwrap();
+        let expected = crate::ck_wire::project_messages(&acknowledged.messages).unwrap();
+        assert_eq!(
+            handler.native_attachments.lock().unwrap().sessions[session]
+                .snapshot
+                .projection
+                .as_deref(),
+            Some(&expected)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_delta_d5_lineage_descent_forces_full_projection() {
+        let target = "projection-lineage-target";
+        let source = "projection-lineage-source";
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        handler.bind_route(7, binding(project.to_str().unwrap(), target));
+        handler.bind_route(8, binding(project.to_str().unwrap(), source));
+        let source_messages = (1..=10)
+            .map(|ordinal| {
+                ck(
+                    &format!("prior-{ordinal}"),
+                    ordinal,
+                    &format!("turn {ordinal}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let source_request =
+            native_cache_request(source, source_messages, Vec::new(), "lineage-source-fp");
+        let source_response = call_transform_request_on_channel(
+            &handler,
+            8,
+            serde_json::to_value(source_request).unwrap(),
+        )
+        .await;
+        assert_eq!(source_response["status"], "ok", "{source_response}");
+        store
+            .append_compartments(
+                source,
+                &[
+                    stored_comp(1, 1, 3, "prior-3", "history one through three"),
+                    stored_comp(2, 4, 6, "prior-6", "history four through six"),
+                ],
+            )
+            .unwrap();
+        let source_epoch = store.load(source).unwrap().meta.revert_epoch;
+        let summary = "This session is being continued from a previous conversation.\n\nSummary:\nDurable summary alpha\n\nFull transcript: /tmp/session.jsonl";
+        let compaction_user = CkIngressMessage {
+            mid: "lineage-summary".to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "user",
+                vec![
+                    CkWireBlock::bare(CkKind::Text {
+                        text: "<system-reminder>Today's date: 2026-08-10</system-reminder>"
+                            .to_string(),
+                    }),
+                    CkWireBlock::bare(CkKind::Text {
+                        text: summary.to_string(),
+                    }),
+                ],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta {
+                    harness_id: Some("lineage-summary".to_string()),
+                    ..Default::default()
+                },
+            ),
+        };
+        let initial_messages = vec![
+            compaction_user,
+            ck_with_role("lineage-tail", 2, "assistant", "continued answer"),
+        ];
+        let configure_lineage = |request: &mut TransformRequest, subagent: bool| {
+            request.lineage_switched = true;
+            request.is_subagent = subagent;
+            request.descent_edge_id = 101;
+            request.prior_conversation_key = source.to_string();
+            request.prior_epoch = source_epoch;
+            request.new_epoch = source_epoch.saturating_add(1);
+            request.constituents = vec![(
+                source.to_string(),
+                target.to_string(),
+                source_epoch.saturating_add(1),
+            )];
+            request.compaction_observed = true;
+        };
+        let mut subagent = native_cache_request(
+            target,
+            initial_messages.clone(),
+            Vec::new(),
+            "lineage-target-fp-1",
+        );
+        configure_lineage(&mut subagent, true);
+        let passthrough =
+            call_transform_request(&handler, serde_json::to_value(subagent).unwrap()).await;
+        assert_eq!(passthrough["status"], "ok", "{passthrough}");
+
+        let mut descent = native_cache_request(
+            target,
+            vec![ck_with_role(
+                "lineage-tail",
+                2,
+                "assistant",
+                "continued answer changed",
+            )],
+            Vec::new(),
+            "lineage-target-fp-2",
+        );
+        configure_lineage(&mut descent, false);
+        descent.tail_delta = Some(json!({
+            "after": "lineage-target-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        }));
+        let descended =
+            call_transform_request(&handler, serde_json::to_value(descent).unwrap()).await;
+        assert_eq!(descended["status"], "ok", "{descended}");
+        assert_eq!(descended["lineage_descent_disposition"], "descended");
+        assert_eq!(descended["lineage_switch_consumed_id"], 101);
+        assert_eq!(descended["timings"]["projection_reused_messages"], 0);
+        assert_eq!(descended["timings"]["projection_projected_messages"], 2);
+        assert!(store.load(target).unwrap().meta.descent_completed);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_delta_normalization_matches_full_when_reserved_todo_starts_at_frontier() {
+        let (cached_handler, _cached_store, _cached_dir, _cached_project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let (control_handler, _control_store, _control_dir, _control_project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let initial_messages = vec![
+            ck("todo-prefix", 1, "prefix"),
+            assistant_tool_call("call-ordinary", 2),
+            tool_result("result-ordinary", 3, "ordinary"),
+        ];
+        for handler in [&cached_handler, &control_handler] {
+            let request = native_cache_request(
+                "ses",
+                initial_messages.clone(),
+                Vec::new(),
+                "todo-normalize-fp-1",
+            );
+            let response =
+                call_transform_request(handler, serde_json::to_value(request).unwrap()).await;
+            assert_eq!(response["status"], "ok", "{response}");
+        }
+
+        let pair = injection::build_synthetic_todo_pair(
+            r#"[{"content":"pin normalization","status":"in_progress","priority":"high"}]"#,
+        )
+        .unwrap();
+        let mut call = pair.assistant_msg;
+        call.meta.synthetic = false;
+        call.meta.harness_id = Some("todo-reserved-call".to_string());
+        let mut result = pair.tool_msg;
+        result.meta.synthetic = false;
+        result.meta.harness_id = Some("todo-reserved-result".to_string());
+        let changed_messages = vec![
+            ck("todo-prefix", 1, "prefix"),
+            CkIngressMessage {
+                mid: "todo-reserved-call".to_string(),
+                ordinal: 2,
+                ck: call,
+            },
+            CkIngressMessage {
+                mid: "todo-reserved-result".to_string(),
+                ordinal: 3,
+                ck: result,
+            },
+        ];
+        let mut delta = native_cache_request(
+            "ses",
+            changed_messages[1..].to_vec(),
+            Vec::new(),
+            "todo-normalize-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "todo-normalize-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        }));
+        let cached =
+            call_transform_request(&cached_handler, serde_json::to_value(delta).unwrap()).await;
+        let full = call_transform_request(
+            &control_handler,
+            serde_json::to_value(native_cache_request(
+                "ses",
+                changed_messages,
+                Vec::new(),
+                "todo-normalize-fp-2",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(cached["status"], "ok", "{cached}");
+        assert_eq!(cached["timings"]["projection_reused_messages"], 1);
+        assert_eq!(cached["ck_messages"], full["ck_messages"]);
+        let cached_projection = cached_handler.native_attachments.lock().unwrap().sessions["ses"]
+            .snapshot
+            .projection
+            .clone()
+            .unwrap();
+        let full_projection = control_handler.native_attachments.lock().unwrap().sessions["ses"]
+            .snapshot
+            .projection
+            .clone()
+            .unwrap();
+        assert_eq!(cached_projection, full_projection);
+        assert!(cached_projection
+            .blocks
+            .iter()
+            .skip(1)
+            .all(|block| block.synthetic));
     }
 
     #[tokio::test(flavor = "current_thread")]

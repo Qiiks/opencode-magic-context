@@ -481,6 +481,7 @@ fn spawn_module(module_bin: &Path, connection_file: &Path, data_home: &Path) -> 
         .env(subc_protocol::SUBC_MODULE_ID_ENV, MODULE_ID)
         .env("XDG_DATA_HOME", data_home)
         .env("MC_NATIVE_ATTACHMENT_DIFFERENTIAL", "1")
+        .env("MC_PREFIX_PROJECTION_DIFFERENTIAL", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
