@@ -5,10 +5,10 @@ Git predicates. It reads exactly one JSON request from stdin and writes exactly 
 response to stdout.
 
 ```json
-{"cursor":null,"config":{"kind":"path_exists","path":"/workspace/result.json"}}
+{"scalar":null,"config":{"kind":"path_exists","path":"/workspace/result.json"}}
 ```
 
-A successful check exits `0` and returns `{"events": [...], "cursor": {...}}`. An empty
+A successful check exits `0` and returns `{"events": [...], "scalar": {...}}`. An empty
 `events` array means the filesystem or repository was checked and the condition did not fire.
 A check that could not be performed exits nonzero, writes no stdout, and writes one JSON line
 to stderr: `{"code":"...","message":"..."}`.
@@ -26,9 +26,12 @@ atomic predicates. Unknown fields are rejected.
 | `git_commit_after` | `repo_path`, optional `ref`, `sha` | The local ref (default `HEAD`) is a strict descendant of `sha`. Each newly observed descendant commit is a new occurrence. |
 | `git_tag_matching` | `repo_path`, `pattern`, optional `above` | A newly observed local tag matches Git's tag-list glob and, when supplied, is semantically newer than `above`. |
 
-The cursor is opaque to callers and must be passed back unchanged. It records the last state
-of each predicate. A condition fires on its first matching observation and when it enters a
-matching state again; unchanged states emit nothing. Each event has this shape:
+The scalar is opaque to callers and must be passed back unchanged. It is a scalar-diff value
+(observed-vs-stored, emit-on-change) that records the last state of each predicate. The wire
+field was renamed from `cursor` to `scalar` to match the contract note's scalar-diff naming pin
+before any consumer existed, so no compatibility shim is needed. A condition fires on its first
+matching observation and when it enters a matching state again; unchanged states emit nothing.
+Each event has this shape:
 
 ```json
 {
@@ -74,4 +77,4 @@ bun run smoke
 ```
 
 The smoke example creates a real temporary file, invokes the executable twice, and verifies
-that the returned cursor suppresses the unchanged second observation.
+that the returned scalar suppresses the unchanged second observation.

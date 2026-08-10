@@ -7,7 +7,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const CURSOR_VERSION = 1;
+const SCALAR_VERSION = 1;
 
 export type AtomicPredicate =
     | { kind: "file_contains"; path: string; needle: string; absent?: boolean }
@@ -18,14 +18,14 @@ export type AtomicPredicate =
 
 export type ProviderConfig = AtomicPredicate | { any: readonly AtomicPredicate[] };
 
-interface PredicateCursor {
+interface PredicateScalar {
     state: unknown;
     occurrence: number;
 }
 
-export interface ProviderCursor {
+export interface ProviderScalar {
     version: 1;
-    predicates: Record<string, PredicateCursor>;
+    predicates: Record<string, PredicateScalar>;
 }
 
 export interface ProviderEvent {
@@ -39,7 +39,7 @@ export interface ProviderEvent {
 
 export interface ProviderOutput {
     events: ProviderEvent[];
-    cursor: ProviderCursor;
+    scalar: ProviderScalar;
 }
 
 interface EvaluationOptions {
@@ -67,23 +67,23 @@ export async function runProvider(
     input: unknown,
     options: EvaluationOptions = {},
 ): Promise<ProviderOutput> {
-    const { config, cursor } = parseInput(input);
+    const { config, scalar } = parseInput(input);
     const predicates = "any" in config ? config.any : [config];
-    const previous = cursor?.predicates ?? {};
-    const next: ProviderCursor = { version: CURSOR_VERSION, predicates: {} };
+    const previous = scalar?.predicates ?? {};
+    const next: ProviderScalar = { version: SCALAR_VERSION, predicates: {} };
     const events: ProviderEvent[] = [];
     const firedAt = (options.now ?? Date.now)();
 
     for (const [index, predicate] of predicates.entries()) {
         const predicateHash = sha256(canonicalJson(predicate));
-        const cursorKey = `${index}:${predicateHash}`;
+        const scalarKey = `${index}:${predicateHash}`;
         const canonicalPath = await canonicalizeAndFence(
             "repo_path" in predicate ? predicate.repo_path : predicate.path,
             predicate.kind === "path_exists",
             options.homeDirectory,
         );
-        const evaluated = await evaluatePredicate(predicate, canonicalPath, previous[cursorKey]);
-        next.predicates[cursorKey] = {
+        const evaluated = await evaluatePredicate(predicate, canonicalPath, previous[scalarKey]);
+        next.predicates[scalarKey] = {
             state: evaluated.state,
             occurrence: evaluated.occurrence,
         };
@@ -100,13 +100,13 @@ export async function runProvider(
         }
     }
 
-    return { events, cursor: next };
+    return { events, scalar: next };
 }
 
 async function evaluatePredicate(
     predicate: AtomicPredicate,
     canonicalPath: string,
-    previous: PredicateCursor | undefined,
+    previous: PredicateScalar | undefined,
 ): Promise<EvaluatedPredicate> {
     switch (predicate.kind) {
         case "file_contains": {
@@ -201,7 +201,7 @@ async function evaluatePredicate(
 function evaluateBooleanState(
     state: boolean,
     matches: boolean,
-    previous: PredicateCursor | undefined,
+    previous: PredicateScalar | undefined,
     observed: Record<string, unknown>,
 ): EvaluatedPredicate {
     const transitioned = previous === undefined || previous.state !== state;
@@ -469,15 +469,15 @@ function compareSemver(left: Semver, right: Semver): number {
     return 0;
 }
 
-function parseInput(input: unknown): { config: ProviderConfig; cursor: ProviderCursor | null } {
+function parseInput(input: unknown): { config: ProviderConfig; scalar: ProviderScalar | null } {
     const request = requireObject(input, "request");
-    requireOnlyKeys(request, ["cursor", "config"], "request");
-    if (!("cursor" in request) || !("config" in request)) {
-        invalid("Request must contain cursor and config");
+    requireOnlyKeys(request, ["scalar", "config"], "request");
+    if (!("scalar" in request) || !("config" in request)) {
+        invalid("Request must contain scalar and config");
     }
     return {
         config: parseConfig(request.config),
-        cursor: parseCursor(request.cursor),
+        scalar: parseScalar(request.scalar),
     };
 }
 
@@ -554,29 +554,29 @@ function parseAtomicPredicate(value: unknown): AtomicPredicate {
     }
 }
 
-function parseCursor(value: unknown): ProviderCursor | null {
+function parseScalar(value: unknown): ProviderScalar | null {
     if (value === null) {
         return null;
     }
-    const cursor = requireObject(value, "cursor");
-    requireOnlyKeys(cursor, ["version", "predicates"], "cursor");
-    if (cursor.version !== CURSOR_VERSION) {
-        invalid(`cursor.version must be ${CURSOR_VERSION}`);
+    const scalar = requireObject(value, "scalar");
+    requireOnlyKeys(scalar, ["version", "predicates"], "scalar");
+    if (scalar.version !== SCALAR_VERSION) {
+        invalid(`scalar.version must be ${SCALAR_VERSION}`);
     }
-    const predicates = requireObject(cursor.predicates, "cursor.predicates");
-    const parsed: Record<string, PredicateCursor> = {};
+    const predicates = requireObject(scalar.predicates, "scalar.predicates");
+    const parsed: Record<string, PredicateScalar> = {};
     for (const [key, raw] of Object.entries(predicates)) {
-        const entry = requireObject(raw, `cursor.predicates.${key}`);
-        requireOnlyKeys(entry, ["state", "occurrence"], `cursor.predicates.${key}`);
+        const entry = requireObject(raw, `scalar.predicates.${key}`);
+        requireOnlyKeys(entry, ["state", "occurrence"], `scalar.predicates.${key}`);
         if (!("state" in entry)) {
-            invalid(`cursor.predicates.${key}.state is required`);
+            invalid(`scalar.predicates.${key}.state is required`);
         }
         if (!Number.isSafeInteger(entry.occurrence) || (entry.occurrence as number) < 0) {
-            invalid(`cursor.predicates.${key}.occurrence must be a non-negative integer`);
+            invalid(`scalar.predicates.${key}.occurrence must be a non-negative integer`);
         }
         parsed[key] = { state: entry.state, occurrence: entry.occurrence as number };
     }
-    return { version: CURSOR_VERSION, predicates: parsed };
+    return { version: SCALAR_VERSION, predicates: parsed };
 }
 
 function requireObject(value: unknown, field: string): Record<string, unknown> {
