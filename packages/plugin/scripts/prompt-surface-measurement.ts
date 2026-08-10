@@ -1,10 +1,15 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import Tokenizer from "ai-tokenizer";
+import type { ToolDefinition } from "@opencode-ai/plugin";
 import * as claudeEncoding from "ai-tokenizer/encoding/claude";
 import { buildMagicContextSection } from "../src/agents/magic-context-prompt";
 import { normalizeToolArgSchemas } from "../src/plugin/normalize-tool-arg-schemas";
-import { LIGHT_TOOL_DESCRIPTIONS } from "../src/shared/prompt-surface-runtime";
+import {
+    ACTIVE_TOOL_IDS,
+    LIGHT_TOOL_DESCRIPTIONS,
+    type PromptSurfaceToolId,
+} from "../src/shared/prompt-surface-runtime";
 import { createCtxExpandTools } from "../src/tools/ctx-expand/tools";
 import { createCtxMemoryTools } from "../src/tools/ctx-memory/tools";
 import { createCtxNoteTools } from "../src/tools/ctx-note/tools";
@@ -16,15 +21,7 @@ export const TOKENIZER_ENCODING = "claude";
 export const TOKENIZER_VERSION = "1.0.6";
 export const PRIMARY_VARIANT_ID = "primary-full-reduce-memory-on";
 
-export const ACTIVE_TOOL_IDS = [
-    "ctx_reduce",
-    "ctx_expand",
-    "ctx_note",
-    "ctx_memory",
-    "ctx_search",
-] as const;
-
-export type ToolId = (typeof ACTIVE_TOOL_IDS)[number];
+export type ToolId = PromptSurfaceToolId;
 
 export interface TokenCount {
     chars: number;
@@ -114,13 +111,23 @@ function buildToolDefinitions() {
         },
     ) as never;
 
-    const definitions = {
-        ...createCtxReduceTools(stubDeps),
-        ...createCtxExpandTools(stubDeps),
-        ...createCtxNoteTools(stubDeps),
-        ...createCtxMemoryTools(stubDeps),
-        ...createCtxSearchTools(stubDeps),
-    };
+    const definitions: Record<string, ToolDefinition> = Object.assign(
+        {},
+        createCtxReduceTools(stubDeps),
+        createCtxExpandTools(stubDeps),
+        createCtxNoteTools(stubDeps),
+        createCtxMemoryTools(stubDeps),
+        createCtxSearchTools(stubDeps),
+    );
+    const definitionIds = new Set(Object.keys(definitions));
+    const canonicalIds = new Set<string>(ACTIVE_TOOL_IDS);
+    const missing = ACTIVE_TOOL_IDS.filter((id) => !definitionIds.has(id));
+    const extra = Object.keys(definitions).filter((id) => !canonicalIds.has(id));
+    if (missing.length > 0 || extra.length > 0) {
+        throw new Error(
+            `Prompt-surface measurement tool definitions drifted from ACTIVE_TOOL_IDS (missing: ${missing.join(", ") || "none"}; extra: ${extra.join(", ") || "none"})`,
+        );
+    }
 
     for (const definition of Object.values(definitions)) {
         normalizeToolArgSchemas(definition);
