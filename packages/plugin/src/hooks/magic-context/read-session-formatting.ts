@@ -126,14 +126,17 @@ let tokenizer: TokenizerLike | undefined;
 function getTokenizer(): TokenizerLike {
     if (tokenizer) return tokenizer;
 
-    const tokenizerModule = requireFromThisModule("ai-tokenizer") as {
+    // Non-literal specifiers keep Bun's bundler static analysis from folding
+    // the Claude vocabulary into the eager chunk (same convention as the
+    // sqlite backend selector).
+    const tokenizerModule = requireFromThisModule("ai-" + "tokenizer") as {
         default?: TokenizerConstructor;
         Tokenizer?: TokenizerConstructor;
     };
     const Tokenizer = tokenizerModule.default ?? tokenizerModule.Tokenizer;
     if (!Tokenizer) throw new Error("ai-tokenizer does not expose a Tokenizer constructor");
 
-    const claudeEncoding = requireFromThisModule("ai-tokenizer/encoding/claude");
+    const claudeEncoding = requireFromThisModule("ai-tokenizer/encoding/" + "claude");
     tokenizer = new Tokenizer(claudeEncoding);
     return tokenizer;
 }
