@@ -6,14 +6,14 @@ const directory = await mkdtemp(join(tmpdir(), "retina-local-fs-smoke-"));
 const path = join(directory, "ready.txt");
 const cli = new URL("../src/cli.ts", import.meta.url).pathname;
 
-async function invoke(cursor: object | null): Promise<{ events: unknown[]; cursor: object }> {
+async function invoke(scalar: object | null): Promise<{ events: unknown[]; scalar: object }> {
     const child = Bun.spawn({
         cmd: ["bun", cli],
         stdin: "pipe",
         stdout: "pipe",
         stderr: "pipe",
     });
-    child.stdin.write(JSON.stringify({ cursor, config: { kind: "path_exists", path } }));
+    child.stdin.write(JSON.stringify({ scalar, config: { kind: "path_exists", path } }));
     child.stdin.end();
     const [exitCode, stdout, stderr] = await Promise.all([
         child.exited,
@@ -23,15 +23,15 @@ async function invoke(cursor: object | null): Promise<{ events: unknown[]; curso
     if (exitCode !== 0) {
         throw new Error(`provider exited ${exitCode}: ${stderr.trim()}`);
     }
-    return JSON.parse(stdout) as { events: unknown[]; cursor: object };
+    return JSON.parse(stdout) as { events: unknown[]; scalar: object };
 }
 
 try {
     await writeFile(path, "ready\n");
     const first = await invoke(null);
-    const second = await invoke(first.cursor);
+    const second = await invoke(first.scalar);
     if (first.events.length !== 1 || second.events.length !== 0) {
-        throw new Error("cursor round-trip did not suppress the unchanged observation");
+        throw new Error("scalar round-trip did not suppress the unchanged observation");
     }
     process.stdout.write(`${JSON.stringify({ first, second })}\n`);
 } finally {

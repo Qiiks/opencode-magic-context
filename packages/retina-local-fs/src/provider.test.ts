@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { type ProviderConfig, type ProviderCursor, ProviderError, runProvider } from "./provider";
+import { type ProviderConfig, ProviderError, type ProviderScalar, runProvider } from "./provider";
 
 const execFileAsync = promisify(execFile);
 const temporaryDirectories: string[] = [];
@@ -23,10 +23,10 @@ afterEach(async () => {
 
 async function poll(
     config: ProviderConfig,
-    cursor: ProviderCursor | null = null,
+    scalar: ProviderScalar | null = null,
     homeDirectory?: string,
 ) {
-    return runProvider({ cursor, config }, { homeDirectory, now: () => 1_786_320_000_000 });
+    return runProvider({ scalar, config }, { homeDirectory, now: () => 1_786_320_000_000 });
 }
 
 async function git(repo: string, ...args: string[]): Promise<string> {
@@ -62,10 +62,10 @@ describe("filesystem predicates", () => {
         const first = await poll(config);
         expect(first.events).toHaveLength(1);
         expect(first.events[0]?.observed).toEqual({ contains: true });
-        expect((await poll(config, first.cursor)).events).toHaveLength(0);
+        expect((await poll(config, first.scalar)).events).toHaveLength(0);
 
         await writeFile(path, "waiting\n");
-        expect((await poll(config, first.cursor)).events).toHaveLength(0);
+        expect((await poll(config, first.scalar)).events).toHaveLength(0);
 
         const absent = await poll({ ...config, absent: true });
         expect(absent.events).toHaveLength(1);
@@ -80,12 +80,12 @@ describe("filesystem predicates", () => {
         const missing = await poll(existsConfig);
         expect(missing.events).toHaveLength(0);
         await writeFile(path, "{}\n");
-        const appeared = await poll(existsConfig, missing.cursor);
+        const appeared = await poll(existsConfig, missing.scalar);
         expect(appeared.events).toHaveLength(1);
-        expect((await poll(existsConfig, appeared.cursor)).events).toHaveLength(0);
+        expect((await poll(existsConfig, appeared.scalar)).events).toHaveLength(0);
 
         await rm(path);
-        const gone = await poll({ ...existsConfig, gone: true }, appeared.cursor);
+        const gone = await poll({ ...existsConfig, gone: true }, appeared.scalar);
         expect(gone.events).toHaveLength(1);
         expect(gone.events[0]?.observed).toEqual({ exists: false });
     });
@@ -103,11 +103,11 @@ describe("filesystem predicates", () => {
         const config = { kind: "mtime_after", path, since_ms: firstTime.getTime() - 1 } as const;
         const first = await poll(config);
         expect(first.events).toHaveLength(1);
-        expect((await poll(config, first.cursor)).events).toHaveLength(0);
+        expect((await poll(config, first.scalar)).events).toHaveLength(0);
 
         const secondTime = new Date(firstTime.getTime() + 10_000);
         await utimes(path, secondTime, secondTime);
-        const second = await poll(config, first.cursor);
+        const second = await poll(config, first.scalar);
         expect(second.events).toHaveLength(1);
         expect(second.events[0]?.id).not.toBe(first.events[0]?.id);
     });
@@ -123,9 +123,9 @@ describe("filesystem predicates", () => {
         expect(replayA.events[0]?.id).toBe(replayB.events[0]?.id);
 
         await rm(path);
-        const absent = await poll(config, replayA.cursor);
+        const absent = await poll(config, replayA.scalar);
         await writeFile(path, "again");
-        const repeated = await poll(config, absent.cursor);
+        const repeated = await poll(config, absent.scalar);
         expect(repeated.events[0]?.id).not.toBe(replayA.events[0]?.id);
     });
 });
@@ -142,13 +142,13 @@ describe("git predicates", () => {
 
         const secondSha = await commit(repo, "two\n");
         const config = { kind: "git_commit_after", repo_path: repo, sha: firstSha } as const;
-        const second = await poll(config, equal.cursor);
+        const second = await poll(config, equal.scalar);
         expect(second.events).toHaveLength(1);
         expect(second.events[0]?.observed.sha).toBe(secondSha);
-        expect((await poll(config, second.cursor)).events).toHaveLength(0);
+        expect((await poll(config, second.scalar)).events).toHaveLength(0);
 
         const thirdSha = await commit(repo, "three\n");
-        const third = await poll(config, second.cursor);
+        const third = await poll(config, second.scalar);
         expect(third.events[0]?.observed.sha).toBe(thirdSha);
         expect(third.events[0]?.id).not.toBe(second.events[0]?.id);
     });
@@ -166,22 +166,22 @@ describe("git predicates", () => {
         expect(quiet.events).toHaveLength(0);
 
         await git(repo, "tag", "v1.0.0");
-        const thresholdQuiet = await poll(config, quiet.cursor);
+        const thresholdQuiet = await poll(config, quiet.scalar);
         expect(thresholdQuiet.events).toHaveLength(0);
         await git(repo, "tag", "v1.1.0");
-        const matching = await poll(config, thresholdQuiet.cursor);
+        const matching = await poll(config, thresholdQuiet.scalar);
         expect(matching.events).toHaveLength(1);
         expect(matching.events[0]?.observed).toEqual({ tag: "v1.1.0" });
-        expect((await poll(config, matching.cursor)).events).toHaveLength(0);
+        expect((await poll(config, matching.scalar)).events).toHaveLength(0);
 
         await git(repo, "tag", "v2.0.0");
-        const next = await poll(config, matching.cursor);
+        const next = await poll(config, matching.scalar);
         expect(next.events[0]?.id).not.toBe(matching.events[0]?.id);
     });
 });
 
-describe("compound cursor behavior", () => {
-    test("OR evaluates up to four independent predicates and round-trips its cursor", async () => {
+describe("compound scalar behavior", () => {
+    test("OR evaluates up to four independent predicates and round-trips its scalar", async () => {
         const directory = await temporaryDirectory();
         const present = join(directory, "present");
         const missing = join(directory, "missing");
@@ -197,8 +197,8 @@ describe("compound cursor behavior", () => {
 
         const first = await poll(config);
         expect(first.events).toHaveLength(2);
-        expect(Object.keys(first.cursor.predicates)).toHaveLength(4);
-        expect((await poll(config, first.cursor)).events).toHaveLength(0);
+        expect(Object.keys(first.scalar.predicates)).toHaveLength(4);
+        expect((await poll(config, first.scalar)).events).toHaveLength(0);
     });
 
     test("rejects compounds larger than four", async () => {
@@ -208,7 +208,7 @@ describe("compound cursor behavior", () => {
                 path: `/tmp/${index}`,
             })),
         };
-        await expect(runProvider({ cursor: null, config })).rejects.toMatchObject({
+        await expect(runProvider({ scalar: null, config })).rejects.toMatchObject({
             code: "invalid_config",
         });
     });
@@ -329,7 +329,7 @@ describe("CLI exit discipline", () => {
         const path = join(home, "readable.txt");
         await writeFile(path, "waiting");
         const result = await invoke(
-            { cursor: null, config: { kind: "file_contains", path, needle: "ready" } },
+            { scalar: null, config: { kind: "file_contains", path, needle: "ready" } },
             home,
         );
         expect(result.exitCode).toBe(0);
@@ -343,7 +343,7 @@ describe("CLI exit discipline", () => {
         await mkdir(directory);
         const result = await invoke(
             {
-                cursor: null,
+                scalar: null,
                 config: { kind: "file_contains", path: directory, needle: "ready" },
             },
             home,
@@ -358,7 +358,7 @@ describe("CLI exit discipline", () => {
         const home = await temporaryDirectory("retina-local-fs-home-");
         const invalidResult = await invoke(
             {
-                cursor: null,
+                scalar: null,
                 config: { kind: "path_exists", path: home, token: "must-not-be-accepted" },
             },
             home,
@@ -369,7 +369,7 @@ describe("CLI exit discipline", () => {
         await mkdir(join(fenced, ".."), { recursive: true });
         await writeFile(fenced, "secret");
         const fencedResult = await invoke(
-            { cursor: null, config: { kind: "path_exists", path: fenced } },
+            { scalar: null, config: { kind: "path_exists", path: fenced } },
             home,
         );
         expect(JSON.parse(fencedResult.stderr)).toMatchObject({ code: "fenced_path" });
