@@ -32,6 +32,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import { getSlot } from "./lkg-slot";
 import { MODULE_PAGE_MAX_BYTES } from "./module-wire";
+import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
 import {
@@ -1529,6 +1530,118 @@ describe("Rust mode authority adapter", () => {
         expect(getSlot(sessionId)).toBeUndefined();
     });
 
+    it("refreshes the LKG snapshot after an applied SOFT+ pass", async () => {
+        const sessionId = `rust-lkg-soft-plus-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let pass = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                pass += 1;
+                return {
+                    decision: pass === 1 ? "HARD" : "SOFT+",
+                    native_messages: [
+                        {
+                            info: { id: "served", role: "assistant", sessionID: sessionId },
+                            parts: [{ type: "text", text: `applied response ${pass}` }],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const firstInput = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            firstInput,
+            { messages: [...firstInput] },
+            makeMeta(db, sessionId),
+        );
+        const firstSlot = getSlot(sessionId);
+        expect(firstSlot?.jsonPrefix).toContain("applied response 1");
+
+        const secondInput = makeMessages(sessionId);
+        (secondInput[0]?.parts[0] as { text: string }).text = "new live tail state";
+        await transform.run(
+            sessionId,
+            secondInput,
+            { messages: [...secondInput] },
+            makeMeta(db, sessionId),
+        );
+        const secondSlot = getSlot(sessionId);
+
+        expect(secondSlot?.jsonPrefix).toContain("applied response 2");
+        expect(secondSlot?.inputContentDigests).not.toEqual(firstSlot?.inputContentDigests);
+    });
+
+    it("throws locally instead of serving raw above a known context limit", async () => {
+        const sessionId = `rust-raw-limit-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordDetectedContextLimit(db, sessionId, 1_000, "test-provider/test-model");
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method === "transform") throw new Error("client closed");
+                return { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = [
+            {
+                info: {
+                    id: "m1",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: randomText(seededRandom(7), 20_000) }],
+            },
+        ] as MessageLike[];
+        const output = { messages: [] as unknown[] };
+
+        await expect(
+            transform.run(sessionId, input, output, makeMeta(db, sessionId)),
+        ).rejects.toBeInstanceOf(RawFallbackContextLimitError);
+        expect(output.messages).toEqual([]);
+    });
+
+    it("preserves raw fail-open when the estimate fits the known context limit", async () => {
+        const sessionId = `rust-raw-fits-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordDetectedContextLimit(db, sessionId, 10_000, "test-provider/test-model");
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method === "transform") throw new Error("client closed");
+                return { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = [
+            {
+                info: {
+                    id: "m1",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: "small raw prompt" }],
+            },
+        ] as MessageLike[];
+        const output = { messages: [] as unknown[] };
+
+        await expect(
+            transform.run(sessionId, input, output, makeMeta(db, sessionId)),
+        ).resolves.toBeUndefined();
+        expect(output.messages).toEqual(input);
+    });
+
     it("passes through raw input, parks after three failures, then probes on the fifth pass", async () => {
         const sessionId = `rust-failure-${Date.now()}`;
         sessions.push(sessionId);
@@ -1812,7 +1925,7 @@ describe("Rust mode authority adapter", () => {
         expect(transform.getState(sessionId).consecutiveFailures).toBe(1);
     });
 
-    it("refuses an LKG prefix plus pristine tail that exceeds the current limit", async () => {
+    it("refuses both oversized LKG replay and the guaranteed-oversized raw fallback", async () => {
         const sessionId = `rust-lkg-limit-${Date.now()}`;
         sessions.push(sessionId);
         const db = makeDb();
@@ -1864,16 +1977,14 @@ describe("Rust mode authority adapter", () => {
             },
         ] as MessageLike[];
         failTransform = true;
-        const output = { messages: [...appended] as unknown[] };
+        const output = { messages: [] as unknown[] };
         const failureMeta = makeMeta(db, sessionId);
         failureMeta.systemPromptTokens = 100;
-        await transform.run(sessionId, appended, output, failureMeta);
+        await expect(
+            transform.run(sessionId, appended, output, failureMeta),
+        ).rejects.toBeInstanceOf(RawFallbackContextLimitError);
 
-        expect(output.messages).toEqual(appended);
-        expect((output.messages[0] as MessageLike).parts[0]).toEqual({
-            type: "text",
-            text: "current prefix",
-        });
+        expect(output.messages).toEqual([]);
     });
 });
 

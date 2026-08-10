@@ -26,6 +26,7 @@ const CONNECT_BACKOFF_INITIAL_MS = 1_000;
 const CONNECT_BACKOFF_MAX_MS = 30_000;
 const HANDSHAKE_TIMEOUT_MS = 2_000;
 const MODULE_SEND_TIMEOUT_MS = 15_000;
+const TRANSFORM_SEND_TIMEOUT_MS = 5_000;
 const SERIAL_LANE_MAX_WAITERS = 16;
 const SERIAL_LANE_MIN_REMAINING_MS = 25;
 const CANONICAL_ROOT_CACHE_MAX_ENTRIES = 256;
@@ -80,17 +81,24 @@ function isConnectionFailure(error: unknown): boolean {
     ) {
         return true;
     }
-    return errorChainSome(error, (current) =>
-        [
-            "ENOENT",
-            "ECONNREFUSED",
-            "ECONNRESET",
-            "EPIPE",
-            "ETIMEDOUT",
-            "request_deadline",
-            "SUBC_CONNECTION_BACKOFF",
-        ].includes(typeof current.code === "string" ? current.code : ""),
-    );
+    return errorChainSome(error, (current) => {
+        const code = typeof current.code === "string" ? current.code : "";
+        const message = typeof current.message === "string" ? current.message : "";
+        return (
+            [
+                "ENOENT",
+                "ECONNREFUSED",
+                "ECONNRESET",
+                "EPIPE",
+                "ETIMEDOUT",
+                "request_deadline",
+                "deadline_exceeded_no_drop_observed",
+                "connection_dropped",
+                "SUBC_CONNECTION_BACKOFF",
+            ].includes(code) ||
+            /\bclient closed\b|\bconnection closed\b|\bclosed the connection\b/i.test(message)
+        );
+    });
 }
 
 interface CachedRoute {
@@ -186,12 +194,36 @@ export class SubcModuleTransport {
         this.routeSessionPrefix = routeSessionPrefix;
     }
 
-    private laneTimeoutError(): Error & { code?: string } {
-        const error = new Error("module transport deadline expired while queued") as Error & {
+    private deadlineError(detail: string): Error & { code?: string } {
+        const error = new Error(`module transport deadline expired ${detail}`) as Error & {
             code?: string;
         };
         error.code = "ETIMEDOUT";
         return error;
+    }
+
+    private laneTimeoutError(): Error & { code?: string } {
+        return this.deadlineError("while queued");
+    }
+
+    private async beforeDeadline<T>(
+        operation: Promise<T>,
+        deadlineMs: number,
+        detail: string,
+    ): Promise<T> {
+        const remainingMs = deadlineMs - Date.now();
+        if (remainingMs <= 0) throw this.deadlineError(detail);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            return await Promise.race([
+                operation,
+                new Promise<T>((_resolve, reject) => {
+                    timer = setTimeout(() => reject(this.deadlineError(detail)), remainingMs);
+                }),
+            ]);
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
     }
 
     private laneRelease(): () => void {
@@ -314,11 +346,16 @@ export class SubcModuleTransport {
         /** Producer-backed calls (dreamer.run_task) outlive the default transport budget. */
         timeoutMs?: number;
     }): Promise<unknown> {
-        const deadlineMs = Date.now() + (args.timeoutMs ?? this.requestTimeoutMs);
+        const attemptTimeoutMs =
+            args.timeoutMs ??
+            (args.method === "transform"
+                ? Math.min(this.requestTimeoutMs, TRANSFORM_SEND_TIMEOUT_MS)
+                : this.requestTimeoutMs);
+        const laneDeadlineMs = Date.now() + attemptTimeoutMs;
         const releaseLane = await this.acquireCorrectnessLane(
             args.sessionId,
             args.signal,
-            deadlineMs,
+            laneDeadlineMs,
         );
         const onAbort = () => this.invalidateConnection();
         args.signal?.addEventListener("abort", onAbort, { once: true });
@@ -329,34 +366,37 @@ export class SubcModuleTransport {
                     if (args.signal?.aborted) {
                         throw args.signal.reason ?? new Error("module transport call aborted");
                     }
-                    // Queue residence consumes the same deadline as the request. Starting work with
-                    // only scheduler noise left would let an earlier facade call overrun a transform's
-                    // caller budget, so reject before opening or reusing a route.
-                    const remainingMs = deadlineMs - Date.now();
-                    if (remainingMs < SERIAL_LANE_MIN_REMAINING_MS) throw this.laneTimeoutError();
-                    ensuredRoute = await this.ensureRoute(args.sessionId, args.projectRoot);
+                    // Each attempt gets its own timeout, apart from the queue wait limit, so a dead
+                    // socket can hit the deadline and still be replaced on one reconnect.
+                    const attemptDeadlineMs = Date.now() + attemptTimeoutMs;
+                    ensuredRoute = await this.ensureRoute(
+                        args.sessionId,
+                        args.projectRoot,
+                        attemptDeadlineMs,
+                    );
                     if (args.signal?.aborted) {
                         throw args.signal.reason ?? new Error("module transport call aborted");
                     }
-                    return await ensuredRoute.client.request(ensuredRoute.route, args.body, {
-                        priority: Priority.Background,
-                        admissionClass: AdmissionClass.Normal,
-                        timeoutMs: Math.max(1, deadlineMs - Date.now()),
-                    });
+                    return await this.beforeDeadline(
+                        ensuredRoute.client.request(ensuredRoute.route, args.body, {
+                            priority: Priority.Background,
+                            admissionClass: AdmissionClass.Normal,
+                            timeoutMs: Math.max(1, attemptDeadlineMs - Date.now()),
+                        }),
+                        attemptDeadlineMs,
+                        "waiting for the module response",
+                    );
                 } catch (error) {
-                    const staleOrDeadRoute = isStaleOrDeadRouteFailure(error);
-                    if (staleOrDeadRoute) {
+                    if (isConnectionFailure(error)) {
                         if (ensuredRoute) {
                             this.dropRoute(ensuredRoute.routeKey, ensuredRoute.route);
                             this.invalidateConnection(ensuredRoute.client);
                         } else {
                             this.invalidateConnection();
                         }
-                        // Stale handles and dead route channels fail before module dispatch, so one
-                        // retry may safely reconnect and bind a fresh route without replaying work.
+                        // Retry once on a fresh connection generation before the caller enters its
+                        // LKG/raw fallback ladder.
                         if (attempt === 0 && !args.signal?.aborted) continue;
-                    } else if (isConnectionFailure(error)) {
-                        this.invalidateConnection(ensuredRoute?.client);
                     }
                     throw error;
                 }
@@ -527,7 +567,11 @@ export class SubcModuleTransport {
         }
     }
 
-    private async ensureRoute(sessionId: string, rawProjectRoot: string): Promise<EnsuredRoute> {
+    private async ensureRoute(
+        sessionId: string,
+        rawProjectRoot: string,
+        deadlineMs = Date.now() + this.requestTimeoutMs,
+    ): Promise<EnsuredRoute> {
         // The transform and tool lanes can observe the same directory under different
         // spellings when the project is reached through a symlink (OpenCode reports the
         // launch spelling on one lane and the resolved target on the other). The module
@@ -554,7 +598,11 @@ export class SubcModuleTransport {
             harness: getHarness(),
             session: `${this.routeSessionPrefix}${sessionId}`,
         };
-        const route = await client.routeOpen(target, identity);
+        const route = await this.beforeDeadline(
+            client.routeOpen(target, identity),
+            deadlineMs,
+            "opening the module route",
+        );
         if (this.client !== client || generation !== this.connectionGeneration) {
             await client.closeRoute(route).catch(() => undefined);
             const error = new Error(
