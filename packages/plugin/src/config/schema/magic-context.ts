@@ -470,6 +470,10 @@ export interface MagicContextConfig {
     language?: string;
     historian?: HistorianConfig;
     dreamer?: DreamerConfig;
+    smart_notes: {
+        /** Flip ownership of authoring-compiled conditions from dreamer to retina. */
+        retina_handoff: boolean;
+    };
     cache_ttl: string | { default: string; [modelKey: string]: string };
     /** Preset routing for guidance and provider-visible prompt surfaces. */
     prompt_surface: PromptSurfaceConfig;
@@ -688,6 +692,17 @@ export const MagicContextConfigSchema = z
         dreamer: DreamerConfigSchema.optional().describe(
             "Dreamer agent + scheduling configuration (model, fallback_models, disable, schedule, tasks, etc.)",
         ),
+        smart_notes: z
+            .object({
+                retina_handoff: z
+                    .boolean()
+                    .default(false)
+                    .describe(
+                        "When true, dreamer skips smart notes whose surface conditions compiled to retina provider configs at authoring time. Default false keeps both paths active until the retina consumer is deployed.",
+                    ),
+            })
+            .default({ retina_handoff: false })
+            .describe("Smart-note ownership transition controls."),
         cache_ttl: z
             .union([z.string(), z.object({ default: z.string() }).catchall(z.string())])
             .default("5m")

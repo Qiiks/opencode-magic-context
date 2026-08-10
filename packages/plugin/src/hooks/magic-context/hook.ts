@@ -161,6 +161,7 @@ export interface MagicContextDeps {
         };
         sidekick?: SidekickConfig;
         dreamer?: DreamerConfig;
+        smart_notes?: { retina_handoff?: boolean };
         commit_cluster_trigger?: { enabled: boolean; min_clusters: number };
         /** Issue #53: per-agent system-prompt injection opt-out. Optional in
          *  the inline type so legacy tests/callers don't have to construct it;
@@ -1137,6 +1138,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 }),
             userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreaming),
             language: deps.config.language,
+            retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
             transformMode: deps.config.transform_mode,
             // Scheduled/message-triggered runs must share the same direct
             // authority.status transport as the transform path. The
@@ -1269,6 +1271,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               mural: deps.config.mural,
                               memoryInjectionBudgetTokens:
                                   deps.config.memory?.injection_budget_tokens,
+                              retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
                               transformMode: deps.config.transform_mode,
                               // Manual /ctx-dream uses the same live authority
                               // lookup and module transport as scheduled runs.

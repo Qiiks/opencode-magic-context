@@ -274,6 +274,7 @@ Behavior tuning most installs never need to touch.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
+| `smart_notes.retina_handoff` | boolean | `false` | When true, dreamer skips smart notes whose surface conditions compiled to retina provider configs at authoring time. Default false keeps both paths active until the retina consumer is deployed. |
 | `toast_duration_ms` | number (0–60000) | `5000` | TUI toast lifetime in milliseconds for Magic Context notifications. Set to 0 to disable Magic Context toasts entirely (min: 0, max: 60000, default: 5000) |
 | `subc.connection_file` | string | — | Path to the owner-only subc connection file. |
 | `fail_closed_blocking` | boolean | `true` | When Magic Context cannot operate (schema fence mismatch, storage open/migration failure), block the primary-session prompt with a loud recovery error instead of silently degrading to native compaction. Default true. Set false only to restore the old degrade-silently behavior (not recommended). USER-LEVEL ONLY — ignored in project config for security. Requires a restart. |

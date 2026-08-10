@@ -4,7 +4,13 @@ import { mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { type ProviderConfig, ProviderError, type ProviderScalar, runProvider } from "./provider";
+import {
+    type ProviderConfig,
+    ProviderError,
+    type ProviderScalar,
+    runProvider,
+    validateProviderConfig,
+} from "./provider";
 
 const execFileAsync = promisify(execFile);
 const temporaryDirectories: string[] = [];
@@ -199,6 +205,26 @@ describe("compound scalar behavior", () => {
         expect(first.events).toHaveLength(2);
         expect(Object.keys(first.scalar.predicates)).toHaveLength(4);
         expect((await poll(config, first.scalar)).events).toHaveLength(0);
+    });
+
+    test("accepts the authoring audit marker but still rejects unknown fields", () => {
+        expect(
+            validateProviderConfig({
+                kind: "path_exists",
+                path: "/tmp/future",
+                resolved_path_exists: false,
+            }),
+        ).toEqual({
+            success: true,
+            config: {
+                kind: "path_exists",
+                path: "/tmp/future",
+                resolved_path_exists: false,
+            },
+        });
+        expect(
+            validateProviderConfig({ kind: "path_exists", path: "/tmp/future", guessed: true }),
+        ).toMatchObject({ success: false, reason: expect.stringContaining("unknown field") });
     });
 
     test("rejects compounds larger than four", async () => {

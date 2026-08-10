@@ -232,7 +232,11 @@ export const MIGRATIONS: Migration[] = [
 					updated_at INTEGER NOT NULL,
 					last_checked_at INTEGER,
 					ready_at INTEGER,
-					ready_reason TEXT
+					ready_reason TEXT,
+					compiled_provider TEXT,
+					compiled_config TEXT,
+					compiled_at INTEGER,
+					compile_status TEXT CHECK(compile_status IN ('compiled', 'plain', 'refused'))
 				);
 				CREATE INDEX IF NOT EXISTS idx_notes_session_status ON notes(session_id, status);
 				CREATE INDEX IF NOT EXISTS idx_notes_project_status ON notes(project_path, status);
@@ -2751,6 +2755,22 @@ export const MIGRATIONS: Migration[] = [
             // remembers repeated validation failures for its current content hash.
             if (!tableExists(db, "memories")) return;
             ensureColumn(db, "memories", "mural_cue_rejection_count", "INTEGER NOT NULL DEFAULT 0");
+        },
+    },
+    {
+        version: 76,
+        description: "persist retina provider compilation for smart-note conditions",
+        up(db: Database): void {
+            if (!tableExists(db, "notes")) return;
+            ensureColumn(db, "notes", "compiled_provider", "TEXT");
+            ensureColumn(db, "notes", "compiled_config", "TEXT");
+            ensureColumn(db, "notes", "compiled_at", "INTEGER");
+            ensureColumn(
+                db,
+                "notes",
+                "compile_status",
+                "TEXT CHECK(compile_status IN ('compiled', 'plain', 'refused'))",
+            );
         },
     },
 ];

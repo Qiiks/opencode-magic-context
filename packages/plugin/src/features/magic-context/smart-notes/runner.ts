@@ -23,6 +23,7 @@ export interface RunDueCompiledSmartNoteChecksArgs {
     sweepBudgetMs?: number;
     leaseHeld?: () => boolean;
     signal?: AbortSignal;
+    retinaHandoff?: boolean;
 }
 
 export interface RunDueCompiledSmartNoteChecksResult {
@@ -56,6 +57,7 @@ export async function runDueCompiledSmartNoteChecks(
         args.projectIdentity,
         now,
         args.maxChecks ?? DEFAULT_MAX_CHECKS,
+        args.retinaHandoff,
     );
     let ran = 0;
     let surfaced = 0;
