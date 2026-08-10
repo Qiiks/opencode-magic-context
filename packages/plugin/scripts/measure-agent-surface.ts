@@ -12,12 +12,12 @@
  */
 import { resolve } from "node:path";
 import {
-    ACTIVE_TOOL_IDS,
     builtInLightSurface,
     measureAgentSurface,
     measureLightSurface,
     readLightSurface,
 } from "./prompt-surface-measurement";
+import { ACTIVE_TOOL_IDS } from "../src/shared/prompt-surface-runtime";
 import { validateBudgetFixture } from "./prompt-surface-fixture";
 
 const fixturePath = resolve(import.meta.dir, "../../..", "docs/specs/prompt-surface/budget-fixture.json");

@@ -16,6 +16,7 @@ import {
 } from "../shared/prompt-surface-a1-golden";
 import type { PromptSurfaceRuntime } from "../shared/prompt-surface-runtime";
 import {
+    ACTIVE_TOOL_IDS,
     createPromptSurfaceRuntime,
     LIGHT_TOOL_DESCRIPTIONS,
 } from "../shared/prompt-surface-runtime";
@@ -251,6 +252,32 @@ function providerParameters(definition: ToolDefinition): Record<string, unknown>
 }
 
 describe("createToolRegistry — prompt-surface registration", () => {
+    it("links canonical prompt-surface IDs to light descriptions and registration", () => {
+        isolateDb();
+        const registeredCtxToolIds = Object.keys(buildRegistry({})).filter((id) =>
+            id.startsWith("ctx_"),
+        );
+        const canonicalIds = new Set<string>(ACTIVE_TOOL_IDS);
+        const registeredIds = new Set(registeredCtxToolIds);
+        const missing = [...canonicalIds].filter((id) => !registeredIds.has(id));
+        const extra = [...registeredIds].filter((id) => !canonicalIds.has(id));
+        if (missing.length > 0 || extra.length > 0) {
+            throw new Error(
+                [
+                    "Prompt-surface tool registry drifted from ACTIVE_TOOL_IDS.",
+                    `Missing: ${missing.join(", ") || "none"}.`,
+                    `Extra: ${extra.join(", ") || "none"}.`,
+                    "If this is a new ctx_* tool, also review the Rust prompt-surface list in crates/mc-module/src/prompt_surface.rs; cross-language drift is intentionally checked separately.",
+                ].join(" "),
+            );
+        }
+
+        for (const id of ACTIVE_TOOL_IDS) {
+            expect(Object.hasOwn(LIGHT_TOOL_DESCRIPTIONS, id)).toBe(true);
+            expect(LIGHT_TOOL_DESCRIPTIONS[id].trim().length).toBeGreaterThan(0);
+        }
+    });
+
     it("matches the A1 golden for no config and explicit full", () => {
         const golden = readA1GoldenTools();
         isolateDb();

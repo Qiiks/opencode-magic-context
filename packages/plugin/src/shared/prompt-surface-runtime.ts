@@ -23,7 +23,12 @@ import {
 const GUIDANCE_MARKER = "## Magic Context";
 const GUIDANCE_MARKER_LINE = /^## Magic Context[\t ]*\r?$/gm;
 
-export const PROMPT_SURFACE_TOOL_IDS = [
+/**
+ * The single source of truth for the ctx_* tools exposed by the prompt surface.
+ * Consumers derive their registries and light-description catalogs from this list
+ * so adding a tool cannot silently skip one prompt-surface integration point.
+ */
+export const ACTIVE_TOOL_IDS = [
     "ctx_reduce",
     "ctx_expand",
     "ctx_note",
@@ -31,15 +36,18 @@ export const PROMPT_SURFACE_TOOL_IDS = [
     "ctx_search",
 ] as const;
 
-export type PromptSurfaceToolId = (typeof PROMPT_SURFACE_TOOL_IDS)[number];
+/** @deprecated Use ACTIVE_TOOL_IDS. Kept as an alias for existing consumers. */
+export const PROMPT_SURFACE_TOOL_IDS = ACTIVE_TOOL_IDS;
 
-export const LIGHT_TOOL_DESCRIPTIONS: Readonly<Record<PromptSurfaceToolId, string>> = {
+export type PromptSurfaceToolId = (typeof ACTIVE_TOOL_IDS)[number];
+
+export const LIGHT_TOOL_DESCRIPTIONS = {
     ctx_reduce: CTX_REDUCE_LIGHT_DESCRIPTION,
     ctx_expand: CTX_EXPAND_LIGHT_DESCRIPTION,
     ctx_note: CTX_NOTE_LIGHT_DESCRIPTION,
     ctx_memory: CTX_MEMORY_LIGHT_DESCRIPTION,
     ctx_search: CTX_SEARCH_LIGHT_DESCRIPTION,
-};
+} as const satisfies Readonly<Record<PromptSurfaceToolId, string>>;
 
 /**
  * Preserve the existing full-preset hash exactly while giving other presets a
@@ -54,7 +62,7 @@ export function promptSurfaceHashMaterial(
         : `${systemContent}\n\0magic-context-prompt-surface:${preset}`;
 }
 
-const PROMPT_SURFACE_TOOL_ID_SET = new Set<string>(PROMPT_SURFACE_TOOL_IDS);
+const PROMPT_SURFACE_TOOL_ID_SET = new Set<string>(ACTIVE_TOOL_IDS);
 
 export interface PromptSurfaceGuidanceSelection {
     /** The configured built-in preset. */

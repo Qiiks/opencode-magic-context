@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
-    ACTIVE_TOOL_IDS,
     builtInLightSurface,
     measureAgentSurface,
     measureLightSurface,
@@ -11,6 +10,7 @@ import {
     TOKENIZER_PACKAGE,
     TOKENIZER_VERSION,
 } from "./prompt-surface-measurement";
+import { ACTIVE_TOOL_IDS } from "../src/shared/prompt-surface-runtime";
 
 interface BudgetFixture {
     status?: string;
