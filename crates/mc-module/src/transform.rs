@@ -132,6 +132,8 @@ const TAG_BASELINE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 pub struct ServedMessage {
     message: Arc<CkWireMessage>,
     canonical_bytes: Arc<[u8]>,
+    canonical_hash: [u8; 32],
+    output_identity: Arc<str>,
     block_fingerprints: Arc<[(String, usize)]>,
 }
 
@@ -177,11 +179,25 @@ impl ServedMessage {
                 (ck_wire::fingerprint(&serialized), serialized.len())
             })
             .collect::<Vec<_>>();
+        let canonical_digest = Sha256::digest(&canonical_bytes);
+        let output_identity = format!("{canonical_digest:x}");
+        let canonical_hash: [u8; 32] = canonical_digest.into();
         Self {
             message: Arc::new(message),
             canonical_bytes: Arc::from(canonical_bytes),
+            canonical_hash,
+            output_identity: Arc::from(output_identity),
             block_fingerprints: Arc::from(block_fingerprints),
         }
+    }
+
+    fn with_output_identity(mut self, identity: &str) -> Self {
+        self.output_identity = Arc::from(identity);
+        self
+    }
+
+    pub(crate) fn native_identity_basis(&self) -> (&str, &[u8; 32]) {
+        (&self.output_identity, &self.canonical_hash)
     }
 
     pub fn into_message(self) -> CkWireMessage {
@@ -962,6 +978,10 @@ pub struct TransformTimings {
     #[serde(default)]
     pub post_attach: f64,
     #[serde(default)]
+    pub native_cache_reused_messages: usize,
+    #[serde(default)]
+    pub native_cache_encoded_messages: usize,
+    #[serde(default)]
     pub response_encode: f64,
     #[serde(default)]
     pub frozen_units: usize,
@@ -1016,9 +1036,10 @@ pub fn format_pass_timing_line(
          build_output={:.1} build_identity={:.1} build_identity_max={:.1} build_frozen_unit_scan={:.1} \
          build_cache_lookup={:.1} build_serialize_misses={:.1} build_tail_loop={:.1} \
           divergence={:.1} store_commit={:.1} trigger_ms={:.1} trigger_tokenized_blocks={} \
-          post_attach_ms={:.1} response_encode={response_encode_ms:.1} frozen_units={} \
-          tail_units_matched={} projection_blocks={} tail_messages_emitted={} \
-         build_identity_messages={} cache_hits={} cache_misses={} cache_dirty_skips={}",
+           post_attach_ms={:.1} native_cache_reused_messages={} native_cache_encoded_messages={} \
+           response_encode={response_encode_ms:.1} frozen_units={} tail_units_matched={} \
+           projection_blocks={} tail_messages_emitted={} build_identity_messages={} \
+           cache_hits={} cache_misses={} cache_dirty_skips={}",
         timings.total,
         timings.projection,
         timings.store_cache_state,
@@ -1058,6 +1079,8 @@ pub fn format_pass_timing_line(
         timings.trigger_ms,
         timings.trigger_tokenized_blocks,
         timings.post_attach,
+        timings.native_cache_reused_messages,
+        timings.native_cache_encoded_messages,
         timings.frozen_units,
         timings.tail_units_matched,
         timings.projection_blocks,
@@ -1127,7 +1150,7 @@ pub struct TransformResponse {
     /// OpenCode message-with-parts output, present only when the request opted into native
     /// serving and selected the `opencode-aisdk` serializer profile.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub native_messages: Option<Vec<Value>>,
+    pub native_messages: Option<Vec<Arc<Value>>>,
     /// Host-delivery instructions are additive and profile-gated. The module does not
     /// persist delivery because the host owns the channel-2 lease and deduplication.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9139,10 +9162,13 @@ fn build_output_with_tags_inner(
                     );
                 }
                 (
-                    Some(ServedMessage::from_message_reusing(
-                        rendered,
-                        (!blocks.is_empty()).then_some(blocks),
-                    )),
+                    Some(
+                        ServedMessage::from_message_reusing(
+                            rendered,
+                            (!blocks.is_empty()).then_some(blocks),
+                        )
+                        .with_output_identity(&identity),
+                    ),
                     false,
                 )
             } else {
@@ -9405,6 +9431,52 @@ pub(crate) fn clear_served_native_reasoning_with_tags(
     mid_turn: bool,
     tag_numbers: &BTreeMap<String, u64>,
 ) -> usize {
+    clear_served_native_reasoning_from_iter(
+        profile,
+        provider_accepts_empty_content,
+        native_messages,
+        served_messages.iter(),
+        ingress_messages,
+        watermark,
+        mid_turn,
+        tag_numbers,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn clear_served_native_reasoning_from_served(
+    profile: SerializerProfile,
+    provider_accepts_empty_content: bool,
+    native_messages: &mut [Value],
+    served_messages: &[ServedMessage],
+    ingress_messages: &[CkIngressMessage],
+    watermark: u64,
+    mid_turn: bool,
+    tag_numbers: &BTreeMap<String, u64>,
+) -> usize {
+    clear_served_native_reasoning_from_iter(
+        profile,
+        provider_accepts_empty_content,
+        native_messages,
+        served_messages.iter().map(Deref::deref),
+        ingress_messages,
+        watermark,
+        mid_turn,
+        tag_numbers,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clear_served_native_reasoning_from_iter<'a>(
+    profile: SerializerProfile,
+    provider_accepts_empty_content: bool,
+    native_messages: &mut [Value],
+    served_messages: impl IntoIterator<Item = &'a CkWireMessage>,
+    ingress_messages: &[CkIngressMessage],
+    watermark: u64,
+    mid_turn: bool,
+    tag_numbers: &BTreeMap<String, u64>,
+) -> usize {
     if profile != SerializerProfile::OpencodeAiSdk
         || !provider_accepts_empty_content
         || watermark == 0
@@ -9413,7 +9485,7 @@ pub(crate) fn clear_served_native_reasoning_with_tags(
     }
 
     let served_ids = served_messages
-        .iter()
+        .into_iter()
         .filter(|message| !message.meta.synthetic && message.role == "assistant")
         .filter_map(|message| message.meta.harness_id.as_deref())
         .collect::<HashSet<_>>();
@@ -9767,6 +9839,8 @@ mod tests {
             "tag_mint_new",
             "tag_mint_tokenized_bytes",
             "trigger_tokenized_blocks",
+            "native_cache_reused_messages",
+            "native_cache_encoded_messages",
             "frozen_units",
             "tail_units_matched",
             "projection_blocks",
@@ -16124,6 +16198,70 @@ mod tests {
         assert_eq!(healed.len(), 2);
         assert_eq!(healed[0].meta.harness_id.as_deref(), Some("one"));
         assert_eq!(healed[1].meta.harness_id.as_deref(), Some("one-result"));
+
+        let healed_ck = healed
+            .iter()
+            .map(|message| message.deref().clone())
+            .collect::<Vec<_>>();
+        let mut request = req(
+            "belt-release-native",
+            "cfg0",
+            ingress_from_ck(healed_ck.clone()),
+        );
+        request.serializer_profile = "opencode-aisdk".to_string();
+        request.serve_native = true;
+        request.full_array_fingerprint = Some("belt-release-fp".to_string());
+        let cache = Mutex::new(crate::NativeAttachmentCache::new(1024 * 1024));
+        let mut first = TransformResponse::passthrough(
+            healed_ck.clone(),
+            request.full_array_fingerprint.clone(),
+        );
+        let first_stats = crate::attach_native_messages_incremental(
+            &mut first,
+            &request,
+            0,
+            &BTreeMap::new(),
+            None,
+            None,
+            true,
+            None,
+            0,
+            &cache,
+            crate::NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(first_stats.encoded_messages, healed_ck.len());
+        let native = first.native_messages.as_ref().unwrap();
+        let tool_ids = native
+            .iter()
+            .flat_map(|message| message["parts"].as_array().into_iter().flatten())
+            .filter_map(|part| part["callID"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_ids.len(),
+            tool_ids.iter().copied().collect::<HashSet<_>>().len()
+        );
+        assert_eq!(tool_ids, vec!["duplicate"]);
+
+        let mut replay = TransformResponse::passthrough(
+            healed_ck.clone(),
+            request.full_array_fingerprint.clone(),
+        );
+        let replay_stats = crate::attach_native_messages_incremental(
+            &mut replay,
+            &request,
+            0,
+            &BTreeMap::new(),
+            None,
+            None,
+            true,
+            None,
+            0,
+            &cache,
+            crate::NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(replay_stats.reused_messages, healed_ck.len());
+        assert_eq!(replay_stats.encoded_messages, 0);
+        assert_eq!(replay.native_messages, first.native_messages);
     }
 
     #[test]
@@ -16265,6 +16403,75 @@ mod tests {
                 .as_ref()
                 .and_then(|pair| pair.anchor_mid.as_deref()),
             Some("t3")
+        );
+
+        let cache = Mutex::new(crate::NativeAttachmentCache::new(1024 * 1024));
+        let mut first_request = req(
+            "keep-fold-native",
+            "cfg0",
+            vec![item("a", 1, "raw"), todowrite_call("todo", 2, json!([]))],
+        );
+        first_request.serializer_profile = "opencode-aisdk".to_string();
+        first_request.serve_native = true;
+        first_request.full_array_fingerprint = Some("todo-fold-fp-1".to_string());
+        let mut first_native = first.clone();
+        crate::attach_native_messages_incremental(
+            &mut first_native,
+            &first_request,
+            0,
+            &BTreeMap::new(),
+            None,
+            None,
+            true,
+            None,
+            0,
+            &cache,
+            crate::NativeCacheKeyMode::Normal,
+        );
+
+        let mut moved_request = req(
+            "keep-fold-native",
+            "cfg0",
+            vec![
+                item("a", 1, "raw"),
+                todowrite_call("todo", 2, json!([])),
+                assistant_form("t3", 3, &["new tail end"]),
+            ],
+        );
+        moved_request.serializer_profile = "opencode-aisdk".to_string();
+        moved_request.serve_native = true;
+        moved_request.full_array_fingerprint = Some("todo-fold-fp-2".to_string());
+        let mut moved_native = moved.clone();
+        let stats = crate::attach_native_messages_incremental(
+            &mut moved_native,
+            &moved_request,
+            0,
+            &BTreeMap::new(),
+            None,
+            None,
+            true,
+            None,
+            0,
+            &cache,
+            crate::NativeCacheKeyMode::Normal,
+        );
+        assert!(stats.encoded_messages > 0);
+        let native = moved_native.native_messages.unwrap();
+        let tail_index = native
+            .iter()
+            .position(|message| message["info"]["id"] == "t3")
+            .unwrap();
+        let todo_index = native
+            .iter()
+            .position(|message| {
+                message["parts"].as_array().is_some_and(|parts| {
+                    parts.iter().any(|part| part["syntheticTodoMarker"] == true)
+                })
+            })
+            .unwrap();
+        assert!(
+            todo_index > tail_index,
+            "coverage fold must move todo after t3"
         );
     }
 

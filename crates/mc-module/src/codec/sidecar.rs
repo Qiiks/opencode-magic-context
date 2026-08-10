@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,7 +39,7 @@ pub struct DecodeSidecar {
     #[serde(default)]
     pub order: Vec<String>,
     #[serde(default)]
-    pub messages: BTreeMap<String, HarnessMessageMeta>,
+    pub messages: BTreeMap<String, Arc<HarnessMessageMeta>>,
     #[serde(default)]
     pub mid_pins: BTreeMap<String, String>,
 }
@@ -57,17 +58,18 @@ impl DecodeSidecar {
         if !self.messages.contains_key(&mid) {
             self.order.push(mid.clone());
         }
-        self.messages.insert(mid, meta);
+        self.messages.insert(mid, Arc::new(meta));
     }
 
     pub fn message_by_mid(&self, mid: &str) -> Option<&HarnessMessageMeta> {
-        self.messages.get(mid)
+        self.messages.get(mid).map(Arc::as_ref)
     }
 
     pub fn message_for_index(&self, index: usize) -> Option<&HarnessMessageMeta> {
         self.order
             .get(index)
             .and_then(|mid| self.messages.get(mid.as_str()))
+            .map(Arc::as_ref)
     }
 
     pub fn inherit_pin(&self, stable_key: &str) -> Option<String> {
