@@ -1668,10 +1668,45 @@ fn apply_once_with_estimator_and_projection(
     }
 }
 
+#[cfg(test)]
+type TransformAttemptHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+static TRANSFORM_ATTEMPT_HOOKS: OnceLock<Mutex<HashMap<String, TransformAttemptHook>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_transform_attempt_hook(
+    session_id: &str,
+    hook: impl Fn() + Send + Sync + 'static,
+) {
+    TRANSFORM_ATTEMPT_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("transform attempt hook mutex")
+        .insert(session_id.to_string(), Arc::new(hook));
+}
+
+#[cfg(test)]
+fn run_transform_attempt_hook(session_id: &str) {
+    let hook = TRANSFORM_ATTEMPT_HOOKS.get().and_then(|hooks| {
+        hooks
+            .lock()
+            .expect("transform attempt hook mutex")
+            .remove(session_id)
+    });
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+static PREFIX_PROJECTION_DIFFERENTIAL: OnceLock<bool> = OnceLock::new();
+
 fn prefix_projection_differential_enabled() -> bool {
     cfg!(test)
-        || (cfg!(debug_assertions)
-            && std::env::var("MC_PREFIX_PROJECTION_DIFFERENTIAL").as_deref() == Ok("1"))
+        || *PREFIX_PROJECTION_DIFFERENTIAL.get_or_init(|| {
+            std::env::var("MC_PREFIX_PROJECTION_DIFFERENTIAL").as_deref() == Ok("1")
+        })
 }
 
 pub(crate) fn assert_prefix_projection_equivalent(
@@ -2328,6 +2363,8 @@ fn apply_once(
             next_meta.served_output_fingerprint = served_fingerprints;
             let fingerprint_changed = next_meta != loaded.meta;
             let row_version = if fingerprint_changed {
+                #[cfg(test)]
+                run_transform_attempt_hook(&req.session_id);
                 store.commit_transform(
                     &req.session_id,
                     TransformCommit {
@@ -2416,6 +2453,8 @@ fn apply_once(
             .as_ref()
             .map(|value| serde_json::to_string(value).expect("divergence is serializable"));
         meta.served_output_fingerprint = served_fingerprints;
+        #[cfg(test)]
+        run_transform_attempt_hook(&req.session_id);
         let row_version = store.commit_transform(
             &req.session_id,
             TransformCommit {
@@ -4000,6 +4039,8 @@ fn apply_once(
         state_changed || !consumed_drop_ids.is_empty() || !pending_overlays.is_empty();
     let store_commit_started_at = Instant::now();
     let row_version = if commit_required {
+        #[cfg(test)]
+        run_transform_attempt_hook(&req.session_id);
         store.commit_transform(
             &req.session_id,
             TransformCommit {
@@ -9781,7 +9822,7 @@ fn action_str(plan: &PassPlan, _core: &CoreState) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::m1_compose::{m1_revision_signal, m1_revision_signal_parts_for_pass};
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
@@ -10563,7 +10604,11 @@ mod tests {
         req(session_id, "cfg0", messages)
     }
 
-    fn seed_astro_divergence(store: &McStore, session_id: &str, tail_end: u64) -> TransformRequest {
+    pub(crate) fn seed_astro_divergence(
+        store: &McStore,
+        session_id: &str,
+        tail_end: u64,
+    ) -> TransformRequest {
         seed_astro_divergence_from_request(store, astro_request(session_id, tail_end))
     }
 
