@@ -10,6 +10,8 @@ export interface LkgSlot {
     modelKey: string | null;
     providerKey: string | null;
     capturedAt: number;
+    rowVersion?: number;
+    captureSequence?: number;
 }
 
 export interface LkgEntryNote {
@@ -34,49 +36,72 @@ function slotBytes(slot: LkgSlot): number {
     return 2 * slot.jsonPrefix.length + digestBytes + LKG_METADATA_BYTES;
 }
 
-/** Hash provider-relevant message fields only when capturing or validating a replay. */
-export function lkgContentDigest(message: MessageLike): string | null {
-    const hash = createHash("sha256");
+export type LkgContentField = string | number | boolean | symbol;
+
+export const LKG_SNAPSHOT_ARRAY = Symbol("array");
+export const LKG_SNAPSHOT_OBJECT = Symbol("object");
+export const LKG_SNAPSHOT_KEY = Symbol("key");
+export const LKG_SNAPSHOT_STRING = Symbol("string");
+export const LKG_SNAPSHOT_NUMBER = Symbol("number");
+export const LKG_SNAPSHOT_BOOLEAN = Symbol("boolean");
+export const LKG_SNAPSHOT_NULL = Symbol("null");
+export const LKG_SNAPSHOT_UNDEFINED = Symbol("undefined");
+
+/** Flatten a value into typed tokens while retaining strings without deep copies. */
+export function lkgContentFields(value: unknown): LkgContentField[] | null {
+    const fields: LkgContentField[] = [];
     const seen = new WeakSet<object>();
-    const visit = (value: unknown): void => {
-        if (value === null) {
-            hash.update("N;");
-        } else if (typeof value === "string") {
-            hash.update(`S${value.length}:`).update(value);
-        } else if (typeof value === "number") {
-            hash.update(`D${String(value)};`);
-        } else if (typeof value === "boolean") {
-            hash.update(value ? "B1;" : "B0;");
-        } else if (value === undefined) {
-            hash.update("U;");
-        } else if (Array.isArray(value)) {
-            if (seen.has(value)) throw new Error("cyclic message");
-            seen.add(value);
-            hash.update(`A${value.length}[`);
-            for (const child of value) visit(child);
-            hash.update("]");
-            seen.delete(value);
-        } else if (typeof value === "object") {
-            if (seen.has(value)) throw new Error("cyclic message");
-            seen.add(value);
-            const entries = Object.entries(value);
-            hash.update(`O${entries.length}{`);
-            for (const [key, child] of entries) {
-                hash.update(`K${key.length}:`).update(key);
-                visit(child);
+    const visit = (child: unknown): void => {
+        if (child === null) fields.push(LKG_SNAPSHOT_NULL);
+        else if (typeof child === "string") fields.push(LKG_SNAPSHOT_STRING, child);
+        else if (typeof child === "number") fields.push(LKG_SNAPSHOT_NUMBER, child);
+        else if (typeof child === "boolean") fields.push(LKG_SNAPSHOT_BOOLEAN, child);
+        else if (child === undefined || typeof child === "function" || typeof child === "symbol") {
+            fields.push(LKG_SNAPSHOT_UNDEFINED);
+        } else if (Array.isArray(child)) {
+            if (seen.has(child)) throw new Error("cyclic message");
+            seen.add(child);
+            fields.push(LKG_SNAPSHOT_ARRAY, child.length);
+            for (const item of child) visit(item);
+            seen.delete(child);
+        } else if (typeof child === "object") {
+            if (seen.has(child)) throw new Error("cyclic message");
+            seen.add(child);
+            const entries = Object.entries(child).filter(
+                ([, entry]) =>
+                    entry !== undefined && typeof entry !== "function" && typeof entry !== "symbol",
+            );
+            fields.push(LKG_SNAPSHOT_OBJECT, entries.length);
+            for (const [key, entry] of entries) {
+                fields.push(LKG_SNAPSHOT_KEY, key);
+                visit(entry);
             }
-            hash.update("}");
-            seen.delete(value);
-        } else {
-            hash.update(`X${typeof value};`);
-        }
+            seen.delete(child);
+        } else fields.push(LKG_SNAPSHOT_UNDEFINED);
     };
     try {
-        visit(message);
-        return hash.digest("base64url");
+        visit(value);
+        return fields;
     } catch {
         return null;
     }
+}
+
+export function lkgContentDigestFromFields(fields: readonly LkgContentField[]): string {
+    const hash = createHash("sha256");
+    for (const field of fields) {
+        const value = typeof field === "symbol" ? (field.description ?? "") : String(field);
+        hash.update(`${typeof field}:${value.length}:`)
+            .update(value)
+            .update("\0");
+    }
+    return hash.digest("base64url");
+}
+
+/** Digest the full message tree to detect input drift before an LKG replay. */
+export function lkgContentDigest(message: MessageLike): string | null {
+    const fields = lkgContentFields(message);
+    return fields ? lkgContentDigestFromFields(fields) : null;
 }
 
 function touch(sessionId: string, entry: { slot: LkgSlot; bytes: number }): void {
@@ -94,6 +119,15 @@ export function captureSlot(sessionId: string, slot: LkgSlot): boolean {
     const bytes = slotBytes(slot);
     if (bytes > LKG_SINGLE_SLOT_BYTES) return false;
     const prior = slots.get(sessionId);
+    if (
+        prior?.slot.rowVersion !== undefined &&
+        slot.rowVersion !== undefined &&
+        (slot.rowVersion < prior.slot.rowVersion ||
+            (slot.rowVersion === prior.slot.rowVersion &&
+                (slot.captureSequence ?? 0) < (prior.slot.captureSequence ?? 0)))
+    ) {
+        return false;
+    }
     if (prior) totalBytes -= prior.bytes;
     slots.delete(sessionId);
     while (totalBytes + bytes > LKG_TOTAL_BYTES) {
