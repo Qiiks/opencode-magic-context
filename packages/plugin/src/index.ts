@@ -5,6 +5,7 @@ import {
     buildHiddenAgentRegistrations,
 } from "./agents/hidden-agent-registrations";
 import { withContentLanguageDirective } from "./agents/language-directive";
+import { denyTaskRoutingToCallerAgents } from "./agents/permissions";
 import { loadPluginConfigDetailed } from "./config";
 import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
@@ -746,6 +747,8 @@ const server: Plugin = async (ctx) => {
                 });
 
                 const agentConfig = { ...(config.agent ?? {}) } as NonNullable<typeof config.agent>;
+                const agentConfigRecord = agentConfig as Record<string, Record<string, unknown>>;
+                const internalAgentIds = registrations.map((registration) => registration.id);
                 for (const reg of registrations) {
                     if (typeof reg.prompt !== "string" || reg.prompt.length === 0) {
                         log(
@@ -753,7 +756,7 @@ const server: Plugin = async (ctx) => {
                         );
                         continue;
                     }
-                    agentConfig[reg.id] = buildHiddenAgentConfig(
+                    agentConfigRecord[reg.id] = buildHiddenAgentConfig(
                         reg.prompt,
                         reg.allowedTools,
                         reg.maxSteps,
@@ -763,7 +766,11 @@ const server: Plugin = async (ctx) => {
                         reg.description,
                     );
                 }
-                config.agent = agentConfig;
+                const callerAgentConfig = denyTaskRoutingToCallerAgents(
+                    agentConfigRecord,
+                    internalAgentIds,
+                );
+                config.agent = callerAgentConfig as NonNullable<typeof config.agent>;
             } catch (error) {
                 // A failure registering commands/agents must NEVER fail the whole
                 // plugin load — that would also disable the transform/compaction
