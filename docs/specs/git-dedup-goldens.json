@@ -1,0 +1,86 @@
+[
+  {
+    "case": "ordinary-repository",
+    "expected_anchor": "git:cfb02d5432dbd8e84710cf2977e451b2ff79c01c"
+  },
+  {
+    "case": "non-git-directory",
+    "expected_anchor": "NONE"
+  },
+  {
+    "case": "empty-repository",
+    "expected_anchor": "NONE"
+  },
+  {
+    "case": "grafted-history-lexmin-root",
+    "expected_anchor": "git:1c91b0cecc99078da6ad08b03b16be9cddc97d7e"
+  },
+  {
+    "case": "shallow-clone-sees-shallow-tip-as-root",
+    "expected_anchor": "git:89fddaa5f1e29b08d5826dff1ea14ff92dbea201"
+  },
+  {
+    "case": "submodule-uses-its-own-root",
+    "expected_anchor": "git:bbd52c61d817654da41d78fc0dd5e52df91af5ea"
+  },
+  {
+    "case": "worktree-shares-main-checkout-anchor",
+    "expected_anchor": "git:e8e2cd4c5b32daf26a396c0f015b0798d8420dc3"
+  },
+  {
+    "case": "bare-repository-direct-path-is-none",
+    "expected_anchor": "NONE"
+  },
+  {
+    "case": "bare-repository-linked-worktree",
+    "expected_anchor": "git:6c949aff3449ad3157f21d63075921a12428ae1c"
+  },
+  {
+    "case": "trailing-slash-is-path-invariant",
+    "expected_anchor": "git:cfb02d5432dbd8e84710cf2977e451b2ff79c01c"
+  },
+  {
+    "case": "symlink-is-path-invariant",
+    "expected_anchor": "git:cfb02d5432dbd8e84710cf2977e451b2ff79c01c"
+  },
+  {
+    "case": "fork-original-anchor",
+    "expected_anchor": "git:dc0593dfe27aa52ad97fdcfff623823873936d05"
+  },
+  {
+    "case": "fork-sharing-history-anchor",
+    "expected_anchor": "git:dc0593dfe27aa52ad97fdcfff623823873936d05"
+  },
+  {
+    "case": "vendor-original-anchor",
+    "expected_anchor": "git:24ecd634b4f172fbfd32c271933709d60896ec05"
+  },
+  {
+    "case": "vendored-copy-with-intact-git-anchor",
+    "expected_anchor": "git:24ecd634b4f172fbfd32c271933709d60896ec05"
+  },
+  {
+    "case": "monorepo-original-anchor",
+    "expected_anchor": "git:7e0cf863faa8d786c15637c4e185878f20ea2d7c"
+  },
+  {
+    "case": "monorepo-split-preserving-root-anchor",
+    "expected_anchor": "git:7e0cf863faa8d786c15637c4e185878f20ea2d7c"
+  },
+  {
+    "case": "ponder-anchor",
+    "expected_anchor": "git:28029d3e947a77e6cee0ac95b809015b6583eba5"
+  },
+  {
+    "case": "ponder-backup-copy-anchor",
+    "expected_anchor": "git:28029d3e947a77e6cee0ac95b809015b6583eba5"
+  },
+  {
+    "case": "pi-shared-early-history-anchor",
+    "expected_anchor": "git:498b6a2b9cb7ab7158630612eb8f5b4150d20178"
+  },
+  {
+    "case": "pi-mono-shared-early-history-anchor",
+    "expected_anchor": "git:498b6a2b9cb7ab7158630612eb8f5b4150d20178"
+  }
+]

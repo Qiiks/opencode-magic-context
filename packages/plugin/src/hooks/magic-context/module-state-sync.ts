@@ -1480,6 +1480,10 @@ export async function buildModuleStateSyncPayload(args: {
 }
 
 export interface ModuleStateSyncClient {
+    /** Synchronously exposes capabilities cached for the transport's live connection generation. */
+    getCachedStateSyncCapabilities?(): { state_sync_deltas?: boolean } | undefined;
+    /** Clears a capability snapshot when the module reports a restart-like signal. */
+    invalidateStateSyncCapabilities?(): void;
     /** Capability probe is optional so older/test transports retain legacy wire semantics. */
     stateSyncCapabilities?(args: {
         sessionId: string;
@@ -1492,6 +1496,7 @@ export interface ModuleStateSyncClient {
             | "state_sync"
             | "transform"
             | "session.status"
+            | "session.delete"
             | "session.flush"
             | "session.recomp"
             | "session.wrapup"
@@ -1576,7 +1581,9 @@ export async function syncModuleState(args: {
 }): Promise<ModuleStateSyncResult> {
     let force = args.force;
     const adoption = args.options?.authoritySeqAdoption ?? { used: false };
-    let stateSyncDeltas = args.options?.stateSyncDeltas;
+    let stateSyncDeltas =
+        args.options?.stateSyncDeltas ??
+        args.client.getCachedStateSyncCapabilities?.()?.state_sync_deltas;
     if (stateSyncDeltas === undefined && args.client.stateSyncCapabilities) {
         try {
             stateSyncDeltas =

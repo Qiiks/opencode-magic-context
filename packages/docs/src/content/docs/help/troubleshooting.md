@@ -15,11 +15,11 @@ Add `--force` to auto-fix what it can. Add `--issue` to generate a sanitized bug
 
 ## Plugin not loading
 
-**Symptom:** The TUI sidebar doesn't appear in OpenCode, `/ctx-status` returns an unknown command, or the Pi footer shows no Magic Context status.
+**Symptom:** The TUI sidebar doesn't appear in OpenCode, `/ctx-status` returns an unknown command, or the Pi/OMP footer shows no Magic Context status.
 
 **Fix — try in order:**
 
-1. **Restart the harness.** After install, you must restart OpenCode or Pi for the plugin to register. Simply quitting and reopening is enough.
+1. **Restart the harness.** After installation, restart OpenCode or Pi; in OMP, restart or run `/reload-plugins`.
 
 2. **Run doctor.** Doctor verifies the plugin entry in your config, checks for version mismatches, and confirms the plugin package is present:
    ```bash
@@ -30,6 +30,36 @@ Add `--force` to auto-fix what it can. Add `--issue` to generate a sanitized bug
 3. **Check for version pin conflicts.** If your `opencode.json` or npm config pins the plugin to an older version, the new package may not load. Remove explicit version pins and let `@latest` resolve.
 
 4. **`.npmrc` `min-release-age` setting.** Some `.npmrc` configurations set a minimum release age before packages are treated as stable. If you have `prefer-stable` or `min-release-age` set, the latest Magic Context release may not be available to `npx`. Try running `npx --yes @cortexkit/magic-context@latest setup` to bypass the cache, or clear npm's download cache with `npm cache clean --force`.
+
+---
+
+## Doctor finds more than one installation
+
+The doctor reports every detected OpenCode installation in a table with an `[active]` marker, path, version, and source. The first entry is the active path (PATH is checked first). If both harnesses are installed, use `--harness opencode` or `--harness pi` to select which doctor to run without a prompt.
+
+```bash
+npx @cortexkit/magic-context@latest doctor --harness opencode
+```
+
+---
+
+## Merge split project identities
+
+If the same project has memories under two project identities, preview a merge before changing the shared database:
+
+```bash
+npx @cortexkit/magic-context@latest doctor merge-identity \
+  --from <source-id> --to <target-id> --dry-run
+```
+
+The preview lists the project-scoped tables and rows that would be considered. A write requires an explicit confirmation flag:
+
+```bash
+npx @cortexkit/magic-context@latest doctor merge-identity \
+  --from <source-id> --to <target-id> --yes
+```
+
+Without `--dry-run` or `--yes`, the command refuses to mutate `context.db`.
 
 ---
 

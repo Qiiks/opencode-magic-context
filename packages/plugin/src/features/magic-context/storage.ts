@@ -230,6 +230,7 @@ export {
 export { bumpSessionFactsVersion } from "./storage-meta-shared";
 export {
     addNote,
+    type ConditionCompileStatus,
     deleteNote,
     dismissNote,
     getNotes,
@@ -243,6 +244,7 @@ export {
     type NoteStatus,
     type NoteType,
     replaceAllSessionNotes,
+    type UpdateNoteOptions,
     updateNote,
 } from "./storage-notes";
 export {

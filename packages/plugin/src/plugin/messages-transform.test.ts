@@ -6,6 +6,7 @@ import {
     FAIL_CLOSED_DOCTOR_COMMAND,
     isFailClosedBlockingError,
 } from "../features/magic-context/fail-closed-block";
+import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
 import { createMessagesTransformHandler } from "./messages-transform";
 
 // Minimal fake message shape — just needs info + parts.
@@ -61,6 +62,20 @@ describe("createMessagesTransformHandler — error boundary (issue #23)", () => 
 
         const output = makeOutput();
         await expect(handler({}, output)).resolves.toBeDefined();
+    });
+
+    it("surfaces an oversized raw-fallback refusal to the prompt loop", async () => {
+        const handler = createMessagesTransformHandler({
+            magicContext: {
+                "experimental.chat.messages.transform": async () => {
+                    throw new RawFallbackContextLimitError(3_300_000, 1_000_000);
+                },
+            },
+        });
+
+        await expect(handler({}, makeOutput())).rejects.toBeInstanceOf(
+            RawFallbackContextLimitError,
+        );
     });
 
     it("passes through non-error transforms normally", async () => {

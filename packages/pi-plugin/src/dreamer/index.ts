@@ -41,6 +41,7 @@ export interface PiDreamerOptions {
 	 * previously made dreamer's memory tasks a no-op.
 	 */
 	memoryEnabled: boolean;
+	retinaHandoff?: boolean;
 	language?: string;
 	gitCommitIndexing: {
 		enabled: boolean;
@@ -150,6 +151,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		dreamerConfig: opts.config,
 		language: opts.language,
 		gitCommitIndexing: opts.gitCommitIndexing,
+		retinaHandoff: opts.retinaHandoff,
 		ensureRegistered: ensureProjectRegisteredFromPiDirectory,
 		// SCHEDULED Pi retrospective must read Pi JSONL sessions, not opencode.db.
 		// Supply the Pi provider factory (db arg ignored — Pi reads JSONL by cwd),
@@ -192,6 +194,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 				userMemoryCollectionEnabled: userMemoryCollectionEnabled(opts.config),
 				ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 				language: opts.language,
+				retinaHandoff: opts.retinaHandoff,
 			}),
 			task,
 		});

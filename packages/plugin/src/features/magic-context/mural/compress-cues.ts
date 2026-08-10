@@ -14,12 +14,12 @@ import { log } from "../../../shared/logger";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { runLeaseGuardedWrite, startLeaseHeartbeat } from "../dreamer/lease";
+import { assertManifestCoversExactly } from "../dreamer/manifest-parser";
 import {
     DreamerModuleFailureError,
-    getModuleMemoryIdentities,
     type DreamerModuleRoute,
+    getModuleMemoryIdentities,
 } from "../dreamer/module-apply";
-import { assertManifestCoversExactly } from "../dreamer/manifest-parser";
 import { getMemoriesByProject, type Memory } from "../memory";
 import {
     buildCompressCuesPrompt,

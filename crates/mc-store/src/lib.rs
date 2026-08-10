@@ -6505,6 +6505,54 @@ impl McStore {
             .map_err(Into::into)
     }
 
+    /// Delete every row whose ownership is expressed by an exact `session_id` column.
+    /// Project memories and smart notes survive because their ownership is project-scoped;
+    /// session notes and every cache/overlay/producer ledger row are removed atomically.
+    pub fn delete_session(
+        &self,
+        session_id: &str,
+        project_path: &str,
+    ) -> Result<usize, McStoreError> {
+        self.with_note_conn_fenced(project_path, |tx| {
+            let tables = {
+                let mut stmt = tx.prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let mut deleted = 0usize;
+            for table in tables {
+                let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+                let has_session_id = {
+                    let mut stmt = tx.prepare(&format!("PRAGMA table_info({quoted})"))?;
+                    let columns = stmt
+                        .query_map([], |row| row.get::<_, String>(1))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    columns.into_iter().any(|column| column == "session_id")
+                };
+                if has_session_id {
+                    deleted = deleted.saturating_add(if table == "mc_notes" {
+                        tx.execute(
+                            &format!(
+                                "DELETE FROM {quoted} WHERE session_id = ?1 AND project_path = ?2 AND type = 'session'"
+                            ),
+                            params![session_id, project_path],
+                        )?
+                    } else {
+                        tx.execute(
+                            &format!("DELETE FROM {quoted} WHERE session_id = ?1"),
+                            params![session_id],
+                        )?
+                    });
+                }
+            }
+            Ok(deleted)
+        })
+    }
+
     /// Load a session's persisted state. Returns defaults (uninitialized, no row)
     /// when the session has never been seen — the classifier then bootstraps.
     pub fn load(&self, session_id: &str) -> Result<LoadedState, McStoreError> {
@@ -16341,6 +16389,80 @@ mod tests {
         assert!(!loaded.meta.initialized);
         assert_eq!(loaded.row_version, None);
         assert_eq!(loaded.core, CoreState::default());
+    }
+
+    #[test]
+    fn delete_session_clears_owned_rows_without_touching_another_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let core = CoreState::default();
+        let meta = ModuleMeta::default();
+        store.commit("ses_delete", None, &core, &meta).unwrap();
+        store.commit("ses_keep", None, &core, &meta).unwrap();
+        store
+            .insert_note(NoteInput {
+                project_path: "/project",
+                route_project_root: None,
+                session_id: "ses_delete",
+                content: "session note",
+                surface_condition: None,
+                anchor_block_id: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        store
+            .insert_project_note(NoteWriteInput {
+                project_path: "/project",
+                route_project_root: None,
+                session_id: Some("ses_delete"),
+                content: "smart note",
+                surface_condition: Some("later"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        for session_id in ["ses_delete", "ses_keep"] {
+            store
+                .mint_or_get_tags(
+                    session_id,
+                    &[TagMintInput {
+                        block_id: format!("{session_id}#0"),
+                        kind: "message".to_string(),
+                        token_count: 1,
+                        source_bytes: b"source".to_vec(),
+                    }],
+                    1,
+                )
+                .unwrap();
+            store
+                .append_pending_agent_drops(session_id, &[format!("{session_id}#0")], 1)
+                .unwrap();
+        }
+
+        assert!(store.delete_session("ses_delete", "/project").unwrap() >= 3);
+        assert!(!store.has_cache_state("ses_delete").unwrap());
+        assert!(store.load_tags_for_session("ses_delete").unwrap().is_empty());
+        assert!(store
+            .load_pending_agent_drops("ses_delete")
+            .unwrap()
+            .is_empty());
+        let remaining_note_types = store
+            .inner
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT type FROM mc_notes WHERE session_id = 'ses_delete' ORDER BY id",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(remaining_note_types, vec!["smart".to_string()]);
+        assert!(store.has_cache_state("ses_keep").unwrap());
+        assert_eq!(store.load_tags_for_session("ses_keep").unwrap().len(), 1);
+        assert_eq!(store.load_pending_agent_drops("ses_keep").unwrap().len(), 1);
     }
 
     #[test]

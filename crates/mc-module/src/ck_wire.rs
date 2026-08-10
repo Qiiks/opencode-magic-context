@@ -46,7 +46,7 @@ pub struct FlatBlock {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_input: Option<Value>,
+    pub tool_input: Option<Arc<Value>>,
     pub provider_executed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arc_id: Option<String>,
@@ -60,7 +60,7 @@ pub struct FlatBlock {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_kind: Option<String>,
     #[serde(skip_serializing)]
-    pub wire: CkWireBlock,
+    pub wire: Arc<CkWireBlock>,
 }
 
 impl CkItem for FlatBlock {
@@ -81,10 +81,104 @@ impl CkItem for FlatBlock {
     }
 }
 
+/// Projector state at one message boundary. Tail deltas resume from this exact frontier so a
+/// tool result in the changed suffix can still pair with a call in the cached prefix.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct ProjectionState {
+    pending_calls: BTreeMap<String, VecDeque<String>>,
+    call_arcs: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlatProjection {
     pub blocks: Vec<FlatBlock>,
     pub identity_by_mid: BTreeMap<String, Vec<BlockIdentity>>,
+    /// Flat block end after each ingress message; maps the transport's message frontier without
+    /// walking or serializing the cached payload.
+    message_block_ends: Vec<usize>,
+    /// Shared boundary states make prefix reconstruction proportional in small Arc copies rather
+    /// than cloning pending tool-arc maps for every retained message.
+    states_after_messages: Vec<Arc<ProjectionState>>,
+}
+
+impl FlatProjection {
+    pub(crate) fn message_count(&self) -> usize {
+        self.message_block_ends.len()
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let block_bytes = self
+            .blocks
+            .iter()
+            .map(|block| {
+                std::mem::size_of::<FlatBlock>()
+                    .saturating_add(block.id.len())
+                    .saturating_add(block.mid.len())
+                    .saturating_add(block.role.len())
+                    .saturating_add(block.kind_tag.len())
+                    .saturating_add(block.name.as_deref().map_or(0, str::len))
+                    .saturating_add(block.file_path.as_deref().map_or(0, str::len))
+                    .saturating_add(block.arc_id.as_deref().map_or(0, str::len))
+                    .saturating_add(block.tool_call_id.as_deref().map_or(0, str::len))
+                    .saturating_add(block.output_kind.as_deref().map_or(0, str::len))
+                    // `bytes` is the serialized wire block. Charging it three times covers the
+                    // canonical string, the CK tree behind `wire`, and the separately retained
+                    // tool input (the third copy is intentionally conservative for non-tool data).
+                    .saturating_add(block.bytes.len().saturating_mul(3))
+            })
+            .sum::<usize>();
+        let identity_bytes = self
+            .identity_by_mid
+            .iter()
+            .map(|(mid, identities)| {
+                mid.len().saturating_add(
+                    identities
+                        .len()
+                        .saturating_mul(std::mem::size_of::<BlockIdentity>()),
+                )
+            })
+            .sum::<usize>();
+        let frontier_bytes = self
+            .states_after_messages
+            .iter()
+            .map(|state| {
+                state
+                    .pending_calls
+                    .iter()
+                    .map(|(call_id, arcs)| {
+                        call_id
+                            .len()
+                            .saturating_add(arcs.iter().map(String::len).sum::<usize>())
+                    })
+                    .sum::<usize>()
+                    .saturating_add(
+                        state
+                            .call_arcs
+                            .iter()
+                            .map(|(block_id, arc_id)| block_id.len().saturating_add(arc_id.len()))
+                            .sum::<usize>(),
+                    )
+            })
+            .sum::<usize>();
+        block_bytes
+            .saturating_add(identity_bytes)
+            .saturating_add(frontier_bytes)
+            .saturating_add(
+                self.message_block_ends
+                    .len()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            )
+    }
+
+    pub(crate) fn differential_bytes(&self) -> Vec<u8> {
+        let wires = self
+            .blocks
+            .iter()
+            .map(|block| block.wire.as_ref())
+            .collect::<Vec<_>>();
+        serde_json::to_vec(&(&self.blocks, &self.identity_by_mid, wires))
+            .expect("flat projection differential bytes must serialize")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,11 +222,62 @@ impl std::fmt::Display for CkWireError {
 impl std::error::Error for CkWireError {}
 
 pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection, CkWireError> {
-    let mut blocks = Vec::new();
-    let mut identity_by_mid: BTreeMap<String, Vec<BlockIdentity>> = BTreeMap::new();
-    let mut pending_calls: BTreeMap<String, VecDeque<String>> = BTreeMap::new();
-    let mut call_arcs: BTreeMap<String, String> = BTreeMap::new();
+    project_messages_from_state(messages, FlatProjectionBuilder::default())
+}
 
+/// Reuse an acknowledged message prefix and project only its replacement suffix.
+///
+/// The caller validates the session fingerprint and context before supplying `cached`; malformed
+/// or out-of-range local metadata falls back to a full projection rather than trusting a partial
+/// result.
+pub(crate) fn project_messages_incremental(
+    messages: &[CkIngressMessage],
+    cached: &FlatProjection,
+    prefix_messages: usize,
+) -> Result<FlatProjection, CkWireError> {
+    if prefix_messages == 0
+        || prefix_messages > messages.len()
+        || prefix_messages > cached.message_count()
+    {
+        return project_messages(messages);
+    }
+
+    let prefix_block_end = cached.message_block_ends[prefix_messages - 1];
+    let mut identity_by_mid = BTreeMap::new();
+    for message in &messages[..prefix_messages] {
+        if message.ck.meta.synthetic {
+            continue;
+        }
+        let Some(identities) = cached.identity_by_mid.get(&message.mid) else {
+            return project_messages(messages);
+        };
+        identity_by_mid.insert(message.mid.clone(), identities.clone());
+    }
+    let builder = FlatProjectionBuilder {
+        blocks: cached.blocks[..prefix_block_end].to_vec(),
+        identity_by_mid,
+        message_block_ends: cached.message_block_ends[..prefix_messages].to_vec(),
+        states_after_messages: cached.states_after_messages[..prefix_messages].to_vec(),
+        state: cached.states_after_messages[prefix_messages - 1]
+            .as_ref()
+            .clone(),
+    };
+    project_messages_from_state(&messages[prefix_messages..], builder)
+}
+
+#[derive(Default)]
+struct FlatProjectionBuilder {
+    blocks: Vec<FlatBlock>,
+    identity_by_mid: BTreeMap<String, Vec<BlockIdentity>>,
+    message_block_ends: Vec<usize>,
+    states_after_messages: Vec<Arc<ProjectionState>>,
+    state: ProjectionState,
+}
+
+fn project_messages_from_state(
+    messages: &[CkIngressMessage],
+    mut builder: FlatProjectionBuilder,
+) -> Result<FlatProjection, CkWireError> {
     for msg in messages {
         if msg.mid.contains('#') {
             return Err(CkWireError::MidContainsReservedHash(msg.mid.clone()));
@@ -140,8 +285,8 @@ pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection,
 
         let role = msg.ck.role.as_str();
         if role == "assistant" {
-            pending_calls.clear();
-            call_arcs.clear();
+            builder.state.pending_calls.clear();
+            builder.state.call_arcs.clear();
             let mut call_counts = BTreeMap::<&str, usize>::new();
             for block in &msg.ck.content {
                 if let CkKind::ToolCall { id, .. } = &block.kind {
@@ -156,8 +301,10 @@ pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection,
                     } else {
                         block_id.clone()
                     };
-                    call_arcs.insert(block_id, arc_id.clone());
-                    pending_calls
+                    builder.state.call_arcs.insert(block_id, arc_id.clone());
+                    builder
+                        .state
+                        .pending_calls
                         .entry(id.clone())
                         .or_default()
                         .push_back(arc_id);
@@ -168,7 +315,13 @@ pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection,
         let mut identities = Vec::new();
         for (index, block) in msg.ck.content.iter().enumerate() {
             let id = block_id(&msg.mid, index);
-            let arc_id = arc_for_block(&msg.mid, index, &msg.ck, &mut pending_calls, &call_arcs)?;
+            let arc_id = arc_for_block(
+                &msg.mid,
+                index,
+                &msg.ck,
+                &mut builder.state.pending_calls,
+                &builder.state.call_arcs,
+            )?;
             let flat = flatten_block(msg, index, block, id, arc_id)?;
             if !flat.synthetic {
                 identities.push(BlockIdentity {
@@ -176,7 +329,7 @@ pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection,
                     byte_fingerprint: fingerprint_digest(&flat.content_hash),
                 });
             }
-            blocks.push(flat);
+            builder.blocks.push(flat);
         }
 
         // A tool arc ends at the next non-tool-carrying turn, but the clear must run
@@ -187,16 +340,22 @@ pub fn project_messages(messages: &[CkIngressMessage]) -> Result<FlatProjection,
         // ingress errors precede any state commit, one such message in the history
         // rejected every subsequent pass for the session's lifetime.
         if role != "assistant" && role != "tool" {
-            pending_calls.clear();
+            builder.state.pending_calls.clear();
         }
         if !msg.ck.meta.synthetic {
-            identity_by_mid.insert(msg.mid.clone(), identities);
+            builder.identity_by_mid.insert(msg.mid.clone(), identities);
         }
+        builder.message_block_ends.push(builder.blocks.len());
+        builder
+            .states_after_messages
+            .push(Arc::new(builder.state.clone()));
     }
 
     Ok(FlatProjection {
-        blocks,
-        identity_by_mid,
+        blocks: builder.blocks,
+        identity_by_mid: builder.identity_by_mid,
+        message_block_ends: builder.message_block_ends,
+        states_after_messages: builder.states_after_messages,
     })
 }
 
@@ -288,7 +447,7 @@ fn flatten_block(
             } => (
                 Some(name.clone()),
                 extract_file_path(input),
-                Some(input.clone()),
+                Some(Arc::new(input.clone())),
                 *provider_executed,
                 Some(id.clone()),
                 None,
@@ -326,7 +485,7 @@ fn flatten_block(
         synthetic: msg.ck.meta.synthetic,
         tool_call_id,
         output_kind,
-        wire: block.clone(),
+        wire: Arc::new(block.clone()),
     })
 }
 
@@ -410,7 +569,7 @@ pub(crate) fn fingerprint_from_projected_wire(
     projected: Option<&FlatBlock>,
 ) -> Option<(String, usize)> {
     let flat = projected?;
-    if &flat.wire != served {
+    if flat.wire.as_ref() != served {
         return None;
     }
     Some((fingerprint_digest(&flat.content_hash), flat.bytes.len()))
@@ -669,5 +828,56 @@ mod tests {
             .expect("media result block")
             .bytes
             .contains("file://capture.png"));
+    }
+
+    #[test]
+    fn incremental_projection_reuses_prefix_storage_and_preserves_tool_arc_state() {
+        let mut messages = vec![
+            text_msg("m0", 0, "user", "start"),
+            assistant_with_call("m1", 1, "toolu_1"),
+            CkIngressMessage {
+                mid: "m2".to_string(),
+                ordinal: 2,
+                ck: CkWireMessage::from_parts(
+                    "tool",
+                    vec![CkWireBlock::bare(CkKind::ToolResult {
+                        id: "toolu_1".to_string(),
+                        tool_name: "read".to_string(),
+                        output: CkToolOutput::bare(CkOutputKind::Text {
+                            text: "first result".into(),
+                        }),
+                        provider_executed: false,
+                    })],
+                    None,
+                    ProviderExtras::new(),
+                    HarnessMeta::default(),
+                ),
+            },
+        ];
+        let cached = project_messages(&messages).expect("initial projection");
+        if let CkKind::ToolResult { output, .. } = &mut messages[2].ck.content[0].kind {
+            output.kind = CkOutputKind::Text {
+                text: "changed result".into(),
+            };
+        }
+
+        let incremental =
+            project_messages_incremental(&messages, &cached, 2).expect("incremental projection");
+        let full = project_messages(&messages).expect("full projection");
+        assert_eq!(incremental, full);
+        assert_eq!(incremental.differential_bytes(), full.differential_bytes());
+        assert!(Arc::ptr_eq(
+            &incremental.blocks[0].wire,
+            &cached.blocks[0].wire
+        ));
+        assert!(Arc::ptr_eq(
+            &incremental.blocks[0].bytes,
+            &cached.blocks[0].bytes
+        ));
+        assert_eq!(
+            incremental.blocks[2].arc_id.as_deref(),
+            Some("m1#1"),
+            "the cached frontier must carry the pending tool call into the suffix"
+        );
     }
 }

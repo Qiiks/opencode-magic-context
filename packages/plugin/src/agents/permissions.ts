@@ -6,9 +6,10 @@ import { log } from "../shared/logger";
  * # Why this exists
  *
  * Hidden agents (`historian`, `historian-editor`, `dreamer`, `sidekick`) are
- * registered with `mode: "subagent"` and `hidden: true`, but those flags
- * only control visibility in the UI picker — they do NOT restrict which
- * tools the spawned session can call. By default a registered subagent
+ * registered with `mode: "primary"` and `hidden: true`: primary mode keeps
+ * them out of OpenCode's general Task candidate list, while hidden keeps them
+ * out of the UI picker. Those flags do NOT restrict which tools the spawned
+ * session can call. By default a registered agent
  * inherits the FULL primary-agent tool surface: `task`, `bash`, `edit`,
  * `webfetch`, `websearch`, `read`, `grep`, `glob`, every MCP tool, etc.
  *

@@ -39,7 +39,7 @@ Both channels suppress themselves after the agent calls `ctx_reduce` — no nagg
 
 If the agent doesn't reduce and pressure keeps building, automatic safety nets kick in:
 
-**Execute threshold.** At the configured execute threshold (default: 65% of context), the system runs heuristic cleanup: deduplicating identical tool calls, stripping system injections, and clearing old reasoning. It also applies any `ctx_reduce` drops the agent already queued. Crucially, the execute threshold does **not** drop tool outputs on its own — see [Why your token count can stay high after the threshold](#why-your-token-count-can-stay-high-after-the-threshold) below.
+**Execute threshold.** At the configured execute threshold (default: 65% of context, configurable up to 90%), the system runs heuristic cleanup: deduplicating identical tool calls, stripping system injections, and clearing old reasoning. It also applies any `ctx_reduce` drops the agent already queued. Values above the 90% cap are rejected or clamped according to the threshold form. Crucially, the execute threshold does **not** drop tool outputs on its own — see [Why your token count can stay high after the threshold](#why-your-token-count-can-stay-high-after-the-threshold) below.
 
 **85% — tiered emergency drop.** At 85% usage, a target-headroom eviction kicks in. Tool outputs are dropped oldest-first across three tiers: miscellaneous tools first (bash, web), then edit/search tools, then navigation tools last. The newest 20% of navigation and edit tools are reserved as continuation context. This is a cache-busting pass — the prompt cache rebuilds, but the system was heading there anyway.
 

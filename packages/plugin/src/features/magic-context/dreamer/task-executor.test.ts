@@ -46,6 +46,21 @@ function assistantMessages(text: string) {
     ];
 }
 
+function providerFailureMessages(text: string) {
+    return [
+        {
+            info: {
+                role: "assistant",
+                time: { created: Date.now() },
+                finish: "stop",
+                error: null,
+                tokens: { output: 8, reasoning: 0 },
+            },
+            parts: [{ type: "text", text }],
+        },
+    ];
+}
+
 describe("createDreamTaskExecutor — curate", () => {
     test("runs whole-pool curation without verification gate or watermark patch", async () => {
         db = freshDb();
@@ -232,6 +247,58 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         };
         expect(task.error).toContain("verify-broad cycle");
         expect(task.backlog).toMatchObject({ pendingAtStart: 51, pendingAtEnd: 1, processed: 50 });
+    });
+
+    test("surfaces provider-outage completions as transient task failures", async () => {
+        db = freshDb();
+        const project = "/repo/verify-broad-provider-outage";
+        seedTaskScheduleState(db, project, "verify-broad", null, null, "0 3 * * 0");
+        const memory = insertMemory(db, {
+            projectPath: project,
+            category: "ARCHITECTURE",
+            content: "Mapped fact blocked by a provider outage.",
+        });
+        recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1_000);
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "verify-provider-outage" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({
+                    data: providerFailureMessages("All Antigravity endpoints failed"),
+                })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+        const leaseKey = leaseKeyFor("verify-broad", project);
+        expect(acquireLease(db, "holder-broad-provider-outage", leaseKey)).toBe(true);
+
+        const result = await executor(
+            { task: "verify-broad", schedule: "0 3 * * 0", timeoutMinutes: 20 },
+            {
+                db,
+                projectIdentity: project,
+                holderId: "holder-broad-provider-outage",
+                leaseKey,
+            },
+        );
+
+        expect(result.status).toBe("failed");
+        expect(result.transient).toBe(true);
+        expect(result.error).toContain("provider-outage completion");
+        expect(result.error).not.toContain("manifest missing");
+        expect(getTaskScheduleState(db, project, "verify-broad")?.lastBroadRunAt).toBeGreaterThan(
+            0,
+        );
+        const run = getDreamRuns(db, project)[0];
+        expect(run?.tasks_failed).toBe(1);
+        const task = JSON.parse(run?.tasks_json ?? "[]")[0] as { error?: string };
+        expect(task.error).toContain("provider-outage completion");
     });
 
     test("keeps a zero-progress broad run failed", async () => {

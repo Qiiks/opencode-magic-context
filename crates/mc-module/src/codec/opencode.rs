@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
@@ -242,6 +243,43 @@ pub fn decode_opencode_with_sidecar_and_base(
     }
 }
 
+pub(crate) fn decode_opencode_sidecar_incremental(
+    messages: &[MessageV2Json],
+    prior: &DecodeSidecar,
+    replace_from: usize,
+) -> DecodeSidecar {
+    debug_assert!(replace_from <= messages.len());
+    debug_assert!(replace_from <= prior.order.len());
+    if replace_from == messages.len() && replace_from == prior.order.len() {
+        return prior.clone();
+    }
+
+    let suffix = decode_opencode_with_sidecar_and_base(
+        &messages[replace_from..],
+        Some(prior),
+        replace_from as u64,
+    )
+    .sidecar;
+    let mut sidecar = DecodeSidecar::new(HARNESS);
+    sidecar.mid_pins = suffix.mid_pins;
+    for mid in prior.order.iter().take(replace_from) {
+        if let Some(meta) = prior.messages.get(mid) {
+            sidecar.order.push(mid.clone());
+            sidecar.messages.insert(mid.clone(), Arc::clone(meta));
+        }
+    }
+    for mid in suffix.order {
+        let Some(meta) = suffix.messages.get(&mid) else {
+            continue;
+        };
+        if !sidecar.messages.contains_key(&mid) {
+            sidecar.order.push(mid.clone());
+        }
+        sidecar.messages.insert(mid, Arc::clone(meta));
+    }
+    sidecar
+}
+
 pub fn encode_opencode(
     messages: &[CkWireMessage],
     sidecar: &DecodeSidecar,
@@ -302,6 +340,13 @@ pub(crate) fn encode_opencode_with_transition_state(
     )
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct EncodedOpencodeChunk {
+    pub(crate) start_index: usize,
+    pub(crate) end_index: usize,
+    pub(crate) value: MessageV2Json,
+}
+
 fn encode_opencode_impl(
     messages: &[CkWireMessage],
     sidecar: &DecodeSidecar,
@@ -310,26 +355,61 @@ fn encode_opencode_impl(
     mutation_exempt_mids: &[&str],
     transition_consumed: bool,
 ) -> Vec<MessageV2Json> {
+    let encoded = encode_opencode_chunks_with_transition_state(
+        messages,
+        sidecar,
+        session_id,
+        preserve_compaction,
+        mutation_exempt_mids,
+        transition_consumed,
+        0,
+    )
+    .into_iter()
+    .map(|chunk| chunk.value)
+    .collect::<Vec<_>>();
+    assert_unique_tool_use_ids(&encoded);
+    encoded
+}
+
+pub(crate) fn encode_opencode_chunks_with_transition_state(
+    messages: &[CkWireMessage],
+    sidecar: &DecodeSidecar,
+    session_id: Option<&str>,
+    preserve_compaction: bool,
+    mutation_exempt_mids: &[&str],
+    _transition_consumed: bool,
+    base_index: usize,
+) -> Vec<EncodedOpencodeChunk> {
     let mut encoded = Vec::with_capacity(messages.len());
     let mut index = 0;
     while index < messages.len() {
+        let absolute_index = base_index.saturating_add(index);
         if let Some(next) = messages.get(index + 1) {
             if let Some(part) = render_synthetic_todo_pair(&messages[index], next) {
                 let info = synthetic_message_info(&messages[index], session_id);
-                encoded.push(json!({
-                    "info": info,
-                    "parts": [part],
-                }));
+                encoded.push(EncodedOpencodeChunk {
+                    start_index: absolute_index,
+                    end_index: absolute_index.saturating_add(2),
+                    value: json!({
+                        "info": info,
+                        "parts": [part],
+                    }),
+                });
                 index += 2;
                 continue;
             }
-            let call_is_fresh = meta_for_ck(sidecar, &messages[index], index).is_none();
-            let result_is_fresh = meta_for_ck(sidecar, next, index + 1).is_none();
+            let call_is_fresh = meta_for_ck(sidecar, &messages[index], absolute_index).is_none();
+            let result_is_fresh =
+                meta_for_ck(sidecar, next, absolute_index.saturating_add(1)).is_none();
             if call_is_fresh && result_is_fresh {
                 if let Some(part) = render_adjacent_tool_pair(&messages[index], next) {
                     let mut message = encode_new_message(&messages[index], session_id);
                     set_value(&mut message, "parts", Value::Array(vec![part]));
-                    encoded.push(message);
+                    encoded.push(EncodedOpencodeChunk {
+                        start_index: absolute_index,
+                        end_index: absolute_index.saturating_add(2),
+                        value: message,
+                    });
                     index += 2;
                     continue;
                 }
@@ -339,15 +419,54 @@ fn encode_opencode_impl(
         // Decoded input messages retain their harness id, so metadata can be rebound by
         // identity. A positional synthetic fallback can instead attach an input nudge's
         // native envelope to a fresh module-authored m0/m1 message.
-        let meta = meta_for_ck(sidecar, msg, index);
-        encoded.push(match meta {
+        let meta = meta_for_ck(sidecar, msg, absolute_index);
+        let value = match meta {
             Some(meta) if mutation_exempt_mids.contains(&meta.mid.as_str()) => meta.raw.clone(),
-            Some(meta) => encode_with_meta(msg, meta, preserve_compaction, transition_consumed),
+            Some(meta) => encode_with_meta(msg, meta, preserve_compaction),
             None => encode_new_message(msg, session_id),
+        };
+        encoded.push(EncodedOpencodeChunk {
+            start_index: absolute_index,
+            end_index: absolute_index.saturating_add(1),
+            value,
         });
         index += 1;
     }
     encoded
+}
+
+fn duplicate_tool_use_locations<'a>(
+    messages: impl IntoIterator<Item = &'a MessageV2Json>,
+) -> Vec<(String, usize, usize)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut duplicates = Vec::new();
+    for (message_index, message) in messages.into_iter().enumerate() {
+        let Some(parts) = message.get("parts").and_then(Value::as_array) else {
+            continue;
+        };
+        for (part_index, part) in parts.iter().enumerate() {
+            if part.get("type").and_then(Value::as_str) != Some("tool") {
+                continue;
+            }
+            let Some(call_id) = part.get("callID").and_then(Value::as_str) else {
+                continue;
+            };
+            if !seen.insert(call_id.to_string()) {
+                duplicates.push((call_id.to_string(), message_index, part_index));
+            }
+        }
+    }
+    duplicates
+}
+
+pub(crate) fn assert_unique_tool_use_ids<'a>(
+    messages: impl IntoIterator<Item = &'a MessageV2Json>,
+) {
+    let duplicates = duplicate_tool_use_locations(messages);
+    debug_assert!(
+        duplicates.is_empty(),
+        "OpenCode serialization produced duplicate tool_use ids: {duplicates:?}"
+    );
 }
 
 fn decode_tool_part(
@@ -583,7 +702,6 @@ fn encode_with_meta(
     msg: &CkWireMessage,
     meta: &HarnessMessageMeta,
     preserve_compaction: bool,
-    transition_consumed: bool,
 ) -> Value {
     let mut raw = meta.raw.clone();
     let mut parts = raw
@@ -628,13 +746,11 @@ fn encode_with_meta(
                     block_index += 2;
                     continue;
                 }
-                if transition_consumed
-                    && call_native_index.is_none()
-                    && result_native_index.is_none()
-                {
+                if call_native_index.is_none() && result_native_index.is_none() {
                     // OpenCode stores a completed invocation as one part, while CK expands that
-                    // part into adjacent call and result blocks. Recombine an unmatched pair as
-                    // one part instead of independently emitting the same callID twice.
+                    // part into adjacent call and result blocks. This provider-validity invariant
+                    // cannot depend on whether an older renderer-transition marker was persisted:
+                    // two independently emitted shells carry the same callID.
                     parts.push(render_tool_pair_as_part(block, result));
                     block_index += 2;
                     continue;
@@ -1856,6 +1972,185 @@ mod tests {
             &["summary", "latest"],
         );
         assert_eq!(served, raw);
+    }
+
+    #[test]
+    fn hard_epoch_fold_with_head_todo_coalesces_unmatched_reduced_tool_arc() {
+        let raw = vec![json!({
+            "absolute_ordinal": 2_752,
+            "info": { "id": "first-tail-assistant", "role": "assistant" },
+            "parts": [
+                { "type": "step-start" },
+                {
+                    "type": "reasoning",
+                    "text": "signed transition reasoning",
+                    "metadata": { "signature": "transition-signature" }
+                },
+                {
+                    "type": "tool",
+                    "tool": "aft_zoom",
+                    "callID": "call_uRXFDXYYs6UiMIkmAVDWZDzX",
+                    "state": {
+                        "status": "completed",
+                        "input": { "path": "src/lib.rs", "symbols": ["target"] },
+                        "output": "historical output"
+                    }
+                },
+                { "type": "step-finish", "reason": "tool-calls" }
+            ]
+        })];
+        let decoded = decode_opencode(&raw);
+        assert!(matches!(
+            decoded.messages[0].ck.content[2].kind,
+            CkKind::ToolCall { ref id, .. } if id == "call_uRXFDXYYs6UiMIkmAVDWZDzX"
+        ));
+        assert!(matches!(
+            decoded.messages[0].ck.content[3].kind,
+            CkKind::ToolResult { ref id, .. } if id == "call_uRXFDXYYs6UiMIkmAVDWZDzX"
+        ));
+        let mut reduced_tail = decoded.messages[0].ck.clone();
+        reduced_tail.content = reduced_tail
+            .content
+            .into_iter()
+            .map(|block| {
+                let reduced = match &block.kind {
+                    CkKind::ToolCall { .. } => {
+                        crate::ck_wire::reduced_block(&block, "reduced call skeleton", None)
+                    }
+                    CkKind::ToolResult { .. } => {
+                        crate::ck_wire::reduced_block(&block, "[dropped]", None)
+                    }
+                    _ => block,
+                };
+                CkWireBlock::bare(reduced.kind)
+            })
+            .collect();
+        reduced_tail.mark_modified();
+
+        let active_todo = crate::injection::build_synthetic_todo_pair(
+            r#"[{"content":"Inspect contributor issue","status":"in_progress","priority":"high"}]"#,
+        )
+        .unwrap();
+        let served = vec![
+            CkWireMessage::synthetic_user_text("m0"),
+            CkWireMessage::synthetic_user_text("m1"),
+            active_todo.assistant_msg,
+            active_todo.tool_msg,
+            reduced_tail,
+        ];
+
+        // A hard request triggered by an epoch change can be the first request after a renderer
+        // deployment, before the session row contains a transition marker. The codec must still
+        // produce a valid request when that marker is absent.
+        let encoded = encode_opencode_with_transition_state(
+            &served,
+            &decoded.sidecar,
+            Some("astro-epoch-change"),
+            &[],
+            false,
+        );
+        let tool_ids = encoded
+            .iter()
+            .flat_map(|message| message["parts"].as_array().into_iter().flatten())
+            .filter(|part| part["type"] == "tool")
+            .filter_map(|part| part["callID"].as_str())
+            .collect::<Vec<_>>();
+        let unique_ids = tool_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(
+            tool_ids.len(),
+            unique_ids.len(),
+            "a reduced call/result shell must serialize as one native tool part: {tool_ids:?}"
+        );
+        assert_eq!(
+            tool_ids
+                .iter()
+                .filter(|id| **id == "call_uRXFDXYYs6UiMIkmAVDWZDzX")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn whole_array_tool_use_guard_rejects_both_id_collision_directions() {
+        let valid = vec![
+            json!({
+                "info": { "id": "first", "role": "assistant" },
+                "parts": [{
+                    "type": "tool",
+                    "tool": "read",
+                    "callID": "call-first",
+                    "state": { "status": "pending", "input": {} }
+                }]
+            }),
+            json!({
+                "info": { "id": "second", "role": "assistant" },
+                "parts": [{
+                    "type": "tool",
+                    "tool": "read",
+                    "callID": "call-second",
+                    "state": { "status": "pending", "input": {} }
+                }]
+            }),
+        ];
+        assert_unique_tool_use_ids(&valid);
+
+        for (source, target) in [(0, 1), (1, 0)] {
+            let mut collided = valid.clone();
+            collided[target]["parts"][0]["callID"] = collided[source]["parts"][0]["callID"].clone();
+            assert!(
+                std::panic::catch_unwind(|| assert_unique_tool_use_ids(&collided)).is_err(),
+                "copying the id from message {source} to message {target} must trip the guard"
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_sidecar_carries_pins_across_three_generations() {
+        let mut seed = DecodeSidecar::new(HARNESS);
+        seed.pin_mid("stable-key", "pinned-mid");
+        let generation_1 = vec![json!({
+            "info": { "id": "stable-key", "role": "user" },
+            "parts": [{ "type": "text", "text": "first" }]
+        })];
+        let first = decode_opencode_with_sidecar(&generation_1, Some(&seed));
+        assert_eq!(first.messages[0].mid, "pinned-mid");
+
+        let mut generation_2 = generation_1.clone();
+        generation_2.push(json!({
+            "info": { "id": "other-key", "role": "assistant" },
+            "parts": [{ "type": "text", "text": "second" }]
+        }));
+        let second = decode_opencode_sidecar_incremental(&generation_2, &first.sidecar, 1);
+        assert_eq!(
+            second.inherit_pin("stable-key").as_deref(),
+            Some("pinned-mid")
+        );
+
+        let mut generation_3 = generation_2.clone();
+        generation_3.push(json!({
+            "info": { "id": "stable-key", "role": "user", "generation": 3 },
+            "parts": [{ "type": "text", "text": "third" }]
+        }));
+        let incremental = decode_opencode_sidecar_incremental(&generation_3, &second, 2);
+        let full = decode_opencode_with_sidecar(&generation_3, Some(&seed)).sidecar;
+        assert_eq!(incremental, full);
+        assert_eq!(
+            incremental.message_by_mid("pinned-mid").unwrap().raw["info"]["generation"],
+            3
+        );
+
+        // Mutation proof: dropping inherited pins before the third generation creates a second
+        // identity for the repeated stable key and must diverge from the full decoder.
+        let mut broken_prior = second;
+        broken_prior.mid_pins.clear();
+        let broken = decode_opencode_sidecar_incremental(&generation_3, &broken_prior, 2);
+        assert_ne!(broken, full);
+        assert!(broken.message_by_mid("stable-key").is_some());
     }
 
     #[test]

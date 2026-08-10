@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+
 import {
     type AuthorityDrainResponse,
     type AuthorityModuleClient,
@@ -46,8 +47,17 @@ import {
     captureSlot,
     dropSlot,
     getSlot,
+    LKG_SNAPSHOT_ARRAY,
+    LKG_SNAPSHOT_BOOLEAN,
+    LKG_SNAPSHOT_KEY,
+    LKG_SNAPSHOT_NULL,
+    LKG_SNAPSHOT_NUMBER,
+    LKG_SNAPSHOT_OBJECT,
+    LKG_SNAPSHOT_STRING,
+    LKG_SNAPSHOT_UNDEFINED,
+    type LkgContentField,
     type LkgEntryNote,
-    lkgContentDigest,
+    lkgContentDigestFromFields,
     noteEntry,
 } from "./lkg-slot";
 import {
@@ -64,12 +74,13 @@ import {
     resolveOrdinalsForModule,
 } from "./module-wire";
 import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
+import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { findLastAssistantModelFromOpenCodeDb, isMidTurn } from "./read-session-db";
 import type { RawMessageOrdinalAnchor } from "./read-session-raw";
+import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
 import type { TransformDeps } from "./transform";
 import { resolveHistoryBudgetTokens } from "./transform";
 import { loadContextUsage } from "./transform-context-state";
-import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
 import type { MessageLike } from "./transform-operations";
 import { runRustModePostprocess } from "./transform-postprocess-phase";
 import { logTransformTiming } from "./transform-stage-logger";
@@ -111,6 +122,7 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
         live_only?: boolean;
         projectRoot?: string;
     }): Promise<{ page: import("../../features/magic-context/context-authority").ChangefeedPage }>;
+    deleteSession?(sessionId: string, projectRoot: string): Promise<void>;
     closeSession?(sessionId: string): void;
     getCompartmentsAfter?(
         sessionId: string,
@@ -118,11 +130,21 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
     ): Promise<ModuleCompartmentMirrorResponse>;
 }
 
-type MessageContentField = string | number | boolean | symbol;
-
 interface MessageContentSnapshot {
     signature: string;
-    fields: MessageContentField[];
+    fields: LkgContentField[];
+}
+
+interface RustLkgCapturePlan {
+    sessionId: string;
+    inputIds: string[];
+    inputSnapshots: readonly MessageContentSnapshot[];
+    jsonPrefix: string;
+    modelKey: string | null;
+    providerKey: string | null;
+    capturedAt: number;
+    rowVersion: number;
+    captureSequence: number;
 }
 
 interface RustWireCache {
@@ -167,6 +189,9 @@ interface RustSessionState extends ModuleStateSyncState {
     memoryAuthorityRoot: string | null;
     memoryAuthorityReady: boolean;
     authorityMemorySyncSkipLogged?: boolean;
+    lkgCaptureSequence: number;
+    lkgLastCapturedRowVersion: number;
+    lkgSyncCaptureRequired: boolean;
 }
 
 export interface RustModeTransformOptions {
@@ -184,6 +209,8 @@ export interface RustModeTransformOptions {
     onProjectPrepared?: (projectPath: string) => void;
     /** Test-only escape hatch for transform-wire tests without an authority transport. */
     allowAuthorityProtocolBypassForTests?: boolean;
+    /** Override only for deterministic capture scheduling in tests. */
+    scheduleLkgCapture?: (capture: () => void) => void;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -223,17 +250,8 @@ function updateFnv1a32(hash: number, value: string): number {
     return next;
 }
 
-const SNAPSHOT_ARRAY = Symbol("array");
-const SNAPSHOT_OBJECT = Symbol("object");
-const SNAPSHOT_KEY = Symbol("key");
-const SNAPSHOT_STRING = Symbol("string");
-const SNAPSHOT_NUMBER = Symbol("number");
-const SNAPSHOT_BOOLEAN = Symbol("boolean");
-const SNAPSHOT_NULL = Symbol("null");
-const SNAPSHOT_UNDEFINED = Symbol("undefined");
-
 interface MessageContentFieldVisitor {
-    field(value: MessageContentField): boolean;
+    field(value: LkgContentField): boolean;
     beginObject(): number | undefined;
     endObject(token: number, entryCount: number): boolean;
 }
@@ -243,28 +261,28 @@ function isSnapshotObjectChild(value: unknown): boolean {
 }
 
 function visitMessageContentFields(value: unknown, visitor: MessageContentFieldVisitor): boolean {
-    if (value === null) return visitor.field(SNAPSHOT_NULL);
+    if (value === null) return visitor.field(LKG_SNAPSHOT_NULL);
     if (typeof value === "string") {
-        return visitor.field(SNAPSHOT_STRING) && visitor.field(value);
+        return visitor.field(LKG_SNAPSHOT_STRING) && visitor.field(value);
     }
     if (typeof value === "number") {
-        return visitor.field(SNAPSHOT_NUMBER) && visitor.field(value);
+        return visitor.field(LKG_SNAPSHOT_NUMBER) && visitor.field(value);
     }
     if (typeof value === "boolean") {
-        return visitor.field(SNAPSHOT_BOOLEAN) && visitor.field(value);
+        return visitor.field(LKG_SNAPSHOT_BOOLEAN) && visitor.field(value);
     }
     if (value === undefined || typeof value === "function" || typeof value === "symbol") {
-        return visitor.field(SNAPSHOT_UNDEFINED);
+        return visitor.field(LKG_SNAPSHOT_UNDEFINED);
     }
     if (Array.isArray(value)) {
-        if (!visitor.field(SNAPSHOT_ARRAY) || !visitor.field(value.length)) return false;
+        if (!visitor.field(LKG_SNAPSHOT_ARRAY) || !visitor.field(value.length)) return false;
         for (const item of value) {
             if (!visitMessageContentFields(item, visitor)) return false;
         }
         return true;
     }
     if (typeof value === "object") {
-        if (!visitor.field(SNAPSHOT_OBJECT)) return false;
+        if (!visitor.field(LKG_SNAPSHOT_OBJECT)) return false;
         const objectToken = visitor.beginObject();
         if (objectToken === undefined) return false;
         let entryCount = 0;
@@ -274,7 +292,7 @@ function visitMessageContentFields(value: unknown, visitor: MessageContentFieldV
             if (!isSnapshotObjectChild(child)) continue;
             entryCount += 1;
             if (
-                !visitor.field(SNAPSHOT_KEY) ||
+                !visitor.field(LKG_SNAPSHOT_KEY) ||
                 !visitor.field(key) ||
                 !visitMessageContentFields(child, visitor)
             ) {
@@ -283,11 +301,11 @@ function visitMessageContentFields(value: unknown, visitor: MessageContentFieldV
         }
         return visitor.endObject(objectToken, entryCount);
     }
-    return visitor.field(SNAPSHOT_UNDEFINED);
+    return visitor.field(LKG_SNAPSHOT_UNDEFINED);
 }
 
-function messageContentFields(message: MessageLike): MessageContentField[] {
-    const fields: MessageContentField[] = [];
+function messageContentFields(message: MessageLike): LkgContentField[] {
+    const fields: LkgContentField[] = [];
     const complete = visitMessageContentFields(message, {
         field(value) {
             fields.push(value);
@@ -307,7 +325,7 @@ function messageContentFields(message: MessageLike): MessageContentField[] {
     return fields;
 }
 
-function signatureForFields(fields: readonly MessageContentField[]): string {
+function signatureForFields(fields: readonly LkgContentField[]): string {
     let hash = FNV1A_32_OFFSET;
     for (const field of fields) {
         const value = typeof field === "symbol" ? (field.description ?? "") : String(field);
@@ -568,6 +586,9 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             memoryAuthorityRoot: null,
             memoryAuthorityReady: false,
             authorityMemorySyncSkipLogged: false,
+            lkgCaptureSequence: 0,
+            lkgLastCapturedRowVersion: 0,
+            lkgSyncCaptureRequired: false,
         };
         states.set(sessionId, state);
     }
@@ -898,7 +919,8 @@ function syntheticTodoAnchorFromNative(messages: readonly unknown[]): {
         if (stateJson === null || computeSyntheticCallId(stateJson) !== part.callID) continue;
 
         const previous = messages[index - 1];
-        const previousInfo = isRecord(previous) && isRecord(previous.info) ? previous.info : undefined;
+        const previousInfo =
+            isRecord(previous) && isRecord(previous.info) ? previous.info : undefined;
         const messageId =
             previousInfo && typeof previousInfo.id === "string" && previousInfo.id.length > 0
                 ? previousInfo.id
@@ -1020,8 +1042,7 @@ function buildTransformBody(args: {
         tool_present: args.passInputs.tool_present === true,
         prompt_surface_preset: args.passInputs.prompt_surface_preset ?? "full",
         prompt_surface_model_key: args.passInputs.prompt_surface_model_key,
-        prompt_surface_tool_descriptions:
-            args.passInputs.prompt_surface_tool_descriptions ?? {},
+        prompt_surface_tool_descriptions: args.passInputs.prompt_surface_tool_descriptions ?? {},
         effective_execute_threshold: args.passInputs.effective_execute_threshold,
         history_budget_tokens: args.passInputs.history_budget_tokens,
         clear_reasoning_age: args.passInputs.clear_reasoning_age,
@@ -1058,6 +1079,8 @@ export function createRustModeTransform(
 } {
     const states = new Map<string, RustSessionState>();
     const wireCaches = new Map<string, RustWireCache>();
+    const scheduleLkgCapture =
+        options.scheduleLkgCapture ?? ((capture: () => void) => setImmediate(capture));
     const timeoutMs = Math.max(1, options.moduleTimeoutMs ?? RUST_SEND_TIMEOUT_MS);
 
     const logStage = (
@@ -1218,34 +1241,70 @@ export function createRustModeTransform(
         return true;
     };
 
-    const captureRustResponse = (
+    const prepareRustCapture = (
+        state: RustSessionState,
         sessionId: string,
         input: MessageLike[],
+        inputSnapshots: readonly MessageContentSnapshot[],
         response: Record<string, unknown>,
-    ): boolean => {
-        const ids = input.map((message) => message.info.id);
+        responseRowVersion: number,
+    ): RustLkgCapturePlan | null => {
+        state.lkgCaptureSequence += 1;
+        const inputIds = input.map((message) => message.info.id);
         if (
-            ids.some((id) => typeof id !== "string") ||
-            new Set(ids).size !== ids.length ||
-            ids.length === 0
+            inputIds.some((id) => typeof id !== "string") ||
+            new Set(inputIds).size !== inputIds.length ||
+            inputIds.length === 0 ||
+            inputSnapshots.length !== inputIds.length
         ) {
-            return false;
+            return null;
         }
-        const inputContentDigests = input.map((message) => lkgContentDigest(message));
-        if (inputContentDigests.some((digest) => digest === null)) return false;
         const native = response.native_messages;
         const jsonPrefix = typeof native === "string" ? native : JSON.stringify(native);
-        if (typeof jsonPrefix !== "string") return false;
+        if (typeof jsonPrefix !== "string") return null;
         const keys = resolveLkgModelKeys(input);
-        return captureSlot(sessionId, {
+        return {
+            sessionId,
+            inputIds: inputIds as string[],
+            inputSnapshots,
             jsonPrefix,
-            inputIdSeq: ids as string[],
-            inputContentDigests: inputContentDigests as string[],
-            lastInputMessageId: ids[ids.length - 1] as string,
             modelKey: keys.modelKey,
             providerKey: keys.providerKey,
             capturedAt: Date.now(),
+            rowVersion: responseRowVersion,
+            captureSequence: state.lkgCaptureSequence,
+        };
+    };
+
+    const commitRustCapture = (
+        state: RustSessionState,
+        plan: RustLkgCapturePlan,
+    ): "captured" | "superseded" => {
+        if (
+            states.get(plan.sessionId) !== state ||
+            plan.captureSequence !== state.lkgCaptureSequence ||
+            plan.rowVersion < state.lkgLastCapturedRowVersion
+        ) {
+            return "superseded";
+        }
+        const inputContentDigests = plan.inputSnapshots.map((snapshot) =>
+            lkgContentDigestFromFields(snapshot.fields),
+        );
+        const captured = captureSlot(plan.sessionId, {
+            jsonPrefix: plan.jsonPrefix,
+            inputIdSeq: plan.inputIds,
+            inputContentDigests,
+            lastInputMessageId: plan.inputIds[plan.inputIds.length - 1] as string,
+            modelKey: plan.modelKey,
+            providerKey: plan.providerKey,
+            capturedAt: plan.capturedAt,
+            rowVersion: plan.rowVersion,
+            captureSequence: plan.captureSequence,
         });
+        if (!captured) throw new Error("LKG slot rejected the prepared snapshot");
+        state.lkgLastCapturedRowVersion = plan.rowVersion;
+        state.lkgSyncCaptureRequired = false;
+        return "captured";
     };
 
     const run = async (
@@ -1326,6 +1385,37 @@ export function createRustModeTransform(
                 overflowState.emergencyRecoveryOrigin === "provider_overflow" &&
                 hasProviderProof;
         }
+        const serveRawFallback = (cause?: unknown): void => {
+            const contextLimit =
+                resolvedContextLimit ??
+                (overflowState && overflowState.detectedContextLimit > 0
+                    ? overflowState.detectedContextLimit
+                    : undefined);
+            if (contextLimit !== undefined) {
+                try {
+                    const estimate = estimateFinalWireInputTokens({
+                        messages,
+                        systemPromptTokens: sessionMeta.systemPromptTokens,
+                        providerID: model?.providerID,
+                        modelID: model?.modelID,
+                        agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                    });
+                    if (estimate.tokens > contextLimit) {
+                        sessionLog(
+                            sessionId,
+                            `raw_fallback_over_context_limit estimated=${estimate.tokens} limit=${contextLimit}`,
+                        );
+                        throw new RawFallbackContextLimitError(estimate.tokens, contextLimit, {
+                            cause,
+                        });
+                    }
+                } catch (error) {
+                    if (error instanceof RawFallbackContextLimitError) throw error;
+                    // An unavailable estimate leaves the ordinary raw fail-open contract intact.
+                }
+            }
+            replaceMessagesInPlace(output, messages);
+        };
         const finishPass = (applied: boolean, served = true): void => {
             const elapsedAt = applied && appliedAt !== undefined ? appliedAt : performance.now();
             const elapsedMs = Math.max(0, elapsedAt - passStartedAt);
@@ -1371,19 +1461,50 @@ export function createRustModeTransform(
                     ? response.materialize_reason
                     : "none";
             const timings = isRecord(response.timings) ? response.timings : undefined;
-            const total = timings?.total;
-            moduleElapsedMs = typeof total === "number" && Number.isFinite(total) ? total : 0;
+            const applyOnceTotal = timings?.total;
+            const handlerTotal = timings?.handler_total;
+            moduleElapsedMs =
+                typeof handlerTotal === "number" && Number.isFinite(handlerTotal)
+                    ? handlerTotal
+                    : typeof applyOnceTotal === "number" && Number.isFinite(applyOnceTotal)
+                      ? applyOnceTotal
+                      : 0;
             rowVersion =
                 typeof response.row_version === "number" &&
                 Number.isSafeInteger(response.row_version)
                     ? response.row_version
                     : 0;
-            // A slow module pass earns its stage breakdown in the log: the pass line
-            // only carries the module total, which cannot distinguish a tokenizer
-            // stall from a store commit stall on large sessions.
+            if (
+                timings &&
+                (typeof timings.handler_total === "number" ||
+                    typeof timings.native_cache_reused_messages === "number" ||
+                    typeof timings.native_cache_encoded_messages === "number")
+            ) {
+                const stage = (name: string): string => {
+                    const value = timings[name];
+                    return typeof value === "number" && Number.isFinite(value)
+                        ? value.toFixed(1)
+                        : "n/a";
+                };
+                sessionLog(
+                    sessionId,
+                    `rust module stages: handler=${stage("handler_total")} apply_once=${stage("total")} ` +
+                        `request_to_handler=${stage("request_observed_to_handler")} ` +
+                        `projection=${stage("projection")} selection=${stage("selection")} ` +
+                        `build_output=${stage("build_output")} store_commit=${stage("store_commit")} ` +
+                        `post_attach=${stage("post_attach")} response_encode=${stage("response_encode")} ` +
+                        `native_cache_reused=${stage("native_cache_reused_messages")} ` +
+                        `native_cache_encoded=${stage("native_cache_encoded_messages")}`,
+                );
+            }
+            // If the module took at least one second, log every other numeric timing
+            // field so the slow stage can be identified.
             if (timings && moduleElapsedMs >= 1000) {
                 const detail = Object.entries(timings)
-                    .filter(([key, value]) => key !== "total" && typeof value === "number")
+                    .filter(
+                        ([key, value]) =>
+                            key !== "total" && key !== "handler_total" && typeof value === "number",
+                    )
                     .map(([key, value]) => `${key}:${(value as number).toFixed(1)}`)
                     .join(" ");
                 if (detail) sessionLog(sessionId, `rust module stages (slow pass): ${detail}`);
@@ -1409,7 +1530,12 @@ export function createRustModeTransform(
                     servedFrom = "lkg";
                 } else {
                     servedFrom = "raw";
-                    replaceMessagesInPlace(output, messages);
+                    try {
+                        serveRawFallback();
+                    } catch (error) {
+                        finishPass(false, false);
+                        throw error;
+                    }
                 }
                 finishPass(false);
                 return;
@@ -1455,10 +1581,7 @@ export function createRustModeTransform(
                 overflowState.needsEmergencyRecovery &&
                 loadProtectedTailMeta(deps.db, sessionId).recoveryNoEligibleHeadCount >=
                     RECOVERY_NO_HEAD_LIMIT;
-            const promptSurface = resolvePromptSurface(
-                deps.promptSurface,
-                modelKey ?? undefined,
-            );
+            const promptSurface = resolvePromptSurface(deps.promptSurface, modelKey ?? undefined);
             const passInputs: Record<string, unknown> = {
                 now_ms: requestObservedAtMs,
                 model_key: modelKey,
@@ -1667,10 +1790,15 @@ export function createRustModeTransform(
                         };
                     }
                 }
+                const getCachedStateSyncCapabilities =
+                    options.moduleClient.getCachedStateSyncCapabilities;
                 const stateSyncCapabilities = options.moduleClient.stateSyncCapabilities;
                 const stateSyncResult = await syncModuleState({
                     client: {
                         call: callModule,
+                        getCachedStateSyncCapabilities: getCachedStateSyncCapabilities
+                            ? () => getCachedStateSyncCapabilities.call(options.moduleClient)
+                            : undefined,
                         stateSyncCapabilities: stateSyncCapabilities
                             ? (capabilityArgs) =>
                                   stateSyncCapabilities.call(options.moduleClient, capabilityArgs)
@@ -1834,6 +1962,9 @@ export function createRustModeTransform(
             if (!response) throw new Error("rust module returned no transform response");
             captureResponseTelemetry(response);
             if (isNeedFullSync(response)) {
+                // A module restart can retain durable state while changing the accepted
+                // state-sync shape, so the next sync must re-probe its capabilities.
+                options.moduleClient.invalidateStateSyncCapabilities?.();
                 // need_full_sync is a WIRE-layer miss: the module (often freshly
                 // restarted, with its process-local Ready snapshot gone) cannot
                 // reconstruct the array from a tail delta. It says nothing about
@@ -2044,14 +2175,61 @@ export function createRustModeTransform(
                 }
                 logStage(sessionId, "apply", applyStartedAt, timings);
                 const lkgSnapshotStartedAt = performance.now();
-                // Slots are process-memory: after a serve restart every session has
-                // NO snapshot until its next busting pass, and any transport failure
-                // in that window falls through LKG to a raw full-array serve. The
-                // first applied pass of a process seeds the slot unconditionally.
-                if (cacheBustingPass || !getSlot(sessionId)) {
-                    const captured = captureRustResponse(sessionId, messages, response);
-                    if (cacheBustingPass && !captured) {
-                        dropSlot(sessionId, "lkg_refresh_declined");
+                // Reuse the wire-cache field snapshots for this input. Serialize the served
+                // response here, but defer hashing so LKG work does not block installing the result.
+                const capturePlan = prepareRustCapture(
+                    state,
+                    sessionId,
+                    messages,
+                    pendingWireCache.rawContentSnapshots,
+                    response,
+                    rowVersion,
+                );
+                let captureMode = "async";
+                const captureFailed = (mode: "async" | "sync", error: unknown): void => {
+                    if (
+                        states.get(sessionId) !== state ||
+                        (capturePlan && capturePlan.captureSequence !== state.lkgCaptureSequence)
+                    ) {
+                        return;
+                    }
+                    dropSlot(sessionId, `lkg_${mode}_capture_failed`);
+                    state.lkgSyncCaptureRequired = true;
+                    sessionLog(
+                        sessionId,
+                        `LKG ${mode.toUpperCase()} CAPTURE FAILED; forcing synchronous capture on the next applied pass:`,
+                        error,
+                    );
+                };
+                if (!capturePlan) {
+                    captureMode = "declined";
+                    captureFailed("async", new Error("LKG snapshot preparation was rejected"));
+                } else if (state.lkgSyncCaptureRequired) {
+                    captureMode = "sync_recovery";
+                    try {
+                        commitRustCapture(state, capturePlan);
+                    } catch (error) {
+                        captureFailed("sync", error);
+                    }
+                } else {
+                    try {
+                        scheduleLkgCapture(() => {
+                            const asyncStartedAt = performance.now();
+                            try {
+                                const result = commitRustCapture(state, capturePlan);
+                                logTransformTiming(
+                                    sessionId,
+                                    "rust.lkg_snapshot_async",
+                                    asyncStartedAt,
+                                    `result=${result} row_version=${capturePlan.rowVersion}`,
+                                );
+                            } catch (error) {
+                                captureFailed("async", error);
+                            }
+                        });
+                    } catch (error) {
+                        captureMode = "schedule_failed";
+                        captureFailed("async", error);
                     }
                 }
                 logStage(
@@ -2059,7 +2237,7 @@ export function createRustModeTransform(
                     "lkgSnapshot",
                     lkgSnapshotStartedAt,
                     timings,
-                    cacheBustingPass ? "captured=true" : "captured=false",
+                    `mode=${captureMode} row_version=${rowVersion}`,
                 );
                 const applyReplaceStartedAt = performance.now();
                 replaceMessagesInPlace(output, appliedMessages);
@@ -2222,11 +2400,18 @@ export function createRustModeTransform(
                 output,
                 sessionMeta.systemPromptTokens,
             );
-            if (!replayed) replaceMessagesInPlace(output, messages);
             servedFrom = replayed ? "lkg" : "raw";
             if (decision.toLowerCase() !== "need_full_sync") decision = "error";
             materializeReason = "none";
             markFailure(sessionId, state, error);
+            if (!replayed) {
+                try {
+                    serveRawFallback(error);
+                } catch (rawFallbackError) {
+                    finishPass(false, false);
+                    throw rawFallbackError;
+                }
+            }
             finishPass(false);
             return;
         }
@@ -2235,10 +2420,21 @@ export function createRustModeTransform(
     return {
         run,
         clearSession(sessionId: string): void {
+            const projectRoot =
+                states.get(sessionId)?.memoryAuthorityRoot ?? options.projectRoot ?? null;
             dropSlot(sessionId, "session-deleted");
             states.delete(sessionId);
             wireCaches.delete(sessionId);
-            options.moduleClient.closeSession?.(sessionId);
+            if (projectRoot && options.moduleClient.deleteSession) {
+                void options.moduleClient
+                    .deleteSession(sessionId, projectRoot)
+                    .catch((error) => {
+                        sessionLog(sessionId, "rust module session deletion failed:", error);
+                    })
+                    .finally(() => options.moduleClient.closeSession?.(sessionId));
+            } else {
+                options.moduleClient.closeSession?.(sessionId);
+            }
         },
         invalidateWireState,
         getState(sessionId: string): Readonly<RustSessionState> {
@@ -2264,14 +2460,14 @@ export const __rustModeTransformTest = {
     applyNativeMessagesVerbatim,
     contentSnapshotsFor,
     snapshotTags: {
-        array: SNAPSHOT_ARRAY,
-        object: SNAPSHOT_OBJECT,
-        key: SNAPSHOT_KEY,
-        string: SNAPSHOT_STRING,
-        number: SNAPSHOT_NUMBER,
-        boolean: SNAPSHOT_BOOLEAN,
-        null: SNAPSHOT_NULL,
-        undefined: SNAPSHOT_UNDEFINED,
+        array: LKG_SNAPSHOT_ARRAY,
+        object: LKG_SNAPSHOT_OBJECT,
+        key: LKG_SNAPSHOT_KEY,
+        string: LKG_SNAPSHOT_STRING,
+        number: LKG_SNAPSHOT_NUMBER,
+        boolean: LKG_SNAPSHOT_BOOLEAN,
+        null: LKG_SNAPSHOT_NULL,
+        undefined: LKG_SNAPSHOT_UNDEFINED,
     },
     messageContentSnapshot,
     messageMatchesContentSnapshot,

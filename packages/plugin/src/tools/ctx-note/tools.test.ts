@@ -23,6 +23,10 @@ function createTestDb(): Database {
       last_checked_at INTEGER,
       ready_at INTEGER,
       ready_reason TEXT,
+      compiled_provider TEXT,
+      compiled_config TEXT,
+      compiled_at INTEGER,
+      compile_status TEXT,
       harness TEXT NOT NULL DEFAULT 'opencode',
       anchor_ordinal INTEGER
     );
@@ -135,6 +139,60 @@ describe("createCtxNoteTools", () => {
         );
         expect(result).toContain("Saved session note");
         expect(routed).toBe(false);
+    });
+
+    it("stores compiled, plain, and refused smart notes with the required reply shapes", async () => {
+        tools = createCtxNoteTools({
+            db,
+            dreamerEnabled: true,
+            resolveProjectPath: () => "git:project-a",
+        });
+
+        const plain = await tools.ctx_note.execute(
+            {
+                action: "write",
+                content: "Follow up on the pull request.",
+                surface_condition: "When PR #42 is merged",
+            },
+            toolContext(),
+        );
+        const compiled = await tools.ctx_note.execute(
+            {
+                action: "write",
+                content: "Read the generated artifact.",
+                surface_condition: "when path /tmp/ctx-note-future-artifact exists",
+            },
+            toolContext(),
+        );
+        const refused = await tools.ctx_note.execute(
+            {
+                action: "write",
+                content: "Never inspect key material.",
+                surface_condition: "when path /tmp/project-binding-key exists",
+            },
+            toolContext(),
+        );
+
+        expect(plain).toBe(
+            "Created smart note #1. Dreamer will evaluate the condition during nightly runs:\n- Content: Follow up on the pull request.\n- Condition: When PR #42 is merged",
+        );
+        expect(compiled).toContain("- Retina provider: local-fs");
+        expect(refused).toContain("- Retina compile refused: fenced path");
+        expect(
+            db
+                .prepare(
+                    "SELECT compile_status, compiled_provider, compiled_config FROM notes ORDER BY id",
+                )
+                .all(),
+        ).toEqual([
+            { compile_status: "plain", compiled_provider: null, compiled_config: null },
+            {
+                compile_status: "compiled",
+                compiled_provider: "local-fs",
+                compiled_config: expect.stringContaining('"kind":"path_exists"'),
+            },
+            { compile_status: "refused", compiled_provider: null, compiled_config: null },
+        ]);
     });
 
     it("rejects module smart-note writes when evaluation is unavailable", async () => {

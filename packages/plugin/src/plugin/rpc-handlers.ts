@@ -75,6 +75,7 @@ export interface RustSessionStatus {
     compartment_count?: number;
     compartment_tokens?: number;
     pending_drop_count?: number;
+    tag_count?: number;
     pending_m1_delta?: boolean;
     pending_m1_age_ms?: number | null;
     wrapup_active?: boolean;

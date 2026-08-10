@@ -340,6 +340,18 @@ function thrownMessage(fn: () => unknown): string {
     }
 }
 
+async function waitForRustCompartment(sessionId: string): Promise<void> {
+    const stack = h.rustStack;
+    if (!stack) throw new Error("Rust compartment wait requires the hermetic module stack");
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+        const status = await stack.moduleStatus(sessionId, h.opencode.env.workdir, "session.status");
+        if (Number(status.compartment_count ?? 0) > 0) return;
+        await Bun.sleep(100);
+    }
+    throw new Error("waitForRustCompartment timed out after 60000ms");
+}
+
 function assertNoBusts(label: string): void {
     const requests = mainAgentRequests(h.mock.requests());
     const busts = findBusts(requests);
@@ -447,114 +459,122 @@ describe("cache invariants — replay class", () => {
 
 describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
     describe("#given a compartment published after m[0] materialized empty (B9 — the seq-refold regression)", () => {
-        describe("#when the publish surfaces it as an m[1] delta and defer passes follow", () => {
-            it("#then m[0] stays empty/frozen (SOFT) — the compartment rides m[1], never folds into m[0]", async () => {
-                //#given — the SOFT-publish invariant only exists once m[0] has
-                // materialized empty BEFORE the compartment exists. Then the
-                // baseline freezes cachedM0Seq=-1, so the published compartment
-                // (seq 0) is an m[1] delta (readNewCompartments: seq > -1) and
-                // mustMaterialize must NOT re-fold it into m[0]. Pre-fix,
-                // max_compartment_seq was a HARD mustMaterialize trigger, so the
-                // publish re-materialized m[0] and folded the compartment INTO the
-                // baseline — exactly the regression this asserts against.
-                installHistorianMatcher(h);
-                const sessionId = await h.createSession();
+        describe("#when publication surfaces and defer passes follow", () => {
+            it(
+                RUST_MODE
+                    ? "#then the one-time renderer transition folds into m[0], then defer replay freezes"
+                    : "#then m[0] stays empty/frozen (SOFT) — the compartment rides m[1], never folds into m[0]",
+                async () => {
+                    //#given — TypeScript materializes an empty m[0] before the
+                    // compartment exists. Rust follows the same setup but may consume
+                    // a renderer transition when the first compartment appears.
+                    installHistorianMatcher(h);
+                    const sessionId = await h.createSession();
 
-                // Phase 1 — force an early execute pass so m[0] materializes EMPTY
-                // (0 compartments yet). A high-usage turn marks the next pass as
-                // execute; the pass after it does the empty materialization.
-                setDefer("B9 warm 1");
-                await h.sendPrompt(sessionId, "B9 turn 1: warmup.");
-                h.mock.setDefault({
-                    text: "B9 high",
-                    usage: RUST_MODE
-                        ? { input_tokens: 19_000, output_tokens: 20, cache_creation_input_tokens: 19_000, cache_read_input_tokens: 0 }
-                        : EXECUTE_USAGE,
-                });
-                await h.sendPrompt(sessionId, "B9 turn 2: high usage marks the next pass execute.");
-                setDefer("B9 materialize-empty");
-                await h.sendPrompt(sessionId, "B9 turn 3: execute pass materializes empty m[0].");
-
-                const m0BaselineEmpty = wireValueText(
-                    extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body),
-                );
-                expect(m0BaselineEmpty).toContain("<session-history></session-history>");
-
-                // Phase 2 — build an eligible tail, then trigger + run the historian.
-                for (let i = 4; i <= 11; i++) {
-                    setDefer(`B9 reply ${i}`);
-                    await h.sendPrompt(sessionId, `B9 turn ${i}: durable content for compartment chunk ${i}. ${h.ballast(3_000)}`);
-                }
-                h.mock.setDefault({ text: "B9 trigger", usage: HISTORIAN_TRIGGER_USAGE });
-                await h.sendPrompt(sessionId, "B9 turn 12: high-usage historian trigger.");
-                setDefer("B9 post-trigger");
-                await h.sendPrompt(sessionId, "B9 turn 13: follow-up starts + awaits the historian publish.");
-
-                if (RUST_MODE) {
-                    await h.waitFor(
-                        () =>
-                            mainAgentRequests(h.mock.requests()).find((request) =>
-                                wireValueText(extractM1(request.body)).includes("<new-compartments>"),
-                            ),
-                        { timeoutMs: 60_000, label: "B9 Rust compartment publishes to the m[1] wire" },
-                    );
-                } else {
-                    await h.waitFor(() => h.countCompartments(sessionId) >= 1, {
-                        timeoutMs: 60_000,
-                        label: "B9 compartment publishes to DB",
+                    // Force an early execute pass so m[0] materializes EMPTY
+                    // (0 compartments yet). A high-usage turn marks the next pass as
+                    // execute; the pass after it does the empty materialization.
+                    setDefer("B9 warm 1");
+                    await h.sendPrompt(sessionId, "B9 turn 1: warmup.");
+                    h.mock.setDefault({
+                        text: "B9 high",
+                        usage: RUST_MODE
+                            ? { input_tokens: 19_000, output_tokens: 20, cache_creation_input_tokens: 19_000, cache_read_input_tokens: 0 }
+                            : EXECUTE_USAGE,
                     });
-                }
+                    await h.sendPrompt(sessionId, "B9 turn 2: high usage marks the next pass execute.");
+                    setDefer("B9 materialize-empty");
+                    await h.sendPrompt(sessionId, "B9 turn 3: execute pass materializes empty m[0].");
 
-                //#then — the published compartment must surface as an m[1] delta
-                // while m[0] stays the empty baseline.
-                const requests = mainAgentRequests(h.mock.requests());
-                const surfaceReq = requests.find((r) =>
-                    wireValueText(extractM1(r.body)).includes("<new-compartments>"),
-                );
-                expect(surfaceReq).toBeDefined();
-                const m1 = wireValueText(extractM1(surfaceReq!.body));
-                const m0 = wireValueText(extractM0(surfaceReq!.body));
-                // Delta invariant: the compartment rides m[1].
-                expect(m1).toContain("<new-compartments>");
-                expect(m1).toContain("cache-invariant chunk");
-                // SOFT invariant: m[0] is STILL the empty baseline — the
-                // compartment was NOT folded into m[0] (the HARD regression).
-                expect(m0).not.toContain("cache-invariant chunk");
-                expect(m0).toBe(m0BaselineEmpty!);
-
-                // And defer passes after surfacing replay m[0] AND m[1] byte-identically.
-                const surfaceIdx = requests.indexOf(surfaceReq!);
-                setDefer("B9 replay 1");
-                await h.sendPrompt(sessionId, "B9 turn 14: defer replay of the surfaced compartment.");
-                setDefer("B9 replay 2");
-                await h.sendPrompt(sessionId, "B9 turn 15: defer replay again.");
-
-                // m[0] and m[1] must be byte-identical from the moment the
-                // compartment surfaced through every following defer pass. This is
-                // the load-bearing SOFT-replay assertion: the surfaced delta is
-                // frozen, not re-rendered, on defer.
-                const after = mainAgentRequests(h.mock.requests()).slice(surfaceIdx);
-                const m1s = new Set(after.map((r) => wireValueText(extractM1(r.body))));
-                const m0s = new Set(after.map((r) => wireValueText(extractM0(r.body))));
-                expect(m1s.size).toBe(1);
-                expect(m0s.size).toBe(1);
-
-                // Whole-wire no-bust is asserted over the trailing PURE-DEFER
-                // replay pair only. The surface pass itself is an execute pass
-                // (allowed to bust once) and the historian-await turn just before
-                // it is an in-flight multi-call assistant turn whose tail
-                // legitimately accretes parts as it settles — neither is a defer
-                // replay, so including them would conflate normal tail growth with
-                // a prefix bust. Turns 14 and 15 are both settled pure defers.
-                const replayPair = mainAgentRequests(h.mock.requests()).slice(-2);
-                const busts = findBusts(replayPair);
-                if (busts.length > 0) {
-                    console.error(
-                        `[cache-invariant:B9-soft-publish] ${busts.length} bust(s):\n${formatBustReport(busts)}`,
+                    const m0BaselineEmpty = wireValueText(
+                        extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body),
                     );
-                }
-                expect(busts.length).toBe(0);
-            }, 220_000);
+                    expect(m0BaselineEmpty).toContain("<session-history></session-history>");
+
+                    // Build an eligible tail, then trigger and run the historian.
+                    for (let i = 4; i <= 11; i++) {
+                        setDefer(`B9 reply ${i}`);
+                        await h.sendPrompt(sessionId, `B9 turn ${i}: durable content for compartment chunk ${i}. ${h.ballast(3_000)}`);
+                    }
+                    h.mock.setDefault({ text: "B9 trigger", usage: HISTORIAN_TRIGGER_USAGE });
+                    await h.sendPrompt(sessionId, "B9 turn 12: high-usage historian trigger.");
+                    setDefer("B9 post-trigger");
+                    await h.sendPrompt(sessionId, "B9 turn 13: follow-up starts + awaits the historian publish.");
+
+                    if (RUST_MODE) {
+                        // a5b7d61d moved Rust publication to the out-of-band Broca
+                        // stack. The next real turn surfaces the committed module state
+                        // on the provider wire instead of waiting for a synthetic request.
+                        await waitForRustCompartment(sessionId);
+                        setDefer("B9 surface published Rust compartment");
+                        await h.sendPrompt(sessionId, "B9 turn 14: surface the published compartment.");
+                    } else {
+                        await h.waitFor(() => h.countCompartments(sessionId) >= 1, {
+                            timeoutMs: 60_000,
+                            label: "B9 compartment publishes to DB",
+                        });
+                    }
+
+                    //#then — TypeScript keeps the additive publication in the m[1]
+                    // delta lane. Rust first consumes the pending hard transition for
+                    // this newly detected renderer shape, then replays that result.
+                    const requests = mainAgentRequests(h.mock.requests());
+                    const surfaceReq = RUST_MODE
+                        ? requests.at(-1)
+                        : requests.find((r) => wireValueText(extractM1(r.body)).includes("<new-compartments>"));
+                    expect(surfaceReq).toBeDefined();
+                    const m1 = wireValueText(extractM1(surfaceReq!.body));
+                    const m0 = wireValueText(extractM0(surfaceReq!.body));
+                    if (RUST_MODE) {
+                        // 887696d9 gives each newly detected renderer shape one hard
+                        // transition. cc842547 stores the consumed marker per shape, so
+                        // this compartment cannot fold again or receive another replay identifier.
+                        expect(m0).toContain("Hermetic Broca chunk");
+                        expect(m0).not.toBe(m0BaselineEmpty!);
+                        expect(m1).not.toContain("<new-compartments>");
+                    } else {
+                        expect(m1).toContain("<new-compartments>");
+                        expect(m1).toContain("cache-invariant chunk");
+                        expect(m0).not.toContain("cache-invariant chunk");
+                        expect(m0).toBe(m0BaselineEmpty!);
+                    }
+
+                    const surfaceIdx = requests.indexOf(surfaceReq!);
+                    setDefer("B9 replay 1");
+                    await h.sendPrompt(
+                        sessionId,
+                        RUST_MODE
+                            ? "B9 turn 15: defer replay of the surfaced compartment."
+                            : "B9 turn 14: defer replay of the surfaced compartment.",
+                    );
+                    setDefer("B9 replay 2");
+                    await h.sendPrompt(
+                        sessionId,
+                        RUST_MODE ? "B9 turn 16: defer replay again." : "B9 turn 15: defer replay again.",
+                    );
+
+                    // From the surface request through every subsequent defer-only
+                    // replay, both message lanes must remain byte-identical. The existing
+                    // delta or transition result is reused rather than rendered again.
+                    const after = mainAgentRequests(h.mock.requests()).slice(surfaceIdx);
+                    const m1s = new Set(after.map((r) => wireValueText(extractM1(r.body))));
+                    const m0s = new Set(after.map((r) => wireValueText(extractM0(r.body))));
+                    expect(m1s.size).toBe(1);
+                    expect(m0s.size).toBe(1);
+
+                    // Whole-wire no-bust is asserted only over the trailing defer
+                    // pair. The surface request may legitimately bust once.
+                    const replayPair = mainAgentRequests(h.mock.requests()).slice(-2);
+                    const busts = findBusts(replayPair);
+                    if (busts.length > 0) {
+                        console.error(
+                            `[cache-invariant:B9-soft-publish] ${busts.length} bust(s):\n${formatBustReport(busts)}`,
+                        );
+                    }
+                    expect(busts.length).toBe(0);
+                },
+                220_000,
+            );
         });
     });
 

@@ -275,6 +275,47 @@ async fn mc_transform_spine_through_real_daemon() {
         m0(&boot)
     );
 
+    // Native serving runs with the module's differential flag below, so both the cold full
+    // encoder and the incremental path execute and byte-compare inside the real provider process.
+    let native_request = json!({
+        "session_id": "native",
+        "render_config": "cfg0",
+        "serializer_profile": "opencode-aisdk",
+        "serve_native": true,
+        "full_array_fingerprint": "fp-native",
+        "messages": [ck("native-1", 1, "native tail")],
+        "native_messages": [{
+            "info": { "id": "native-1", "role": "user", "custom": "preserve" },
+            "parts": [{ "type": "text", "text": "native tail" }]
+        }]
+    });
+    let native_first = call(&consumer, native_request.clone()).await;
+    assert_eq!(native_first["status"], "ok");
+    assert_eq!(
+        native_first["native_messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["info"]["custom"],
+        "preserve"
+    );
+    let native_replay = call(&consumer, native_request).await;
+    assert_eq!(native_replay["action"], "SOFT+");
+    assert_eq!(
+        native_replay["timings"]["native_cache_encoded_messages"], 0,
+        "steady real-daemon native replay must encode no messages"
+    );
+    assert!(
+        native_replay["timings"]["native_cache_reused_messages"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0
+    );
+    assert_eq!(
+        native_replay["native_messages"], native_first["native_messages"],
+        "real-daemon incremental native replay drifted"
+    );
+
     // ===== restart the module and confirm byte-identical replay (spine session) =====
     module.kill_and_wait();
     drop(module);
@@ -439,6 +480,8 @@ fn spawn_module(module_bin: &Path, connection_file: &Path, data_home: &Path) -> 
         .arg(connection_file)
         .env(subc_protocol::SUBC_MODULE_ID_ENV, MODULE_ID)
         .env("XDG_DATA_HOME", data_home)
+        .env("MC_NATIVE_ATTACHMENT_DIFFERENTIAL", "1")
+        .env("MC_PREFIX_PROJECTION_DIFFERENTIAL", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

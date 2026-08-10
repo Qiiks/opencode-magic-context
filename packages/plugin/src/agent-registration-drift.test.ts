@@ -14,6 +14,7 @@ import {
 import {
     buildHiddenAgentConfig,
     buildHiddenAgentRegistrations,
+    HIDDEN_AGENT_DESCRIPTION_MARKER,
 } from "./agents/hidden-agent-registrations";
 import {
     HISTORIAN_AGENT,
@@ -170,7 +171,10 @@ describe("hidden-agent registration drift guard", () => {
         });
     });
 
-    test("internal direct-prompt agent configuration remains a hidden subagent", () => {
+    // Since #285, internal agents register as mode "primary" + hidden (excluded
+    // from describeTask); the Task-permission denies in this suite cover the
+    // explicit subagent_type bypass that mode/hidden metadata cannot.
+    test("internal direct-prompt agent configuration remains hidden from routing", () => {
         const config = buildHiddenAgentConfig(
             "reviewer prompt",
             [],
@@ -181,9 +185,21 @@ describe("hidden-agent registration drift guard", () => {
         );
 
         expect(config.prompt).toBe("reviewer prompt");
-        expect(config.mode).toBe("subagent");
+        expect(config.mode).toBe("primary");
         expect(config.hidden).toBe(true);
         expect(config.permission).toEqual({ "*": "deny" });
+    });
+
+    test("every hidden agent has an internal-only task-routing description", () => {
+        expect(regs).toHaveLength(12);
+        for (const registration of regs) {
+            expect(registration.mode, registration.id).toBe("primary");
+            expect(registration.hidden, registration.id).toBe(true);
+            expect(registration.description, registration.id).toContain(
+                HIDDEN_AGENT_DESCRIPTION_MARKER,
+            );
+            expect(registration.description, registration.id).toContain("do not select");
+        }
     });
 
     test("classifier is a zero-tool locked pure transform", () => {

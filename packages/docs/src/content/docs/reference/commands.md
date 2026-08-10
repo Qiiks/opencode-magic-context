@@ -12,7 +12,7 @@ You run these slash commands in your harness chat or command box. They execute i
 3. **`/ctx-recomp`** — Rebuild compartments from raw history with the historian model; slow on long sessions. Use `/ctx-recomp <start>-<end>` for a partial range when only part of the timeline is wrong.
 4. **`/ctx-wrapup [messages_to_keep]`** — Deliberately compact older live history while keeping the newest N messages raw.
 
-Use **`/ctx-session-upgrade`** for legacy session format upgrades, not `/ctx-recomp --upgrade` (deprecated).
+Use **`/ctx-session-upgrade`** for legacy session format upgrades, not `/ctx-recomp --upgrade` (deprecated). If `compaction.enabled` is `false`, `/ctx-recomp`, `/ctx-wrapup`, `/ctx-flush`, and `/ctx-session-upgrade` refuse instead of changing compacted history; status, recall, and embedding commands remain available.
 
 ## /ctx-status
 
@@ -80,7 +80,7 @@ Uses historian-model tokens; full recomp on long sessions can take a long time.
 
 **When to use it.** A manual run instead of waiting for a task's cron schedule, or to force a single task on demand.
 
-**What you'll see.** `Starting dream run...` (or `Running dream task "<task>"...`), then `## /ctx-dream` with which tasks ran, were skipped (no work), failed, or were busy.
+**What you'll see.** `Starting dream run...` (or `Running dream task "<task>"...`), followed by a backlog snapshot with pending/total counts. The final `## /ctx-dream` report lists tasks that ran, were skipped (no work), failed, or were busy, plus backlog at run start and run end when available.
 
 ## /ctx-embed
 

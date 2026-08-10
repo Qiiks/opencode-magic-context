@@ -47,7 +47,7 @@ Active memories render into a `<project-memory>` block that the agent sees every
 
 Memories are ordered by category priority, then by recency within each category. Memories already visible in the rendered session history are filtered from search results to avoid duplication.
 
-When the text budget trims memories away, the optional experimental [memory mural](/concepts/mural/) can attach a single image of those overflow memories to the cached context baseline (vision models only).
+When the text budget trims memories away, the optional [memory mural](/concepts/mural/) can attach a single image of those overflow memories to the cached context baseline (vision models only).
 
 ## Retrieval-count promotion
 
@@ -67,7 +67,7 @@ The desktop app and dashboard provide a memory browser where you can search, fil
 
 ## Project-scoped and shared
 
-Memories are scoped to a **project identity** derived from the repository, not a filesystem path. This means memories follow a project across worktrees, clones, and forks. The same SQLite database is shared between OpenCode and Pi — write a memory in one harness, retrieve it in the other.
+Memories are scoped to a **project identity** derived from the repository, not a filesystem path. This means memories follow a project across worktrees, clones, and forks. The same SQLite database is shared by OpenCode, Pi, and OMP — write a memory in one harness, retrieve it in another.
 
 ## How it connects
 
