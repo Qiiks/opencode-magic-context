@@ -6,6 +6,7 @@ import { ProviderError } from "./errors";
 export interface ResolveProviderPathOptions {
     allowMissing: boolean;
     homeDirectory?: string;
+    dataDirectory?: string;
     cwd?: string;
 }
 
@@ -13,13 +14,7 @@ export async function resolveAndFenceProviderPath(
     configuredPath: string,
     options: ResolveProviderPathOptions,
 ): Promise<string> {
-    const configuredHomePath = resolve(options.homeDirectory ?? process.env.HOME ?? homedir());
-    let home: string;
-    try {
-        home = await realpath(configuredHomePath);
-    } catch (error) {
-        throw fsError(configuredHomePath, error);
-    }
+    const { home, dataDirectory } = await resolveFenceRoots(options);
     const expanded = configuredPath.startsWith("~/")
         ? join(home, configuredPath.slice(2))
         : configuredPath === "~"
@@ -29,10 +24,44 @@ export async function resolveAndFenceProviderPath(
         ? resolve(expanded)
         : resolve(options.cwd ?? process.cwd(), expanded);
     const canonical = await canonicalPath(absolute, options.allowMissing);
-    if (isFencedPath(canonical, home)) {
+    if (isFencedPath(canonical, home, dataDirectory)) {
         throw new ProviderError("fenced_path", `Refusing fenced path: ${canonical}`);
     }
     return canonical;
+}
+
+export async function revalidateProviderPath(
+    canonicalPath: string,
+    options: ResolveProviderPathOptions,
+): Promise<string> {
+    const revalidated = await resolveAndFenceProviderPath(canonicalPath, options);
+    if (revalidated !== canonicalPath) {
+        throw new ProviderError(
+            "fenced_path",
+            `Refusing path changed after fence check: ${canonicalPath}`,
+        );
+    }
+    return revalidated;
+}
+
+async function resolveFenceRoots(
+    options: ResolveProviderPathOptions,
+): Promise<{ home: string; dataDirectory: string }> {
+    const configuredHomePath = resolve(options.homeDirectory ?? process.env.HOME ?? homedir());
+    let home: string;
+    try {
+        home = await realpath(configuredHomePath);
+    } catch (error) {
+        throw fsError(configuredHomePath, error);
+    }
+
+    // Runtime storage is rooted at XDG_DATA_HOME. Canonicalize the configured data
+    // root before checking paths, so a symlinked data directory is checked by its real path.
+    const configuredDataDirectory = resolve(
+        options.dataDirectory ?? process.env.XDG_DATA_HOME ?? join(home, ".local", "share"),
+    );
+    const dataDirectory = await canonicalPath(configuredDataDirectory, true);
+    return { home, dataDirectory };
 }
 
 async function canonicalPath(path: string, allowMissing: boolean): Promise<string> {
@@ -76,9 +105,12 @@ async function canonicalPath(path: string, allowMissing: boolean): Promise<strin
     }
 }
 
-export function isFencedPath(canonicalPath: string, homeDirectory: string): boolean {
-    const home = resolve(homeDirectory);
-    const cortexkitRoot = join(home, ".local", "share", "cortexkit");
+export function isFencedPath(
+    canonicalPath: string,
+    homeDirectory: string,
+    dataDirectory = process.env.XDG_DATA_HOME ?? join(resolve(homeDirectory), ".local", "share"),
+): boolean {
+    const cortexkitRoot = join(resolve(dataDirectory), "cortexkit");
     const relativeToCortexkit = relative(cortexkitRoot, canonicalPath);
     const insideCortexkit =
         relativeToCortexkit !== "" &&
@@ -92,12 +124,18 @@ export function isFencedPath(canonicalPath: string, homeDirectory: string): bool
     const catalogDirectoryCarveIn = pathParts.includes("catalog");
     const moduleBinCarveIn = parts.length >= 2 && parts[1] === "bin";
     const catalogJsonCarveIn = name.endsWith(".json") && name.includes("catalog");
-    if (catalogDirectoryCarveIn || moduleBinCarveIn || catalogJsonCarveIn) {
+    const rootWithoutCarveIns =
+        insideCortexkit && (parts[0] === "run" || parts[0] === "magic-context");
+    if (
+        !rootWithoutCarveIns &&
+        (catalogDirectoryCarveIn || moduleBinCarveIn || catalogJsonCarveIn)
+    ) {
         return false;
     }
 
     const inFencedRoot =
-        insideCortexkit && ["plexus", "claustrum", "staging"].includes(parts[0] ?? "");
+        insideCortexkit &&
+        ["plexus", "claustrum", "staging", "run", "magic-context"].includes(parts[0] ?? "");
     const fencedBasename = name.includes("binding-key") || name.endsWith(".handle");
     const plexusStore = insideCortexkit && parts[0] === "plexus" && name.startsWith("store.db");
     return inFencedRoot || fencedBasename || plexusStore;

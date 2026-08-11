@@ -1193,7 +1193,8 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
         ),
         updateNote: db.prepare(
             `UPDATE notes SET type = ?, status = ?, project_path = ?, session_id = ?, content = ?,
-             surface_condition = ?, ready_at = ?, ready_reason = ?, manifest_json = ?, compiled_check = ?,
+             surface_condition = ?, compiled_provider = ?, compiled_config = ?, compiled_at = ?, compile_status = ?,
+             ready_at = ?, ready_reason = ?, manifest_json = ?, compiled_check = ?,
              check_hash = ?, check_cron = ?, check_failure_count = ?, check_network_failure_count = ?,
              check_quarantined_until = ?, check_next_due_at = ?, check_compiled_at = ?, check_false_since_at = ?,
              check_last_liveness_at = ?, last_checked_at = ?, check_status = ?, check_version = ?,
@@ -1297,6 +1298,42 @@ function mirrorIdentity(
             )
         ).get(domain, moduleProject, moduleRowId) as { context_row_id: number } | undefined) ?? null
     );
+}
+
+export interface MirroredNoteCompileFields {
+    compiledProvider: string | null;
+    compiledConfig: string | null;
+    compiledAt: number | null;
+    compileStatus: "compiled" | "plain" | "refused";
+}
+
+export function applyMirroredNoteCompileFields(args: {
+    db: Database;
+    moduleProject: string;
+    moduleRowId: number;
+    fields: MirroredNoteCompileFields;
+}): boolean {
+    return withPrivilegedWriter(args.db, () => {
+        const result = args.db
+            .prepare(
+                `UPDATE notes
+                    SET compiled_provider = ?, compiled_config = ?, compiled_at = ?, compile_status = ?
+                  WHERE id = (
+                        SELECT context_row_id
+                          FROM mirror_identity
+                         WHERE domain = 'notes' AND module_project = ? AND module_row_id = ?
+                  )`,
+            )
+            .run(
+                args.fields.compiledProvider,
+                args.fields.compiledConfig,
+                args.fields.compiledAt,
+                args.fields.compileStatus,
+                args.moduleProject,
+                args.moduleRowId,
+            );
+        return result.changes === 1;
+    });
 }
 
 function rememberIdentity(
@@ -1724,6 +1761,10 @@ function applyNoteRow(db: Database, feed: ChangefeedRow, statements: MirrorPageS
         rowNullableString(effectiveRow, "session_id"),
         rowString(effectiveRow, "content"),
         rowNullableString(effectiveRow, "surface_condition"),
+        rowNullableString(effectiveRow, "compiled_provider"),
+        rowNullableString(effectiveRow, "compiled_config"),
+        typeof effectiveRow.compiled_at === "number" ? effectiveRow.compiled_at : null,
+        rowNullableString(effectiveRow, "compile_status"),
         typeof effectiveRow.ready_at === "number" ? effectiveRow.ready_at : null,
         rowNullableString(effectiveRow, "ready_reason"),
         rowNullableString(effectiveRow, "manifest_json"),

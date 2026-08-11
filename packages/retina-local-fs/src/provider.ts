@@ -4,7 +4,7 @@ import { constants } from "node:fs";
 import { access, readFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { ProviderError } from "./errors";
-import { resolveAndFenceProviderPath } from "./path-fence";
+import { resolveAndFenceProviderPath, revalidateProviderPath } from "./path-fence";
 
 export { ProviderError } from "./errors";
 export { isFencedPath } from "./path-fence";
@@ -62,7 +62,9 @@ export interface ProviderOutput {
 
 interface EvaluationOptions {
     homeDirectory?: string;
+    dataDirectory?: string;
     now?: () => number;
+    beforePathUseForTests?: (canonicalPath: string) => void | Promise<void>;
 }
 
 interface EvaluatedPredicate {
@@ -85,14 +87,23 @@ export async function runProvider(
     for (const [index, predicate] of predicates.entries()) {
         const predicateHash = sha256(canonicalJson(predicate));
         const scalarKey = `${index}:${predicateHash}`;
+        const pathOptions = {
+            allowMissing: predicate.kind === "path_exists",
+            homeDirectory: options.homeDirectory,
+            dataDirectory: options.dataDirectory,
+        };
         const canonicalPath = await resolveAndFenceProviderPath(
             "repo_path" in predicate ? predicate.repo_path : predicate.path,
-            {
-                allowMissing: predicate.kind === "path_exists",
-                homeDirectory: options.homeDirectory,
-            },
+            pathOptions,
         );
-        const evaluated = await evaluatePredicate(predicate, canonicalPath, previous[scalarKey]);
+        let beforePathUseForTests = options.beforePathUseForTests;
+        const pathAtUse = async () => {
+            const beforeUse = beforePathUseForTests;
+            beforePathUseForTests = undefined;
+            await beforeUse?.(canonicalPath);
+            return revalidateProviderPath(canonicalPath, pathOptions);
+        };
+        const evaluated = await evaluatePredicate(predicate, previous[scalarKey], pathAtUse);
         next.predicates[scalarKey] = {
             state: evaluated.state,
             occurrence: evaluated.occurrence,
@@ -115,12 +126,12 @@ export async function runProvider(
 
 async function evaluatePredicate(
     predicate: AtomicPredicate,
-    canonicalPath: string,
     previous: PredicateScalar | undefined,
+    pathAtUse: () => Promise<string>,
 ): Promise<EvaluatedPredicate> {
     switch (predicate.kind) {
         case "file_contains": {
-            const content = await readUtf8(canonicalPath);
+            const content = await readUtf8(await pathAtUse());
             const contains = content.includes(predicate.needle);
             return evaluateBooleanState(
                 contains,
@@ -130,13 +141,13 @@ async function evaluatePredicate(
             );
         }
         case "path_exists": {
-            const exists = await pathExists(canonicalPath);
+            const exists = await pathExists(await pathAtUse());
             return evaluateBooleanState(exists, predicate.gone ? !exists : exists, previous, {
                 exists,
             });
         }
         case "mtime_after": {
-            const metadata = await readableStat(canonicalPath);
+            const metadata = await readableStat(await pathAtUse());
             const mtimeMs = metadata.mtimeMs;
             const changed = previous?.state !== mtimeMs;
             return {
@@ -149,18 +160,18 @@ async function evaluatePredicate(
             };
         }
         case "git_commit_after": {
-            const currentSha = await git(canonicalPath, [
+            const currentSha = await git(pathAtUse, [
                 "rev-parse",
                 "--verify",
                 `${predicate.ref ?? "HEAD"}^{commit}`,
             ]);
-            const baseSha = await git(canonicalPath, [
+            const baseSha = await git(pathAtUse, [
                 "rev-parse",
                 "--verify",
                 `${predicate.sha}^{commit}`,
             ]);
             const isAfter =
-                currentSha !== baseSha && (await gitIsAncestor(canonicalPath, baseSha, currentSha));
+                currentSha !== baseSha && (await gitIsAncestor(pathAtUse, baseSha, currentSha));
             return {
                 state: currentSha,
                 occurrence: previous?.occurrence ?? 0,
@@ -180,7 +191,7 @@ async function evaluatePredicate(
             };
         }
         case "git_tag_matching": {
-            const tagsOutput = await git(canonicalPath, ["tag", "--list", predicate.pattern]);
+            const tagsOutput = await git(pathAtUse, ["tag", "--list", predicate.pattern]);
             const above = predicate.above ? parseSemver(predicate.above) : undefined;
             const tags = tagsOutput
                 .split("\n")
@@ -267,7 +278,8 @@ function isMissingError(error: unknown): boolean {
     );
 }
 
-async function git(repoPath: string, args: string[]): Promise<string> {
+async function git(pathAtUse: () => Promise<string>, args: string[]): Promise<string> {
+    const repoPath = await pathAtUse();
     try {
         const { stdout } = await execFileAsync("git", ["-C", repoPath, ...args], {
             encoding: "utf8",
@@ -287,10 +299,11 @@ async function git(repoPath: string, args: string[]): Promise<string> {
 }
 
 async function gitIsAncestor(
-    repoPath: string,
+    pathAtUse: () => Promise<string>,
     ancestor: string,
     descendant: string,
 ): Promise<boolean> {
+    const repoPath = await pathAtUse();
     try {
         await execFileAsync(
             "git",

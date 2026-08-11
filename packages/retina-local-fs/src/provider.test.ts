@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -14,6 +14,7 @@ import {
 
 const execFileAsync = promisify(execFile);
 const temporaryDirectories: string[] = [];
+const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 async function temporaryDirectory(prefix = "retina-local-fs-"): Promise<string> {
     const directory = await mkdtemp(join(tmpdir(), prefix));
@@ -22,6 +23,8 @@ async function temporaryDirectory(prefix = "retina-local-fs-"): Promise<string> 
 }
 
 afterEach(async () => {
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
     await Promise.all(
         temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true })),
     );
@@ -31,8 +34,18 @@ async function poll(
     config: ProviderConfig,
     scalar: ProviderScalar | null = null,
     homeDirectory?: string,
+    dataDirectory?: string,
 ) {
-    return runProvider({ scalar, config }, { homeDirectory, now: () => 1_786_320_000_000 });
+    return runProvider(
+        { scalar, config },
+        {
+            homeDirectory,
+            dataDirectory:
+                dataDirectory ??
+                (homeDirectory ? join(homeDirectory, ".local", "share") : undefined),
+            now: () => 1_786_320_000_000,
+        },
+    );
 }
 
 async function git(repo: string, ...args: string[]): Promise<string> {
@@ -241,9 +254,9 @@ describe("compound scalar behavior", () => {
 });
 
 describe("path fence", () => {
-    test("refuses every key-bearing root", async () => {
+    test("refuses every sensitive CortexKit data root", async () => {
         const home = await temporaryDirectory("retina-local-fs-home-");
-        for (const root of ["plexus", "claustrum", "staging"]) {
+        for (const root of ["plexus", "claustrum", "staging", "run", "magic-context"]) {
             const path = join(home, ".local", "share", "cortexkit", root, "secret.txt");
             await mkdir(join(path, ".."), { recursive: true });
             await writeFile(path, "secret");
@@ -251,6 +264,92 @@ describe("path fence", () => {
                 code: "fenced_path",
             });
         }
+    });
+
+    test("refuses Magic Context databases and RPC bearer discovery files", async () => {
+        const home = await temporaryDirectory("retina-local-fs-home-");
+        const root = join(home, ".local", "share", "cortexkit", "magic-context");
+        const paths = [
+            join(root, "context.db"),
+            join(root, "store.db-wal"),
+            join(root, "rpc", "project", "port-123-instance.json"),
+        ];
+        for (const path of paths) {
+            await mkdir(join(path, ".."), { recursive: true });
+            await writeFile(path, "credential-bearing data");
+            await expect(poll({ kind: "path_exists", path }, null, home)).rejects.toMatchObject({
+                code: "fenced_path",
+            });
+        }
+    });
+
+    test("refuses the default subc connection file by name", async () => {
+        const home = await temporaryDirectory("retina-local-fs-home-");
+        const path = join(home, ".local", "share", "cortexkit", "run", "subc-connection.json");
+        await mkdir(join(path, ".."), { recursive: true });
+        await writeFile(path, JSON.stringify({ key: "secret" }));
+
+        await expect(
+            poll({ kind: "file_contains", path, needle: "secret" }, null, home),
+        ).rejects.toMatchObject({ code: "fenced_path" });
+    });
+
+    test("refuses an XDG-relocated subc connection file", async () => {
+        const home = await temporaryDirectory("retina-local-fs-home-");
+        const dataDirectory = await temporaryDirectory("retina-local-fs-xdg-");
+        const path = join(dataDirectory, "cortexkit", "run", "subc-connection.json");
+        await mkdir(join(path, ".."), { recursive: true });
+        await writeFile(path, JSON.stringify({ key: "secret" }));
+
+        process.env.XDG_DATA_HOME = dataDirectory;
+        await expect(
+            runProvider(
+                { scalar: null, config: { kind: "path_exists", path } },
+                { homeDirectory: home },
+            ),
+        ).rejects.toMatchObject({ code: "fenced_path" });
+    });
+
+    test("admits a non-secret file under the CortexKit data root", async () => {
+        const home = await temporaryDirectory("retina-local-fs-home-");
+        const dataDirectory = await temporaryDirectory("retina-local-fs-xdg-");
+        const path = join(dataDirectory, "cortexkit", "docs", "notice.txt");
+        await mkdir(join(path, ".."), { recursive: true });
+        await writeFile(path, "public notice");
+
+        const result = await poll(
+            { kind: "file_contains", path, needle: "public" },
+            null,
+            home,
+            dataDirectory,
+        );
+        expect(result.events).toHaveLength(1);
+    });
+
+    test("refuses a symlink swap after canonicalization", async () => {
+        const home = await temporaryDirectory("retina-local-fs-home-");
+        const path = join(home, "watched.txt");
+        const original = join(home, "watched-original.txt");
+        const sensitive = join(home, ".local", "share", "cortexkit", "run", "subc-connection.json");
+        await writeFile(path, "safe");
+        await mkdir(join(sensitive, ".."), { recursive: true });
+        await writeFile(sensitive, JSON.stringify({ key: "secret" }));
+        await expect(
+            runProvider(
+                {
+                    scalar: null,
+                    config: { kind: "file_contains", path, needle: "secret" },
+                },
+                {
+                    homeDirectory: home,
+                    dataDirectory: join(home, ".local", "share"),
+                    beforePathUseForTests: async () => {
+                        await rename(path, original);
+                        await symlink(sensitive, path);
+                    },
+                },
+            ),
+        ).rejects.toMatchObject({ code: "fenced_path" });
     });
 
     test("refuses sensitive basenames outside fenced roots", async () => {
@@ -335,7 +434,11 @@ describe("CLI exit discipline", () => {
         const child = Bun.spawn({
             cmd: ["bun", cli],
             cwd: import.meta.dir,
-            env: { ...process.env, HOME: home },
+            env: {
+                ...process.env,
+                HOME: home,
+                XDG_DATA_HOME: join(home, ".local", "share"),
+            },
             stdin: "pipe",
             stdout: "pipe",
             stderr: "pipe",

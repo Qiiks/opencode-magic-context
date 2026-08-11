@@ -13,7 +13,7 @@ export type ConditionCompileResult =
           config: ProviderConfig;
           compiledAt: number;
       }
-    | { status: "plain" }
+    | { status: "plain"; reason?: string }
     | { status: "refused"; reason: string };
 
 export interface ConditionPathResolution {
@@ -46,6 +46,9 @@ export async function compileSurfaceCondition(
     surfaceCondition: string,
     options: ConditionCompilerOptions,
 ): Promise<ConditionCompileResult> {
+    const plainReason = unsafeGrammarReason(surfaceCondition);
+    if (plainReason) return { status: "plain", reason: plainReason };
+
     const parsed = parseCondition(surfaceCondition, options.projectPath);
     if (parsed === null) return { status: "plain" };
 
@@ -146,16 +149,17 @@ function parseCondition(surfaceCondition: string, projectPath: string): RawPredi
 function parseAtomicCondition(text: string, projectPath: string): RawPredicate | null {
     const fileContains = text.match(
         new RegExp(
-            `^(?:when\\s+)?file\\s+(${VALUE})\\s+(no longer contains|contains)\\s+(.+)$`,
+            `^(?:when\\s+)?file\\s+(${VALUE})\\s+(no longer contains|contains)\\s+(${VALUE})$`,
             "i",
         ),
     );
     if (fileContains) {
+        const path = unquote(fileContains[1]);
         const needle = unquote(fileContains[3].trim());
-        if (needle === null) return null;
+        if (path === null || needle === null) return null;
         return {
             kind: "file_contains",
-            path: unquote(fileContains[1]) ?? fileContains[1],
+            path,
             needle,
             ...(fileContains[2].toLowerCase() === "no longer contains" ? { absent: true } : {}),
         };
@@ -168,9 +172,11 @@ function parseAtomicCondition(text: string, projectPath: string): RawPredicate |
         ),
     );
     if (commit) {
+        const repoPath = unquote(commit[1]);
+        if (repoPath === null) return null;
         return {
             kind: "git_commit_after",
-            repo_path: unquote(commit[1]) ?? commit[1],
+            repo_path: repoPath,
             sha: commit[2],
         };
     }
@@ -201,9 +207,11 @@ function parseAtomicCondition(text: string, projectPath: string): RawPredicate |
         ),
     );
     if (mtime) {
+        const path = unquote(mtime[1]);
+        if (path === null) return null;
         return {
             kind: "mtime_after",
-            path: unquote(mtime[1]) ?? mtime[1],
+            path,
         };
     }
 
@@ -211,9 +219,11 @@ function parseAtomicCondition(text: string, projectPath: string): RawPredicate |
         new RegExp(`^(?:when\\s+)?(?:path\\s+)?(${VALUE})\\s+(exists|is gone)$`, "i"),
     );
     if (pathExists) {
+        const path = unquote(pathExists[1]);
+        if (path === null) return null;
         return {
             kind: "path_exists",
-            path: unquote(pathExists[1]) ?? pathExists[1],
+            path,
             ...(pathExists[2].toLowerCase() === "is gone" ? { gone: true } : {}),
         };
     }
@@ -277,10 +287,43 @@ function splitOrClauses(text: string): string[] {
     return clauses.filter(Boolean);
 }
 
+function unsafeGrammarReason(value: string): string | null {
+    let quote: '"' | "'" | null = null;
+    let escaped = false;
+    for (const character of value) {
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (quote && character === "\\") {
+            escaped = true;
+            continue;
+        }
+        if (character === '"' || character === "'") {
+            quote = quote === character ? null : quote === null ? character : quote;
+        }
+    }
+    if (quote !== null) return "unbalanced quote; leaving condition dreamer-evaluated";
+    if (/\bcontains\s+no(?:\s|$)/i.test(value)) {
+        return "ambiguous negation after contains; leaving condition dreamer-evaluated";
+    }
+    const temporalSuffix = new RegExp(
+        `\\bcontains\\s+${VALUE}\\s+(?:since|until|after|before|when|while|for|as\\s+of)\\b`,
+        "i",
+    );
+    if (temporalSuffix.test(value)) {
+        return "temporal suffix after contains; leaving condition dreamer-evaluated";
+    }
+    return null;
+}
+
 function unquote(value: string): string | null {
-    if (value.length < 2) return value;
     const quote = value[0];
-    if ((quote !== '"' && quote !== "'") || value.at(-1) !== quote) return value;
+    const final = value.at(-1);
+    const startsQuoted = quote === '"' || quote === "'";
+    const endsQuoted = final === '"' || final === "'";
+    if (!startsQuoted && !endsQuoted) return value;
+    if (!startsQuoted || final !== quote || value.length < 2) return null;
     if (quote === '"') {
         try {
             const parsed = JSON.parse(value);
