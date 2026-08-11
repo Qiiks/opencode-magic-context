@@ -941,10 +941,15 @@ pub(crate) fn select_reductions_with_outcome(
                 .iter()
                 .map(|a| bytes_to_tokens(a.reclaim_bytes()))
                 .sum();
-            for arc_id in select_emergency(&active_arcs, ctx, all_active_reclaim) {
-                arc_shapes.insert(arc_id, ArcShape::FullDrop);
+            let emergency_arc_ids = select_emergency(&active_arcs, ctx, all_active_reclaim);
+            for arc_id in &emergency_arc_ids {
+                arc_shapes.insert(arc_id.clone(), ArcShape::FullDrop);
             }
-            if cfg.smart_drops {
+            // Apply supersession only when this pass selected concrete reclaim work: an
+            // emergency eviction or a two-pass reclaim batch. If emergency mode has met
+            // its headroom target but selected nothing, defer supersession so it cannot
+            // create a cache bust by itself.
+            if cfg.smart_drops && (!emergency_arc_ids.is_empty() || !two_pass_arc_ids.is_empty()) {
                 for (arc_id, intent) in
                     select_supersession(&active_arcs, &recent_supersession_message_ids)
                 {
@@ -1295,6 +1300,26 @@ mod tests {
         m
     }
 
+    fn served_block_bytes(
+        items: &[SelItem],
+        decisions: &[ReductionDecision],
+    ) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let reductions: HashMap<&str, &str> = decisions
+            .iter()
+            .map(|decision| (decision.target_id.as_str(), decision.payload.as_str()))
+            .collect();
+        items
+            .iter()
+            .map(|item| {
+                let bytes = reductions.get(item.id.as_str()).map_or_else(
+                    || vec![b'x'; item.byte_size],
+                    |payload| payload.as_bytes().to_vec(),
+                );
+                (item.id.clone(), bytes)
+            })
+            .collect()
+    }
+
     // --- the differential golden vs the 5 TS selectors ---
 
     #[derive(Deserialize)]
@@ -1543,6 +1568,106 @@ mod tests {
     }
 
     #[test]
+    fn force_band_two_pass_batch_carries_pending_supersession() {
+        let mut aged_result = tool_result("aged", 1, "read", 2_000);
+        aged_result.token_count = Some(300);
+        let mut items = vec![
+            tool_call("aged", 1, "read", serde_json::json!({"path":"old.txt"}), 50),
+            aged_result,
+            tool_call(
+                "c1",
+                2,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":"one"}),
+                500,
+            ),
+            tool_result("c1", 2, "edit", 100),
+            tool_call(
+                "c2",
+                3,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":"two"}),
+                500,
+            ),
+            tool_result("c2", 3, "edit", 100),
+        ];
+        for n in 0..RECENT_SUPERSESSION_WINDOW {
+            items.push(text_with_id(&format!("tail-{n}#0"), 4 + n as u64, 1));
+        }
+
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.last_execute_ordinal = 1;
+        ctx.scheduler_pressure_execute = true;
+        ctx.current_total_input_tokens = 90_000.0;
+        ctx.ceiling_tokens = 100_000.0;
+        ctx.pass_already_busting = true;
+        let out = select_reductions(
+            &items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig { smart_drops: true },
+        );
+
+        assert_eq!(out.len(), 4);
+        assert!(out.iter().any(|decision| decision.target_id == "aged#0"));
+        assert!(out
+            .iter()
+            .any(|decision| { decision.target_id == "c1#0" && decision.kind == "edit_marker" }));
+        assert!(out
+            .iter()
+            .all(|decision| !decision.target_id.starts_with("c2#")));
+    }
+
+    #[test]
+    fn emergency_eviction_carries_pending_supersession() {
+        let mut items = vec![
+            tool_call("emergency", 1, "bash", serde_json::json!({}), 160_000),
+            tool_result("emergency", 1, "bash", 40_000),
+            tool_call(
+                "c1",
+                2,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":"one"}),
+                500,
+            ),
+            tool_result("c1", 2, "edit", 100),
+            tool_call(
+                "c2",
+                3,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":"two"}),
+                500,
+            ),
+            tool_result("c2", 3, "edit", 100),
+        ];
+        for n in 0..RECENT_SUPERSESSION_WINDOW {
+            items.push(text_with_id(&format!("tail-{n}#0"), 4 + n as u64, 1));
+        }
+
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.current_total_input_tokens = 90_000.0;
+        ctx.ceiling_tokens = 100_000.0;
+        ctx.pass_already_busting = true;
+        let out = select_reductions(
+            &items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig { smart_drops: true },
+        );
+
+        assert_eq!(out.len(), 4);
+        assert!(out
+            .iter()
+            .any(|decision| decision.target_id == "emergency#0"));
+        assert!(out
+            .iter()
+            .any(|decision| { decision.target_id == "c1#0" && decision.kind == "edit_marker" }));
+        assert!(out
+            .iter()
+            .all(|decision| !decision.target_id.starts_with("c2#")));
+    }
+
+    #[test]
     fn sustained_execute_band_accumulates_supersession_without_trickling() {
         const PASSES: u64 = 3;
 
@@ -1640,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn force_band_applies_aged_supersession_without_an_independent_bust() {
+    fn idle_force_band_defers_aged_supersession_without_changing_served_bytes() {
         let mut items = vec![
             tool_call(
                 "c1",
@@ -1663,17 +1788,176 @@ mod tests {
             items.push(text_with_id(&format!("tail-{n}#0"), 3 + n as u64, 1));
         }
 
-        let ctx = base_ctx(PassClass::EmergencyForce);
-        let out = select_reductions(
-            &items,
-            &HashSet::new(),
-            &ctx,
-            &SelectionConfig { smart_drops: true },
+        let cfg = SelectionConfig { smart_drops: true };
+        let previous =
+            select_reductions(&items, &HashSet::new(), &base_ctx(PassClass::Execute), &cfg);
+        assert!(previous.is_empty());
+        let previous_served = served_block_bytes(&items, &previous);
+
+        let mut emergency_ctx = base_ctx(PassClass::EmergencyForce);
+        emergency_ctx.current_total_input_tokens = 90_000.0;
+        emergency_ctx.ceiling_tokens = 100_000.0;
+        emergency_ctx.pass_already_busting = true;
+        let emergency = select_reductions(&items, &HashSet::new(), &emergency_ctx, &cfg);
+
+        assert!(
+            emergency.is_empty(),
+            "an idle force band cannot create a bust"
         );
-        assert_eq!(out.len(), 2);
-        assert!(out
+        assert_eq!(served_block_bytes(&items, &emergency), previous_served);
+    }
+
+    #[test]
+    fn sustained_idle_force_band_batches_supersession_until_a_real_bust() {
+        const IDLE_PASSES: u64 = 3;
+
+        let mut items = vec![
+            tool_call(
+                "c1",
+                1,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":"one"}),
+                500,
+            ),
+            tool_result("c1", 1, "edit", 100),
+        ];
+        let cfg = SelectionConfig { smart_drops: true };
+        let mut next_ordinal = 2;
+        let mut self_caused_busts = 0;
+
+        for pass in 1..=IDLE_PASSES {
+            let edit_number = pass + 1;
+            items.push(tool_call(
+                &format!("c{edit_number}"),
+                next_ordinal,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":format!("edit-{edit_number}")}),
+                500,
+            ));
+            items.push(tool_result(
+                &format!("c{edit_number}"),
+                next_ordinal,
+                "edit",
+                100,
+            ));
+            next_ordinal += 1;
+            for message in 0..RECENT_SUPERSESSION_WINDOW {
+                items.push(text_with_id(
+                    &format!("pass-{pass}-tail-{message}#0"),
+                    next_ordinal,
+                    1,
+                ));
+                next_ordinal += 1;
+            }
+
+            let mut ctx = base_ctx(PassClass::EmergencyForce);
+            ctx.current_total_input_tokens = 90_000.0;
+            ctx.ceiling_tokens = 100_000.0;
+            ctx.pass_already_busting = true;
+            if !select_reductions(&items, &HashSet::new(), &ctx, &cfg).is_empty() {
+                self_caused_busts += 1;
+            }
+        }
+
+        assert_eq!(self_caused_busts, 0, "idle force passes must not trickle");
+
+        items.push(tool_call(
+            "emergency",
+            next_ordinal,
+            "bash",
+            serde_json::json!({}),
+            160_000,
+        ));
+        items.push(tool_result("emergency", next_ordinal, "bash", 40_000));
+        let mut bust_ctx = base_ctx(PassClass::EmergencyForce);
+        bust_ctx.current_total_input_tokens = 90_000.0;
+        bust_ctx.ceiling_tokens = 100_000.0;
+        bust_ctx.pass_already_busting = true;
+        let bust = select_reductions(&items, &HashSet::new(), &bust_ctx, &cfg);
+        let markers: HashSet<&str> = bust
             .iter()
-            .all(|decision| decision.target_id.starts_with("c1#")));
+            .filter(|decision| decision.kind == "edit_marker")
+            .map(|decision| decision.target_id.as_str())
+            .collect();
+
+        assert_eq!(
+            markers,
+            HashSet::from(["c1#0", "c2#0", "c3#0"]),
+            "the first real emergency eviction must carry the whole pending batch"
+        );
+        assert!(bust
+            .iter()
+            .any(|decision| decision.target_id == "emergency#0"));
+        assert!(bust
+            .iter()
+            .all(|decision| !decision.target_id.starts_with("c4#")));
+    }
+
+    #[test]
+    fn latched_force_below_band_preserves_served_bytes_while_supersession_accumulates() {
+        const LATCHED_PASSES: u64 = 3;
+
+        let mut items = vec![
+            tool_call(
+                "c1",
+                1,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":"one"}),
+                500,
+            ),
+            tool_result("c1", 1, "edit", 100),
+        ];
+        let cfg = SelectionConfig { smart_drops: true };
+        let mut previous_served = served_block_bytes(&items, &[]);
+        let mut next_ordinal = 2;
+        let mut applied_reclaims = 0;
+
+        for pass in 1..=LATCHED_PASSES {
+            let edit_number = pass + 1;
+            items.push(tool_call(
+                &format!("c{edit_number}"),
+                next_ordinal,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":format!("edit-{edit_number}")}),
+                500,
+            ));
+            items.push(tool_result(
+                &format!("c{edit_number}"),
+                next_ordinal,
+                "edit",
+                100,
+            ));
+            next_ordinal += 1;
+            for message in 0..RECENT_SUPERSESSION_WINDOW {
+                items.push(text_with_id(
+                    &format!("latched-{pass}-tail-{message}#0"),
+                    next_ordinal,
+                    1,
+                ));
+                next_ordinal += 1;
+            }
+
+            let mut ctx = base_ctx(PassClass::EmergencyForce);
+            ctx.current_total_input_tokens = 70_000.0;
+            ctx.ceiling_tokens = 100_000.0;
+            ctx.pass_already_busting = true;
+            let reductions = select_reductions(&items, &HashSet::new(), &ctx, &cfg);
+            applied_reclaims += usize::from(!reductions.is_empty());
+            let served = served_block_bytes(&items, &reductions);
+            for (id, previous_bytes) in &previous_served {
+                assert_eq!(
+                    served.get(id),
+                    Some(previous_bytes),
+                    "latched pass {pass} changed previously served block {id}"
+                );
+            }
+            previous_served = served;
+        }
+
+        assert_eq!(
+            applied_reclaims, 0,
+            "an armed but idle emergency latch must not authorize supersession"
+        );
     }
 
     #[test]
