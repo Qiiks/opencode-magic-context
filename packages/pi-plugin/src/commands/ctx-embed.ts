@@ -263,6 +263,7 @@ export function maybeAutoEmbedPiSession(
 	if (deps.memoryEnabled === false) return;
 	autoEmbedAttemptedBySession.add(sessionId);
 	void (async () => {
+		let completedDrainWithWork = false;
 		try {
 			// Defer off the context-handler thread before any DB/config work:
 			// ensureProjectRegisteredFromPiDirectory does its config load + stale
@@ -280,10 +281,18 @@ export function maybeAutoEmbedPiSession(
 			notify(
 				`Embedding ${remaining} compartment${remaining === 1 ? "" : "s"} of history in the background…`,
 			);
-			const { text } = await runEmbedDrain(deps.db, projectIdentity, sessionId);
+			const { text, level } = await runEmbedDrain(
+				deps.db,
+				projectIdentity,
+				sessionId,
+			);
+			completedDrainWithWork = level === "success";
 			notify(text.replace(/^## \/ctx-embed\n\n/, ""));
 		} catch {
 			// best-effort background drain
+		} finally {
+			if (!completedDrainWithWork)
+				autoEmbedAttemptedBySession.delete(sessionId);
 		}
 	})();
 }

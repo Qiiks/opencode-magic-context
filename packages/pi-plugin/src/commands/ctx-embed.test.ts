@@ -8,11 +8,18 @@ import type {
 import {
 	_resetProjectEmbeddingRegistryForTests,
 	_setTestProviderFactoryForProject,
+	getEmbeddingCoverageStatus,
 	registerProjectEmbedding,
 } from "@magic-context/core/features/magic-context/project-embedding-registry";
+import { recordSessionProjectIdentity } from "@magic-context/core/features/magic-context/session-project-storage";
+import { autoEmbedAttemptedBySession } from "@magic-context/core/hooks/magic-context/embed-session-state";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { createTestDb } from "../test-utils.test";
-import { runEmbedDrain } from "./ctx-embed";
+import {
+	clearPiEmbedSessionState,
+	maybeAutoEmbedPiSession,
+	runEmbedDrain,
+} from "./ctx-embed";
 
 class FakeEmbeddingProvider implements EmbeddingProvider {
 	readonly modelId = "fake-embedding-model";
@@ -88,8 +95,74 @@ function registerEmbedding(
 
 describe("Pi /ctx-embed progress", () => {
 	afterEach(() => {
+		autoEmbedAttemptedBySession.clear();
 		_resetProjectEmbeddingRegistryForTests();
 		_setTestProviderFactoryForProject(null);
+	});
+
+	it("re-arms after a zero-work pass and latches only after the later drain succeeds", async () => {
+		_setTestProviderFactoryForProject(() => new FakeEmbeddingProvider());
+		const db = createTestDb();
+		const project = "pi-auto-embed-project";
+		const sessionId = "pi-auto-embed-session";
+		const notifications: string[] = [];
+		const waitUntil = async (predicate: () => boolean): Promise<void> => {
+			const deadline = Date.now() + 3_000;
+			while (!predicate() && Date.now() < deadline) {
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+			expect(predicate()).toBe(true);
+		};
+		try {
+			registerEmbedding(db, project);
+			recordSessionProjectIdentity(db, sessionId, project);
+
+			maybeAutoEmbedPiSession(
+				{ db, projectDir: "/tmp/pi-embed", projectIdentity: project },
+				sessionId,
+				"/tmp/pi-embed",
+				project,
+				(text) => notifications.push(text),
+			);
+			await waitUntil(() => !autoEmbedAttemptedBySession.has(sessionId));
+			expect(notifications).toEqual([]);
+
+			seedCompartments(db, sessionId, 1);
+			expect(getEmbeddingCoverageStatus(db, project, sessionId)).toMatchObject({
+				enabled: true,
+				session: { total: 1, embedded: 0 },
+			});
+			maybeAutoEmbedPiSession(
+				{ db, projectDir: "/tmp/pi-embed", projectIdentity: project },
+				sessionId,
+				"/tmp/pi-embed",
+				project,
+				(text) => notifications.push(text),
+			);
+			await waitUntil(
+				() =>
+					autoEmbedAttemptedBySession.has(sessionId) &&
+					notifications.some((text) =>
+						text.includes(
+							"Embedded 1 compartment of history for semantic search.",
+						),
+					),
+			);
+			const completedNotifications = notifications.length;
+
+			maybeAutoEmbedPiSession(
+				{ db, projectDir: "/tmp/pi-embed", projectIdentity: project },
+				sessionId,
+				"/tmp/pi-embed",
+				project,
+				(text) => notifications.push(text),
+			);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(notifications).toHaveLength(completedNotifications);
+		} finally {
+			clearPiEmbedSessionState(sessionId);
+			closeQuietly(db);
+		}
 	});
 
 	it("emits start, throttled progress, and terminal summary for a multi-batch drain", async () => {

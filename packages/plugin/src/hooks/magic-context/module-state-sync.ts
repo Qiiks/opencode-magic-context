@@ -255,33 +255,103 @@ export async function mirrorModuleCompartments(args: {
     sessionId: string;
     reader: ModuleCompartmentReader;
 }): Promise<number> {
-    const row = args.db
-        .prepare(
-            "SELECT COALESCE(MAX(sequence), -1) AS max_sequence FROM compartments WHERE session_id = ?",
-        )
-        .get(args.sessionId) as { max_sequence?: number } | undefined;
-    const afterSequence = row?.max_sequence ?? -1;
-    const published = await args.reader.getCompartmentsAfter(args.sessionId, afterSequence);
-    if (!Number.isFinite(published.max_sequence) || published.max_sequence <= afterSequence) {
-        return afterSequence;
-    }
-    const insert = args.db.prepare(
-        "INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at, harness) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, sequence) DO NOTHING",
-    );
-    const now = Date.now();
-    args.db.transaction(() => {
+    const authoritative: ModuleCompartmentMirrorRow[] = [];
+    let afterSequence = -1;
+    let maxSequence: number | null = null;
+
+    for (;;) {
+        const published = await args.reader.getCompartmentsAfter(args.sessionId, afterSequence);
+        if (
+            !Number.isSafeInteger(published.max_sequence) ||
+            published.max_sequence < -1 ||
+            (maxSequence !== null && published.max_sequence !== maxSequence)
+        ) {
+            throw new Error(
+                "module compartment mirror changed while its authoritative set was read",
+            );
+        }
+        maxSequence ??= published.max_sequence;
+
+        let pageAdvanced = false;
         for (const compartment of published.compartments) {
             if (
-                !Number.isFinite(compartment.sequence) ||
+                !Number.isSafeInteger(compartment.sequence) ||
                 compartment.sequence <= afterSequence ||
+                compartment.sequence > maxSequence ||
+                !Number.isSafeInteger(compartment.start_message) ||
+                !Number.isSafeInteger(compartment.end_message) ||
                 typeof compartment.start_message_id !== "string" ||
                 typeof compartment.end_message_id !== "string" ||
                 typeof compartment.title !== "string" ||
                 typeof compartment.content !== "string"
             ) {
-                continue;
+                throw new Error("module compartment mirror returned an invalid authoritative row");
             }
-            insert.run(
+            authoritative.push(compartment);
+            afterSequence = compartment.sequence;
+            pageAdvanced = true;
+        }
+
+        if (afterSequence >= maxSequence) break;
+        if (!pageAdvanced) {
+            throw new Error("module compartment mirror returned an incomplete authoritative set");
+        }
+    }
+
+    const local = args.db
+        .prepare(
+            "SELECT sequence, end_message FROM compartments WHERE session_id = ? ORDER BY sequence ASC",
+        )
+        .all(args.sessionId) as Array<{ sequence: number; end_message: number }>;
+    let firstDifference = 0;
+    while (
+        firstDifference < local.length &&
+        firstDifference < authoritative.length &&
+        local[firstDifference]?.sequence === authoritative[firstDifference]?.sequence &&
+        local[firstDifference]?.end_message === authoritative[firstDifference]?.end_message
+    ) {
+        firstDifference += 1;
+    }
+    const localDifference = local[firstDifference]?.sequence;
+    const authoritativeDifference = authoritative[firstDifference]?.sequence;
+    const divergentSequence =
+        localDifference === undefined
+            ? authoritativeDifference
+            : authoritativeDifference === undefined
+              ? localDifference
+              : Math.min(localDifference, authoritativeDifference);
+
+    const upsert = args.db.prepare(
+        `INSERT INTO compartments
+            (session_id, sequence, start_message, end_message, start_message_id, end_message_id,
+             title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at, harness)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id, sequence) DO UPDATE SET
+             start_message = excluded.start_message,
+             end_message = excluded.end_message,
+             start_message_id = excluded.start_message_id,
+             end_message_id = excluded.end_message_id,
+             title = excluded.title,
+             content = excluded.content,
+             p1 = excluded.p1,
+             p2 = excluded.p2,
+             p3 = excluded.p3,
+             p4 = excluded.p4,
+             importance = excluded.importance,
+             episode_type = excluded.episode_type,
+             legacy = excluded.legacy,
+             created_at = excluded.created_at,
+             harness = excluded.harness`,
+    );
+    const now = Date.now();
+    args.db.transaction(() => {
+        if (divergentSequence !== undefined) {
+            args.db
+                .prepare("DELETE FROM compartments WHERE session_id = ? AND sequence >= ?")
+                .run(args.sessionId, divergentSequence);
+        }
+        for (const compartment of authoritative) {
+            upsert.run(
                 args.sessionId,
                 compartment.sequence,
                 compartment.start_message,
@@ -302,7 +372,7 @@ export async function mirrorModuleCompartments(args: {
             );
         }
     })();
-    return published.max_sequence;
+    return maxSequence;
 }
 
 interface ModuleWorkspaceContext {

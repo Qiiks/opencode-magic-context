@@ -8,16 +8,27 @@ import type { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { ensureContextStoreUuid } from "../../features/magic-context/context-authority";
 import { writeTaskScheduleState } from "../../features/magic-context/dreamer/storage-task-schedule";
 import { insertMemory } from "../../features/magic-context/memory";
+import type {
+    EmbeddingProvider,
+    EmbeddingPurpose,
+} from "../../features/magic-context/memory/embedding-provider";
 import {
     __resetProjectIdentityForTests,
     __setProjectIdentityTestHooks,
     resolveProjectIdentity,
 } from "../../features/magic-context/memory/project-identity";
 import { __resetMessageIndexAsyncForTests } from "../../features/magic-context/message-index-async";
+import {
+    _resetProjectEmbeddingRegistryForTests,
+    _setTestProviderFactoryForProject,
+    getEmbeddingCoverageStatus,
+} from "../../features/magic-context/project-embedding-registry";
 import type { Scheduler } from "../../features/magic-context/scheduler";
+import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
     closeDatabase,
     getOrCreateSessionMeta,
@@ -27,6 +38,7 @@ import {
 } from "../../features/magic-context/storage";
 import type { Tagger } from "../../features/magic-context/tagger";
 import { Database } from "../../shared/sqlite";
+import { autoEmbedAttemptedBySession, clearEmbedSessionState } from "./embed-session-state";
 import { createMagicContextHook, type MagicContextDeps } from "./hook";
 import { createLiveSessionState } from "./live-session-state";
 import { closeReadOnlySessionDb } from "./read-session-db";
@@ -40,6 +52,32 @@ type PromptMocks = {
     showToast: ReturnType<typeof mock>;
 };
 
+class HookFakeEmbeddingProvider implements EmbeddingProvider {
+    readonly modelId = "hook-fake-embedding-model";
+
+    async initialize(): Promise<boolean> {
+        return true;
+    }
+
+    async embed(text: string, _signal?: AbortSignal): Promise<Float32Array> {
+        return new Float32Array([text.length, 1]);
+    }
+
+    async embedBatch(
+        texts: string[],
+        _signal?: AbortSignal,
+        _purpose?: EmbeddingPurpose,
+    ): Promise<Float32Array[]> {
+        return texts.map((text) => new Float32Array([text.length, 1]));
+    }
+
+    async dispose(): Promise<void> {}
+
+    isLoaded(): boolean {
+        return true;
+    }
+}
+
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
@@ -50,6 +88,9 @@ function makeTempDir(prefix: string): string {
 }
 
 afterEach(() => {
+    autoEmbedAttemptedBySession.clear();
+    _resetProjectEmbeddingRegistryForTests();
+    _setTestProviderFactoryForProject(null);
     __resetProjectIdentityForTests();
     __resetMessageIndexAsyncForTests();
     closeReadOnlySessionDb();
@@ -308,6 +349,76 @@ describe("magic-context hook", () => {
         expect(typeof hook.event).toBe("function");
         expect(typeof hook["command.execute.before"]).toBe("function");
         expect(typeof hook["tool.execute.after"]).toBe("function");
+    });
+
+    it("re-arms auto-embed when the first transform precedes compartment work", async () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-auto-embed-data-");
+        const projectDir = makeTempDir("hook-auto-embed-project-");
+        mkdirSync(join(projectDir, ".cortexkit"));
+        writeFileSync(
+            join(projectDir, ".cortexkit", "magic-context.jsonc"),
+            JSON.stringify({
+                embedding: { provider: "local", model: "hook-fake-embedding-model" },
+                memory: { enabled: true },
+            }),
+        );
+        _setTestProviderFactoryForProject(() => new HookFakeEmbeddingProvider());
+        const deps = createMockDeps();
+        deps.directory = projectDir;
+        const hook = requireHook(createMagicContextHook(deps));
+        const db = openDatabase();
+        const sessionId = "ses-hook-auto-embed";
+        const projectIdentity = resolveProjectIdentity(projectDir);
+        recordSessionProjectIdentity(db, sessionId, projectIdentity);
+        const runTransform = async () => {
+            const messages = [
+                {
+                    info: { id: "u1", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "hello" }],
+                },
+            ];
+            await hook["experimental.chat.messages.transform"]!({}, { messages });
+        };
+        const waitUntil = async (predicate: () => boolean): Promise<void> => {
+            const deadline = Date.now() + 3_000;
+            while (!predicate() && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+            expect(predicate()).toBe(true);
+        };
+
+        try {
+            await runTransform();
+            await waitUntil(() => !autoEmbedAttemptedBySession.has(sessionId));
+
+            appendCompartments(db, sessionId, [
+                {
+                    sequence: 0,
+                    startMessage: 1,
+                    endMessage: 1,
+                    startMessageId: "u1",
+                    endMessageId: "u1",
+                    title: "Late compartment",
+                    content: "Late compartment content",
+                    p1: "Late compartment content",
+                },
+            ]);
+            db.prepare(
+                "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
+            ).run(sessionId, 1, "u1", "user", "Late compartment source text");
+
+            await runTransform();
+            await waitUntil(() => {
+                const coverage = getEmbeddingCoverageStatus(db, projectIdentity, sessionId);
+                return (
+                    coverage.session.total === 1 &&
+                    coverage.session.embedded === 1 &&
+                    autoEmbedAttemptedBySession.has(sessionId)
+                );
+            });
+        } finally {
+            clearEmbedSessionState(sessionId);
+        }
     });
 
     it("initializes the dream queue table during setup", () => {

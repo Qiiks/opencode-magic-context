@@ -1050,7 +1050,12 @@ export function registerProjectShadowEmbedding(
     const prior = shadowRegistrations.get(projectIdentity);
     if (prior && prior.providerIdentity === providerIdentity) {
         void provider.dispose();
+        dbForShadowQueue.set(projectIdentity, db);
         persistShadowDescriptor(db, prior);
+        const backfillAlreadyArmed =
+            hasPendingShadowBackfill(projectIdentity) ||
+            shadowQueue.some((item) => item.projectIdentity === projectIdentity);
+        if (!backfillAlreadyArmed) maybeArmShadowBackfill(db, projectIdentity, prior);
         return {
             ...snapshotFor({
                 projectIdentity,

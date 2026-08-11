@@ -9,6 +9,7 @@ import {
     type AuthorityStatus,
     getAuthorityManagedMarker,
 } from "../../features/magic-context/context-authority";
+import { insertMemory } from "../../features/magic-context/memory";
 import { runMigrations } from "../../features/magic-context/migrations";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/magic-context/storage";
@@ -30,7 +31,9 @@ import { ABSOLUTE_EMERGENCY_PERCENTAGE } from "../../shared/escalation-bands";
 import { promptSurfaceConfigIdentity } from "../../shared/prompt-surface";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createCtxSearchTools } from "../../tools/ctx-search/tools";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
+import { getVisibleMemoryIds } from "./inject-compartments";
 import { getSlot } from "./lkg-slot";
 import { MODULE_PAGE_MAX_BYTES } from "./module-wire";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
@@ -942,6 +945,70 @@ describe("Rust mode authority adapter", () => {
         expect(transformRequest?.prompt_surface_tool_descriptions).toEqual({
             ctx_search: "Search the project memory index.",
         });
+    });
+
+    it("mirrors rendered memory ids for ctx_search without rewriting a stable manifest", async () => {
+        const sessionId = `rust-memory-visibility-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const memory = insertMemory(db, {
+            projectPath: "/tmp/project",
+            category: "ARCHITECTURE_DECISIONS",
+            content: "The rust-rendered memory must not be returned twice.",
+        });
+        const meta = makeMeta(db, sessionId);
+        db.exec(`
+            CREATE TABLE memory_manifest_updates (count INTEGER NOT NULL);
+            INSERT INTO memory_manifest_updates (count) VALUES (0);
+            CREATE TRIGGER count_memory_manifest_updates
+            AFTER UPDATE OF memory_block_ids, memory_block_count ON session_meta
+            BEGIN
+                UPDATE memory_manifest_updates SET count = count + 1;
+            END;
+        `);
+        let renderedMemoryIds = [memory.id];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          native_messages: makeMessages(sessionId),
+                          rendered_memory_ids: renderedMemoryIds,
+                      }
+                    : { ok: true },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const run = async () => {
+            const messages = makeMessages(sessionId);
+            await transform.run(sessionId, messages, { messages: [...messages] }, meta);
+        };
+
+        await run();
+        expect(getVisibleMemoryIds(db, sessionId)).toEqual(new Set([memory.id]));
+        const tools = createCtxSearchTools({
+            db,
+            resolveProjectPath: () => "/tmp/project",
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            readMessages: () => [],
+        });
+        const search = await tools.ctx_search.execute(
+            { query: `#${memory.id}`, sources: ["memory"] },
+            { sessionID: sessionId, directory: "/tmp/project" } as never,
+        );
+        expect(search).toContain("No results found");
+
+        await run();
+        expect(
+            db.prepare("SELECT count FROM memory_manifest_updates").get() as { count: number },
+        ).toEqual({ count: 1 });
+
+        renderedMemoryIds = [memory.id + 1];
+        await run();
+        expect(getVisibleMemoryIds(db, sessionId)).toEqual(new Set([memory.id + 1]));
+        expect(
+            db.prepare("SELECT count FROM memory_manifest_updates").get() as { count: number },
+        ).toEqual({ count: 2 });
     });
 
     it("preserves the receiver for a class-backed compartment mirror client", async () => {

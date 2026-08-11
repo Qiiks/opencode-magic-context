@@ -994,7 +994,7 @@ describe("module incremental and paged assembly", () => {
 });
 
 describe("module compartment mirror-back", () => {
-    it("copies rows after the local watermark idempotently", async () => {
+    it("copies the authoritative row set idempotently", async () => {
         const db = new Database(":memory:");
         databases.push(db);
         initializeDatabase(db);
@@ -1036,7 +1036,61 @@ describe("module compartment mirror-back", () => {
         await mirrorModuleCompartments({ db, sessionId: "ses-mirror", reader });
         await mirrorModuleCompartments({ db, sessionId: "ses-mirror", reader });
 
-        expect(calls).toEqual([-1, 2]);
+        expect(calls).toEqual([-1, -1]);
         expect(getCompartments(db, "ses-mirror").map((row) => row.sequence)).toEqual([1, 2]);
+    });
+
+    it("replaces a recut suffix and truncates rows absent from the module set", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-mirror-recut";
+        let rows = Array.from({ length: 5 }, (_, index) => {
+            const sequence = index + 1;
+            return {
+                sequence,
+                start_message: sequence * 2 - 1,
+                end_message: sequence * 2,
+                start_message_id: `m${sequence * 2 - 1}#0`,
+                end_message_id: `m${sequence * 2}#0`,
+                title: `Compartment ${sequence}`,
+                content: `original content ${sequence}`,
+                created_at: sequence,
+            };
+        });
+        const reader = {
+            async getCompartmentsAfter(_sessionId: string, afterSequence: number) {
+                return {
+                    max_sequence: rows.at(-1)?.sequence ?? -1,
+                    compartments: rows.filter((row) => row.sequence > afterSequence).slice(0, 2),
+                };
+            },
+        };
+
+        await mirrorModuleCompartments({ db, sessionId, reader });
+        expect(getCompartments(db, sessionId)).toHaveLength(5);
+
+        rows = [
+            rows[0]!,
+            rows[1]!,
+            {
+                ...rows[2]!,
+                end_message: 30,
+                end_message_id: "recut-m30#0",
+                title: "Recut third compartment",
+                content: "authoritative recut content",
+            },
+        ];
+        await mirrorModuleCompartments({ db, sessionId, reader });
+
+        const mirrored = getCompartments(db, sessionId);
+        expect(mirrored).toHaveLength(3);
+        expect(mirrored.map((row) => row.sequence)).toEqual([1, 2, 3]);
+        expect(mirrored[2]).toEqual(
+            expect.objectContaining({
+                endMessage: 30,
+                endMessageId: "recut-m30#0",
+                title: "Recut third compartment",
+                content: "authoritative recut content",
+            }),
+        );
     });
 });

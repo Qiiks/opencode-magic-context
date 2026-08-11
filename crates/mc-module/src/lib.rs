@@ -19373,6 +19373,7 @@ mod tests {
         let request = request(vec![ck("m0", 0, "live input")]);
         let initial = call_transform_request(&handler, request.clone()).await;
         assert_eq!(initial["action"], "HARD");
+        assert_eq!(initial["rendered_memory_ids"], json!([source]));
         assert_eq!(
             store.load("ses").unwrap().meta.rendered_memory_ids,
             vec![source]

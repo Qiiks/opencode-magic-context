@@ -1582,4 +1582,61 @@ describe("project embedding registry", () => {
 
         expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("stalled_no_progress");
     });
+
+    it("re-arms a stalled shadow backfill when the same identity registers after recovery", async () => {
+        let providerRecovered = false;
+        _setTestProviderFactoryForProject((config) => {
+            if (config.provider === "local") return new FakeEmbeddingProvider(config.model);
+            return new (class extends FakeEmbeddingProvider {
+                override async embedBatch(texts: string[]): Promise<Float32Array[]> {
+                    return providerRecovered
+                        ? super.embedBatch(texts)
+                        : texts.map(() => null as unknown as Float32Array);
+                }
+            })("shadow");
+        });
+        const db = useTempDb();
+        const projectIdentity = "git:shadow-rearm";
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-primary"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/shadow-rearm",
+        );
+        for (let i = 0; i < 3; i++) {
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "CONSTRAINTS",
+                content: `recoverable shadow memory ${i}`,
+            });
+            saveEmbedding(db, memory.id, new Float32Array([i, 1]), currentModelId(projectIdentity));
+        }
+        const shadowConfig = {
+            provider: "synapse",
+            model: "synapse-model",
+            synapse_fingerprint: "fp-rearm",
+        } as unknown as EmbeddingConfig;
+        const first = registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            shadowConfig,
+            "/tmp/shadow-rearm",
+        );
+        await flushShadowEmbeddingBacklog(projectIdentity);
+        expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("stalled_no_progress");
+
+        providerRecovered = true;
+        const repeated = registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            shadowConfig,
+            "/tmp/shadow-rearm",
+        );
+        expect(repeated?.generation).toBe(first?.generation);
+        await flushShadowEmbeddingBacklog(projectIdentity);
+
+        expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("drained");
+        expect(loadAllEmbeddings(db, projectIdentity, repeated!.modelId).size).toBe(3);
+    });
 });
