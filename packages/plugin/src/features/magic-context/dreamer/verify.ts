@@ -28,7 +28,7 @@ import {
 import { computeNormalizedHash } from "../memory/normalize-hash";
 import { queueMemoryMutation } from "../storage-memory-mutation-log";
 import { recordChildInvocation } from "../subagent-token-capture";
-import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
+import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
 import {
     DreamerModuleFailureError,
@@ -87,6 +87,7 @@ export interface VerifyArgs {
     holderId: string;
     leaseKey: string;
     deadline: number;
+    leaseAcquisition?: LeaseAcquisition;
     forceBroad?: boolean;
     model?: string;
     fallbackModels?: readonly string[];
@@ -167,8 +168,12 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
     }
 
     const abortController = new AbortController();
-    const heartbeat = startLeaseHeartbeat(args.db, args.holderId, args.leaseKey, () =>
-        abortController.abort(),
+    const heartbeat = startLeaseHeartbeat(
+        args.db,
+        args.holderId,
+        args.leaseKey,
+        () => abortController.abort(),
+        args.leaseAcquisition,
     );
 
     let consecutiveProviderFailures = 0;

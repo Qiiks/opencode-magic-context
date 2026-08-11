@@ -24,7 +24,7 @@ export class DreamerProviderOutputFailureError extends Error {
     ) {
         const preview = responseText.trim().replace(/\s+/g, " ").slice(0, 160);
         super(
-            `verify provider-outage completion (output_tokens=${outputTokens}, reasoning_tokens=${reasoningTokens}): ${JSON.stringify(preview)}`,
+            `dreamer provider-outage completion (output_tokens=${outputTokens}, reasoning_tokens=${reasoningTokens}): ${JSON.stringify(preview)}`,
         );
         this.name = "DreamerProviderOutputFailureError";
     }

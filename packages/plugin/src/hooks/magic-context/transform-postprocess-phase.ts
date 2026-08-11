@@ -821,6 +821,10 @@ export async function runPostTransformPhase(
                   state: args.sessionMeta as M0M1State,
                   projectPath: args.m0M1.projectPath,
                   projectDirectory: args.m0M1.projectDirectory,
+                  injectDocs: args.m0M1.injectDocs,
+                  muralEnabled: args.m0M1.muralEnabled,
+                  memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
+                  historyBudgetTokens: args.m0M1.historyBudgetTokens,
                   hardSignals: args.m0M1.hardSignals,
               }).value
             : false;

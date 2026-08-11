@@ -13,13 +13,17 @@ import { shouldKeepSubagents } from "../../../shared/keep-subagents";
 import { log } from "../../../shared/logger";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
-import { runLeaseGuardedWrite, startLeaseHeartbeat } from "../dreamer/lease";
+import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "../dreamer/lease";
 import { assertManifestCoversExactly } from "../dreamer/manifest-parser";
 import {
     DreamerModuleFailureError,
     type DreamerModuleRoute,
     getModuleMemoryIdentities,
 } from "../dreamer/module-apply";
+import {
+    DreamerProviderOutputFailureError,
+    providerOutputFailureFromInvalidManifest,
+} from "../dreamer/provider-output-failure";
 import { getMemoriesByProject, type Memory } from "../memory";
 import {
     buildCompressCuesPrompt,
@@ -90,6 +94,7 @@ export interface CompressCuesArgs {
     holderId: string;
     leaseKey: string;
     deadline: number;
+    leaseAcquisition?: LeaseAcquisition;
     model?: string;
     fallbackModels?: readonly string[];
     onProgress?: (processed: number) => void;
@@ -254,8 +259,12 @@ export async function runCompressCues(args: CompressCuesArgs): Promise<CompressC
     }
 
     const abortController = new AbortController();
-    const heartbeat = startLeaseHeartbeat(args.db, args.holderId, args.leaseKey, () =>
-        abortController.abort(),
+    const heartbeat = startLeaseHeartbeat(
+        args.db,
+        args.holderId,
+        args.leaseKey,
+        () => abortController.abort(),
+        args.leaseAcquisition,
     );
     try {
         let consecutiveTimeouts = 0;
@@ -393,7 +402,16 @@ async function compressOneChunk(
                     if (!text) throw new Error("compress-cues returned no output");
                     // Fail-closed root parse: a missing/truncated <cues> root rejects
                     // the whole chunk here (no partial apply from a truncated reply).
-                    parseCuesManifest(text);
+                    try {
+                        parseCuesManifest(text);
+                    } catch (error) {
+                        const providerFailure = providerOutputFailureFromInvalidManifest(
+                            messages,
+                            text,
+                        );
+                        if (providerFailure) throw providerFailure;
+                        throw error;
+                    }
                     return text;
                 },
             },
@@ -411,7 +429,7 @@ async function compressOneChunk(
         // A chunk failure is not fatal to the run: other chunks still compress,
         // and this chunk's memories stay NULL and are retried next run. Rethrow
         // only on abort (lease lost / deadline) so the scheduler records it.
-        if (signal.aborted) throw error;
+        if (signal.aborted || error instanceof DreamerProviderOutputFailureError) throw error;
         // Classify the failure so the run loop can drive the consecutive-timeout
         // circuit breaker. The measured elapsed time lets the operator compare
         // how long the model actually ran against the slice it was given.

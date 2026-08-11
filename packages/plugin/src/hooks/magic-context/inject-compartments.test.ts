@@ -25,7 +25,10 @@ import {
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { COMPARTMENT_RENDER_EPOCH } from "./compartment-render-epoch";
+import {
+    COMPARTMENT_RENDER_EPOCH,
+    encodeCachedM0UpgradeIdentity,
+} from "./compartment-render-epoch";
 import {
     clearInjectionCache,
     getVisibleMemoryIds,
@@ -1113,7 +1116,12 @@ describe("m[0]/m[1] materialization", () => {
             cachedM0MaxMutationId: 0,
             cachedM0ProjectDocsHash: "",
             cachedM0SessionFactsVersion: 0,
-            cachedM0UpgradeState: `ready|compartment-render:${COMPARTMENT_RENDER_EPOCH}`,
+            cachedM0UpgradeState: encodeCachedM0UpgradeIdentity(
+                "ready",
+                COMPARTMENT_RENDER_EPOCH,
+                false,
+                "m8000-h60000",
+            ),
         };
 
         expect(
@@ -1544,6 +1552,7 @@ describe("m[0]/m[1] materialization", () => {
                 sessionId: SESSION_ID,
                 state,
                 projectPath: PROJECT_PATH,
+                memoryInjectionBudgetTokens: budget,
                 hardSignals: hardV1,
             }),
         ).toEqual({ value: false, reason: null });
@@ -1703,7 +1712,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(typeof row.cached_m0_materialized_at).toBe("number");
         expect(row.cached_m0_session_facts_version).toBe(0);
         expect(row.cached_m0_upgrade_state).toBe(
-            `ready|compartment-render:${COMPARTMENT_RENDER_EPOCH}`,
+            encodeCachedM0UpgradeIdentity("ready", COMPARTMENT_RENDER_EPOCH, false, "m8000-h60000"),
         );
     });
 
@@ -1930,7 +1939,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(typeof state.cachedM0MaterializedAt).toBe("number");
         expect(state.cachedM0SessionFactsVersion).toBe(0);
         expect(state.cachedM0UpgradeState).toBe(
-            `ready|compartment-render:${COMPARTMENT_RENDER_EPOCH}`,
+            encodeCachedM0UpgradeIdentity("ready", COMPARTMENT_RENDER_EPOCH, false, "m8000-h60000"),
         );
         expect(state.snapshotMarkers?.maxMemoryId).toBe(0);
         expect(

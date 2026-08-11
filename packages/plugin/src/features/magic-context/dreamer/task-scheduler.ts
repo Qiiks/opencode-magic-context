@@ -2,7 +2,12 @@ import type { PiThinkingLevel } from "../../../config/schema/magic-context";
 import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
 import { nextDueAtMs } from "./cron";
-import { acquireLease, peekLeaseHolderAndExpiry, releaseLease } from "./lease";
+import {
+    acquireLeaseWithAcquisition,
+    type LeaseAcquisition,
+    leaseOwnershipMatches,
+    releaseLease,
+} from "./lease";
 import { getDreamState } from "./storage-dream-state";
 import {
     getTaskScheduleState,
@@ -53,9 +58,17 @@ export interface TaskExecOutcome {
 /** Runs ONE task's actual work (LLM loop). Supplied by the runner (step 4). The
  *  scheduler holds the domain lease + `holderId`; the executor must verify the
  *  lease holder under BEGIN IMMEDIATE immediately before any durable write. */
+export interface TaskExecutorContext {
+    db: Database;
+    projectIdentity: string;
+    holderId: string;
+    leaseKey: string;
+    leaseAcquisition?: LeaseAcquisition;
+}
+
 export type TaskExecutor = (
     task: DreamTaskRuntimeConfig,
-    ctx: { db: Database; projectIdentity: string; holderId: string; leaseKey: string },
+    ctx: TaskExecutorContext,
 ) => Promise<TaskExecOutcome>;
 
 export interface RunDueTasksDeps {
@@ -291,20 +304,20 @@ async function runDomainGroup(
     const leaseKey = leaseKeyFor(group[0].config.task, projectIdentity);
     const holderId = crypto.randomUUID();
 
-    let acquired = acquireLease(db, holderId, leaseKey);
-    if (!acquired && cb?.leaseWaitMs) {
+    let acquisition = acquireLeaseWithAcquisition(db, holderId, leaseKey);
+    if (!acquisition && cb?.leaseWaitMs) {
         // Explicit manual run: the lease holder is usually a scheduled
         // catch-up task on the same domain finishing within seconds. Waiting
         // briefly turns a confusing "busy, try again" into the run the user
         // asked for. Scheduled ticks never wait (leaseWaitMs unset) — the next
         // tick retries anyway.
         const deadline = Date.now() + cb.leaseWaitMs;
-        while (!acquired && Date.now() < deadline) {
+        while (!acquisition && Date.now() < deadline) {
             await new Promise((resolve) => setTimeout(resolve, LEASE_WAIT_POLL_MS));
-            acquired = acquireLease(db, holderId, leaseKey);
+            acquisition = acquireLeaseWithAcquisition(db, holderId, leaseKey);
         }
     }
-    if (!acquired) {
+    if (!acquisition) {
         // Busy (a long sibling run or another process holds it). Leave next_due_at
         // unchanged so these tasks re-attempt next tick — they run the instant the
         // lease frees. No state write.
@@ -317,7 +330,7 @@ async function runDomainGroup(
         for (const due of [...group].sort((a, b) =>
             compareTaskOrder(a.config.task, b.config.task),
         )) {
-            if (!peekLeaseHolderAndExpiry(db, holderId, leaseKey)) {
+            if (!leaseOwnershipMatches(db, holderId, acquisition.generation, leaseKey)) {
                 log(`[dreamer] domain lease lost (${leaseKey}) — stopping remaining task(s)`);
                 break;
             }
@@ -345,7 +358,13 @@ async function runDomainGroup(
 
             let outcome: TaskExecOutcome;
             try {
-                outcome = await executor(due.config, { db, projectIdentity, holderId, leaseKey });
+                outcome = await executor(due.config, {
+                    db,
+                    projectIdentity,
+                    holderId,
+                    leaseKey,
+                    leaseAcquisition: acquisition,
+                });
             } catch (error) {
                 outcome = { status: "failed", transient: true, error: String(error) };
             }

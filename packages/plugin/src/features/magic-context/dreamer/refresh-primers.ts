@@ -21,7 +21,7 @@ import {
     updatePrimerAnswer,
 } from "../storage-primers";
 import { recordChildInvocation } from "../subagent-token-capture";
-import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
+import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { buildPrimerSeed } from "./primer-seed";
 import { PRIMER_INVESTIGATOR_SYSTEM_PROMPT } from "./task-prompts";
 
@@ -36,6 +36,7 @@ export interface RefreshPrimersArgs {
     holderId: string;
     leaseKey: string;
     deadline: number;
+    leaseAcquisition?: LeaseAcquisition;
     model?: string;
     fallbackModels?: readonly string[];
     language?: string;
@@ -168,8 +169,12 @@ export async function refreshPrimers(args: RefreshPrimersArgs): Promise<RefreshP
     if (primers.length === 0) return result;
 
     const abortController = new AbortController();
-    const heartbeat = startLeaseHeartbeat(args.db, args.holderId, args.leaseKey, () =>
-        abortController.abort(),
+    const heartbeat = startLeaseHeartbeat(
+        args.db,
+        args.holderId,
+        args.leaseKey,
+        () => abortController.abort(),
+        args.leaseAcquisition,
     );
 
     try {

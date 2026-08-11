@@ -6,7 +6,7 @@ const LEASE_DURATION_MS = 2 * 60 * 1000; // 2 minutes — renewed periodically d
 /**
  * Dreamer v2 uses one lease PER CONFLICT-DOMAIN (memory:<project>,
  * key-files:<project>, user-memories, …) so disjoint-state tasks don't block
- * each other while the memory-mutating tasks still serialize. A lease is three
+ * each other while the memory-mutating tasks still serialize. A lease is four
  * `dream_state` rows under a key namespace.
  *
  * `DREAMING_LEASE_KEY` is the legacy single-lease key. It keeps the original
@@ -19,6 +19,7 @@ interface LeaseRowKeys {
     holder: string;
     heartbeat: string;
     expiry: string;
+    generation: string;
 }
 
 function rowKeys(leaseKey: string): LeaseRowKeys {
@@ -29,12 +30,14 @@ function rowKeys(leaseKey: string): LeaseRowKeys {
             holder: "dreaming_lease_holder",
             heartbeat: "dreaming_lease_heartbeat",
             expiry: "dreaming_lease_expiry",
+            generation: "dreaming_lease_generation",
         };
     }
     return {
         holder: `lease:${leaseKey}:holder`,
         heartbeat: `lease:${leaseKey}:heartbeat`,
         expiry: `lease:${leaseKey}:expiry`,
+        generation: `lease:${leaseKey}:generation`,
     };
 }
 
@@ -57,6 +60,16 @@ export function getLeaseHolder(db: Database, leaseKey: string = DREAMING_LEASE_K
     return getDreamState(db, rowKeys(leaseKey).holder);
 }
 
+export function getLeaseGeneration(
+    db: Database,
+    leaseKey: string = DREAMING_LEASE_KEY,
+): number | null {
+    const value = getDreamState(db, rowKeys(leaseKey).generation);
+    if (!value) return null;
+    const generation = Number(value);
+    return Number.isSafeInteger(generation) && generation > 0 ? generation : null;
+}
+
 export function peekLeaseHolderAndExpiry(
     db: Database,
     expectedHolder: string,
@@ -71,7 +84,19 @@ export function peekLeaseHolderAndExpiry(
     return Number.isFinite(expiry) && expiry >= Date.now();
 }
 
-// The lease spans three dream_state rows (holder/heartbeat/expiry), so it can't
+export function leaseOwnershipMatches(
+    db: Database,
+    expectedHolder: string,
+    expectedGeneration: number,
+    leaseKey: string = DREAMING_LEASE_KEY,
+): boolean {
+    return (
+        getLeaseGeneration(db, leaseKey) === expectedGeneration &&
+        peekLeaseHolderAndExpiry(db, expectedHolder, leaseKey)
+    );
+}
+
+// The lease spans four dream_state rows (holder/heartbeat/expiry/generation), so it can't
 // be a single-statement CAS like compartment-lease.ts. Instead each mutation
 // runs under BEGIN IMMEDIATE: the write lock is taken at BEGIN time (not at the
 // first write, as the deferred BEGIN that db.transaction() emits would), so the
@@ -99,36 +124,57 @@ function runImmediate<T>(db: Database, body: () => T): T {
     }
 }
 
+export interface LeaseAcquisition {
+    acquiredAt: number;
+    generation: number;
+}
+
+export function acquireLeaseWithAcquisition(
+    db: Database,
+    holderId: string,
+    leaseKey: string = DREAMING_LEASE_KEY,
+): LeaseAcquisition | null {
+    const keys = rowKeys(leaseKey);
+    return runImmediate(db, () => {
+        const existingHolder = getLeaseHolder(db, leaseKey);
+        if (isLeaseActive(db, leaseKey) && existingHolder && existingHolder !== holderId) {
+            return null;
+        }
+
+        const now = Date.now();
+        const priorGeneration = getLeaseGeneration(db, leaseKey) ?? 0;
+        const generation =
+            existingHolder === holderId ? Math.max(1, priorGeneration) : priorGeneration + 1;
+        setDreamState(db, keys.holder, holderId);
+        setDreamState(db, keys.heartbeat, String(now));
+        setDreamState(db, keys.expiry, String(now + LEASE_DURATION_MS));
+        setDreamState(db, keys.generation, String(generation));
+        return { acquiredAt: now, generation };
+    });
+}
+
 export function acquireLease(
     db: Database,
     holderId: string,
     leaseKey: string = DREAMING_LEASE_KEY,
 ): boolean {
-    const keys = rowKeys(leaseKey);
-    return runImmediate(db, () => {
-        if (isLeaseActive(db, leaseKey)) {
-            const existingHolder = getLeaseHolder(db, leaseKey);
-            if (existingHolder && existingHolder !== holderId) {
-                return false;
-            }
-        }
-
-        const now = Date.now();
-        setDreamState(db, keys.holder, holderId);
-        setDreamState(db, keys.heartbeat, String(now));
-        setDreamState(db, keys.expiry, String(now + LEASE_DURATION_MS));
-        return true;
-    });
+    return acquireLeaseWithAcquisition(db, holderId, leaseKey) !== null;
 }
 
 export function renewLease(
     db: Database,
     holderId: string,
     leaseKey: string = DREAMING_LEASE_KEY,
+    expectedGeneration?: number,
 ): boolean {
     const keys = rowKeys(leaseKey);
     return runImmediate(db, () => {
-        if (getLeaseHolder(db, leaseKey) !== holderId || !isLeaseActive(db, leaseKey)) {
+        if (
+            getLeaseHolder(db, leaseKey) !== holderId ||
+            !isLeaseActive(db, leaseKey) ||
+            (expectedGeneration !== undefined &&
+                getLeaseGeneration(db, leaseKey) !== expectedGeneration)
+        ) {
             return false;
         }
 
@@ -192,10 +238,17 @@ export function startLeaseHeartbeat(
     holderId: string,
     leaseKey: string,
     onLost: (reason: string) => void,
-    intervalMs: number = LEASE_HEARTBEAT_INTERVAL_MS,
+    intervalOrAcquisition: number | LeaseAcquisition = LEASE_HEARTBEAT_INTERVAL_MS,
 ): LeaseHeartbeat {
+    const intervalMs =
+        typeof intervalOrAcquisition === "number"
+            ? intervalOrAcquisition
+            : LEASE_HEARTBEAT_INTERVAL_MS;
+    const acquisition =
+        typeof intervalOrAcquisition === "number" ? undefined : intervalOrAcquisition;
     let lost = false;
-    let lastConfirmedAt = Date.now();
+    let expectedGeneration = acquisition?.generation ?? getLeaseGeneration(db, leaseKey);
+    let lastConfirmedAt = acquisition?.acquiredAt ?? Date.now();
     const declareLost = (reason: string): void => {
         if (lost) return;
         lost = true;
@@ -206,8 +259,22 @@ export function startLeaseHeartbeat(
         try {
             // Continuous ownership: renewLease keeps it if still ours. This is
             // the always-safe path — we never lost the lease.
-            if (renewLease(db, holderId, leaseKey)) {
+            if (
+                renewLease(
+                    db,
+                    holderId,
+                    leaseKey,
+                    expectedGeneration === null ? undefined : expectedGeneration,
+                )
+            ) {
                 lastConfirmedAt = Date.now();
+                return;
+            }
+            if (
+                expectedGeneration !== null &&
+                getLeaseGeneration(db, leaseKey) !== expectedGeneration
+            ) {
+                declareLost("lease generation changed — another holder acquired it");
                 return;
             }
             // renewLease failed → we are no longer the recorded holder OR the
@@ -225,7 +292,13 @@ export function startLeaseHeartbeat(
             // reclaim an expired-but-free lease after only a short gap (our own
             // delayed beat); returns false only when a different holder is
             // actively in possession.
-            if (acquireLease(db, holderId, leaseKey)) {
+            const reacquired = acquireLeaseWithAcquisition(db, holderId, leaseKey);
+            if (reacquired) {
+                if (expectedGeneration !== null && reacquired.generation !== expectedGeneration) {
+                    declareLost("lease generation changed during reacquisition");
+                    return;
+                }
+                expectedGeneration = reacquired.generation;
                 lastConfirmedAt = Date.now();
                 return;
             }

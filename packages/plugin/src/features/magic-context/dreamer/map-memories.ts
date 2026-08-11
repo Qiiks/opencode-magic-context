@@ -20,7 +20,7 @@ import {
     recordMemoryMapping,
 } from "../memory";
 import { recordChildInvocation } from "../subagent-token-capture";
-import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
+import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
 import {
     buildMapMemoriesPrompt,
@@ -67,6 +67,7 @@ export interface MapMemoriesArgs {
     holderId: string;
     leaseKey: string;
     deadline: number;
+    leaseAcquisition?: LeaseAcquisition;
     model?: string;
     fallbackModels?: readonly string[];
     moduleRoute?: DreamerModuleRoute;
@@ -122,8 +123,12 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
     result.remaining = inputs.length;
 
     const abortController = new AbortController();
-    const heartbeat = startLeaseHeartbeat(args.db, args.holderId, args.leaseKey, () =>
-        abortController.abort(),
+    const heartbeat = startLeaseHeartbeat(
+        args.db,
+        args.holderId,
+        args.leaseKey,
+        () => abortController.abort(),
+        args.leaseAcquisition,
     );
 
     try {

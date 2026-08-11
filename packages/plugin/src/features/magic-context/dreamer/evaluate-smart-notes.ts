@@ -25,7 +25,7 @@ import {
 import type { SmartNoteCheckNote } from "../smart-notes/types";
 import { getPendingSmartNotes, markNoteChecked, markNoteReady } from "../storage-notes";
 import { recordChildInvocation } from "../subagent-token-capture";
-import { peekLeaseHolderAndExpiry, startLeaseHeartbeat } from "./lease";
+import { type LeaseAcquisition, peekLeaseHolderAndExpiry, startLeaseHeartbeat } from "./lease";
 
 export interface EvaluateSmartNotesArgs {
     db: Database;
@@ -37,6 +37,7 @@ export interface EvaluateSmartNotesArgs {
     /** Keyed lease this task holds (Dreamer v2: per-project evaluate-smart-notes domain). */
     leaseKey: string;
     deadline: number;
+    leaseAcquisition?: LeaseAcquisition;
     model?: string;
     fallbackModels?: readonly string[];
     /** When true, authoring-compiled provider conditions are owned by retina. */
@@ -111,12 +112,18 @@ export async function evaluateSmartNotes(
             throw new Error(`Dream lease lost during smart-notes ${phase}`);
         }
     };
-    const heartbeat = startLeaseHeartbeat(args.db, args.holderId, args.leaseKey, () => {
-        leaseLost = true;
-        leaseAbortController.abort(new Error("Dream lease lost during smart notes"));
-        log("[dreamer] smart notes: lease lost — aborting");
-        args.onLeaseLost?.("smart notes");
-    });
+    const heartbeat = startLeaseHeartbeat(
+        args.db,
+        args.holderId,
+        args.leaseKey,
+        () => {
+            leaseLost = true;
+            leaseAbortController.abort(new Error("Dream lease lost during smart notes"));
+            log("[dreamer] smart notes: lease lost — aborting");
+            args.onLeaseLost?.("smart notes");
+        },
+        args.leaseAcquisition,
+    );
 
     let surfaced = 0;
     let didWork = false;
