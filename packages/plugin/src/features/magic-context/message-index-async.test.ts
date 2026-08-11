@@ -3,6 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 
 import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
+import { BOOT_QUIET_MS, setBootQuietPeriodForTests } from "../../plugin/boot-quiet";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { getDirtyIndexFloor } from "./message-index";
@@ -112,6 +113,7 @@ describe("message-index-async", () => {
     });
 
     afterEach(() => {
+        setBootQuietPeriodForTests(null);
         closeQuietly(db);
         __resetMessageIndexAsyncForTests();
     });
@@ -354,6 +356,27 @@ describe("message-index-async", () => {
         expect(countMessageRows(db, "ses-clear", "m-1")).toBe(0);
         expect(countMessageRows(db, "ses-clear", "m-2")).toBe(1);
         expect(isSessionReconciled("ses-clear")).toBe(true);
+    });
+
+    it("rebuilds when removal overtakes a boot-quiet reconciliation", async () => {
+        const sessionId = "ses-boot-clear";
+        const surviving = [message("m-survivor", 1, "surviving searchable bytes")];
+        let reads = 0;
+        const readSurviving = () => {
+            reads++;
+            return surviving;
+        };
+        setBootQuietPeriodForTests(Date.now() - BOOT_QUIET_MS + 20);
+
+        scheduleReconciliation(db, sessionId, readSurviving);
+        scheduleClearAndReindex(db, sessionId, readSurviving);
+        expect(isSessionReconciled(sessionId)).toBe(false);
+
+        await wait(80);
+
+        expect(reads).toBe(2);
+        expect(countMessageRows(db, sessionId, "m-survivor")).toBe(1);
+        expect(isSessionReconciled(sessionId)).toBe(true);
     });
 
     it("catches indexing errors without propagating", async () => {
