@@ -155,8 +155,9 @@ pub struct SelectionContext {
     /// The protected-recent window: items with `ordinal > protected_cutoff_ordinal`
     /// are never emergency-evicted (0 = protect nothing).
     pub protected_cutoff_ordinal: u64,
-    /// The two-pass watermark: tool items with `ordinal <= last_execute_ordinal` are
-    /// age-drop candidates (0 = none).
+    /// The frozen two-pass watermark: tool items with `ordinal <= last_execute_ordinal`
+    /// may join the next riding/force batch (0 = none). It advances only after that
+    /// batch is applied, so execute-band residency cannot age in one new arc per pass.
     pub last_execute_ordinal: u64,
     /// True only for a scheduler execute caused by a context-pressure threshold crossing.
     pub scheduler_pressure_execute: bool,
@@ -672,10 +673,15 @@ fn select_supersession(
     intents
 }
 
+fn two_pass_batch_can_apply(ctx: &SelectionContext) -> bool {
+    ctx.scheduler_pressure_execute
+        && (ctx.pass_already_busting || ctx.pass_class == PassClass::EmergencyForce)
+}
+
 /// 1.4 Age-based two-pass: tool arcs whose age (ToolCall ordinal) is at/under the
 /// last-execute watermark. Add-only (the watermark advances forward). Returns arc ids.
 fn select_two_pass(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<String> {
-    if !ctx.scheduler_pressure_execute || ctx.last_execute_ordinal == 0 {
+    if !two_pass_batch_can_apply(ctx) || ctx.last_execute_ordinal == 0 {
         return HashSet::new();
     }
     let newest_todowrite = arcs
@@ -848,6 +854,15 @@ fn select_emergency(
     selected
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct SelectionOutcome {
+    pub decisions: Vec<ReductionDecision>,
+    /// The pressure pass was already busting, or was in the force band, so the age
+    /// batch had an application opportunity. Empty opportunities still advance the
+    /// watermark so future arcs can age into a later batch.
+    pub two_pass_batch_can_apply: bool,
+}
+
 /// Produce the full reduction-decision set for this pass. PURE + deterministic (see
 /// the module-level docs for the invariants). Empty on a defer pass (the mechanics
 /// replay the already-frozen set).
@@ -857,10 +872,20 @@ pub fn select_reductions(
     ctx: &SelectionContext,
     cfg: &SelectionConfig,
 ) -> Vec<ReductionDecision> {
+    select_reductions_with_outcome(items, frozen_keys, ctx, cfg).decisions
+}
+
+pub(crate) fn select_reductions_with_outcome(
+    items: &[SelItem],
+    frozen_keys: &HashSet<String>,
+    ctx: &SelectionContext,
+    cfg: &SelectionConfig,
+) -> SelectionOutcome {
     if ctx.pass_class == PassClass::Defer {
-        return Vec::new();
+        return SelectionOutcome::default();
     }
 
+    let two_pass_batch_can_apply = two_pass_batch_can_apply(ctx);
     let live_ids: HashSet<String> = items
         .iter()
         .filter(|item| {
@@ -903,11 +928,15 @@ pub fn select_reductions(
 
     // Per-arc reduction intents (arc_id → shape), assembled in TS precedence order.
     let mut arc_shapes: HashMap<String, ArcShape> = HashMap::new();
+    let two_pass_arc_ids = select_two_pass(&active_arcs, ctx);
 
     match ctx.pass_class {
         PassClass::EmergencyForce => {
-            // Emergency owns age selection, while supersession may ride the canonical
-            // force-band discriminant below. fixedFloor accounting sums ALL active arcs.
+            // The force-band edge admits a waiting age batch without changing emergency's
+            // own candidate accounting or tiered selection.
+            for arc_id in &two_pass_arc_ids {
+                arc_shapes.insert(arc_id.clone(), ArcShape::FullDrop);
+            }
             let all_active_reclaim: f64 = active_arcs
                 .iter()
                 .map(|a| bytes_to_tokens(a.reclaim_bytes()))
@@ -930,8 +959,8 @@ pub fn select_reductions(
         PassClass::Execute => {
             // Order = two-pass (drop) → control-plane (drop) → edit (edit_marker).
             // drop wins: a later edit_marker never overrides an assigned drop.
-            for arc_id in select_two_pass(&active_arcs, ctx) {
-                arc_shapes.insert(arc_id, ArcShape::FullDrop);
+            for arc_id in &two_pass_arc_ids {
+                arc_shapes.insert(arc_id.clone(), ArcShape::FullDrop);
             }
             // Supersession is deferred work: ordinary execute-band pressure cannot
             // authorize a rewrite, so the entire pending set waits for another bust.
@@ -1016,7 +1045,10 @@ pub fn select_reductions(
 
     // Deterministic merge: exactly one decision per target (drop > edit_marker >
     // skeleton), stable output order (by target_id).
-    dedupe_and_sort(out)
+    SelectionOutcome {
+        decisions: dedupe_and_sort(out),
+        two_pass_batch_can_apply,
+    }
 }
 
 /// Collapse to one decision per target_id (drop beats edit_marker beats skeleton) and
@@ -1283,6 +1315,8 @@ mod tests {
         protected_cutoff_ordinal: u64,
         last_execute_ordinal: u64,
         scheduler_pressure_execute: bool,
+        #[serde(default)]
+        pass_already_busting: bool,
         prior_input_sample: f64,
         has_prior_drop: bool,
         agent_drop_ids: Vec<String>,
@@ -1414,7 +1448,7 @@ mod tests {
                 agent_drop_ids: case.ctx.agent_drop_ids.clone(),
                 agent_drop_command_ids: HashMap::new(),
                 first_applied_agent_drop_ids: HashSet::new(),
-                pass_already_busting: case.smart_drops,
+                pass_already_busting: case.smart_drops || case.ctx.pass_already_busting,
                 protected_block_ids: HashSet::new(),
             };
             let cfg = SelectionConfig {
@@ -1444,7 +1478,7 @@ mod tests {
     // --- CK-model unit tests (no TS equivalent) ---
 
     #[test]
-    fn age_reclaim_requires_scheduler_pressure_even_on_an_existing_bust() {
+    fn age_reclaim_requires_both_scheduler_pressure_and_a_ride() {
         let mut result = tool_result("c1", 1, "bash", 2_000);
         result.token_count = Some(300);
         let items = vec![
@@ -1453,19 +1487,59 @@ mod tests {
         ];
         let mut ctx = base_ctx(PassClass::Execute);
         ctx.last_execute_ordinal = 1;
+
+        let level_only = select_reductions_with_outcome(
+            &items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig::default(),
+        );
+        assert!(level_only.decisions.is_empty());
+        assert!(!level_only.two_pass_batch_can_apply);
+
         ctx.pass_already_busting = true;
         ctx.scheduler_pressure_execute = false;
-
-        assert!(
-            select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default(),)
-                .is_empty()
+        let ride_only = select_reductions_with_outcome(
+            &items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig::default(),
         );
+        assert!(ride_only.decisions.is_empty());
+        assert!(!ride_only.two_pass_batch_can_apply);
 
         ctx.scheduler_pressure_execute = true;
-        assert!(
-            !select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default(),)
-                .is_empty()
+        let admitted = select_reductions_with_outcome(
+            &items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig::default(),
         );
+        assert_eq!(admitted.decisions.len(), 2);
+        assert!(admitted.two_pass_batch_can_apply);
+    }
+
+    #[test]
+    fn force_band_applies_waiting_two_pass_batch_without_a_ride() {
+        let mut result = tool_result("c1", 1, "read", 2_000);
+        result.token_count = Some(300);
+        let items = vec![
+            tool_call("c1", 1, "read", serde_json::json!({"path":"a.txt"}), 50),
+            result,
+        ];
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.last_execute_ordinal = 1;
+        ctx.scheduler_pressure_execute = true;
+        assert!(!ctx.pass_already_busting);
+
+        let admitted = select_reductions_with_outcome(
+            &items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig::default(),
+        );
+        assert_eq!(admitted.decisions.len(), 2);
+        assert!(admitted.two_pass_batch_can_apply);
     }
 
     #[test]
@@ -1661,6 +1735,7 @@ mod tests {
         }
         let mut ctx = base_ctx(PassClass::Execute);
         ctx.last_execute_ordinal = 2; // both arcs at/under watermark
+        ctx.pass_already_busting = true;
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         let arcs = arc_decisions(&items, &out);
         assert_eq!(
@@ -1684,6 +1759,7 @@ mod tests {
         ];
         let mut ctx = base_ctx(PassClass::Execute);
         ctx.last_execute_ordinal = 2;
+        ctx.pass_already_busting = true;
         let frozen: HashSet<String> = [result_block_id("c1")].into_iter().collect();
         let out = select_reductions(&items, &frozen, &ctx, &SelectionConfig::default());
         assert!(
@@ -1707,6 +1783,7 @@ mod tests {
         let protected = result_block_id("c1");
         let mut ctx = base_ctx(PassClass::Execute);
         ctx.last_execute_ordinal = 2;
+        ctx.pass_already_busting = true;
         ctx.agent_drop_ids = vec![protected.clone()];
         ctx.protected_block_ids.insert(protected.clone());
 
@@ -1756,6 +1833,7 @@ mod tests {
         }
         let mut ctx = base_ctx(PassClass::Execute);
         ctx.last_execute_ordinal = 22;
+        ctx.pass_already_busting = true;
 
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         assert!(
@@ -1811,6 +1889,7 @@ mod tests {
         }
         let mut ctx = base_ctx(PassClass::Execute);
         ctx.last_execute_ordinal = 22;
+        ctx.pass_already_busting = true;
 
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         assert!(
@@ -1866,6 +1945,7 @@ mod tests {
         ];
         let mut ctx = base_ctx(PassClass::Execute);
         ctx.last_execute_ordinal = 2;
+        ctx.pass_already_busting = true;
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         let arcs = arc_decisions(&items, &out);
         assert_eq!(arcs.get("turn1#0").map(String::as_str), Some("drop"));
@@ -1898,6 +1978,7 @@ mod tests {
         }
         let mut ctx = base_ctx(PassClass::Execute);
         ctx.last_execute_ordinal = 22; // all arcs are drop candidates
+        ctx.pass_already_busting = true;
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         let call_kind = |arc: &str| -> String {
             out.iter()
@@ -1935,6 +2016,7 @@ mod tests {
         ];
         let mut ctx = base_ctx(PassClass::Execute);
         ctx.last_execute_ordinal = 1; // c1 under watermark → two-pass drop
+        ctx.pass_already_busting = true;
         let out = select_reductions(
             &items,
             &HashSet::new(),

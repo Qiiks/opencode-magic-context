@@ -864,6 +864,7 @@
       "protected_cutoff_ordinal": 0,
       "last_execute_ordinal": 3,
       "scheduler_pressure_execute": true,
+      "pass_already_busting": true,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -941,6 +942,7 @@
       "protected_cutoff_ordinal": 0,
       "last_execute_ordinal": 2,
       "scheduler_pressure_execute": true,
+      "pass_already_busting": true,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -1016,6 +1018,7 @@
       "protected_cutoff_ordinal": 0,
       "last_execute_ordinal": 2,
       "scheduler_pressure_execute": true,
+      "pass_already_busting": true,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []

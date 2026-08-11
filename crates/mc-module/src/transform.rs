@@ -34,8 +34,8 @@ use crate::scheduler::{
     SchedulerConfig, SchedulerInputs, SessionMeta, TailState,
 };
 use crate::selection::{
-    filter_reasoning_ineligible_decisions, select_reductions, PassClass, SelItem, SelKind,
-    SelectionConfig, SelectionContext,
+    filter_reasoning_ineligible_decisions, select_reductions_with_outcome, PassClass, SelItem,
+    SelKind, SelectionConfig, SelectionContext, SelectionOutcome,
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
@@ -2956,7 +2956,7 @@ fn apply_once(
             timings.emergency_reasoning_exclusions = excluded_arcs;
         }
     }
-    let selected_reductions = if producer_gate {
+    let selection_outcome = if producer_gate {
         let frozen = frozen_red_targets(&loaded.core);
         // No per-request gate here: producer_gate already requires
         // tail_reclaim_enabled, which is the profile default. Gating again on the
@@ -2979,7 +2979,7 @@ fn apply_once(
             .filter(|drop| drop.command_first_applied_at_ms.is_some())
             .map(|drop| drop.target_id.clone())
             .collect::<HashSet<_>>();
-        select_reductions(
+        select_reductions_with_outcome(
             &tail_for_selection,
             &frozen,
             &SelectionContext {
@@ -3011,9 +3011,11 @@ fn apply_once(
             },
         )
     } else {
-        Vec::new()
+        SelectionOutcome::default()
     };
     timings.selection = elapsed_ms(selection_started_at);
+    let selected_reductions = selection_outcome.decisions;
+    let two_pass_batch_can_apply = selection_outcome.two_pass_batch_can_apply;
     #[cfg(test)]
     let selected_reductions = if ctx.injected_reductions.is_empty() {
         selected_reductions
@@ -3874,12 +3876,11 @@ fn apply_once(
     }
     timings.compose_m0m1 = elapsed_ms(compose_m0m1_started_at);
 
-    // The two-pass watermark advances on every genuine pressure execute, even if the
-    // sweep selected nothing. TTL/model/epoch folds and low-usage refresh executes do not
-    // move it: they may drain queued work, but are not age-reclaim cadence. Held back under
-    // reconcile because the watermark may be stale-high against a store about to be re-cut.
-    let pressure_execute = tail_reclaim_enabled && scheduler_outcome.pressure_execute;
-    if pressure_execute && !loaded.core.reconcile_pending {
+    // Advance whenever a pressure pass allowed the age batch to apply, even if it selected
+    // no reductions. Ordinary execute-band passes that are not already changing provider-visible
+    // bytes leave the watermark frozen; an allowed empty batch records the current tail so later
+    // arcs can age into a future batch.
+    if two_pass_batch_can_apply && !loaded.core.reconcile_pending {
         meta.last_execute_ordinal = tail_for_selection
             .iter()
             .map(|item| item.ordinal)
@@ -12282,6 +12283,16 @@ pub(crate) mod tests {
         );
         let first_bytes = serde_json::to_vec(&first.ck_messages).unwrap();
 
+        // Reset only the age watermark so this test remains about the emergency selector's
+        // same-sample latch. The first force pass advances the age watermark; without this
+        // reset, the second pass could legitimately select the emergency-reserved newer arc
+        // through the separate two-pass selector.
+        let loaded = s.load("subagent").unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.last_execute_ordinal = 0;
+        s.commit("subagent", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+
         let second = transform(&s, &request, &context).unwrap();
         let second_red = s
             .load("subagent")
@@ -12528,7 +12539,9 @@ pub(crate) mod tests {
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
             .unwrap();
-        let boot_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 90, 100);
+        let request = req("ses", "cfg0", vec![item("a", 1, "raw")]);
+        let boot_req = with_usage(request.clone(), 10, 100);
+        let execute_req = with_usage(request, 70, 100);
         let boot = run(&s, &boot_req, &spine());
         assert_eq!(boot.action, "HARD");
         assert!(s.load("ses").unwrap().meta.last_todo_state.is_none());
@@ -12536,19 +12549,19 @@ pub(crate) mod tests {
         let before_native = opencode_native_bytes(&boot, "ses");
         let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
         ctx.observed_last_response_at_ms = Some(0);
-        let execute = transform(&s, &boot_req, &ctx).unwrap();
-        // A zero-drop execute is byte-identical (no bust) but MAY commit metadata: the
-        // two-pass watermark stamps this tail as the next execute's candidate set.
+        let execute = transform(&s, &execute_req, &ctx).unwrap();
+        // A zero-drop execute is byte-identical and cannot move the age watermark. A
+        // pressure level is not an application edge, so residency alone remains silent.
         assert_eq!(execute.action, "SOFT+");
         assert_eq!(serde_json::to_vec(&execute.ck_messages).unwrap(), before);
         assert_eq!(opencode_native_bytes(&execute, "ses"), before_native);
         let meta = s.load("ses").unwrap().meta;
         assert_eq!(
-            meta.last_execute_ordinal, 1,
-            "zero-drop execute still advances the two-pass watermark"
+            meta.last_execute_ordinal, 0,
+            "zero-drop execute must keep the two-pass watermark frozen"
         );
         // And the pass after it, with an unchanged tail, is a true no-write defer.
-        let again = transform(&s, &boot_req, &ctx).unwrap();
+        let again = transform(&s, &execute_req, &ctx).unwrap();
         assert!(!again.committed);
         assert_eq!(serde_json::to_vec(&again.ck_messages).unwrap(), before);
     }
@@ -12744,56 +12757,274 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn zero_drop_execute_watermark_ages_arcs_into_next_execute() {
+    fn band_resident_two_pass_waits_byte_identically_then_batches_on_fold_bust() {
+        const CONVEYOR_PASSES: usize = 3;
+        const FROZEN_WATERMARK: u64 = 5;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reference_dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let reference = store(reference_dir.path());
+        for target in [&s, &reference] {
+            target
+                .replace_compartments("two-pass-conveyor", &[comp(1, 1, 1, "a", "SUMMARY")])
+                .unwrap();
+        }
+        let mut messages = vec![
+            item("a", 1, "covered head"),
+            assistant_tool_call("old-call-1", 2, "old-1"),
+            tool_result("old-result-1", 3, "old-1", "eligible output one"),
+            assistant_tool_call("old-call-2", 4, "old-2"),
+            tool_result("old-result-2", 5, "old-2", "eligible output two"),
+            item("tail", 6, "stable tail"),
+        ];
+        let mut context = pctx("git:proj", "/nonexistent-docs", 0);
+        context.cache_ttl = "never".to_string();
+        let boot_request = with_usage(req("two-pass-conveyor", "cfg0", messages.clone()), 10, 100);
+        let boot = transform(&s, &boot_request, &context).unwrap();
+        let reference_boot = transform(&reference, &boot_request, &context).unwrap();
+        assert_eq!(boot.action, "HARD");
+        assert_eq!(
+            canonical_output(boot.messages()),
+            canonical_output(reference_boot.messages())
+        );
+        for target in [&s, &reference] {
+            let loaded = target.load("two-pass-conveyor").unwrap();
+            let mut meta = loaded.meta.clone();
+            meta.last_execute_ordinal = FROZEN_WATERMARK;
+            target
+                .commit("two-pass-conveyor", loaded.row_version, &loaded.core, &meta)
+                .unwrap();
+        }
+
+        let mut next_ordinal = 7u64;
+        let mut previous_bytes = canonical_output(boot.messages());
+        for pass in 1..=CONVEYOR_PASSES {
+            let call_id = format!("new-{pass}");
+            messages.push(assistant_tool_call(
+                &format!("new-call-{pass}"),
+                next_ordinal,
+                &call_id,
+            ));
+            next_ordinal += 1;
+            messages.push(tool_result(
+                &format!("new-result-{pass}"),
+                next_ordinal,
+                &call_id,
+                &format!("new output {pass}"),
+            ));
+            next_ordinal += 1;
+
+            let execute = transform(
+                &s,
+                &with_usage(req("two-pass-conveyor", "cfg0", messages.clone()), 70, 100),
+                &context,
+            )
+            .unwrap();
+            let expected = transform(
+                &reference,
+                &with_usage(req("two-pass-conveyor", "cfg0", messages.clone()), 10, 100),
+                &context,
+            )
+            .unwrap();
+            let execute_bytes = canonical_output(execute.messages());
+            assert_eq!(
+                execute_bytes,
+                canonical_output(expected.messages()),
+                "conveyor pass {pass} must render the unreduced byte identity"
+            );
+            assert_eq!(
+                &execute_bytes[..previous_bytes.len()],
+                previous_bytes.as_slice(),
+                "conveyor pass {pass} must preserve every previously cached byte"
+            );
+            let loaded = s.load("two-pass-conveyor").unwrap();
+            assert_eq!(
+                loaded.meta.last_execute_ordinal, FROZEN_WATERMARK,
+                "conveyor pass {pass} must not advance the frozen watermark"
+            );
+            assert!(
+                loaded
+                    .core
+                    .frozen_units
+                    .iter()
+                    .all(|unit| !unit.key.starts_with("red:")),
+                "conveyor pass {pass} must not first-apply an age decision"
+            );
+            previous_bytes = execute_bytes;
+        }
+
+        let loaded = s.load("two-pass-conveyor").unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.soft_refresh_pending = true;
+        s.commit("two-pass-conveyor", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let riding = transform(
+            &s,
+            &with_usage(req("two-pass-conveyor", "cfg0", messages.clone()), 70, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(riding.action, "SOFT");
+        assert_ne!(canonical_output(riding.messages()), previous_bytes);
+        let loaded = s.load("two-pass-conveyor").unwrap();
+        for mid in ["old-call-1", "old-result-1", "old-call-2", "old-result-2"] {
+            assert!(
+                frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_some(),
+                "the whole watermark-eligible batch must apply on the riding pass"
+            );
+        }
+        for pass in 1..=CONVEYOR_PASSES {
+            for mid in [format!("new-call-{pass}"), format!("new-result-{pass}")] {
+                assert!(
+                    frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_none(),
+                    "arcs newer than the frozen watermark wait for a later batch"
+                );
+            }
+        }
+        assert_eq!(
+            loaded.meta.last_execute_ordinal,
+            next_ordinal - 1,
+            "the applied batch advances the watermark once to the riding pass tail"
+        );
+
+        let riding_bytes = canonical_output(riding.messages());
+        let replay = transform(
+            &s,
+            &with_usage(req("two-pass-conveyor", "cfg0", messages), 10, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(canonical_output(replay.messages()), riding_bytes);
+        assert_eq!(
+            s.load("two-pass-conveyor")
+                .unwrap()
+                .meta
+                .last_execute_ordinal,
+            next_ordinal - 1,
+            "replay must not advance the applied watermark again"
+        );
+    }
+
+    #[test]
+    fn empty_two_pass_ride_advances_watermark_for_future_arc() {
+        const SESSION: &str = "two-pass-empty-ride";
+
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        // Two-pass aging requires a FOLDED session: a new reduction can only freeze on
-        // a SOFT pass, and the classifier admits a SOFT only when a boundary is present.
-        // Seed one compartment covering ordinal 1 and fold it, then drive executes over
-        // the post-coverage tail.
-        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+        s.replace_compartments(SESSION, &[comp(1, 1, 1, "a", "SUMMARY")])
             .unwrap();
-        let large_output = "large tool output ".repeat(400);
-        let msgs = vec![
+        let mut messages = vec![
             item("a", 1, "covered head"),
-            assistant_tool_call("m1", 2, "call_age"),
-            tool_result("m2", 3, "call_age", &large_output),
-            item("m9", 9, "newest user text"),
+            assistant_tool_call("old-call", 2, "old"),
+            tool_result("old-result", 3, "old", "old eligible output"),
+            item("tail", 4, "stable tail"),
         ];
-        let boot = run(&s, &req("ses", "cfg0", msgs.clone()), &spine());
+        let mut context = pctx("git:proj", "/nonexistent-docs", 0);
+        context.cache_ttl = "never".to_string();
+        let boot = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
+            &context,
+        )
+        .unwrap();
         assert_eq!(boot.action, "HARD");
-        // Execute pass 1 over the completed tool arc: nothing to drop yet (the arc is
-        // newer than the 0 watermark), but the watermark must stamp its ordinal.
-        // 70% usage: above the execute threshold (65) but below Force85, so the
-        // scheduler classes the pass Execute and the two-pass selector runs.
-        let exec_req = with_usage(req("ses", "cfg0", msgs.clone()), 70, 100);
-        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        ctx.observed_last_response_at_ms = Some(0);
-        let _ = transform(&s, &exec_req, &ctx).unwrap();
-        let after_first = s.load("ses").unwrap();
-        assert!(
-            after_first
+
+        let loaded = s.load(SESSION).unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.last_execute_ordinal = 3;
+        meta.soft_refresh_pending = true;
+        s.commit(SESSION, loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let drained = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(drained.action, "SOFT");
+        let loaded = s.load(SESSION).unwrap();
+        for mid in ["old-call", "old-result"] {
+            assert!(frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_some());
+        }
+        assert_eq!(loaded.meta.last_execute_ordinal, 4);
+        let drained_reduction_count = loaded
+            .core
+            .frozen_units
+            .iter()
+            .filter(|unit| unit.key.starts_with("red:"))
+            .count();
+
+        messages.push(assistant_tool_call("fresh-call", 5, "fresh"));
+        messages.push(tool_result(
+            "fresh-result",
+            6,
+            "fresh",
+            "future eligible output",
+        ));
+        let minted = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
+            &context,
+        )
+        .unwrap();
+        let minted_bytes = canonical_output(minted.messages());
+        assert_eq!(s.load(SESSION).unwrap().meta.last_execute_ordinal, 4);
+
+        let loaded = s.load(SESSION).unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.soft_refresh_pending = true;
+        s.commit(SESSION, loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let empty_ride = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(empty_ride.action, "SOFT");
+        assert_eq!(
+            canonical_output(empty_ride.messages()),
+            minted_bytes,
+            "an empty age batch must add no provider-visible bytes"
+        );
+        let loaded = s.load(SESSION).unwrap();
+        assert_eq!(
+            loaded.meta.last_execute_ordinal, 6,
+            "the empty riding opportunity must advance over the fresh arc"
+        );
+        assert_eq!(
+            loaded
                 .core
                 .frozen_units
                 .iter()
-                .all(|unit| !unit.key.starts_with("red:m1#") && !unit.key.starts_with("red:m2#")),
-            "first execute has no candidates old enough to drop"
+                .filter(|unit| unit.key.starts_with("red:"))
+                .count(),
+            drained_reduction_count,
+            "the empty ride must not freeze a reduction"
         );
-        assert!(
-            after_first.meta.last_execute_ordinal >= 9,
-            "watermark stamped from the execute tail"
-        );
-        // Execute pass 2: the same arc is now at-or-below the watermark → age-drops.
-        let _ = transform(&s, &exec_req, &ctx).unwrap();
-        let after_second = s.load("ses").unwrap();
-        assert!(
-            after_second
-                .core
-                .frozen_units
-                .iter()
-                .any(|unit| unit.key.starts_with("red:m1#") || unit.key.starts_with("red:m2#")),
-            "completed arc aged in by the prior execute's watermark must freeze a drop"
-        );
+        for mid in ["fresh-call", "fresh-result"] {
+            assert!(frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_none());
+        }
+
+        let mut meta = loaded.meta.clone();
+        meta.soft_refresh_pending = true;
+        s.commit(SESSION, loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let next_ride = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages), 70, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(next_ride.action, "SOFT");
+        let loaded = s.load(SESSION).unwrap();
+        for mid in ["fresh-call", "fresh-result"] {
+            assert!(
+                frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_some(),
+                "the arc crossed by the empty ride must freeze on the next ride"
+            );
+        }
     }
 
     #[test]
