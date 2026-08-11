@@ -2209,6 +2209,14 @@ fn apply_once(
             )));
         }
     }
+    let mut lineage_anchor_failure = false;
+    if let Err(detail) = validate_lineage_anchor(&loaded.meta, req, &projection) {
+        lineage_anchor_failure = true;
+        eprintln!(
+            "mc-module: lineage anchor validation failed closed for {}: {detail}",
+            req.session_id
+        );
+    }
     // Legacy sessions stored the CC latch before the generic surface latch existed.
     // Treat that old true value as the generic latch so an upgrade does not repeat a fold.
     let persisted_tagging_surface_active =
@@ -3130,27 +3138,10 @@ fn apply_once(
     }
     apply_scheduler_meta(&mut meta, &scheduler_outcome);
 
-    let soft_has_new_coverage = if matches!(plan, PassPlan::Soft)
-        && loaded.meta.anchor_block_id.is_some()
-        && compartment_seq_changed_since_meta
-    {
-        let compartments = store.load_compartments(&req.session_id)?;
-        coverage_ordinal_from_compartments(&compartments)? > loaded.meta.coverage_ordinal
-    } else {
-        false
-    };
-    let mut lineage_anchor_failure = false;
-    if matches!(plan, PassPlan::Hard | PassPlan::MigrateHard) || soft_has_new_coverage {
-        if let Err(detail) = validate_lineage_anchor(&loaded.meta, req, &projection) {
-            lineage_anchor_failure = true;
-            eprintln!(
-                "mc-module: lineage anchor validation failed closed for {}: {detail}",
-                req.session_id
-            );
-            core.reconcile_pending = true;
-            plan = PassPlan::Defer;
-            materialize_reason = Some("lineage_anchor_mismatch".to_string());
-        }
+    if lineage_anchor_failure {
+        core.reconcile_pending = true;
+        plan = PassPlan::Defer;
+        materialize_reason = Some("lineage_anchor_mismatch".to_string());
     }
 
     let is_bust_pass = !req.is_subagent
@@ -23601,6 +23592,67 @@ pub(crate) mod tests {
             outcome.is_ok(),
             "post-descent fold past the seam must not fence: {:?}",
             outcome.err()
+        );
+    }
+
+    #[test]
+    fn continued_lineage_stable_defer_rejects_mutated_anchor_after_post_seam_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_fake_compaction_prior(&store, "A");
+        let summary = continuation_summary("stable-seam");
+        let descent = fake_compaction_request(
+            "B",
+            "A",
+            2,
+            502,
+            true,
+            fake_compaction_messages("2026-08-06", &summary),
+        );
+        run(&store, &descent, &spine());
+        store
+            .append_compartments("B", &[comp(4, 12, 14, "successor-14", "successor work")])
+            .unwrap();
+
+        let follow_up_messages = vec![
+            wire_item(
+                "user",
+                "summary",
+                11,
+                &[
+                    "<system-reminder>Today's date: 2026-08-06</system-reminder>",
+                    &summary,
+                ],
+            ),
+            wire_item("assistant", "tail", 12, &["continued answer"]),
+            item("succ-13", 13, "successor turn thirteen"),
+            item("succ-14", 14, "successor turn fourteen"),
+        ];
+        let follow_up = req("B", "descent-cfg", follow_up_messages);
+        let intact = run(&store, &follow_up, &spine());
+        assert_eq!(intact.action, "SOFT+");
+        assert!(!intact.reconcile_pending);
+
+        let mut mutated = follow_up.clone();
+        mutated.messages[0].ck.content[1].kind = ck_wire::CkKind::Text {
+            text: continuation_summary("MUTATED"),
+        };
+        mutated.messages[0].ck.content[1].mark_modified();
+        let refused = run(&store, &mutated, &spine());
+        assert_eq!(refused.action, "SOFT+");
+        assert!(refused.reconcile_pending);
+        assert_eq!(
+            refused.materialize_reason.as_deref(),
+            Some("lineage_anchor_mismatch")
+        );
+        assert_eq!(
+            refused
+                .messages()
+                .iter()
+                .filter(|message| !message.meta.synthetic)
+                .count(),
+            mutated.messages.len(),
+            "a mutated continuation anchor must fail closed without trimming live input"
         );
     }
 

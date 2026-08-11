@@ -2175,6 +2175,12 @@ export function createRustModeTransform(
                 }
                 logStage(sessionId, "apply", applyStartedAt, timings);
                 const lkgSnapshotStartedAt = performance.now();
+                // When the response changes the served bytes, discard the previous last-known-good
+                // snapshot before scheduling the new capture. Otherwise, a transport failure on the
+                // next turn could replay obsolete output.
+                if (cacheBustingPass) {
+                    dropSlot(sessionId, "lkg_cache_bust_pending_capture");
+                }
                 // Reuse the wire-cache field snapshots for this input. Serialize the served
                 // response here, but defer hashing so LKG work does not block installing the result.
                 const capturePlan = prepareRustCapture(

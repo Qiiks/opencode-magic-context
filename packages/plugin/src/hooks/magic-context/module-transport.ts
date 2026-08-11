@@ -113,6 +113,23 @@ interface EnsuredRoute {
     generation: number;
 }
 
+export interface ModuleTransportGenerationChangedResult {
+    transport_status: "connection_generation_changed";
+    previous_generation: number;
+    current_generation: number;
+}
+
+export function isModuleTransportGenerationChangedResult(
+    value: unknown,
+): value is ModuleTransportGenerationChangedResult {
+    return (
+        isRecord(value) &&
+        value.transport_status === "connection_generation_changed" &&
+        typeof value.previous_generation === "number" &&
+        typeof value.current_generation === "number"
+    );
+}
+
 interface SerialLaneWaiter {
     sessionId: string;
     signal?: AbortSignal;
@@ -343,6 +360,8 @@ export class SubcModuleTransport {
             | "memory.set_classification";
         body: unknown;
         signal?: AbortSignal;
+        /** Do not retry after reconnecting; let the caller rebuild for the new connection. */
+        generationSensitive?: boolean;
         /** Producer-backed calls (dreamer.run_task) outlive the default transport budget. */
         timeoutMs?: number;
     }): Promise<unknown> {
@@ -388,11 +407,20 @@ export class SubcModuleTransport {
                     );
                 } catch (error) {
                     if (isConnectionFailure(error)) {
+                        const previousGeneration =
+                            ensuredRoute?.generation ?? this.connectionGeneration;
                         if (ensuredRoute) {
                             this.dropRoute(ensuredRoute.routeKey, ensuredRoute.route);
                             this.invalidateConnection(ensuredRoute.client);
                         } else {
                             this.invalidateConnection();
+                        }
+                        if (args.generationSensitive && !args.signal?.aborted) {
+                            return {
+                                transport_status: "connection_generation_changed",
+                                previous_generation: previousGeneration,
+                                current_generation: this.connectionGeneration,
+                            } satisfies ModuleTransportGenerationChangedResult;
                         }
                         // Retry once on a fresh connection generation before the caller enters its
                         // LKG/raw fallback ladder.

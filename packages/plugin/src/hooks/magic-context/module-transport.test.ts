@@ -293,6 +293,43 @@ describe("SubcModuleTransport", () => {
         expect(firstCloseCount).toBe(1);
     });
 
+    it("returns a typed generation change instead of retrying a sensitive body", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 100);
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        let connectionCount = 0;
+        const client = {
+            routeOpen: async () => route,
+            request: async () => {
+                throw new Error("client closed");
+            },
+            close: () => undefined,
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureConnected(): Promise<SubcClient>;
+        };
+        internals.ensureConnected = async () => {
+            connectionCount += 1;
+            internals.client = client;
+            return client;
+        };
+
+        await expect(
+            transport.call({
+                sessionId: "session-generation-sensitive",
+                projectRoot: "/workspace/project",
+                method: "state_sync",
+                body: { method: "state_sync", v: 1 },
+                generationSensitive: true,
+            }),
+        ).resolves.toEqual({
+            transport_status: "connection_generation_changed",
+            previous_generation: 0,
+            current_generation: 1,
+        });
+        expect(connectionCount).toBe(1);
+    });
+
     it("bounds a half-open route and stops after one fresh-connection retry", async () => {
         const timeoutMs = 30;
         const transport = new SubcModuleTransport(

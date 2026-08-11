@@ -50,6 +50,7 @@ import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import { resolveTodowriteAvailability } from "./ctx-reduce-availability";
+import { isModuleTransportGenerationChangedResult } from "./module-transport";
 import { MODULE_PAGE_MAX_BYTES, moduleRawBlockMappings, moduleWireBodyBytes } from "./module-wire";
 import {
     readRawSessionMessageOrdinalById,
@@ -1301,10 +1302,9 @@ export async function buildModuleStateSyncPayload(args: {
                   nowMs: args.pass.nowMs,
               })
         : [];
-    const userProfile =
-        includeUserProfile && profileChanged
-            ? getActiveUserMemories(args.pass.db).map((memory) => memory.content)
-            : [];
+    const userProfile = includeUserProfile
+        ? getActiveUserMemories(args.pass.db).map((memory) => memory.content)
+        : [];
     const memoryMutations =
         memoryMutationsChanged && args.pass.projectPath
             ? getMemoryMutationsForRenderByProjects(
@@ -1509,6 +1509,7 @@ export interface ModuleStateSyncClient {
             | "transform.nack";
         body: unknown;
         signal?: AbortSignal;
+        generationSensitive?: boolean;
     }): Promise<unknown>;
 }
 
@@ -1581,26 +1582,28 @@ export async function syncModuleState(args: {
 }): Promise<ModuleStateSyncResult> {
     let force = args.force;
     const adoption = args.options?.authoritySeqAdoption ?? { used: false };
-    let stateSyncDeltas =
-        args.options?.stateSyncDeltas ??
-        args.client.getCachedStateSyncCapabilities?.()?.state_sync_deltas;
-    if (stateSyncDeltas === undefined && args.client.stateSyncCapabilities) {
-        try {
-            stateSyncDeltas =
-                (
+    const resolveStateSyncDeltas = async (afterGenerationChange = false): Promise<boolean> => {
+        let capability = afterGenerationChange ? undefined : args.options?.stateSyncDeltas;
+        capability ??= args.client.getCachedStateSyncCapabilities?.()?.state_sync_deltas;
+        if (capability === undefined && args.client.stateSyncCapabilities) {
+            try {
+                capability = (
                     await args.client.stateSyncCapabilities({
                         sessionId: args.pass.sessionId,
                         projectRoot: args.projectRoot,
                     })
-                ).state_sync_deltas === true;
-        } catch {
-            // If the capability check fails, assume the module does not support
-            // state_sync_deltas and send the older payload format with its state-sync
-            // fields always present.
-            stateSyncDeltas = false;
+                ).state_sync_deltas;
+            } catch {
+                // If the capability check fails, assume the module does not support
+                // state_sync_deltas and send the older payload format with its state-sync
+                // fields always present.
+                capability = false;
+            }
         }
-    }
-    for (;;) {
+        return capability === true;
+    };
+    let stateSyncDeltas = await resolveStateSyncDeltas();
+    syncLoop: for (;;) {
         const payload = await buildModuleStateSyncPayload({
             state: args.state,
             pass: args.pass,
@@ -1627,7 +1630,14 @@ export async function syncModuleState(args: {
                         method: batch.method,
                         ...batch.params,
                     },
+                    generationSensitive: stateSyncDeltas,
                 });
+                if (isModuleTransportGenerationChangedResult(response)) {
+                    // The payload used the previous connection's capabilities. Re-probe the new
+                    // connection and rebuild before retrying because it may not support deltas.
+                    stateSyncDeltas = await resolveStateSyncDeltas(true);
+                    continue syncLoop;
+                }
                 if (
                     args.options?.authority === true &&
                     responseMemoriesSkipped(response) &&
