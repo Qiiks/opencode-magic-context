@@ -190,7 +190,8 @@ function corruptLastTagLeaf(dbPath: string): void {
             const headerAt = pageno === 1 ? 100 : 0;
             const pageType = buffer[headerAt];
             if (pageType === 0x0d) break; // leaf table page
-            if (pageType !== 0x05) throw new Error(`unexpected page type 0x${pageType.toString(16)}`);
+            if (pageType !== 0x05)
+                throw new Error(`unexpected page type 0x${pageType.toString(16)}`);
             // Interior table page: the rightmost child pointer lives at header offset 8.
             pageno = buffer.readUInt32BE(headerAt + 8);
         }
