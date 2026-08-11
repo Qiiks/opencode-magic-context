@@ -67,6 +67,7 @@ import {
 	findPiFallbackToolOwnerTags,
 	getActiveTagsBySession,
 	getActiveTagTokenAggregate,
+	getDroppedTagsByNumbers,
 	getHistorianFailureState,
 	getMaxDroppedTagNumber,
 	getOldestActiveUnprotectedToolTags,
@@ -4714,30 +4715,28 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// execute passes. Mirrors OpenCode's `applyFlushedStatuses` call
 	// at transform.ts:728.
 	//
-	// P0 perf: applyFlushedStatuses only ever mutates tags whose
-	// tag_number is in `targets`, so feed it just that slice instead
-	// of the whole session (~50k rows on long sessions). Without this
-	// pre-load it lazy-loads via getTagsBySession internally — exactly
-	// the full-table scan we eliminated in OpenCode's transform.
+	// Status replay only acts on dropped targets. Filter by both status and
+	// visible tag number in SQLite so active rows are not materialized merely to
+	// be discarded by applyFlushedStatuses.
 	const targetTagNumbers = [...targets.keys()];
 	const tGetTags = performance.now();
-	const flushedSliceTags = getTagsByNumbers(
+	const flushedDroppedTags = getDroppedTagsByNumbers(
 		args.db,
 		args.sessionId,
 		targetTagNumbers,
 	);
 	logTransformTiming(
 		args.sessionId,
-		"getTagsByNumbers",
+		"getDroppedTagsByNumbers",
 		tGetTags,
-		`targets=${targetTagNumbers.length} fetched=${flushedSliceTags.length}`,
+		`targets=${targetTagNumbers.length} fetched=${flushedDroppedTags.length}`,
 	);
 	const tFlushed = performance.now();
 	didMutateFromFlushedStatuses = applyFlushedStatuses(
 		args.sessionId,
 		args.db,
 		targets,
-		flushedSliceTags,
+		flushedDroppedTags,
 	);
 	logTransformTiming(args.sessionId, "applyFlushedStatuses", tFlushed);
 	logTransformTiming(args.sessionId, "batchFinalize:flushed", tFlushed);

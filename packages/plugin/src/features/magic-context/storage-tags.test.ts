@@ -8,6 +8,7 @@ import {
     findAdoptableFallbackTags,
     getActiveTagsBySession,
     getActiveTagTokenAggregate,
+    getDroppedTagsByNumbers,
     getMaxDroppedTagNumber,
     getOldestActiveUnprotectedToolTags,
     getTagById,
@@ -520,6 +521,70 @@ describe("storage-tags", () => {
 
             // Order matches by ORDER BY tag_number ASC, id ASC in both.
             expect(fromHelper).toEqual(fromFull);
+        });
+    });
+
+    describe("#given getDroppedTagsByNumbers", () => {
+        it("#when tagNumbers is empty #then returns no rows", () => {
+            db = makeMemoryDatabase();
+            insertTag(db, "ses-1", "msg-1", "message", 100, 1);
+
+            expect(getDroppedTagsByNumbers(db, "ses-1", [])).toEqual([]);
+        });
+
+        it("#when statuses and drop modes are mixed #then returns only targeted dropped rows", () => {
+            db = makeMemoryDatabase();
+            insertTag(db, "ses-1", "active-text", "message", 100, 1);
+            const droppedText = insertTag(db, "ses-1", "dropped-text", "message", 100, 2);
+            const fullTool = insertTag(db, "ses-1", "call-full", "tool", 100, 3);
+            const truncatedTool = insertTag(db, "ses-1", "call-truncated", "tool", 100, 4);
+            const editMarkerTool = insertTag(db, "ses-1", "call-edit", "tool", 100, 5);
+            const compacted = insertTag(db, "ses-1", "compacted", "message", 100, 6);
+            const nonTargetDropped = insertTag(
+                db,
+                "ses-1",
+                "non-target-dropped",
+                "message",
+                100,
+                7,
+            );
+            for (const tagNumber of [droppedText, fullTool, truncatedTool, editMarkerTool]) {
+                updateTagStatus(db, "ses-1", tagNumber, "dropped");
+            }
+            updateTagStatus(db, "ses-1", compacted, "compacted");
+            updateTagStatus(db, "ses-1", nonTargetDropped, "dropped");
+            updateTagDropMode(db, "ses-1", fullTool, "full");
+            updateTagDropMode(db, "ses-1", truncatedTool, "truncated");
+            updateTagDropMode(db, "ses-1", editMarkerTool, "edit_marker");
+
+            const rows = getDroppedTagsByNumbers(db, "ses-1", [1, 2, 3, 4, 5, 6]);
+
+            // This exact set makes the status predicate observable: removing
+            // `status = 'dropped'` leaks active tag 1 and compacted tag 6.
+            expect(rows.map((tag) => tag.tagNumber)).toEqual([2, 3, 4, 5]);
+            expect(rows.map((tag) => [tag.type, tag.dropMode])).toEqual([
+                ["message", "full"],
+                ["tool", "full"],
+                ["tool", "truncated"],
+                ["tool", "edit_marker"],
+            ]);
+            expect(rows.every((tag) => tag.status === "dropped")).toBe(true);
+        });
+
+        it("#when more than 900 numbers are requested #then chunks without returning active rows", () => {
+            db = makeMemoryDatabase();
+            for (let tagNumber = 1; tagNumber <= 1_001; tagNumber++) {
+                const id = insertTag(db, "ses-1", `msg-${tagNumber}`, "message", 10, tagNumber);
+                if (tagNumber % 2 === 0) {
+                    updateTagStatus(db, "ses-1", id, "dropped");
+                }
+            }
+            const requested = Array.from({ length: 1_001 }, (_, index) => index + 1);
+
+            const rows = getDroppedTagsByNumbers(db, "ses-1", requested);
+
+            expect(rows).toHaveLength(500);
+            expect(rows.every((tag) => tag.tagNumber % 2 === 0)).toBe(true);
         });
     });
 
