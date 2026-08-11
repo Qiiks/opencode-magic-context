@@ -317,11 +317,11 @@ fn read_claude_code_session_detail_uncached(
 ) -> Option<JsonlSessionDetail> {
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
-    let mut events = Vec::new();
+    let mut events_by_message_id = HashMap::new();
     let mut session_id = String::new();
     let mut cwd = String::new();
 
-    for line in reader.lines().map_while(Result::ok) {
+    for (line_index, line) in reader.lines().map_while(Result::ok).enumerate() {
         let Some(entry) = parse_json_line(&line) else {
             continue;
         };
@@ -334,12 +334,17 @@ fn read_claude_code_session_detail_uncached(
         if cwd.is_empty() {
             cwd = get_optional_string(&entry, "cwd").unwrap_or_default();
         }
-        events.push(event);
+        // Claude Code emits one assistant entry for each content block in an API
+        // message. The final block carries the message's final token usage.
+        events_by_message_id.insert(event.message_id.clone(), (line_index, event));
     }
 
-    if events.is_empty() {
+    if events_by_message_id.is_empty() {
         return None;
     }
+    let mut events: Vec<_> = events_by_message_id.into_values().collect();
+    events.sort_by_key(|(line_index, event)| (event.timestamp_ms, *line_index));
+    let events: Vec<_> = events.into_iter().map(|(_, event)| event).collect();
     if session_id.is_empty() {
         session_id = path
             .file_stem()
@@ -347,7 +352,6 @@ fn read_claude_code_session_detail_uncached(
             .unwrap_or_default()
             .to_string();
     }
-    events.sort_by_key(|event| event.timestamp_ms);
     let created = events
         .iter()
         .map(|event| event.timestamp_ms)
@@ -394,7 +398,8 @@ fn claude_code_event_from_entry(entry: &Value) -> Option<JsonlCacheEvent> {
         return None;
     }
     Some(JsonlCacheEvent {
-        message_id: get_optional_string(entry, "uuid")?,
+        message_id: get_optional_string(message, "id")
+            .or_else(|| get_optional_string(entry, "uuid"))?,
         session_id: get_optional_string(entry, "sessionId")?,
         timestamp_ms: parse_ts_ms(entry.get("timestamp"))?,
         input_tokens: input,
@@ -731,22 +736,29 @@ mod tests {
         let path = dir.path().join("-tmp-proj/session-1.jsonl");
         write_fixture(
             &path,
-            r#"{"type":"assistant","uuid":"cc-main-1","sessionId":"cc-session","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/proj","isSidechain":false,"message":{"model":"claude-sonnet-4-20250514","stop_reason":"end_turn","usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":25,"output_tokens":5}}}
-{"type":"assistant","uuid":"cc-side-1","sessionId":"cc-session","timestamp":"2026-01-01T00:00:01.000Z","cwd":"/tmp/proj","isSidechain":true,"message":{"model":"claude-sonnet-4-20250514","usage":{"input_tokens":1,"cache_read_input_tokens":2,"cache_creation_input_tokens":3,"output_tokens":4}}}
-{"type":"assistant","uuid":"cc-zero","sessionId":"cc-session","timestamp":"2026-01-01T00:00:02.000Z","cwd":"/tmp/proj","isSidechain":false,"message":{"model":"claude-sonnet-4-20250514","usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}
+            r#"{"type":"assistant","uuid":"cc-block-1","sessionId":"cc-session","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/proj","isSidechain":false,"message":{"id":"msg-shared","model":"claude-sonnet-4-20250514","usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":25,"output_tokens":5}}}
+{"type":"assistant","uuid":"cc-block-2","sessionId":"cc-session","timestamp":"2026-01-01T00:00:01.000Z","cwd":"/tmp/proj","isSidechain":false,"message":{"id":"msg-shared","model":"claude-sonnet-4-20250514","stop_reason":"end_turn","usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":25,"output_tokens":10}}}
+{"type":"assistant","uuid":"cc-main-2","sessionId":"cc-session","timestamp":"2026-01-01T00:00:02.000Z","cwd":"/tmp/proj","isSidechain":false,"message":{"id":"msg-bystander","model":"claude-sonnet-4-20250514","stop_reason":"end_turn","usage":{"input_tokens":3,"cache_read_input_tokens":4,"cache_creation_input_tokens":0,"output_tokens":2}}}
+{"type":"assistant","uuid":"cc-side-1","sessionId":"cc-session","timestamp":"2026-01-01T00:00:03.000Z","cwd":"/tmp/proj","isSidechain":true,"message":{"id":"msg-sidechain","model":"claude-sonnet-4-20250514","usage":{"input_tokens":1,"cache_read_input_tokens":2,"cache_creation_input_tokens":3,"output_tokens":4}}}
+{"type":"assistant","uuid":"cc-zero","sessionId":"cc-session","timestamp":"2026-01-01T00:00:04.000Z","cwd":"/tmp/proj","isSidechain":false,"message":{"id":"msg-zero","model":"claude-sonnet-4-20250514","usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}
 "#,
         );
 
         let detail = read_claude_code_session_detail(&path).unwrap();
         assert_eq!(detail.meta.session_id, "cc-session");
-        assert_eq!(detail.events.len(), 1);
-        let event = &detail.events[0];
-        assert_eq!(event.message_id, "cc-main-1");
-        assert_eq!(event.input_tokens, 10);
-        assert_eq!(event.cache_read, 100);
-        assert_eq!(event.cache_write, 25);
-        assert_eq!(event.total_tokens, 140);
-        assert_eq!(event.finish.as_deref(), Some("end_turn"));
+        assert_eq!(detail.events.len(), 2);
+
+        let shared = &detail.events[0];
+        assert_eq!(shared.message_id, "msg-shared");
+        assert_eq!(shared.input_tokens, 10);
+        assert_eq!(shared.cache_read, 100);
+        assert_eq!(shared.cache_write, 25);
+        assert_eq!(shared.total_tokens, 145);
+        assert_eq!(shared.finish.as_deref(), Some("end_turn"));
+
+        let bystander = &detail.events[1];
+        assert_eq!(bystander.message_id, "msg-bystander");
+        assert_eq!(bystander.total_tokens, 9);
     }
 
     #[test]
@@ -790,5 +802,6 @@ mod tests {
         let second = read_claude_code_session_detail(&path).unwrap();
 
         assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.events[0].message_id, "cc-main-1");
     }
 }
