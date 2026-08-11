@@ -1864,6 +1864,89 @@ describe("Rust mode authority adapter", () => {
         expect(output.messages).toEqual([]);
     });
 
+    it("refuses a large raw fallback when the token estimator is unavailable", async () => {
+        const sessionId = `rust-raw-estimator-unavailable-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordDetectedContextLimit(db, sessionId, 1_000, "test-provider/test-model");
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method === "transform") throw new Error("client closed");
+                return { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        let estimatorCalls = 0;
+        const transform = createRustModeTransform(deps, {
+            moduleClient,
+            rawFallbackEstimatorForTests: () => {
+                estimatorCalls += 1;
+                throw new Error("tokenizer unavailable");
+            },
+        });
+        const input = [
+            {
+                info: {
+                    id: "m1",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: "x".repeat(5_000) }],
+            },
+        ] as MessageLike[];
+        const output = { messages: [] as unknown[] };
+
+        await expect(
+            transform.run(sessionId, input, output, makeMeta(db, sessionId)),
+        ).rejects.toBeInstanceOf(RawFallbackContextLimitError);
+        expect(estimatorCalls).toBe(1);
+        expect(output.messages).toEqual([]);
+    });
+
+    it("refuses a byte-large raw fallback when the token estimate is materially low", async () => {
+        const sessionId = `rust-raw-estimator-low-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordDetectedContextLimit(db, sessionId, 1_000, "test-provider/test-model");
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method === "transform") throw new Error("client closed");
+                return { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        const transform = createRustModeTransform(deps, {
+            moduleClient,
+            rawFallbackEstimatorForTests: () => ({
+                tokens: 900,
+                trusted: true,
+                messageTokens: { conversation: 900, toolCall: 0 },
+                systemTokens: 0,
+                toolDefinitionTokens: 0,
+            }),
+        });
+        const input = [
+            {
+                info: {
+                    id: "m1",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: "x".repeat(5_000) }],
+            },
+        ] as MessageLike[];
+        const output = { messages: [] as unknown[] };
+
+        await expect(
+            transform.run(sessionId, input, output, makeMeta(db, sessionId)),
+        ).rejects.toBeInstanceOf(RawFallbackContextLimitError);
+        expect(output.messages).toEqual([]);
+    });
+
     it("preserves raw fail-open when the estimate fits the known context limit", async () => {
         const sessionId = `rust-raw-fits-${Date.now()}`;
         sessions.push(sessionId);

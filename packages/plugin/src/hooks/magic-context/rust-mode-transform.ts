@@ -102,6 +102,17 @@ export const RUST_PARK_RETRY_INTERVAL = 5;
 export const RUST_EMERGENCY_WALL_PCT = 95;
 export const RUST_PARK_PROBE_PRESSURE_BYPASS_PCT = 90;
 const RUST_SEND_TIMEOUT_MS = 15_000;
+const RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN = 4;
+
+function rawFallbackSerializedBytes(messages: readonly MessageLike[]): number | null {
+    try {
+        const serialized = JSON.stringify(messages);
+        return typeof serialized === "string" ? Buffer.byteLength(serialized) : null;
+    } catch {
+        // Serialization is itself required before these messages can reach a provider.
+        return null;
+    }
+}
 
 export interface RustModeModuleClient extends ModuleStateSyncClient {
     authorityStatus?(args: {
@@ -212,6 +223,8 @@ export interface RustModeTransformOptions {
     allowAuthorityProtocolBypassForTests?: boolean;
     /** Override only for deterministic capture scheduling in tests. */
     scheduleLkgCapture?: (capture: () => void) => void;
+    /** Override only to exercise raw-fallback estimator failures in tests. */
+    rawFallbackEstimatorForTests?: typeof estimateFinalWireInputTokens;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1110,6 +1123,8 @@ export function createRustModeTransform(
     const wireCaches = new Map<string, RustWireCache>();
     const scheduleLkgCapture =
         options.scheduleLkgCapture ?? ((capture: () => void) => setImmediate(capture));
+    const rawFallbackEstimator =
+        options.rawFallbackEstimatorForTests ?? estimateFinalWireInputTokens;
     const timeoutMs = Math.max(1, options.moduleTimeoutMs ?? RUST_SEND_TIMEOUT_MS);
 
     const logStage = (
@@ -1421,26 +1436,34 @@ export function createRustModeTransform(
                     ? overflowState.detectedContextLimit
                     : undefined);
             if (contextLimit !== undefined) {
+                let estimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
                 try {
-                    const estimate = estimateFinalWireInputTokens({
+                    estimate = rawFallbackEstimator({
                         messages,
                         systemPromptTokens: sessionMeta.systemPromptTokens,
                         providerID: model?.providerID,
                         modelID: model?.modelID,
                         agentName: deps.getNotificationParams?.(sessionId)?.agent,
                     });
-                    if (estimate.tokens > contextLimit) {
-                        sessionLog(
-                            sessionId,
-                            `raw_fallback_over_context_limit estimated=${estimate.tokens} limit=${contextLimit}`,
-                        );
-                        throw new RawFallbackContextLimitError(estimate.tokens, contextLimit, {
-                            cause,
-                        });
-                    }
-                } catch (error) {
-                    if (error instanceof RawFallbackContextLimitError) throw error;
-                    // An unavailable estimate leaves the ordinary raw fail-open contract intact.
+                } catch {
+                    // The byte proxy below remains available when tokenization does not.
+                }
+                const rawBytes = rawFallbackSerializedBytes(messages);
+                // The local tokenizer is telemetry-grade and can materially undercount a new
+                // provider tokenizer. Four serialized bytes per context token is an independent,
+                // conservative risk budget for a raw full-history fallback.
+                const proxyTokens =
+                    rawBytes === null
+                        ? contextLimit + 1
+                        : Math.ceil(rawBytes / RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN);
+                const refusalTokens = Math.max(estimate?.tokens ?? 0, proxyTokens);
+                if (refusalTokens > contextLimit) {
+                    sessionLog(
+                        sessionId,
+                        `raw_fallback_over_context_limit estimated=${estimate?.tokens ?? "unavailable"} ` +
+                            `proxy_bytes=${rawBytes ?? "unavailable"} proxy_tokens=${proxyTokens} limit=${contextLimit}`,
+                    );
+                    throw new RawFallbackContextLimitError(refusalTokens, contextLimit, { cause });
                 }
             }
             replaceMessagesInPlace(output, messages);
