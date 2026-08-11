@@ -219,9 +219,23 @@ function commandLooksLikePi(command: string): boolean {
     return false;
 }
 
-/** Enumerate live Pi/OMP harnesses on the cold migration-guard path. */
-export function discoverLivePiProcessIds(): number[] {
-    if (process.env.NODE_ENV === "test" && !rpcProcessListTestOverride) return [];
+/** Result of checking whether Pi/OMP processes may currently hold the shared database. */
+export interface PiProcessDiscovery {
+    state: "known" | "unreadable";
+    processIds: number[];
+    error?: string;
+}
+
+/**
+ * Inspect Pi/OMP processes without converting a failed process-list probe into
+ * false evidence that no harness is running. Destructive maintenance callers
+ * use the unreadable state to fail closed; ordinary migration guards retain
+ * their historical best-effort process list through discoverLivePiProcessIds().
+ */
+export function inspectLivePiProcesses(): PiProcessDiscovery {
+    if (process.env.NODE_ENV === "test" && !rpcProcessListTestOverride) {
+        return { state: "known", processIds: [] };
+    }
     try {
         const output = String(
             rpcProcessListExecFileSync("ps", ["-axo", "pid=,command="], {
@@ -237,12 +251,19 @@ export function discoverLivePiProcessIds(): number[] {
             if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
             if (commandLooksLikePi(match[2])) pids.add(pid);
         }
-        return [...pids].sort((left, right) => left - right);
-    } catch {
-        // RPC port discovery remains authoritative where process enumeration is
-        // unavailable (notably minimal Windows installations).
-        return [];
+        return { state: "known", processIds: [...pids].sort((left, right) => left - right) };
+    } catch (error) {
+        return {
+            state: "unreadable",
+            processIds: [],
+            error: error instanceof Error ? error.message : String(error),
+        };
     }
+}
+
+/** Enumerate live Pi/OMP harness processes before deciding whether migration can proceed. */
+export function discoverLivePiProcessIds(): number[] {
+    return inspectLivePiProcesses().processIds;
 }
 
 export function parseRpcPortFile(content: string, fallbackPid = 0): RpcPortFileRecord | null {

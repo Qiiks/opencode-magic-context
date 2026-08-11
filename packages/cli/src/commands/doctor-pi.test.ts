@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, setDefaultTimeout } from "bun:test";
+import { afterEach, describe, expect, it, setDefaultTimeout, spyOn } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -232,6 +232,41 @@ describe("Pi doctor", () => {
         expect(output).toContain("PASS SQLite integrity_check: ok");
         expect(output).toContain("Summary: PASS");
         expect(output).toContain("FAIL 0");
+    });
+
+    it("names the database and repair command when integrity_check fails", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        const prompts = new MockPrompts();
+        const options = baseOptions(root, cwd, prompts);
+        const damaged = createMockDb();
+        const originalPrepare = damaged.prepare.bind(damaged);
+        (damaged as Database & { prepare: typeof damaged.prepare }).prepare = ((sql: string) => {
+            if (sql === "PRAGMA integrity_check") {
+                return { get: () => ({ integrity_check: "invalid page number 42" }) };
+            }
+            return originalPrepare(sql);
+        }) as typeof damaged.prepare;
+        if (!options.deps) throw new Error("expected doctor dependencies");
+        options.deps.openExistingContextDatabase = () => damaged;
+        const errors: string[] = [];
+        const errorSpy = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+            errors.push(args.map(String).join(" "));
+        });
+
+        try {
+            const code = await runDoctor(options);
+            expect(code).toBe(1);
+        } finally {
+            errorSpy.mockRestore();
+        }
+
+        const output = errors.join("\n");
+        const dbPath = join(root, ".local", "share", "cortexkit", "magic-context", "context.db");
+        expect(output).toContain(`Database: ${dbPath}`);
+        expect(output).toContain("bunx @cortexkit/magic-context@latest doctor repair-db");
     });
 
     it("leaves an older supported shared DB schema unchanged", async () => {

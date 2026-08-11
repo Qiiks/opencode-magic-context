@@ -7,6 +7,7 @@ import {
     __resetRpcIdentityTestHooks,
     __setRpcIdentityTestHooks,
     discoverLivePiProcessIds,
+    inspectLivePiProcesses,
     isPidIdentityPlausible,
     type RpcPortFileRecord,
 } from "./rpc-utils";
@@ -62,6 +63,20 @@ describe("discoverLivePiProcessIds", () => {
         });
 
         expect(discoverLivePiProcessIds()).toEqual([41001, 41002, 41003, 41007]);
+    });
+
+    test("reports uncertainty instead of treating an unavailable process list as empty", () => {
+        __setRpcIdentityTestHooks({
+            processListExecFileSync: (() => {
+                throw new Error("ps unavailable");
+            }) as typeof execFileSync,
+        });
+
+        expect(inspectLivePiProcesses()).toEqual({
+            state: "unreadable",
+            processIds: [],
+            error: "ps unavailable",
+        });
     });
 });
 

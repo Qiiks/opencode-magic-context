@@ -9,6 +9,7 @@ const SOURCE_ROOTS = ["packages/cli/src", "packages/plugin/src", "packages/pi-pl
 // class-(c) schema migration commands; if one is added, its production file
 // must be listed here explicitly and must print its version transition.
 const ALLOWED_RUN_MIGRATIONS_IMPORTS = new Set([
+    "packages/cli/src/commands/doctor-repair-db.ts",
     "packages/plugin/src/features/magic-context/storage-db.ts",
 ]);
 
