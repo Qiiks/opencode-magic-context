@@ -75,6 +75,7 @@ import {
 	clearNoteNudgeTriggerAndCooldown,
 	onNoteTrigger,
 } from "@magic-context/core/hooks/magic-context/note-nudger";
+import { preloadTokenizer } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { normalizeTodoStateJson } from "@magic-context/core/hooks/magic-context/todo-view";
 import { maybeSendUpgradeReminder } from "@magic-context/core/hooks/magic-context/upgrade-reminder";
 import {
@@ -1499,6 +1500,9 @@ async function startPiMagicContextRuntime(
 	// `experimental.chat.system.transform` handler in
 	// `system-prompt-hash.ts`.
 	pi.on("before_agent_start", async (event, ctx) => {
+		// Match OpenCode's first-prompt lazy-load boundary so synchronous token
+		// estimates below never depend on a virtual bundled-module resolution base.
+		await preloadTokenizer();
 		// Startup release announcement (Pi parity with OpenCode TUI dialog +
 		// Desktop ignored message). Fires once per ANNOUNCEMENT_VERSION across
 		// the whole machine — persistence file is shared with the OpenCode

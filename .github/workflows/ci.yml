@@ -90,6 +90,12 @@ jobs:
       - name: Smoke (TUI packaged install import)
         run: bun packages/plugin/scripts/smoke-tui-pack-install.ts
 
+      # Tokenizer loading is lazy, so an import-only smoke misses resolution
+      # failures. Pack + npm-install prod deps, then exercise an estimate from a
+      # compiled Bun host matching OpenCode's /$bunfs/root runtime.
+      - name: Smoke (tokenizer packaged install estimate)
+        run: bun packages/plugin/scripts/smoke-tokenizer-pack-install.ts
+
   check-pi-plugin:
     name: Check (pi-plugin)
     runs-on: ubuntu-latest

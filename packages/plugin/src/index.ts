@@ -40,6 +40,7 @@ import {
 } from "./hooks/magic-context/compartment-prompt";
 import { createLiveSessionState } from "./hooks/magic-context/live-session-state";
 import { SubcModuleTransport } from "./hooks/magic-context/module-transport";
+import { preloadTokenizer } from "./hooks/magic-context/read-session-formatting";
 import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
 import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./plugin/boot-quiet";
 import { cleanupConflictWarnings, sendConflictWarning } from "./plugin/conflict-warning-hook";
@@ -605,6 +606,10 @@ const server: Plugin = async (ctx) => {
             await magicContextRuntime.magicContext?.["command.execute.before"]?.(input, output);
         },
         "chat.message": async (input, _output) => {
+            // The first real prompt is the lazy-load boundary. Awaiting here keeps
+            // the tokenizer out of cold start while ensuring synchronous token
+            // estimates later in this prompt use the installed package.
+            await preloadTokenizer();
             // Update tool-def measurement latch before delegating to magic-context
             // hooks. `registry.tools()` is invoked right after chat.message inside
             // OpenCode's prompt flow (see session/prompt.ts), so by the time
