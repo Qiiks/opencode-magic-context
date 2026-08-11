@@ -72,6 +72,9 @@ describe("doctor merge-identity schema guard", () => {
         expect(fileHash(path)).toBe(before);
     });
 
+    // Explicit ceiling: createCurrentDatabase replays the full migration
+    // chain, whose wall time grows with every release and crossed bun's 5s
+    // default under CI load at v76 (release run 31447211517).
     it("works against the current checkout schema without running migrations", () => {
         const path = join(tempDir(), "context.db");
         createCurrentDatabase(path);
@@ -98,5 +101,5 @@ describe("doctor merge-identity schema guard", () => {
         db.close();
         expect(version.version).toBe(CLI_SCHEMA_FLOOR_VERSION);
         expect(target).toBeDefined();
-    });
+    }, 30_000);
 });
