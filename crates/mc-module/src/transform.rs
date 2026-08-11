@@ -42,9 +42,10 @@ use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInpu
 use mc_store::{
     BlockIdentity, Channel1AppendRow, DeferredExecuteState, LineageAnchor, LineageConstituent,
     LineageDescentDisposition, LineageDescentRequest, McStore, McStoreError, McTagRow,
-    MemoryRevision, ModuleMeta, ModuleUsage, NoteDelivery, PendingAgentDrop, PendingRewriteState,
-    ServedBlockFingerprint, StoredCompartment, TagCacheSummary, TagMintInput, TemporalMarkInput,
-    TemporalMarkRow, TransformCommit, TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
+    MemoryRevision, ModuleMeta, ModuleUsage, NoteDelivery, PassSchedulerObservation,
+    PendingAgentDrop, PendingRewriteState, ServedBlockFingerprint, StoredCompartment,
+    TagCacheSummary, TagMintInput, TemporalMarkInput, TemporalMarkRow, TransformCommit,
+    TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1320,6 +1321,7 @@ pub struct TransformWithProjection {
     /// second numbers-only table scan after the response has been built.
     pub tag_numbers: BTreeMap<String, u64>,
     pub scheduler_pass: scheduler::PassDecision,
+    pub scheduler_drain_latch_active: bool,
     pub boundary_state: BoundaryState,
     pub trim_mismatch: Option<TrimMismatch>,
     pub revert_epoch: u64,
@@ -1642,12 +1644,30 @@ fn record_stable_pass_trace(
     ctx: &ProducerContext<'_>,
     result: &Result<TransformWithProjection, TransformError>,
 ) {
-    if result.as_ref().ok().is_some_and(|pass| {
+    if let Some(pass) = result.as_ref().ok().filter(|pass| {
         pass.response.status == TransformStatus::Ok
             && pass.response.ck_messages.is_some()
             && pass.response.first_divergence.is_none()
+            && !pass.response.committed
     }) {
-        let _ = store.trace_pass_stable(&req.session_id, ctx.now_ms);
+        let observation = pass_scheduler_observation(
+            pass.scheduler_pass,
+            pass.scheduler_drain_latch_active,
+            ctx.now_ms,
+        );
+        let _ = store.trace_pass_stable(&req.session_id, &observation);
+    }
+}
+
+fn pass_scheduler_observation(
+    pass: scheduler::PassDecision,
+    drain_latch_active: bool,
+    timestamp_ms: i64,
+) -> PassSchedulerObservation {
+    PassSchedulerObservation {
+        timestamp_ms,
+        scheduler_decision: pass.as_str().to_string(),
+        drain_latch_active,
     }
 }
 
@@ -2094,6 +2114,7 @@ fn lineage_protocol_passthrough(
         tag_numbers: BTreeMap::new(),
         projection,
         scheduler_pass: scheduler::PassDecision::Defer,
+        scheduler_drain_latch_active: false,
         boundary_state: BoundaryState::Absent,
         trim_mismatch: None,
         revert_epoch: 0,
@@ -2511,6 +2532,11 @@ fn apply_once(
                         compartment_max_seq: None,
                         project_root: Some(ctx.project_directory),
                         first_divergence: first_divergence_json.as_deref(),
+                        scheduler_observation: Some(&pass_scheduler_observation(
+                            scheduler::PassDecision::Defer,
+                            false,
+                            ctx.now_ms,
+                        )),
                         overlays: TransformOverlayBatch::default(),
                     },
                 )?
@@ -2602,6 +2628,11 @@ fn apply_once(
                 compartment_max_seq: None,
                 project_root: Some(ctx.project_directory),
                 first_divergence: first_divergence_json.as_deref(),
+                scheduler_observation: Some(&pass_scheduler_observation(
+                    scheduler::PassDecision::Defer,
+                    false,
+                    ctx.now_ms,
+                )),
                 overlays: TransformOverlayBatch::default(),
             },
         )?;
@@ -2972,12 +3003,17 @@ fn apply_once(
         && !render_config_changed
         && !reconcile_hard_due
         && loaded.meta.initialized;
-    let pass_already_busting = !loaded.meta.initialized
+    let supersession_ride_available = !loaded.meta.initialized
         || render_config_changed
         || hard_fold_requested
         || reconcile_hard_due
-        || emergency_arm_engaged
+        || matches!(
+            scheduler_outcome.pass,
+            scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95
+        )
         || loaded.meta.soft_refresh_pending;
+    let pass_already_busting =
+        supersession_ride_available || scheduler_outcome.drain_latch.is_active();
     // Tail reclaim gates purely on the serializer profile. Every shipping profile is a
     // full-array consumer (healing::tail_reclaim is true for all of them), so the request
     // array round-trips both prefix and tail mutations on every pass. The U1-era layering
@@ -3104,6 +3140,7 @@ fn apply_once(
                 agent_drop_command_ids,
                 first_applied_agent_drop_ids,
                 pass_already_busting,
+                supersession_ride_available,
                 protected_block_ids: protected_block_ids.clone(),
             },
             &SelectionConfig {
@@ -4191,6 +4228,11 @@ fn apply_once(
                 compartment_max_seq: is_bust_pass.then_some(m1_signal.max_compartment_seq),
                 project_root: Some(ctx.project_directory),
                 first_divergence: first_divergence_json.as_deref(),
+                scheduler_observation: Some(&pass_scheduler_observation(
+                    scheduler_outcome.pass,
+                    scheduler_outcome.drain_latch.is_active(),
+                    ctx.now_ms,
+                )),
                 overlays: TransformOverlayBatch {
                     max_seen_ordinal: pending_overlays.max_seen_ordinal,
                     tag_mints: &tag_rows[pending_overlays.tag_mint_start
@@ -4270,6 +4312,7 @@ fn apply_once(
         tag_numbers,
         projection,
         scheduler_pass: scheduler_outcome.pass,
+        scheduler_drain_latch_active: scheduler_outcome.drain_latch.is_active(),
         boundary_state,
         trim_mismatch,
         revert_epoch: meta.revert_epoch,
@@ -5766,6 +5809,7 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         tag_numbers,
         projection,
         scheduler_pass: scheduler::PassDecision::Defer,
+        scheduler_drain_latch_active: false,
         boundary_state: BoundaryState::Absent,
         trim_mismatch,
         revert_epoch,
@@ -11281,6 +11325,57 @@ pub(crate) mod tests {
             .find(|unit| unit.key == TRANSITION_CONSUMED_KEY)
             .expect("renderer transition marker must be durable");
         serde_json::from_str(&marker.frozen_payload).unwrap()
+    }
+
+    #[test]
+    fn scheduler_trace_records_every_pass_and_preserves_variable_arm_state() {
+        const SESSION: &str = "scheduler-trace";
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let messages = vec![item("m1", 1, "stable tail")];
+        let low_request = with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100);
+        let mut context = pctx("git:proj", "/nonexistent-docs", 101);
+        context.cache_ttl = "never".to_string();
+
+        transform(&store, &low_request, &context).unwrap();
+        context.now_ms = 102;
+        transform(&store, &low_request, &context).unwrap();
+        context.now_ms = 103;
+        transform(
+            &store,
+            &with_usage(req(SESSION, "cfg0", messages), 90, 100),
+            &context,
+        )
+        .unwrap();
+
+        let history = store
+            .load_pass_trace(SESSION)
+            .unwrap()
+            .unwrap()
+            .scheduler_history;
+        assert_eq!(history.len(), 3, "every accepted pass must be queryable");
+        assert_eq!(
+            history
+                .iter()
+                .map(|observation| observation.timestamp_ms)
+                .collect::<Vec<_>>(),
+            vec![101, 102, 103]
+        );
+        assert_eq!(history[0].scheduler_decision, "Defer");
+        assert!(!history[0].drain_latch_active);
+        assert_eq!(history[1].scheduler_decision, "Defer");
+        assert!(!history[1].drain_latch_active);
+        assert_eq!(history[2].scheduler_decision, "Force85");
+        assert!(history[2].drain_latch_active);
+        assert_ne!(
+            history[0].scheduler_decision, history[2].scheduler_decision,
+            "the trace must record the scheduler output rather than a constant"
+        );
+        let incident_window = store
+            .load_pass_scheduler_history(SESSION, 102, 103)
+            .unwrap();
+        assert_eq!(incident_window, history[1..]);
     }
 
     #[test]
@@ -20164,6 +20259,240 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn latched_execute_without_concrete_work_preserves_supersession_bytes() {
+        const LATCHED_PASSES: usize = 3;
+        const SESSION: &str = "latched-supersession-idle";
+
+        let dir = tempfile::tempdir().unwrap();
+        let reference_dir = tempfile::tempdir().unwrap();
+        let reference_store = store(reference_dir.path());
+        let store = store(dir.path());
+        for target in [&store, &reference_store] {
+            target
+                .replace_compartments(SESSION, &[comp(1, 1, 1, "covered", "summary")])
+                .unwrap();
+        }
+        let mut messages = vec![
+            item("covered", 1, "covered source"),
+            assistant_edit_call("edit-call-1", 2, "edit-1", "shared.ts"),
+            edit_result("edit-result-1", 3, "edit-1", "result one"),
+        ];
+        let mut context = smart_pctx();
+        context.cache_ttl = "never".to_string();
+        let mut reference_context = pctx("git:proj", "/nonexistent-docs", 0);
+        reference_context.cache_ttl = "never".to_string();
+        let boot_request = with_usage(cc_req(SESSION, "cfg0", messages.clone()), 10, 100);
+        let boot = transform(&store, &boot_request, &context).unwrap();
+        let reference_boot =
+            transform(&reference_store, &boot_request, &reference_context).unwrap();
+        let mut previous_bytes = canonical_output(boot.messages());
+        assert_eq!(previous_bytes, canonical_output(reference_boot.messages()));
+
+        let mut next_ordinal = 4u64;
+        for pass in 1..=LATCHED_PASSES {
+            let edit_number = pass + 1;
+            let call_id = format!("edit-{edit_number}");
+            messages.push(assistant_edit_call(
+                &format!("edit-call-{edit_number}"),
+                next_ordinal,
+                &call_id,
+                "shared.ts",
+            ));
+            next_ordinal += 1;
+            messages.push(edit_result(
+                &format!("edit-result-{edit_number}"),
+                next_ordinal,
+                &call_id,
+                &format!("result {edit_number}"),
+            ));
+            next_ordinal += 1;
+            for message in 0..crate::selection::RECENT_SUPERSESSION_WINDOW {
+                messages.push(item(
+                    &format!("latched-{pass}-tail-{message}"),
+                    next_ordinal,
+                    "stable tail",
+                ));
+                next_ordinal += 1;
+            }
+
+            for target in [&store, &reference_store] {
+                let loaded = target.load(SESSION).unwrap();
+                let mut meta = loaded.meta;
+                meta.soft_refresh_pending = false;
+                meta.deferred_execute_state = Some(mc_store::DeferredExecuteState {
+                    reason: "execute-none".to_string(),
+                });
+                meta.emergency_drain_active = true;
+                meta.emergency_drain_entered_at_ms = 1;
+                target
+                    .commit(SESSION, loaded.row_version, &loaded.core, &meta)
+                    .unwrap();
+            }
+
+            let request = with_usage(cc_req(SESSION, "cfg0", messages.clone()), 60, 100);
+            let latched = transform(&store, &request, &context).unwrap();
+            let reference = transform(&reference_store, &request, &reference_context).unwrap();
+            let rendered = canonical_output(latched.messages());
+            assert_eq!(
+                rendered,
+                canonical_output(reference.messages()),
+                "latched Execute pass {pass} must serve the unreduced bytes"
+            );
+            assert_eq!(
+                &rendered[..previous_bytes.len()],
+                previous_bytes.as_slice(),
+                "latched Execute pass {pass} must preserve all previously served bytes"
+            );
+            let loaded = store.load(SESSION).unwrap();
+            assert!(loaded.meta.emergency_drain_active);
+            assert!(
+                loaded
+                    .core
+                    .frozen_units
+                    .iter()
+                    .all(|unit| !unit.key.starts_with("red:")),
+                "latched Execute pass {pass} must leave supersession pending"
+            );
+            previous_bytes = rendered;
+        }
+    }
+
+    #[test]
+    fn latched_execute_batches_supersession_on_the_next_concrete_bust() {
+        const LATCHED_PASSES: usize = 3;
+        const SESSION: &str = "latched-supersession-batch";
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .replace_compartments(SESSION, &[comp(1, 1, 1, "covered", "summary")])
+            .unwrap();
+        let mut messages = vec![
+            item("covered", 1, "covered source"),
+            assistant_edit_call("edit-call-1", 2, "edit-1", "shared.ts"),
+            edit_result("edit-result-1", 3, "edit-1", "result one"),
+        ];
+        let mut context = smart_pctx();
+        context.cache_ttl = "never".to_string();
+        let boot = transform(
+            &store,
+            &with_usage(cc_req(SESSION, "cfg0", messages.clone()), 10, 100),
+            &context,
+        )
+        .unwrap();
+        let mut previous_bytes = canonical_output(boot.messages());
+
+        let mut next_ordinal = 4u64;
+        for pass in 1..=LATCHED_PASSES {
+            let edit_number = pass + 1;
+            let call_id = format!("edit-{edit_number}");
+            messages.push(assistant_edit_call(
+                &format!("edit-call-{edit_number}"),
+                next_ordinal,
+                &call_id,
+                "shared.ts",
+            ));
+            next_ordinal += 1;
+            messages.push(edit_result(
+                &format!("edit-result-{edit_number}"),
+                next_ordinal,
+                &call_id,
+                &format!("result {edit_number}"),
+            ));
+            next_ordinal += 1;
+            for message in 0..crate::selection::RECENT_SUPERSESSION_WINDOW {
+                messages.push(item(
+                    &format!("batch-{pass}-tail-{message}"),
+                    next_ordinal,
+                    "stable tail",
+                ));
+                next_ordinal += 1;
+            }
+
+            let loaded = store.load(SESSION).unwrap();
+            let mut meta = loaded.meta;
+            meta.soft_refresh_pending = false;
+            meta.deferred_execute_state = Some(mc_store::DeferredExecuteState {
+                reason: "execute-none".to_string(),
+            });
+            meta.emergency_drain_active = true;
+            meta.emergency_drain_entered_at_ms = 1;
+            store
+                .commit(SESSION, loaded.row_version, &loaded.core, &meta)
+                .unwrap();
+
+            let latched = transform(
+                &store,
+                &with_usage(cc_req(SESSION, "cfg0", messages.clone()), 60, 100),
+                &context,
+            )
+            .unwrap();
+            let rendered = canonical_output(latched.messages());
+            assert_eq!(
+                &rendered[..previous_bytes.len()],
+                previous_bytes.as_slice(),
+                "latched Execute pass {pass} must not rewrite an existing byte"
+            );
+            assert!(
+                store
+                    .load(SESSION)
+                    .unwrap()
+                    .core
+                    .frozen_units
+                    .iter()
+                    .all(|unit| !unit.key.starts_with("red:")),
+                "latched Execute pass {pass} must accumulate the supersession batch"
+            );
+            previous_bytes = rendered;
+        }
+
+        let loaded = store.load(SESSION).unwrap();
+        let mut meta = loaded.meta;
+        meta.soft_refresh_pending = true;
+        meta.emergency_drain_active = true;
+        meta.emergency_drain_entered_at_ms = 1;
+        store
+            .commit(SESSION, loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let riding = transform(
+            &store,
+            &with_usage(cc_req(SESSION, "cfg0", messages), 60, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(riding.action, "SOFT");
+        assert_ne!(canonical_output(riding.messages()), previous_bytes);
+
+        let loaded = store.load(SESSION).unwrap();
+        for edit_number in 1..=LATCHED_PASSES {
+            for mid in [
+                format!("edit-call-{edit_number}"),
+                format!("edit-result-{edit_number}"),
+            ] {
+                assert!(
+                    frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_some(),
+                    "superseded edit member {mid} must join the one riding batch"
+                );
+            }
+        }
+        assert_eq!(
+            loaded
+                .core
+                .frozen_units
+                .iter()
+                .filter(|unit| unit.key.starts_with("red:"))
+                .count(),
+            LATCHED_PASSES * 2,
+            "every accumulated member must first-apply in the concrete bust"
+        );
+        assert!(
+            frozen_red_payload(&loaded.core, &format!("edit-call-{}#0", LATCHED_PASSES + 1),)
+                .is_none(),
+            "the newest edit must stay full"
+        );
+    }
+
+    #[test]
     fn aged_supersession_stays_byte_stable_then_rides_one_bust() {
         const EXECUTE_BAND_PASSES: usize = 3;
 
@@ -20392,6 +20721,7 @@ pub(crate) mod tests {
                     compartment_max_seq: None,
                     project_root: None,
                     first_divergence: None,
+                    scheduler_observation: None,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -20471,6 +20801,7 @@ pub(crate) mod tests {
                     compartment_max_seq: None,
                     project_root: None,
                     first_divergence: None,
+                    scheduler_observation: None,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -23401,6 +23732,7 @@ pub(crate) mod tests {
                 compartment_max_seq: None,
                 project_root: None,
                 first_divergence: None,
+                scheduler_observation: None,
                 overlays: TransformOverlayBatch::default(),
             },
         )

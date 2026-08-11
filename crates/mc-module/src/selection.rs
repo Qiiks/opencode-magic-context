@@ -177,6 +177,9 @@ pub struct SelectionContext {
     /// True when a byte-changing pass is already known before reduction selection.
     /// Selection may also discover a different command's first application as a ride.
     pub pass_already_busting: bool,
+    /// True when supersession can ride concrete work already scheduled for this pass.
+    /// Unlike `pass_already_busting`, a held emergency latch alone does not set this.
+    pub supersession_ride_available: bool,
     /// Dynamic newest-tag protection expressed as exact block ids. This applies to
     /// automatic selectors and agent-marked drops alike.
     pub protected_block_ids: HashSet<String>,
@@ -967,9 +970,11 @@ pub(crate) fn select_reductions_with_outcome(
             for arc_id in &two_pass_arc_ids {
                 arc_shapes.insert(arc_id.clone(), ArcShape::FullDrop);
             }
-            // Supersession is deferred work: ordinary execute-band pressure cannot
-            // authorize a rewrite, so the entire pending set waits for another bust.
-            if cfg.smart_drops && ctx.pass_already_busting {
+            // Supersession is deferred work: ordinary execute-band pressure and a held
+            // emergency latch cannot authorize a rewrite. Concrete scheduled work or an
+            // admitted two-pass batch lets the whole pending set ride the same bust.
+            if cfg.smart_drops && (ctx.supersession_ride_available || !two_pass_arc_ids.is_empty())
+            {
                 let intents = select_supersession(&active_arcs, &recent_supersession_message_ids);
                 for (arc_id, intent) in intents {
                     if arc_shapes.contains_key(&arc_id) {
@@ -1228,6 +1233,7 @@ mod tests {
             agent_drop_command_ids: HashMap::new(),
             first_applied_agent_drop_ids: HashSet::new(),
             pass_already_busting: false,
+            supersession_ride_available: false,
             protected_block_ids: HashSet::new(),
         }
     }
@@ -1474,6 +1480,7 @@ mod tests {
                 agent_drop_command_ids: HashMap::new(),
                 first_applied_agent_drop_ids: HashSet::new(),
                 pass_already_busting: case.smart_drops || case.ctx.pass_already_busting,
+                supersession_ride_available: case.smart_drops || case.ctx.pass_already_busting,
                 protected_block_ids: HashSet::new(),
             };
             let cfg = SelectionConfig {
@@ -1717,6 +1724,7 @@ mod tests {
             );
 
             ctx.pass_already_busting = true;
+            ctx.supersession_ride_available = true;
             assert_eq!(
                 select_reductions(&items, &HashSet::new(), &ctx, &cfg).len(),
                 pass as usize * 2,
@@ -1745,6 +1753,7 @@ mod tests {
         let mut ctx = base_ctx(PassClass::Execute);
         ctx.scheduler_pressure_execute = true;
         ctx.pass_already_busting = true;
+        ctx.supersession_ride_available = true;
         let out = select_reductions(
             &items,
             &HashSet::new(),
@@ -1985,6 +1994,7 @@ mod tests {
         }
         let mut ctx = base_ctx(PassClass::Execute);
         ctx.pass_already_busting = true;
+        ctx.supersession_ride_available = true;
         let cfg = SelectionConfig { smart_drops: true };
 
         assert!(select_reductions(&items, &HashSet::new(), &ctx, &cfg).is_empty());
@@ -2384,6 +2394,7 @@ mod tests {
         // Context A: no agent drops, zero pressure fields.
         let mut ctx_a = base_ctx(PassClass::Execute);
         ctx_a.pass_already_busting = true;
+        ctx_a.supersession_ride_available = true;
         // Context B: a genuinely different produced set — an unrelated agent drop (c9)
         // plus non-zero pressure/latch fields. last_execute_ordinal stays 0 so c1 is NOT
         // a two-pass drop candidate (keeps it an edit_marker in both).
@@ -2395,6 +2406,7 @@ mod tests {
             prior_input_sample: 99_000.0,
             has_prior_drop: true,
             pass_already_busting: true,
+            supersession_ride_available: true,
             ..base_ctx(PassClass::Execute)
         };
 
