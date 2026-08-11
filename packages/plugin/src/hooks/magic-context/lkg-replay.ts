@@ -363,9 +363,33 @@ function partIsAnthropicThinking(part: unknown): boolean {
     return type === "thinking" || type === "reasoning" || type === "redacted_thinking";
 }
 
+function partEndsAnthropicAssistantRun(part: unknown): boolean {
+    if (!part || typeof part !== "object") return false;
+    const value = part as Record<string, unknown>;
+    if (
+        value.type !== "tool" ||
+        value.providerExecuted === true ||
+        !value.state ||
+        typeof value.state !== "object"
+    ) {
+        return false;
+    }
+    const status = (value.state as Record<string, unknown>).status;
+    return status === "completed" || status === "error";
+}
+
+function partIsOpenCodeStepMetadata(part: unknown): boolean {
+    if (!part || typeof part !== "object") return false;
+    const type = (part as Record<string, unknown>).type;
+    return type === "step-start" || type === "step-finish";
+}
+
 /**
- * The Anthropic adapter merges adjacent assistant messages before sending them.
- * A merged run may contain only one leading thinking block; moving or retaining a
+ * The Anthropic adapter merges adjacent assistant content before sending it. A
+ * completed non-provider-executed tool result materializes as user content and
+ * starts a new assistant run, while OpenCode's step markers do not materialize
+ * on the provider wire.
+ * Each resulting assistant run may contain only one leading thinking block; a
  * later signed block would invalidate its provider signature, so recovery declines
  * the entire replay instead of attempting a rewrite.
  */
@@ -383,7 +407,10 @@ export function validateAnthropicReasoningRuns(messages: MessageLike[]): boolean
                 if (partIsAnthropicThinking(part)) {
                     thinkingBlocks += 1;
                     if (thinkingBlocks > 1 || sawOtherContent) return false;
-                } else {
+                } else if (partEndsAnthropicAssistantRun(part)) {
+                    thinkingBlocks = 0;
+                    sawOtherContent = false;
+                } else if (!partIsOpenCodeStepMetadata(part)) {
                     sawOtherContent = true;
                 }
             }
