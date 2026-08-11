@@ -4159,7 +4159,7 @@ fn apply_once(
     timings.store_notes = m1_revision_read_timings.notes_ms;
     timings.total = elapsed_ms(total_started_at);
     Ok(TransformWithProjection {
-        tag_numbers: tag_number_by_message(&tag_rows),
+        tag_numbers,
         projection,
         scheduler_pass: scheduler_outcome.pass,
         boundary_state,
@@ -17521,6 +17521,31 @@ pub(crate) mod tests {
             serde_json::to_vec(first.messages()).unwrap(),
             serde_json::to_vec(replay.messages()).unwrap()
         );
+    }
+
+    #[test]
+    fn transform_projection_tag_numbers_include_same_pass_mints() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let request = active_opencode_req(
+                "same-pass-tag-numbers",
+                "cfg0",
+                vec![item("m1", 1, "hello")],
+            );
+
+            let result =
+                transform_with_projection(&s, &request, &pctx("git:proj", "/nonexistent-docs", 0))
+                    .unwrap();
+
+            assert_eq!(result.tag_numbers.get("m1"), Some(&1));
+            assert_eq!(
+                s.load_tags_for_session("same-pass-tag-numbers")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        });
     }
 
     #[test]
