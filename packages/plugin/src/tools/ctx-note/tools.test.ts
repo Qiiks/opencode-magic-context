@@ -195,6 +195,62 @@ describe("createCtxNoteTools", () => {
         ]);
     });
 
+    it("compiles a fenced MODULE-authority smart note before the facade write", async () => {
+        tools = createCtxNoteTools({
+            db,
+            dreamerEnabled: true,
+            resolveProjectPath: () => "git:project-a",
+            rustToolBackends: {
+                authorityState: async () => "MODULE",
+                noteEvaluationAvailable: () => true,
+                note: async (request) => {
+                    db.prepare(
+                        `INSERT INTO notes (
+                            type, status, content, session_id, project_path, surface_condition,
+                            compiled_provider, compiled_config, compiled_at, compile_status,
+                            created_at, updated_at
+                        ) VALUES ('smart', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, 1, 1)`,
+                    ).run(
+                        request.content,
+                        request.sessionId,
+                        request.memoryProject,
+                        request.surfaceCondition,
+                        request.compiledProvider,
+                        request.compiledConfig,
+                        request.compiledAt,
+                        request.compileStatus,
+                    );
+                    return {
+                        content: [{ type: "text", text: "Created smart note #1." }],
+                    };
+                },
+            },
+        });
+
+        const result = await tools.ctx_note.execute(
+            {
+                action: "write",
+                content: "Never inspect key material.",
+                surface_condition: "when path /tmp/project-binding-key exists",
+            },
+            toolContext(),
+        );
+
+        expect(result).toContain("Created smart note #1");
+        expect(result).toContain("Retina compile refused: fenced path");
+        expect(
+            db
+                .prepare(
+                    "SELECT compile_status, compiled_provider, compiled_config FROM notes WHERE id = 1",
+                )
+                .get(),
+        ).toEqual({
+            compile_status: "refused",
+            compiled_provider: null,
+            compiled_config: null,
+        });
+    });
+
     it("rejects module smart-note writes when evaluation is unavailable", async () => {
         tools = createCtxNoteTools({
             db,

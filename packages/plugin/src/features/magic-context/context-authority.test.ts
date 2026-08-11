@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import type { AuthorityModuleClient, AuthorityStatus, ChangefeedPage } from "./context-authority";
 import {
+    applyMirroredNoteCompileFields,
     applyMirrorPage,
     bumpDomainMutationEpoch,
     drainAuthority,
@@ -164,6 +165,10 @@ describe("memory authority protocol", () => {
                             session_id: "foreign-session",
                             content: "foreign note",
                             status: "active",
+                            compiled_provider: "local-fs",
+                            compiled_config: '{"kind":"path_exists","path":"/tmp/result"}',
+                            compiled_at: 35,
+                            compile_status: "compiled",
                             created_at_ms: 30,
                             updated_at_ms: 40,
                         },
@@ -174,10 +179,32 @@ describe("memory authority protocol", () => {
         });
 
         expect(
-            database.prepare("SELECT id, content, session_id FROM notes ORDER BY id").all(),
+            database
+                .prepare(
+                    `SELECT id, content, session_id, compiled_provider, compiled_config,
+                            compiled_at, compile_status
+                       FROM notes ORDER BY id`,
+                )
+                .all(),
         ).toEqual([
-            { id: 41, content: "local note", session_id: "local-session" },
-            { id: 42, content: "foreign note", session_id: "foreign-session" },
+            {
+                id: 41,
+                content: "local note",
+                session_id: "local-session",
+                compiled_provider: null,
+                compiled_config: null,
+                compiled_at: null,
+                compile_status: null,
+            },
+            {
+                id: 42,
+                content: "foreign note",
+                session_id: "foreign-session",
+                compiled_provider: "local-fs",
+                compiled_config: '{"kind":"path_exists","path":"/tmp/result"}',
+                compiled_at: 35,
+                compile_status: "compiled",
+            },
         ]);
         expect(
             database
@@ -186,6 +213,56 @@ describe("memory authority protocol", () => {
                 )
                 .get(),
         ).toEqual({ context_row_id: 42 });
+    });
+
+    test("attaches host compilation metadata to a mirrored module note", () => {
+        const database = db();
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "notes",
+                cursor: 0,
+                next_cursor: 1,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "notes",
+                        op: "insert",
+                        module_row_id: 12,
+                        full_row_snapshot: {
+                            project_path: "/repo",
+                            session_id: "session",
+                            content: "guard secret",
+                            surface_condition: "when path /tmp/project-binding-key exists",
+                            status: "pending",
+                            created_at_ms: 10,
+                            updated_at_ms: 10,
+                        },
+                        content_hash: null,
+                    },
+                ],
+            },
+        });
+
+        expect(
+            applyMirroredNoteCompileFields({
+                db: database,
+                moduleProject: "/repo",
+                moduleRowId: 12,
+                fields: {
+                    compiledProvider: null,
+                    compiledConfig: null,
+                    compiledAt: null,
+                    compileStatus: "refused",
+                },
+            }),
+        ).toBe(true);
+        expect(
+            database
+                .prepare("SELECT compile_status FROM notes WHERE content = 'guard secret'")
+                .get(),
+        ).toEqual({ compile_status: "refused" });
     });
 
     test("matching-store note ids reuse the source row and mapped tombstones remove it", () => {

@@ -127,11 +127,27 @@ describe("surface-condition compiler", () => {
         "when /tmp/output changed",
         "when /workspace/repo gets a commit after abcdef1",
         "when release v2.0.0 appears",
+        "when file /tmp/state stops containing READY",
         "either when path /a exists and path /b exists",
     ])("leaves near-miss prose plain: %s", async (condition) => {
         await expect(compileSurfaceCondition(condition, pureOptions())).resolves.toEqual({
             status: "plain",
         });
+    });
+
+    test.each([
+        ["when file /tmp/state contains no ERROR", "ambiguous negation"],
+        ["when file /tmp/state contains ERROR since yesterday", "temporal suffix"],
+        ['when path "/tmp/result exists', "unbalanced quote"],
+    ])("leaves unsafe grammar plain with a reason: %s", async (condition, reason) => {
+        const result = await compileSurfaceCondition(condition, pureOptions());
+        expect(result).toEqual({
+            status: "plain",
+            reason: expect.stringContaining(reason),
+        });
+        if (result.status === "plain") {
+            expect(result.reason).not.toContain("\n");
+        }
     });
 
     test("compiles up to four OR clauses without splitting quoted needles", async () => {

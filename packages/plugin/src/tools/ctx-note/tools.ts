@@ -304,12 +304,17 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 if (!rustNote || !projectIdentity) {
                     return "Error: Rust notes authority is active, but this module transport does not support ctx_note.";
                 }
-                if (
-                    action === "write" &&
-                    args.surface_condition?.trim() &&
-                    deps.rustToolBackends?.noteEvaluationAvailable?.(projectIdentity) !== true
-                ) {
-                    return "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not written.";
+                const surfaceCondition = args.surface_condition?.trim();
+                let compilation: Awaited<ReturnType<typeof compileSurfaceCondition>> | undefined;
+                if ((action === "write" || action === "update") && surfaceCondition) {
+                    if (
+                        deps.rustToolBackends?.noteEvaluationAvailable?.(projectIdentity) !== true
+                    ) {
+                        return "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not written.";
+                    }
+                    compilation = await compileSurfaceCondition(surfaceCondition, {
+                        projectPath: toolContext.directory,
+                    });
                 }
                 const commandId = toolCallIdFromContext(toolContext);
                 const request: RustNoteToolRequest = {
@@ -320,7 +325,8 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                     memoryProject: projectIdentity,
                     action,
                     content: args.content,
-                    surfaceCondition: args.surface_condition,
+                    surfaceCondition,
+                    ...(compilation ? conditionCompileStorageFields(compilation) : {}),
                     filter: args.filter,
                     limit: args.limit,
                     offset: args.offset,
@@ -328,8 +334,13 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 };
                 try {
                     const text = moduleNoteText(await rustNote(request));
-                    if (text !== null) return text;
-                    return "Error: Rust module returned an invalid ctx_note response.";
+                    if (text === null) {
+                        return "Error: Rust module returned an invalid ctx_note response.";
+                    }
+                    if (compilation && !text.startsWith("Error:")) {
+                        return text + conditionCompileReplySuffix(compilation);
+                    }
+                    return text;
                 } catch (error) {
                     if (isRustAuthorityDrainingError(error)) {
                         return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
