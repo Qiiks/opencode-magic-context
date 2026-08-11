@@ -1885,13 +1885,18 @@ fn validate_lineage_anchor(
             block.ordinal
         ));
     }
+    // Locate the anchor at the first NON-synthetic message, matching the seam
+    // check's boundary rule. A synthetic-marked head (e.g. a normalized
+    // synthetic-todo message) would otherwise pass the seam gate and fail here
+    // on every pass, turning a benign head into a per-pass defer.
     let first = req
         .messages
-        .first()
-        .ok_or_else(|| "anchor message at messages[0] is absent".to_string())?;
+        .iter()
+        .find(|message| !message.ck.meta.synthetic)
+        .ok_or_else(|| "anchor message is absent from the live request".to_string())?;
     if first.mid != block.mid {
         return Err(format!(
-            "anchor block {anchor_id} is no longer in messages[0]"
+            "anchor block {anchor_id} is no longer the first live message"
         ));
     }
     let last_text_index = first
@@ -23653,6 +23658,59 @@ pub(crate) mod tests {
                 .count(),
             mutated.messages.len(),
             "a mutated continuation anchor must fail closed without trimming live input"
+        );
+    }
+
+    #[test]
+    fn continued_lineage_tolerates_a_synthetic_head_like_the_seam_check() {
+        // The seam check finds the boundary at the first non-synthetic message;
+        // the anchor check must use the same rule or a synthetic-marked head
+        // (normalized synthetic todo) passes one gate and defers forever on the
+        // other.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_fake_compaction_prior(&store, "A");
+        let summary = continuation_summary("synthetic-head");
+        let descent = fake_compaction_request(
+            "B",
+            "A",
+            2,
+            601,
+            true,
+            fake_compaction_messages("2026-08-06", &summary),
+        );
+        let first = run(&store, &descent, &spine());
+        assert_eq!(first.lineage_descent_disposition.as_deref(), Some("descended"));
+
+        // Follow-up pass whose head message is synthetic-marked; the anchor
+        // stays the first NON-synthetic message.
+        let mut synthetic_head = item("synth-head", 10, "synthetic filler");
+        synthetic_head.ck.meta.synthetic = true;
+        let mut follow_up_messages = vec![
+            synthetic_head,
+            wire_item(
+                "user",
+                "summary",
+                11,
+                &[
+                    "<system-reminder>Today's date: 2026-08-06</system-reminder>",
+                    &summary,
+                ],
+            ),
+            wire_item("assistant", "tail", 12, &["continued answer"]),
+        ];
+        follow_up_messages.push(item("succ-13", 13, "successor turn thirteen"));
+        let follow_up = req("B", "descent-cfg", follow_up_messages);
+        let outcome = transform(&store, &follow_up, &pctx("git:proj", "/nonexistent-docs", 0));
+        assert!(
+            outcome.is_ok(),
+            "synthetic head must not fail the anchor gate: {:?}",
+            outcome.err()
+        );
+        let response = outcome.unwrap();
+        assert!(
+            !response.reconcile_pending,
+            "synthetic head must not latch a lineage_anchor_mismatch defer"
         );
     }
 
