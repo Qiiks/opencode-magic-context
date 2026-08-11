@@ -106,6 +106,9 @@ const USER_HINT_MIN_MATCHED_TOKENS: usize = 2;
 const USER_HINT_NORMALIZED_SCORE_FLOOR: f64 = 0.35;
 const DEFAULT_CLEAR_REASONING_AGE: u64 = 50;
 const DEFAULT_CAVEMAN_MIN_CHARS: usize = 500;
+const FIVE_MINUTE_CACHE_TTL_MS: u64 = 5 * 60 * 1_000;
+const ONE_HOUR_CACHE_TTL_MS: u64 = 60 * 60 * 1_000;
+const SUBAGENT_CACHE_TTL: &str = "5m";
 const M1_PENDING_LOG_THRESHOLDS_MS: [i64; 3] =
     [5 * 60 * 1_000, 30 * 60 * 1_000, 2 * 60 * 60 * 1_000];
 static M1_PENDING_LOG_BUCKETS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
@@ -1167,6 +1170,11 @@ pub struct TransformResponse {
     /// reading this module's store.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lineage_descent_disposition: Option<String>,
+    /// TTL the consumer must apply to every cache marker it places on this
+    /// response. Absent = inherit whatever the harness authored (today's
+    /// behaviour), so old/new module+gateway mixes are no-ops in both directions.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cache_ttl: Option<String>,
     /// Prior lineage tail used as the provisional ordinal base for native adapters.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ordinal_continuation_base: Option<u64>,
@@ -1221,6 +1229,7 @@ impl TransformResponse {
             rendered_memory_ids: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
+            cache_ttl: None,
             ordinal_continuation_base: None,
             historian: None,
             ck_messages: None,
@@ -1253,6 +1262,7 @@ impl TransformResponse {
             rendered_memory_ids: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
+            cache_ttl: None,
             ordinal_continuation_base: None,
             historian: None,
             ck_messages: Some(
@@ -1651,6 +1661,75 @@ fn apply_once_with_estimator(
     apply_once_with_estimator_and_projection(store, req, ctx, estimate_tokens, output_cache, None)
 }
 
+/// Convert MC's assumed cache lifetime into a provider-expressible Claude Code marker TTL.
+///
+/// The two values describe different things: the input controls when MC assumes a cache is dead,
+/// while the output is constrained to Anthropic's complete marker vocabulary, `5m|1h`. The wire
+/// mapping is therefore deliberately lossy: assumptions such as 60m, 90m, and 300m all mean "use
+/// the long provider cache" and become `1h`. Zero is the explicit provider-default/no-paid-TTL
+/// intent, while malformed values fall back as though the setting were absent. The `1h` value is
+/// beta-gated by Anthropic's `extended-cache-ttl-2025-04-11` request token. Only the
+/// `claude-code-anthropic` consumer is known to send that token on every request, so the response
+/// profile gate is a correctness constraint; widening it without verifying the beta header would
+/// make rewritten requests fail with HTTP 400.
+fn claude_code_marker_ttl(assumed_lifetime: &str) -> String {
+    let normalized = assumed_lifetime.trim();
+    if normalized.is_empty() {
+        return String::new();
+    }
+    match scheduler::parse_cache_ttl(normalized) {
+        Ok(0) => String::new(),
+        Ok(FIVE_MINUTE_CACHE_TTL_MS) => SUBAGENT_CACHE_TTL.to_string(),
+        Ok(_) => "1h".to_string(),
+        Err(_) => SUBAGENT_CACHE_TTL.to_string(),
+    }
+}
+
+/// Resolve MC's assumed cache lifetime for the idle-HARD predicate.
+///
+/// Anthropic is the one profile here with a known one-hour provider ceiling, and Claude Code has no
+/// cache-keep warmup on this path. An assumption above that ceiling therefore cannot be true and is
+/// clamped down to one hour. Other profiles retain the raw assumption because their provider ceiling
+/// is unknown or their plugin may keep a cache warm. `never` remains the user's explicit instruction
+/// to disable TTL-driven folds and is not a finite lifetime to clamp.
+fn internal_assumed_cache_lifetime_for_profile(
+    profile: Option<SerializerProfile>,
+    is_subagent: bool,
+    configured_assumed_lifetime: &str,
+) -> String {
+    if configured_assumed_lifetime
+        .trim()
+        .eq_ignore_ascii_case("never")
+    {
+        return configured_assumed_lifetime.to_string();
+    }
+    if profile != Some(SerializerProfile::ClaudeCodeAnthropic) {
+        return configured_assumed_lifetime.to_string();
+    }
+    if is_subagent {
+        return SUBAGENT_CACHE_TTL.to_string();
+    }
+    match scheduler::parse_cache_ttl(configured_assumed_lifetime) {
+        Ok(milliseconds) if milliseconds > ONE_HOUR_CACHE_TTL_MS => "1h".to_string(),
+        _ => configured_assumed_lifetime.to_string(),
+    }
+}
+
+fn response_marker_ttl(
+    req: &TransformRequest,
+    configured_assumed_lifetime: &str,
+) -> Option<String> {
+    (SerializerProfile::parse(&req.serializer_profile)
+        == Some(SerializerProfile::ClaudeCodeAnthropic))
+    .then(|| {
+        if req.is_subagent {
+            SUBAGENT_CACHE_TTL.to_string()
+        } else {
+            claude_code_marker_ttl(configured_assumed_lifetime)
+        }
+    })
+}
+
 fn apply_once_with_estimator_and_projection(
     store: &McStore,
     req: &TransformRequest,
@@ -1682,6 +1761,10 @@ fn apply_once_with_estimator_and_projection(
                 boundary_divergence_retry |= boundary_divergence_detected;
                 attempt += 1;
                 continue;
+            }
+            Ok(mut output) => {
+                output.response.cache_ttl = response_marker_ttl(req, &ctx.cache_ttl);
+                return Ok(output);
             }
             other => return other,
         }
@@ -2739,7 +2822,11 @@ fn apply_once(
                 .observed_last_response_at_ms
                 .map(|ts| ts.max(0) as u64)
                 .unwrap_or(0),
-            cache_ttl: ctx.cache_ttl.clone(),
+            cache_ttl: internal_assumed_cache_lifetime_for_profile(
+                serializer_profile,
+                req.is_subagent,
+                &ctx.cache_ttl,
+            ),
         },
         now_ms: ctx.now_ms.max(0) as u64,
         model_key: ctx.model_key.clone(),
@@ -4191,6 +4278,7 @@ fn apply_once(
             rendered_memory_ids: Some(meta.rendered_memory_ids.clone()),
             lineage_switch_consumed_id: lineage_state.acknowledge_edge,
             lineage_descent_disposition: lineage_state.disposition.map(str::to_string),
+            cache_ttl: None,
             ordinal_continuation_base: meta.ordinal_continuation_base,
             historian: None,
             ck_messages: Some(ck_messages),
@@ -9868,6 +9956,168 @@ pub(crate) mod tests {
         InsertMemoryInput, McTagRow, ModuleDropSeedRow, ModuleStateSyncRequest, ModuleUsage,
         NoteCasOutcome, NoteEvaluationInput, NoteWriteInput, StoredCompartment,
     };
+
+    #[test]
+    fn claude_code_cache_ttl_mapper_is_lossy_because_provider_vocabulary_is_limited() {
+        assert_eq!(claude_code_marker_ttl("5m"), "5m");
+        assert_eq!(claude_code_marker_ttl("60m"), "1h");
+        assert_eq!(claude_code_marker_ttl("90m"), "1h");
+        assert_eq!(claude_code_marker_ttl("300m"), "1h");
+        assert_eq!(claude_code_marker_ttl("0m"), "");
+        assert_eq!(claude_code_marker_ttl(""), "");
+    }
+
+    #[test]
+    fn claude_code_cache_ttl_mapper_treats_garbage_as_unset() {
+        assert_eq!(claude_code_marker_ttl("not-a-ttl"), "5m");
+    }
+
+    #[test]
+    fn wire_normalization_does_not_change_the_raw_effective_cache_lifetime() {
+        let config = crate::config::McModuleConfig {
+            cache_ttl: "300m".to_string(),
+            ..crate::config::McModuleConfig::default()
+        };
+        let internally_resolved = config.resolve_cache_ttl(None);
+
+        assert_eq!(internally_resolved, "300m");
+        assert_eq!(claude_code_marker_ttl(&internally_resolved), "1h");
+        assert_eq!(internally_resolved, "300m");
+    }
+
+    #[test]
+    fn claude_code_clamps_only_assumptions_above_its_known_provider_ceiling() {
+        assert_eq!(
+            internal_assumed_cache_lifetime_for_profile(
+                Some(SerializerProfile::ClaudeCodeAnthropic),
+                false,
+                "60m",
+            ),
+            "60m"
+        );
+        assert_eq!(
+            internal_assumed_cache_lifetime_for_profile(
+                Some(SerializerProfile::ClaudeCodeAnthropic),
+                false,
+                "300m",
+            ),
+            "1h"
+        );
+        assert_eq!(
+            internal_assumed_cache_lifetime_for_profile(
+                Some(SerializerProfile::OpencodeAiSdk),
+                false,
+                "300m",
+            ),
+            "300m"
+        );
+    }
+
+    #[test]
+    fn never_assumption_disables_ttl_folds_even_on_claude_code() {
+        let internal = internal_assumed_cache_lifetime_for_profile(
+            Some(SerializerProfile::ClaudeCodeAnthropic),
+            false,
+            "never",
+        );
+        assert_eq!(internal, "never");
+        assert_eq!(scheduler::parse_cache_ttl(&internal), Ok(u64::MAX));
+    }
+
+    #[test]
+    fn cache_ttl_serde_round_trip_preserves_absent_and_empty_states() {
+        let absent = TransformResponse::passthrough(Vec::new(), None);
+        let absent_json = serde_json::to_value(&absent).unwrap();
+        assert!(absent_json.get("cache_ttl").is_none());
+        let absent_round_trip: TransformResponse = serde_json::from_value(absent_json).unwrap();
+        assert_eq!(absent_round_trip.cache_ttl, None);
+
+        let mut provider_default = absent;
+        provider_default.cache_ttl = Some(String::new());
+        let provider_default_json = serde_json::to_value(&provider_default).unwrap();
+        assert_eq!(provider_default_json.get("cache_ttl"), Some(&json!("")));
+        let provider_default_round_trip: TransformResponse =
+            serde_json::from_value(provider_default_json).unwrap();
+        assert_eq!(provider_default_round_trip.cache_ttl, Some(String::new()));
+    }
+
+    #[test]
+    fn cache_ttl_serialization_discriminates_no_opinion_from_provider_default() {
+        let no_opinion = TransformResponse::passthrough(Vec::new(), None);
+        let mut provider_default = no_opinion.clone();
+        provider_default.cache_ttl = Some(String::new());
+
+        let no_opinion_json = serde_json::to_value(no_opinion).unwrap();
+        let provider_default_json = serde_json::to_value(provider_default).unwrap();
+        assert!(!no_opinion_json
+            .as_object()
+            .unwrap()
+            .contains_key("cache_ttl"));
+        assert_eq!(provider_default_json["cache_ttl"], "");
+    }
+
+    #[test]
+    fn claude_code_subagent_serializes_five_minutes_over_model_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = cc_req("cache-ttl-subagent", "cfg", vec![item("a", 1, "alpha")]);
+        request.is_subagent = true;
+        request.model_key = Some("anthropic/claude-opus-4-1".to_string());
+        let mut config = crate::config::McModuleConfig::default();
+        config
+            .cache_ttl_by_model
+            .insert("anthropic/claude-opus-4-1".to_string(), "300m".to_string());
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.cache_ttl = config.resolve_cache_ttl(request.model_key.as_deref());
+
+        let serialized = serde_json::to_value(transform(&s, &request, &ctx).unwrap()).unwrap();
+        assert_eq!(serialized["cache_ttl"], "5m");
+    }
+
+    #[test]
+    fn claude_code_main_serializes_normalized_model_cache_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = cc_req("cache-ttl-model", "cfg", vec![item("a", 1, "alpha")]);
+        request.model_key = Some("anthropic/claude-opus-4-1".to_string());
+        let mut config = crate::config::McModuleConfig::default();
+        config
+            .cache_ttl_by_model
+            .insert("anthropic/claude-opus-4-1".to_string(), "300m".to_string());
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.cache_ttl = config.resolve_cache_ttl(request.model_key.as_deref());
+
+        let serialized = serde_json::to_value(transform(&s, &request, &ctx).unwrap()).unwrap();
+        assert_eq!(serialized["cache_ttl"], "1h");
+    }
+
+    #[test]
+    fn claude_code_main_without_model_serializes_normalized_default_cache_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let request = cc_req("cache-ttl-default", "cfg", vec![item("a", 1, "alpha")]);
+        let config = crate::config::McModuleConfig {
+            cache_ttl: "90m".to_string(),
+            ..crate::config::McModuleConfig::default()
+        };
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.cache_ttl = config.resolve_cache_ttl(request.model_key.as_deref());
+
+        let serialized = serde_json::to_value(transform(&s, &request, &ctx).unwrap()).unwrap();
+        assert_eq!(serialized["cache_ttl"], "1h");
+    }
+
+    #[test]
+    fn non_claude_code_profile_omits_cache_ttl_even_for_one_hour_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let request = opencode_req("cache-ttl-opencode", "cfg", vec![item("a", 1, "alpha")]);
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.cache_ttl = "1h".to_string();
+
+        let serialized = serde_json::to_value(transform(&s, &request, &ctx).unwrap()).unwrap();
+        assert!(serialized.get("cache_ttl").is_none());
+    }
 
     #[test]
     fn effective_context_limit_falls_back_below_plausible_floor() {

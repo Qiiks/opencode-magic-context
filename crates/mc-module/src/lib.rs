@@ -6675,10 +6675,12 @@ impl McHandler {
                 now_ms: pass_now,
                 execute_threshold_percentage: binding.config.execute_threshold_percentage,
                 smart_drops: binding.config.smart_drops,
+                // OpenCode/Pi send their host-resolved value. Claude Code omits it, so use the
+                // request's per-pass model key; a missing key deliberately selects the config default.
                 cache_ttl: parsed.cache_ttl.clone().unwrap_or_else(|| {
                     binding
                         .config
-                        .resolve_cache_ttl(binding.model_key.as_deref())
+                        .resolve_cache_ttl(parsed.model_key.as_deref())
                 }),
                 model_key: binding.model_key.clone(),
                 observed_last_response_at_ms: self
@@ -14165,6 +14167,45 @@ mod tests {
 
     async fn call_transform(handler: &McHandler, messages: Vec<CkIngressMessage>) -> Value {
         call_transform_request(handler, request(messages)).await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_code_response_resolves_per_pass_model_cache_ttl_from_module_config() {
+        let mut config = default_test_config();
+        config.model_chain.clear();
+        config
+            .cache_ttl_by_model
+            .insert("anthropic/claude-opus-4-1".to_string(), "300m".to_string());
+        let route_config = config.clone();
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), config);
+        let mut route = binding(project.to_str().unwrap(), "ses");
+        route.config = route_config;
+        handler.bind_route(7, route);
+        let mut transform_request = request(vec![ck("a", 1, "alpha")]);
+        transform_request["serializer_profile"] = json!("claude-code-anthropic");
+        transform_request["model_key"] = json!("anthropic/claude-opus-4-1");
+
+        let response = call_transform_request(&handler, transform_request).await;
+        assert_eq!(response["cache_ttl"], "1h");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_code_response_without_model_cache_ttl_uses_module_config_default() {
+        let mut config = default_test_config();
+        config.model_chain.clear();
+        config.cache_ttl = "90m".to_string();
+        let route_config = config.clone();
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), config);
+        let mut route = binding(project.to_str().unwrap(), "ses");
+        route.config = route_config;
+        handler.bind_route(7, route);
+        let mut transform_request = request(vec![ck("a", 1, "alpha")]);
+        transform_request["serializer_profile"] = json!("claude-code-anthropic");
+
+        let response = call_transform_request(&handler, transform_request).await;
+        assert_eq!(response["cache_ttl"], "1h");
     }
 
     #[test]
