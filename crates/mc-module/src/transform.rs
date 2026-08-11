@@ -12151,14 +12151,14 @@ pub(crate) mod tests {
             &ctx,
         )
         .unwrap();
-        assert_eq!(execute.action, "SOFT");
+        assert_eq!(execute.action, "SOFT+");
         assert!(s
             .load("ses")
             .unwrap()
             .core
             .frozen_units
             .iter()
-            .any(|unit| unit.key == "red:old#0"));
+            .all(|unit| unit.key != "red:old#0"));
 
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -12192,6 +12192,9 @@ pub(crate) mod tests {
         let mut hard_messages = vec![item("a", 1, "raw")];
         hard_messages.extend(todowrite_arc("hard_old", 2));
         hard_messages.extend(todowrite_arc("hard_new", 4));
+        for ordinal in 6..(6 + crate::selection::RECENT_SUPERSESSION_WINDOW as u64) {
+            hard_messages.push(item(&format!("hard-tail-{ordinal}"), ordinal, "tail"));
+        }
         let hard = transform(
             &s,
             &with_usage(req("ses", "cfg1", hard_messages), 10, 100),
@@ -12308,6 +12311,13 @@ pub(crate) mod tests {
         assert_eq!(boot.action, "HARD");
         messages.extend(todowrite_arc("tail_old", 3));
         messages.extend(todowrite_arc("tail_new", 5));
+        for ordinal in 7..(7 + crate::selection::RECENT_SUPERSESSION_WINDOW as u64) {
+            messages.push(item(&format!("tail-{ordinal}"), ordinal, "tail"));
+        }
+        let mut loaded = s.load("ses").unwrap();
+        loaded.meta.soft_refresh_pending = true;
+        s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
         let response =
             transform(&s, &with_usage(req("ses", "cfg0", messages), 70, 100), &ctx).unwrap();
         assert_eq!(response.action, "SOFT");
@@ -12353,6 +12363,13 @@ pub(crate) mod tests {
                 },
             ),
         });
+        for ordinal in 7..(7 + crate::selection::RECENT_SUPERSESSION_WINDOW as u64) {
+            messages.push(item(&format!("tail-{ordinal}"), ordinal, "tail"));
+        }
+        let mut loaded = s.load("ses").unwrap();
+        loaded.meta.soft_refresh_pending = true;
+        s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
         let response =
             transform(&s, &with_usage(req("ses", "cfg0", messages), 70, 100), &ctx).unwrap();
         assert_eq!(response.action, "SOFT");
@@ -19054,8 +19071,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn sequential_edit_supersession_stays_silent_then_batches_on_pressure() {
-        const DEFER_PASSES: usize = 3;
+    fn aged_supersession_stays_byte_stable_then_rides_one_bust() {
+        const EXECUTE_BAND_PASSES: usize = 3;
 
         let dir = tempfile::tempdir().unwrap();
         let reference_dir = tempfile::tempdir().unwrap();
@@ -19074,15 +19091,18 @@ pub(crate) mod tests {
             assistant_edit_call("edit-call-1", 2, "edit-1", "shared.ts"),
             edit_result("edit-result-1", 3, "edit-1", "result one"),
         ];
-        let context = smart_pctx();
-        let reference_context = pctx("git:proj", "/nonexistent-docs", 0);
+        let mut context = smart_pctx();
+        context.cache_ttl = "never".to_string();
+        let mut reference_context = pctx("git:proj", "/nonexistent-docs", 0);
+        reference_context.cache_ttl = "never".to_string();
         let boot_request = with_usage(
             cc_req("supersession-trickle", "cfg0", messages.clone()),
             10,
             100,
         );
         let boot = transform(&store, &boot_request, &context).unwrap();
-        let reference_boot = transform(&reference_store, &boot_request, &reference_context).unwrap();
+        let reference_boot =
+            transform(&reference_store, &boot_request, &reference_context).unwrap();
         assert_eq!(boot.action, "HARD");
         let mut previous_bytes = canonical_output(boot.messages());
         assert_eq!(
@@ -19090,37 +19110,37 @@ pub(crate) mod tests {
             canonical_output(reference_boot.messages()),
             "both fixtures must begin from identical rendered bytes"
         );
-        assert!(store
-            .load("supersession-trickle")
-            .unwrap()
-            .core
-            .frozen_units
-            .iter()
-            .all(|unit| !unit.key.starts_with("red:")));
 
-        for pass in 0..DEFER_PASSES {
+        let mut next_ordinal = 4u64;
+        for pass in 0..EXECUTE_BAND_PASSES {
             let edit_number = pass + 2;
-            let call_ordinal = (edit_number * 2) as u64;
-            let result_ordinal = (edit_number * 2 + 1) as u64;
             let call_id = format!("edit-{edit_number}");
             messages.push(assistant_edit_call(
                 &format!("edit-call-{edit_number}"),
-                call_ordinal,
+                next_ordinal,
                 &call_id,
                 "shared.ts",
             ));
+            next_ordinal += 1;
             messages.push(edit_result(
                 &format!("edit-result-{edit_number}"),
-                result_ordinal,
+                next_ordinal,
                 &call_id,
                 &format!("result {edit_number}"),
             ));
+            next_ordinal += 1;
+            for message in 0..crate::selection::RECENT_SUPERSESSION_WINDOW {
+                messages.push(item(
+                    &format!("pass-{pass}-tail-{message}"),
+                    next_ordinal,
+                    "stable tail",
+                ));
+                next_ordinal += 1;
+            }
 
-            // The stored deferred-execute state retries execute selection without scheduler
-            // pressure or other byte-changing work. This covers the regression in which each
-            // newly superseded edit rewrote one older prefix arc on every pass.
             for target in [&store, &reference_store] {
                 let mut loaded = target.load("supersession-trickle").unwrap();
+                loaded.meta.soft_refresh_pending = false;
                 loaded.meta.deferred_execute_state = Some(mc_store::DeferredExecuteState {
                     reason: "execute-none".to_string(),
                 });
@@ -19133,24 +19153,23 @@ pub(crate) mod tests {
                     )
                     .unwrap();
             }
-
             let request = with_usage(
                 cc_req("supersession-trickle", "cfg0", messages.clone()),
                 10,
                 100,
             );
-            let deferred = transform(&store, &request, &context).unwrap();
+            let execute_band = transform(&store, &request, &context).unwrap();
             let reference = transform(&reference_store, &request, &reference_context).unwrap();
-            let rendered = canonical_output(deferred.messages());
+            let rendered = canonical_output(execute_band.messages());
             assert_eq!(
                 &rendered[..previous_bytes.len()],
                 previous_bytes.as_slice(),
-                "defer pass {pass} must preserve every previously rendered byte"
+                "non-busting pass {pass} must preserve every existing byte"
             );
             assert_eq!(
                 rendered,
                 canonical_output(reference.messages()),
-                "defer pass {pass} must render byte-identically when supersession is silent"
+                "non-busting pass {pass} must not first-apply supersession"
             );
             assert!(
                 store
@@ -19160,38 +19179,51 @@ pub(crate) mod tests {
                     .frozen_units
                     .iter()
                     .all(|unit| !unit.key.starts_with("red:")),
-                "defer pass {pass} must not change the reclaim set"
+                "non-busting pass {pass} must leave the growing batch pending"
             );
             previous_bytes = rendered;
         }
 
-        let pressure_request = with_usage(
+        let mut loaded = store.load("supersession-trickle").unwrap();
+        loaded.meta.soft_refresh_pending = true;
+        store
+            .commit(
+                "supersession-trickle",
+                loaded.row_version,
+                &loaded.core,
+                &loaded.meta,
+            )
+            .unwrap();
+        let bust_request = with_usage(
             cc_req("supersession-trickle", "cfg0", messages.clone()),
-            70,
+            10,
             100,
         );
-        let batch = transform(&store, &pressure_request, &context).unwrap();
+        let batch = transform(&store, &bust_request, &context).unwrap();
         assert_eq!(batch.action, "SOFT");
         let batch_bytes = canonical_output(batch.messages());
         assert_ne!(
             batch_bytes, previous_bytes,
-            "the pressure pass is the one bust"
+            "the independent refresh is the one bust"
         );
 
         let loaded = store.load("supersession-trickle").unwrap();
-        for edit_number in 1..=DEFER_PASSES {
+        for edit_number in 1..=EXECUTE_BAND_PASSES {
             assert!(
                 frozen_red_payload(&loaded.core, &format!("edit-call-{edit_number}#0")).is_some(),
-                "superseded edit {edit_number} must join the pressure batch"
+                "superseded edit {edit_number} must join the riding batch"
             );
             assert!(
                 frozen_red_payload(&loaded.core, &format!("edit-result-{edit_number}#0")).is_some(),
-                "superseded result {edit_number} must join the pressure batch"
+                "superseded result {edit_number} must join the riding batch"
             );
         }
         assert!(
-            frozen_red_payload(&loaded.core, &format!("edit-call-{}#0", DEFER_PASSES + 1))
-                .is_none(),
+            frozen_red_payload(
+                &loaded.core,
+                &format!("edit-call-{}#0", EXECUTE_BAND_PASSES + 1),
+            )
+            .is_none(),
             "the newest edit stays full"
         );
         let reduction_count = loaded
@@ -19200,7 +19232,7 @@ pub(crate) mod tests {
             .iter()
             .filter(|unit| unit.key.starts_with("red:"))
             .count();
-        assert_eq!(reduction_count, DEFER_PASSES * 2);
+        assert_eq!(reduction_count, EXECUTE_BAND_PASSES * 2);
 
         let replay = transform(
             &store,
@@ -19219,7 +19251,7 @@ pub(crate) mod tests {
                 .filter(|unit| unit.key.starts_with("red:"))
                 .count(),
             reduction_count,
-            "the batch must replay without minting another reclaim change"
+            "the frozen batch must replay without minting another reclaim change"
         );
     }
 

@@ -74,6 +74,12 @@ const T2_TOOLS: &[&str] = &["edit", "write", "apply_patch", "grep", "glob", "aft
 /// Newest-window tool arcs keep a name-preserving call skeleton; older ones fully
 /// reduce the call block. The skeleton-vs-full choice is frozen at freeze time.
 const RECENT_TOOL_SKELETON_WINDOW: usize = 20;
+/// Supersession never rewrites an owner message in the newest window. The 20-message
+/// window matches the existing skeleton window and exceeds the observed maximum cache
+/// marker advance of 3 messages per pass, providing more than 6x margin. A future wire
+/// protocol could carry the exact marker index if measurement still finds rewrites of
+/// newly cached content.
+pub(crate) const RECENT_SUPERSESSION_WINDOW: usize = RECENT_TOOL_SKELETON_WINDOW;
 
 /// The reduction kind emitted per block. `drop` = `[dropped]` placeholder;
 /// `skeleton` = a name-preserving ToolCall shell (newest window, pairing context);
@@ -198,6 +204,8 @@ pub struct SelectionConfig {
 /// arcs to reduce; the arc then expands to per-block decisions.
 struct ToolArc {
     arc_id: String,
+    /// Message that owns the ToolCall block; supersession recency is message-based.
+    owner_message_id: Option<String>,
     name: String,
     /// The arc's age key = the ToolCall block's ordinal (or the min block ordinal).
     ordinal: u64,
@@ -265,6 +273,7 @@ fn group_arcs(items: &[SelItem], frozen: &HashSet<String>) -> Vec<ToolArc> {
         };
         let entry = arcs.entry(arc_id.clone()).or_insert_with(|| ToolArc {
             arc_id: arc_id.clone(),
+            owner_message_id: None,
             name: String::new(),
             ordinal: u64::MAX,
             provider_executed: false,
@@ -295,6 +304,7 @@ fn group_arcs(items: &[SelItem], frozen: &HashSet<String>) -> Vec<ToolArc> {
                 entry.name = normalize_tool_name(name);
                 if entry.call_inputs.is_empty() {
                     entry.input = input.clone();
+                    entry.owner_message_id = item_message_id(item).map(str::to_owned);
                 }
                 entry.call_inputs.push((item.id.clone(), input.clone()));
                 entry.call_bytes += item.byte_size;
@@ -595,7 +605,10 @@ fn expand_arc(
 /// meta drop-all, ctx_note drop-on-zero-value-action; edit/write older-per-file →
 /// edit_marker. Returns per-arc intents so the caller expands + shapes them. Active
 /// (non-reduced, client-executed) arcs only.
-fn select_supersession(arcs: &[&ToolArc]) -> HashMap<String, ArcIntent> {
+fn select_supersession(
+    arcs: &[&ToolArc],
+    recent_message_ids: &HashSet<String>,
+) -> HashMap<String, ArcIntent> {
     let mut intents: HashMap<String, ArcIntent> = HashMap::new();
     // Newest-arc-first for keep-N and newest-per-file semantics.
     let mut newest_first: Vec<&&ToolArc> = arcs.iter().collect();
@@ -615,9 +628,15 @@ fn select_supersession(arcs: &[&ToolArc]) -> HashMap<String, ArcIntent> {
         if is_edit_tool(name) {
             if let Some(fp) = read_input_str(&arc.input, FILE_PATH_KEYS) {
                 if seen_file.contains(&fp) {
-                    intents
-                        .entry(arc.arc_id.clone())
-                        .or_insert(ArcIntent { edit_marker: true });
+                    if arc
+                        .owner_message_id
+                        .as_ref()
+                        .is_some_and(|mid| !recent_message_ids.contains(mid))
+                    {
+                        intents
+                            .entry(arc.arc_id.clone())
+                            .or_insert(ArcIntent { edit_marker: true });
+                    }
                 } else {
                     seen_file.insert(fp); // newest edit to this file stays full
                 }
@@ -640,7 +659,12 @@ fn select_supersession(arcs: &[&ToolArc]) -> HashMap<String, ArcIntent> {
         } else {
             false
         };
-        if is_drop_target {
+        if is_drop_target
+            && arc
+                .owner_message_id
+                .as_ref()
+                .is_some_and(|mid| !recent_message_ids.contains(mid))
+        {
             // A full drop supersedes an edit_marker for the same arc (drop wins).
             intents.insert(arc.arc_id.clone(), ArcIntent { edit_marker: false });
         }
@@ -853,6 +877,18 @@ pub fn select_reductions(
         .collect();
     let arcs = group_arcs(items, frozen_keys);
     let reasoning_ineligible_arcs = reasoning_ineligible_arc_ids(items);
+    let mut messages_by_recency: Vec<(u64, String)> = items
+        .iter()
+        .filter_map(|item| Some((item.ordinal, item_message_id(item)?.to_owned())))
+        .collect();
+    messages_by_recency.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let mut seen_message_ids = HashSet::new();
+    messages_by_recency.retain(|(_, mid)| seen_message_ids.insert(mid.clone()));
+    let recent_supersession_message_ids: HashSet<String> = messages_by_recency
+        .into_iter()
+        .take(RECENT_SUPERSESSION_WINDOW)
+        .map(|(_, mid)| mid)
+        .collect();
 
     // The COMPOSED candidate pool: active (non-reduced), client-executed arcs only.
     // frozen_keys is applied per-block at emit time (expand_arc skips frozen ids); an
@@ -870,14 +906,25 @@ pub fn select_reductions(
 
     match ctx.pass_class {
         PassClass::EmergencyForce => {
-            // Emergency OWNS the pass (mutually exclusive with the execute selectors).
-            // fixedFloor accounting sums ALL active arcs' reclaimable tokens.
+            // Emergency owns age selection, while supersession may ride the canonical
+            // force-band discriminant below. fixedFloor accounting sums ALL active arcs.
             let all_active_reclaim: f64 = active_arcs
                 .iter()
                 .map(|a| bytes_to_tokens(a.reclaim_bytes()))
                 .sum();
             for arc_id in select_emergency(&active_arcs, ctx, all_active_reclaim) {
                 arc_shapes.insert(arc_id, ArcShape::FullDrop);
+            }
+            if cfg.smart_drops {
+                for (arc_id, intent) in
+                    select_supersession(&active_arcs, &recent_supersession_message_ids)
+                {
+                    arc_shapes.entry(arc_id).or_insert(if intent.edit_marker {
+                        ArcShape::EditMarker
+                    } else {
+                        ArcShape::FullDrop
+                    });
+                }
             }
         }
         PassClass::Execute => {
@@ -886,12 +933,10 @@ pub fn select_reductions(
             for arc_id in select_two_pass(&active_arcs, ctx) {
                 arc_shapes.insert(arc_id, ArcShape::FullDrop);
             }
-            // Keep supersession intents pending until scheduler pressure requires execution
-            // or this pass is already changing other bytes, then apply them together.
-            if cfg.smart_drops
-                && (ctx.scheduler_pressure_execute || ctx.pass_already_busting)
-            {
-                let intents = select_supersession(&active_arcs);
+            // Supersession is deferred work: ordinary execute-band pressure cannot
+            // authorize a rewrite, so the entire pending set waits for another bust.
+            if cfg.smart_drops && ctx.pass_already_busting {
+                let intents = select_supersession(&active_arcs, &recent_supersession_message_ids);
                 for (arc_id, intent) in intents {
                     if arc_shapes.contains_key(&arc_id) {
                         continue; // already a drop (two-pass) → drop wins
@@ -1297,7 +1342,7 @@ mod tests {
         let mut saw_t2_tool = false;
 
         for case in &cases {
-            let items: Vec<SelItem> = case
+            let mut items: Vec<SelItem> = case
                 .items
                 .iter()
                 .map(|i| SelItem {
@@ -1310,6 +1355,21 @@ mod tests {
                     arc_id: i.arc_id.clone(),
                 })
                 .collect();
+            if case.smart_drops {
+                let first_padding_ordinal = items
+                    .iter()
+                    .map(|item| item.ordinal)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                for n in 0..RECENT_SUPERSESSION_WINDOW {
+                    items.push(text_with_id(
+                        &format!("golden-tail-{n}#0"),
+                        first_padding_ordinal + n as u64,
+                        1,
+                    ));
+                }
+            }
             let call_ids: HashSet<&str> = items
                 .iter()
                 .filter(|i| matches!(&i.kind, SelKind::ToolCall { .. }))
@@ -1354,7 +1414,7 @@ mod tests {
                 agent_drop_ids: case.ctx.agent_drop_ids.clone(),
                 agent_drop_command_ids: HashMap::new(),
                 first_applied_agent_drop_ids: HashSet::new(),
-                pass_already_busting: false,
+                pass_already_busting: case.smart_drops,
                 protected_block_ids: HashSet::new(),
             };
             let cfg = SelectionConfig {
@@ -1409,8 +1469,105 @@ mod tests {
     }
 
     #[test]
-    fn supersession_waits_for_pressure_or_an_independent_bust_and_batches() {
-        let items = vec![
+    fn sustained_execute_band_accumulates_supersession_without_trickling() {
+        const PASSES: u64 = 3;
+
+        let mut items = vec![
+            tool_call(
+                "c1",
+                1,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":"one"}),
+                500,
+            ),
+            tool_result("c1", 1, "edit", 100),
+        ];
+        let cfg = SelectionConfig { smart_drops: true };
+        let mut next_ordinal = 2;
+
+        for pass in 1..=PASSES {
+            let edit_number = pass + 1;
+            items.push(tool_call(
+                &format!("c{edit_number}"),
+                next_ordinal,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":format!("edit-{edit_number}")}),
+                500,
+            ));
+            items.push(tool_result(
+                &format!("c{edit_number}"),
+                next_ordinal,
+                "edit",
+                100,
+            ));
+            next_ordinal += 1;
+            for message in 0..RECENT_SUPERSESSION_WINDOW {
+                items.push(text_with_id(
+                    &format!("pass-{pass}-tail-{message}#0"),
+                    next_ordinal,
+                    1,
+                ));
+                next_ordinal += 1;
+            }
+
+            let mut ctx = base_ctx(PassClass::Execute);
+            ctx.scheduler_pressure_execute = true;
+            assert!(
+                select_reductions(&items, &HashSet::new(), &ctx, &cfg).is_empty(),
+                "66% execute-band pressure must not admit pass {pass} supersession"
+            );
+
+            ctx.pass_already_busting = true;
+            assert_eq!(
+                select_reductions(&items, &HashSet::new(), &ctx, &cfg).len(),
+                pass as usize * 2,
+                "the pending superseded members must accumulate as a single batch"
+            );
+        }
+    }
+
+    #[test]
+    fn independent_bust_applies_the_whole_aged_supersession_batch() {
+        let mut items = Vec::new();
+        for n in 1..=4u64 {
+            items.push(tool_call(
+                &format!("c{n}"),
+                n,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":format!("edit-{n}")}),
+                500,
+            ));
+            items.push(tool_result(&format!("c{n}"), n, "edit", 100));
+        }
+        for n in 0..RECENT_SUPERSESSION_WINDOW {
+            items.push(text_with_id(&format!("tail-{n}#0"), 5 + n as u64, 1));
+        }
+
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.scheduler_pressure_execute = true;
+        ctx.pass_already_busting = true;
+        let out = select_reductions(
+            &items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig { smart_drops: true },
+        );
+        assert_eq!(out.len(), 6, "all three superseded arcs must ride together");
+        assert_eq!(
+            out.iter()
+                .filter(|decision| decision.kind == "edit_marker")
+                .count(),
+            3,
+            "each superseded call becomes an edit marker"
+        );
+        assert!(out
+            .iter()
+            .all(|decision| !decision.target_id.starts_with("c4#")));
+    }
+
+    #[test]
+    fn force_band_applies_aged_supersession_without_an_independent_bust() {
+        let mut items = vec![
             tool_call(
                 "c1",
                 1,
@@ -1427,57 +1584,64 @@ mod tests {
                 500,
             ),
             tool_result("c2", 2, "edit", 100),
+        ];
+        for n in 0..RECENT_SUPERSESSION_WINDOW {
+            items.push(text_with_id(&format!("tail-{n}#0"), 3 + n as u64, 1));
+        }
+
+        let ctx = base_ctx(PassClass::EmergencyForce);
+        let out = select_reductions(
+            &items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig { smart_drops: true },
+        );
+        assert_eq!(out.len(), 2);
+        assert!(out
+            .iter()
+            .all(|decision| decision.target_id.starts_with("c1#")));
+    }
+
+    #[test]
+    fn recent_supersession_floor_waits_until_the_owner_message_ages_out() {
+        let mut items = vec![
             tool_call(
-                "c3",
-                3,
+                "c1",
+                1,
                 "edit",
-                serde_json::json!({"filePath":"a.ts","oldString":"three"}),
+                serde_json::json!({"filePath":"a.ts","oldString":"one"}),
                 500,
             ),
-            tool_result("c3", 3, "edit", 100),
-            tool_call("c4", 4, "bash_status", serde_json::json!({}), 100),
-            tool_result("c4", 4, "bash_status", 100),
+            tool_result("c1", 1, "edit", 100),
+            tool_call(
+                "c2",
+                2,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":"two"}),
+                500,
+            ),
+            tool_result("c2", 2, "edit", 100),
         ];
+        for n in 0..18u64 {
+            items.push(text_with_id(&format!("tail-{n}#0"), 3 + n, 1));
+        }
         let mut ctx = base_ctx(PassClass::Execute);
-        ctx.scheduler_pressure_execute = false;
+        ctx.pass_already_busting = true;
         let cfg = SelectionConfig { smart_drops: true };
 
         assert!(select_reductions(&items, &HashSet::new(), &ctx, &cfg).is_empty());
 
-        ctx.pass_already_busting = true;
-        let riding = select_reductions(&items, &HashSet::new(), &ctx, &cfg);
-        ctx.pass_already_busting = false;
-        ctx.scheduler_pressure_execute = true;
-        let pressured = select_reductions(&items, &HashSet::new(), &ctx, &cfg);
+        items.push(text_with_id("tail-18#0", 21, 1));
+        let aged = select_reductions(&items, &HashSet::new(), &ctx, &cfg);
+        assert_eq!(aged.len(), 2);
+        assert!(aged
+            .iter()
+            .all(|decision| decision.target_id.starts_with("c1#")));
+    }
 
-        let signature = |decisions: &[ReductionDecision]| {
-            decisions
-                .iter()
-                .map(|decision| {
-                    (
-                        decision.target_id.clone(),
-                        decision.kind.clone(),
-                        decision.payload.clone(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(signature(&riding), signature(&pressured));
-        assert_eq!(
-            pressured
-                .iter()
-                .map(|decision| decision.target_id.clone())
-                .collect::<Vec<_>>(),
-            vec![
-                call_block_id("c1"),
-                result_block_id("c1"),
-                call_block_id("c2"),
-                result_block_id("c2"),
-                call_block_id("c4"),
-                result_block_id("c4"),
-            ],
-            "edit markers and control-plane drops must first-apply in one qualifying batch"
-        );
+    #[test]
+    fn supersession_floor_keeps_more_than_six_times_the_measured_marker_advance() {
+        assert_eq!(RECENT_SUPERSESSION_WINDOW, 20);
     }
 
     #[test]
@@ -1808,7 +1972,7 @@ mod tests {
         // so c1 stays an edit_marker in BOTH (last_execute_ordinal stays 0, so c1 is
         // never a two-pass FullDrop that would change its shape). A payload fn that
         // accidentally read ctx would diverge here; a pure one cannot.
-        let items = vec![
+        let mut items = vec![
             tool_call(
                 "c1",
                 1,
@@ -1836,6 +2000,9 @@ mod tests {
             tool_call("c9", 9, "read", serde_json::json!({}), 50),
             tool_result("c9", 9, "read", 300),
         ];
+        for n in 0..RECENT_SUPERSESSION_WINDOW {
+            items.push(text_with_id(&format!("tail-{n}#0"), 10 + n as u64, 1));
+        }
         let c1_marker_payload = |ctx: &SelectionContext| -> Option<String> {
             let out = select_reductions(
                 &items,
@@ -1849,7 +2016,8 @@ mod tests {
         };
 
         // Context A: no agent drops, zero pressure fields.
-        let ctx_a = base_ctx(PassClass::Execute);
+        let mut ctx_a = base_ctx(PassClass::Execute);
+        ctx_a.pass_already_busting = true;
         // Context B: a genuinely different produced set — an unrelated agent drop (c9)
         // plus non-zero pressure/latch fields. last_execute_ordinal stays 0 so c1 is NOT
         // a two-pass drop candidate (keeps it an edit_marker in both).
@@ -1860,6 +2028,7 @@ mod tests {
             protected_cutoff_ordinal: 2,
             prior_input_sample: 99_000.0,
             has_prior_drop: true,
+            pass_already_busting: true,
             ..base_ctx(PassClass::Execute)
         };
 
