@@ -2187,9 +2187,15 @@ fn apply_once(
             )
         })?;
         let compartment_end = store.max_compartment_end_ordinal(&req.session_id)?;
-        if compartment_end <= 0 || compartment_end as u64 != expected_boundary {
+        // The continuation base is a frozen fact about the descent seam, so it is
+        // validated directionally: coverage must have REACHED the seam. Coverage
+        // past the seam is the historian folding during the successor run and is
+        // legitimate; requiring equality here wedged every continued lineage on
+        // its first post-descent fold while the peer's basis stayed correctly
+        // frozen at the seam.
+        if compartment_end <= 0 || (compartment_end as u64) < expected_boundary {
             return Err(TransformError::LineageProtocol(format!(
-                "continued lineage requires boundary ordinal {expected_boundary}, found compartment end {compartment_end}; refusing silent re-base-to-1 fallback"
+                "continued lineage requires boundary coverage through ordinal {expected_boundary}, found compartment end {compartment_end}; refusing silent re-base-to-1 fallback"
             )));
         }
         let first_live = req
@@ -23539,6 +23545,63 @@ pub(crate) mod tests {
         assert_eq!(mismatch_response.action, "PASSTHROUGH");
         assert_eq!(mismatch_response.lineage_switch_consumed_id, None);
         assert!(store.load("resolved-target").unwrap().row_version.is_none());
+    }
+
+    #[test]
+    fn continued_lineage_survives_post_descent_folds_advancing_past_the_seam() {
+        // Prod wedge f6a4ca71 (2026-08-11): the continuation base is frozen at
+        // the descent seam, but the successor's historian keeps folding. The
+        // old equality check fenced every pass after the first successor fold
+        // (+2 / +5 compartment-end overhangs); coverage PAST the seam must be
+        // accepted, coverage SHORT of it must still refuse.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_fake_compaction_prior(&store, "A");
+        let summary = continuation_summary("seam");
+        let descent = fake_compaction_request(
+            "B",
+            "A",
+            2,
+            501,
+            true,
+            fake_compaction_messages("2026-08-06", &summary),
+        );
+        let first = run(&store, &descent, &spine());
+        assert_eq!(first.lineage_descent_disposition.as_deref(), Some("descended"));
+        assert_eq!(first.ordinal_continuation_base, Some(10));
+
+        // The successor runs on: the historian folds messages past the seam,
+        // exactly what a healthy long-lived successor does.
+        store
+            .append_compartments("B", &[comp(4, 12, 14, "successor-14", "successor work")])
+            .unwrap();
+
+        // An ordinary follow-up pass (no lineage switch) must NOT fence on the
+        // advanced compartment end.
+        // The successor's wire continues the predecessor's numbering: first
+        // live ordinal is base + 1, exactly as the gateway's edge counter
+        // assigns it.
+        let mut follow_up_messages = vec![
+            wire_item(
+                "user",
+                "summary",
+                11,
+                &[
+                    "<system-reminder>Today's date: 2026-08-06</system-reminder>",
+                    &summary,
+                ],
+            ),
+            wire_item("assistant", "tail", 12, &["continued answer"]),
+        ];
+        follow_up_messages.push(item("succ-13", 13, "successor turn thirteen"));
+        follow_up_messages.push(item("succ-14", 14, "successor turn fourteen"));
+        let follow_up = req("B", "descent-cfg", follow_up_messages);
+        let outcome = transform(&store, &follow_up, &pctx("git:proj", "/nonexistent-docs", 0));
+        assert!(
+            outcome.is_ok(),
+            "post-descent fold past the seam must not fence: {:?}",
+            outcome.err()
+        );
     }
 
     #[test]
