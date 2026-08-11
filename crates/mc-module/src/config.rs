@@ -91,6 +91,12 @@ impl McModuleConfig {
     /// adapter: exact and bare candidates at each progressive dash boundary,
     /// then the provider wildcard, then the configured default.
     pub fn resolve_cache_ttl(&self, model_key: Option<&str>) -> String {
+        // No producer currently sends an unprefixed key, but the pre-parity
+        // walk honored an exact match before splitting; keep that so a bare
+        // input can never silently downgrade to the default TTL.
+        if let Some(ttl) = model_key.and_then(|key| self.cache_ttl_by_model.get(key)) {
+            return ttl.clone();
+        }
         let Some((provider, mut model_id)) = model_key.and_then(|key| key.split_once('/')) else {
             return self.cache_ttl.clone();
         };
@@ -472,6 +478,9 @@ mod cache_ttl_tests {
         assert_eq!(cfg.resolve_cache_ttl(Some("openai/gpt-5.6-sol")), "30m");
         assert_eq!(cfg.resolve_cache_ttl(Some("unknown/model")), "10m");
         assert_eq!(cfg.resolve_cache_ttl(None), "10m");
+        // A bare unprefixed key with an exact config entry must not downgrade
+        // to the default (pre-parity behavior preserved).
+        assert_eq!(cfg.resolve_cache_ttl(Some("gpt-5.6-sol")), "30m");
     }
 
     #[test]
