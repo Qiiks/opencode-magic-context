@@ -17,12 +17,7 @@ describe("legacy upgrade-identity crossing (R3 F7)", () => {
     });
 
     test("a recorded mural component round-trips and discriminates", () => {
-        const recorded = encodeCachedM0UpgradeIdentity(
-            "upgrade-v2",
-            "cre2",
-            true,
-            "m15000-h96000",
-        );
+        const recorded = encodeCachedM0UpgradeIdentity("upgrade-v2", "cre2", true, "m15000-h96000");
         const decoded = decodeCachedM0UpgradeIdentity(recorded);
         expect(decoded.muralEnabled).toBe(true);
         expect(decoded.renderBudgetIdentity).toBe("m15000-h96000");
