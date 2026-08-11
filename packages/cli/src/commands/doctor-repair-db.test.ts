@@ -166,42 +166,36 @@ function seedCurrentDatabase(dbPath: string): void {
 }
 
 function corruptLastTagLeaf(dbPath: string): void {
+    // Zero exactly one LEAF page of the `tags` b-tree, so most rows survive and `.recover`
+    // has something to salvage. Two approaches are unavailable here: `dbstat` is a
+    // compile-time SQLite option (SQLITE_ENABLE_DBSTAT_VTAB) that some bun builds omit, and
+    // scanning for row text picks a different page depending on how the build packs cells —
+    // both make the fixture depend on the toolchain rather than on the code under test.
+    // Instead walk the documented on-disk format: sqlite_master gives the table's root page,
+    // and the page header's rightmost-child pointer descends to the last leaf.
     const db = new Database(dbPath, { readonly: true });
     const { page_size: pageSize } = db.prepare("PRAGMA page_size").get() as { page_size: number };
-    // `dbstat` is a compile-time SQLite option (SQLITE_ENABLE_DBSTAT_VTAB), present in some
-    // bun builds and absent in others, so picking a page through it makes this fixture pass
-    // or fail on the toolchain rather than on the code under test. Scan the file instead.
-    // Every `tags` row stores the literal 'message' in its type column and nothing bulky,
-    // so a tags leaf packs dozens of them into one page while other pages that mention the
-    // word (the schema page's start_message/end_message columns) hold only a few. Taking
-    // the page with the MOST occurrences therefore lands on a real tags leaf without a
-    // magic threshold; skip page 1, which is the schema header.
-    const { page_count: pageCount } = db.prepare("PRAGMA page_count").get() as {
-        page_count: number;
-    };
+    const { rootpage } = db
+        .prepare("SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'tags'")
+        .get() as { rootpage: number };
     db.close();
 
-    const rowMarker = Buffer.from("message");
     const fd = openSync(dbPath, "r+");
     try {
         const buffer = Buffer.alloc(pageSize);
-        let target: number | undefined;
-        let best = 0;
-        for (let pageno = 2; pageno <= pageCount; pageno++) {
+        let pageno = rootpage;
+        // Page 1 carries the 100-byte database header before its b-tree header.
+        for (let depth = 0; depth < 32; depth++) {
             readSync(fd, buffer, 0, pageSize, (pageno - 1) * pageSize);
-            let count = 0;
-            let at = buffer.indexOf(rowMarker);
-            while (at !== -1) {
-                count += 1;
-                at = buffer.indexOf(rowMarker, at + rowMarker.length);
-            }
-            if (count > best) {
-                best = count;
-                target = pageno;
-            }
+            const headerAt = pageno === 1 ? 100 : 0;
+            const pageType = buffer[headerAt];
+            if (pageType === 0x0d) break; // leaf table page
+            if (pageType !== 0x05) throw new Error(`unexpected page type 0x${pageType.toString(16)}`);
+            // Interior table page: the rightmost child pointer lives at header offset 8.
+            pageno = buffer.readUInt32BE(headerAt + 8);
         }
-        if (!target) throw new Error("no tags leaf page found to corrupt");
-        writeSync(fd, Buffer.alloc(pageSize), 0, pageSize, (target - 1) * pageSize);
+        if (buffer[pageno === 1 ? 100 : 0] !== 0x0d) throw new Error("no tags leaf page found");
+        writeSync(fd, Buffer.alloc(pageSize), 0, pageSize, (pageno - 1) * pageSize);
     } finally {
         closeSync(fd);
     }
