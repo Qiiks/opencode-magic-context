@@ -8,6 +8,29 @@ export function jsoncErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+const PROTOTYPE_POLLUTION_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function assertPrototypeSafe(value: unknown, path = "$root"): void {
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => {
+      assertPrototypeSafe(entry, `${path}[${index}]`);
+    });
+    return;
+  }
+  if (!isRecord(value)) return;
+
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== null && prototype !== Object.prototype) {
+    throw new Error(`unsafe prototype-pollution key at ${path}.__proto__`);
+  }
+  for (const key of Object.keys(value)) {
+    if (PROTOTYPE_POLLUTION_KEYS.has(key)) {
+      throw new Error(`unsafe prototype-pollution key at ${path}.${key}`);
+    }
+    assertPrototypeSafe(value[key], `${path}.${key}`);
+  }
+}
+
 function parseRoot(text: string): Record<string, unknown> {
   const source = text.trim() === "" ? "{}\n" : text;
   let parsed: unknown;
@@ -19,6 +42,7 @@ function parseRoot(text: string): Record<string, unknown> {
   if (!isRecord(parsed)) {
     throw new Error("Config JSONC root must be an object");
   }
+  assertPrototypeSafe(parsed);
   return parsed;
 }
 

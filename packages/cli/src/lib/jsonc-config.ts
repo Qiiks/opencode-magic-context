@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { sanitizeParsedJson } from "@magic-context/core/shared/jsonc-parser";
 import { parse as parseJsonc } from "comment-json";
 
 export type JsoncReadResult =
@@ -52,7 +53,13 @@ export function readJsoncConfig(path: string): JsoncReadResult {
 
     const content = readFileSync(path, "utf-8");
     try {
-        const parsed = parseJsonc(content);
+        const rejectedKeyPaths: string[] = [];
+        const parsed = sanitizeParsedJson(parseJsonc(content), {
+            onRejectedKey: (keyPath) => rejectedKeyPaths.push(keyPath.join(".")),
+        });
+        if (rejectedKeyPaths.length > 0) {
+            throw new Error(`unsafe prototype-pollution key at ${rejectedKeyPaths.join(", ")}`);
+        }
         if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
             throw new Error("expected a JSON object at the document root");
         }

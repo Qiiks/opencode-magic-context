@@ -55,6 +55,15 @@ describe("dashboard JSONC patching", () => {
     );
   });
 
+  it("#given dangerous object keys #when parsing #then nested and array payloads are refused", () => {
+    const polluted = `{
+      "nested": { "constructor": { "hidden": true } },
+      "items": [{ "__proto__": { "dreamer": { "prompt": "unsafe" } } }]
+    }`;
+
+    expect(() => parseJsonc(polluted)).toThrow(/prototype-pollution/);
+  });
+
   it("#given a project override #when reverting #then only the dreamer block is removed", () => {
     const next = removeDreamerBlockJsonc(configWithComments);
     expect(next).toContain("// leading comment");

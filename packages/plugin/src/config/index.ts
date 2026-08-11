@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 
-import { detectConfigFile, parseJsonc } from "../shared/jsonc-parser";
+import { detectConfigFile, isPrototypePollutionKey, parseJsonc } from "../shared/jsonc-parser";
 import { setOutputReserveConfig } from "../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../shared/prompt-surface";
 import { isCompactionEnabled, migrateLegacyAgentEnabledInMemory } from "./agent-disable";
@@ -127,10 +127,25 @@ function loadConfigFileDetailed(
             configPath,
             isProjectConfig: source === "project",
         });
+        const rejectedKeyPaths: string[] = [];
+        const config = parseJsonc<Record<string, unknown>>(substituted.text, {
+            onRejectedKey: (path) => rejectedKeyPaths.push(path.join(".")),
+        });
+        const unsafeKeyWarnings = rejectedKeyPaths.map(
+            (path) =>
+                `Ignored unsafe config key "${path}" (security: prototype-pollution keys are not allowed).`,
+        );
         return {
-            config: parseJsonc<Record<string, unknown>>(substituted.text),
-            warnings: substituted.warnings.map((w) => `${configPath}: ${w}`),
-            outcome: substituted.warnings.length > 0 ? "substitution-failure" : "ok",
+            config,
+            warnings: [...substituted.warnings, ...unsafeKeyWarnings].map(
+                (warning) => `${configPath}: ${warning}`,
+            ),
+            outcome:
+                rejectedKeyPaths.length > 0
+                    ? "schema-recovery"
+                    : substituted.warnings.length > 0
+                      ? "substitution-failure"
+                      : "ok",
             source,
         };
     } catch (error) {
@@ -159,14 +174,30 @@ function loadConfigFileDetailed(
  * and project can both contribute hook IDs without one silently losing the
  * other's entries.
  */
+function defineOwnConfigValue(target: Record<string, unknown>, key: string, value: unknown): void {
+    Object.defineProperty(target, key, {
+        value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+    });
+}
+
 function deepMergeRawConfig(
     base: Record<string, unknown>,
     override: Record<string, unknown>,
 ): Record<string, unknown> {
-    const result: Record<string, unknown> = { ...base };
+    const result: Record<string, unknown> = {};
+    for (const key of Object.keys(base)) {
+        if (isPrototypePollutionKey(key)) continue;
+        defineOwnConfigValue(result, key, base[key]);
+    }
+
     for (const key of Object.keys(override)) {
-        const baseVal = base[key];
+        if (isPrototypePollutionKey(key)) continue;
+        const baseVal = Object.hasOwn(base, key) ? base[key] : undefined;
         const overrideVal = override[key];
+        let mergedValue: unknown;
         if (
             baseVal !== null &&
             typeof baseVal === "object" &&
@@ -175,7 +206,7 @@ function deepMergeRawConfig(
             typeof overrideVal === "object" &&
             !Array.isArray(overrideVal)
         ) {
-            result[key] = deepMergeRawConfig(
+            mergedValue = deepMergeRawConfig(
                 baseVal as Record<string, unknown>,
                 overrideVal as Record<string, unknown>,
             );
@@ -186,10 +217,11 @@ function deepMergeRawConfig(
         ) {
             // Union-merge so user + project can both disable hooks without
             // one source erasing the other's entries.
-            result[key] = [...new Set([...baseVal, ...overrideVal])];
+            mergedValue = [...new Set([...baseVal, ...overrideVal])];
         } else {
-            result[key] = overrideVal;
+            mergedValue = overrideVal;
         }
+        defineOwnConfigValue(result, key, mergedValue);
     }
     return result;
 }

@@ -21,9 +21,13 @@ import {
 	MagicContextConfigSchema,
 } from "@magic-context/core/config/schema/magic-context";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
+import {
+	isPrototypePollutionKey,
+	sanitizeParsedJson,
+} from "@magic-context/core/shared/jsonc-parser";
 import { setOutputReserveConfig } from "@magic-context/core/shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "@magic-context/core/shared/prompt-surface";
-import { parse as parseJsonc } from "comment-json";
+import { parse as parseCommentJson } from "comment-json";
 
 export interface LoadPiConfigOptions {
 	cwd?: string;
@@ -110,13 +114,28 @@ function loadConfigFile(
 			// {env:}/{file:} secret-bearing tokens (parity with OpenCode).
 			isProjectConfig: scope === "project",
 		});
+		const rejectedKeyPaths: string[] = [];
+		const config = sanitizeParsedJson(
+			parseCommentJson(substituted.text) as Record<string, unknown>,
+			{ onRejectedKey: (keyPath) => rejectedKeyPaths.push(keyPath.join(".")) },
+		);
+		const unsafeKeyWarnings = rejectedKeyPaths.map(
+			(keyPath) =>
+				`Ignored unsafe config key "${keyPath}" (security: prototype-pollution keys are not allowed).`,
+		);
 		return {
 			path,
 			scope,
-			config: parseJsonc(substituted.text) as Record<string, unknown>,
-			warnings: substituted.warnings.map((warning) => `${path}: ${warning}`),
+			config,
+			warnings: [...substituted.warnings, ...unsafeKeyWarnings].map(
+				(warning) => `${path}: ${warning}`,
+			),
 			loadOutcome:
-				substituted.warnings.length > 0 ? "substitution-failure" : "ok",
+				rejectedKeyPaths.length > 0
+					? "schema-recovery"
+					: substituted.warnings.length > 0
+						? "substitution-failure"
+						: "ok",
 		};
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -156,18 +175,38 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function defineOwnConfigValue(
+	target: Record<string, unknown>,
+	key: string,
+	value: unknown,
+): void {
+	Object.defineProperty(target, key, {
+		value,
+		enumerable: true,
+		configurable: true,
+		writable: true,
+	});
+}
+
 function mergeRawConfigs(
 	base: Record<string, unknown>,
 	override: Record<string, unknown>,
 ): Record<string, unknown> {
-	const merged: Record<string, unknown> = { ...base };
+	const merged: Record<string, unknown> = {};
+	for (const key of Object.keys(base)) {
+		if (isPrototypePollutionKey(key)) continue;
+		defineOwnConfigValue(merged, key, base[key]);
+	}
 
-	for (const [key, overrideValue] of Object.entries(override)) {
-		const baseValue = merged[key];
-		merged[key] =
+	for (const key of Object.keys(override)) {
+		if (isPrototypePollutionKey(key)) continue;
+		const overrideValue = override[key];
+		const baseValue = Object.hasOwn(base, key) ? base[key] : undefined;
+		const mergedValue =
 			isPlainObject(baseValue) && isPlainObject(overrideValue)
 				? mergeRawConfigs(baseValue, overrideValue)
 				: overrideValue;
+		defineOwnConfigValue(merged, key, mergedValue);
 	}
 
 	return merged;
