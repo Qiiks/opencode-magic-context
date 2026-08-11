@@ -380,23 +380,26 @@ export function createSystemPromptHashHandler(deps: {
 
         // ── Step 2: Coalesce content/preset and date changes into one bust ──
         const DATE_PATTERN = /Today's date: .+/;
+        const DATE_PATTERN_ALL = /Today's date: .+/g;
         const liveSystemContent = output.system.join("\n");
         if (liveSystemContent.length === 0) return;
         const previousHash = sessionMetaEarly?.systemPromptHash ?? "";
         const hasPersistedHash = previousHash !== "" && previousHash !== "0";
-        let dateElementIndex = -1;
+        // Every element carrying a date line participates in freezing. Only MC
+        // injects the line today, but a host prompt carrying the same format
+        // must not leave a second live date that busts the hash at midnight.
+        const dateElementIndexes: number[] = [];
         let currentDate: string | undefined;
         for (let i = 0; i < output.system.length; i++) {
             const match = output.system[i].match(DATE_PATTERN);
             if (!match) continue;
-            dateElementIndex = i;
-            currentDate = match[0];
-            break;
+            dateElementIndexes.push(i);
+            currentDate ??= match[0];
         }
         const stickyDate = stickyDateBySession.get(sessionId);
         const stableCandidate =
             currentDate && stickyDate && currentDate !== stickyDate
-                ? liveSystemContent.replace(DATE_PATTERN, stickyDate)
+                ? liveSystemContent.replace(DATE_PATTERN_ALL, stickyDate)
                 : liveSystemContent;
         const stableCandidateHash = createHash("md5")
             .update(promptSurfaceHashMaterial(stableCandidate, promptSurface.preset))
@@ -413,11 +416,13 @@ export function createSystemPromptHashHandler(deps: {
                     sessionId,
                     `system prompt date updated: ${stickyDate} → ${currentDate} (cache-busting pass)`,
                 );
-            } else if (dateElementIndex >= 0) {
-                output.system[dateElementIndex] = output.system[dateElementIndex].replace(
-                    DATE_PATTERN,
-                    stickyDate,
-                );
+            } else if (dateElementIndexes.length > 0) {
+                for (const index of dateElementIndexes) {
+                    output.system[index] = output.system[index].replace(
+                        DATE_PATTERN_ALL,
+                        stickyDate,
+                    );
+                }
                 sessionLog(
                     sessionId,
                     `system prompt date frozen: real=${currentDate}, using=${stickyDate} (defer pass)`,
