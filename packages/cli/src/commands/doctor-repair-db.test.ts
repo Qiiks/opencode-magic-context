@@ -166,13 +166,19 @@ function seedCurrentDatabase(dbPath: string): void {
 }
 
 function corruptLastTagLeaf(dbPath: string): void {
-    // Zero exactly one LEAF page of the `tags` b-tree, so most rows survive and `.recover`
-    // has something to salvage. Two approaches are unavailable here: `dbstat` is a
-    // compile-time SQLite option (SQLITE_ENABLE_DBSTAT_VTAB) that some bun builds omit, and
-    // scanning for row text picks a different page depending on how the build packs cells —
-    // both make the fixture depend on the toolchain rather than on the code under test.
-    // Instead walk the documented on-disk format: sqlite_master gives the table's root page,
-    // and the page header's rightmost-child pointer descends to the last leaf.
+    // Damage the CELL CONTENT of one leaf page of the `tags` b-tree while leaving the page
+    // header and cell pointer array intact, so `.recover` can still walk the tree and salvage
+    // the other pages. Three things this deliberately avoids, each of which made the fixture
+    // depend on the toolchain rather than on the code under test:
+    //   - `dbstat` to find the page: a compile-time option (SQLITE_ENABLE_DBSTAT_VTAB) that
+    //     some SQLite builds omit entirely.
+    //   - scanning the file for row text: picks a different page depending on how the build
+    //     packs cells, so a different page gets destroyed on each machine.
+    //   - zeroing the whole page: destroys the header too, and whether `.recover` can still
+    //     rebuild the tree after that varies by SQLite version — locally it salvaged, on CI
+    //     it gave up and the command correctly reported the database unsalvageable.
+    // Walking the documented on-disk format keeps page SELECTION deterministic, and damaging
+    // only the cell area keeps the RESULT deterministic.
     const db = new Database(dbPath, { readonly: true });
     const { page_size: pageSize } = db.prepare("PRAGMA page_size").get() as { page_size: number };
     const { rootpage } = db
@@ -195,8 +201,15 @@ function corruptLastTagLeaf(dbPath: string): void {
             // Interior table page: the rightmost child pointer lives at header offset 8.
             pageno = buffer.readUInt32BE(headerAt + 8);
         }
-        if (buffer[pageno === 1 ? 100 : 0] !== 0x0d) throw new Error("no tags leaf page found");
-        writeSync(fd, Buffer.alloc(pageSize), 0, pageSize, (pageno - 1) * pageSize);
+        const headerAt = pageno === 1 ? 100 : 0;
+        readSync(fd, buffer, 0, pageSize, (pageno - 1) * pageSize);
+        if (buffer[headerAt] !== 0x0d) throw new Error("no tags leaf page found");
+        // Cell content begins at the offset in header bytes 5-6; everything from there to the
+        // end of the page is row data. Overwrite it and leave the 8-byte header plus the cell
+        // pointer array alone.
+        const cellContentStart = buffer.readUInt16BE(headerAt + 5) || pageSize;
+        const damage = Buffer.alloc(pageSize - cellContentStart, 0xff);
+        writeSync(fd, damage, 0, damage.length, (pageno - 1) * pageSize + cellContentStart);
     } finally {
         closeSync(fd);
     }
@@ -240,7 +253,14 @@ describe("doctor repair-db", () => {
             deps: { now: () => new Date("2026-08-11T12:34:56.789Z") },
         });
 
-        expect(code).toBe(REPAIR_DB_EXIT.salvaged);
+        // Report WHY salvage failed rather than just the exit code. The command captures its
+        // reason in prompts.messages, and without surfacing it a failure here says only
+        // "expected 0, received 2" — which cost several CI round-trips diagnosing a fixture
+        // whose behaviour differed by SQLite version.
+        expect({ code, why: prompts.messages.filter((m) => m.startsWith("error:")) }).toEqual({
+            code: REPAIR_DB_EXIT.salvaged,
+            why: [],
+        });
         expect(integrity(dbPath)).toEqual(["ok"]);
         const recovered = new Database(dbPath, { readonly: true });
         const recoveredTags = rowCount(recovered, "tags");
