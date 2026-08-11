@@ -730,29 +730,9 @@ export function createTransform(deps: TransformDeps) {
             return;
         }
 
-        // Rust mode is an authority adapter, not a second implementation of the
-        // TypeScript renderer. Internal children returned above retain their identity
-        // in both modes; every other rust-mode session is handed to the module here.
-        if (deps.transformMode === "rust") {
-            if (!rustModeTransform) {
-                sessionLog(sessionId, "rust transform unavailable; using raw passthrough");
-                return;
-            }
-            await rustModeTransform.run(sessionId, messages, output, sessionMeta);
-            return;
-        }
-
-        // System prompt change detection is handled in experimental.chat.system.transform
-        // (see system-prompt-hash.ts), not here. The messages transform only receives
-        // user/assistant messages, not the system prompt.
-
-        const reducedMode = sessionMeta.isSubagent;
-        const fullFeatureMode = !reducedMode;
-        // Compaction-off mode (issue #266) is a THIRD flag, orthogonal to the
-        // subagent split above: every mutating gate below becomes
-        // `existingGate && !compactionOff`, and the m[0]/m[1] injection gate
-        // is re-expressed as identity-present AND (fullFeatureMode ||
-        // compactionOff) so the mode cannot swallow memory delivery.
+        // Compaction mode is session hygiene shared by both renderer authorities.
+        // Resolve it before either mode can return so stale markers and latches are
+        // reconciled even when Rust owns normal transform rendering.
         const compactionOff = deps.compactionOff === true;
 
         // Mode-transition reconciliation runs on every pass and is a no-op
@@ -829,6 +809,32 @@ export function createTransform(deps: TransformDeps) {
             passOutcome.record("compaction-mode-transition-failure");
             sessionLog(sessionId, "compaction mode transition failed (retrying next pass):", error);
         }
+
+        // Rust mode is an authority adapter, not a second implementation of the
+        // TypeScript renderer. Compaction-off leaves native compaction in charge,
+        // so no mutating module transform may run after reconciliation.
+        if (deps.transformMode === "rust") {
+            if (compactionOff) return;
+            if (!rustModeTransform) {
+                sessionLog(sessionId, "rust transform unavailable; using raw passthrough");
+                return;
+            }
+            await rustModeTransform.run(sessionId, messages, output, sessionMeta);
+            return;
+        }
+
+        // System prompt change detection is handled in experimental.chat.system.transform
+        // (see system-prompt-hash.ts), not here. The messages transform only receives
+        // user/assistant messages, not the system prompt.
+
+        const reducedMode = sessionMeta.isSubagent;
+        const fullFeatureMode = !reducedMode;
+        // Compaction-off mode (issue #266) is a THIRD flag, orthogonal to the
+        // subagent split above: every mutating gate below becomes
+        // `existingGate && !compactionOff`, and the m[0]/m[1] injection gate
+        // is re-expressed as identity-present AND (fullFeatureMode ||
+        // compactionOff) so the mode cannot swallow memory delivery.
+
         // §N§ prefix + ctx_reduce + Channel 1 are gated on this single signal,
         // NOT on subagent status. `ctx_reduce` is registered process-globally
         // (tool-registry.ts), so subagents may have the tool — they just need

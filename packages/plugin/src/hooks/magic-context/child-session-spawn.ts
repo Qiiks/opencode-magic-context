@@ -1,3 +1,4 @@
+import { FAIL_CLOSED_DOCTOR_COMMAND } from "../../features/magic-context/fail-closed-block";
 import {
     type ChildSpawnFenceFailure,
     probeChildSpawnFence,
@@ -10,6 +11,7 @@ import { type NotificationParams, sendIgnoredMessage } from "./send-session-noti
 
 export const STALE_PLUGIN_RESTART_NOTICE =
     "Magic Context: plugin build is older than its database — restart OpenCode";
+export const SCHEMA_PROBE_FAILURE_NOTICE = `Magic Context: unable to verify the database schema before spawning a child — run ${FAIL_CLOSED_DOCTOR_COMMAND}`;
 
 interface ChildSessionClient {
     session: { create(input: never): unknown | Promise<unknown> };
@@ -26,19 +28,31 @@ interface ChildSessionSpawnArgs {
     onFenceLatched?: (failure: ChildSpawnFenceFailure) => void | Promise<void>;
 }
 
-async function surfaceStalePluginBuild(args: ChildSessionSpawnArgs): Promise<void> {
+async function surfaceSchemaFenceFailure(
+    args: ChildSessionSpawnArgs,
+    failure: ChildSpawnFenceFailure,
+): Promise<void> {
     if (!args.parentSessionId) return;
-    try {
-        if (args.db) {
+    const notice =
+        failure.reason === "read_error" ? SCHEMA_PROBE_FAILURE_NOTICE : STALE_PLUGIN_RESTART_NOTICE;
+    if (args.db) {
+        try {
             updateSessionMeta(args.db, args.parentSessionId, {
-                lastTransformError: STALE_PLUGIN_RESTART_NOTICE,
+                lastTransformError: notice,
             });
+        } catch (error) {
+            sessionLog(
+                args.parentSessionId,
+                `schema-fence warning persistence failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
         }
+    }
+    try {
         pushNotification(
             "toast",
             {
                 title: "Magic Context",
-                message: STALE_PLUGIN_RESTART_NOTICE,
+                message: notice,
                 variant: "error",
                 duration: 10_000,
             },
@@ -52,14 +66,14 @@ async function surfaceStalePluginBuild(args: ChildSessionSpawnArgs): Promise<voi
         await sendIgnoredMessage(
             args.client,
             args.parentSessionId,
-            STALE_PLUGIN_RESTART_NOTICE,
+            notice,
             args.notificationParams ?? {},
             true,
         );
     } catch (error) {
         sessionLog(
             args.parentSessionId,
-            `stale plugin-build warning delivery failed: ${error instanceof Error ? error.message : String(error)}`,
+            `schema-fence warning delivery failed: ${error instanceof Error ? error.message : String(error)}`,
         );
     }
 }
@@ -81,7 +95,7 @@ export async function createChildSessionWithFence(
         }
         if (verdict.shouldSurface) {
             if (args.onFenceLatched) await args.onFenceLatched(verdict.failure);
-            else await surfaceStalePluginBuild(args);
+            else await surfaceSchemaFenceFailure(args, verdict.failure);
         }
         return null;
     }

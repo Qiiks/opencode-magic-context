@@ -67,6 +67,8 @@ const OPEN_CODE_COMMAND_MARKERS = ["opencode", "node", "bun", "electron"];
 
 let rpcIdentityReadFileSync: typeof readFileSync = readFileSync;
 let rpcIdentityExecFileSync: typeof execFileSync = execFileSync;
+let rpcProcessListExecFileSync: typeof execFileSync = execFileSync;
+let rpcProcessListTestOverride = false;
 let rpcIdentityPlatform: NodeJS.Platform = process.platform;
 let rpcIdentityNowMs: () => number = () => Date.now();
 
@@ -179,11 +181,14 @@ export function isPidIdentityPlausible(record: RpcPortFileRecord): boolean {
 export function __setRpcIdentityTestHooks(hooks: {
     readFileSync?: typeof readFileSync;
     execFileSync?: typeof execFileSync;
+    processListExecFileSync?: typeof execFileSync;
     platform?: NodeJS.Platform;
     nowMs?: () => number;
 }): void {
     rpcIdentityReadFileSync = hooks.readFileSync ?? readFileSync;
     rpcIdentityExecFileSync = hooks.execFileSync ?? execFileSync;
+    rpcProcessListExecFileSync = hooks.processListExecFileSync ?? execFileSync;
+    rpcProcessListTestOverride = hooks.processListExecFileSync !== undefined;
     rpcIdentityPlatform = hooks.platform ?? process.platform;
     rpcIdentityNowMs = hooks.nowMs ?? (() => Date.now());
 }
@@ -191,8 +196,53 @@ export function __setRpcIdentityTestHooks(hooks: {
 export function __resetRpcIdentityTestHooks(): void {
     rpcIdentityReadFileSync = readFileSync;
     rpcIdentityExecFileSync = execFileSync;
+    rpcProcessListExecFileSync = execFileSync;
+    rpcProcessListTestOverride = false;
     rpcIdentityPlatform = process.platform;
     rpcIdentityNowMs = () => Date.now();
+}
+
+function commandLooksLikePi(command: string): boolean {
+    const normalized = command.trim().toLowerCase().replaceAll("\\", "/");
+    const tokens = normalized.split(/\s+/).filter(Boolean);
+    const executableName = (token: string | undefined): string =>
+        (token ?? "").split("/").at(-1) ?? "";
+    const first = executableName(tokens[0]).replace(/\.exe$/, "");
+    if (["pi", "pi.cmd", "omp", "oh-my-pi"].includes(first)) return true;
+    if (["node", "bun", "deno"].includes(first)) {
+        const script = executableName(tokens[1]);
+        return (
+            ["pi", "pi.js", "pi.mjs", "pi.cjs"].includes(script) ||
+            normalized.includes("pi-coding-agent")
+        );
+    }
+    return false;
+}
+
+/** Enumerate live Pi/OMP harnesses on the cold migration-guard path. */
+export function discoverLivePiProcessIds(): number[] {
+    if (process.env.NODE_ENV === "test" && !rpcProcessListTestOverride) return [];
+    try {
+        const output = String(
+            rpcProcessListExecFileSync("ps", ["-axo", "pid=,command="], {
+                encoding: "utf8",
+                timeout: PS_PROBE_TIMEOUT_MS,
+            }),
+        );
+        const pids = new Set<number>();
+        for (const line of output.split(/\r?\n/)) {
+            const match = /^\s*(\d+)\s+(.+)$/.exec(line);
+            if (!match) continue;
+            const pid = Number(match[1]);
+            if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
+            if (commandLooksLikePi(match[2])) pids.add(pid);
+        }
+        return [...pids].sort((left, right) => left - right);
+    } catch {
+        // RPC port discovery remains authoritative where process enumeration is
+        // unavailable (notably minimal Windows installations).
+        return [];
+    }
 }
 
 export function parseRpcPortFile(content: string, fallbackPid = 0): RpcPortFileRecord | null {

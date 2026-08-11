@@ -6,6 +6,7 @@ import type { readFileSync } from "node:fs";
 import {
     __resetRpcIdentityTestHooks,
     __setRpcIdentityTestHooks,
+    discoverLivePiProcessIds,
     isPidIdentityPlausible,
     type RpcPortFileRecord,
 } from "./rpc-utils";
@@ -42,6 +43,26 @@ function psOutput(output: string | Error): typeof execFileSync {
 
 afterEach(() => {
     __resetRpcIdentityTestHooks();
+});
+
+describe("discoverLivePiProcessIds", () => {
+    test("finds Pi-family harness commands while excluding the current process", () => {
+        __setRpcIdentityTestHooks({
+            processListExecFileSync: (() =>
+                [
+                    ` ${process.pid} /usr/local/bin/pi`,
+                    " 41001 /usr/local/bin/pi --model test",
+                    " 41002 node /opt/node_modules/@mariozechner/pi-coding-agent/dist/cli.js",
+                    " 41003 bun /opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js",
+                    " 41004 /Applications/OpenCode.app/Contents/MacOS/opencode",
+                    " 41005 node /workspace/pi-plugin/src/index.ts",
+                    " 41006 npm install @earendil-works/pi-coding-agent",
+                    " 41007 /usr/local/bin/omp --model test",
+                ].join("\n")) as typeof execFileSync,
+        });
+
+        expect(discoverLivePiProcessIds()).toEqual([41001, 41002, 41003, 41007]);
+    });
 });
 
 describe("isPidIdentityPlausible", () => {

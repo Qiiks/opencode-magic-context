@@ -184,17 +184,9 @@ export function reconcileCompactionMode(args: {
             notice: COMPACTION_ON_WRAPUP_SUGGESTION,
         };
     }
-    if (stored === "off_notice_pending") {
-        const markerCleanup = cleanupOffMarkers(sessionId);
-        return {
-            ...NO_TRANSITION,
-            recordToWrite: markerCleanup.verified ? "off" : "off_cleanup_pending",
-            notice: COMPACTION_OFF_FLIP_NOTICE,
-            markerCleanup,
-        };
-    }
+    const completingOffNotice = stored === "off_notice_pending";
 
-    if (!args.compactionOff) {
+    if (!args.compactionOff && !completingOffNotice) {
         if (stored === null || resolveCompactionModeRecord(stored) === "on") {
             return stored === null ? { ...NO_TRANSITION, recordToWrite: "on" } : NO_TRANSITION;
         }
@@ -251,7 +243,12 @@ export function reconcileCompactionMode(args: {
         };
     }
 
-    // stored === null | "on" → the off-transition (exactly once per session).
+    // stored === null | "on" | "off_notice_pending" → start or resume the
+    // off-transition. Stage notice intent before touching either database so a
+    // crash after the first durable clear cannot lose the one-time notice.
+    if (!completingOffNotice) {
+        setCompactionModeRecord(db, sessionId, "off_notice_pending");
+    }
     let clearedSomething = false;
 
     // 1. Delete MC-owned marker lineages from opencode.db (canonical +
@@ -324,12 +321,8 @@ export function reconcileCompactionMode(args: {
         );
     }
 
-    const notice = clearedSomething ? COMPACTION_OFF_FLIP_NOTICE : null;
-    if (notice) {
-        // Store the notice intent with the completed durable clears. Unlike the
-        // old process-local map, this survives a restart after those clears.
-        setCompactionModeRecord(db, sessionId, "off_notice_pending");
-    } else if (!markerCleanup.verified) {
+    const notice = clearedSomething || completingOffNotice ? COMPACTION_OFF_FLIP_NOTICE : null;
+    if (!notice && !markerCleanup.verified) {
         // No notice is warranted, but verification must still be retried even
         // though the mode record is now present and resolves to off.
         setCompactionModeRecord(db, sessionId, "off_cleanup_pending");

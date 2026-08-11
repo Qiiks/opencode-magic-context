@@ -18,7 +18,12 @@ import {
 } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
-import { isPidAlive, isPidIdentityPlausible, parseRpcPortFile } from "../../shared/rpc-utils";
+import {
+    discoverLivePiProcessIds,
+    isPidAlive,
+    isPidIdentityPlausible,
+    parseRpcPortFile,
+} from "../../shared/rpc-utils";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
@@ -481,17 +486,21 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
     return { state: "stale", serverPids: [], staleFiles };
 }
 
-/** Return the live OpenCode servers that would block an on-open migration. */
+/** Return the live harnesses that would block an on-open migration. */
 export function getLiveMigrationBlockingProcesses(storageDir: string): FailClosedBlockingProcess[] {
     const discovery = inspectRpcServerDiscovery(storageDir);
-    if (discovery.state !== "live") return [];
-    return discovery.serverPids.map((pid) => ({ harness: "OpenCode server", pid }));
+    const openCode =
+        discovery.state === "live"
+            ? discovery.serverPids.map((pid) => ({ harness: "OpenCode server", pid }))
+            : [];
+    const pi = discoverLivePiProcessIds().map((pid) => ({ harness: "Pi harness", pid }));
+    return [...openCode, ...pi];
 }
 
 /**
- * Refuse an on-open migration when another live OpenCode server still has this
- * shared DB open. That server loaded its plugin dist at boot and cannot observe
- * the new fence, so migrating here would strand every session it creates later.
+ * Refuse an on-open migration while another long-lived harness may still run an
+ * older build. OpenCode servers keep their plugin loaded, and a live Pi process
+ * can spawn a child with its loaded extension after another process migrates.
  */
 function enforceMigrationOnOpenGuard(
     db: Database,
@@ -505,14 +514,18 @@ function enforceMigrationOnOpenGuard(
         return true;
     }
     const discovery = inspectRpcServerDiscovery(dbDir);
-    if (discovery.state === "absent" || discovery.state === "stale") {
+    const piPids = discoverLivePiProcessIds();
+    if ((discovery.state === "absent" || discovery.state === "stale") && piPids.length === 0) {
         lastMigrationOnOpenRefusal = null;
         return true;
     }
+    const blockingPids = [...new Set([...discovery.serverPids, ...piPids])].sort(
+        (left, right) => left - right,
+    );
     lastMigrationOnOpenRefusal = {
         persistedVersion,
         supportedVersion: latestSupportedVersion,
-        serverPids: discovery.serverPids,
+        serverPids: blockingPids,
         ...(discovery.unreadableFile ? { unreadableFile: discovery.unreadableFile } : {}),
         ...(discovery.unreadableArm ? { unreadableArm: discovery.unreadableArm } : {}),
     };
@@ -527,8 +540,12 @@ function enforceMigrationOnOpenGuard(
             `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} because RPC discovery file ${unreadableFile} is uncertain (${arm} arm), so the absence of a live OpenCode server cannot be proven. ${recovery}`,
         );
     } else {
+        const blockers = [
+            ...discovery.serverPids.map((pid) => `OpenCode server PID ${pid}`),
+            ...piPids.map((pid) => `Pi harness PID ${pid}`),
+        ];
         log(
-            `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while live OpenCode server PID(s) ${discovery.serverPids.join(", ")} may still use the old plugin build. Restart OpenCode, then retry this process.`,
+            `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while ${blockers.join(", ")} may still use the old plugin build. Restart the blocking harness, then retry this process.`,
         );
     }
     return false;

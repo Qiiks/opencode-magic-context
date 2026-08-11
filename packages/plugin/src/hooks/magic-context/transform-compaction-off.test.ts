@@ -48,6 +48,7 @@ import type { PluginContext } from "../../plugin/types";
 import { clearModelsDevCache } from "../../shared/models-dev-cache";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { createTransform } from "./transform";
 
 type TestMessage = {
@@ -135,6 +136,8 @@ function makeOffTransform(args: {
     client?: PluginContext["client"];
     isSubagent?: boolean;
     maybeAutoEmbedSession?: (sessionId: string) => void;
+    transformMode?: "ts" | "rust";
+    rustModuleCall?: (request: Record<string, unknown>) => Promise<unknown>;
 }) {
     const scheduler: Scheduler = {
         shouldExecute: mock(() => (args.schedulerDecision ?? "defer") as "execute" | "defer"),
@@ -169,6 +172,11 @@ function makeOffTransform(args: {
         compactionOff: args.compactionOff ?? true,
         client: args.client,
         maybeAutoEmbedSession: args.maybeAutoEmbedSession,
+        transformMode: args.transformMode,
+        rustModeModuleClient: args.rustModuleCall
+            ? ({ call: args.rustModuleCall } as never)
+            : undefined,
+        rustModeAllowAuthorityProtocolBypassForTests: true,
     });
     return { db, transform };
 }
@@ -245,6 +253,92 @@ function guardDeepMutations<T extends object>(
 }
 
 describe("compaction-off transform — additive-only proof (issue #266 S3)", () => {
+    it("reconciles a Rust session flip before skipping module dispatch", async () => {
+        useTempDataHome("co-rust-transition-");
+        const sessionId = "ses-rust-off";
+        createOpenCodeDbForSession(sessionId);
+        const opencodePath = join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db");
+        const opencode = new Database(opencodePath);
+        opencode
+            .prepare(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+            )
+            .run(
+                "msg-mc-summary",
+                sessionId,
+                2,
+                2,
+                JSON.stringify({
+                    id: "msg-mc-summary",
+                    role: "assistant",
+                    sessionID: sessionId,
+                    parentID: "m-user-1",
+                    summary: true,
+                    finish: "stop",
+                    providerID: "magic-context",
+                    modelID: "magic-context",
+                }),
+            );
+        opencode
+            .prepare(
+                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .run(
+                "prt-mc-compaction",
+                "m-user-1",
+                sessionId,
+                2,
+                2,
+                JSON.stringify({ type: "compaction", auto: true }),
+            );
+        opencode
+            .prepare(
+                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .run(
+                "prt-mc-summary-text",
+                "msg-mc-summary",
+                sessionId,
+                3,
+                3,
+                JSON.stringify({ type: "text", text: MARKER_SUMMARY_TEXT }),
+            );
+        opencode.close();
+
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, sessionId);
+        setCompactionModeRecord(db, sessionId, "on");
+        queuePendingOp(db, sessionId, 1, "drop");
+        const moduleCall = mock(async (_request: Record<string, unknown>) => ({ ok: true }));
+        const { transform } = makeOffTransform({
+            sessionId,
+            transformMode: "rust",
+            rustModuleCall: moduleCall,
+        });
+        const first = makeMessages(sessionId);
+        const raw = JSON.parse(JSON.stringify(first)) as TestMessage[];
+
+        await transform({}, { messages: first });
+
+        expect(first).toEqual(raw);
+        expect(moduleCall).not.toHaveBeenCalled();
+        expect(getPendingOps(db, sessionId)).toHaveLength(0);
+        expect(getCompactionModeRecord(db, sessionId)).toBe("off");
+        const cleaned = new Database(opencodePath, { readonly: true });
+        expect(
+            cleaned.prepare("SELECT id FROM part WHERE id = ?").get("prt-mc-compaction"),
+        ).toBeNull();
+        expect(
+            cleaned.prepare("SELECT id FROM message WHERE id = ?").get("msg-mc-summary"),
+        ).toBeNull();
+        cleaned.close();
+
+        const stable = makeMessages(sessionId);
+        await transform({}, { messages: stable });
+        expect(stable).toEqual(raw);
+        expect(moduleCall).not.toHaveBeenCalled();
+    });
+
     it("memory injection SURVIVES compaction-off (mutation direction: gating the injection off makes this red)", async () => {
         useTempDataHome("co-memory-survival-");
         const db = openDatabase();
@@ -439,7 +533,7 @@ describe("compaction-off transform — additive-only proof (issue #266 S3)", () 
         expect(wire).not.toContain("[dropped");
     });
 
-    it("treats off_notice_pending exactly like off for reduced-mode gates", async () => {
+    it("keeps settled off stable while resuming hygiene for off_notice_pending", async () => {
         useTempDataHome("co-pending-resolution-");
         for (const record of ["off", "off_notice_pending"] as const) {
             const sessionId = `ses-${record}`;
@@ -456,10 +550,10 @@ describe("compaction-off transform — additive-only proof (issue #266 S3)", () 
             const messages = makeMessages(sessionId);
             await transform({}, { messages });
 
-            // Both record values resolve to off before normal transform gates.
-            // Removing pending-record parsing makes this look like a fresh flip
-            // and clears the queued state, which trips this assertion.
-            expect(getPendingOps(openDatabase(), sessionId)).toHaveLength(1);
+            // Both records resolve to off for normal gates. A settled record is
+            // a no-op; notice-pending must replay idempotent hygiene because its
+            // intent is now staged before the first durable clear.
+            expect(getPendingOps(openDatabase(), sessionId)).toHaveLength(record === "off" ? 1 : 0);
             expect(allText(messages)).toContain("tool output body");
             expect(allText(messages)).not.toContain("[dropped");
             closeDatabase();

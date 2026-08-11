@@ -66,6 +66,24 @@ describe("child spawn schema-fence probe", () => {
         });
     });
 
+    it("refuses a child spawn when the live schema probe cannot be read", () => {
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        db.close();
+
+        const verdict = probeChildSpawnFence(db);
+
+        expect(verdict).toMatchObject({
+            allowSpawn: false,
+            shouldSurface: false,
+            failure: {
+                failureClass: STALE_CHILD_SPAWN_FAILURE,
+                reason: "read_error",
+                supportedVersion: LATEST_SUPPORTED_VERSION,
+            },
+        });
+    });
+
     it("ignores downstream rows when probing a fully migrated upstream lane", () => {
         const db = new Database(":memory:");
         initializeDatabase(db);

@@ -27,6 +27,8 @@ const CONNECT_BACKOFF_MAX_MS = 30_000;
 const HANDSHAKE_TIMEOUT_MS = 2_000;
 const MODULE_SEND_TIMEOUT_MS = 15_000;
 const TRANSFORM_SEND_TIMEOUT_MS = 5_000;
+/** Consumer deadline for the module's exported historian::MAX_WRAPUP_REQUEST_BUDGET. */
+export const MAX_WRAPUP_REQUEST_BUDGET_MS = 3_800_000;
 const SERIAL_LANE_MAX_WAITERS = 16;
 const SERIAL_LANE_MIN_REMAINING_MS = 25;
 const CANONICAL_ROOT_CACHE_MAX_ENTRIES = 256;
@@ -150,6 +152,7 @@ export class SubcModuleTransport {
     private routes = new Map<string, CachedRoute>();
     private canonicalRootCache = new Map<string, string>();
     private activeSession: string | null = null;
+    private wrapupSessions = new Map<string, number>();
     private nextProbeMs = 0;
     private laneReleaseCallbacks: SerialLaneWaiter[] = [];
     private authorityProjectRoot = "";
@@ -362,20 +365,43 @@ export class SubcModuleTransport {
         signal?: AbortSignal;
         /** Do not retry after reconnecting; let the caller rebuild for the new connection. */
         generationSensitive?: boolean;
-        /** Producer-backed calls (dreamer.run_task) outlive the default transport budget. */
+        /** Producer-backed calls can outlive the default transport budget. */
         timeoutMs?: number;
     }): Promise<unknown> {
+        const wrapupInFlight = (this.wrapupSessions.get(args.sessionId) ?? 0) > 0;
         const attemptTimeoutMs =
             args.timeoutMs ??
-            (args.method === "transform"
-                ? Math.min(this.requestTimeoutMs, TRANSFORM_SEND_TIMEOUT_MS)
-                : this.requestTimeoutMs);
+            (args.method === "session.wrapup" ||
+            (args.method === "session.status" && wrapupInFlight)
+                ? MAX_WRAPUP_REQUEST_BUDGET_MS
+                : args.method === "transform"
+                  ? Math.min(this.requestTimeoutMs, TRANSFORM_SEND_TIMEOUT_MS)
+                  : this.requestTimeoutMs);
+        const tracksWrapup = args.method === "session.wrapup";
+        if (tracksWrapup) {
+            this.wrapupSessions.set(
+                args.sessionId,
+                (this.wrapupSessions.get(args.sessionId) ?? 0) + 1,
+            );
+        }
+        const finishWrapupTracking = (): void => {
+            if (!tracksWrapup) return;
+            const remaining = (this.wrapupSessions.get(args.sessionId) ?? 1) - 1;
+            if (remaining > 0) this.wrapupSessions.set(args.sessionId, remaining);
+            else this.wrapupSessions.delete(args.sessionId);
+        };
         const laneDeadlineMs = Date.now() + attemptTimeoutMs;
-        const releaseLane = await this.acquireCorrectnessLane(
-            args.sessionId,
-            args.signal,
-            laneDeadlineMs,
-        );
+        let releaseLane: (() => void) | undefined;
+        try {
+            releaseLane = await this.acquireCorrectnessLane(
+                args.sessionId,
+                args.signal,
+                laneDeadlineMs,
+            );
+        } catch (error) {
+            finishWrapupTracking();
+            throw error;
+        }
         const onAbort = () => this.invalidateConnection();
         args.signal?.addEventListener("abort", onAbort, { once: true });
         try {
@@ -432,6 +458,7 @@ export class SubcModuleTransport {
             throw new Error("module transport route retry exhausted");
         } finally {
             args.signal?.removeEventListener("abort", onAbort);
+            finishWrapupTracking();
             releaseLane();
         }
     }

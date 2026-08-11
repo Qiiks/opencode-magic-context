@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
+import type { execFileSync } from "node:child_process";
 import {
     type chmodSync,
     existsSync,
@@ -436,6 +437,26 @@ describe("storage-db", () => {
             expect(openDatabase()).not.toBeNull();
             expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
             expect(getMigrationOnOpenRefusal()).toBeNull();
+        });
+
+        it("#when an older Pi harness is live #then refuses a pending migration", () => {
+            const dataHome = useTempDataHome("storage-db-live-pi-migration-");
+            const dbPath = seedPendingMigration(dataHome);
+            __setRpcIdentityTestHooks({
+                processListExecFileSync: (() =>
+                    " 41001 node /opt/node_modules/@mariozechner/pi-coding-agent/dist/cli.js\n") as typeof execFileSync,
+            });
+
+            expect(openDatabase()).toBeNull();
+            expect(getMigrationOnOpenRefusal()).toEqual({
+                persistedVersion: LATEST_SUPPORTED_VERSION - 1,
+                supportedVersion: LATEST_SUPPORTED_VERSION,
+                serverPids: [41001],
+            });
+            expect(getLiveMigrationBlockingProcesses(dirname(dbPath))).toEqual([
+                { harness: "Pi harness", pid: 41001 },
+            ]);
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
         });
 
         it("#when every advertised PID is stale #then deletes stale files and allows migration", () => {
