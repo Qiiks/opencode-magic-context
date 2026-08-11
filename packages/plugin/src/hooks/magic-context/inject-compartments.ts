@@ -730,8 +730,8 @@ export interface M0SnapshotMarkers {
     projectIdentity?: string | null;
     /** Hash of the image identity folded into this m0 baseline. */
     muralHash?: string | null;
-    muralEnabled: boolean;
-    renderBudgetIdentity: string;
+    muralEnabled: boolean | null;
+    renderBudgetIdentity: string | null;
 }
 
 /**
@@ -1465,8 +1465,8 @@ function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null
         modelKey: state.cachedM0ModelKey ?? "",
         projectIdentity: state.cachedM0ProjectIdentity ?? null,
         muralHash: state.cachedM0MuralHash ?? null,
-        muralEnabled: cachedUpgradeIdentity.muralEnabled ?? false,
-        renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity ?? "",
+        muralEnabled: cachedUpgradeIdentity.muralEnabled,
+        renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity,
     };
 }
 
@@ -1513,9 +1513,15 @@ export function mustMaterialize(args: {
     if (cachedUpgradeIdentity.compartmentRenderEpoch !== current.compartmentRenderEpoch) {
         return { value: true, reason: "compartment_render_epoch" };
     }
+    // Null components are legacy rows encoded before mural/budget joined the
+    // identity: adopt silently (the values persist on the next natural HARD)
+    // rather than folding the whole fleet once at upgrade. Only a real change
+    // against a RECORDED component triggers.
     if (
-        cachedUpgradeIdentity.muralEnabled !== current.muralEnabled ||
-        cachedUpgradeIdentity.renderBudgetIdentity !== current.renderBudgetIdentity
+        (cachedUpgradeIdentity.muralEnabled !== null &&
+            cachedUpgradeIdentity.muralEnabled !== current.muralEnabled) ||
+        (cachedUpgradeIdentity.renderBudgetIdentity !== null &&
+            cachedUpgradeIdentity.renderBudgetIdentity !== current.renderBudgetIdentity)
     ) {
         return { value: true, reason: "render_config" };
     }
@@ -2725,8 +2731,8 @@ function markersFromCachedRow(row: CachedM0M1Row): M0SnapshotMarkers | null {
         modelKey: row.cached_m0_model_key ?? "",
         projectIdentity: row.cached_m0_project_identity ?? null,
         muralHash: row.cached_m0_mural_hash ?? null,
-        muralEnabled: cachedUpgradeIdentity.muralEnabled ?? false,
-        renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity ?? "",
+        muralEnabled: cachedUpgradeIdentity.muralEnabled,
+        renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity,
     };
 }
 
