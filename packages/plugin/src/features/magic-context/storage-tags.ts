@@ -1747,6 +1747,33 @@ export function getTagsByNumbers(
     return rows.map(toTagEntry);
 }
 
+/** Return only dropped tags whose numbers are visible replay targets. */
+export function getDroppedTagsByNumbers(
+    db: Database,
+    sessionId: string,
+    tagNumbers: readonly number[],
+): TagEntry[] {
+    if (tagNumbers.length === 0) return [];
+
+    if (tagNumbers.length > 900) {
+        const all: TagEntry[] = [];
+        for (let i = 0; i < tagNumbers.length; i += 900) {
+            all.push(...getDroppedTagsByNumbers(db, sessionId, tagNumbers.slice(i, i + 900)));
+        }
+        return all;
+    }
+
+    const placeholders = tagNumbers.map(() => "?").join(",");
+    const rows = db
+        .prepare(
+            `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND status = 'dropped' AND tag_number IN (${placeholders}) ORDER BY tag_number ASC, id ASC`,
+        )
+        .all(sessionId, ...tagNumbers)
+        .filter(isTagRow);
+
+    return rows.map(toTagEntry);
+}
+
 /**
  * Return the maximum tag_number among tags whose status is 'dropped' for
  * this session, or 0 if no dropped tags exist.

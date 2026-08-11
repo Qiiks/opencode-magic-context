@@ -294,6 +294,7 @@ export {
     getActiveTagTokenTotalsByMessage,
     getActiveToolTagsForAgeReclaim,
     getAllStatusTagTokenTotalsFlat,
+    getDroppedTagsByNumbers,
     getMaxDroppedTagNumber,
     getMaxTagNumberBySession,
     getMinMessageTagNumberForRawId,
