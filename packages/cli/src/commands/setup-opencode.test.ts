@@ -168,3 +168,49 @@ describe("setup-opencode compaction-off writer (issue #266)", () => {
         expect(afterOn.compaction?.auto).toBe(false);
     });
 });
+
+describe("setup-opencode JSONC byte preservation", () => {
+    it("removes DCP and updates compaction without reformatting the existing config", () => {
+        const configPath = join(tempDir(), "opencode.jsonc");
+        const original =
+            "// leading comment\r\n" +
+            "{\r\n" +
+            '\t"plugin": [\r\n' +
+            "\t\t// first plugin\r\n" +
+            '\t\t"@keep/first",\r\n' +
+            "\t\t// removed DCP plugin\r\n" +
+            '\t\t"@tarquinen/opencode-dcp@latest",\r\n' +
+            "\t\t// Magic Context stays\r\n" +
+            '\t\t"@cortexkit/opencode-magic-context@latest",\r\n' +
+            "\t], // array comment\r\n" +
+            '\t"compaction": {\r\n' +
+            "\t\t// preserve nested comment\r\n" +
+            '\t\t"auto": true,\r\n' +
+            '\t\t"prune": true,\r\n' +
+            "\t},\r\n" +
+            '\t"theme": "dark",\r\n' +
+            "}\r\n";
+        const expected =
+            "// leading comment\r\n" +
+            "{\r\n" +
+            '\t"plugin": [\r\n' +
+            "\t\t// first plugin\r\n" +
+            '\t\t"@keep/first",\r\n' +
+            "\t\t// Magic Context stays\r\n" +
+            '\t\t"@cortexkit/opencode-magic-context@latest",\r\n' +
+            "\t], // array comment\r\n" +
+            '\t"compaction": {\r\n' +
+            "\t\t// preserve nested comment\r\n" +
+            '\t\t"auto": false,\r\n' +
+            '\t\t"prune": false,\r\n' +
+            "\t},\r\n" +
+            '\t"theme": "dark",\r\n' +
+            "}\r\n";
+        writeFileSync(configPath, original);
+
+        addPluginToOpenCodeConfig(configPath, "jsonc", true);
+
+        expect(readFileSync(configPath, "utf-8")).toBe(expected);
+        expect(readFileSync(configPath, "utf-8")).not.toContain("removed DCP plugin");
+    });
+});

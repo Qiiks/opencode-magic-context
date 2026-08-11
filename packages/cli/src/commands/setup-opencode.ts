@@ -1,9 +1,14 @@
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import { loadPluginConfig } from "@magic-context/core/config";
 import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
 import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import { fixConflicts } from "@magic-context/core/shared/conflict-fixer";
+import {
+    appendJsoncArrayValues,
+    removeJsoncArrayEntries,
+    setJsoncValue,
+} from "@magic-context/core/shared/jsonc-edit";
 import { stringify as stringifyJsonc } from "comment-json";
 import {
     isDevPathPluginEntry,
@@ -79,26 +84,29 @@ export function addPluginToOpenCodeConfig(
     // a config created while the wizard was open is merged instead of overwritten.
     const existsAtCommit = existsSync(configPath);
     const existing = existsAtCommit ? readJsoncConfigForUpdate(configPath) : {};
-    if (!existsAtCommit) ensureDir(dirname(configPath));
-
-    // Operate on the raw plugin array — entries can be:
-    //   • a string:  "@cortexkit/opencode-magic-context@latest"
-    //   • a tuple:   ["@pkg/name@latest", { ...options }]
-    //   • a dev URL: "file:///abs/path/.../packages/plugin"
-    // We preserve every entry shape; matchesPluginEntry / isDevPathPluginEntry
-    // safely accept both strings and tuples.
-    let rawPlugins: unknown[] = Array.isArray(existing.plugin) ? existing.plugin : [];
-    if (removeDcp) {
-        rawPlugins = rawPlugins.filter((plugin) => !matchesPluginEntry(plugin, DCP_PLUGIN_NAME));
+    if (!existsAtCommit) {
+        ensureDir(dirname(configPath));
+        const created: Record<string, unknown> = { plugin: [PLUGIN_ENTRY] };
+        if (compactionEnabled) {
+            created.compaction = { auto: false, prune: false };
+        }
+        writeFileAtomic(configPath, `${stringifyJsonc(created, null, 2)}\n`);
+        return;
     }
-    const hasNpmEntry = rawPlugins.some((p) => matchesPluginEntry(p, PLUGIN_NAME));
-    const hasDevEntry = rawPlugins.some((p) => isDevPathPluginEntry(p));
+
+    let text = readFileSync(configPath, "utf-8");
+    let changed = false;
+    const rawPlugins: unknown[] = Array.isArray(existing.plugin) ? existing.plugin : [];
+    const retainedPlugins = removeDcp
+        ? rawPlugins.filter((plugin) => !matchesPluginEntry(plugin, DCP_PLUGIN_NAME))
+        : rawPlugins;
+
     if (
-        rawPlugins.some(
-            (p) =>
-                isLocalPathPluginEntry(p) &&
-                String(p).includes("magic-context") &&
-                !isDevPathPluginEntry(p),
+        retainedPlugins.some(
+            (plugin) =>
+                isLocalPathPluginEntry(plugin) &&
+                String(plugin).includes("magic-context") &&
+                !isDevPathPluginEntry(plugin),
         )
     ) {
         log.warn(
@@ -106,46 +114,72 @@ export function addPluginToOpenCodeConfig(
         );
     }
 
-    // Don't double-add if either an npm entry OR a local dev-path entry exists.
-    // Dev paths are intentionally NOT replaced — that would silently disable
-    // the developer's local plugin checkout.
-    if (!hasNpmEntry && !hasDevEntry) {
-        rawPlugins.push(PLUGIN_ENTRY);
-    }
-    existing.plugin = rawPlugins;
+    if (Array.isArray(existing.plugin)) {
+        if (removeDcp) {
+            const result = removeJsoncArrayEntries(text, ["plugin"], (plugin) =>
+                matchesPluginEntry(plugin, DCP_PLUGIN_NAME),
+            );
+            if (result.removed) {
+                text = result.text;
+                changed = true;
+            }
+        }
 
-    // Set compaction fields without replacing other compaction settings.
-    // In compaction-off mode this write is SKIPPED: native compaction is the
-    // user's chosen window manager (or nothing is), so MC must not force
-    // `compaction.auto=false` / `prune=false` onto the native config. Pre-existing
-    // native compaction values are left byte-for-byte as found.
+        const hasNpmEntry = retainedPlugins.some((plugin) =>
+            matchesPluginEntry(plugin, PLUGIN_NAME),
+        );
+        const hasDevEntry = retainedPlugins.some((plugin) => isDevPathPluginEntry(plugin));
+        if (!hasNpmEntry && !hasDevEntry) {
+            text = appendJsoncArrayValues(text, ["plugin"], [PLUGIN_ENTRY]);
+            changed = true;
+        }
+    } else {
+        text = setJsoncValue(text, ["plugin"], [PLUGIN_ENTRY]);
+        changed = true;
+    }
+
+    // In compaction-off mode native fields are never changed. In mode-on, update
+    // existing booleans in place so comments and the rest of the file stay intact.
     if (compactionEnabled) {
-        const compaction = (existing.compaction as Record<string, unknown>) ?? {};
-        compaction.auto = false;
-        compaction.prune = false;
-        existing.compaction = compaction;
+        const compaction = existing.compaction;
+        const hasCompactionObject =
+            typeof compaction === "object" && compaction !== null && !Array.isArray(compaction);
+        if (!hasCompactionObject) {
+            text = setJsoncValue(text, ["compaction"], { auto: false, prune: false });
+            changed = true;
+        } else {
+            const fields = compaction as Record<string, unknown>;
+            if (fields.auto !== false) {
+                text = setJsoncValue(text, ["compaction", "auto"], false);
+                changed = true;
+            }
+            if (fields.prune !== false) {
+                text = setJsoncValue(text, ["compaction", "prune"], false);
+                changed = true;
+            }
+        }
     }
 
-    writeFileAtomic(configPath, `${stringifyJsonc(existing, null, 2)}\n`);
+    if (changed) writeFileAtomic(configPath, text);
 }
 
 export function addPluginToTuiConfig(configPath: string, _format: "json" | "jsonc" | "none"): void {
     // Config discovery may be stale after prompts; merge the commit-time contents.
     const existsAtCommit = existsSync(configPath);
     const existing = existsAtCommit ? readJsoncConfigForUpdate(configPath) : {};
-    if (!existsAtCommit) ensureDir(dirname(configPath));
+    if (!existsAtCommit) {
+        ensureDir(dirname(configPath));
+        writeFileAtomic(configPath, `${stringifyJsonc({ plugin: [PLUGIN_ENTRY] }, null, 2)}\n`);
+        return;
+    }
 
-    // Same rules as the main opencode config — preserve tuple entries and
-    // never replace dev-path entries.
     const rawPlugins: unknown[] = Array.isArray(existing.plugin) ? existing.plugin : [];
-    const hasNpmEntry = rawPlugins.some((p) => matchesPluginEntry(p, PLUGIN_NAME));
-    const hasDevEntry = rawPlugins.some((p) => isDevPathPluginEntry(p));
     if (
         rawPlugins.some(
-            (p) =>
-                isLocalPathPluginEntry(p) &&
-                String(p).includes("magic-context") &&
-                !isDevPathPluginEntry(p),
+            (plugin) =>
+                isLocalPathPluginEntry(plugin) &&
+                String(plugin).includes("magic-context") &&
+                !isDevPathPluginEntry(plugin),
         )
     ) {
         log.warn(
@@ -153,12 +187,14 @@ export function addPluginToTuiConfig(configPath: string, _format: "json" | "json
         );
     }
 
-    if (!hasNpmEntry && !hasDevEntry) {
-        rawPlugins.push(PLUGIN_ENTRY);
-    }
+    const hasNpmEntry = rawPlugins.some((plugin) => matchesPluginEntry(plugin, PLUGIN_NAME));
+    const hasDevEntry = rawPlugins.some((plugin) => isDevPathPluginEntry(plugin));
+    if (hasNpmEntry || hasDevEntry) return;
 
-    existing.plugin = rawPlugins;
-    writeFileAtomic(configPath, `${stringifyJsonc(existing, null, 2)}\n`);
+    const text = Array.isArray(existing.plugin)
+        ? appendJsoncArrayValues(readFileSync(configPath, "utf-8"), ["plugin"], [PLUGIN_ENTRY])
+        : setJsoncValue(readFileSync(configPath, "utf-8"), ["plugin"], [PLUGIN_ENTRY]);
+    writeFileAtomic(configPath, text);
 }
 
 export function findDcpPluginIndexes(plugins: unknown[]): number[] {
