@@ -89,10 +89,12 @@ const CLONE_MARKER_KEY = "cortexkitClone";
 const NATIVE_ID_PATTERN = /^(?:msg|prt)_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const MAGIC_CONTEXT_ADDITIONAL_TABLES = [
     "compression_depth",
-    "session_projects",
     "session_facts",
     "session_notes",
     "notes",
+    // Notes must land before this association because authority-managed note
+    // guards resolve session ownership through session_projects.
+    "session_projects",
     "user_memory_candidates",
     "primer_candidates",
     "transform_decisions",
@@ -381,6 +383,13 @@ function mapString(
     for (const map of otherIds) {
         const mapped = map.get(value);
         if (mapped) return mapped;
+    }
+    const blockSeparator = value.lastIndexOf("#");
+    const blockSuffix = blockSeparator > 0 ? value.slice(blockSeparator) : "";
+    if (/^#\d+$/.test(blockSuffix)) {
+        const sourceMessageId = value.slice(0, blockSeparator);
+        const mappedBlockMessage = messageIds.get(sourceMessageId);
+        if (mappedBlockMessage) return `${mappedBlockMessage}${blockSuffix}`;
     }
     return mapContentId(value, messageIds);
 }

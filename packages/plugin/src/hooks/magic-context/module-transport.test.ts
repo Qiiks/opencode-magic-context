@@ -553,6 +553,71 @@ describe("SubcModuleTransport", () => {
         expect(transport.getCachedStateSyncCapabilities()).toBeUndefined();
     });
 
+    it("keeps wrapup and live status calls beyond a 20-second round without raising the generic deadline", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        let releaseWrapup: (() => void) | undefined;
+        let markWrapupStarted: (() => void) | undefined;
+        const wrapupStarted = new Promise<void>((resolve) => {
+            markWrapupStarted = resolve;
+        });
+        const observedTimeouts = new Map<string, number>();
+        const client = {
+            request: async (_route: RouteHandle, body: unknown, options: { timeoutMs: number }) => {
+                const method = (body as { method: string }).method;
+                observedTimeouts.set(method, options.timeoutMs);
+                if (method === "session.wrapup") {
+                    markWrapupStarted?.();
+                    await new Promise<void>((resolve) => {
+                        releaseWrapup = resolve;
+                    });
+                }
+                return { result: { ok: true } };
+            },
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            ensureRoute: () => Promise<{
+                client: SubcClient;
+                route: RouteHandle;
+                routeKey: string;
+                generation: number;
+            }>;
+        };
+        internals.ensureRoute = async () => ({
+            client,
+            route,
+            routeKey: "session-wrapup\0/workspace/project",
+            generation: 0,
+        });
+
+        const wrapup = transport.call({
+            sessionId: "session-wrapup",
+            projectRoot: "/workspace/project",
+            method: "session.wrapup",
+            body: { method: "session.wrapup", v: 1 },
+        });
+        await wrapupStarted;
+        const status = transport.call({
+            sessionId: "session-wrapup",
+            projectRoot: "/workspace/project",
+            method: "session.status",
+            body: { method: "session.status", v: 1 },
+        });
+        releaseWrapup?.();
+        await expect(wrapup).resolves.toEqual({ result: { ok: true } });
+        await expect(status).resolves.toEqual({ result: { ok: true } });
+        await transport.call({
+            sessionId: "session-generic",
+            projectRoot: "/workspace/project",
+            method: "session.flush",
+            body: { method: "session.flush", v: 1 },
+        });
+
+        expect(observedTimeouts.get("session.wrapup")).toBeGreaterThan(20_000);
+        expect(observedTimeouts.get("session.status")).toBeGreaterThan(20_000);
+        expect(observedTimeouts.get("session.flush")).toBeLessThanOrEqual(15_000);
+    });
+
     it("does not reuse a route cached under an earlier connection generation", async () => {
         const transport = new SubcModuleTransport("unused-connection-file");
         const oldRoute = { channel: 7, epoch: 77 } as RouteHandle;

@@ -10,6 +10,7 @@ export const STALE_CHILD_SPAWN_LATCH_THRESHOLD = 2;
 
 export interface ChildSpawnFenceFailure {
     failureClass: typeof STALE_CHILD_SPAWN_FAILURE;
+    reason: "newer_schema" | "read_error";
     persistedVersion: number;
     supportedVersion: number;
     consecutiveFailures: number;
@@ -40,6 +41,7 @@ export type ChildSpawnFenceProbeResult =
 function recordStaleFence(
     persistedVersion: number,
     supportedVersion: number,
+    reason: ChildSpawnFenceFailure["reason"] = "newer_schema",
 ): ChildSpawnFenceProbeResult {
     state.consecutiveFailures += 1;
     state.totalFailures += 1;
@@ -47,6 +49,7 @@ function recordStaleFence(
     state.latched ||= latched;
     const failure: ChildSpawnFenceFailure = {
         failureClass: STALE_CHILD_SPAWN_FAILURE,
+        reason,
         persistedVersion,
         supportedVersion,
         consecutiveFailures: state.consecutiveFailures,
@@ -82,10 +85,10 @@ export function probeChildSpawnFence(db: Database | null): ChildSpawnFenceProbeR
             return recordStaleFence(persistedVersion, LATEST_SUPPORTED_VERSION);
         }
     } catch {
-        // This probe only blocks known stale builds. The caller's existing storage
-        // handling owns ordinary SQLite read failures, so a transient probe error
-        // must not convert a healthy child spawn into an unrelated failure.
-        return { allowSpawn: true };
+        // A failed read cannot prove that this process still matches the shared
+        // schema. Refuse the child rather than allowing one stale spawn across a
+        // migration fence; the surfaced doctor command provides the recovery path.
+        return recordStaleFence(LATEST_SUPPORTED_VERSION, LATEST_SUPPORTED_VERSION, "read_error");
     }
 
     // A successful live read re-arms the N-consecutive latch. This is normally

@@ -15,7 +15,11 @@ import {
     drainNotifications,
 } from "../../shared/rpc-notifications";
 import { Database } from "../../shared/sqlite";
-import { createChildSessionWithFence, STALE_PLUGIN_RESTART_NOTICE } from "./child-session-spawn";
+import {
+    createChildSessionWithFence,
+    SCHEMA_PROBE_FAILURE_NOTICE,
+    STALE_PLUGIN_RESTART_NOTICE,
+} from "./child-session-spawn";
 
 const dbs: Database[] = [];
 
@@ -62,6 +66,34 @@ describe("createChildSessionWithFence", () => {
             supportedVersion: LATEST_SUPPORTED_VERSION,
             consecutiveFailures: 2,
         });
+    });
+
+    it("refuses an unreadable probe and surfaces the doctor recovery message", async () => {
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        db.close();
+        const create = mock(async () => ({ id: "child" }));
+        const prompt = mock(async () => undefined);
+        const client = { session: { create, prompt } } as never;
+        const args = {
+            client,
+            db,
+            parentSessionId: "ses_parent",
+            title: "magic-context-sidekick",
+            directory: "/project",
+        };
+
+        await createChildSessionWithFence(args);
+        await createChildSessionWithFence(args);
+
+        expect(create).not.toHaveBeenCalled();
+        expect(drainNotifications(0, "ses_parent")).toContainEqual(
+            expect.objectContaining({
+                type: "toast",
+                payload: expect.objectContaining({ message: SCHEMA_PROBE_FAILURE_NOTICE }),
+            }),
+        );
+        expect(prompt).toHaveBeenCalledTimes(1);
     });
 
     it("surfaces the latched failure through the TUI toast and parent warning paths", async () => {

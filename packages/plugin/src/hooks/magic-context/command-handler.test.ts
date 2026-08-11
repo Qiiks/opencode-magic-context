@@ -3,6 +3,7 @@
 import { beforeEach, describe, expect, it, mock } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { createMagicContextCommandHandler } from "./command-handler";
+import { MAX_WRAPUP_REQUEST_BUDGET_MS } from "./module-transport";
 
 function createTestDb(): Database {
     const db = new Database(":memory:");
@@ -849,7 +850,11 @@ describe("createMagicContextCommandHandler", () => {
         it("maps Rust wrapup and recomp dispositions while minting command ids", async () => {
             const sendNotification = mock(async () => {});
             const moduleCall = mock(
-                async (args: { method: string; body: Record<string, unknown> }) => {
+                async (args: {
+                    method: string;
+                    body: Record<string, unknown>;
+                    timeoutMs?: number;
+                }) => {
                     if (args.method === "session.wrapup") {
                         return { disposition: "completed", rounds: 2, summary: "Wrapped up." };
                     }
@@ -882,11 +887,12 @@ describe("createMagicContextCommandHandler", () => {
             );
 
             const calls = moduleCall.mock.calls as unknown as Array<
-                [{ method: string; body: Record<string, unknown> }]
+                [{ method: string; body: Record<string, unknown>; timeoutMs?: number }]
             >;
             expect(calls[0]?.[0].method).toBe("session.wrapup");
             expect(calls[0]?.[0].body.keep).toBe(100);
             expect(calls[0]?.[0].body.command_id).toEqual(expect.any(String));
+            expect(calls[0]?.[0].timeoutMs).toBe(MAX_WRAPUP_REQUEST_BUDGET_MS);
             expect(calls[1]?.[0].method).toBe("session.recomp");
             expect(calls[1]?.[0].body.command_id).toEqual(expect.any(String));
             expect(sendNotification).toHaveBeenCalledWith(

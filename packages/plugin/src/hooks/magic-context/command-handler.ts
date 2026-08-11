@@ -22,6 +22,7 @@ import {
 } from "./compartment-runner-partial-recomp";
 import { executeFlush } from "./execute-flush";
 import { executeStatus } from "./execute-status";
+import { MAX_WRAPUP_REQUEST_BUDGET_MS } from "./module-transport";
 import type { RustModeModuleClient } from "./rust-mode-transform";
 import type { NotificationParams } from "./send-session-notification";
 import { sendUserPrompt } from "./send-session-notification";
@@ -596,6 +597,7 @@ export function createMagicContextCommandHandler(deps: {
     const callRust = async (
         method: Parameters<RustModeModuleClient["call"]>[0]["method"],
         body: Record<string, unknown>,
+        timeoutMs?: number,
     ): Promise<Record<string, unknown>> => {
         if (!rustMode) throw new Error("Rust module client is unavailable");
         return moduleResponseValue(
@@ -604,6 +606,7 @@ export function createMagicContextCommandHandler(deps: {
                 projectRoot: deps.projectRoot ?? process.cwd(),
                 method,
                 body,
+                ...(timeoutMs === undefined ? {} : { timeoutMs }),
             }),
         );
     };
@@ -806,13 +809,17 @@ export function createMagicContextCommandHandler(deps: {
                         {},
                     );
                     try {
-                        const value = await callRust("session.wrapup", {
-                            method: "session.wrapup",
-                            v: 1,
-                            session_id: sessionId,
-                            keep,
-                            command_id: rustCommandId("wrapup"),
-                        });
+                        const value = await callRust(
+                            "session.wrapup",
+                            {
+                                method: "session.wrapup",
+                                v: 1,
+                                session_id: sessionId,
+                                keep,
+                                command_id: rustCommandId("wrapup"),
+                            },
+                            MAX_WRAPUP_REQUEST_BUDGET_MS,
+                        );
                         result = formatRustOperationMessage("wrapup", value);
                     } catch (error) {
                         result = `## Magic Wrapup — Failed\n\n${error instanceof Error ? error.message : String(error)}`;

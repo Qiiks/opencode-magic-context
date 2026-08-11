@@ -747,6 +747,50 @@ describe("reconcileCompactionMode — transition algebra", () => {
         expect(getChannel2NudgeState(db, "ses-1")).toBe("");
     });
 
+    it("persists off notice intent before the first durable clear", () => {
+        useTempDataHome("mc-mode-interrupted-off-");
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, "ses-1");
+        setCompactionModeRecord(db, "ses-1", "on");
+        setPersistedCompactionMarkerState(db, "ses-1", {
+            boundaryMessageId: "msg-user-1",
+            summaryMessageId: "msg-summary",
+            compactionPartId: "prt-marker",
+            summaryPartId: "prt-summary",
+            boundaryOrdinal: 1,
+            targetEndMessageId: null,
+        });
+        db.exec(`
+            CREATE TRIGGER interrupt_first_off_clear
+            BEFORE UPDATE OF compaction_marker_state ON session_meta
+            WHEN OLD.compaction_marker_state <> '' AND NEW.compaction_marker_state = ''
+            BEGIN SELECT RAISE(ABORT, 'simulated interrupt after notice intent'); END;
+        `);
+
+        expect(() =>
+            reconcileCompactionMode({
+                db,
+                sessionId: "ses-1",
+                compactionOff: true,
+                historianRunnable: true,
+                compartmentInProgress: false,
+            }),
+        ).toThrow("simulated interrupt after notice intent");
+        expect(getCompactionModeRecord(db, "ses-1")).toBe("off_notice_pending");
+        expect(getPersistedCompactionMarkerState(db, "ses-1")).not.toBeNull();
+
+        db.exec("DROP TRIGGER interrupt_first_off_clear");
+        const resumed = reconcileCompactionMode({
+            db,
+            sessionId: "ses-1",
+            compactionOff: true,
+            historianRunnable: true,
+            compartmentInProgress: false,
+        });
+        expect(resumed.notice).toBe(COMPACTION_OFF_FLIP_NOTICE);
+        expect(getPersistedCompactionMarkerState(db, "ses-1")).toBeNull();
+    });
+
     it("no record + off on a LEGACY session (upgrade path) → full cleanup + flip notice", () => {
         useTempDataHome("mc-mode-legacy-off-");
         const db = openDatabase();
