@@ -102,6 +102,11 @@ jobs:
       - name: Smoke (TUI packaged install import)
         run: bun packages/plugin/scripts/smoke-tui-pack-install.ts
 
+      # Exercise the lazy token-estimate path from the real tarball inside the
+      # same compiled-Bun module shape used by OpenCode.
+      - name: Smoke (tokenizer packaged install estimate)
+        run: bun packages/plugin/scripts/smoke-tokenizer-pack-install.ts
+
   test-pi:
     name: Test (pi-plugin)
     runs-on: ubuntu-latest
