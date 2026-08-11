@@ -9,6 +9,7 @@ import {
     openSync,
     readdirSync,
     readFileSync,
+    readSync,
     rmSync,
     statSync,
     writeFileSync,
@@ -166,19 +167,41 @@ function seedCurrentDatabase(dbPath: string): void {
 
 function corruptLastTagLeaf(dbPath: string): void {
     const db = new Database(dbPath, { readonly: true });
-    const pageSize = db.prepare("PRAGMA page_size").get() as { page_size: number };
-    const page = db
-        .prepare(
-            "SELECT pageno FROM dbstat WHERE name = 'tags' AND pagetype = 'leaf' ORDER BY pageno DESC LIMIT 1",
-        )
-        .get() as { pageno: number } | undefined;
+    const { page_size: pageSize } = db.prepare("PRAGMA page_size").get() as { page_size: number };
+    // `dbstat` is a compile-time SQLite option (SQLITE_ENABLE_DBSTAT_VTAB), present in some
+    // bun builds and absent in others, so picking a page through it makes this fixture pass
+    // or fail on the toolchain rather than on the code under test. Scan the file instead.
+    // Every `tags` row stores the literal 'message' in its type column and nothing bulky,
+    // so a tags leaf packs dozens of them into one page while other pages that mention the
+    // word (the schema page's start_message/end_message columns) hold only a few. Taking
+    // the page with the MOST occurrences therefore lands on a real tags leaf without a
+    // magic threshold; skip page 1, which is the schema header.
+    const { page_count: pageCount } = db.prepare("PRAGMA page_count").get() as {
+        page_count: number;
+    };
     db.close();
-    if (!page) throw new Error("dbstat did not find a tags leaf page");
 
+    const rowMarker = Buffer.from("message");
     const fd = openSync(dbPath, "r+");
     try {
-        const zeroPage = Buffer.alloc(pageSize.page_size);
-        writeSync(fd, zeroPage, 0, zeroPage.length, (page.pageno - 1) * pageSize.page_size);
+        const buffer = Buffer.alloc(pageSize);
+        let target: number | undefined;
+        let best = 0;
+        for (let pageno = 2; pageno <= pageCount; pageno++) {
+            readSync(fd, buffer, 0, pageSize, (pageno - 1) * pageSize);
+            let count = 0;
+            let at = buffer.indexOf(rowMarker);
+            while (at !== -1) {
+                count += 1;
+                at = buffer.indexOf(rowMarker, at + rowMarker.length);
+            }
+            if (count > best) {
+                best = count;
+                target = pageno;
+            }
+        }
+        if (!target) throw new Error("no tags leaf page found to corrupt");
+        writeSync(fd, Buffer.alloc(pageSize), 0, pageSize, (target - 1) * pageSize);
     } finally {
         closeSync(fd);
     }
