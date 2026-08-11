@@ -517,6 +517,80 @@ describe("module state sync section deltas", () => {
         expect(statusCalls).toBe(1);
     });
 
+    it("re-probes and rebuilds a full payload after a delta crosses a connection generation", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-state-sync-delta-reconnect";
+        createWorkspace(db);
+        insertUserMemory(db, "profile survives reconnect", []);
+        setProjectState(db, "__global__", { projectUserProfileVersion: 1 });
+        const state = {
+            ...syncState(),
+            lastAckedWatermarks: loadModuleWatermarks({
+                db,
+                sessionId,
+                projectPath: "/tmp/project",
+            }),
+            seedPassPending: false,
+        };
+        updateSessionMeta(db, sessionId, { lastTodoState: '[{"content":"changed"}]' });
+
+        let generation = 1;
+        let cachedGeneration = 1;
+        let moduleSupportsDeltas = true;
+        let statusCalls = 0;
+        const stateSyncBodies: Record<string, unknown>[] = [];
+        let moduleProfile = ["profile survives reconnect"];
+        let moduleWorkspace: unknown = { preserved: true };
+        const transport = {
+            getCachedStateSyncCapabilities: () =>
+                cachedGeneration === generation
+                    ? { state_sync_deltas: moduleSupportsDeltas }
+                    : undefined,
+            async stateSyncCapabilities() {
+                statusCalls += 1;
+                cachedGeneration = generation;
+                return { state_sync_deltas: moduleSupportsDeltas };
+            },
+            async call(args: { body: unknown; generationSensitive?: boolean }) {
+                const body = args.body as Record<string, unknown>;
+                stateSyncBodies.push(body);
+                if (stateSyncBodies.length === 1) {
+                    expect(args.generationSensitive).toBe(true);
+                    expect(body).not.toHaveProperty("user_profile");
+                    expect(body).not.toHaveProperty("workspace");
+                    generation = 2;
+                    moduleSupportsDeltas = false;
+                    return {
+                        transport_status: "connection_generation_changed",
+                        previous_generation: 1,
+                        current_generation: 2,
+                    };
+                }
+                expect(args.generationSensitive).toBe(false);
+                moduleProfile = body.user_profile as string[];
+                moduleWorkspace = body.workspace;
+                return { result: { shadow_seq: 1 } };
+            },
+        };
+
+        await expect(
+            syncModuleState({
+                client: transport,
+                state,
+                pass: { db, sessionId, projectPath: "/tmp/project", nowMs: 1 },
+                projectRoot: "/tmp/project",
+                force: false,
+            }),
+        ).resolves.toMatchObject({ status: "acked" });
+
+        expect(statusCalls).toBe(1);
+        expect(stateSyncBodies).toHaveLength(2);
+        expect(stateSyncBodies[1]).toHaveProperty("user_profile", ["profile survives reconnect"]);
+        expect(stateSyncBodies[1]).toHaveProperty("workspace");
+        expect(moduleProfile).toEqual(["profile survives reconnect"]);
+        expect(moduleWorkspace).toEqual(expect.objectContaining({ members: expect.any(Array) }));
+    });
+
     it("uses a re-probed capability shape without leaking module-owned memories", async () => {
         const db = createContextDb();
         const sessionId = "ses-state-sync-capability-reprobe";

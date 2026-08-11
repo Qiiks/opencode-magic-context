@@ -1577,19 +1577,21 @@ describe("Rust mode authority adapter", () => {
         expect(secondSlot?.inputContentDigests).not.toEqual(firstSlot?.inputContentDigests);
     });
 
-    it("keeps an applied pass at most one immediate turn ahead of its LKG slot", async () => {
+    it("refuses a pre-bust LKG before the async replacement capture commits", async () => {
         const sessionId = `rust-lkg-async-${Date.now()}`;
         sessions.push(sessionId);
         const db = makeDb();
         installRawProvider(sessionId);
         const scheduled: Array<() => void> = [];
         let pass = 0;
+        let failTransform = false;
         const moduleClient: RustModeModuleClient = {
             call: async ({ method }) => {
                 if (method !== "transform") return { ok: true };
+                if (failTransform) throw new Error("daemon unavailable before LKG commit");
                 pass += 1;
                 return {
-                    decision: pass === 1 ? "HARD" : "SOFT+",
+                    decision: pass === 1 ? "HARD" : "SOFT",
                     row_version: pass,
                     native_messages: [
                         {
@@ -1613,8 +1615,16 @@ describe("Rust mode authority adapter", () => {
         expect(getSlot(sessionId)?.jsonPrefix).toContain("async response 1");
 
         await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
-        expect(getSlot(sessionId)?.jsonPrefix).toContain("async response 1");
+        expect(getSlot(sessionId)).toBeUndefined();
         expect(scheduled).toHaveLength(1);
+
+        failTransform = true;
+        const failureOutput = { messages: [...input] as unknown[] };
+        await transform.run(sessionId, input, failureOutput, makeMeta(db, sessionId));
+        expect(failureOutput.messages).toEqual(input);
+        expect(JSON.stringify(failureOutput.messages)).not.toContain("async response 1");
+        expect(getSlot(sessionId)).toBeUndefined();
+
         scheduled.shift()?.();
         expect(getSlot(sessionId)?.jsonPrefix).toContain("async response 2");
     });
