@@ -582,6 +582,10 @@ pub struct TransformRequest {
     /// deliberately false so older callers stay on the dormant byte path.
     #[serde(default)]
     pub tool_present: bool,
+    /// Frozen availability of OpenCode's native todowrite tool. None is a provisional or
+    /// legacy-sender verdict and fails open to preserve the existing injection behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_tool_present: Option<bool>,
     /// Session-resolved prompt preset. Full is the wire default so older callers retain the
     /// exact pre-prompt-surface identity.
     #[serde(default)]
@@ -730,6 +734,8 @@ struct TransformRequestWire {
     #[serde(default)]
     tool_present: bool,
     #[serde(default)]
+    todo_tool_present: Option<bool>,
+    #[serde(default)]
     prompt_surface_preset: PromptSurfacePreset,
     #[serde(default)]
     prompt_surface_model_key: Option<String>,
@@ -817,6 +823,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             caveman_enabled: wire.caveman_enabled,
             caveman_min_chars: wire.caveman_min_chars,
             tool_present: wire.tool_present,
+            todo_tool_present: wire.todo_tool_present,
             prompt_surface_preset: wire.prompt_surface_preset,
             prompt_surface_model_key: wire.prompt_surface_model_key,
             prompt_surface_config_identity: wire.prompt_surface_config_identity,
@@ -2914,6 +2921,7 @@ fn apply_once(
             &loaded.meta,
             &tail_for_selection,
             loaded.meta.synthetic_todo.as_ref(),
+            req.todo_tool_present,
         );
     let mut protected_block_ids = if tagging_surface_requested {
         newest_active_tag_block_ids(
@@ -3218,7 +3226,7 @@ fn apply_once(
     let tail_for_capture = tail_for_selection.clone();
     if is_bust_pass && tail_reclaim_enabled {
         let todo_started_at = Instant::now();
-        capture_todo_state_on_bust(&mut meta, &tail_for_capture, true);
+        capture_todo_state_on_bust(&mut meta, &tail_for_capture, true, req.todo_tool_present);
         todo_ms += elapsed_ms(todo_started_at);
     }
 
@@ -3482,7 +3490,12 @@ fn apply_once(
                     let todo_started_at = Instant::now();
                     let post_truncate_tail =
                         tail_sel_items(&live, comp.coverage_ordinal, &tag_tokens_by_block);
-                    capture_todo_state_on_bust(&mut meta, &post_truncate_tail, true);
+                    capture_todo_state_on_bust(
+                        &mut meta,
+                        &post_truncate_tail,
+                        true,
+                        req.todo_tool_present,
+                    );
                     todo_ms += elapsed_ms(todo_started_at);
                 }
                 meta.coverage_ordinal = comp.coverage_ordinal;
@@ -5678,7 +5691,8 @@ fn advance_synthetic_todo(
     req: &TransformRequest,
 ) -> Result<(), TransformError> {
     let existing = meta.synthetic_todo.clone();
-    let outcome = advance_injection_from_meta(meta, existing.as_ref(), is_bust_pass);
+    let outcome =
+        advance_injection_from_meta(meta, existing.as_ref(), is_bust_pass, req.todo_tool_present);
     match outcome {
         InjectionOutcome::Replace(next) => {
             let anchor_mid = tail_end_mid(req, meta.coverage_ordinal);
@@ -10529,6 +10543,7 @@ pub(crate) mod tests {
             caveman_enabled: false,
             caveman_min_chars: DEFAULT_CAVEMAN_MIN_CHARS,
             tool_present: false,
+            todo_tool_present: None,
             prompt_surface_preset: PromptSurfacePreset::Full,
             prompt_surface_model_key: None,
             prompt_surface_config_identity: String::new(),
@@ -12608,6 +12623,69 @@ pub(crate) mod tests {
         assert_eq!(
             serde_json::to_vec(&defer_native).unwrap(),
             serde_json::to_vec(&bust_native).unwrap()
+        );
+    }
+
+    #[test]
+    fn disabled_todowrite_waits_for_independent_bust_then_clears_visible_tail_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let before_disable = json!([{
+            "content": "Captured before disable",
+            "status": "in_progress",
+            "priority": "high"
+        }]);
+        let initial = req(
+            "todo-disabled",
+            "cfg0",
+            vec![
+                item("a", 1, "raw"),
+                todowrite_call("todo-before", 2, before_disable.clone()),
+            ],
+        );
+        let boot = run(&s, &initial, &spine());
+        assert_eq!(boot.action, "HARD");
+        let frozen_pair = synthetic_todo_pair_bytes(&boot);
+
+        let mut disabled = initial;
+        disabled.todo_tool_present = Some(false);
+        disabled.messages.push(todowrite_call(
+            "todo-visible-after-disable",
+            3,
+            json!([{
+                "content": "Visible but disabled",
+                "status": "in_progress",
+                "priority": "high"
+            }]),
+        ));
+        let defer = run(&s, &with_usage(disabled.clone(), 10, 100), &spine());
+        assert_eq!(defer.materialize_reason, None);
+        assert_eq!(
+            synthetic_todo_pair_bytes(&defer),
+            frozen_pair,
+            "pending clearing must not create its own bust"
+        );
+        let deferred_meta = s.load("todo-disabled").unwrap().meta;
+        assert_eq!(
+            deferred_meta.last_todo_state_owner_message_id.as_deref(),
+            Some("todo-before")
+        );
+
+        let bust = run(&s, &with_usage(disabled, 70, 100), &spine());
+        assert!(bust.committed);
+        assert!(bust.messages().iter().all(|message| {
+            !message.meta.synthetic
+                || !matches!(
+                    message.content.first().map(|block| &block.kind),
+                    Some(ck_wire::CkKind::ToolCall { name, .. }) if name == "todowrite"
+                )
+        }));
+        let busted_meta = s.load("todo-disabled").unwrap().meta;
+        assert!(busted_meta.synthetic_todo.is_none());
+        assert_eq!(
+            busted_meta.last_todo_state_owner_message_id.as_deref(),
+            Some("todo-before"),
+            "disabled bust must not recapture the newer visible call"
         );
     }
 
@@ -19706,6 +19784,21 @@ pub(crate) mod tests {
         let durable = store.load("mixed-freezes").unwrap().core;
         assert_eq!(frozen_red_payload(&durable, "m1#0"), Some("[dropped §7§]"));
         assert_eq!(frozen_red_payload(&durable, "m2#0"), Some("[dropped]"));
+    }
+
+    #[test]
+    fn missing_todo_tool_verdict_deserializes_as_provisional() {
+        let wire = serde_json::to_value(profile_req(
+            SerializerProfile::OpencodeAiSdk,
+            "todo-verdict-default",
+            "cfg0",
+            vec![item("a", 1, "first")],
+        ))
+        .unwrap();
+        assert!(wire.get("todo_tool_present").is_none());
+        let request: TransformRequest = serde_json::from_value(wire).unwrap();
+
+        assert_eq!(request.todo_tool_present, None);
     }
 
     #[test]
