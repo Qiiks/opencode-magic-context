@@ -6656,6 +6656,19 @@ impl McHandler {
         // change the transform result.
         let _ = store.trace_pass_received(&parsed.session_id, pass_now);
         let run_transform = || {
+            let resolved_cache_ttl = parsed.cache_ttl.clone().map_or_else(
+                || {
+                    binding
+                        .config
+                        .resolve_cache_ttl_with_provenance(parsed.model_key.as_deref())
+                },
+                |value| config::ResolvedCacheTtl {
+                    value,
+                    // Host-resolved TTLs remain host-side; only a per-model config match may
+                    // instruct the Claude Code marker owner.
+                    provenance: config::CacheTtlProvenance::Default,
+                },
+            );
             let producer_ctx = transform::ProducerContext {
                 project_path: &project_path,
                 note_project_path: &note_project_path,
@@ -6675,13 +6688,10 @@ impl McHandler {
                 now_ms: pass_now,
                 execute_threshold_percentage: binding.config.execute_threshold_percentage,
                 smart_drops: binding.config.smart_drops,
-                // OpenCode/Pi send their host-resolved value. Claude Code omits it, so use the
-                // request's per-pass model key; a missing key deliberately selects the config default.
-                cache_ttl: parsed.cache_ttl.clone().unwrap_or_else(|| {
-                    binding
-                        .config
-                        .resolve_cache_ttl(parsed.model_key.as_deref())
-                }),
+                // OpenCode/Pi send their host-resolved value. Claude Code omits it, so resolve the
+                // request's model while retaining whether the walk actually matched an entry.
+                cache_ttl: resolved_cache_ttl.value,
+                cache_ttl_provenance: resolved_cache_ttl.provenance,
                 model_key: binding.model_key.clone(),
                 observed_last_response_at_ms: self
                     .observed_last_response_at_ms(&store, &parsed.session_id),
@@ -14191,7 +14201,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn claude_code_response_without_model_cache_ttl_uses_module_config_default() {
+    async fn claude_code_response_without_model_cache_ttl_inherits_harness_markers() {
         let mut config = default_test_config();
         config.model_chain.clear();
         config.cache_ttl = "90m".to_string();
@@ -14205,7 +14215,7 @@ mod tests {
         transform_request["serializer_profile"] = json!("claude-code-anthropic");
 
         let response = call_transform_request(&handler, transform_request).await;
-        assert_eq!(response["cache_ttl"], "1h");
+        assert!(response.get("cache_ttl").is_none());
     }
 
     #[test]
@@ -23271,6 +23281,7 @@ mod tests {
                 execute_threshold_percentage: 65.0,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
+                cache_ttl_provenance: config::CacheTtlProvenance::Default,
                 model_key: None,
                 observed_last_response_at_ms: None,
                 guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
@@ -24044,6 +24055,7 @@ mod tests {
                 execute_threshold_percentage: 65.0,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
+                cache_ttl_provenance: config::CacheTtlProvenance::Default,
                 model_key: None,
                 observed_last_response_at_ms: None,
                 guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),

@@ -86,31 +86,52 @@ impl Default for McModuleConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTtlProvenance {
+    Explicit,
+    Default,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCacheTtl {
+    pub value: String,
+    pub provenance: CacheTtlProvenance,
+}
+
 impl McModuleConfig {
-    /// Resolve the effective cache TTL with the same walk as the TypeScript
-    /// adapter: exact and bare candidates at each progressive dash boundary,
-    /// then the provider wildcard, then the configured default.
-    pub fn resolve_cache_ttl(&self, model_key: Option<&str>) -> String {
-        // No producer currently sends an unprefixed key, but the pre-parity
-        // walk honored an exact match before splitting; keep that so a bare
-        // input can never silently downgrade to the default TTL.
+    /// Resolve the effective cache TTL while preserving whether the model walk matched an entry.
+    ///
+    /// The configured default remains the effective value for host-side scheduling, but it is not
+    /// an instruction to place that value on a provider cache marker.
+    pub fn resolve_cache_ttl_with_provenance(&self, model_key: Option<&str>) -> ResolvedCacheTtl {
+        let explicit = |value: &String| ResolvedCacheTtl {
+            value: value.clone(),
+            provenance: CacheTtlProvenance::Explicit,
+        };
+        let default = || ResolvedCacheTtl {
+            value: self.cache_ttl.clone(),
+            provenance: CacheTtlProvenance::Default,
+        };
+
+        // Check an exact key before splitting into provider and model parts, so a bare key cannot
+        // silently fall back to the default TTL.
         if let Some(ttl) = model_key.and_then(|key| self.cache_ttl_by_model.get(key)) {
-            return ttl.clone();
+            return explicit(ttl);
         }
         let Some((provider, mut model_id)) = model_key.and_then(|key| key.split_once('/')) else {
-            return self.cache_ttl.clone();
+            return default();
         };
         if provider.is_empty() || model_id.is_empty() {
-            return self.cache_ttl.clone();
+            return default();
         }
 
         loop {
             let exact = format!("{provider}/{model_id}");
             if let Some(ttl) = self.cache_ttl_by_model.get(&exact) {
-                return ttl.clone();
+                return explicit(ttl);
             }
             if let Some(ttl) = self.cache_ttl_by_model.get(model_id) {
-                return ttl.clone();
+                return explicit(ttl);
             }
 
             let Some(last_dash) = model_id.rfind('-').filter(|index| *index > 0) else {
@@ -120,9 +141,14 @@ impl McModuleConfig {
         }
 
         if let Some(ttl) = self.cache_ttl_by_model.get(&format!("{provider}/*")) {
-            return ttl.clone();
+            return explicit(ttl);
         }
-        self.cache_ttl.clone()
+        default()
+    }
+
+    /// Resolve only the effective value for existing host-side callers.
+    pub fn resolve_cache_ttl(&self, model_key: Option<&str>) -> String {
+        self.resolve_cache_ttl_with_provenance(model_key).value
     }
 }
 
@@ -481,6 +507,21 @@ mod cache_ttl_tests {
         // A bare unprefixed key with an exact config entry must not downgrade
         // to the default (pre-parity behavior preserved).
         assert_eq!(cfg.resolve_cache_ttl(Some("gpt-5.6-sol")), "30m");
+    }
+
+    #[test]
+    fn provenance_distinguishes_an_explicit_value_equal_to_the_default() {
+        let mut cfg = McModuleConfig::default();
+        cfg.cache_ttl_by_model.insert(
+            "anthropic/claude-haiku-4-5".to_string(),
+            cfg.cache_ttl.clone(),
+        );
+
+        let explicit = cfg.resolve_cache_ttl_with_provenance(Some("anthropic/claude-haiku-4-5"));
+        let fallback = cfg.resolve_cache_ttl_with_provenance(Some("anthropic/claude-nova-6-0"));
+        assert_eq!(explicit.value, fallback.value);
+        assert_eq!(explicit.provenance, CacheTtlProvenance::Explicit);
+        assert_eq!(fallback.provenance, CacheTtlProvenance::Default);
     }
 
     #[test]
