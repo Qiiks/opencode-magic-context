@@ -886,7 +886,11 @@ pub fn select_reductions(
             for arc_id in select_two_pass(&active_arcs, ctx) {
                 arc_shapes.insert(arc_id, ArcShape::FullDrop);
             }
-            if cfg.smart_drops {
+            // Keep supersession intents pending until scheduler pressure requires execution
+            // or this pass is already changing other bytes, then apply them together.
+            if cfg.smart_drops
+                && (ctx.scheduler_pressure_execute || ctx.pass_already_busting)
+            {
                 let intents = select_supersession(&active_arcs);
                 for (arc_id, intent) in intents {
                     if arc_shapes.contains_key(&arc_id) {
@@ -1401,6 +1405,78 @@ mod tests {
         assert!(
             !select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default(),)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn supersession_waits_for_pressure_or_an_independent_bust_and_batches() {
+        let items = vec![
+            tool_call(
+                "c1",
+                1,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":"one"}),
+                500,
+            ),
+            tool_result("c1", 1, "edit", 100),
+            tool_call(
+                "c2",
+                2,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":"two"}),
+                500,
+            ),
+            tool_result("c2", 2, "edit", 100),
+            tool_call(
+                "c3",
+                3,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":"three"}),
+                500,
+            ),
+            tool_result("c3", 3, "edit", 100),
+            tool_call("c4", 4, "bash_status", serde_json::json!({}), 100),
+            tool_result("c4", 4, "bash_status", 100),
+        ];
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.scheduler_pressure_execute = false;
+        let cfg = SelectionConfig { smart_drops: true };
+
+        assert!(select_reductions(&items, &HashSet::new(), &ctx, &cfg).is_empty());
+
+        ctx.pass_already_busting = true;
+        let riding = select_reductions(&items, &HashSet::new(), &ctx, &cfg);
+        ctx.pass_already_busting = false;
+        ctx.scheduler_pressure_execute = true;
+        let pressured = select_reductions(&items, &HashSet::new(), &ctx, &cfg);
+
+        let signature = |decisions: &[ReductionDecision]| {
+            decisions
+                .iter()
+                .map(|decision| {
+                    (
+                        decision.target_id.clone(),
+                        decision.kind.clone(),
+                        decision.payload.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(signature(&riding), signature(&pressured));
+        assert_eq!(
+            pressured
+                .iter()
+                .map(|decision| decision.target_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                call_block_id("c1"),
+                result_block_id("c1"),
+                call_block_id("c2"),
+                result_block_id("c2"),
+                call_block_id("c4"),
+                result_block_id("c4"),
+            ],
+            "edit markers and control-plane drops must first-apply in one qualifying batch"
         );
     }
 
