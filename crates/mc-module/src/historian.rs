@@ -1838,6 +1838,7 @@ mod tests {
             execute_threshold_percentage: 65.0,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
+            cache_ttl_provenance: crate::config::CacheTtlProvenance::Default,
             model_key: None,
             observed_last_response_at_ms: None,
             guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
