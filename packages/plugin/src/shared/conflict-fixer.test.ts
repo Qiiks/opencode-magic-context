@@ -434,4 +434,178 @@ describe("fixConflicts", () => {
             expect(updated.compaction).toEqual({ auto: false, prune: false });
         });
     });
+
+    describe("JSONC byte preservation", () => {
+        it("removes DCP and disables compaction without changing comments or formatting elsewhere", () => {
+            const configPath = join(projectDir, "opencode.jsonc");
+            const original =
+                "// leading file comment\r\n" +
+                "{\r\n" +
+                '\t"plugin": [\r\n' +
+                "\t\t// first plugin comment\r\n" +
+                '\t\t"@keep/first",\r\n' +
+                "\t\t// removed DCP comment\r\n" +
+                '\t\t"@tarquinen/opencode-dcp@latest",\r\n' +
+                "\t\t// second plugin comment\r\n" +
+                '\t\t"@keep/second",\r\n' +
+                "\t], // trailing array comment\r\n" +
+                '\t"compaction": {\r\n' +
+                "\t\t// nested compaction comment\r\n" +
+                '\t\t"auto": true,\r\n' +
+                '\t\t"prune": true,\r\n' +
+                "\t},\r\n" +
+                '\t"theme": "dark",\r\n' +
+                "}\r\n";
+            const expected =
+                "// leading file comment\r\n" +
+                "{\r\n" +
+                '\t"plugin": [\r\n' +
+                "\t\t// first plugin comment\r\n" +
+                '\t\t"@keep/first",\r\n' +
+                "\t\t// second plugin comment\r\n" +
+                '\t\t"@keep/second",\r\n' +
+                "\t], // trailing array comment\r\n" +
+                '\t"compaction": {\r\n' +
+                "\t\t// nested compaction comment\r\n" +
+                '\t\t"auto": false,\r\n' +
+                '\t\t"prune": false,\r\n' +
+                "\t},\r\n" +
+                '\t"theme": "dark",\r\n' +
+                "}\r\n";
+            writeFileSync(configPath, original);
+
+            const actions = fixConflicts(projectDir, {
+                compactionAuto: true,
+                compactionPrune: true,
+                dcpPlugin: true,
+                ...noOmoConflicts,
+            });
+
+            expect(actions).toEqual(["Disabled auto-compaction", "Removed opencode-dcp plugin"]);
+            expect(readFileSync(configPath, "utf-8")).toBe(expected);
+            expect(readFileSync(configPath, "utf-8")).not.toContain("removed DCP comment");
+        });
+
+        it("keeps each survivor's own comment when removing a middle plugin entry", () => {
+            const configPath = join(projectDir, "opencode.jsonc");
+            const original = `{
+    "plugin": [
+        // first plugin
+        "@keep/first",
+        // removed plugin
+        "@tarquinen/opencode-dcp@latest",
+        // second plugin
+        "@keep/second",
+    ],
+    "theme": "dark",
+}
+`;
+            const expected = `{
+    "plugin": [
+        // first plugin
+        "@keep/first",
+        // second plugin
+        "@keep/second",
+    ],
+    "theme": "dark",
+}
+`;
+            writeFileSync(configPath, original);
+
+            fixConflicts(projectDir, {
+                compactionAuto: false,
+                compactionPrune: false,
+                dcpPlugin: true,
+                ...noOmoConflicts,
+            });
+
+            expect(readFileSync(configPath, "utf-8")).toBe(expected);
+        });
+
+        it("preserves CRLF and the array's trailing comment when DCP is the final entry", () => {
+            const configPath = join(projectDir, "opencode.jsonc");
+            const original =
+                "{\r\n" +
+                '\t"plugin": [\r\n' +
+                "\t\t// surviving plugin\r\n" +
+                '\t\t"@keep/first",\r\n' +
+                "\t\t// removed final plugin\r\n" +
+                '\t\t"@tarquinen/opencode-dcp@latest",\r\n' +
+                "\t], // array trailing comment\r\n" +
+                "}\r\n";
+            const expected =
+                "{\r\n" +
+                '\t"plugin": [\r\n' +
+                "\t\t// surviving plugin\r\n" +
+                '\t\t"@keep/first"\r\n' +
+                "\t], // array trailing comment\r\n" +
+                "}\r\n";
+            writeFileSync(configPath, original);
+
+            fixConflicts(projectDir, {
+                compactionAuto: false,
+                compactionPrune: false,
+                dcpPlugin: true,
+                ...noOmoConflicts,
+            });
+
+            expect(readFileSync(configPath, "utf-8")).toBe(expected);
+        });
+
+        it("leaves an already conflict-free config byte-identical", () => {
+            const configPath = join(projectDir, "opencode.jsonc");
+            const original = '// preserve every byte\r\n{\r\n\t"plugin": ["@keep/one",],\r\n}\r\n';
+            writeFileSync(configPath, original);
+
+            const actions = fixConflicts(projectDir, {
+                compactionAuto: false,
+                compactionPrune: false,
+                dcpPlugin: true,
+                ...noOmoConflicts,
+            });
+
+            expect(actions).toEqual([]);
+            expect(readFileSync(configPath, "utf-8")).toBe(original);
+        });
+
+        it("appends OMO hooks without reformatting the existing JSONC", () => {
+            const omoDir = join(homeDir, ".omo");
+            mkdirSync(omoDir, { recursive: true });
+            const configPath = join(omoDir, "omo.jsonc");
+            const original = `{
+    // preserve this leading comment
+    "[opencode]": {
+        "disabled_hooks": [
+            // custom hook comment
+            "custom-hook",
+        ], // preserve this array comment
+    },
+}
+`;
+            const expected = `{
+    // preserve this leading comment
+    "[opencode]": {
+        "disabled_hooks": [
+            // custom hook comment
+            "custom-hook",
+            "context-window-monitor",
+        ], // preserve this array comment
+    },
+}
+`;
+            writeFileSync(configPath, original);
+
+            const actions = fixConflicts(projectDir, {
+                compactionAuto: false,
+                compactionPrune: false,
+                dcpPlugin: false,
+                omoPreemptiveCompaction: false,
+                omoContextWindowMonitor: true,
+                omoAnthropicRecovery: false,
+            });
+
+            expect(actions).toEqual(["Disabled conflicting oh-my-opencode hooks"]);
+            expect(readFileSync(configPath, "utf-8")).toBe(expected);
+        });
+    });
 });
