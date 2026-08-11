@@ -14,6 +14,7 @@ import {
     migrateConfigLocationsForCli,
 } from "../lib/config-location-migration";
 import { openExistingContextDatabase } from "../lib/database-access";
+import { formatDatabaseRepairGuidance } from "../lib/database-repair-guidance";
 import {
     detectOmpBinary,
     getOmpSetting,
@@ -281,10 +282,14 @@ async function runHealthChecks(options: {
                 add(
                     results,
                     "fail",
-                    `SQLite integrity_check: ${String(integrity?.integrity_check)}`,
+                    `SQLite integrity_check: ${String(integrity?.integrity_check)}\n${formatDatabaseRepairGuidance(dbPath)}`,
                 );
         } catch (error) {
-            add(results, "fail", `Could not inspect shared DB: ${String(error)}`);
+            add(
+                results,
+                "fail",
+                `Could not inspect shared DB: ${String(error)}\n${formatDatabaseRepairGuidance(dbPath)}`,
+            );
         } finally {
             db?.close();
         }

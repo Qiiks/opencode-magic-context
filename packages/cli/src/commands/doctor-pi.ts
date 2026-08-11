@@ -34,6 +34,7 @@ import {
     openExistingContextDatabaseForMutation,
     UnsupportedSchemaVersionError,
 } from "../lib/database-access";
+import { formatDatabaseRepairGuidance } from "../lib/database-repair-guidance";
 import { collectDiagnostics } from "../lib/diagnostics-pi";
 import {
     checkLocalEmbeddingRuntimeByResolution,
@@ -621,7 +622,7 @@ async function runHealthChecks(options: {
                     add(
                         results,
                         "fail",
-                        `SQLite integrity_check: ${String(integrity?.integrity_check ?? "unknown")}`,
+                        `SQLite integrity_check: ${String(integrity?.integrity_check ?? "unknown")}\n${formatDatabaseRepairGuidance(dbPath)}`,
                     );
 
                 const counts = ROW_COUNT_TABLES.map(
@@ -643,7 +644,7 @@ async function runHealthChecks(options: {
                 add(
                     results,
                     "fail",
-                    `Could not open shared context DB: ${error instanceof Error ? error.message : String(error)}`,
+                    `Could not open shared context DB: ${error instanceof Error ? error.message : String(error)}\n${formatDatabaseRepairGuidance(dbPath)}`,
                 );
             }
         } finally {

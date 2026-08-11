@@ -29,6 +29,7 @@ import {
     openExistingContextDatabaseForMutation,
     UnsupportedSchemaVersionError,
 } from "../lib/database-access";
+import { formatDatabaseRepairGuidance } from "../lib/database-repair-guidance";
 import { collectDiagnostics } from "../lib/diagnostics-opencode";
 import {
     checkLocalEmbeddingRuntime,
@@ -1278,10 +1279,13 @@ export async function runDoctor(
                         | undefined;
                     const result = integrity?.integrity_check ?? "unknown";
                     if (result === "ok") pass("SQLite integrity_check: ok");
-                    else fail(`SQLite integrity_check reported: ${result}`);
+                    else
+                        fail(
+                            `SQLite integrity_check reported: ${result}\n${formatDatabaseRepairGuidance(dbPath)}`,
+                        );
                 } catch (err) {
                     fail(
-                        `SQLite integrity_check failed: ${err instanceof Error ? err.message : String(err)}`,
+                        `SQLite integrity_check failed: ${err instanceof Error ? err.message : String(err)}\n${formatDatabaseRepairGuidance(dbPath)}`,
                     );
                 }
 
@@ -1325,7 +1329,7 @@ export async function runDoctor(
                 );
             } else {
                 fail(
-                    `Could not open shared DB: ${err instanceof Error ? err.message : String(err)}`,
+                    `Could not open shared DB: ${err instanceof Error ? err.message : String(err)}\n${formatDatabaseRepairGuidance(dbPath)}`,
                 );
             }
         }
