@@ -523,6 +523,30 @@ function responseValue(response: unknown): Record<string, unknown> {
     throw new Error("module transform returned a non-object response");
 }
 
+function mirrorRustRenderedMemoryIds(args: {
+    db: TransformDeps["db"];
+    sessionId: string;
+    response: Record<string, unknown>;
+}): void {
+    if (!("rendered_memory_ids" in args.response)) return;
+    const rawIds = args.response.rendered_memory_ids;
+    if (
+        !Array.isArray(rawIds) ||
+        rawIds.some((id) => typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0)
+    ) {
+        throw new Error("module transform returned an invalid rendered-memory manifest");
+    }
+    const serialized = JSON.stringify(rawIds);
+    args.db
+        .prepare(
+            `UPDATE session_meta
+                SET memory_block_ids = ?, memory_block_count = ?
+              WHERE session_id = ?
+                AND (COALESCE(memory_block_ids, '') <> ? OR COALESCE(memory_block_count, -1) <> ?)`,
+        )
+        .run(serialized, rawIds.length, args.sessionId, serialized, rawIds.length);
+}
+
 function noteDeliveryPassIds(response: Record<string, unknown>): string[] {
     if (!Array.isArray(response.note_deliveries)) return [];
     return [
@@ -2258,6 +2282,11 @@ export function createRustModeTransform(
                     sessionLog(sessionId, "rust note delivery nack failed (ignored):", nackError);
                 }
                 throw error;
+            }
+            try {
+                mirrorRustRenderedMemoryIds({ db: deps.db, sessionId, response });
+            } catch (error) {
+                sessionLog(sessionId, "rust rendered-memory mirror write failed (ignored):", error);
             }
             if (deliveryPassIds.length > 0) {
                 try {

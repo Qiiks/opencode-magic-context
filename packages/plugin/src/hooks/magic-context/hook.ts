@@ -699,6 +699,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         autoEmbedAttemptedBySession.add(sessionId);
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
         void (async () => {
+            let completedDrainWithWork = false;
             try {
                 // Defer off the transform thread BEFORE any DB/config work.
                 // ensureProjectRegisteredFromOpenCodeDirectory is `async` but does
@@ -731,6 +732,13 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                     });
                 }
                 const summary = await executeEmbedHistory(sessionId);
+                const completedCoverage = getEmbeddingCoverageStatus(
+                    db,
+                    sessionProjectIdentity,
+                    sessionId,
+                );
+                completedDrainWithWork =
+                    completedCoverage.session.total - completedCoverage.session.embedded <= 0;
                 if (!isTuiConnected(sessionId)) {
                     await sendIgnoredMessage(deps.client, sessionId, summary, {
                         ...notifyParams,
@@ -738,6 +746,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 }
             } catch (error) {
                 log("[magic-context] auto-embed drain failed:", error);
+            } finally {
+                if (!completedDrainWithWork) autoEmbedAttemptedBySession.delete(sessionId);
             }
         })();
     };

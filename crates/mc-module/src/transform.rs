@@ -1146,6 +1146,10 @@ pub struct TransformResponse {
     pub committed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage_ordinal: Option<u64>,
+    /// Memory IDs currently shown in the module's memory view. The host copies this list to
+    /// filter search results, using the module manifest rather than its TypeScript render cache.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rendered_memory_ids: Option<Vec<i64>>,
     /// Exact composed edge id consumed by observed durable state. Omitted on ordinary,
     /// subagent, defer-only protocol-error, and pending-build-skew responses.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -1207,6 +1211,7 @@ impl TransformResponse {
             surface_state: SurfaceState::Inactive,
             committed: false,
             coverage_ordinal: None,
+            rendered_memory_ids: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             ordinal_continuation_base: None,
@@ -1238,6 +1243,7 @@ impl TransformResponse {
             surface_state: SurfaceState::Inactive,
             committed: false,
             coverage_ordinal: None,
+            rendered_memory_ids: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             ordinal_continuation_base: None,
@@ -2423,6 +2429,7 @@ fn apply_once(
                 req,
                 mutation_exempt_mid: mutation_exempt_mid.map(str::to_string),
                 row_version,
+                rendered_memory_ids: next_meta.rendered_memory_ids.clone(),
                 revert_epoch: next_meta.revert_epoch,
                 reasoning_watermark: next_meta
                     .reasoning_cleared_through_tag
@@ -2514,6 +2521,7 @@ fn apply_once(
             req,
             mutation_exempt_mid: mutation_exempt_mid.map(str::to_string),
             row_version,
+            rendered_memory_ids: meta.rendered_memory_ids.clone(),
             revert_epoch: meta.revert_epoch,
             reasoning_watermark: meta
                 .reasoning_cleared_through_tag
@@ -4166,6 +4174,7 @@ fn apply_once(
             surface_state,
             committed: commit_required,
             coverage_ordinal: meta.coverage_ordinal,
+            rendered_memory_ids: Some(meta.rendered_memory_ids.clone()),
             lineage_switch_consumed_id: lineage_state.acknowledge_edge,
             lineage_descent_disposition: lineage_state.disposition.map(str::to_string),
             ordinal_continuation_base: meta.ordinal_continuation_base,
@@ -5556,6 +5565,7 @@ struct PendingPassthroughArgs<'a> {
     req: &'a TransformRequest,
     mutation_exempt_mid: Option<String>,
     row_version: u64,
+    rendered_memory_ids: Vec<i64>,
     revert_epoch: u64,
     reasoning_watermark: u64,
     transition_consumed: bool,
@@ -5606,6 +5616,7 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         req,
         mutation_exempt_mid,
         row_version,
+        rendered_memory_ids,
         revert_epoch,
         reasoning_watermark,
         transition_consumed,
@@ -5622,6 +5633,7 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         TransformResponse::passthrough(Vec::new(), req.full_array_fingerprint.clone());
     response.ck_messages = Some(messages);
     response.row_version = row_version;
+    response.rendered_memory_ids = Some(rendered_memory_ids);
     response.surface_state = surface_state;
     response.committed = committed;
     response.materialize_reason = materialize_reason;
