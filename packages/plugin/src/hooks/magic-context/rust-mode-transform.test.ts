@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -28,6 +28,7 @@ import {
 } from "../../features/magic-context/transform-decision-log";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { ABSOLUTE_EMERGENCY_PERCENTAGE } from "../../shared/escalation-bands";
+import * as logger from "../../shared/logger";
 import { promptSurfaceConfigIdentity } from "../../shared/prompt-surface";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -409,6 +410,59 @@ describe("Rust mode authority adapter", () => {
         });
         expect(body.caveman_enabled).toBe(true);
         expect(body.caveman_min_chars).toBe(240);
+    });
+
+    it("emits discriminating pass and stage logs from ordinary Rust transforms", async () => {
+        const sessionId = `rust-log-fence-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const responses = [
+            {
+                decision: "HARD",
+                materialize_reason: "first_render",
+                served_from: "transform",
+                timings: { handler_total: 5, total: 4, native_cache_encoded_messages: 1 },
+            },
+            {
+                decision: "SOFT+",
+                served_from: "lkg",
+                timings: { handler_total: 3, total: 2, native_cache_reused_messages: 1 },
+            },
+        ];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? { ...responses.shift(), native_messages: makeMessages(sessionId) }
+                    : { ok: true },
+        };
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+            for (let index = 0; index < 2; index += 1) {
+                const messages = makeMessages(sessionId);
+                await transform.run(
+                    sessionId,
+                    messages,
+                    { messages: [...messages] },
+                    makeMeta(db, sessionId),
+                );
+            }
+
+            const logged = logSpy.mock.calls
+                .filter(([loggedSession]) => loggedSession === sessionId)
+                .map(([, message]) => message);
+            const passLines = logged.filter((message) => message.startsWith("rust pass:"));
+            expect(passLines).toHaveLength(2);
+            expect(passLines[0]).toContain("decision=HARD");
+            expect(passLines[0]).toContain("served_from=transform");
+            expect(passLines[1]).toContain("decision=SOFT+");
+            expect(passLines[1]).toContain("served_from=lkg");
+            expect(passLines[0]).not.toBe(passLines[1]);
+            expect(logged.some((message) => message.startsWith("rust module stages:"))).toBe(true);
+        } finally {
+            logSpy.mockRestore();
+        }
     });
 
     it("keeps the rust pass line grep-compatible", () => {

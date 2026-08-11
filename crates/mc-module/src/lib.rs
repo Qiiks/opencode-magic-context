@@ -16698,7 +16698,7 @@ mod tests {
         assert_eq!(second.receive_count, 2);
         assert_eq!(second.reject_count, 2);
         assert_eq!(second.last_reject_error.as_deref(), Some(message.as_str()));
-        assert!(second.last_reject_at_ms.unwrap() >= first.last_reject_at_ms.unwrap());
+        assert!(second.last_reject_at_ms.unwrap() > first.last_reject_at_ms.unwrap());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -20074,6 +20074,44 @@ mod tests {
         assert!(historical["pass_id"].is_number());
         assert!(historical["timestamp_ms"].is_number());
         assert_eq!(historical["divergence"], diverging["first_divergence"]);
+
+        let appended = request(vec![ck("m1", 1, "after"), ck("m2", 2, "before")]);
+        let append_only = call_transform_request(&handler, appended.clone()).await;
+        assert!(append_only.get("first_divergence").is_none());
+        let second_diverging = call_transform_request(
+            &handler,
+            request(vec![ck("m1", 1, "after"), ck("m2", 2, "after")]),
+        )
+        .await;
+        assert!(second_diverging["first_divergence"].is_object());
+        let second_status = match handler.handle_status_value(&json!({
+            "kind": "status",
+            "session_id": "ses",
+        })) {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("expected status response, got {other:?}"),
+        };
+        let second_historical: Value = serde_json::from_str(
+            second_status["pass_trace"]["last_divergence"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            second_historical["divergence"],
+            second_diverging["first_divergence"]
+        );
+        assert_ne!(
+            historical["divergence"]["block_id_old"],
+            second_historical["divergence"]["block_id_old"],
+            "different divergent blocks must remain distinguishable in the durable trace"
+        );
+        let stable_again = call_transform_request(
+            &handler,
+            request(vec![ck("m1", 1, "after"), ck("m2", 2, "after")]),
+        )
+        .await;
+        assert!(stable_again.get("first_divergence").is_none());
 
         let session_status = tool_body(handler.handle_session_status_value(
             7,

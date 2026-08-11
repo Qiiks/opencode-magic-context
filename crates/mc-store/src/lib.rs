@@ -16342,21 +16342,29 @@ mod tests {
     }
 
     fn command_ledger_ids(store: &McStore, session_id: &str) -> Vec<String> {
+        command_ledger_rows(store, session_id)
+            .into_iter()
+            .map(|(command_id, _)| command_id)
+            .collect()
+    }
+
+    fn command_ledger_rows(store: &McStore, session_id: &str) -> Vec<(String, Option<String>)> {
         store
             .inner
             .with_conn(|conn| {
                 let mut statement = conn.prepare(
-                    "SELECT command_id
+                    "SELECT command_id, disposition
                      FROM mc_reduce_command_ledger
                      WHERE session_id = ?1
                      ORDER BY queued_at_ms ASC, command_id ASC",
                 )?;
-                let rows = statement.query_map(params![session_id], |row| row.get(0))?;
-                let mut command_ids = Vec::new();
+                let rows = statement
+                    .query_map(params![session_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                let mut commands = Vec::new();
                 for row in rows {
-                    command_ids.push(row?);
+                    commands.push(row?);
                 }
-                Ok(command_ids)
+                Ok(commands)
             })
             .unwrap()
     }
@@ -17534,10 +17542,15 @@ mod tests {
         );
         assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
 
-        // The no_targets row exists in the ledger (for idempotency) but has disposition set.
-        let ledger_ids = command_ledger_ids(&store, "ses");
-        assert!(ledger_ids.contains(&"cmd-zero".to_string()));
-        assert!(ledger_ids.contains(&"cmd-normal".to_string()));
+        // The diagnostic ledger must distinguish the terminal no-target result from work
+        // that is still pending; a constant disposition would make incident reads misleading.
+        assert_eq!(
+            command_ledger_rows(&store, "ses"),
+            vec![
+                ("cmd-zero".to_string(), Some("no_targets".to_string())),
+                ("cmd-normal".to_string(), None),
+            ]
+        );
     }
 
     #[test]
