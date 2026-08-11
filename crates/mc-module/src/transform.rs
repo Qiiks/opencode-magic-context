@@ -3963,12 +3963,19 @@ fn apply_once(
     }
     timings.transition_detection += elapsed_ms(transition_post_detection_started_at);
     let transition_newly_consumed = !newly_consumed_transition_classes.is_empty();
+    let mut committed_transition_classes = consumed_transition_classes.clone();
+    committed_transition_classes.extend(newly_consumed_transition_classes);
+    // A HARD rebuild reconstructs the frozen-unit vector from data-plane survivors, bypassing
+    // durability handling. Reinsert the full consumed union afterward so an unrelated fold cannot
+    // make an already-healed class eligible for another renderer transition.
+    if transition_newly_consumed
+        || (matches!(plan, PassPlan::Hard | PassPlan::MigrateHard)
+            && !committed_transition_classes.is_empty())
+    {
+        preserve_transition_consumed_marker(&mut core, &committed_transition_classes);
+    }
     let transition_committed = transition_renderer_active(&core) || transition_newly_consumed;
     if transition_newly_consumed {
-        let mut committed_transition_classes = consumed_transition_classes.clone();
-        committed_transition_classes.extend(newly_consumed_transition_classes);
-        preserve_transition_consumed_marker(&mut core, &committed_transition_classes);
-
         // Record consumption after any bust that renders an affected shape. If the shape first
         // appeared during a pass that was already invalidating the cache for another reason, its
         // changed bytes rode that invalidation and replay must not trigger a second one.
@@ -11233,6 +11240,47 @@ pub(crate) mod tests {
         let mut unit = transition_consumed_unit(&v1_transition_classes());
         unit.frozen_payload.clear();
         unit
+    }
+
+    fn unstamped_opencode_tool_pair(mid: &str, ordinal: u64, call_id: &str) -> CkIngressMessage {
+        let native_message = json!({
+            "absolute_ordinal": ordinal,
+            "info": { "id": mid, "role": "assistant" },
+            "parts": [{
+                "type": "tool",
+                "tool": "read",
+                "callID": call_id,
+                "state": {
+                    "status": "completed",
+                    "input": { "path": "pair.txt" },
+                    "output": "historical output"
+                }
+            }]
+        });
+        let decoded = crate::codec::decode_opencode(&[native_message]);
+        let mut projected = decoded.messages.into_iter().next().unwrap();
+        projected.ck.content = projected
+            .ck
+            .content
+            .into_iter()
+            .map(|block| ck_wire::CkWireBlock::bare(block.kind))
+            .collect();
+        projected.ck.mark_modified();
+        projected
+    }
+
+    fn stored_transition_marker_classes(
+        store: &McStore,
+        session_id: &str,
+    ) -> BTreeSet<RendererTransitionClass> {
+        let loaded = store.load(session_id).unwrap();
+        let marker = loaded
+            .core
+            .frozen_units
+            .iter()
+            .find(|unit| unit.key == TRANSITION_CONSUMED_KEY)
+            .expect("renderer transition marker must be durable");
+        serde_json::from_str(&marker.frozen_payload).unwrap()
     }
 
     #[test]
@@ -23698,6 +23746,145 @@ pub(crate) mod tests {
             per_pass_micros < 50.0,
             "the no-reduction short circuit regressed: {per_pass_micros:.3}us/pass"
         );
+    }
+
+    #[test]
+    fn consumed_transition_marker_survives_unrelated_hard_and_store_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "transition-hard-survivor";
+        let messages = vec![
+            unstamped_opencode_tool_pair("survivor-pair", 1, "survivor-call"),
+            item("survivor-tail", 2, "stable tail"),
+        ];
+        let initial_store = store(dir.path());
+        let request = active_opencode_req(session, "cfg0", messages.clone());
+        assert_eq!(run(&initial_store, &request, &spine()).action, "HARD");
+        append_historical_frozen_reductions(
+            &initial_store,
+            session,
+            &[
+                red_unit("survivor-pair#0", "skeleton", "historical call shell"),
+                red_unit("survivor-pair#1", "drop", "historical result shell"),
+            ],
+        );
+
+        let transition = run(&initial_store, &request, &spine());
+        assert_eq!(transition.action, "HARD");
+        assert_eq!(
+            transition.materialize_reason.as_deref(),
+            Some("renderer_transition")
+        );
+        let expected = BTreeSet::from([RendererTransitionClass::UnmatchedPair]);
+        assert_eq!(
+            stored_transition_marker_classes(&initial_store, session),
+            expected
+        );
+
+        let unrelated_request = active_opencode_req(session, "cfg1", messages);
+        let unrelated = run(&initial_store, &unrelated_request, &spine());
+        assert_eq!(unrelated.action, "HARD");
+        assert_eq!(
+            unrelated.materialize_reason.as_deref(),
+            Some("epoch_change")
+        );
+        assert_eq!(
+            stored_transition_marker_classes(&initial_store, session),
+            expected
+        );
+
+        drop(initial_store);
+        let reopened = store(dir.path());
+        assert_eq!(
+            stored_transition_marker_classes(&reopened, session),
+            expected
+        );
+        let replay = run(&reopened, &unrelated_request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_ne!(
+            replay.materialize_reason.as_deref(),
+            Some("renderer_transition")
+        );
+        assert_eq!(
+            stored_transition_marker_classes(&reopened, session),
+            expected
+        );
+    }
+
+    #[test]
+    fn consumed_class_does_not_mask_a_new_renderer_transition_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "transition-new-class";
+        let messages = vec![
+            unstamped_opencode_tool_pair("new-class-pair", 1, "new-class-unmatched"),
+            reasoning_tool_shell_message("new-class-reasoning", 2, "new-class-poisoned", false),
+            tool_result(
+                "new-class-result",
+                3,
+                "new-class-poisoned",
+                "historical tool output",
+            ),
+            item("new-class-tail", 4, "stable tail"),
+        ];
+        let request = active_opencode_req(session, "cfg0", messages);
+        assert_eq!(run(&store, &request, &spine()).action, "HARD");
+        append_historical_frozen_reductions(
+            &store,
+            session,
+            &[
+                red_unit("new-class-pair#0", "skeleton", "historical call shell"),
+                red_unit("new-class-pair#1", "drop", "historical result shell"),
+            ],
+        );
+
+        let unmatched_transition = run(&store, &request, &spine());
+        assert_eq!(unmatched_transition.action, "HARD");
+        assert_eq!(
+            unmatched_transition.materialize_reason.as_deref(),
+            Some("renderer_transition")
+        );
+        let unmatched_only = BTreeSet::from([RendererTransitionClass::UnmatchedPair]);
+        assert_eq!(
+            stored_transition_marker_classes(&store, session),
+            unmatched_only,
+            "classes without consumed shapes must not be pre-recorded"
+        );
+
+        append_historical_frozen_reductions(
+            &store,
+            session,
+            &[
+                red_unit(
+                    "new-class-reasoning#1",
+                    "skeleton",
+                    "historical reasoning call shell",
+                ),
+                red_unit(
+                    "new-class-result#0",
+                    "drop",
+                    "historical reasoning result shell",
+                ),
+            ],
+        );
+        let new_class_transition = run(&store, &request, &spine());
+        assert_eq!(new_class_transition.action, "HARD");
+        assert_eq!(
+            new_class_transition.materialize_reason.as_deref(),
+            Some("renderer_transition")
+        );
+        let expected = BTreeSet::from([
+            RendererTransitionClass::PoisonedReasoning,
+            RendererTransitionClass::UnmatchedPair,
+        ]);
+        assert_eq!(stored_transition_marker_classes(&store, session), expected);
+
+        let replay = run(&store, &request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_ne!(
+            replay.materialize_reason.as_deref(),
+            Some("renderer_transition")
+        );
+        assert_eq!(stored_transition_marker_classes(&store, session), expected);
     }
 
     #[test]
