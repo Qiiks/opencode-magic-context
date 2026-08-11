@@ -85,6 +85,9 @@ pub struct GuidanceAsset {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptSurfaceSelection {
     pub model_key: Option<String>,
+    /// Caller-computed identity of the live prompt-surface config generation.
+    /// It participates only in materialization freezing, never provider-visible epochs.
+    pub config_identity: String,
     pub preset: PromptSurfacePreset,
     pub tool_descriptions: BTreeMap<String, String>,
 }
@@ -93,6 +96,7 @@ impl Default for PromptSurfaceSelection {
     fn default() -> Self {
         Self {
             model_key: None,
+            config_identity: String::new(),
             preset: PromptSurfacePreset::Full,
             tool_descriptions: BTreeMap::new(),
         }
@@ -207,6 +211,23 @@ pub fn session_tools(selection: &PromptSurfaceSelection) -> Vec<Tool> {
         .into_iter()
         .filter(|tool| is_known_tool_id(&tool.name))
         .collect()
+}
+
+pub fn selection_freeze_identity(selection: &PromptSurfaceSelection) -> String {
+    if !selection.config_identity.is_empty() {
+        return selection.config_identity.clone();
+    }
+
+    // Older callers did not send an explicit config generation. Derive a stable
+    // compatibility key from the selected bytes so live preset/override changes
+    // still reselect while unchanged requests remain frozen.
+    let mut hasher = Sha256::new();
+    hash_part(&mut hasher, "preset", selection.preset.as_str());
+    for (tool_id, description) in &selection.tool_descriptions {
+        hash_part(&mut hasher, "tool", tool_id);
+        hash_part(&mut hasher, "description", description);
+    }
+    format!("legacy{}", hex_digest(hasher.finalize()))
 }
 
 pub fn manifest_content_epoch(selection: &PromptSurfaceSelection) -> String {

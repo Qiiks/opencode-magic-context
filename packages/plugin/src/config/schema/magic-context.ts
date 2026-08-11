@@ -59,7 +59,7 @@ export type { PromptSurfacePreset } from "../../shared/prompt-surface";
 
 const PromptSurfaceModelKeySchema = z.string().refine(isValidPromptSurfaceModelKey, {
     message:
-        "Use a non-empty provider/model key or the literal provider/* wildcard; model IDs may contain additional slashes and matching is case-sensitive.",
+        "Use a non-empty bare model key, provider/model key, or the literal provider/* wildcard; model IDs may contain additional slashes and matching is case-sensitive.",
 });
 // Tool-description keys must be non-empty IDs; harness-specific known-tool
 // validation can run when a user override is applied.
@@ -76,7 +76,7 @@ export const PromptSurfaceConfigSchema = z
             .record(PromptSurfaceModelKeySchema, PromptSurfacePresetSchema)
             .optional()
             .describe(
-                "Literal per-model routing. Keys are provider/model or provider/*; matching is case-sensitive and preserves additional slashes in model IDs.",
+                "Literal per-model routing. Keys are bare model IDs, provider/model, or provider/*; matching is case-sensitive and preserves additional slashes in model IDs.",
             ),
         guidance_override_path: z
             .string()
@@ -710,7 +710,7 @@ export const MagicContextConfigSchema = z
                 'Cache TTL: string (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "model-id": "10m" }). Set to "never" for lanes kept warm by an external keepwarm proxy — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time.',
             ),
         prompt_surface: PromptSurfaceConfigSchema.default({ default: "full" }).describe(
-            "Prompt-surface presets: default is full; models use the literal provider/model or provider/* routing grammar. Guidance and tool-description overrides are user-level only. On OpenCode and Pi, per-model routing applies to the guidance block only: tool descriptions are registered once per process, so they follow the default preset (a v1 plugin-surface limitation; per-model tool descriptions are planned for the OpenCode v2 plugin API once the SDK stabilizes).",
+            "Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/* routing keys. Guidance and tool-description overrides are user-level only. On OpenCode and Pi, per-model routing applies to the guidance block only: tool descriptions are registered once per process, so they follow the default preset (a v1 plugin-surface limitation; per-model tool descriptions are planned for the OpenCode v2 plugin API once the SDK stabilizes).",
         ),
         output_reserve: z
             .union([

@@ -13,14 +13,29 @@ export interface PromptSurfaceConfig {
     tool_descriptions?: Readonly<Record<string, string>>;
 }
 
-export type PromptSurfaceResolutionSource = "exact" | "wildcard" | "default";
+/** Stable wire identity for the config fields that can alter a served prompt surface. */
+export function promptSurfaceConfigIdentity(config: PromptSurfaceConfig | undefined): string {
+    return JSON.stringify({
+        default: config?.default ?? "full",
+        models: Object.entries(config?.models ?? {}).sort(([left], [right]) =>
+            left < right ? -1 : left > right ? 1 : 0,
+        ),
+        guidanceOverridePath: config?.guidance_override_path ?? null,
+        toolDescriptions: Object.entries(config?.tool_descriptions ?? {}).sort(([left], [right]) =>
+            left < right ? -1 : left > right ? 1 : 0,
+        ),
+    });
+}
 
-/** Validate the literal provider/model and provider/* key grammar. */
+export type PromptSurfaceResolutionSource = "exact" | "bare" | "wildcard" | "default";
+
+/** Validate bare model, provider/model, and provider/* routing keys. */
 export function isValidPromptSurfaceModelKey(key: string): boolean {
     if (key.length === 0 || key.trim() !== key) return false;
 
     const slash = key.indexOf("/");
-    if (slash <= 0 || slash === key.length - 1) return false;
+    if (slash < 0) return !key.includes("*");
+    if (slash === 0 || slash === key.length - 1) return false;
 
     const provider = key.slice(0, slash);
     const modelID = key.slice(slash + 1);
@@ -42,7 +57,7 @@ export function isValidPromptSurfaceModelKey(key: string): boolean {
     );
 }
 
-export type ModelKeyLookupSource = PromptSurfaceResolutionSource | "bare";
+export type ModelKeyLookupSource = Exclude<PromptSurfaceResolutionSource, "default">;
 
 export interface ModelKeyCandidate {
     key: string;
@@ -117,11 +132,7 @@ export function resolvePromptSurface(
     const fallback = config?.default ?? "full";
     const match = resolveModelConfigValue(config?.models, modelKey);
 
-    // Bare model keys are accepted by cache_ttl for compatibility, but the
-    // prompt_surface schema deliberately accepts only provider/model keys and
-    // provider wildcards. Ignore a bare entry if an unvalidated object reaches
-    // this API so prompt routing keeps its documented grammar.
-    if (match && match.source !== "bare") {
+    if (match) {
         return { preset: match.value, source: match.source };
     }
 

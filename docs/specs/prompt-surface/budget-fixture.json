@@ -69,7 +69,9 @@
   "includedSurfaces": [
     "The primary built-in full guidance section for the exact feature variant above.",
     "One built-in full top-level description for every active ctx_* tool above.",
-    "The same raw-text tokenizer method for the future built-in light guidance and descriptions."
+    "The same raw-text tokenizer method for built-in light guidance and descriptions.",
+    "All four runtime serving combinations: full/full, full/light, light/full, and light/light guidance/description pairs.",
+    "Claude Code built-in guidance_light_primary.txt and guidance_light_no_reduce.txt assets."
   ],
   "excludedSurfaces": [
     "Serialized parameter schemas; they are reported separately and added only to provider-visible totals.",

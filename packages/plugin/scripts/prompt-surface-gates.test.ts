@@ -38,6 +38,22 @@ describe("prompt-surface CI gates", () => {
         });
     });
 
+    test("ratified ceiling literals cannot be raised through fixture edits", () => {
+        withTempDir((directory) => {
+            const fixture = JSON.parse(readFileSync(fixturePath, "utf8")) as {
+                integerLightCeiling: number;
+            };
+            fixture.integerLightCeiling = 99_999;
+            const mutatedPath = join(directory, "budget-fixture.json");
+            writeFileSync(mutatedPath, JSON.stringify(fixture));
+
+            const result = validateBudgetFixture({ fixturePath: mutatedPath });
+            expect(result.errors.some((error) => error.includes("ratified literal 1825"))).toBe(
+                true,
+            );
+        });
+    });
+
     test("a light candidate above the ceiling is a red gate", () => {
         withTempDir((directory) => {
             const lightPath = join(directory, "light-surface.json");
@@ -47,14 +63,59 @@ describe("prompt-surface CI gates", () => {
             writeFileSync(lightPath, JSON.stringify(mutated));
 
             const result = validateBudgetFixture({ fixturePath, lightSurfacePath: lightPath });
-            expect(result.errors.some((error) => error.includes("exceeds ceiling"))).toBe(true);
+            expect(
+                result.errors.some(
+                    (error) =>
+                        error.includes("light guidance + full descriptions") &&
+                        error.includes("exceeds ceiling 3650"),
+                ),
+            ).toBe(true);
+            expect(
+                result.errors.some(
+                    (error) =>
+                        error.includes("light guidance + light descriptions") &&
+                        error.includes("exceeds ceiling 1825"),
+                ),
+            ).toBe(true);
+        });
+    });
+
+    test("gates every real guidance and registration-description combination", () => {
+        const result = validateBudgetFixture({ fixturePath });
+        expect(result.errors).toEqual([]);
+        expect(
+            result.messages.some((message) =>
+                message.includes("serving matrix light guidance + full descriptions"),
+            ),
+        ).toBe(true);
+        expect(
+            result.messages.filter((message) => message.includes("Claude Code light guidance")),
+        ).toHaveLength(2);
+    });
+
+    test("an oversized Claude Code light asset is a red gate", () => {
+        withTempDir((directory) => {
+            const assetPath = join(directory, "guidance_light_primary.txt");
+            writeFileSync(assetPath, "inflate Claude Code guidance ".repeat(2_000));
+
+            const result = validateBudgetFixture({
+                fixturePath,
+                ccLightAssetPaths: [assetPath],
+            });
+            expect(
+                result.errors.some(
+                    (error) =>
+                        error.includes("Claude Code light guidance") &&
+                        error.includes("exceeds ceiling 1825"),
+                ),
+            ).toBe(true);
         });
     });
 
     test("the committed light mapping resolves every compressed checklist rule", () => {
         const result = validateChecklist(checklistPath);
         expect(result.errors).toEqual([]);
-        expect(result.messages.some((message) => message.includes("resolved 37"))).toBe(true);
+        expect(result.messages.some((message) => message.includes("resolved 40"))).toBe(true);
     });
 
     test("deleting a mapped light line is a red mapping gate", () => {
@@ -75,6 +136,22 @@ describe("prompt-surface CI gates", () => {
     test("rendered checklist matches the machine-readable artifact", () => {
         const checklist = JSON.parse(readFileSync(checklistPath, "utf8"));
         expect(renderChecklist(checklist)).toBe(readFileSync(renderedChecklistPath, "utf8"));
+    });
+
+    test("an orphaned fragment is a red completeness gate", () => {
+        withTempDir((directory) => {
+            const checklist = JSON.parse(readFileSync(checklistPath, "utf8")) as {
+                fragments: Record<string, unknown>;
+            };
+            checklist.fragments.orphan = checklist.fragments["guidance-long-term-frame"];
+            const mutatedPath = join(directory, "checklist.json");
+            writeFileSync(mutatedPath, JSON.stringify(checklist));
+
+            const result = validateChecklist(mutatedPath);
+            expect(
+                result.errors.some((error) => error.includes("fragment orphan is not referenced")),
+            ).toBe(true);
+        });
     });
 
     test("deleting a checklist entry is a red completeness gate", () => {

@@ -50,9 +50,9 @@ Select the full or light built-in prompt preset. Model routes use the same progr
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `prompt_surface` | object | — | Prompt-surface presets: default is full; models use the literal provider/model or provider/* routing grammar. Guidance and tool-description overrides are user-level only. On OpenCode and Pi, per-model routing applies to the guidance block only: tool descriptions are registered once per process, so they follow the default preset (a v1 plugin-surface limitation; per-model tool descriptions are planned for the OpenCode v2 plugin API once the SDK stabilizes). |
+| `prompt_surface` | object | — | Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/* routing keys. Guidance and tool-description overrides are user-level only. On OpenCode and Pi, per-model routing applies to the guidance block only: tool descriptions are registered once per process, so they follow the default preset (a v1 plugin-surface limitation; per-model tool descriptions are planned for the OpenCode v2 plugin API once the SDK stabilizes). |
 | `prompt_surface.default` | `"full"` \\| `"light"` | `"full"` | Fallback prompt-surface preset ("full" or "light"). |
-| `prompt_surface.models` | map<string, `"full"` \\| `"light"`> | — | Literal per-model routing. Keys are provider/model or provider/*; matching is case-sensitive and preserves additional slashes in model IDs. |
+| `prompt_surface.models` | map<string, `"full"` \\| `"light"`> | — | Literal per-model routing. Keys are bare model IDs, provider/model, or provider/*; matching is case-sensitive and preserves additional slashes in model IDs. |
 | `prompt_surface.guidance_override_path` | string | — | USER-LEVEL ONLY path to a complete primary guidance section. Relative paths resolve from the user config file. |
 | `prompt_surface.tool_descriptions` | map<string, string> | — | USER-LEVEL ONLY top-level description overrides keyed by ctx_* tool ID; parameter schemas and descriptions are unchanged. |
 

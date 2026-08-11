@@ -91,6 +91,7 @@ function buildHandler(opts?: {
     protectedTags?: number;
     promptSurface?: PromptSurfaceConfig;
     promptSurfaceRuntime?: PromptSurfaceRuntime;
+    resolveModel?: (sessionId: string) => { providerID: string; modelID: string } | undefined;
 }): ReturnType<typeof createSystemPromptHashHandler> {
     return createSystemPromptHashHandler({
         db: openDatabase(),
@@ -99,6 +100,8 @@ function buildHandler(opts?: {
         dreamerEnabled: opts?.dreamerEnabled ?? false,
         promptSurface: opts?.promptSurface,
         promptSurfaceRuntime: opts?.promptSurfaceRuntime,
+        resolveModel:
+            opts?.resolveModel ?? (() => ({ providerID: "provider", modelID: "default-model" })),
         historyRefreshSessions: opts?.historyRefreshSessions ?? new Set<string>(),
         systemPromptRefreshSessions: opts?.systemPromptRefreshSessions ?? new Set<string>(),
         pendingMaterializationSessions: opts?.pendingMaterializationSessions ?? new Set<string>(),
@@ -907,6 +910,100 @@ describe("OpenCode prompt-surface guidance epochs", () => {
         expect(getOrCreateSessionMeta(openDatabase(), "ses-a1-explicit").systemPromptHash).toBe(
             expectedComposedHash,
         );
+    });
+
+    it("defers the baseline until the model route is resolved", async () => {
+        useTempDataHome("sph-model-freeze-");
+        const sessionID = "ses-model-freeze";
+        resolveCtxReduceAvailabilityFromMessages(sessionID, [
+            { info: { role: "user", tools: { "*": true } } },
+        ]);
+        let recoveredModel: { providerID: string; modelID: string } | undefined;
+        const historyRefreshSessions = new Set<string>();
+        const systemPromptRefreshSessions = new Set<string>();
+        const pendingMaterializationSessions = new Set<string>();
+        const { handler } = buildHandler({
+            promptSurface: {
+                default: "full",
+                models: { "provider/light": "light" },
+            },
+            resolveModel: () => recoveredModel,
+            historyRefreshSessions,
+            systemPromptRefreshSessions,
+            pendingMaterializationSessions,
+        });
+
+        const modelLessSystem = ["Base system prompt"];
+        await handler({ sessionID }, { system: modelLessSystem });
+        const afterModelLess = getOrCreateSessionMeta(openDatabase(), sessionID);
+        expect(
+            afterModelLess.systemPromptHash === "" || afterModelLess.systemPromptHash === "0",
+        ).toBe(true);
+
+        recoveredModel = { providerID: "provider", modelID: "light" };
+        const resolvedSystem = ["Base system prompt"];
+        await handler({ sessionID }, { system: resolvedSystem });
+        const baselineHash = getOrCreateSessionMeta(openDatabase(), sessionID).systemPromptHash;
+        expect(baselineHash).not.toBe("");
+        expect(baselineHash).not.toBe("0");
+        expect(resolvedSystem.join("\n")).not.toBe(modelLessSystem.join("\n"));
+        expect(historyRefreshSessions.has(sessionID)).toBe(false);
+        expect(systemPromptRefreshSessions.has(sessionID)).toBe(false);
+        expect(pendingMaterializationSessions.has(sessionID)).toBe(false);
+
+        const stableSystem = ["Base system prompt"];
+        await handler({ sessionID }, { system: stableSystem });
+        expect(getOrCreateSessionMeta(openDatabase(), sessionID).systemPromptHash).toBe(
+            baselineHash,
+        );
+        expect(historyRefreshSessions.has(sessionID)).toBe(false);
+    });
+
+    it("coalesces a midnight date and preset flip into one hash change", async () => {
+        useTempDataHome("sph-midnight-preset-");
+        const sessionID = "ses-midnight-preset";
+        resolveCtxReduceAvailabilityFromMessages(sessionID, [
+            { info: { role: "user", tools: { "*": true } } },
+        ]);
+        const historyRefreshSessions = new Set<string>();
+        const systemPromptRefreshSessions = new Set<string>();
+        const pendingMaterializationSessions = new Set<string>();
+        const { handler } = buildHandler({
+            promptSurface: {
+                default: "full",
+                models: { "provider/light": "light" },
+            },
+            historyRefreshSessions,
+            systemPromptRefreshSessions,
+            pendingMaterializationSessions,
+        });
+        const run = async (modelID: string, date: string) => {
+            const system = [`Base prompt\nToday's date: ${date}`];
+            await handler({ sessionID, model: { providerID: "provider", modelID } }, { system });
+            return system.join("\n");
+        };
+
+        await run("full", "Mon Jan 01 2024");
+        const firstHash = getOrCreateSessionMeta(openDatabase(), sessionID).systemPromptHash;
+        historyRefreshSessions.clear();
+        systemPromptRefreshSessions.clear();
+        pendingMaterializationSessions.clear();
+
+        const changed = await run("light", "Tue Jan 02 2024");
+        const changedHash = getOrCreateSessionMeta(openDatabase(), sessionID).systemPromptHash;
+        expect(changed).toContain("Today's date: Tue Jan 02 2024");
+        expect(changedHash).not.toBe(firstHash);
+        expect(historyRefreshSessions.has(sessionID)).toBe(true);
+
+        historyRefreshSessions.clear();
+        systemPromptRefreshSessions.clear();
+        pendingMaterializationSessions.clear();
+        const stable = await run("light", "Tue Jan 02 2024");
+        expect(stable).toBe(changed);
+        expect(getOrCreateSessionMeta(openDatabase(), sessionID).systemPromptHash).toBe(
+            changedHash,
+        );
+        expect(historyRefreshSessions.has(sessionID)).toBe(false);
     });
 
     it("emits one hash fold when a preset/model boundary selects authored light", async () => {

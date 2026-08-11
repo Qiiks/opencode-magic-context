@@ -378,50 +378,60 @@ export function createSystemPromptHashHandler(deps: {
         // date in system so BP1 remains stable.
         const isCacheBusting = deps.systemPromptRefreshSessions.has(sessionId);
 
-        // ── Step 2: Freeze volatile date to prevent unnecessary cache busts ──
+        // ── Step 2: Coalesce content/preset and date changes into one bust ──
         const DATE_PATTERN = /Today's date: .+/;
-
+        const liveSystemContent = output.system.join("\n");
+        if (liveSystemContent.length === 0) return;
+        const previousHash = sessionMetaEarly?.systemPromptHash ?? "";
+        const hasPersistedHash = previousHash !== "" && previousHash !== "0";
+        let dateElementIndex = -1;
+        let currentDate: string | undefined;
         for (let i = 0; i < output.system.length; i++) {
             const match = output.system[i].match(DATE_PATTERN);
             if (!match) continue;
-
-            const currentDate = match[0];
-            const stickyDate = stickyDateBySession.get(sessionId);
-
-            if (!stickyDate) {
-                // First time seeing this session — store the date
-                stickyDateBySession.set(sessionId, currentDate);
-            } else if (currentDate !== stickyDate) {
-                if (isCacheBusting) {
-                    // Cache is already busting — update to the real date
-                    stickyDateBySession.set(sessionId, currentDate);
-                    sessionLog(
-                        sessionId,
-                        `system prompt date updated: ${stickyDate} → ${currentDate} (cache-busting pass)`,
-                    );
-                } else {
-                    // Defer pass — replace with the sticky date to keep prompt stable
-                    output.system[i] = output.system[i].replace(DATE_PATTERN, stickyDate);
-                    sessionLog(
-                        sessionId,
-                        `system prompt date frozen: real=${currentDate}, using=${stickyDate} (defer pass)`,
-                    );
-                }
-            }
+            dateElementIndex = i;
+            currentDate = match[0];
             break;
         }
+        const stickyDate = stickyDateBySession.get(sessionId);
+        const stableCandidate =
+            currentDate && stickyDate && currentDate !== stickyDate
+                ? liveSystemContent.replace(DATE_PATTERN, stickyDate)
+                : liveSystemContent;
+        const stableCandidateHash = createHash("md5")
+            .update(promptSurfaceHashMaterial(stableCandidate, promptSurface.preset))
+            .digest("hex");
+        const contentOrPresetChanged = hasPersistedHash && stableCandidateHash !== previousHash;
+        const dateMayAdvance = isCacheBusting || contentOrPresetChanged;
 
-        // ── Step 3: Detect system prompt or preset changes ──
+        if (currentDate && !stickyDate) {
+            stickyDateBySession.set(sessionId, currentDate);
+        } else if (currentDate && stickyDate && currentDate !== stickyDate) {
+            if (dateMayAdvance) {
+                stickyDateBySession.set(sessionId, currentDate);
+                sessionLog(
+                    sessionId,
+                    `system prompt date updated: ${stickyDate} → ${currentDate} (cache-busting pass)`,
+                );
+            } else if (dateElementIndex >= 0) {
+                output.system[dateElementIndex] = output.system[dateElementIndex].replace(
+                    DATE_PATTERN,
+                    stickyDate,
+                );
+                sessionLog(
+                    sessionId,
+                    `system prompt date frozen: real=${currentDate}, using=${stickyDate} (defer pass)`,
+                );
+            }
+        }
+
+        // ── Step 3: Persist only after all routing identities are frozen ──
         const systemContent = output.system.join("\n");
-        if (systemContent.length === 0) return;
 
-        // Provisional availability (no first user message persisted yet): the
-        // guidance above may be the wrong variant for this session. Do not
-        // initialize or compare the persisted hash from it — the first pass with
-        // a frozen verdict owns the baseline. Skipping here means the variant
-        // settles before any hash is written, so a deny-list session's prompt
-        // never records a reduce-enabled hash it would immediately flip.
-        if (!availability.frozen) return;
+        // The first stable ctx_reduce verdict and resolved model jointly own the
+        // baseline. A provisional tool verdict or unknown model can render a
+        // prompt, but neither may persist a hash that the settled route would flip.
+        if (!availability.frozen || !modelKey) return;
 
         // Use hex digest — numeric strings get coerced by SQLite INTEGER column affinity,
         // causing precision loss on read-back and infinite hash-change flushes.
@@ -441,7 +451,6 @@ export function createSystemPromptHashHandler(deps: {
             return;
         }
         const sessionMeta = sessionMetaEarly;
-        const previousHash = sessionMeta.systemPromptHash;
         if (previousHash !== "" && previousHash !== "0" && previousHash !== currentHash) {
             sessionLog(
                 sessionId,

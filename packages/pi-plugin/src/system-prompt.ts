@@ -134,35 +134,38 @@ export function processSystemPromptForCache(args: {
 		);
 	}
 
-	// Hash the prompt BEFORE date freezing — we want to detect content
-	// changes that aren't just the date flipping at midnight. (Date
-	// drift will not cause a hash change because we apply freezing
-	// in step 2 below; the persisted hash is over the FROZEN prompt.)
 	const previousHash = sessionMeta?.systemPromptHash ?? "";
 	const isFirstHash = previousHash === "" || previousHash === "0";
 
-	// Step 2: sticky-date freeze.
+	// Decide whether content or preset already requires a bust before choosing
+	// which date to hash. This lets a midnight date change ride the same fold.
 	let frozenPrompt = systemPrompt;
 	const dateMatch = systemPrompt.match(DATE_PATTERN);
 	const liveDate = dateMatch ? dateMatch[0] : null;
 	const stickyDate = stickyDateBySession.get(sessionId);
+	const stableCandidate =
+		liveDate && stickyDate && liveDate !== stickyDate
+			? systemPrompt.replace(DATE_PATTERN, stickyDate)
+			: systemPrompt;
+	const stableCandidateHash = createHash("md5")
+		.update(
+			promptSurfaceHashMaterial(stableCandidate, args.promptSurfacePreset),
+		)
+		.digest("hex");
+	const contentOrPresetChanged =
+		!isFirstHash && stableCandidateHash !== previousHash;
+	const dateMayAdvance = isCacheBusting || contentOrPresetChanged;
 
 	if (liveDate && !stickyDate) {
-		// First time seeing this session — store the date. Persisted
-		// prompt will use the live date.
 		stickyDateBySession.set(sessionId, liveDate);
 	} else if (liveDate && stickyDate && liveDate !== stickyDate) {
-		if (isCacheBusting) {
-			// Already busting cache — adopt the live date so future
-			// stable turns freeze on it.
+		if (dateMayAdvance) {
 			stickyDateBySession.set(sessionId, liveDate);
 			sessionLog(
 				sessionId,
 				`system prompt date updated: ${stickyDate} → ${liveDate} (cache-busting pass)`,
 			);
 		} else {
-			// Defer-equivalent turn — replace the live date with the
-			// frozen one so the prefix cache survives.
 			frozenPrompt = systemPrompt.replace(DATE_PATTERN, stickyDate);
 			sessionLog(
 				sessionId,
@@ -171,9 +174,6 @@ export function processSystemPromptForCache(args: {
 		}
 	}
 
-	// Hash the date-frozen prompt plus its semantic preset identity. The full
-	// preset adds no salt so its existing hash stays stable; placeholder light
-	// still gets a distinct identity while it renders the same provider bytes.
 	const currentHash = createHash("md5")
 		.update(promptSurfaceHashMaterial(frozenPrompt, args.promptSurfacePreset))
 		.digest("hex");

@@ -1788,6 +1788,7 @@ mod tests {
             tool_present: false,
             prompt_surface_preset: crate::prompt_surface::PromptSurfacePreset::Full,
             prompt_surface_model_key: None,
+            prompt_surface_config_identity: String::new(),
             prompt_surface_tool_descriptions: BTreeMap::new(),
             serve_native: false,
             native_messages: None,

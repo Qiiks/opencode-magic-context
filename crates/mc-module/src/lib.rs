@@ -6058,7 +6058,10 @@ impl McHandler {
             .lock()
             .expect("prompt surface epoch mutex");
         if let Some(frozen) = epochs.get(session_id) {
-            if frozen.model_key == requested.model_key {
+            if frozen.model_key == requested.model_key
+                && prompt_surface::selection_freeze_identity(frozen)
+                    == prompt_surface::selection_freeze_identity(&requested)
+            {
                 return frozen.clone();
             }
         }
@@ -6090,6 +6093,18 @@ impl McHandler {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        let config_identity = match request
+            .get("prompt_surface_config_identity")
+            .or_else(|| request.get("config_identity"))
+        {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(value)) => value.trim().to_string(),
+            _ => {
+                return Err(invalid_params_error(
+                    "prompt_surface config identity must be a string",
+                ))
+            }
+        };
         let descriptions = request
             .get("tool_descriptions")
             .or_else(|| request.get("prompt_surface_tool_descriptions"));
@@ -6121,6 +6136,7 @@ impl McHandler {
         }
         Ok(PromptSurfaceSelection {
             model_key,
+            config_identity,
             preset,
             tool_descriptions,
         })
@@ -6556,6 +6572,7 @@ impl McHandler {
                 .prompt_surface_model_key
                 .clone()
                 .or_else(|| parsed.model_key.clone()),
+            config_identity: parsed.prompt_surface_config_identity.clone(),
             preset: parsed.prompt_surface_preset,
             tool_descriptions: parsed.prompt_surface_tool_descriptions.clone(),
         };
@@ -6563,6 +6580,7 @@ impl McHandler {
             self.freeze_prompt_surface_selection(&parsed.session_id, requested_prompt_surface);
         parsed.prompt_surface_preset = frozen_prompt_surface.preset;
         parsed.prompt_surface_model_key = frozen_prompt_surface.model_key;
+        parsed.prompt_surface_config_identity = frozen_prompt_surface.config_identity;
         parsed.prompt_surface_tool_descriptions = frozen_prompt_surface.tool_descriptions;
 
         let lineage_root = canonical_root(&binding.project_root);
@@ -16830,7 +16848,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn session_manifest_freezes_per_model_epoch_and_keeps_ids_and_schemas_stable() {
+    async fn session_manifest_freezes_per_model_and_config_epoch_and_keeps_ids_and_schemas_stable()
+    {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
         handler.bind_route(30, binding("/tmp/project", "manifest-ses"));
@@ -16841,6 +16860,7 @@ mod tests {
                 "kind": "manifest.get",
                 "session_id": "manifest-ses",
                 "model_key": "provider/model-a",
+                "config_identity": "config-a",
                 "preset": "light",
                 "tool_descriptions": { "ctx_search": "Search override A." },
             }),
@@ -16856,6 +16876,7 @@ mod tests {
                 "kind": "manifest.get",
                 "session_id": "manifest-ses",
                 "model_key": "provider/model-a",
+                "config_identity": "config-a",
                 "preset": "full",
                 "tool_descriptions": { "ctx_search": "Ignored mid-epoch override." },
             }),
@@ -16872,7 +16893,8 @@ mod tests {
             json!({
                 "kind": "manifest.get",
                 "session_id": "manifest-ses",
-                "model_key": "provider/model-b",
+                "model_key": "provider/model-a",
+                "config_identity": "config-b",
                 "preset": "full",
                 "tool_descriptions": { "ctx_search": "Search override B." },
             }),
@@ -16899,6 +16921,130 @@ mod tests {
                 assert_eq!(actual.execution_mode, expected.execution_mode);
             }
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn config_reload_reselects_guidance_and_manifest_together_then_stays_frozen() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let session = "prompt-config-reload";
+        handler.bind_route(31, binding("/tmp/project", session));
+        handler.guidance_dates.lock().unwrap().insert(
+            session.to_string(),
+            "Today's date: Fri Jan 01 2016".to_string(),
+        );
+
+        let guidance_light = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "guidance.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-light",
+                "preset": "light",
+                "tool_present": true,
+            }),
+        )
+        .await;
+        let manifest_light = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "manifest.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-light",
+                "preset": "light",
+            }),
+        )
+        .await;
+        assert_eq!(guidance_light["preset"], json!("light"));
+        assert_eq!(manifest_light["preset"], json!("light"));
+        assert_eq!(
+            guidance_light["manifest_content_epoch"],
+            manifest_light["content_epoch"]
+        );
+
+        let guidance_stable = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "guidance.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-light",
+                "preset": "full",
+                "tool_present": true,
+            }),
+        )
+        .await;
+        let manifest_stable = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "manifest.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-light",
+                "preset": "full",
+            }),
+        )
+        .await;
+        assert_eq!(guidance_stable, guidance_light);
+        assert_eq!(manifest_stable, manifest_light);
+
+        let guidance_full = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "guidance.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-full",
+                "preset": "full",
+                "tool_present": true,
+            }),
+        )
+        .await;
+        let manifest_full = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "manifest.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-full",
+                "preset": "full",
+            }),
+        )
+        .await;
+        assert_eq!(guidance_full["preset"], json!("full"));
+        assert_eq!(manifest_full["preset"], json!("full"));
+        assert_ne!(guidance_full["bytes"], guidance_light["bytes"]);
+        assert_ne!(
+            manifest_full["content_epoch"],
+            manifest_light["content_epoch"]
+        );
+        assert_eq!(
+            guidance_full["manifest_content_epoch"],
+            manifest_full["content_epoch"]
+        );
+
+        let guidance_full_repeat = call_dispatch_request_on_channel(
+            &handler,
+            31,
+            json!({
+                "kind": "guidance.get",
+                "session_id": session,
+                "model_key": "provider/model",
+                "config_identity": "config-full",
+                "preset": "light",
+                "tool_present": true,
+            }),
+        )
+        .await;
+        assert_eq!(guidance_full_repeat, guidance_full);
     }
 
     #[tokio::test(flavor = "current_thread")]

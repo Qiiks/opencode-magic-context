@@ -315,4 +315,43 @@ describe("Pi prompt-surface guidance epochs", () => {
 			closeQuietly(db);
 		}
 	});
+
+	it("coalesces a midnight date and preset flip into one hash change", () => {
+		const db = createTestDb();
+		const sessionId = "ses-midnight-preset";
+		try {
+			const first = processSystemPromptForCache({
+				db,
+				sessionId,
+				systemPrompt: "Base prompt\nToday's date: Mon Jan 01 2024",
+				isCacheBusting: false,
+				promptSurfacePreset: "full",
+			});
+			expect(first.hashChanged).toBe(false);
+
+			const changed = processSystemPromptForCache({
+				db,
+				sessionId,
+				systemPrompt: "Base prompt\nToday's date: Tue Jan 02 2024",
+				isCacheBusting: false,
+				promptSurfacePreset: "light",
+			});
+			expect(changed.hashChanged).toBe(true);
+			expect(changed.currentHash).not.toBe(first.currentHash);
+			expect(changed.systemPrompt).toContain("Today's date: Tue Jan 02 2024");
+
+			const stable = processSystemPromptForCache({
+				db,
+				sessionId,
+				systemPrompt: "Base prompt\nToday's date: Tue Jan 02 2024",
+				isCacheBusting: false,
+				promptSurfacePreset: "light",
+			});
+			expect(stable.hashChanged).toBe(false);
+			expect(stable.currentHash).toBe(changed.currentHash);
+		} finally {
+			clearPiSystemPromptSession(sessionId);
+			closeQuietly(db);
+		}
+	});
 });

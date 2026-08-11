@@ -1122,7 +1122,7 @@
       "default": {
         "default": "full"
       },
-      "description": "Prompt-surface presets: default is full; models use the literal provider/model or provider/* routing grammar. Guidance and tool-description overrides are user-level only. On OpenCode and Pi, per-model routing applies to the guidance block only: tool descriptions are registered once per process, so they follow the default preset (a v1 plugin-surface limitation; per-model tool descriptions are planned for the OpenCode v2 plugin API once the SDK stabilizes).",
+      "description": "Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/* routing keys. Guidance and tool-description overrides are user-level only. On OpenCode and Pi, per-model routing applies to the guidance block only: tool descriptions are registered once per process, so they follow the default preset (a v1 plugin-surface limitation; per-model tool descriptions are planned for the OpenCode v2 plugin API once the SDK stabilizes).",
       "type": "object",
       "properties": {
         "default": {
@@ -1135,7 +1135,7 @@
           ]
         },
         "models": {
-          "description": "Literal per-model routing. Keys are provider/model or provider/*; matching is case-sensitive and preserves additional slashes in model IDs.",
+          "description": "Literal per-model routing. Keys are bare model IDs, provider/model, or provider/*; matching is case-sensitive and preserves additional slashes in model IDs.",
           "type": "object",
           "propertyNames": {
             "type": "string"

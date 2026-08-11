@@ -804,6 +804,78 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 | `tool-all-active` | **not-present** |
 | `tool-memory-disabled` | **not-present** |
 
+### G-033 — Reduction prompts are housekeeping, not scarcity
+
+- **Source fragment:** `guidance-reduce-closer`
+- **Scope:** primary sessions with ctx_reduce
+- **Polarity:** prohibition
+- **Operative condition:** Context usage or a reduction prompt is visible.
+- **Mechanism:** Treat reduction as routine maintenance and never reduce task scope or depth because context is large.
+- **Consequence:** Cache maintenance cannot cause the agent to rush, defer, or omit work.
+- **Source evidence:** `never let context size change *what* work you take on or *how thoroughly*`
+
+| Variant | Applicability status |
+| --- | --- |
+| `primary-full-reduce-memory-on` | **compressed** |
+| `primary-full-reduce-memory-off` | **compressed** |
+| `primary-full-no-reduce-memory-on` | **not-present** |
+| `primary-full-no-reduce-memory-off` | **not-present** |
+| `primary-full-reduce-dreamer-off` | **compressed** |
+| `primary-full-reduce-temporal-off` | **compressed** |
+| `primary-full-reduce-caveman-on` | **compressed** |
+| `primary-full-reduce-language-on` | **compressed** |
+| `subagent-reduce` | **not-present** |
+| `tool-all-active` | **not-present** |
+| `tool-memory-disabled` | **not-present** |
+
+### G-034 — No-reduce sessions are automatically managed
+
+- **Source fragment:** `guidance-no-reduce-closer`
+- **Scope:** primary sessions without ctx_reduce
+- **Polarity:** prohibition
+- **Operative condition:** The reduction tool is unavailable.
+- **Mechanism:** Rely on automatic context management; do not prune, heed reduction warnings, or cut task scope or depth.
+- **Consequence:** An unavailable reduction tool cannot create false manual housekeeping obligations.
+- **Source evidence:** `there's nothing to prune and no warnings to act on`
+
+| Variant | Applicability status |
+| --- | --- |
+| `primary-full-reduce-memory-on` | **not-present** |
+| `primary-full-reduce-memory-off` | **not-present** |
+| `primary-full-no-reduce-memory-on` | **compressed** |
+| `primary-full-no-reduce-memory-off` | **compressed** |
+| `primary-full-reduce-dreamer-off` | **not-present** |
+| `primary-full-reduce-temporal-off` | **not-present** |
+| `primary-full-reduce-caveman-on` | **not-present** |
+| `primary-full-reduce-language-on` | **not-present** |
+| `subagent-reduce` | **not-present** |
+| `tool-all-active` | **not-present** |
+| `tool-memory-disabled` | **not-present** |
+
+### G-035 — No-reduce sessions retain recovery guidance without pruning instructions
+
+- **Source fragment:** `guidance-no-reduce-intro`
+- **Scope:** primary sessions without ctx_reduce
+- **Polarity:** contract
+- **Operative condition:** Prior project or compacted-session context is needed while ctx_reduce is unavailable.
+- **Mechanism:** Keep note, memory, search, expansion, and real-tool guidance while omitting tag and reduction mechanics.
+- **Consequence:** The agent can recover hidden context without being told to call an unavailable tool.
+- **Source evidence:** `when ctx_reduce is unavailable`
+
+| Variant | Applicability status |
+| --- | --- |
+| `primary-full-reduce-memory-on` | **not-present** |
+| `primary-full-reduce-memory-off` | **not-present** |
+| `primary-full-no-reduce-memory-on` | **compressed** |
+| `primary-full-no-reduce-memory-off` | **compressed** |
+| `primary-full-reduce-dreamer-off` | **not-present** |
+| `primary-full-reduce-temporal-off` | **not-present** |
+| `primary-full-reduce-caveman-on` | **not-present** |
+| `primary-full-reduce-language-on` | **not-present** |
+| `subagent-reduce` | **not-present** |
+| `tool-all-active` | **not-present** |
+| `tool-memory-disabled` | **not-present** |
+
 ### T-001 — ctx_reduce queues release
 
 - **Source fragment:** `tool-ctx-reduce`
