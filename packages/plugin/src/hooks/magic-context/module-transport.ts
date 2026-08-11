@@ -30,6 +30,7 @@ const TRANSFORM_SEND_TIMEOUT_MS = 5_000;
 /** Consumer deadline for the module's exported historian::MAX_WRAPUP_REQUEST_BUDGET. */
 export const MAX_WRAPUP_REQUEST_BUDGET_MS = 3_800_000;
 const SERIAL_LANE_MAX_WAITERS = 16;
+const SERIAL_LANE_MAX_WAITERS_PER_SESSION = 8;
 const SERIAL_LANE_MIN_REMAINING_MS = 25;
 const CANONICAL_ROOT_CACHE_MAX_ENTRIES = 256;
 
@@ -133,7 +134,6 @@ export function isModuleTransportGenerationChangedResult(
 }
 
 interface SerialLaneWaiter {
-    sessionId: string;
     signal?: AbortSignal;
     deadlineMs: number;
     resolve: (release: () => void) => void;
@@ -143,6 +143,17 @@ interface SerialLaneWaiter {
     settled: boolean;
 }
 
+interface SerialLane {
+    active: boolean;
+    waiters: SerialLaneWaiter[];
+}
+
+interface OpeningRoute {
+    client: SubcClient;
+    generation: number;
+    promise: Promise<EnsuredRoute>;
+}
+
 export class SubcModuleTransport {
     private readonly connectionFile: string;
     private readonly moduleId: string;
@@ -150,11 +161,15 @@ export class SubcModuleTransport {
     private readonly routeSessionPrefix: string;
     private client: SubcClient | null = null;
     private routes = new Map<string, CachedRoute>();
+    private routeOpenings = new Map<string, OpeningRoute>();
     private canonicalRootCache = new Map<string, string>();
-    private activeSession: string | null = null;
+    // Preserve request order within a session while allowing independent sessions to overlap.
+    // Both the aggregate and per-session counts cap queued work; active calls are not waiters.
+    private sessionLanes = new Map<string, SerialLane>();
+    private queuedLaneWaiters = 0;
     private wrapupSessions = new Map<string, number>();
     private nextProbeMs = 0;
-    private laneReleaseCallbacks: SerialLaneWaiter[] = [];
+    private connectionPromise: Promise<SubcClient> | null = null;
     private authorityProjectRoot = "";
     /**
      * Filesystem root used to bind authority/mirror routes. Authority request
@@ -226,6 +241,12 @@ export class SubcModuleTransport {
         return this.deadlineError("while queued");
     }
 
+    private connectionChangedError(detail: string): Error & { code?: string } {
+        const error = new Error(detail) as Error & { code?: string };
+        error.code = "ECONNRESET";
+        return error;
+    }
+
     private async beforeDeadline<T>(
         operation: Promise<T>,
         deadlineMs: number,
@@ -246,21 +267,33 @@ export class SubcModuleTransport {
         }
     }
 
-    private laneRelease(): () => void {
+    private cleanupLane(sessionId: string, lane: SerialLane): void {
+        if (
+            !lane.active &&
+            lane.waiters.length === 0 &&
+            this.sessionLanes.get(sessionId) === lane
+        ) {
+            this.sessionLanes.delete(sessionId);
+        }
+    }
+
+    private laneRelease(sessionId: string, lane: SerialLane): () => void {
         let released = false;
         return () => {
             if (released) return;
             released = true;
-            this.activeSession = null;
-            this.dispatchNextLaneWaiter();
+            lane.active = false;
+            this.dispatchNextLaneWaiter(sessionId, lane);
         };
     }
 
-    private dispatchNextLaneWaiter(): void {
-        if (this.activeSession !== null) return;
-        while (this.laneReleaseCallbacks.length > 0) {
-            const waiter = this.laneReleaseCallbacks.shift();
-            if (!waiter || waiter.settled) continue;
+    private dispatchNextLaneWaiter(sessionId: string, lane: SerialLane): void {
+        if (lane.active) return;
+        while (lane.waiters.length > 0) {
+            const waiter = lane.waiters.shift();
+            if (!waiter) continue;
+            this.queuedLaneWaiters = Math.max(0, this.queuedLaneWaiters - 1);
+            if (waiter.settled) continue;
             waiter.settled = true;
             clearTimeout(waiter.timer);
             waiter.signal?.removeEventListener("abort", waiter.onAbort);
@@ -272,10 +305,17 @@ export class SubcModuleTransport {
                 waiter.reject(this.laneTimeoutError());
                 continue;
             }
-            this.activeSession = waiter.sessionId;
-            waiter.resolve(this.laneRelease());
+            lane.active = true;
+            waiter.resolve(this.laneRelease(sessionId, lane));
             return;
         }
+        this.cleanupLane(sessionId, lane);
+    }
+
+    private queueFullError(): Error & { code?: string } {
+        const error = new Error("module transport queue is full") as Error & { code?: string };
+        error.code = "EBUSY";
+        return error;
     }
 
     private acquireCorrectnessLane(
@@ -289,14 +329,17 @@ export class SubcModuleTransport {
         if (deadlineMs - Date.now() < SERIAL_LANE_MIN_REMAINING_MS) {
             return Promise.reject(this.laneTimeoutError());
         }
-        if (this.activeSession === null && this.laneReleaseCallbacks.length === 0) {
-            this.activeSession = sessionId;
-            return Promise.resolve(this.laneRelease());
+        const lane = this.sessionLanes.get(sessionId) ?? { active: false, waiters: [] };
+        this.sessionLanes.set(sessionId, lane);
+        if (!lane.active && lane.waiters.length === 0) {
+            lane.active = true;
+            return Promise.resolve(this.laneRelease(sessionId, lane));
         }
-        if (this.laneReleaseCallbacks.length >= SERIAL_LANE_MAX_WAITERS) {
-            const error = new Error("module transport queue is full") as Error & { code?: string };
-            error.code = "EBUSY";
-            return Promise.reject(error);
+        if (
+            this.queuedLaneWaiters >= SERIAL_LANE_MAX_WAITERS ||
+            lane.waiters.length >= SERIAL_LANE_MAX_WAITERS_PER_SESSION
+        ) {
+            return Promise.reject(this.queueFullError());
         }
         return new Promise<() => void>((resolve, reject) => {
             const waiter = {} as SerialLaneWaiter;
@@ -305,12 +348,14 @@ export class SubcModuleTransport {
                 waiter.settled = true;
                 clearTimeout(waiter.timer);
                 signal?.removeEventListener("abort", waiter.onAbort);
-                const index = this.laneReleaseCallbacks.indexOf(waiter);
-                if (index >= 0) this.laneReleaseCallbacks.splice(index, 1);
+                const index = lane.waiters.indexOf(waiter);
+                if (index >= 0) {
+                    lane.waiters.splice(index, 1);
+                    this.queuedLaneWaiters = Math.max(0, this.queuedLaneWaiters - 1);
+                }
                 reject(error);
-                if (this.activeSession === null) this.dispatchNextLaneWaiter();
+                this.cleanupLane(sessionId, lane);
             };
-            waiter.sessionId = sessionId;
             waiter.signal = signal;
             waiter.deadlineMs = deadlineMs;
             waiter.resolve = resolve;
@@ -323,7 +368,8 @@ export class SubcModuleTransport {
                 Math.max(0, deadlineMs - Date.now()),
             );
             signal?.addEventListener("abort", waiter.onAbort, { once: true });
-            this.laneReleaseCallbacks.push(waiter);
+            lane.waiters.push(waiter);
+            this.queuedLaneWaiters += 1;
         });
     }
 
@@ -402,10 +448,12 @@ export class SubcModuleTransport {
             finishWrapupTracking();
             throw error;
         }
-        const onAbort = () => this.invalidateConnection();
+        let activeAttemptClient: SubcClient | null = null;
+        const onAbort = () => this.invalidateConnection(activeAttemptClient ?? this.client);
         args.signal?.addEventListener("abort", onAbort, { once: true });
         try {
             for (let attempt = 0; attempt < 2; attempt += 1) {
+                activeAttemptClient = null;
                 let ensuredRoute: EnsuredRoute | null = null;
                 try {
                     if (args.signal?.aborted) {
@@ -419,10 +467,11 @@ export class SubcModuleTransport {
                         args.projectRoot,
                         attemptDeadlineMs,
                     );
+                    activeAttemptClient = ensuredRoute.client;
                     if (args.signal?.aborted) {
                         throw args.signal.reason ?? new Error("module transport call aborted");
                     }
-                    return await this.beforeDeadline(
+                    const response = await this.beforeDeadline(
                         ensuredRoute.client.request(ensuredRoute.route, args.body, {
                             priority: Priority.Background,
                             admissionClass: AdmissionClass.Normal,
@@ -431,6 +480,15 @@ export class SubcModuleTransport {
                         attemptDeadlineMs,
                         "waiting for the module response",
                     );
+                    if (
+                        this.client !== ensuredRoute.client ||
+                        this.connectionGeneration !== ensuredRoute.generation
+                    ) {
+                        throw this.connectionChangedError(
+                            "subc connection changed while awaiting the module response",
+                        );
+                    }
+                    return response;
                 } catch (error) {
                     if (isConnectionFailure(error)) {
                         const previousGeneration =
@@ -617,7 +675,7 @@ export class SubcModuleTransport {
                 });
             }
         }
-        if (routes.length === 0 && this.activeSession === sessionId) {
+        if (routes.length === 0 && this.sessionLanes.get(sessionId)?.active) {
             this.invalidateConnection(client);
         }
     }
@@ -646,30 +704,41 @@ export class SubcModuleTransport {
             return { client, route: existing.route, routeKey, generation };
         }
         if (existing) this.routes.delete(routeKey);
-
-        const target: RouteTarget = { kind: "tool_provider", module_id: this.moduleId };
-        const identity: BindIdentity = {
-            project_root: projectRoot,
-            harness: getHarness(),
-            session: `${this.routeSessionPrefix}${sessionId}`,
-        };
-        const route = await this.beforeDeadline(
-            client.routeOpen(target, identity),
-            deadlineMs,
-            "opening the module route",
-        );
-        if (this.client !== client || generation !== this.connectionGeneration) {
-            await client.closeRoute(route).catch(() => undefined);
-            const error = new Error(
-                "subc connection changed while opening module route",
-            ) as Error & {
-                code?: string;
-            };
-            error.code = "ECONNRESET";
-            throw error;
+        const opening = this.routeOpenings.get(routeKey);
+        if (opening?.client === client && opening.generation === generation) {
+            return await opening.promise;
         }
-        this.routes.set(routeKey, { route, generation });
-        return { client, route, routeKey, generation };
+
+        const promise = (async (): Promise<EnsuredRoute> => {
+            const target: RouteTarget = { kind: "tool_provider", module_id: this.moduleId };
+            const identity: BindIdentity = {
+                project_root: projectRoot,
+                harness: getHarness(),
+                session: `${this.routeSessionPrefix}${sessionId}`,
+            };
+            const route = await this.beforeDeadline(
+                client.routeOpen(target, identity),
+                deadlineMs,
+                "opening the module route",
+            );
+            if (this.client !== client || generation !== this.connectionGeneration) {
+                await client.closeRoute(route).catch(() => undefined);
+                throw this.connectionChangedError(
+                    "subc connection changed while opening module route",
+                );
+            }
+            this.routes.set(routeKey, { route, generation });
+            return { client, route, routeKey, generation };
+        })();
+        const routeOpening = { client, generation, promise };
+        this.routeOpenings.set(routeKey, routeOpening);
+        try {
+            return await promise;
+        } finally {
+            if (this.routeOpenings.get(routeKey) === routeOpening) {
+                this.routeOpenings.delete(routeKey);
+            }
+        }
     }
 
     private dropRoute(routeKey: string, route?: RouteHandle): void {
@@ -702,8 +771,16 @@ export class SubcModuleTransport {
         return resolved;
     }
 
+    private connectClient(): Promise<SubcClient> {
+        return SubcClient.connect({
+            connectionFile: this.connectionFile,
+            handshakeTimeoutMs: HANDSHAKE_TIMEOUT_MS,
+        });
+    }
+
     private async ensureConnected(): Promise<SubcClient> {
         if (this.client) return this.client;
+        if (this.connectionPromise) return await this.connectionPromise;
         const now = Date.now();
         if (now < this.nextProbeMs) {
             const error = new Error(
@@ -716,40 +793,42 @@ export class SubcModuleTransport {
         }
 
         const generation = this.connectionGeneration;
-        let candidate: SubcClient | null = null;
-        try {
-            candidate = await SubcClient.connect({
-                connectionFile: this.connectionFile,
-                handshakeTimeoutMs: HANDSHAKE_TIMEOUT_MS,
-            });
-            if (generation !== this.connectionGeneration) {
-                candidate.close();
-                const error = new Error("subc connection attempt was superseded") as Error & {
-                    code?: string;
-                };
-                error.code = "ECONNRESET";
+        const connecting = (async (): Promise<SubcClient> => {
+            let candidate: SubcClient | null = null;
+            try {
+                candidate = await this.connectClient();
+                if (generation !== this.connectionGeneration) {
+                    candidate.close();
+                    throw this.connectionChangedError("subc connection attempt was superseded");
+                }
+                this.client = candidate;
+                this.routes.clear();
+                this.backoffMs = CONNECT_BACKOFF_INITIAL_MS;
+                this.nextProbeMs = 0;
+                return candidate;
+            } catch (error) {
+                candidate?.close();
+                if (generation === this.connectionGeneration) this.invalidateConnection();
+                this.nextProbeMs = Date.now() + this.backoffMs;
+                this.backoffMs = Math.min(this.backoffMs * 2, CONNECT_BACKOFF_MAX_MS);
                 throw error;
             }
-            this.client = candidate;
-            this.routes.clear();
-            this.backoffMs = CONNECT_BACKOFF_INITIAL_MS;
-            this.nextProbeMs = 0;
-            return candidate;
-        } catch (error) {
-            candidate?.close();
-            this.invalidateConnection();
-            this.nextProbeMs = Date.now() + this.backoffMs;
-            this.backoffMs = Math.min(this.backoffMs * 2, CONNECT_BACKOFF_MAX_MS);
-            throw error;
+        })();
+        this.connectionPromise = connecting;
+        try {
+            return await connecting;
+        } finally {
+            if (this.connectionPromise === connecting) this.connectionPromise = null;
         }
     }
 
     private invalidateConnection(client: SubcClient | null = this.client): void {
-        if (client && this.client && client !== this.client) return;
+        if (client && this.client !== client) return;
         this.connectionGeneration += 1;
         this.invalidateStateSyncCapabilities();
         this.client = null;
         this.routes.clear();
+        this.routeOpenings.clear();
         client?.close();
     }
 }

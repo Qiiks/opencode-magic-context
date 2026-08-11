@@ -6,6 +6,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+    type BindIdentity,
     buildFlags,
     buildFrame,
     CLIENT_AUTH_DOMAIN,
@@ -18,6 +19,7 @@ import {
     PROTOCOL_VERSION,
     Priority,
     type RouteHandle,
+    type RouteTarget,
     SERVER_PROOF_DOMAIN,
     StaleRouteHandleError,
     type SubcClient,
@@ -91,6 +93,20 @@ async function listen(server: Server): Promise<number> {
     if (!address || typeof address === "string")
         throw new Error("fake subc server has no TCP port");
     return address.port;
+}
+
+function deferred<T = void>(): {
+    promise: Promise<T>;
+    resolve: (value: T) => void;
+    reject: (error: unknown) => void;
+} {
+    let resolve!: (value: T) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<T>((promiseResolve, promiseReject) => {
+        resolve = promiseResolve;
+        reject = promiseReject;
+    });
+    return { promise, resolve, reject };
 }
 
 describe("SubcModuleTransport", () => {
@@ -553,6 +569,311 @@ describe("SubcModuleTransport", () => {
         expect(transport.getCachedStateSyncCapabilities()).toBeUndefined();
     });
 
+    it("allows another session to start while a long wrapup is still in flight", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        const wrapupStarted = deferred();
+        const statusStarted = deferred();
+        const releaseWrapup = deferred();
+        let wrapupSettled = false;
+        const client = {
+            request: async (_route: RouteHandle, body: unknown) => {
+                const method = (body as { method: string }).method;
+                if (method === "session.wrapup") {
+                    wrapupStarted.resolve();
+                    await releaseWrapup.promise;
+                } else {
+                    statusStarted.resolve();
+                }
+                return { result: { ok: true } };
+            },
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureRoute: (sessionId: string) => Promise<{
+                client: SubcClient;
+                route: RouteHandle;
+                routeKey: string;
+                generation: number;
+            }>;
+        };
+        internals.client = client;
+        internals.ensureRoute = async (sessionId) => ({
+            client,
+            route,
+            routeKey: `${sessionId}\0/workspace/project`,
+            generation: 0,
+        });
+
+        const wrapup = transport
+            .call({
+                sessionId: "session-a",
+                projectRoot: "/workspace/project",
+                method: "session.wrapup",
+                body: { method: "session.wrapup", v: 1 },
+            })
+            .finally(() => {
+                wrapupSettled = true;
+            });
+        await wrapupStarted.promise;
+        const status = transport.call({
+            sessionId: "session-b",
+            projectRoot: "/workspace/project",
+            method: "session.status",
+            body: { method: "session.status", v: 1 },
+        });
+
+        await statusStarted.promise;
+        expect(wrapupSettled).toBe(false);
+        await expect(status).resolves.toEqual({ result: { ok: true } });
+        releaseWrapup.resolve();
+        await expect(wrapup).resolves.toEqual({ result: { ok: true } });
+    });
+
+    it("executes one session's state sync, transform, and status strictly in submission order", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        const stateSyncStarted = deferred();
+        const transformStarted = deferred();
+        const releaseStateSync = deferred();
+        const releaseTransform = deferred();
+        const starts: string[] = [];
+        const client = {
+            request: async (_route: RouteHandle, body: unknown) => {
+                const method = (body as { method: string }).method;
+                starts.push(method);
+                if (method === "state_sync") {
+                    stateSyncStarted.resolve();
+                    await releaseStateSync.promise;
+                } else if (method === "transform") {
+                    transformStarted.resolve();
+                    await releaseTransform.promise;
+                }
+                return { result: { method } };
+            },
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureRoute: () => Promise<{
+                client: SubcClient;
+                route: RouteHandle;
+                routeKey: string;
+                generation: number;
+            }>;
+        };
+        internals.client = client;
+        internals.ensureRoute = async () => ({
+            client,
+            route,
+            routeKey: "ordered-session\0/workspace/project",
+            generation: 0,
+        });
+        const base = { sessionId: "ordered-session", projectRoot: "/workspace/project" };
+
+        const stateSync = transport.call({
+            ...base,
+            method: "state_sync",
+            body: { method: "state_sync" },
+        });
+        const transform = transport.call({
+            ...base,
+            method: "transform",
+            body: { method: "transform" },
+        });
+        const status = transport.call({
+            ...base,
+            method: "session.status",
+            body: { method: "session.status" },
+        });
+
+        await stateSyncStarted.promise;
+        expect(starts).toEqual(["state_sync"]);
+        releaseStateSync.resolve();
+        await transformStarted.promise;
+        expect(starts).toEqual(["state_sync", "transform"]);
+        releaseTransform.resolve();
+        await Promise.all([stateSync, transform, status]);
+        expect(starts).toEqual(["state_sync", "transform", "session.status"]);
+    });
+
+    it("coalesces concurrent connection recovery and retries two sessions on one fresh generation", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1_000);
+        const oldRouteA = { channel: 7, epoch: 70 } as RouteHandle;
+        const oldRouteB = { channel: 8, epoch: 80 } as RouteHandle;
+        const oldRequestsStarted = deferred();
+        let oldRequestCount = 0;
+        let oldCloseCount = 0;
+        const oldClient = {
+            request: async () => {
+                oldRequestCount += 1;
+                if (oldRequestCount === 2) oldRequestsStarted.resolve();
+                await oldRequestsStarted.promise;
+                throw new Error("client closed");
+            },
+            close: () => {
+                oldCloseCount += 1;
+            },
+        } as unknown as SubcClient;
+        let routeOpenCount = 0;
+        const freshRequestSessions: string[] = [];
+        const freshClient = {
+            routeOpen: async (_target: RouteTarget, identity: BindIdentity) => {
+                routeOpenCount += 1;
+                return {
+                    channel: 20 + routeOpenCount,
+                    epoch: 100,
+                    session: identity.session,
+                } as unknown as RouteHandle;
+            },
+            request: async (_route: RouteHandle, body: unknown) => {
+                const sessionId = (body as { session_id: string }).session_id;
+                freshRequestSessions.push(sessionId);
+                return { result: { sessionId } };
+            },
+            close: () => undefined,
+        } as unknown as SubcClient;
+        let connectCount = 0;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            connectionGeneration: number;
+            routes: Map<string, { route: RouteHandle; generation: number }>;
+            connectClient(): Promise<SubcClient>;
+        };
+        internals.client = oldClient;
+        internals.routes.set("session-a\0/invalidation-a", { route: oldRouteA, generation: 0 });
+        internals.routes.set("session-b\0/invalidation-b", { route: oldRouteB, generation: 0 });
+        internals.connectClient = async () => {
+            connectCount += 1;
+            await Bun.sleep(10);
+            return freshClient;
+        };
+
+        const [responseA, responseB] = await Promise.all([
+            transport.call({
+                sessionId: "session-a",
+                projectRoot: "/invalidation-a",
+                method: "transform",
+                body: { method: "transform", session_id: "session-a" },
+            }),
+            transport.call({
+                sessionId: "session-b",
+                projectRoot: "/invalidation-b",
+                method: "transform",
+                body: { method: "transform", session_id: "session-b" },
+            }),
+        ]);
+
+        expect(responseA).toEqual({ result: { sessionId: "session-a" } });
+        expect(responseB).toEqual({ result: { sessionId: "session-b" } });
+        expect(oldCloseCount).toBe(1);
+        expect(connectCount).toBe(1);
+        expect(internals.connectionGeneration).toBe(1);
+        expect(routeOpenCount).toBe(2);
+        expect(freshRequestSessions.sort()).toEqual(["session-a", "session-b"]);
+    });
+
+    it("coalesces concurrent route opens for the same session and project", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        const routeOpenStarted = deferred();
+        const releaseRouteOpen = deferred();
+        let routeOpenCount = 0;
+        const client = {
+            routeOpen: async () => {
+                routeOpenCount += 1;
+                routeOpenStarted.resolve();
+                await releaseRouteOpen.promise;
+                return route;
+            },
+            closeRoute: async () => undefined,
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureRoute: (
+                sessionId: string,
+                projectRoot: string,
+            ) => Promise<{ route: RouteHandle }>;
+        };
+        internals.client = client;
+
+        const first = internals.ensureRoute("route-session", "/route-project");
+        const second = internals.ensureRoute("route-session", "/route-project");
+        await routeOpenStarted.promise;
+        expect(routeOpenCount).toBe(1);
+        releaseRouteOpen.resolve();
+
+        const [firstResult, secondResult] = await Promise.all([first, second]);
+        expect(firstResult.route).toBe(route);
+        expect(secondResult.route).toBe(route);
+        expect(routeOpenCount).toBe(1);
+    });
+
+    it("keeps the aggregate queued-call ceiling across independent session lanes", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        const releaseActiveCalls = deferred();
+        const allActiveCallsStarted = deferred();
+        let activeCallsStarted = 0;
+        const client = {
+            request: async (_route: RouteHandle, body: unknown) => {
+                if ((body as { active?: boolean }).active) {
+                    activeCallsStarted += 1;
+                    if (activeCallsStarted === 4) allActiveCallsStarted.resolve();
+                    await releaseActiveCalls.promise;
+                }
+                return { result: { ok: true } };
+            },
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureRoute: (sessionId: string) => Promise<{
+                client: SubcClient;
+                route: RouteHandle;
+                routeKey: string;
+                generation: number;
+            }>;
+        };
+        internals.client = client;
+        internals.ensureRoute = async (sessionId) => ({
+            client,
+            route,
+            routeKey: `${sessionId}\0/workspace/project`,
+            generation: 0,
+        });
+        const sessions = ["cap-a", "cap-b", "cap-c", "cap-d"];
+        const activeCalls = sessions.map((sessionId) =>
+            transport.call({
+                sessionId,
+                projectRoot: "/workspace/project",
+                method: "session.status",
+                body: { method: "session.status", active: true },
+            }),
+        );
+        await allActiveCallsStarted.promise;
+        const queuedCalls = sessions.flatMap((sessionId) =>
+            Array.from({ length: 4 }, (_, index) =>
+                transport.call({
+                    sessionId,
+                    projectRoot: "/workspace/project",
+                    method: "session.status",
+                    body: { method: "session.status", index },
+                }),
+            ),
+        );
+
+        await expect(
+            transport.call({
+                sessionId: sessions[0],
+                projectRoot: "/workspace/project",
+                method: "session.status",
+                body: { method: "session.status", overflow: true },
+            }),
+        ).rejects.toMatchObject({ code: "EBUSY" });
+
+        releaseActiveCalls.resolve();
+        await Promise.all([...activeCalls, ...queuedCalls]);
+    });
+
     it("keeps wrapup and live status calls beyond a 20-second round without raising the generic deadline", async () => {
         const transport = new SubcModuleTransport("unused-connection-file");
         const route = { channel: 7, epoch: 77 } as RouteHandle;
@@ -576,6 +897,7 @@ describe("SubcModuleTransport", () => {
             },
         } as unknown as SubcClient;
         const internals = transport as unknown as {
+            client: SubcClient | null;
             ensureRoute: () => Promise<{
                 client: SubcClient;
                 route: RouteHandle;
@@ -583,6 +905,7 @@ describe("SubcModuleTransport", () => {
                 generation: number;
             }>;
         };
+        internals.client = client;
         internals.ensureRoute = async () => ({
             client,
             route,
