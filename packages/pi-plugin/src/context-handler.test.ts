@@ -43,6 +43,7 @@ import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudg
 import { withRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { setBootQuietPeriodForTests } from "@magic-context/core/plugin/boot-quiet";
 import { clearModelsDevCache } from "@magic-context/core/shared/models-dev-cache";
+import { resolvePromptSurface } from "@magic-context/core/shared/prompt-surface";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
@@ -1657,25 +1658,37 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
-	it("persists model-resolved cache_ttl from Pi message_end assistant metadata", async () => {
+	it("canonicalizes Pi-native refs before cache_ttl and prompt-surface routing", async () => {
 		const db = createTestDb();
 		try {
-			const { persistPiMessageEndModelMeta } = await import("./index");
+			const { canonicalPiModelKey, persistPiMessageEndModelMeta } =
+				await import("./index");
+			const canonicalModelKey = canonicalPiModelKey(
+				"openai-codex",
+				"gpt-5.6-sol",
+			);
 
 			persistPiMessageEndModelMeta({
 				db,
 				sessionId: "ses-context",
 				message: assistantMessage("done", 1, {
-					provider: "anthropic",
-					model: "claude-sonnet-4-5",
+					provider: "openai-codex",
+					model: "gpt-5.6-sol",
 				}),
 				cacheTtlConfig: {
 					default: "5m",
-					"anthropic/claude-sonnet-4-5": "1h",
+					"openai/gpt-5.6-sol": "never",
 				},
 			});
 
-			expect(getOrCreateSessionMeta(db, "ses-context").cacheTtl).toBe("1h");
+			expect(canonicalModelKey).toBe("openai/gpt-5.6-sol");
+			expect(getOrCreateSessionMeta(db, "ses-context").cacheTtl).toBe("never");
+			expect(
+				resolvePromptSurface(
+					{ default: "full", models: { "openai/gpt-5.6-sol": "light" } },
+					canonicalModelKey,
+				),
+			).toEqual({ preset: "light", source: "exact" });
 		} finally {
 			clearContextHandlerSession("ses-context");
 			closeQuietly(db);

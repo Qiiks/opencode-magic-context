@@ -27,6 +27,7 @@ import {
 } from "../../features/magic-context/transform-decision-log";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { ABSOLUTE_EMERGENCY_PERCENTAGE } from "../../shared/escalation-bands";
+import { promptSurfaceConfigIdentity } from "../../shared/prompt-surface";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
@@ -878,6 +879,9 @@ describe("Rust mode authority adapter", () => {
         expect(transformRequest?.tool_present).toBe(true);
         expect(transformRequest?.prompt_surface_preset).toBe("full");
         expect(transformRequest?.prompt_surface_model_key).toBeNull();
+        expect(transformRequest?.prompt_surface_config_identity).toBe(
+            promptSurfaceConfigIdentity(undefined),
+        );
         expect(transformRequest?.prompt_surface_tool_descriptions).toEqual({});
         expect(transformRequest?.native_messages).toBe(messages);
         expect(Array.isArray(transformRequest?.messages)).toBe(true);
@@ -932,6 +936,9 @@ describe("Rust mode authority adapter", () => {
 
         expect(transformRequest?.prompt_surface_preset).toBe("light");
         expect(transformRequest?.prompt_surface_model_key).toBe("anthropic/opus");
+        expect(transformRequest?.prompt_surface_config_identity).toBe(
+            promptSurfaceConfigIdentity(deps.promptSurface),
+        );
         expect(transformRequest?.prompt_surface_tool_descriptions).toEqual({
             ctx_search: "Search the project memory index.",
         });

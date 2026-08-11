@@ -152,6 +152,14 @@ export function validateChecklist(
 
     const variantIds = Object.keys(variants);
     if (variantIds.length === 0) errors.push("fragment-to-variant composition map has no variants");
+    const referencedFragmentIds = new Set(
+        rules.flatMap((rule) => (rule.sourceFragment ? [rule.sourceFragment] : [])),
+    );
+    for (const fragmentId of Object.keys(fragments)) {
+        if (!referencedFragmentIds.has(fragmentId)) {
+            errors.push(`fragment ${fragmentId} is not referenced by any checklist rule`);
+        }
+    }
     const sourceTextCache = new Map<string, string>();
     for (const [fragmentId, fragment] of Object.entries(fragments)) {
         if (!fragment.source?.file || !fragment.source.evidence) {

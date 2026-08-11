@@ -30,7 +30,7 @@ import {
 import { writeRustTransformDecision } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
-import { resolvePromptSurface } from "../../shared/prompt-surface";
+import { promptSurfaceConfigIdentity, resolvePromptSurface } from "../../shared/prompt-surface";
 import {
     resolveCtxReduceAvailability,
     resolveTodowriteAvailabilityFromMessages,
@@ -1042,6 +1042,7 @@ function buildTransformBody(args: {
         tool_present: args.passInputs.tool_present === true,
         prompt_surface_preset: args.passInputs.prompt_surface_preset ?? "full",
         prompt_surface_model_key: args.passInputs.prompt_surface_model_key,
+        prompt_surface_config_identity: args.passInputs.prompt_surface_config_identity,
         prompt_surface_tool_descriptions: args.passInputs.prompt_surface_tool_descriptions ?? {},
         effective_execute_threshold: args.passInputs.effective_execute_threshold,
         history_budget_tokens: args.passInputs.history_budget_tokens,
@@ -1601,6 +1602,7 @@ export function createRustModeTransform(
                 tool_present: toolPresent,
                 prompt_surface_preset: promptSurface.preset,
                 prompt_surface_model_key: modelKey,
+                prompt_surface_config_identity: promptSurfaceConfigIdentity(deps.promptSurface),
                 prompt_surface_tool_descriptions: deps.promptSurface?.tool_descriptions ?? {},
                 protected_tags: deps.protectedTags ?? DEFAULT_PROTECTED_TAGS,
                 temporal_awareness: deps.experimentalTemporalAwareness === true,

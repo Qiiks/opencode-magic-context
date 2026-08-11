@@ -98,6 +98,10 @@ function count(text: string): TokenCount {
     return { chars: text.length, tokens: tokenizer.count(text) };
 }
 
+export function measurePromptSurfaceText(text: string): TokenCount {
+    return count(text);
+}
+
 function buildToolDefinitions() {
     const stubDeps = new Proxy(
         {},

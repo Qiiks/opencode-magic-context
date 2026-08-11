@@ -61,9 +61,8 @@ pub struct McModuleConfig {
     pub temporal_awareness: bool,
     pub smart_drops: bool,
     pub cache_ttl: String,
-    /// Per-model TTL overrides from the object config shape; keys are full
-    /// provider/model keys or bare model ids, mirroring the TS resolveCacheTtl
-    /// precedence (exact key, then bare id, then default).
+    /// Per-model TTL overrides from the object config shape. Resolution uses the
+    /// shared exact, bare, dash-stripped, provider-wildcard, then default walk.
     pub cache_ttl_by_model: std::collections::BTreeMap<String, String>,
 }
 
@@ -88,19 +87,34 @@ impl Default for McModuleConfig {
 }
 
 impl McModuleConfig {
-    /// Resolve the effective cache TTL for a model, mirroring the TS adapter's
-    /// resolveCacheTtl precedence: exact provider/model key, then the bare model id
-    /// (config written without the provider prefix), then the default.
+    /// Resolve the effective cache TTL with the same walk as the TypeScript
+    /// adapter: exact and bare candidates at each progressive dash boundary,
+    /// then the provider wildcard, then the configured default.
     pub fn resolve_cache_ttl(&self, model_key: Option<&str>) -> String {
-        if let Some(key) = model_key {
-            if let Some(ttl) = self.cache_ttl_by_model.get(key) {
+        let Some((provider, mut model_id)) = model_key.and_then(|key| key.split_once('/')) else {
+            return self.cache_ttl.clone();
+        };
+        if provider.is_empty() || model_id.is_empty() {
+            return self.cache_ttl.clone();
+        }
+
+        loop {
+            let exact = format!("{provider}/{model_id}");
+            if let Some(ttl) = self.cache_ttl_by_model.get(&exact) {
                 return ttl.clone();
             }
-            if let Some((_, bare)) = key.split_once('/') {
-                if let Some(ttl) = self.cache_ttl_by_model.get(bare) {
-                    return ttl.clone();
-                }
+            if let Some(ttl) = self.cache_ttl_by_model.get(model_id) {
+                return ttl.clone();
             }
+
+            let Some(last_dash) = model_id.rfind('-').filter(|index| *index > 0) else {
+                break;
+            };
+            model_id = &model_id[..last_dash];
+        }
+
+        if let Some(ttl) = self.cache_ttl_by_model.get(&format!("{provider}/*")) {
+            return ttl.clone();
         }
         self.cache_ttl.clone()
     }
@@ -458,6 +472,32 @@ mod cache_ttl_tests {
         assert_eq!(cfg.resolve_cache_ttl(Some("openai/gpt-5.6-sol")), "30m");
         assert_eq!(cfg.resolve_cache_ttl(Some("unknown/model")), "10m");
         assert_eq!(cfg.resolve_cache_ttl(None), "10m");
+    }
+
+    #[test]
+    fn cache_ttl_resolution_matches_shared_typescript_vectors() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/cache-ttl-routing-vectors.json"))
+                .unwrap();
+        let mut cfg = McModuleConfig {
+            cache_ttl: vectors["default"].as_str().unwrap().to_string(),
+            ..McModuleConfig::default()
+        };
+        cfg.cache_ttl_by_model = vectors["models"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.as_str().unwrap().to_string()))
+            .collect();
+
+        for case in vectors["cases"].as_array().unwrap() {
+            assert_eq!(
+                cfg.resolve_cache_ttl(case["modelKey"].as_str()),
+                case["expected"].as_str().unwrap(),
+                "shared vector {}",
+                case["name"].as_str().unwrap()
+            );
+        }
     }
 
     #[test]

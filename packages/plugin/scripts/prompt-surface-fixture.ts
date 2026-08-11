@@ -4,6 +4,7 @@ import {
     builtInLightSurface,
     measureAgentSurface,
     measureLightSurface,
+    measurePromptSurfaceText,
     readLightSurface,
     PRIMARY_VARIANT_ID,
     TOKENIZER_ENCODING,
@@ -11,6 +12,14 @@ import {
     TOKENIZER_VERSION,
 } from "./prompt-surface-measurement";
 import { ACTIVE_TOOL_IDS } from "../src/shared/prompt-surface-runtime";
+
+export const RATIFIED_FULL_MUTABLE_PROSE_CEILING = 3650;
+export const RATIFIED_LIGHT_MUTABLE_PROSE_CEILING = 1825;
+
+const DEFAULT_CC_LIGHT_ASSET_PATHS = [
+    resolve(import.meta.dir, "../../../crates/mc-module/assets/guidance_light_primary.txt"),
+    resolve(import.meta.dir, "../../../crates/mc-module/assets/guidance_light_no_reduce.txt"),
+];
 
 interface BudgetFixture {
     status?: string;
@@ -57,6 +66,7 @@ function compareCount(
 export function validateBudgetFixture(options: {
     fixturePath: string;
     lightSurfacePath?: string;
+    ccLightAssetPaths?: string[];
 }): BudgetValidationResult {
     const fixture = readFixture(options.fixturePath);
     const surface = measureAgentSurface();
@@ -124,10 +134,17 @@ export function validateBudgetFixture(options: {
     if (fixture.mutableProseBaseline !== baseline) {
         errors.push(`mutable-prose baseline drifted: fixture=${fixture.mutableProseBaseline}, source=${baseline}`);
     }
-    const expectedCeiling = Math.floor(0.5 * baseline);
-    if (fixture.policy?.fraction !== 0.5 || fixture.integerLightCeiling !== expectedCeiling) {
+    if (baseline > RATIFIED_FULL_MUTABLE_PROSE_CEILING) {
         errors.push(
-            `integer light ceiling drifted: fixture=${fixture.integerLightCeiling}, expected floor(0.50 * ${baseline})=${expectedCeiling}`,
+            `primary full mutable-prose total ${baseline} exceeds ratified ceiling ${RATIFIED_FULL_MUTABLE_PROSE_CEILING}`,
+        );
+    }
+    if (
+        fixture.policy?.fraction !== 0.5 ||
+        fixture.integerLightCeiling !== RATIFIED_LIGHT_MUTABLE_PROSE_CEILING
+    ) {
+        errors.push(
+            `integer light ceiling must remain the ratified literal ${RATIFIED_LIGHT_MUTABLE_PROSE_CEILING}; fixture=${fixture.integerLightCeiling}`,
         );
     }
     const expectedProviderTotal = baseline + schemaTotal;
@@ -145,17 +162,56 @@ export function validateBudgetFixture(options: {
         errors.push(`light surface variant must be ${PRIMARY_VARIANT_ID}, got ${light.variant}`);
     }
     messages.push(`measured primary light mutable-prose total: ${light.mutableProseTotal} tokens`);
-    messages.push(`ratified integer light ceiling: ${fixture.integerLightCeiling} tokens`);
-    if (light.mutableProseTotal > (fixture.integerLightCeiling ?? -1)) {
-        errors.push(
-            `primary light mutable-prose total ${light.mutableProseTotal} exceeds ceiling ${fixture.integerLightCeiling}`,
-        );
-    } else {
-        messages.push("primary light surface is at or below the ceiling");
+    messages.push(
+        `ratified ceilings: full=${RATIFIED_FULL_MUTABLE_PROSE_CEILING}, light=${RATIFIED_LIGHT_MUTABLE_PROSE_CEILING} tokens`,
+    );
+
+    const fullGuidanceTokens = surface.primary.guidance.full.tokens;
+    const fullDescriptionTokens = baseline - fullGuidanceTokens;
+    const lightDescriptionTokens = light.mutableProseTotal - light.guidance.tokens;
+    const servingMatrix = [
+        {
+            label: "full guidance + full descriptions",
+            tokens: fullGuidanceTokens + fullDescriptionTokens,
+            ceiling: RATIFIED_FULL_MUTABLE_PROSE_CEILING,
+        },
+        {
+            label: "full guidance + light descriptions",
+            tokens: fullGuidanceTokens + lightDescriptionTokens,
+            ceiling: RATIFIED_FULL_MUTABLE_PROSE_CEILING,
+        },
+        {
+            label: "light guidance + full descriptions",
+            tokens: light.guidance.tokens + fullDescriptionTokens,
+            ceiling: RATIFIED_FULL_MUTABLE_PROSE_CEILING,
+        },
+        {
+            label: "light guidance + light descriptions",
+            tokens: light.mutableProseTotal,
+            ceiling: RATIFIED_LIGHT_MUTABLE_PROSE_CEILING,
+        },
+    ];
+    for (const state of servingMatrix) {
+        messages.push(`serving matrix ${state.label}: ${state.tokens}/${state.ceiling} tokens`);
+        if (state.tokens > state.ceiling) {
+            errors.push(`${state.label} total ${state.tokens} exceeds ceiling ${state.ceiling}`);
+        }
+    }
+
+    for (const path of options.ccLightAssetPaths ?? DEFAULT_CC_LIGHT_ASSET_PATHS) {
+        const measurement = measurePromptSurfaceText(readFileSync(resolve(path), "utf8"));
+        messages.push(`Claude Code light guidance ${path}: ${measurement.tokens} tokens`);
+        if (measurement.tokens > RATIFIED_LIGHT_MUTABLE_PROSE_CEILING) {
+            errors.push(
+                `Claude Code light guidance ${path} total ${measurement.tokens} exceeds ceiling ${RATIFIED_LIGHT_MUTABLE_PROSE_CEILING}`,
+            );
+        }
     }
 
     if (errors.length === 0) {
-        messages.unshift(`budget fixture matches source: baseline ${baseline}, ceiling ${expectedCeiling}`);
+        messages.unshift(
+            `budget fixture matches source: baseline ${baseline}, ratified light ceiling ${RATIFIED_LIGHT_MUTABLE_PROSE_CEILING}`,
+        );
     }
     return { errors, messages };
 }

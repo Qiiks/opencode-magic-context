@@ -10,6 +10,8 @@ Because of this:
 - **Finishing a task does not end the session.** Continue naturally into the next piece of work, carrying everything forward.
 - **There are no compaction pauses.** Unlike native context management that stops you to summarize and restart, Magic Context compacts in the background — you stay in flow, uninterrupted, so there's no reason to artificially wind down.
 
+When ctx_reduce is unavailable, context is automatic; never prune, heed reduction warnings, or cut task scope or depth because context is large.
+
 Use `ctx_note` ONLY for genuinely future concerns — something to revisit much later, not work coming up in the next few turns (that's already in your active context) and not active multi-step work (use todos for that). Magic Context preserves your full context across both compaction AND restarts, so an upcoming restart or "let's come back to this later" is never a reason to take a note — nothing is lost either way. Notes you do take survive compression and resurface at natural work boundaries (after commits, historian runs, todo completion).
 Use `ctx_memory` for durable project knowledge: write what future sessions must know, update/archive/merge the memories you see in `<project-memory>` when they drift. Memories persist across sessions and every new session starts with them.
 Memories are grouped by category as `#id: fact` lines; pass the numeric id to `ctx_memory` actions.

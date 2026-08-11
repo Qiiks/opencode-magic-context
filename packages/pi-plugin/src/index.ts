@@ -90,6 +90,7 @@ import {
 } from "@magic-context/core/shared/announcement";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { setHarness } from "@magic-context/core/shared/harness";
+import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import { setKeepSubagents } from "@magic-context/core/shared/keep-subagents";
 import { log } from "@magic-context/core/shared/logger";
 import {
@@ -276,6 +277,10 @@ export async function handlePiSessionBeforeCompact(args: {
 	return { cancel: true };
 }
 
+export function canonicalPiModelKey(provider: string, model: string): string {
+	return piModelRefToCanonical(`${provider}/${model}`);
+}
+
 export function persistPiMessageEndModelMeta(args: {
 	db: ContextDatabase;
 	sessionId: string;
@@ -297,7 +302,7 @@ export function persistPiMessageEndModelMeta(args: {
 	) {
 		return;
 	}
-	const modelKey = `${msg.provider}/${msg.model}`;
+	const modelKey = canonicalPiModelKey(msg.provider, msg.model);
 	recordPiLiveModel(args.sessionId, modelKey);
 	const cacheTtl = resolveCacheTtl(args.cacheTtlConfig, modelKey);
 	const currentMeta = getOrCreateSessionMeta(args.db, args.sessionId);
@@ -1716,7 +1721,10 @@ async function startPiMagicContextRuntime(
 				promptSurfaceModel.provider.length > 0 &&
 				typeof promptSurfaceModel.id === "string" &&
 				promptSurfaceModel.id.length > 0
-					? `${promptSurfaceModel.provider}/${promptSurfaceModel.id}`
+					? canonicalPiModelKey(
+							promptSurfaceModel.provider,
+							promptSurfaceModel.id,
+						)
 					: undefined;
 			const promptSurface = sessionId
 				? promptSurfaceGuidanceEpochs.resolve(

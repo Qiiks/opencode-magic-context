@@ -1,7 +1,13 @@
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 import { resolveCacheTtl } from "../hooks/magic-context/event-resolvers";
-import { modelKeyLookupOrder, resolvePromptSurface } from "./prompt-surface";
+import {
+    modelKeyLookupOrder,
+    promptSurfaceConfigIdentity,
+    resolvePromptSurface,
+} from "./prompt-surface";
 
 describe("prompt-surface resolution", () => {
     it("keeps cache_ttl and prompt-surface routing on the same lookup walk", () => {
@@ -11,6 +17,7 @@ describe("prompt-surface resolution", () => {
             "google/*": "light" as const,
             "CaseSensitive/model": "light" as const,
             "progressive/base": "light" as const,
+            "bare-model": "light" as const,
         };
         const cacheTtl = {
             default: "full",
@@ -26,6 +33,7 @@ describe("prompt-surface resolution", () => {
             ["casesensitive/model", "full"],
             ["CaseSensitive/model", "light"],
             ["progressive/base-extra", "light"],
+            ["provider/bare-model", "light"],
             ["unknown/model", "full"],
             [undefined, "full"],
         ] as const;
@@ -39,11 +47,50 @@ describe("prompt-surface resolution", () => {
         }
     });
 
-    it("applies exact, wildcard, then default precedence", () => {
+    it("derives a stable config identity independent of object key order", () => {
+        const left = promptSurfaceConfigIdentity({
+            default: "full",
+            models: { "provider/b": "light", "provider/a": "full" },
+            tool_descriptions: { ctx_search: "Search", ctx_note: "Note" },
+        });
+        const right = promptSurfaceConfigIdentity({
+            tool_descriptions: { ctx_note: "Note", ctx_search: "Search" },
+            models: { "provider/a": "full", "provider/b": "light" },
+            default: "full",
+        });
+        expect(left).toBe(right);
+        expect(
+            promptSurfaceConfigIdentity({ default: "light", models: { "provider/a": "full" } }),
+        ).not.toBe(right);
+    });
+
+    it("matches the Rust cache_ttl resolver over shared routing vectors", () => {
+        const vectors = JSON.parse(
+            readFileSync(
+                resolve(
+                    import.meta.dir,
+                    "../../../../crates/mc-module/testdata/cache-ttl-routing-vectors.json",
+                ),
+                "utf8",
+            ),
+        ) as {
+            default: string;
+            models: Record<string, string>;
+            cases: Array<{ name: string; modelKey: string; expected: string }>;
+        };
+        const config = { default: vectors.default, ...vectors.models };
+
+        for (const vector of vectors.cases) {
+            expect(resolveCacheTtl(config, vector.modelKey), vector.name).toBe(vector.expected);
+        }
+    });
+
+    it("applies exact, bare, wildcard, then default precedence", () => {
         const config = {
             default: "full" as const,
             models: {
                 "provider/model": "light" as const,
+                bare: "light" as const,
                 "provider/*": "full" as const,
             },
         };
@@ -51,6 +98,10 @@ describe("prompt-surface resolution", () => {
         expect(resolvePromptSurface(config, "provider/model")).toEqual({
             preset: "light",
             source: "exact",
+        });
+        expect(resolvePromptSurface(config, "provider/bare")).toEqual({
+            preset: "light",
+            source: "bare",
         });
         expect(resolvePromptSurface(config, "provider/other")).toEqual({
             preset: "full",

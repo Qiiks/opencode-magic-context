@@ -591,6 +591,10 @@ pub struct TransformRequest {
     /// coupling routing scope to the provider's opaque model identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_surface_model_key: Option<String>,
+    /// Stable identity of the live prompt-surface config used to coordinate guidance,
+    /// manifest, and transform selection across config reloads.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt_surface_config_identity: String,
     /// USER-tier top-level description replacements. IDs and schemas remain module-owned.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub prompt_surface_tool_descriptions: BTreeMap<String, String>,
@@ -730,6 +734,8 @@ struct TransformRequestWire {
     #[serde(default)]
     prompt_surface_model_key: Option<String>,
     #[serde(default)]
+    prompt_surface_config_identity: String,
+    #[serde(default)]
     prompt_surface_tool_descriptions: BTreeMap<String, String>,
     #[serde(default)]
     serve_native: bool,
@@ -813,6 +819,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             tool_present: wire.tool_present,
             prompt_surface_preset: wire.prompt_surface_preset,
             prompt_surface_model_key: wire.prompt_surface_model_key,
+            prompt_surface_config_identity: wire.prompt_surface_config_identity,
             prompt_surface_tool_descriptions: wire.prompt_surface_tool_descriptions,
             serve_native: wire.serve_native,
             native_messages: wire.native_messages,
@@ -4391,6 +4398,7 @@ fn prompt_surface_selection(req: &TransformRequest) -> PromptSurfaceSelection {
             .prompt_surface_model_key
             .clone()
             .or_else(|| req.model_key.clone()),
+        config_identity: req.prompt_surface_config_identity.clone(),
         preset: req.prompt_surface_preset,
         tool_descriptions: req.prompt_surface_tool_descriptions.clone(),
     }
@@ -10511,6 +10519,7 @@ pub(crate) mod tests {
             tool_present: false,
             prompt_surface_preset: PromptSurfacePreset::Full,
             prompt_surface_model_key: None,
+            prompt_surface_config_identity: String::new(),
             prompt_surface_tool_descriptions: BTreeMap::new(),
             serve_native: false,
             native_messages: None,
