@@ -95,9 +95,13 @@ function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
     return { safe: blockers.length === 0, blockers };
 }
 
+export function defaultSqliteExecutable(): string {
+    return process.env.MAGIC_CONTEXT_SQLITE3 ?? "sqlite3";
+}
+
 const DEFAULT_DEPS: RepairDbDeps = {
     now: () => new Date(),
-    sqliteExecutable: process.env.MAGIC_CONTEXT_SQLITE3 ?? "sqlite3",
+    sqliteExecutable: defaultSqliteExecutable(),
     inspectHolders: defaultInspectHolders,
 };
 
@@ -203,12 +207,31 @@ function sqliteError(result: ReturnType<typeof spawnSync>): string {
     return `sqlite3 exited with status ${String(result.status)}`;
 }
 
+// `.recover` reads raw database pages through the sqlite_dbpage virtual table.
+// That table is a compile-time option (SQLITE_ENABLE_DBPAGE_VTAB); a shell built
+// without it dies the moment `.recover` reaches for it, with one of the first two
+// errors below. Shells older than SQLite 3.29 have no `.recover` command at all
+// and answer "unknown command". All three mean THIS SQLITE3 LACKS A FEATURE, not
+// that the data is gone: the same database may salvage fine on a full build, so
+// the command must stop without claiming it is unsalvageable and without offering
+// the destructive reset. Kept deliberately narrow — a genuine data-level failure
+// of `.recover` must still reach the normal failure path.
+const RECOVER_UNAVAILABLE_PATTERNS = [
+    /no such table: sqlite_dbpage/i,
+    /no such module: sqlite_dbpage/i,
+    /unknown command[^\n]*\.recover/i,
+] as const;
+
+function isRecoverCapabilityMissing(errorDetail: string): boolean {
+    return RECOVER_UNAVAILABLE_PATTERNS.some((pattern) => pattern.test(errorDetail));
+}
+
 function runRecoverShell(
     sqliteExecutable: string,
     sourcePath: string,
     recoveredPath: string,
     dumpPath: string,
-): { ok: true } | { ok: false; detail: string; attempted: boolean } {
+): { ok: true } | { ok: false; detail: string; attempted: boolean; unavailable: boolean } {
     let dumpWriteFd: number | null = null;
     try {
         dumpWriteFd = openSync(dumpPath, "wx", 0o600);
@@ -220,10 +243,15 @@ function runRecoverShell(
         closeSync(dumpWriteFd);
         dumpWriteFd = null;
         if (recovered.error || recovered.status !== 0) {
+            const errorDetail = sqliteError(recovered);
+            const attempted = recovered.error === undefined;
             return {
                 ok: false,
-                detail: `.recover failed: ${sqliteError(recovered)}`,
-                attempted: recovered.error === undefined,
+                detail: `.recover failed: ${errorDetail}`,
+                attempted,
+                // Only a shell that actually ran can report a missing capability;
+                // a spawn failure is the could-not-start case, handled separately.
+                unavailable: attempted && isRecoverCapabilityMissing(errorDetail),
             };
         }
 
@@ -239,6 +267,9 @@ function runRecoverShell(
                     ok: false,
                     detail: `replaying .recover output failed: ${sqliteError(replayed)}`,
                     attempted: true,
+                    // The replay step only executes the SQL `.recover` emitted, so a
+                    // failure here is about the recovered data, never about the shell.
+                    unavailable: false,
                 };
             }
         } finally {
@@ -250,6 +281,7 @@ function runRecoverShell(
             ok: false,
             detail: error instanceof Error ? error.message : String(error),
             attempted: false,
+            unavailable: false,
         };
     } finally {
         if (dumpWriteFd !== null) closeSync(dumpWriteFd);
@@ -394,6 +426,9 @@ function printHelp(): void {
     console.log(
         "If salvage is impossible, an empty reset is offered with a separate confirmation.",
     );
+    console.log(
+        "Salvage needs a sqlite3 shell built with SQLITE_ENABLE_DBPAGE_VTAB; without one, the command backs up and stops without modifying the database.",
+    );
 }
 
 export async function runRepairDb(options: RunRepairDbOptions = {}): Promise<RepairDbExitCode> {
@@ -485,6 +520,26 @@ export async function runRepairDb(options: RunRepairDbOptions = {}): Promise<Rep
         prompts.log.info(`Database remains unchanged: ${dbPath}`);
         prompts.log.info(`Backup base: ${backup.basePath}`);
         prompts.outro("Database repair stopped before salvage could run");
+        return REPAIR_DB_EXIT.failed;
+    }
+    if (!salvage.ok && salvage.unavailable) {
+        // Same posture as the could-not-start branch above: no verdict about the
+        // DATA may be drawn from a tool that lacks a feature. The database stays
+        // untouched, the backup is named, and the destructive reset is never
+        // offered — exit code `failed`, not `unsalvageable`.
+        removeRecoveryBundle(recoveredPath);
+        const unavailableAfter = Object.fromEntries(
+            ROW_COUNT_TABLES.map((table) => [table, null]),
+        ) as RowCounts;
+        reportCounts(prompts, "AFTER", unavailableAfter);
+        reportSalvageRates(prompts, beforeCounts, unavailableAfter);
+        prompts.log.error(`SQLite .recover is unavailable on this machine: ${salvage.detail}`);
+        prompts.log.info(
+            "This sqlite3 was built without SQLITE_ENABLE_DBPAGE_VTAB, the compile-time option .recover needs. That is a limitation of the tool, not a verdict about your data: the database may be perfectly salvageable with a full sqlite3 build. Install the official SQLite command-line binary (sqlite.org/download.html) or a distro package built with SQLITE_ENABLE_DBPAGE_VTAB, then rerun this command. Reset was not offered because salvage did not run.",
+        );
+        prompts.log.info(`Database remains unchanged: ${dbPath}`);
+        prompts.log.info(`Backup base: ${backup.basePath}`);
+        prompts.outro("Database repair stopped: this sqlite3 cannot run .recover");
         return REPAIR_DB_EXIT.failed;
     }
     let salvageResult: SalvageResult;
