@@ -2345,6 +2345,16 @@ const MIGRATIONS: &[Migration] = &[
         END;
         "#,
     },
+    Migration {
+        version: 47,
+        // Keep a bounded per-pass scheduler history on the existing trace row. Accepted passes
+        // append through a write they already perform, so incident diagnostics gain arm/latch
+        // evidence without adding another hot-path statement or an unbounded event table.
+        statements: "
+        ALTER TABLE mc_pass_trace
+            ADD COLUMN scheduler_history TEXT NOT NULL DEFAULT '[]';
+        ",
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -2654,6 +2664,14 @@ impl Default for HistorianDurableState {
     }
 }
 
+/// One accepted pass in the bounded scheduler history attached to [`PassTrace`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassSchedulerObservation {
+    pub timestamp_ms: i64,
+    pub scheduler_decision: String,
+    pub drain_latch_active: bool,
+}
+
 /// Durable receive/complete/reject breadcrumbs for one session's transform passes.
 /// Stored separately from `mc_cache_state` so a rejected pass can still leave a readable
 /// trail without advancing the cache row_version.
@@ -2669,6 +2687,8 @@ pub struct PassTrace {
     pub first_divergence: Option<String>,
     /// JSON for the most recent diverging pass, including its accepted pass id and timestamp.
     pub last_divergence: Option<String>,
+    /// Oldest-to-newest bounded history of accepted scheduler decisions and latch state.
+    pub scheduler_history: Vec<PassSchedulerObservation>,
 }
 
 /// A validated historian fact that may become a project memory. Validation owns
@@ -3648,6 +3668,9 @@ pub struct TransformCommit<'a> {
     pub project_root: Option<&'a str>,
     /// Serialized first-divergence attribution to store with the accepted pass.
     pub first_divergence: Option<&'a str>,
+    /// Scheduler arm and updated drain-latch state for a real accepted transform pass.
+    /// Maintenance callers that reuse this transaction leave it absent.
+    pub scheduler_observation: Option<&'a PassSchedulerObservation>,
     pub overlays: TransformOverlayBatch<'a>,
 }
 
@@ -6815,7 +6838,7 @@ impl McStore {
                 .query_row(
                     "SELECT last_received_at_ms, last_completed_at_ms, last_reject_error,
                             last_reject_at_ms, reject_count, receive_count, first_divergence,
-                            last_divergence
+                            last_divergence, scheduler_history
                        FROM mc_pass_trace WHERE session_id = ?1",
                     params![session_id],
                     |row| {
@@ -6828,6 +6851,16 @@ impl McStore {
                             receive_count: row.get::<_, i64>(5)?.max(0) as u64,
                             first_divergence: row.get(6)?,
                             last_divergence: row.get(7)?,
+                            scheduler_history: serde_json::from_str(
+                                &row.get::<_, String>(8)?,
+                            )
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    8,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })?,
                         })
                     },
                 )
@@ -6876,7 +6909,13 @@ impl McStore {
     /// Clear the current-pass divergence for a successful stable transform. This is separate
     /// from `trace_pass_received` because direct module callers do not use the daemon receive
     /// hook, while daemon callers must not count the same pass twice.
-    pub fn trace_pass_stable(&self, session_id: &str, now_ms: i64) -> Result<(), McStoreError> {
+    pub fn trace_pass_stable(
+        &self,
+        session_id: &str,
+        observation: &PassSchedulerObservation,
+    ) -> Result<(), McStoreError> {
+        let observation_json = serde_json::to_string(observation)
+            .map_err(|error| McStoreError::Serde(error.to_string()))?;
         self.inner.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO mc_pass_trace (
@@ -6887,12 +6926,24 @@ impl McStore {
                      last_reject_at_ms,
                      reject_count,
                      receive_count,
-                     first_divergence
-                 ) VALUES (?1, 0, ?2, NULL, NULL, 0, 0, NULL)
+                     first_divergence,
+                     scheduler_history
+                 ) VALUES (?1, 0, ?2, NULL, NULL, 0, 0, NULL, json_array(json(?3)))
                  ON CONFLICT(session_id) DO UPDATE SET
                      first_divergence = NULL,
-                     last_completed_at_ms = excluded.last_completed_at_ms",
-                params![session_id, now_ms],
+                     last_completed_at_ms = excluded.last_completed_at_ms,
+                     scheduler_history = CASE
+                         WHEN json_array_length(mc_pass_trace.scheduler_history) < 256 THEN
+                             json_insert(mc_pass_trace.scheduler_history, '$[#]', json(?3))
+                         ELSE
+                             json_insert(
+                                 (SELECT json_group_array(json(value))
+                                    FROM json_each(mc_pass_trace.scheduler_history)
+                                   WHERE key >= json_array_length(mc_pass_trace.scheduler_history) - 255),
+                                 '$[#]', json(?3)
+                             )
+                     END",
+                params![session_id, observation.timestamp_ms, observation_json],
             )?;
             Ok(())
         })?;
@@ -6970,7 +7021,8 @@ impl McStore {
                      reject_count,
                      receive_count,
                      first_divergence,
-                     last_divergence
+                     last_divergence,
+                     scheduler_history
                    FROM mc_pass_trace
                  WHERE session_id = ?1",
                 params![session_id],
@@ -6984,10 +7036,57 @@ impl McStore {
                         receive_count: r.get::<_, i64>(5)? as u64,
                         first_divergence: r.get(6)?,
                         last_divergence: r.get(7)?,
+                        scheduler_history: serde_json::from_str(&r.get::<_, String>(8)?).map_err(
+                            |error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    8,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            },
+                        )?,
                     })
                 },
             )
             .optional()
+        })?)
+    }
+
+    /// Load accepted scheduler observations whose request timestamps fall in an inclusive range.
+    /// The JSON ring stays on the session row so appends reuse existing pass writes; `json_each`
+    /// makes the bounded records directly filterable during an incident.
+    pub fn load_pass_scheduler_history(
+        &self,
+        session_id: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<PassSchedulerObservation>, McStoreError> {
+        if start_ms > end_ms {
+            return Ok(Vec::new());
+        }
+        Ok(self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT history.value
+                   FROM mc_pass_trace AS trace,
+                        json_each(trace.scheduler_history) AS history
+                  WHERE trace.session_id = ?1
+                    AND CAST(json_extract(history.value, '$.timestamp_ms') AS INTEGER)
+                        BETWEEN ?2 AND ?3
+                  ORDER BY CAST(history.key AS INTEGER)",
+            )?;
+            let rows = statement
+                .query_map(params![session_id, start_ms, end_ms], |row| {
+                    let raw = row.get::<_, String>(0)?;
+                    serde_json::from_str(&raw).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
         })?)
     }
 
@@ -8372,6 +8471,7 @@ impl McStore {
                 compartment_max_seq: None,
                 project_root: None,
                 first_divergence: None,
+                scheduler_observation: None,
                 overlays: TransformOverlayBatch::default(),
             },
         )
@@ -8393,6 +8493,7 @@ impl McStore {
             compartment_max_seq,
             project_root,
             first_divergence,
+            scheduler_observation,
             overlays,
         } = request;
         let max_seen_ordinal = overlays
@@ -8426,6 +8527,10 @@ impl McStore {
             serde_json::to_string(core).map_err(|e| McStoreError::Serde(e.to_string()))?;
         let meta_json =
             serde_json::to_string(meta).map_err(|e| McStoreError::Serde(e.to_string()))?;
+        let scheduler_observation_json = scheduler_observation
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| McStoreError::Serde(error.to_string()))?;
         let next = expected.unwrap_or(0) + 1;
         let canonical_project_root = project_root
             .filter(|root| !root.is_empty())
@@ -8533,12 +8638,14 @@ impl McStore {
                      reject_count,
                      receive_count,
                      first_divergence,
-                     last_divergence
+                     last_divergence,
+                     scheduler_history
                  ) VALUES (
                      ?1, 0, 0, NULL, NULL, 0, 0, ?2,
                      CASE WHEN ?2 IS NOT NULL THEN
                          json_object('pass_id', ?3, 'timestamp_ms', ?4, 'divergence', json(?2))
-                     ELSE NULL END
+                     ELSE NULL END,
+                     CASE WHEN ?5 IS NOT NULL THEN json_array(json(?5)) ELSE '[]' END
                  )
                  ON CONFLICT(session_id) DO UPDATE SET
                      first_divergence = excluded.first_divergence,
@@ -8548,8 +8655,26 @@ impl McStore {
                               'timestamp_ms', ?4,
                               'divergence', json(excluded.first_divergence)
                           )
-                     ELSE mc_pass_trace.last_divergence END",
-                params![session_id, first_divergence, divergence_pass_id, divergence_at_ms],
+                     ELSE mc_pass_trace.last_divergence END,
+                     scheduler_history = CASE
+                         WHEN ?5 IS NULL THEN mc_pass_trace.scheduler_history
+                         WHEN json_array_length(mc_pass_trace.scheduler_history) < 256 THEN
+                             json_insert(mc_pass_trace.scheduler_history, '$[#]', json(?5))
+                         ELSE
+                             json_insert(
+                                 (SELECT json_group_array(json(value))
+                                    FROM json_each(mc_pass_trace.scheduler_history)
+                                   WHERE key >= json_array_length(mc_pass_trace.scheduler_history) - 255),
+                                 '$[#]', json(?5)
+                             )
+                     END",
+                params![
+                    session_id,
+                    first_divergence,
+                    divergence_pass_id,
+                    divergence_at_ms,
+                    scheduler_observation_json
+                ],
             )?;
             if let Some(project_root) = canonical_project_root.as_deref() {
                 // Durable root lineage is committed with the cache CAS, so a restart cannot
@@ -16450,7 +16575,10 @@ mod tests {
 
         assert!(store.delete_session("ses_delete", "/project").unwrap() >= 3);
         assert!(!store.has_cache_state("ses_delete").unwrap());
-        assert!(store.load_tags_for_session("ses_delete").unwrap().is_empty());
+        assert!(store
+            .load_tags_for_session("ses_delete")
+            .unwrap()
+            .is_empty());
         assert!(store
             .load_pending_agent_drops("ses_delete")
             .unwrap()
@@ -16581,6 +16709,7 @@ mod tests {
                         compartment_max_seq: None,
                         project_root: Some("/root-a"),
                         first_divergence: None,
+                        scheduler_observation: None,
                         overlays: TransformOverlayBatch {
                             created_at_ms: observed_at,
                             ..Default::default()
@@ -16652,6 +16781,7 @@ mod tests {
                     compartment_max_seq: None,
                     project_root: Some(link_text),
                     first_divergence: None,
+                    scheduler_observation: None,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -16720,6 +16850,7 @@ mod tests {
                     compartment_max_seq: None,
                     project_root: Some(missing_text),
                     first_divergence: None,
+                    scheduler_observation: None,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -16851,6 +16982,7 @@ mod tests {
                     compartment_max_seq: None,
                     project_root: None,
                     first_divergence: None,
+                    scheduler_observation: None,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
                         tag_mints: &tag_mints,
@@ -16929,6 +17061,7 @@ mod tests {
                     compartment_max_seq: None,
                     project_root: None,
                     first_divergence: None,
+                    scheduler_observation: None,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
                         tag_mints: &tags,
@@ -17079,6 +17212,7 @@ mod tests {
                     compartment_max_seq: None,
                     project_root: None,
                     first_divergence: None,
+                    scheduler_observation: None,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -17781,6 +17915,7 @@ mod tests {
                         compartment_max_seq: None,
                         project_root: None,
                         first_divergence: None,
+                        scheduler_observation: None,
                         overlays: TransformOverlayBatch {
                             max_seen_ordinal: Some(3),
                             temporal_marks: &temporal_marks,
@@ -17838,6 +17973,7 @@ mod tests {
                     compartment_max_seq: None,
                     project_root: None,
                     first_divergence: None,
+                    scheduler_observation: None,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(4),
                         temporal_marks: &late_mark,
@@ -18046,6 +18182,51 @@ mod tests {
         assert_eq!(trace.last_reject_at_ms, Some(22));
         assert_eq!(trace.reject_count, 2);
         assert_eq!(trace.receive_count, 2);
+
+        let defer = PassSchedulerObservation {
+            timestamp_ms: 32,
+            scheduler_decision: "Defer".to_string(),
+            drain_latch_active: false,
+        };
+        let force = PassSchedulerObservation {
+            timestamp_ms: 33,
+            scheduler_decision: "Force85".to_string(),
+            drain_latch_active: true,
+        };
+        store.trace_pass_stable("scheduler-trace", &defer).unwrap();
+        store.trace_pass_stable("scheduler-trace", &force).unwrap();
+        let scheduler_trace = store.load_pass_trace("scheduler-trace").unwrap().unwrap();
+        assert_eq!(
+            scheduler_trace.scheduler_history,
+            vec![defer, force.clone()]
+        );
+        assert_eq!(
+            store
+                .load_pass_scheduler_history("scheduler-trace", 33, 33)
+                .unwrap(),
+            vec![force]
+        );
+
+        for timestamp_ms in 0..=256 {
+            store
+                .trace_pass_stable(
+                    "bounded-scheduler-trace",
+                    &PassSchedulerObservation {
+                        timestamp_ms,
+                        scheduler_decision: "Execute".to_string(),
+                        drain_latch_active: false,
+                    },
+                )
+                .unwrap();
+        }
+        let bounded = store
+            .load_pass_trace("bounded-scheduler-trace")
+            .unwrap()
+            .unwrap()
+            .scheduler_history;
+        assert_eq!(bounded.len(), 256);
+        assert_eq!(bounded.first().unwrap().timestamp_ms, 1);
+        assert_eq!(bounded.last().unwrap().timestamp_ms, 256);
 
         store
             .trace_pass_rejected("trace-cap", &long_error, 41)
@@ -18447,7 +18628,7 @@ mod tests {
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=46).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=47).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -18504,6 +18685,18 @@ mod tests {
             })
             .unwrap();
         assert_eq!(fresh_has_table.as_deref(), Some("mc_pass_trace"));
+        let fresh_has_scheduler_history = fresh
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('mc_pass_trace')
+                      WHERE name = 'scheduler_history'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(fresh_has_scheduler_history, 1);
         let fresh_has_import_table = fresh
             .inner
             .with_conn(|conn| {
@@ -18624,6 +18817,18 @@ mod tests {
             })
             .unwrap();
         assert_eq!(migrated_has_table.as_deref(), Some("mc_pass_trace"));
+        let migrated_has_scheduler_history = migrated
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('mc_pass_trace')
+                      WHERE name = 'scheduler_history'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(migrated_has_scheduler_history, 1);
         let migrated_has_import_table = migrated
             .inner
             .with_conn(|conn| {
@@ -21839,7 +22044,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=46).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=47).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)

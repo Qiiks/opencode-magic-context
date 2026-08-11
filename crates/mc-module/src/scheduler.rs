@@ -220,6 +220,16 @@ impl PassDecision {
     fn is_force_or_emergency(self) -> bool {
         matches!(self, PassDecision::Force85 | PassDecision::Emergency95)
     }
+
+    /// Stable diagnostic label persisted with accepted pass telemetry.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PassDecision::Defer => "Defer",
+            PassDecision::Execute => "Execute",
+            PassDecision::Force85 => "Force85",
+            PassDecision::Emergency95 => "Emergency95",
+        }
+    }
 }
 
 /// Live-tail state computed by the caller from typed content blocks.
