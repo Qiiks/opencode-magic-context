@@ -13028,6 +13028,406 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn periodic_fold_cadence_batches_whole_age_sets_and_freezes_watermark_between_folds() {
+        // End-to-end periodic cadence for the age lane: a band-resident session (fill
+        // pinned above the execute threshold on EVERY pass) mints one new tool arc per
+        // pass and takes a fold bust every third pass. Between folds each pass must
+        // render byte-identically and leave the watermark frozen; at each fold the whole
+        // accumulated eligible batch must apply at once and the watermark must jump to
+        // that fold pass's tail ordinal. The pressure boot stamps the first watermark
+        // organically (an application opportunity with an empty batch), so no state is
+        // poked directly. A parallel no-pressure store renders the same message arrays
+        // as the byte-identity reference.
+        const SESSION: &str = "two-pass-periodic-cadence";
+        const TOTAL_PASSES: u64 = 9;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reference_dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let reference = store(reference_dir.path());
+        for target in [&s, &reference] {
+            target
+                .replace_compartments(SESSION, &[comp(1, 1, 1, "a", "SUMMARY")])
+                .unwrap();
+        }
+        let mut messages = vec![
+            item("a", 1, "covered head"),
+            assistant_tool_call("arc-call-0", 2, "arc-0"),
+            tool_result("arc-result-0", 3, "arc-0", "arc zero output"),
+        ];
+        let mut context = pctx("git:proj", "/nonexistent-docs", 0);
+        context.cache_ttl = "never".to_string();
+        let boot = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(boot.action, "HARD");
+        let reference_boot = transform(
+            &reference,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(reference_boot.action, "HARD");
+        assert_eq!(
+            canonical_output(boot.messages()),
+            canonical_output(reference_boot.messages()),
+            "a pressure boot must render the same bytes as a no-pressure boot"
+        );
+        assert_eq!(
+            s.load(SESSION).unwrap().meta.last_execute_ordinal,
+            3,
+            "the pressure boot is an application opportunity and stamps the boot tail"
+        );
+
+        let red_count = |target: &McStore| -> usize {
+            target
+                .load(SESSION)
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .filter(|unit| unit.key.starts_with("red:"))
+                .count()
+        };
+        let mut frozen_reds = red_count(&s);
+        let mut expected_watermark = 3u64;
+        let mut next_ordinal = 4u64;
+        let mut previous_bytes = canonical_output(boot.messages());
+        for pass in 1..=TOTAL_PASSES {
+            let fold = pass % 3 == 0;
+            if fold {
+                s.arm_soft_refresh(SESSION).unwrap();
+            }
+            messages.push(assistant_tool_call(
+                &format!("arc-call-{pass}"),
+                next_ordinal,
+                &format!("arc-{pass}"),
+            ));
+            next_ordinal += 1;
+            messages.push(tool_result(
+                &format!("arc-result-{pass}"),
+                next_ordinal,
+                &format!("arc-{pass}"),
+                &format!("arc {pass} output"),
+            ));
+            next_ordinal += 1;
+
+            let response = transform(
+                &s,
+                &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
+                &context,
+            )
+            .unwrap();
+            let reference_response = transform(
+                &reference,
+                &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
+                &context,
+            )
+            .unwrap();
+            let bytes = canonical_output(response.messages());
+            let reference_bytes = canonical_output(reference_response.messages());
+            if fold {
+                // (b) + (c): the whole accumulated eligible batch applies at once and the
+                // watermark jumps to this fold pass's tail ordinal.
+                assert_eq!(response.action, "SOFT", "fold pass {pass} must bust");
+                let fold_index = pass / 3;
+                let first_new = if fold_index == 1 {
+                    0
+                } else {
+                    3 * fold_index - 5
+                };
+                let last_new = 3 * fold_index - 3;
+                let loaded = s.load(SESSION).unwrap();
+                for arc_index in first_new..=last_new {
+                    for mid in [
+                        format!("arc-call-{arc_index}"),
+                        format!("arc-result-{arc_index}"),
+                    ] {
+                        assert!(
+                            frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_some(),
+                            "fold {fold_index} must apply the whole accumulated batch (arc {arc_index})"
+                        );
+                    }
+                }
+                for arc_index in (last_new + 1)..=pass {
+                    for mid in [
+                        format!("arc-call-{arc_index}"),
+                        format!("arc-result-{arc_index}"),
+                    ] {
+                        assert!(
+                            frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_none(),
+                            "fold {fold_index} must not reach arcs minted after the previous stamp (arc {arc_index})"
+                        );
+                    }
+                }
+                frozen_reds += 2 * usize::try_from(last_new - first_new + 1).unwrap();
+                assert_eq!(
+                    red_count(&s),
+                    frozen_reds,
+                    "fold pass {pass} must freeze exactly the accumulated batch"
+                );
+                assert_ne!(
+                    bytes, previous_bytes,
+                    "fold pass {pass} applies a non-empty batch and must change the render"
+                );
+                expected_watermark = next_ordinal - 1;
+            } else {
+                // (a) + (d): byte-identity and a frozen watermark on every non-riding pass.
+                assert_eq!(
+                    response.action, "SOFT+",
+                    "non-riding pass {pass} must stay defer-shaped"
+                );
+                assert_eq!(
+                    &bytes[..previous_bytes.len()],
+                    previous_bytes.as_slice(),
+                    "non-riding pass {pass} must preserve every previously rendered byte"
+                );
+                if pass < 3 {
+                    assert_eq!(
+                        bytes, reference_bytes,
+                        "non-riding pass {pass} must match the no-pressure render exactly"
+                    );
+                }
+                assert_eq!(
+                    &bytes[bytes.len() - 2..],
+                    &reference_bytes[reference_bytes.len() - 2..],
+                    "non-riding pass {pass} must render the freshly minted arc unreduced"
+                );
+                assert_eq!(
+                    red_count(&s),
+                    frozen_reds,
+                    "non-riding pass {pass} must not first-apply a reduction"
+                );
+            }
+            assert_eq!(
+                s.load(SESSION).unwrap().meta.last_execute_ordinal,
+                expected_watermark,
+                "pass {pass}: the watermark must be {expected_watermark}"
+            );
+            previous_bytes = bytes;
+        }
+        assert_eq!(
+            red_count(&reference),
+            0,
+            "the no-pressure reference must never reduce"
+        );
+    }
+
+    #[test]
+    fn force_band_admits_age_batch_and_advances_watermark_under_historian_veto() {
+        // An active historian vetoes the ordinary execute-band arm (queued work waits for
+        // the next materializing pass), but the veto must not reach the force band: a
+        // Force85/Emergency95 pass engages the emergency arm, which exempts the veto, so
+        // the waiting age batch is admitted and the watermark advances on that same pass.
+        // The aged arc is a T1 `read` and the fresh arc a T2 `edit`, each the only arc in
+        // its tier: the emergency tier selector reserves both (newest-20% per tier), so
+        // any freeze of the aged arc is uniquely the force-band age arm's work.
+        const SESSION: &str = "force-band-veto";
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments(SESSION, &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let mut messages = vec![
+            item("a", 1, "covered head"),
+            assistant_tool_call("aged-call", 2, "aged-read"),
+            tool_result("aged-result", 3, "aged-read", "aged eligible output"),
+        ];
+        let mut context = pctx("git:proj", "/nonexistent-docs", 0);
+        context.cache_ttl = "never".to_string();
+        let boot = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(boot.action, "HARD");
+
+        // Stamp the watermark over the aged arc with an empty riding opportunity.
+        s.arm_soft_refresh(SESSION).unwrap();
+        let stamp = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(stamp.action, "SOFT");
+        assert_eq!(s.load(SESSION).unwrap().meta.last_execute_ordinal, 3);
+
+        // Mint a fresh arc above the watermark; a low-usage defer cannot move it.
+        messages.push(assistant_edit_call("fresh-call", 4, "fresh-edit", "a.txt"));
+        messages.push(edit_result("fresh-result", 5, "fresh-edit", "fresh output"));
+        let minted = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(minted.action, "SOFT+");
+        assert_eq!(s.load(SESSION).unwrap().meta.last_execute_ordinal, 3);
+
+        // Queue a pending memory change: it reaches the rendered m1 memory block only
+        // when a bust materializes it, and an engaged veto defers that. The queued change
+        // therefore makes the veto itself observable on the ordinary pass below.
+        s.insert_memory(memory_input(
+            "git:proj",
+            "ARCHITECTURE",
+            "veto probe rule",
+            0,
+        ))
+        .unwrap();
+
+        let mut veto_ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        veto_ctx.cache_ttl = "never".to_string();
+        veto_ctx.historian_active = true;
+
+        // Ordinary execute under the historian veto: the veto engages (the m1 delta stays
+        // queued), the age batch is not admitted and the watermark stays frozen.
+        let ordinary = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
+            &veto_ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            ordinary.action, "SOFT+",
+            "the vetoed ordinary execute must stay defer-shaped"
+        );
+        assert!(
+            !m1_bytes(&ordinary).contains("veto probe rule"),
+            "the engaged historian veto must defer the queued m1 delta"
+        );
+        let loaded = s.load(SESSION).unwrap();
+        assert_eq!(
+            loaded.meta.last_execute_ordinal, 3,
+            "the vetoed ordinary pass must keep the watermark frozen"
+        );
+        assert!(frozen_red_payload(&loaded.core, "aged-call#0").is_none());
+        assert!(frozen_red_payload(&loaded.core, "aged-result#0").is_none());
+
+        // Force85 under the same active historian: the emergency arm bypasses the veto.
+        let force = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 90, 100),
+            &veto_ctx,
+        )
+        .unwrap();
+        assert_eq!(force.action, "SOFT");
+        assert!(
+            m1_bytes(&force).contains("veto probe rule"),
+            "the force pass busts and consumes the queued m1 delta"
+        );
+        let loaded = s.load(SESSION).unwrap();
+        assert!(
+            frozen_red_payload(&loaded.core, "aged-call#0").is_some(),
+            "the force-band edge must admit the waiting age batch despite the historian veto"
+        );
+        assert!(
+            frozen_red_payload(&loaded.core, "aged-result#0").is_some(),
+            "the admitted age batch drops the paired result"
+        );
+        assert!(
+            frozen_red_payload(&loaded.core, "fresh-call#0").is_none(),
+            "the fresh arc stays above the pre-pass watermark"
+        );
+        assert_eq!(
+            loaded.meta.last_execute_ordinal, 5,
+            "the force pass must advance the watermark on that same pass"
+        );
+    }
+
+    #[test]
+    fn injected_reductions_cannot_starve_or_convey_the_watermark() {
+        // The test-only injection seam replaces the native decision set AFTER selection,
+        // so the applied batch is never the native two-pass batch. The watermark must
+        // ignore the injected decisions entirely and follow the opportunity predicate:
+        // a riding pass advances it, a pressure-free pass keeps it frozen no matter how
+        // many injected reductions bust it.
+        const SESSION: &str = "injected-watermark";
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments(SESSION, &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let messages = vec![
+            item("a", 1, "covered head"),
+            assistant_tool_call("old-call", 2, "old"),
+            tool_result("old-result", 3, "old", "old eligible output"),
+            item("tail", 4, "stable tail"),
+        ];
+        let mut context = pctx("git:proj", "/nonexistent-docs", 0);
+        context.cache_ttl = "never".to_string();
+        let boot = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(boot.action, "HARD");
+        assert_eq!(
+            s.load(SESSION).unwrap().meta.last_execute_ordinal,
+            0,
+            "a no-pressure boot must not stamp the watermark"
+        );
+
+        // Riding pass under injection: the native batch (empty at a zero watermark) is
+        // replaced by the injected decision, yet the opportunity predicate still advances
+        // the watermark over the whole tail — injection cannot starve it.
+        s.arm_soft_refresh(SESSION).unwrap();
+        let mut riding_ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        riding_ctx.cache_ttl = "never".to_string();
+        riding_ctx.injected_reductions =
+            with_reductions(vec![reduce("old-result", "drop", "[dropped]")]);
+        let riding = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
+            &riding_ctx,
+        )
+        .unwrap();
+        assert_eq!(riding.action, "SOFT");
+        let loaded = s.load(SESSION).unwrap();
+        assert_eq!(
+            frozen_red_payload(&loaded.core, "old-result#0"),
+            Some("[dropped]"),
+            "the injected decision must be the applied one"
+        );
+        assert!(
+            frozen_red_payload(&loaded.core, "old-call#0").is_none(),
+            "the native decision set was replaced, not extended"
+        );
+        assert_eq!(
+            loaded.meta.last_execute_ordinal, 4,
+            "the riding opportunity must advance the watermark despite the injection"
+        );
+
+        // Defer under injection: the injected reduction forces a bust, but without
+        // pressure there is no opportunity — injection cannot convey the watermark.
+        let mut defer_ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        defer_ctx.cache_ttl = "never".to_string();
+        defer_ctx.injected_reductions =
+            with_reductions(vec![reduce("old-call", "drop", "[dropped]")]);
+        let deferred = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages), 10, 100),
+            &defer_ctx,
+        )
+        .unwrap();
+        assert_eq!(deferred.action, "SOFT");
+        let loaded = s.load(SESSION).unwrap();
+        assert!(
+            frozen_red_payload(&loaded.core, "old-call#0").is_some(),
+            "the injected decision applies on the defer-forced bust"
+        );
+        assert_eq!(
+            loaded.meta.last_execute_ordinal, 4,
+            "a pressure-free injection bust must not convey the watermark"
+        );
+    }
+
+    #[test]
     fn pure_defer_with_scheduler_fields_present_keeps_row_version_stable() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -24175,7 +24575,10 @@ pub(crate) mod tests {
             fake_compaction_messages("2026-08-06", &summary),
         );
         let first = run(&store, &descent, &spine());
-        assert_eq!(first.lineage_descent_disposition.as_deref(), Some("descended"));
+        assert_eq!(
+            first.lineage_descent_disposition.as_deref(),
+            Some("descended")
+        );
         assert_eq!(first.ordinal_continuation_base, Some(10));
 
         // The successor runs on: the historian folds messages past the seam,
@@ -24204,7 +24607,11 @@ pub(crate) mod tests {
         follow_up_messages.push(item("succ-13", 13, "successor turn thirteen"));
         follow_up_messages.push(item("succ-14", 14, "successor turn fourteen"));
         let follow_up = req("B", "descent-cfg", follow_up_messages);
-        let outcome = transform(&store, &follow_up, &pctx("git:proj", "/nonexistent-docs", 0));
+        let outcome = transform(
+            &store,
+            &follow_up,
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        );
         assert!(
             outcome.is_ok(),
             "post-descent fold past the seam must not fence: {:?}",
@@ -24292,7 +24699,10 @@ pub(crate) mod tests {
             fake_compaction_messages("2026-08-06", &summary),
         );
         let first = run(&store, &descent, &spine());
-        assert_eq!(first.lineage_descent_disposition.as_deref(), Some("descended"));
+        assert_eq!(
+            first.lineage_descent_disposition.as_deref(),
+            Some("descended")
+        );
 
         // Follow-up pass whose head message is synthetic-marked; the anchor
         // stays the first NON-synthetic message.
@@ -24313,7 +24723,11 @@ pub(crate) mod tests {
         ];
         follow_up_messages.push(item("succ-13", 13, "successor turn thirteen"));
         let follow_up = req("B", "descent-cfg", follow_up_messages);
-        let outcome = transform(&store, &follow_up, &pctx("git:proj", "/nonexistent-docs", 0));
+        let outcome = transform(
+            &store,
+            &follow_up,
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        );
         assert!(
             outcome.is_ok(),
             "synthetic head must not fail the anchor gate: {:?}",
