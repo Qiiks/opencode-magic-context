@@ -29,9 +29,13 @@ import {
     type ClassifyPromptMemory,
     parseClassifyManifest,
 } from "./classify-prompt";
-import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
+import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
 import { getModuleMemoryIdentities } from "./module-apply";
+import {
+    DreamerProviderOutputFailureError,
+    providerOutputFailureFromInvalidManifest,
+} from "./provider-output-failure";
 
 /**
  * classify-memories: a NON-agentic single-shot transform. Scores each project
@@ -100,6 +104,7 @@ export interface ClassifyArgs {
     holderId: string;
     leaseKey: string;
     deadline: number;
+    leaseAcquisition?: LeaseAcquisition;
     model?: string;
     fallbackModels?: readonly string[];
     /** Present only for rust-mode projects whose memories authority is MODULE. */
@@ -276,8 +281,12 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
     }
 
     const abortController = new AbortController();
-    const heartbeat = startLeaseHeartbeat(args.db, args.holderId, args.leaseKey, () =>
-        abortController.abort(),
+    const heartbeat = startLeaseHeartbeat(
+        args.db,
+        args.holderId,
+        args.leaseKey,
+        () => abortController.abort(),
+        args.leaseAcquisition,
     );
 
     try {
@@ -381,7 +390,16 @@ async function classifyOneChunk(
                     }
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("classify returned no output");
-                    parseClassifyManifest(text);
+                    try {
+                        parseClassifyManifest(text);
+                    } catch (error) {
+                        const providerFailure = providerOutputFailureFromInvalidManifest(
+                            messages,
+                            text,
+                        );
+                        if (providerFailure) throw providerFailure;
+                        throw error;
+                    }
                     return text;
                 },
             },
@@ -404,7 +422,8 @@ async function classifyOneChunk(
         // A MODULE-authority failure is not safe to downgrade to the guarded
         // TypeScript child path. Surface it so the scheduler records a
         // transient failure and retries the same task instead.
-        if (moduleRoute || signal.aborted) throw failure;
+        if (moduleRoute || signal.aborted || failure instanceof DreamerProviderOutputFailureError)
+            throw failure;
         return { classified: 0, changed: 0 };
     } finally {
         // Delete on success AND failure (the failed child still holds the

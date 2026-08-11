@@ -53,6 +53,14 @@ Rules:
 - Every memory in the pool below MUST appear exactly once.
 - importance is an integer 1-100; scope is one of project|ecosystem|universe; shareable is true|false."#;
 
+/// Cheap producer-chain guard for completions that succeeded at the transport
+/// layer but did not return even a classify manifest envelope. The TypeScript
+/// host remains responsible for XML parsing, membership checks, and field validation.
+pub fn has_manifest_envelope(text: &str) -> bool {
+    let text = text.trim();
+    text.contains("<classify>") && text.contains("</classify>")
+}
+
 /// Mint an opaque child id without exposing the command id or project path in
 /// provider/session diagnostics. The registry, rather than this prefix, is the
 /// transform exemption authority.
@@ -81,6 +89,14 @@ fn hex_prefix(bytes: &[u8], count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_envelope_rejects_provider_outage_text() {
+        assert!(!has_manifest_envelope("All Antigravity endpoints failed"));
+        assert!(has_manifest_envelope(
+            "<classify><memory id=\"1\"/></classify>"
+        ));
+    }
 
     #[test]
     fn child_ids_are_stable_but_lineage_scoped() {

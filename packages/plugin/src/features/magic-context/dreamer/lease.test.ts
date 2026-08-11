@@ -11,6 +11,7 @@ import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import {
     acquireLease,
+    acquireLeaseWithAcquisition,
     DREAMING_LEASE_KEY,
     getLeaseHolder,
     isLeaseActive,
@@ -288,6 +289,39 @@ describe("startLeaseHeartbeat", () => {
 
             expect(hb.lost).toBe(true);
             expect(lostReason).toContain("past TTL");
+            hb.stop();
+        } finally {
+            nowSpy.mockRestore();
+            closeQuietly(db);
+        }
+    });
+
+    it("uses acquisition time and generation across a pre-heartbeat interloper gap", () => {
+        const db = makeDb();
+        const realNow = Date.now();
+        const clock = { value: realNow };
+        const nowSpy = spyOn(Date, "now").mockImplementation(() => clock.value);
+        try {
+            const acquisition = acquireLeaseWithAcquisition(db, "holder-a");
+            expect(acquisition).not.toBeNull();
+            clock.value = realNow + 3 * 60 * 1_000;
+            expect(acquireLease(db, "holder-b")).toBe(true);
+            releaseLease(db, "holder-b");
+            let lostReason: string | null = null;
+
+            const hb = startLeaseHeartbeat(
+                db,
+                "holder-a",
+                DREAMING_LEASE_KEY,
+                (reason) => {
+                    lostReason = reason;
+                },
+                acquisition ?? undefined,
+            );
+
+            expect(hb.lost).toBe(true);
+            expect(lostReason).toContain("generation changed");
+            expect(getLeaseHolder(db)).toBeNull();
             hb.stop();
         } finally {
             nowSpy.mockRestore();

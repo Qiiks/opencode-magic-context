@@ -18,7 +18,6 @@ import { log } from "../../../shared/logger";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { getCompartmentEvents } from "../compartment-events";
-import { getContextStoreUuid } from "../context-authority";
 import {
     getMemoriesByProject,
     getMemoryCountsByStatus,
@@ -29,9 +28,15 @@ import { runCompressCues } from "../mural/compress-cues";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
 import { getActiveUserMemories } from "../user-memory/storage-user-memory";
-import { type ClassifyModuleClient, ClassifyModuleFailureError, runClassify } from "./classify";
+import { type ClassifyModuleClient, runClassify } from "./classify";
 import { evaluateSmartNotes } from "./evaluate-smart-notes";
-import { runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
+import {
+    acquireLeaseWithAcquisition,
+    type LeaseAcquisition,
+    leaseOwnershipMatches,
+    runLeaseGuardedWrite,
+    startLeaseHeartbeat,
+} from "./lease";
 import {
     enforceMaintainDocsProtectedRegions,
     snapshotMaintainDocsFiles,
@@ -78,7 +83,12 @@ import {
     type DreamTaskRunBacklog,
     processedDreamTaskItems,
 } from "./task-registry";
-import type { DreamTaskRuntimeConfig, TaskExecOutcome, TaskExecutor } from "./task-scheduler";
+import type {
+    DreamTaskRuntimeConfig,
+    TaskExecOutcome,
+    TaskExecutor,
+    TaskExecutorContext,
+} from "./task-scheduler";
 import { runVerify } from "./verify";
 
 export interface DreamTaskExecutorDeps {
@@ -219,10 +229,16 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
 
     return async (
         config: DreamTaskRuntimeConfig,
-        ctx: { db: Database; projectIdentity: string; holderId: string; leaseKey: string },
+        ctx: TaskExecutorContext,
     ): Promise<TaskExecOutcome> => {
         const { db, projectIdentity, holderId, leaseKey } = ctx;
         const startedAt = Date.now();
+        const leaseAcquisition: LeaseAcquisition =
+            ctx.leaseAcquisition ??
+            acquireLeaseWithAcquisition(db, holderId, leaseKey) ??
+            (() => {
+                throw new Error("Dream lease unavailable during executor setup");
+            })();
         const deadline = startedAt + config.timeoutMinutes * 60 * 1000;
         const backlogAtStart = getDreamTaskBacklog(db, projectIdentity, config.task);
         const reportProgress = (processed: number): void => {
@@ -243,6 +259,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         if (
             config.task === "map-memories" ||
             config.task === "compress-cues" ||
+            config.task === "classify-memories" ||
             config.task === "verify" ||
             config.task === "verify-broad" ||
             config.task === "retrospective"
@@ -259,6 +276,9 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             } catch (error) {
                 throw new DreamerModuleFailureError("authority.status", error);
             }
+        }
+        if (!leaseOwnershipMatches(db, holderId, leaseAcquisition.generation, leaseKey)) {
+            throw new Error("Dream lease lost during executor setup");
         }
 
         const recordRun = (
@@ -361,6 +381,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     holderId,
                     leaseKey,
                     deadline,
+                    leaseAcquisition,
                     model: config.model ?? deps.mural.model ?? deps.dreamerModel,
                     fallbackModels: config.fallbackModels,
                     moduleRoute,
@@ -387,6 +408,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     holderId,
                     leaseKey,
                     deadline,
+                    leaseAcquisition,
                     promotionThreshold: config.promotionThreshold ?? 3,
                     model: config.model,
                     fallbackModels: config.fallbackModels,
@@ -409,6 +431,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     holderId,
                     leaseKey,
                     deadline,
+                    leaseAcquisition,
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     moduleRoute,
@@ -437,6 +460,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     holderId,
                     leaseKey,
                     deadline,
+                    leaseAcquisition,
                     forceBroad: config.task === "verify-broad",
                     model: config.model,
                     fallbackModels: config.fallbackModels,
@@ -495,45 +519,15 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                           | "moduleCommandId"
                       >
                     | undefined;
-                const moduleTransport = deps.transformMode === "ts" ? undefined : deps.moduleClient;
-                if (moduleTransport?.authorityStatus) {
-                    const contextStoreUuid = getContextStoreUuid(db);
-                    if (!contextStoreUuid) {
-                        throw new Error("Rust classify requires a context store identity");
-                    }
-                    let authority: {
-                        authority: { state?: string; generation?: number } | null;
+                if (moduleRoute) {
+                    moduleArgs = {
+                        moduleClient: moduleRoute.moduleClient,
+                        moduleSessionId: moduleRoute.moduleSessionId,
+                        moduleProjectRoot: moduleRoute.moduleProjectRoot,
+                        moduleContextStoreUuid: moduleRoute.moduleContextStoreUuid,
+                        moduleAuthorityGeneration: moduleRoute.moduleAuthorityGeneration,
+                        moduleCommandId: moduleRoute.moduleCommandId,
                     };
-                    try {
-                        authority = await moduleTransport.authorityStatus({
-                            context_store_uuid: contextStoreUuid,
-                            project: projectIdentity,
-                            projectRoot: deps.sessionDirectory,
-                            domain: "memories",
-                        });
-                    } catch (error) {
-                        throw new ClassifyModuleFailureError("authority.status", error);
-                    }
-                    if (authority.authority?.state === "MODULE") {
-                        const generation = authority.authority.generation;
-                        if (typeof generation !== "number") {
-                            throw new ClassifyModuleFailureError(
-                                "authority.status",
-                                new Error("response omitted generation"),
-                            );
-                        }
-                        const moduleClient: ClassifyModuleClient = {
-                            call: (callArgs) => moduleTransport.call(callArgs),
-                        };
-                        moduleArgs = {
-                            moduleClient,
-                            moduleSessionId: projectIdentity,
-                            moduleProjectRoot: deps.sessionDirectory,
-                            moduleContextStoreUuid: contextStoreUuid,
-                            moduleAuthorityGeneration: generation,
-                            moduleCommandId: `${startedAt}:${holderId}`,
-                        };
-                    }
                 }
                 const result = await runClassify({
                     db,
@@ -544,6 +538,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     holderId,
                     leaseKey,
                     deadline,
+                    leaseAcquisition,
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     ...moduleArgs,
@@ -570,6 +565,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     holderId,
                     leaseKey,
                     deadline,
+                    leaseAcquisition,
                     promotionThreshold: config.promotionThreshold ?? 2,
                     ensureProjectRegistered: deps.ensureProjectRegistered,
                 });
@@ -590,6 +586,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     holderId,
                     leaseKey,
                     deadline,
+                    leaseAcquisition,
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
@@ -613,6 +610,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     holderId,
                     leaseKey,
                     deadline,
+                    leaseAcquisition,
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     retinaHandoff: deps.retinaHandoff,
@@ -802,7 +800,7 @@ function retrospectiveEventsForSessions(
 
 async function runRetrospectiveTask(
     config: DreamTaskRuntimeConfig,
-    ctx: { db: Database; projectIdentity: string; holderId: string; leaseKey: string },
+    ctx: TaskExecutorContext,
     helpers: {
         deps: DreamTaskExecutorDeps;
         deadline: number;
@@ -851,10 +849,16 @@ async function runRetrospectiveTask(
 
     const abortController = new AbortController();
     let leaseLost = false;
-    const heartbeat = startLeaseHeartbeat(db, holderId, leaseKey, () => {
-        leaseLost = true;
-        abortController.abort();
-    });
+    const heartbeat = startLeaseHeartbeat(
+        db,
+        holderId,
+        leaseKey,
+        () => {
+            leaseLost = true;
+            abortController.abort();
+        },
+        ctx.leaseAcquisition,
+    );
 
     let childSessionId: string | null = null;
     try {
@@ -1083,7 +1087,7 @@ async function runRetrospectiveTask(
  *  with lease renewal → abort-on-loss and maintain-docs protected-region enforce. */
 async function runAgenticTask(
     config: DreamTaskRuntimeConfig,
-    ctx: { db: Database; projectIdentity: string; holderId: string; leaseKey: string },
+    ctx: TaskExecutorContext,
     helpers: {
         deps: DreamTaskExecutorDeps;
         deadline: number;
@@ -1147,10 +1151,16 @@ async function runAgenticTask(
 
     const abortController = new AbortController();
     let leaseLost = false;
-    const heartbeat = startLeaseHeartbeat(db, holderId, leaseKey, () => {
-        leaseLost = true;
-        abortController.abort();
-    });
+    const heartbeat = startLeaseHeartbeat(
+        db,
+        holderId,
+        leaseKey,
+        () => {
+            leaseLost = true;
+            abortController.abort();
+        },
+        ctx.leaseAcquisition,
+    );
 
     let childSessionId: string | null = null;
     try {

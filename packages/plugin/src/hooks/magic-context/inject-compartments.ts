@@ -730,6 +730,8 @@ export interface M0SnapshotMarkers {
     projectIdentity?: string | null;
     /** Hash of the image identity folded into this m0 baseline. */
     muralHash?: string | null;
+    muralEnabled: boolean;
+    renderBudgetIdentity: string;
 }
 
 /**
@@ -884,6 +886,10 @@ function lastCompartmentBoundaryId(compartments: readonly M0Compartment[]): stri
 
 const DEFAULT_HISTORY_BUDGET_TOKENS = 60_000;
 export const DEFAULT_MEMORY_BUDGET_TOKENS = 8_000;
+
+function renderBudgetIdentity(memoryBudget?: number, historyBudget?: number): string {
+    return `m${memoryBudget ?? DEFAULT_MEMORY_BUDGET_TOKENS}-h${historyBudget ?? DEFAULT_HISTORY_BUDGET_TOKENS}`;
+}
 
 export const DEFAULT_USER_PROFILE_BUDGET_TOKENS = 4_000;
 const MAX_FORCED_MEMORIES_PER_DELTA = 10;
@@ -1106,6 +1112,9 @@ interface M0SnapshotMarkerReadArgs {
     projectPath?: string;
     projectDirectory?: string;
     injectDocs?: boolean;
+    muralEnabled?: boolean;
+    memoryInjectionBudgetTokens?: number;
+    historyBudgetTokens?: number;
     hardSignals?: M0HardSignals;
     workspaceIdentitySet?: WorkspaceIdentitySet;
 }
@@ -1347,6 +1356,11 @@ function readCurrentM0SnapshotMarkersUncached(args: M0SnapshotMarkerReadArgs): {
             systemHash: hard.systemHash,
             modelKey: hard.modelKey,
             projectIdentity: args.projectPath ?? null,
+            muralEnabled: args.muralEnabled === true,
+            renderBudgetIdentity: renderBudgetIdentity(
+                args.memoryInjectionBudgetTokens,
+                args.historyBudgetTokens,
+            ),
         },
     };
 }
@@ -1367,6 +1381,11 @@ function refreshVolatileMarkerInputs(
         systemHash: hard.systemHash,
         modelKey: hard.modelKey,
         projectIdentity: args.projectPath ?? null,
+        muralEnabled: args.muralEnabled === true,
+        renderBudgetIdentity: renderBudgetIdentity(
+            args.memoryInjectionBudgetTokens,
+            args.historyBudgetTokens,
+        ),
     };
 }
 
@@ -1446,6 +1465,8 @@ function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null
         modelKey: state.cachedM0ModelKey ?? "",
         projectIdentity: state.cachedM0ProjectIdentity ?? null,
         muralHash: state.cachedM0MuralHash ?? null,
+        muralEnabled: cachedUpgradeIdentity.muralEnabled ?? false,
+        renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity ?? "",
     };
 }
 
@@ -1474,6 +1495,9 @@ export function mustMaterialize(args: {
     hardSignals?: M0HardSignals;
     workspaceIdentitySet?: WorkspaceIdentitySet;
     injectDocs?: boolean;
+    muralEnabled?: boolean;
+    memoryInjectionBudgetTokens?: number;
+    historyBudgetTokens?: number;
 }): MaterializeDecision {
     if (!args.state.cachedM0Bytes) return { value: true, reason: "first_render" };
     if (!args.state.cachedM1Bytes) return { value: true, reason: "cached_m1_missing" };
@@ -1488,6 +1512,12 @@ export function mustMaterialize(args: {
     // mix with a stale baseline. Persisting the new component consumes this trigger.
     if (cachedUpgradeIdentity.compartmentRenderEpoch !== current.compartmentRenderEpoch) {
         return { value: true, reason: "compartment_render_epoch" };
+    }
+    if (
+        cachedUpgradeIdentity.muralEnabled !== current.muralEnabled ||
+        cachedUpgradeIdentity.renderBudgetIdentity !== current.renderBudgetIdentity
+    ) {
+        return { value: true, reason: "render_config" };
     }
 
     // ── HARD: provider-side cache eviction (the cache was already dead) ──
@@ -1981,6 +2011,8 @@ function applyMarkersToState(
     state.cachedM0UpgradeState = encodeCachedM0UpgradeIdentity(
         markers.upgradeState,
         markers.compartmentRenderEpoch,
+        markers.muralEnabled,
+        markers.renderBudgetIdentity,
     );
     // HARD-bust markers must be mirrored into the flat state fields too: the next
     // pass's mustMaterialize reads state.cachedM0SystemHash/ModelKey
@@ -2063,6 +2095,9 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             projectPath,
             projectDirectory,
             injectDocs: options.injectDocs,
+            muralEnabled: options.muralEnabled,
+            memoryInjectionBudgetTokens: options.memoryInjectionBudgetTokens,
+            historyBudgetTokens: options.historyBudgetTokens,
             hardSignals: options.hardSignals,
             workspaceIdentitySet: {
                 identities: workspace.identities,
@@ -2231,6 +2266,8 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             systemHash: snapshotMarkers.systemHash,
             modelKey: snapshotMarkers.modelKey,
             projectIdentity: projectPath ?? null,
+            muralEnabled: snapshotMarkers.muralEnabled,
+            renderBudgetIdentity: snapshotMarkers.renderBudgetIdentity,
         };
         // NOTE: maxMemoryId is deliberately EXCLUDED from this stale-check.
         // Additive memory writes (write/promote) do not invalidate the rendered
@@ -2290,6 +2327,8 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             upgradeState: encodeCachedM0UpgradeIdentity(
                 snapshotMarkers.upgradeState,
                 snapshotMarkers.compartmentRenderEpoch,
+                snapshotMarkers.muralEnabled,
+                snapshotMarkers.renderBudgetIdentity,
             ),
             systemHash: snapshotMarkers.systemHash,
             modelKey: snapshotMarkers.modelKey,
@@ -2686,6 +2725,8 @@ function markersFromCachedRow(row: CachedM0M1Row): M0SnapshotMarkers | null {
         modelKey: row.cached_m0_model_key ?? "",
         projectIdentity: row.cached_m0_project_identity ?? null,
         muralHash: row.cached_m0_mural_hash ?? null,
+        muralEnabled: cachedUpgradeIdentity.muralEnabled ?? false,
+        renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity ?? "",
     };
 }
 
@@ -2736,6 +2777,8 @@ function applyCachedRowToState(state: M0M1State, row: CachedM0M1Row): void {
     state.cachedM0UpgradeState = encodeCachedM0UpgradeIdentity(
         markers.upgradeState,
         markers.compartmentRenderEpoch,
+        markers.muralEnabled,
+        markers.renderBudgetIdentity,
     );
     state.cachedM0SystemHash = markers.systemHash;
     state.cachedM0ModelKey = markers.modelKey;
@@ -2889,6 +2932,10 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
         projectPath,
         projectDirectory,
         injectDocs: options.injectDocs,
+        muralEnabled: options.muralEnabled,
+        memoryInjectionBudgetTokens: options.memoryInjectionBudgetTokens,
+        historyBudgetTokens: options.historyBudgetTokens,
+        hardSignals: options.hardSignals,
         workspaceIdentitySet: {
             identities: workspace.identities,
             namesByIdentity: workspace.namesByIdentity,
@@ -3034,6 +3081,9 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
         hardSignals: options.hardSignals,
         workspaceIdentitySet: options.workspaceIdentitySet,
         injectDocs: options.injectDocs,
+        muralEnabled: options.muralEnabled,
+        memoryInjectionBudgetTokens: options.memoryInjectionBudgetTokens,
+        historyBudgetTokens: options.historyBudgetTokens,
     });
     let rematerialized = false;
     let contentionExhausted = false;

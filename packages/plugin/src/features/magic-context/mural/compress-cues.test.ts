@@ -104,6 +104,33 @@ function invalidOutputCueClient(onPrompt?: () => void) {
     };
 }
 
+function providerFailureCueClient(onPrompt?: () => void) {
+    return {
+        session: {
+            create: async () => ({ data: { id: "cue-child" } }),
+            prompt: async () => {
+                onPrompt?.();
+                return {};
+            },
+            messages: async () => ({
+                data: [
+                    {
+                        info: {
+                            role: "assistant",
+                            time: { created: Date.now() },
+                            finish: "stop",
+                            error: null,
+                            tokens: { output: 8, reasoning: 0 },
+                        },
+                        parts: [{ type: "text", text: "All Antigravity endpoints failed" }],
+                    },
+                ],
+            }),
+            delete: async () => ({}),
+        },
+    };
+}
+
 function freshDb(): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
@@ -267,6 +294,46 @@ describe("runCompressCues disposition", () => {
             expect(result.compressed).toBe(0);
             expect(result.remaining).toBe(120);
             expect(result.complete).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("provider-outage completion aborts remaining chunks after the model ladder", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:cues-provider-outage";
+            for (let index = 0; index < 120; index += 1) {
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content: `Cue outage fact ${index}.`,
+                    sourceSessionId: "ses",
+                });
+            }
+            const args = cueArgs(db, projectIdentity);
+            let promptCalls = 0;
+            args.client = providerFailureCueClient(() => {
+                promptCalls += 1;
+            }) as never;
+            args.fallbackModels = ["provider/fallback-one", "provider/fallback-two"];
+
+            let thrown: unknown;
+            try {
+                await runCompressCues(args);
+            } catch (error) {
+                thrown = error;
+            }
+
+            expect(String(thrown)).toContain("provider-outage completion");
+            expect(promptCalls).toBe(3);
+            expect(
+                db
+                    .prepare(
+                        "SELECT COUNT(*) AS count FROM memories WHERE project_path = ? AND mural_cue IS NOT NULL",
+                    )
+                    .get(projectIdentity),
+            ).toEqual({ count: 0 });
         } finally {
             closeQuietly(db);
         }

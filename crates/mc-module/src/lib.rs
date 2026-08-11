@@ -81,7 +81,7 @@ use subc_client_rs::{
 
 use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
 use classify::{
-    child_session_id, CLASSIFY_AWAIT_TIMEOUT, CLASSIFY_MAX_OUTPUT_TOKENS,
+    child_session_id, has_manifest_envelope, CLASSIFY_AWAIT_TIMEOUT, CLASSIFY_MAX_OUTPUT_TOKENS,
     CLASSIFY_RECOVERY_TIMEOUT, CLASSIFY_SYSTEM_PROMPT, CLASSIFY_TASK, CLASSIFY_TEMPERATURE,
     MAX_CLASSIFY_PROMPT_BYTES,
 };
@@ -8128,13 +8128,17 @@ impl McHandler {
                 Err(error) => Err(error),
             };
             match attempt_output {
-                Ok(result) => {
-                    // The module never parses manifests. A capped result is still returned
-                    // with truncated=true so the host's fail-closed parser remains the
-                    // authority for output validity.
+                Ok(result) if has_manifest_envelope(&result.text) => {
+                    // The module checks only for the task-specific envelope. Even if the
+                    // output limit truncated a result, this layer accepts it when the
+                    // envelope remains; the host parser rejects malformed contents.
                     output = Some((model.clone(), result));
                     producer.purge_session(&child_session).await;
                     break;
+                }
+                Ok(_) => {
+                    last_error =
+                        "classify producer returned no classify manifest envelope".to_string();
                 }
                 Err(error) => last_error = error.to_string(),
             }
@@ -19269,6 +19273,61 @@ mod tests {
             store.pull_changefeed("notes", 0, 100).unwrap().next_cursor,
             note_head
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_advances_model_chain_after_outage_text() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .await_results
+            .lock()
+            .expect("await results mutex")
+            .extend([
+                Ok(ProducerOutput {
+                    text: "All Antigravity endpoints failed".to_string(),
+                    length_capped: false,
+                }),
+                Ok(ProducerOutput {
+                    text: "<classify></classify>".to_string(),
+                    length_capped: false,
+                }),
+            ]);
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let route_root = project.to_str().unwrap();
+        let mut route_binding = binding(route_root, "ses");
+        route_binding.config.model_chain =
+            vec!["test/bad-model".to_string(), "test/good-model".to_string()];
+        handler.bind_route(7, route_binding);
+        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
+        let generation = store
+            .authority_status("context", "git:identity", "memories")
+            .unwrap()
+            .unwrap()
+            .generation;
+
+        let outcome = handler
+            .handle_dreamer_run_task(
+                7,
+                &json!({
+                    "v": 1,
+                    "session_id": "ses",
+                    "task": CLASSIFY_TASK,
+                    "command_id": "model-chain-command",
+                    "authority_generation": generation,
+                    "payload": { "prompt_body": "classify", "items": [] },
+                }),
+            )
+            .await;
+        let response = match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("dreamer run failed: {other:?}"),
+        };
+
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(response["manifest_text"], json!("<classify></classify>"));
+        assert_eq!(response["diagnostics"]["model"], json!("test/good-model"));
+        assert_eq!(response["diagnostics"]["attempts"], json!(2));
     }
 
     #[tokio::test(flavor = "current_thread")]
