@@ -673,11 +673,15 @@ fn select_supersession(
     intents
 }
 
+fn two_pass_batch_can_apply(ctx: &SelectionContext) -> bool {
+    ctx.scheduler_pressure_execute
+        && (ctx.pass_already_busting || ctx.pass_class == PassClass::EmergencyForce)
+}
+
 /// 1.4 Age-based two-pass: tool arcs whose age (ToolCall ordinal) is at/under the
 /// last-execute watermark. Add-only (the watermark advances forward). Returns arc ids.
 fn select_two_pass(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<String> {
-    let can_apply_batch = ctx.pass_already_busting || ctx.pass_class == PassClass::EmergencyForce;
-    if !ctx.scheduler_pressure_execute || !can_apply_batch || ctx.last_execute_ordinal == 0 {
+    if !two_pass_batch_can_apply(ctx) || ctx.last_execute_ordinal == 0 {
         return HashSet::new();
     }
     let newest_todowrite = arcs
@@ -853,10 +857,10 @@ fn select_emergency(
 #[derive(Debug, Default)]
 pub(crate) struct SelectionOutcome {
     pub decisions: Vec<ReductionDecision>,
-    /// At least one previously unfrozen age-lane target survived protection and joined
-    /// this pass. The transform uses this edge, rather than pressure-band residency, to
-    /// advance the durable watermark.
-    pub two_pass_batch_applied: bool,
+    /// The pressure pass was already busting, or was in the force band, so the age
+    /// batch had an application opportunity. Empty opportunities still advance the
+    /// watermark so future arcs can age into a later batch.
+    pub two_pass_batch_can_apply: bool,
 }
 
 /// Produce the full reduction-decision set for this pass. PURE + deterministic (see
@@ -881,6 +885,7 @@ pub(crate) fn select_reductions_with_outcome(
         return SelectionOutcome::default();
     }
 
+    let two_pass_batch_can_apply = two_pass_batch_can_apply(ctx);
     let live_ids: HashSet<String> = items
         .iter()
         .filter(|item| {
@@ -1040,15 +1045,9 @@ pub(crate) fn select_reductions_with_outcome(
 
     // Deterministic merge: exactly one decision per target (drop > edit_marker >
     // skeleton), stable output order (by target_id).
-    let decisions = dedupe_and_sort(out);
-    let two_pass_batch_applied = decisions.iter().any(|decision| {
-        arc_by_block_id
-            .get(decision.target_id.as_str())
-            .is_some_and(|arc_id| two_pass_arc_ids.contains(*arc_id))
-    });
     SelectionOutcome {
-        decisions,
-        two_pass_batch_applied,
+        decisions: dedupe_and_sort(out),
+        two_pass_batch_can_apply,
     }
 }
 
@@ -1496,7 +1495,7 @@ mod tests {
             &SelectionConfig::default(),
         );
         assert!(level_only.decisions.is_empty());
-        assert!(!level_only.two_pass_batch_applied);
+        assert!(!level_only.two_pass_batch_can_apply);
 
         ctx.pass_already_busting = true;
         ctx.scheduler_pressure_execute = false;
@@ -1507,7 +1506,7 @@ mod tests {
             &SelectionConfig::default(),
         );
         assert!(ride_only.decisions.is_empty());
-        assert!(!ride_only.two_pass_batch_applied);
+        assert!(!ride_only.two_pass_batch_can_apply);
 
         ctx.scheduler_pressure_execute = true;
         let admitted = select_reductions_with_outcome(
@@ -1517,7 +1516,7 @@ mod tests {
             &SelectionConfig::default(),
         );
         assert_eq!(admitted.decisions.len(), 2);
-        assert!(admitted.two_pass_batch_applied);
+        assert!(admitted.two_pass_batch_can_apply);
     }
 
     #[test]
@@ -1540,7 +1539,7 @@ mod tests {
             &SelectionConfig::default(),
         );
         assert_eq!(admitted.decisions.len(), 2);
-        assert!(admitted.two_pass_batch_applied);
+        assert!(admitted.two_pass_batch_can_apply);
     }
 
     #[test]

@@ -3015,12 +3015,12 @@ fn apply_once(
     };
     timings.selection = elapsed_ms(selection_started_at);
     let selected_reductions = selection_outcome.decisions;
-    let two_pass_batch_applied = selection_outcome.two_pass_batch_applied;
+    let two_pass_batch_can_apply = selection_outcome.two_pass_batch_can_apply;
     #[cfg(test)]
-    let (selected_reductions, two_pass_batch_applied) = if ctx.injected_reductions.is_empty() {
-        (selected_reductions, two_pass_batch_applied)
+    let selected_reductions = if ctx.injected_reductions.is_empty() {
+        selected_reductions
     } else {
-        (ctx.injected_reductions.clone(), false)
+        ctx.injected_reductions.clone()
     };
     let selected_reductions =
         filter_reasoning_ineligible_decisions(&tail_for_selection, selected_reductions);
@@ -3876,10 +3876,11 @@ fn apply_once(
     }
     timings.compose_m0m1 = elapsed_ms(compose_m0m1_started_at);
 
-    // Advance only after a waiting age batch has joined a riding/force pass. Keeping this
-    // watermark frozen during execute-band residency prevents each pass from making the
-    // immediately preceding tail arc newly eligible and self-causing another prefix rebuild.
-    if two_pass_batch_applied && !loaded.core.reconcile_pending {
+    // Advance whenever a pressure pass allowed the age batch to apply, even if it selected
+    // no reductions. Ordinary execute-band passes that are not already changing provider-visible
+    // bytes leave the watermark frozen; an allowed empty batch records the current tail so later
+    // arcs can age into a future batch.
+    if two_pass_batch_can_apply && !loaded.core.reconcile_pending {
         meta.last_execute_ordinal = tail_for_selection
             .iter()
             .map(|item| item.ordinal)
@@ -12282,6 +12283,16 @@ pub(crate) mod tests {
         );
         let first_bytes = serde_json::to_vec(&first.ck_messages).unwrap();
 
+        // Reset only the age watermark so this test remains about the emergency selector's
+        // same-sample latch. The first force pass advances the age watermark; without this
+        // reset, the second pass could legitimately select the emergency-reserved newer arc
+        // through the separate two-pass selector.
+        let loaded = s.load("subagent").unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.last_execute_ordinal = 0;
+        s.commit("subagent", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+
         let second = transform(&s, &request, &context).unwrap();
         let second_red = s
             .load("subagent")
@@ -12528,7 +12539,9 @@ pub(crate) mod tests {
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
             .unwrap();
-        let boot_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 90, 100);
+        let request = req("ses", "cfg0", vec![item("a", 1, "raw")]);
+        let boot_req = with_usage(request.clone(), 10, 100);
+        let execute_req = with_usage(request, 70, 100);
         let boot = run(&s, &boot_req, &spine());
         assert_eq!(boot.action, "HARD");
         assert!(s.load("ses").unwrap().meta.last_todo_state.is_none());
@@ -12536,7 +12549,7 @@ pub(crate) mod tests {
         let before_native = opencode_native_bytes(&boot, "ses");
         let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
         ctx.observed_last_response_at_ms = Some(0);
-        let execute = transform(&s, &boot_req, &ctx).unwrap();
+        let execute = transform(&s, &execute_req, &ctx).unwrap();
         // A zero-drop execute is byte-identical and cannot move the age watermark. A
         // pressure level is not an application edge, so residency alone remains silent.
         assert_eq!(execute.action, "SOFT+");
@@ -12548,7 +12561,7 @@ pub(crate) mod tests {
             "zero-drop execute must keep the two-pass watermark frozen"
         );
         // And the pass after it, with an unchanged tail, is a true no-write defer.
-        let again = transform(&s, &boot_req, &ctx).unwrap();
+        let again = transform(&s, &execute_req, &ctx).unwrap();
         assert!(!again.committed);
         assert_eq!(serde_json::to_vec(&again.ck_messages).unwrap(), before);
     }
@@ -12891,6 +12904,127 @@ pub(crate) mod tests {
             next_ordinal - 1,
             "replay must not advance the applied watermark again"
         );
+    }
+
+    #[test]
+    fn empty_two_pass_ride_advances_watermark_for_future_arc() {
+        const SESSION: &str = "two-pass-empty-ride";
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments(SESSION, &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let mut messages = vec![
+            item("a", 1, "covered head"),
+            assistant_tool_call("old-call", 2, "old"),
+            tool_result("old-result", 3, "old", "old eligible output"),
+            item("tail", 4, "stable tail"),
+        ];
+        let mut context = pctx("git:proj", "/nonexistent-docs", 0);
+        context.cache_ttl = "never".to_string();
+        let boot = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(boot.action, "HARD");
+
+        let loaded = s.load(SESSION).unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.last_execute_ordinal = 3;
+        meta.soft_refresh_pending = true;
+        s.commit(SESSION, loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let drained = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(drained.action, "SOFT");
+        let loaded = s.load(SESSION).unwrap();
+        for mid in ["old-call", "old-result"] {
+            assert!(frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_some());
+        }
+        assert_eq!(loaded.meta.last_execute_ordinal, 4);
+        let drained_reduction_count = loaded
+            .core
+            .frozen_units
+            .iter()
+            .filter(|unit| unit.key.starts_with("red:"))
+            .count();
+
+        messages.push(assistant_tool_call("fresh-call", 5, "fresh"));
+        messages.push(tool_result(
+            "fresh-result",
+            6,
+            "fresh",
+            "future eligible output",
+        ));
+        let minted = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 10, 100),
+            &context,
+        )
+        .unwrap();
+        let minted_bytes = canonical_output(minted.messages());
+        assert_eq!(s.load(SESSION).unwrap().meta.last_execute_ordinal, 4);
+
+        let loaded = s.load(SESSION).unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.soft_refresh_pending = true;
+        s.commit(SESSION, loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let empty_ride = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(empty_ride.action, "SOFT");
+        assert_eq!(
+            canonical_output(empty_ride.messages()),
+            minted_bytes,
+            "an empty age batch must add no provider-visible bytes"
+        );
+        let loaded = s.load(SESSION).unwrap();
+        assert_eq!(
+            loaded.meta.last_execute_ordinal, 6,
+            "the empty riding opportunity must advance over the fresh arc"
+        );
+        assert_eq!(
+            loaded
+                .core
+                .frozen_units
+                .iter()
+                .filter(|unit| unit.key.starts_with("red:"))
+                .count(),
+            drained_reduction_count,
+            "the empty ride must not freeze a reduction"
+        );
+        for mid in ["fresh-call", "fresh-result"] {
+            assert!(frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_none());
+        }
+
+        let mut meta = loaded.meta.clone();
+        meta.soft_refresh_pending = true;
+        s.commit(SESSION, loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let next_ride = transform(
+            &s,
+            &with_usage(req(SESSION, "cfg0", messages), 70, 100),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(next_ride.action, "SOFT");
+        let loaded = s.load(SESSION).unwrap();
+        for mid in ["fresh-call", "fresh-result"] {
+            assert!(
+                frozen_red_payload(&loaded.core, &format!("{mid}#0")).is_some(),
+                "the arc crossed by the empty ride must freeze on the next ride"
+            );
+        }
     }
 
     #[test]
