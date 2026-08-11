@@ -35,10 +35,10 @@
     "README.md"
   ],
   "scripts": {
-    "build": "bun run build:tui && rm -f dist/index.js dist/*-*.js && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --external @huggingface/transformers --external onnxruntime-web --external bun:sqlite --external node:sqlite && tsc --emitDeclarationOnly",
+    "build": "tsc -p ../retina-local-fs/tsconfig.build.json && bun run build:tui && rm -f dist/index.js dist/*-*.js && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --external @huggingface/transformers --external onnxruntime-web --external bun:sqlite --external node:sqlite && tsc --emitDeclarationOnly",
     "build:tui": "bun scripts/build-tui.ts",
     "check:tui-compiled": "bun run build:tui && git diff --exit-code -- src/tui-compiled && test -z \"$(git status --porcelain -- src/tui-compiled)\"",
-    "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",
+    "typecheck": "tsc -p ../retina-local-fs/tsconfig.build.json && tsc --noEmit && tsc -p tsconfig.scripts.json",
     "test": "bun test",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",

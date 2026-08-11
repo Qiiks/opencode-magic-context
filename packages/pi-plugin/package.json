@@ -28,9 +28,9 @@
     "README.md"
   ],
   "scripts": {
-    "build": "rm -f dist/index.js dist/subagent-entry.js dist/*-*.js && bun build src/index.ts src/subagent-entry.ts --outdir dist --target node --format esm --splitting --external @earendil-works/pi-coding-agent --external @earendil-works/pi-tui --external @huggingface/transformers --external node:sqlite",
+    "build": "tsc -p ../retina-local-fs/tsconfig.build.json && rm -f dist/index.js dist/subagent-entry.js dist/*-*.js && bun build src/index.ts src/subagent-entry.ts --outdir dist --target node --format esm --splitting --external @earendil-works/pi-coding-agent --external @earendil-works/pi-tui --external @huggingface/transformers --external node:sqlite",
     "build:e2e-argv": "bun build src/subagent-runner.ts --outfile ../../tests/docker/.generated/subagent-runner-e2e.mjs --target node --format esm --external node:sqlite",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc -p ../retina-local-fs/tsconfig.build.json && tsc --noEmit",
     "test": "bun test",
     "lint": "biome check src",
     "lint:fix": "biome check --write src",
