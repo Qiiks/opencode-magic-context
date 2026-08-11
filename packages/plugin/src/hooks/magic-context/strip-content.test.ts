@@ -703,6 +703,63 @@ describe("strip-content", () => {
             });
         });
 
+        describe("#given the newest in-flight assistant is not first in its run", () => {
+            it("#then strips older merged reasoning but preserves newest thinking blocks byte-identically", () => {
+                const buildFixture = () => {
+                    const latest = message("m-latest", "assistant", [
+                        {
+                            type: "thinking",
+                            thinking: "latest signed thinking",
+                            signature: "latest-signature",
+                        },
+                        {
+                            type: "redacted_thinking",
+                            data: "latest-redacted-data",
+                        },
+                        { type: "text", text: "latest tool-use continuation" },
+                    ]);
+                    return {
+                        latest,
+                        messages: [
+                            message("m-u", "user", [{ type: "text", text: "continue" }]),
+                            message("m-first", "assistant", [
+                                { type: "reasoning", text: "first reasoning" },
+                                { type: "text", text: "first step" },
+                            ]),
+                            message("m-older", "assistant", [
+                                { type: "thinking", thinking: "older merged reasoning" },
+                                { type: "text", text: "older step" },
+                            ]),
+                            latest,
+                        ],
+                    };
+                };
+
+                const unprotected = buildFixture();
+                const unprotectedLatestBefore = JSON.stringify(
+                    unprotected.latest.parts.slice(0, 2),
+                );
+                stripReasoningFromMergedAssistants(unprotected.messages, "anthropic");
+                expect(JSON.stringify(unprotected.latest.parts.slice(0, 2))).not.toBe(
+                    unprotectedLatestBefore,
+                );
+
+                const protectedFixture = buildFixture();
+                const latestBefore = JSON.stringify(protectedFixture.latest.parts.slice(0, 2));
+                const stripped = stripReasoningFromMergedAssistants(
+                    protectedFixture.messages,
+                    "anthropic",
+                    { mutationExemptMessage: protectedFixture.latest },
+                );
+
+                expect(stripped).toBe(1);
+                expect(protectedFixture.messages[2]?.parts[0]).toEqual(SENTINEL);
+                expect(JSON.stringify(protectedFixture.latest.parts.slice(0, 2))).toBe(
+                    latestBefore,
+                );
+            });
+        });
+
         describe("#given a long consecutive assistant run with tool calls and reasoning", () => {
             it("#then keeps only the first reasoning; intermediate reasoning becomes sentinels", () => {
                 const u = message("m-u", "user", [{ type: "text", text: "do it" }]);

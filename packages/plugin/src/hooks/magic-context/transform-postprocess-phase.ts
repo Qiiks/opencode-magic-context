@@ -724,6 +724,7 @@ export function finalizeMessageRepresentation(
     options?: {
         prependedMessageCount?: number;
         reasoningMutatedMessages?: Iterable<MessageLike>;
+        reasoningMutationExemptMessage?: MessageLike;
     },
 ): { clearedParts: number; mergedReasoningParts: number } {
     let clearedParts = 0;
@@ -746,7 +747,9 @@ export function finalizeMessageRepresentation(
             clearedParts = stripClearedReasoning(targetedMessages);
         }
     }
-    const mergedReasoningParts = stripReasoningFromMergedAssistants(messages, resolvedProviderID);
+    const mergedReasoningParts = stripReasoningFromMergedAssistants(messages, resolvedProviderID, {
+        mutationExemptMessage: options?.reasoningMutationExemptMessage,
+    });
     return { clearedParts, mergedReasoningParts };
 }
 
@@ -754,6 +757,16 @@ export async function runPostTransformPhase(
     args: RunPostTransformPhaseArgs,
 ): Promise<PostTransformPhaseResult> {
     const compactionOff = args.compactionOff === true;
+    // Capture before todo/history synthesis can add assistant messages. Anthropic
+    // requires the signed reasoning blocks from the newest assistant to be replayed
+    // unchanged, and OpenCode serializes these same in-memory message objects.
+    let reasoningMutationExemptMessage: MessageLike | undefined;
+    for (let index = args.messages.length - 1; index >= 0; index -= 1) {
+        const message = args.messages[index];
+        if (message.info.role !== "assistant") continue;
+        reasoningMutationExemptMessage = message;
+        break;
+    }
     // `isExplicitFlush` reads pendingMaterializationSessions — the persistent
     // "user wants pending ops + heuristics to run" signal. Survives across
     // blocked defer passes (compartmentRunning) so /ctx-flush intent is not
@@ -1923,6 +1936,7 @@ export async function runPostTransformPhase(
         {
             prependedMessageCount,
             reasoningMutatedMessages,
+            reasoningMutationExemptMessage,
         },
     );
     sessionLog(
