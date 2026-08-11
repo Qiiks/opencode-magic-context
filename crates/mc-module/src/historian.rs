@@ -1786,6 +1786,7 @@ mod tests {
             caveman_enabled: false,
             caveman_min_chars: 500,
             tool_present: false,
+            todo_tool_present: None,
             prompt_surface_preset: crate::prompt_surface::PromptSurfacePreset::Full,
             prompt_surface_model_key: None,
             prompt_surface_config_identity: String::new(),

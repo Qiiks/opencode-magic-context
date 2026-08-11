@@ -33,6 +33,7 @@ import { sessionLog } from "../../shared/logger";
 import { promptSurfaceConfigIdentity, resolvePromptSurface } from "../../shared/prompt-surface";
 import {
     resolveCtxReduceAvailability,
+    resolveTodowriteAvailability,
     resolveTodowriteAvailabilityFromMessages,
 } from "./ctx-reduce-availability";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
@@ -1064,6 +1065,9 @@ function buildTransformBody(args: {
         model_key: args.modelKey,
         provider_id: args.providerId,
         tool_present: args.passInputs.tool_present === true,
+        ...(typeof args.passInputs.todo_tool_present === "boolean"
+            ? { todo_tool_present: args.passInputs.todo_tool_present }
+            : {}),
         prompt_surface_preset: args.passInputs.prompt_surface_preset ?? "full",
         prompt_surface_model_key: args.passInputs.prompt_surface_model_key,
         prompt_surface_config_identity: args.passInputs.prompt_surface_config_identity,
@@ -1570,9 +1574,11 @@ export function createRustModeTransform(
         // Freeze the native todo-tool verdict before state sync reads it. Rust owns
         // synthetic-todo bytes, but the host still observes OpenCode's per-session map.
         resolveTodowriteAvailabilityFromMessages(sessionId, messages);
-        // A provisional fail-open verdict must not activate provider-visible bytes. The
-        // first persisted user message freezes the verdict for all later transform passes.
+        const todoAvailability = resolveTodowriteAvailability(sessionId);
+        // A provisional fail-open verdict must not activate ctx_reduce provider bytes. The
+        // first persisted user message freezes each verdict for all later transform passes.
         const toolPresent = reduceAvailability.frozen && reduceAvailability.callable;
+        const todoToolPresent = todoAvailability.frozen ? todoAvailability.callable : undefined;
         try {
             if (preflightError) throw preflightError;
             if (!overflowState) throw new Error("rust overflow state unavailable");
@@ -1624,6 +1630,7 @@ export function createRustModeTransform(
                 system_prompt_hash: sessionMeta.systemPromptHash ?? "",
                 upgrade_state: readUpgradeState(deps.db, sessionId),
                 tool_present: toolPresent,
+                todo_tool_present: todoToolPresent,
                 prompt_surface_preset: promptSurface.preset,
                 prompt_surface_model_key: modelKey,
                 prompt_surface_config_identity: promptSurfaceConfigIdentity(deps.promptSurface),

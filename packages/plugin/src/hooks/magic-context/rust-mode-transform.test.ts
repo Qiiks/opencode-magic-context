@@ -880,6 +880,7 @@ describe("Rust mode authority adapter", () => {
         expect(methods).toEqual(["state_sync", "transform"]);
         expect(transformRequest?.serve_native).toBe(true);
         expect(transformRequest?.tool_present).toBe(true);
+        expect(transformRequest?.todo_tool_present).toBe(true);
         expect(transformRequest?.prompt_surface_preset).toBe("full");
         expect(transformRequest?.prompt_surface_model_key).toBeNull();
         expect(transformRequest?.prompt_surface_config_identity).toBe(
@@ -1090,6 +1091,34 @@ describe("Rust mode authority adapter", () => {
 
         expect(requestBodies).toHaveLength(1);
         expect(requestBodies[0]?.tool_present).toBe(false);
+        expect(requestBodies[0]).not.toHaveProperty("todo_tool_present");
+    });
+
+    it("sends a frozen disabled todowrite verdict on the transform wire", async () => {
+        const sessionId = `rust-todo-disabled-${Date.now()}`;
+        sessions.push(sessionId);
+        installAvailabilityDb(sessionId, { "*": false, read: true });
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let requestBody: Record<string, unknown> | undefined;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform") requestBody = body as Record<string, unknown>;
+                return method === "transform" ? { native_messages: [] } : { ok: true };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const messages = makeMessages(sessionId);
+        messages[0]!.info.tools = { "*": false, read: true };
+
+        await transform.run(
+            sessionId,
+            messages,
+            { messages: messages as unknown[] },
+            makeMeta(db, sessionId),
+        );
+
+        expect(requestBody?.todo_tool_present).toBe(false);
     });
 
     it("defers a repeated module directive until the terminal boundary", async () => {
@@ -1245,6 +1274,7 @@ describe("Rust mode authority adapter", () => {
             ),
         ).toBe(true);
         expect(transformBodies.at(-1)?.tool_present).toBe(true);
+        expect(transformBodies.at(-1)?.todo_tool_present).toBe(true);
         expect(capabilityInvalidations).toBe(1);
         expect(output.messages).toEqual(native);
     });

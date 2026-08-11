@@ -24605,6 +24605,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_todowrite_clears_cold_start_seed_on_first_bust() {
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let state_json =
+            r#"[{"content":"Seeded before disable","status":"in_progress","priority":"high"}]"#;
+        let pair = injection::build_synthetic_todo_pair(state_json).unwrap();
+        let call_id = pair.call_id.clone();
+        let seeded = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "method": "state_sync",
+                    "session_id": "ses",
+                    "shadow_generation": 0,
+                    "expected_shadow_seq": 0,
+                    "last_todo_state": state_json,
+                    "todo_synthetic_anchor": {
+                        "call_id": call_id,
+                        "message_id": "tail",
+                        "state_json": state_json
+                    },
+                    "acked_watermarks": {}
+                }),
+            )
+            .await;
+        assert!(matches!(seeded, HandlerOutcome::Response(_)), "{seeded:?}");
+        assert!(store.load("ses").unwrap().meta.synthetic_todo.is_some());
+
+        let mut first_request = request(vec![ck("tail", 0, "live tail")]);
+        first_request["todo_tool_present"] = json!(false);
+        let first = call_transform_request(&handler, first_request).await;
+
+        assert!(
+            matches!(first["decision"].as_str(), Some("HARD" | "SOFT+")),
+            "{first}"
+        );
+        assert!(first["ck_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .all(|block| block["kind"]["name"] != json!("todowrite")));
+        assert!(store.load("ses").unwrap().meta.synthetic_todo.is_none());
+    }
+
+    #[tokio::test]
     async fn cold_start_state_seed_cannot_rewind_a_materialized_boundary() {
         let (handler, store, _dir, _project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
