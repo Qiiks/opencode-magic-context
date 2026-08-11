@@ -483,6 +483,9 @@ const REASONING_PART_TYPES = new Set(["reasoning", "thinking", "redacted_thinkin
  *   - That reasoning part must be the first non-metadata content part of
  *     the first assistant in the run. Otherwise strip all reasoning from
  *     the run.
+ *   - Leave a supplied mutation-exempt assistant byte-identical. OpenCode
+ *     uses this for the newest assistant because Anthropic requires its signed
+ *     thinking and redacted-thinking blocks to be replayed unchanged.
  *
  * Trade-off: the model loses visibility into its own intermediate-step
  * reasoning for multi-step turns. The first step's reasoning is preserved
@@ -496,6 +499,7 @@ const REASONING_PART_TYPES = new Set(["reasoning", "thinking", "redacted_thinkin
 export function stripReasoningFromMergedAssistants(
     messages: MessageLike[],
     providerID?: string,
+    options?: { mutationExemptMessage?: MessageLike },
 ): number {
     // Anthropic-only workaround for @ai-sdk/anthropic's groupIntoBlocks
     // index-0-thinking rule. openai-compatible providers like Kimi/
@@ -520,6 +524,11 @@ export function stripReasoningFromMergedAssistants(
 
         const firstInRun = prevRole !== "assistant";
         if (firstInRun) keptReasoningInRun = false;
+
+        if (message === options?.mutationExemptMessage) {
+            prevRole = role;
+            continue;
+        }
 
         // Determine which reasoning/thinking part (if any) to KEEP for this
         // run. Only eligible: the first assistant in a run, no reasoning

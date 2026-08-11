@@ -2525,6 +2525,10 @@ describe("final message representation", () => {
                     { type: "tool_use", id: "call-live", name: "read", input: {} },
                 ],
             },
+            {
+                info: { id: "assistant-latest", role: "assistant" },
+                parts: [{ type: "text", text: "newest assistant remains the mutation boundary" }],
+            },
         ] as unknown as MessageLike[];
 
         insertTag(db, sessionId, "call-between", "tool", 100, 1, 0, "read");
@@ -2619,6 +2623,56 @@ describe("final message representation", () => {
             mergedReasoningParts: 0,
         });
         expect(JSON.stringify(nonAnthropicMessages)).toBe(nonAnthropicBefore);
+    });
+
+    it("preserves the newest assistant reasoning through final representation", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-final-representation-newest-reasoning";
+        const latest = {
+            info: { id: "assistant-latest", role: "assistant" },
+            parts: [
+                {
+                    type: "thinking",
+                    thinking: "latest signed thinking",
+                    signature: "latest-signature",
+                },
+                { type: "redacted_thinking", data: "latest-redacted-data" },
+                { type: "text", text: "latest continuation" },
+            ],
+        } as unknown as MessageLike;
+        const messages = [
+            {
+                info: { id: "user", role: "user" },
+                parts: [{ type: "text", text: "continue the tool-use turn" }],
+            },
+            {
+                info: { id: "assistant-first", role: "assistant" },
+                parts: [
+                    { type: "reasoning", text: "first reasoning" },
+                    { type: "text", text: "first step" },
+                ],
+            },
+            {
+                info: { id: "assistant-older", role: "assistant" },
+                parts: [
+                    { type: "thinking", thinking: "older merged reasoning" },
+                    { type: "text", text: "older step" },
+                ],
+            },
+            latest,
+        ] as unknown as MessageLike[];
+        const latestBefore = JSON.stringify(latest.parts.slice(0, 2));
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+
+        expect(messages[2]?.parts[0]).toEqual({ type: "text", text: "" });
+        expect(JSON.stringify(latest.parts.slice(0, 2))).toBe(latestBefore);
     });
 
     it("matches the former full cleared-reasoning walk on a mixed final fixture", () => {
