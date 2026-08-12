@@ -71,6 +71,11 @@ describe("buildStatusDetail — storage version probe", () => {
                 context_db_schema_version: LATEST_SUPPORTED_VERSION,
                 plugin_supported_version: LATEST_SUPPORTED_VERSION,
             });
+            expect(detail.loggerDiagnostics).toEqual({
+                swallowedWriteCount: 0,
+                lastErrorMessage: null,
+                lastErrorTime: null,
+            });
         } finally {
             closeQuietly(db);
         }
