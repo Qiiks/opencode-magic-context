@@ -180,9 +180,17 @@ pub struct SelectionContext {
     /// True when supersession can ride concrete work already scheduled for this pass.
     /// Unlike `pass_already_busting`, a held emergency latch alone does not set this.
     pub supersession_ride_available: bool,
-    /// Dynamic newest-tag protection expressed as exact block ids. This applies to
-    /// automatic selectors and agent-marked drops alike.
-    pub protected_block_ids: HashSet<String>,
+    /// Dynamic newest-tag protection expressed as exact block ids.
+    pub tag_window_protected_block_ids: HashSet<String>,
+    /// Whole-message protection for mutation-exempt and lineage-anchor messages.
+    pub exempt_message_protected_block_ids: HashSet<String>,
+}
+
+impl SelectionContext {
+    fn block_is_protected(&self, block_id: &str) -> bool {
+        self.tag_window_protected_block_ids.contains(block_id)
+            || self.exempt_message_protected_block_ids.contains(block_id)
+    }
 }
 
 /// Which scheduler class this pass is — gates which selectors run.
@@ -717,7 +725,7 @@ fn select_agent_drops(
     out: &mut Vec<ReductionDecision>,
 ) {
     for id in &ctx.agent_drop_ids {
-        if frozen.contains(id) || !live_ids.contains(id) || ctx.protected_block_ids.contains(id) {
+        if frozen.contains(id) || !live_ids.contains(id) || ctx.block_is_protected(id) {
             continue;
         }
         let first_applied = ctx.first_applied_agent_drop_ids.contains(id);
@@ -735,7 +743,7 @@ fn select_agent_drops(
                         && !ctx.first_applied_agent_drop_ids.contains(other)
                         && live_ids.contains(other)
                         && !frozen.contains(other)
-                        && !ctx.protected_block_ids.contains(other)
+                        && !ctx.block_is_protected(other)
                         && ctx.agent_drop_command_ids.get(other)
                             != ctx.agent_drop_command_ids.get(id)
                 }));
@@ -864,6 +872,16 @@ pub(crate) struct SelectionOutcome {
     /// batch had an application opportunity. Empty opportunities still advance the
     /// watermark so future arcs can age into a later batch.
     pub two_pass_batch_can_apply: bool,
+    /// Live superseded arcs counted at the existing selector call inside an open ride gate.
+    /// `active_arcs` excludes any arc with a frozen member, so this depth can shrink between rides.
+    /// Missing means the gate stayed shut and the selector did not run.
+    pub eligible_supersession_count: Option<usize>,
+    /// Eligible supersession arcs entirely removed by the newest-tag block window.
+    pub supersession_withheld_by_tag_window_count: Option<usize>,
+    /// Eligible supersession arcs entirely removed by a whole-message exemption.
+    pub supersession_withheld_by_exempt_message_count: Option<usize>,
+    /// Eligible supersession arcs represented in the final decision list after every filter.
+    pub applied_supersession_count: Option<usize>,
 }
 
 /// Produce the full reduction-decision set for this pass. PURE + deterministic (see
@@ -932,6 +950,7 @@ pub(crate) fn select_reductions_with_outcome(
     // Per-arc reduction intents (arc_id → shape), assembled in TS precedence order.
     let mut arc_shapes: HashMap<String, ArcShape> = HashMap::new();
     let two_pass_arc_ids = select_two_pass(&active_arcs, ctx);
+    let mut eligible_supersession_arc_ids = None;
 
     match ctx.pass_class {
         PassClass::EmergencyForce => {
@@ -953,9 +972,12 @@ pub(crate) fn select_reductions_with_outcome(
             // its headroom target but selected nothing, defer supersession so it cannot
             // create a cache bust by itself.
             if cfg.smart_drops && (!emergency_arc_ids.is_empty() || !two_pass_arc_ids.is_empty()) {
-                for (arc_id, intent) in
-                    select_supersession(&active_arcs, &recent_supersession_message_ids)
-                {
+                // A superseded arc remains eligible while the ride gate is shut, so the count
+                // observed when it next opens summarizes everything accumulated between rides.
+                let intents = select_supersession(&active_arcs, &recent_supersession_message_ids);
+                eligible_supersession_arc_ids =
+                    Some(intents.keys().cloned().collect::<HashSet<_>>());
+                for (arc_id, intent) in intents {
                     arc_shapes.entry(arc_id).or_insert(if intent.edit_marker {
                         ArcShape::EditMarker
                     } else {
@@ -975,7 +997,10 @@ pub(crate) fn select_reductions_with_outcome(
             // admitted two-pass batch lets the whole pending set ride the same bust.
             if cfg.smart_drops && (ctx.supersession_ride_available || !two_pass_arc_ids.is_empty())
             {
+                // Count the exact selector output before overlap precedence removes members.
                 let intents = select_supersession(&active_arcs, &recent_supersession_message_ids);
+                eligible_supersession_arc_ids =
+                    Some(intents.keys().cloned().collect::<HashSet<_>>());
                 for (arc_id, intent) in intents {
                     if arc_shapes.contains_key(&arc_id) {
                         continue; // already a drop (two-pass) → drop wins
@@ -1049,15 +1074,63 @@ pub(crate) fn select_reductions_with_outcome(
             .is_none_or(|arc_id| !reasoning_ineligible_arcs.contains(*arc_id))
     });
 
+    let supersession_arcs_with_tag_window_protection =
+        eligible_supersession_arc_ids.as_ref().map(|eligible| {
+            out.iter()
+                .filter(|decision| {
+                    ctx.tag_window_protected_block_ids
+                        .contains(&decision.target_id)
+                })
+                .filter_map(|decision| arc_by_block_id.get(decision.target_id.as_str()).copied())
+                .filter(|arc_id| eligible.contains(*arc_id))
+                .map(str::to_string)
+                .collect::<HashSet<_>>()
+        });
+    let supersession_arcs_with_exempt_message_protection =
+        eligible_supersession_arc_ids.as_ref().map(|eligible| {
+            out.iter()
+                .filter(|decision| {
+                    ctx.exempt_message_protected_block_ids
+                        .contains(&decision.target_id)
+                })
+                .filter_map(|decision| arc_by_block_id.get(decision.target_id.as_str()).copied())
+                .filter(|arc_id| eligible.contains(*arc_id))
+                .map(str::to_string)
+                .collect::<HashSet<_>>()
+        });
+
     // Protection is block-specific, not an ordinal cutoff: remove protected targets from
     // both automatic arc decisions and agent-directed decisions before the stable merge.
-    out.retain(|decision| !ctx.protected_block_ids.contains(&decision.target_id));
+    out.retain(|decision| !ctx.block_is_protected(&decision.target_id));
 
     // Deterministic merge: exactly one decision per target (drop > edit_marker >
     // skeleton), stable output order (by target_id).
+    let decisions = dedupe_and_sort(out);
+    let applied_supersession_arcs = eligible_supersession_arc_ids.as_ref().map(|eligible| {
+        decisions
+            .iter()
+            .filter_map(|decision| arc_by_block_id.get(decision.target_id.as_str()).copied())
+            .filter(|arc_id| eligible.contains(*arc_id))
+            .map(str::to_string)
+            .collect::<HashSet<_>>()
+    });
+    let withheld_count = |protected: &Option<HashSet<String>>| {
+        protected
+            .as_ref()
+            .zip(applied_supersession_arcs.as_ref())
+            .map(|(protected, applied)| protected.difference(applied).count())
+    };
     SelectionOutcome {
-        decisions: dedupe_and_sort(out),
+        decisions,
         two_pass_batch_can_apply,
+        eligible_supersession_count: eligible_supersession_arc_ids.as_ref().map(HashSet::len),
+        supersession_withheld_by_tag_window_count: withheld_count(
+            &supersession_arcs_with_tag_window_protection,
+        ),
+        supersession_withheld_by_exempt_message_count: withheld_count(
+            &supersession_arcs_with_exempt_message_protection,
+        ),
+        applied_supersession_count: applied_supersession_arcs.as_ref().map(HashSet::len),
     }
 }
 
@@ -1234,7 +1307,8 @@ mod tests {
             first_applied_agent_drop_ids: HashSet::new(),
             pass_already_busting: false,
             supersession_ride_available: false,
-            protected_block_ids: HashSet::new(),
+            tag_window_protected_block_ids: HashSet::new(),
+            exempt_message_protected_block_ids: HashSet::new(),
         }
     }
 
@@ -1481,7 +1555,8 @@ mod tests {
                 first_applied_agent_drop_ids: HashSet::new(),
                 pass_already_busting: case.smart_drops || case.ctx.pass_already_busting,
                 supersession_ride_available: case.smart_drops || case.ctx.pass_already_busting,
-                protected_block_ids: HashSet::new(),
+                tag_window_protected_block_ids: HashSet::new(),
+                exempt_message_protected_block_ids: HashSet::new(),
             };
             let cfg = SelectionConfig {
                 smart_drops: case.smart_drops,
@@ -1549,6 +1624,87 @@ mod tests {
         );
         assert_eq!(admitted.decisions.len(), 2);
         assert!(admitted.two_pass_batch_can_apply);
+    }
+
+    #[test]
+    fn supersession_measurements_distinguish_protection_sources_and_final_application() {
+        let mut items = vec![
+            tool_call(
+                "c1",
+                1,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":"one"}),
+                500,
+            ),
+            tool_result("c1", 1, "edit", 100),
+            tool_call(
+                "c2",
+                2,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":"two"}),
+                500,
+            ),
+            tool_result("c2", 2, "edit", 100),
+            tool_call(
+                "c3",
+                3,
+                "edit",
+                serde_json::json!({"filePath":"a.ts","oldString":"three"}),
+                500,
+            ),
+            tool_result("c3", 3, "edit", 100),
+        ];
+        for n in 0..RECENT_SUPERSESSION_WINDOW {
+            items.push(text_with_id(&format!("tail-{n}#0"), 4 + n as u64, 1));
+        }
+        let config = SelectionConfig { smart_drops: true };
+        let mut protected = base_ctx(PassClass::Execute);
+        protected.supersession_ride_available = true;
+        protected
+            .tag_window_protected_block_ids
+            .extend([call_block_id("c1"), result_block_id("c1")]);
+        protected
+            .exempt_message_protected_block_ids
+            .extend([call_block_id("c2"), result_block_id("c2")]);
+
+        let withheld = select_reductions_with_outcome(&items, &HashSet::new(), &protected, &config);
+        assert_eq!(withheld.eligible_supersession_count, Some(2));
+        assert_eq!(withheld.supersession_withheld_by_tag_window_count, Some(1));
+        assert_eq!(
+            withheld.supersession_withheld_by_exempt_message_count,
+            Some(1)
+        );
+        assert_eq!(withheld.applied_supersession_count, Some(0));
+        assert!(withheld.decisions.is_empty());
+
+        let mut tag_only = base_ctx(PassClass::Execute);
+        tag_only.supersession_ride_available = true;
+        tag_only
+            .tag_window_protected_block_ids
+            .extend([call_block_id("c1"), result_block_id("c1")]);
+        let partially_withheld =
+            select_reductions_with_outcome(&items, &HashSet::new(), &tag_only, &config);
+        assert_eq!(
+            partially_withheld.supersession_withheld_by_tag_window_count,
+            Some(1)
+        );
+        assert_eq!(
+            partially_withheld.supersession_withheld_by_exempt_message_count,
+            Some(0)
+        );
+        assert_eq!(partially_withheld.applied_supersession_count, Some(1));
+
+        let mut unprotected = base_ctx(PassClass::Execute);
+        unprotected.supersession_ride_available = true;
+        let applied =
+            select_reductions_with_outcome(&items, &HashSet::new(), &unprotected, &config);
+        assert_eq!(applied.eligible_supersession_count, Some(2));
+        assert_eq!(applied.supersession_withheld_by_tag_window_count, Some(0));
+        assert_eq!(
+            applied.supersession_withheld_by_exempt_message_count,
+            Some(0)
+        );
+        assert_eq!(applied.applied_supersession_count, Some(2));
     }
 
     #[test]
@@ -2079,7 +2235,7 @@ mod tests {
         ctx.last_execute_ordinal = 2;
         ctx.pass_already_busting = true;
         ctx.agent_drop_ids = vec![protected.clone()];
-        ctx.protected_block_ids.insert(protected.clone());
+        ctx.tag_window_protected_block_ids.insert(protected.clone());
 
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         assert!(out.iter().all(|decision| decision.target_id != protected));
