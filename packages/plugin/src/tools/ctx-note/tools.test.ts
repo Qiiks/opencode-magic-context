@@ -114,10 +114,30 @@ describe("createCtxNoteTools", () => {
             { action: "write", content: "retry me" },
             toolContext(),
         );
-        expect(result).toBe(
-            "Error: Rust notes authority is not ready; TypeScript fallback is disabled.",
-        );
+        expect(result).toContain("Write REFUSED and NOT saved");
+        expect(result).toContain("RESEND");
+        expect(result).toContain("Content to resend:\nretry me");
         expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
+    });
+
+    it("does not echo content attached to a read-only module refusal", async () => {
+        tools = createCtxNoteTools({
+            db,
+            resolveProjectPath: () => "git:project-a",
+            rustToolBackends: {
+                authorityState: async () => "MODULE",
+                note: async () => ({
+                    error: { code: "authority_draining", message: "authority is draining" },
+                }),
+            },
+        });
+        const result = await tools.ctx_note.execute(
+            { action: "read", content: "read-only content must not echo" },
+            toolContext(),
+        );
+        expect(result).toContain("REFUSED and NOT applied");
+        expect(result).toContain("RESEND");
+        expect(result).not.toContain("read-only content must not echo");
     });
 
     it("keeps TS note handling when the notes domain reports TS authority", async () => {

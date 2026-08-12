@@ -7,6 +7,7 @@ import {
     getAuthorityManagedMarker,
 } from "../../features/magic-context/context-authority";
 import {
+    isLinkedGitWorktree,
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
     takeDubiousOwnershipProjectIdentityWarning,
@@ -435,13 +436,15 @@ export async function recoverTsAuthorityProject(args: {
     return "retryable";
 }
 
-function scheduleTsAuthorityRecovery(args: {
+export function scheduleTsAuthorityRecovery(args: {
     db: ContextDatabase;
     projectPath: string;
     projectRoot: string;
     module?: RustModeModuleClient;
+    isLinkedWorktree?: (directory: string) => boolean;
 }): void {
     if (!getAuthorityManagedMarker(args.db, args.projectPath)) return;
+    if ((args.isLinkedWorktree ?? isLinkedGitWorktree)(args.projectRoot)) return;
     if (tsAuthorityRecoveryStateByProject.has(args.projectPath)) return;
     const module = args.module;
 

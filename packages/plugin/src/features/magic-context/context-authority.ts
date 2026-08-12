@@ -1044,6 +1044,7 @@ function installStagedLiveMemorySnapshot(db: Database, generation: string): bool
 interface MirrorPageStatements {
     identityByModule: Statement;
     insertIdentity: Statement;
+    deleteIdentityByContext: Statement;
     deleteLiveMemory: Statement;
     deletePendingReferencesForMemory: Statement;
     deleteIdentity: Statement;
@@ -1108,6 +1109,9 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
         ),
         insertIdentity: db.prepare(
             "INSERT OR IGNORE INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES (?, ?, ?, ?)",
+        ),
+        deleteIdentityByContext: db.prepare(
+            "DELETE FROM mirror_identity WHERE domain = ? AND context_row_id = ?",
         ),
         deleteLiveMemory: db.prepare(
             "DELETE FROM mirror_live_memory_rows WHERE module_project = ? AND module_row_id = ?",
@@ -1201,7 +1205,7 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
              policy_version = ?, anchor_block_id = ?, anchor_ordinal = ?, created_at = ?, updated_at = ? WHERE id = ?`,
         ),
         upsertNoteRevision: db.prepare(
-            "INSERT INTO mirror_note_revisions(module_project, module_row_id, context_row_id, status_version) VALUES (?, ?, ?, ?) ON CONFLICT(module_project, module_row_id) DO UPDATE SET context_row_id = excluded.context_row_id, status_version = excluded.status_version",
+            "INSERT OR REPLACE INTO mirror_note_revisions(module_project, module_row_id, context_row_id, status_version) VALUES (?, ?, ?, ?)",
         ),
         translateMemoryReferences: db.prepare(
             `UPDATE memories
@@ -1346,8 +1350,17 @@ function rememberIdentity(
 ): void {
     const existing = mirrorIdentity(db, domain, moduleProject, moduleRowId, statements);
     if (existing) return;
-    // A context row has one canonical module identity. A duplicate feed row may
-    // still update that row, but it must not claim a second identity for it.
+    // A note can be re-minted with a new module row id when authority is prepared
+    // again. Replace its stale canonical identity so note evaluation joins the live
+    // revision instead of retaining an id that the module no longer recognizes.
+    if (domain === "notes") {
+        (
+            statements?.deleteIdentityByContext ??
+            db.prepare("DELETE FROM mirror_identity WHERE domain = ? AND context_row_id = ?")
+        ).run(domain, contextRowId);
+    }
+    // A context row has one canonical module identity. A duplicate memory feed row
+    // may still update that row, but it must not claim a second identity for it.
     (
         statements?.insertIdentity ??
         db.prepare(

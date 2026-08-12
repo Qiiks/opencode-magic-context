@@ -26,6 +26,7 @@ import { log } from "../../../shared/logger";
 const GIT_TIMEOUT_MS = 5_000;
 const TRANSIENT_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 const identityCache = new Map<string, string>();
+const linkedGitWorktreeCache = new Map<string, boolean>();
 const lastKnownGitIdentityCache = new Map<string, string>();
 // Cached `dir:` fallbacks for directories that have NO `.git` entry in their
 // ancestor chain. We only cache the no-`.git` case: once a `.git` appears we
@@ -606,6 +607,42 @@ export function storedPathBelongsToIdentity(
     );
 }
 
+/**
+ * Detect whether a directory belongs to a linked Git worktree. Linked worktrees
+ * have a per-worktree git dir while sharing the primary checkout's common dir.
+ * The probe is cached because authority recovery can be considered every pass.
+ */
+export function isLinkedGitWorktree(directory: string): boolean {
+    const resolvedDirectory = path.resolve(directory);
+    const cached = linkedGitWorktreeCache.get(resolvedDirectory);
+    if (cached !== undefined) return cached;
+
+    let linked = false;
+    try {
+        const output = execFileSyncForIdentity(
+            "git",
+            ["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+            {
+                cwd: resolvedDirectory,
+                encoding: "utf8",
+                timeout: GIT_TIMEOUT_MS,
+                windowsHide: true,
+            },
+        );
+        const [gitDir, commonDir] = String(output)
+            .split(/\r?\n/u)
+            .map((line) => line.trim())
+            .filter(Boolean);
+        linked = Boolean(gitDir && commonDir && path.resolve(gitDir) !== path.resolve(commonDir));
+    } catch {
+        // If Git metadata exists but its topology cannot be resolved, fail closed:
+        // the checkout may be linked and must not be allowed to drain shared authority.
+        linked = hasGitDir(resolvedDirectory);
+    }
+    linkedGitWorktreeCache.set(resolvedDirectory, linked);
+    return linked;
+}
+
 export function __setProjectIdentityTestHooks(hooks: {
     execFileSync?: typeof execFileSync;
     homeDirectory?: () => string;
@@ -634,6 +671,7 @@ export function __clearProjectIdentityResolutionCacheForTests(directory?: string
 
 export function __resetProjectIdentityForTests(): void {
     identityCache.clear();
+    linkedGitWorktreeCache.clear();
     lastKnownGitIdentityCache.clear();
     directoryFallbackCache.clear();
     transientFailureCooldown.clear();

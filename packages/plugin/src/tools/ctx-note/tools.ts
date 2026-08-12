@@ -176,13 +176,25 @@ function buildReadSections(args: {
     return sections;
 }
 
-function moduleNoteText(response: unknown): string | null {
+function noteAuthorityRefusal(args: CtxNoteArgs, action: RustNoteToolRequest["action"]): string {
+    const readiness = "Rust notes authority is not ready.";
+    if ((action === "write" || action === "update") && typeof args.content === "string") {
+        return `Error: ${readiness} Write REFUSED and NOT saved; RESEND after authority is ready.\nContent to resend:\n${args.content}`;
+    }
+    return `Error: ${readiness} Request REFUSED and NOT applied; RESEND after authority is ready.`;
+}
+
+function moduleNoteText(
+    response: unknown,
+    args: CtxNoteArgs,
+    action: RustNoteToolRequest["action"],
+): string | null {
     let value = response;
     if (value !== null && typeof value === "object" && "result" in value) {
         value = (value as { result?: unknown }).result;
     }
     if (isRustAuthorityDrainingError(value)) {
-        return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
+        return noteAuthorityRefusal(args, action);
     }
     if (typeof value === "string") return value;
     if (value !== null && typeof value === "object") {
@@ -333,7 +345,7 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                     noteId: args.note_id,
                 };
                 try {
-                    const text = moduleNoteText(await rustNote(request));
+                    const text = moduleNoteText(await rustNote(request), args, action);
                     if (text === null) {
                         return "Error: Rust module returned an invalid ctx_note response.";
                     }
@@ -343,13 +355,13 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                     return text;
                 } catch (error) {
                     if (isRustAuthorityDrainingError(error)) {
-                        return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
+                        return noteAuthorityRefusal(args, action);
                     }
                     return `Error: Rust module ctx_note failed. ${error instanceof Error ? error.message : String(error)}`;
                 }
             }
             if (marker || notesAuthority === "PREPARING" || notesAuthority === "DRAINING") {
-                return "Error: Rust notes authority is not ready; TypeScript fallback is disabled.";
+                return noteAuthorityRefusal(args, action);
             }
 
             if (action === "write") {
