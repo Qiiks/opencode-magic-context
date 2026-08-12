@@ -407,6 +407,19 @@ const MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES: usize = 512 * 1024;
 const CHUNK_TRANSCRIPT_TRUNCATION_MARKER: &str =
     "\n[truncated: transcript exceeded the inflated-byte limit]";
 const MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES: i64 = 8 * 1024 * 1024;
+const PASS_SCHEDULER_HISTORY_CAP: usize = 256;
+const PASS_SCHEDULER_INTERESTING_HISTORY_CAP: usize = 256;
+const MAX_FULL_ARRAY_FINGERPRINT_BYTES: usize = 256;
+/// The recency entry is at most 99 bytes. An interesting entry also has the sender clock and
+/// bounded opaque fingerprint; JSON's worst case expands each fingerprint byte to `\u00xx`.
+const MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 99;
+const MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 1_709;
+/// Maximum combined UTF-8 bytes for both scheduler JSON arrays on one session row.
+pub const PASS_SCHEDULER_TELEMETRY_MAX_BYTES: usize = 1
+    + PASS_SCHEDULER_HISTORY_CAP * (MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES + 1)
+    + 1
+    + PASS_SCHEDULER_INTERESTING_HISTORY_CAP
+        * (MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES + 1);
 
 fn current_time_ms() -> i64 {
     std::time::SystemTime::now()
@@ -2355,6 +2368,16 @@ const MIGRATIONS: &[Migration] = &[
             ADD COLUMN scheduler_history TEXT NOT NULL DEFAULT '[]';
         ",
     },
+    Migration {
+        version: 48,
+        // Ordinary Defer traffic must not displace rare scheduler evidence. Keep a second bounded
+        // oldest-to-newest ring on the same row; the existing per-pass UPSERT appends to it only
+        // for reductions, output divergence, or non-Defer arms and evicts its oldest entry at cap.
+        statements: "
+        ALTER TABLE mc_pass_trace
+            ADD COLUMN scheduler_interesting_history TEXT NOT NULL DEFAULT '[]';
+        ",
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -2670,6 +2693,70 @@ pub struct PassSchedulerObservation {
     pub timestamp_ms: i64,
     pub scheduler_decision: String,
     pub drain_latch_active: bool,
+}
+
+/// Incident-worthy scheduler evidence retained independently of the recency ring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterestingPassSchedulerObservation {
+    pub timestamp_ms: i64,
+    pub scheduler_decision: String,
+    pub drain_latch_active: bool,
+    /// Sender-stamped request instant. Missing remains missing; it is never backfilled from the
+    /// module clock because the two clocks are not interchangeable correlation keys.
+    pub request_observed_at_ms: Option<u64>,
+    /// Caller-owned full-array fingerprint echoed by the transform response. This is omitted
+    /// only when the caller supplied no identity or exceeded the diagnostic byte bound.
+    pub full_array_fingerprint: Option<String>,
+}
+
+impl InterestingPassSchedulerObservation {
+    fn from_observation(
+        observation: &PassSchedulerObservation,
+        request_observed_at_ms: Option<u64>,
+        full_array_fingerprint: Option<&str>,
+    ) -> Self {
+        Self {
+            timestamp_ms: observation.timestamp_ms,
+            scheduler_decision: observation.scheduler_decision.clone(),
+            drain_latch_active: observation.drain_latch_active,
+            request_observed_at_ms,
+            full_array_fingerprint: full_array_fingerprint
+                .filter(|fingerprint| fingerprint.len() <= MAX_FULL_ARRAY_FINGERPRINT_BYTES)
+                .map(str::to_string),
+        }
+    }
+}
+
+fn serialize_scheduler_observation(
+    observation: &PassSchedulerObservation,
+) -> Result<String, McStoreError> {
+    if !matches!(
+        observation.scheduler_decision.as_str(),
+        "Defer" | "Execute" | "Force85" | "Emergency95"
+    ) {
+        return Err(McStoreError::Serde(format!(
+            "unknown scheduler decision {:?}",
+            observation.scheduler_decision
+        )));
+    }
+    serde_json::to_string(observation).map_err(|error| McStoreError::Serde(error.to_string()))
+}
+
+fn scheduler_observation_is_inherently_interesting(observation: &PassSchedulerObservation) -> bool {
+    observation.scheduler_decision != "Defer"
+}
+
+fn serialize_interesting_scheduler_observation(
+    observation: &PassSchedulerObservation,
+    request_observed_at_ms: Option<u64>,
+    full_array_fingerprint: Option<&str>,
+) -> Result<String, McStoreError> {
+    serde_json::to_string(&InterestingPassSchedulerObservation::from_observation(
+        observation,
+        request_observed_at_ms,
+        full_array_fingerprint,
+    ))
+    .map_err(|error| McStoreError::Serde(error.to_string()))
 }
 
 /// Durable receive/complete/reject breadcrumbs for one session's transform passes.
@@ -3671,6 +3758,11 @@ pub struct TransformCommit<'a> {
     /// Scheduler arm and updated drain-latch state for a real accepted transform pass.
     /// Maintenance callers that reuse this transaction leave it absent.
     pub scheduler_observation: Option<&'a PassSchedulerObservation>,
+    /// Sender clock and exact full-array identity already carried on the transform request.
+    pub scheduler_request_observed_at_ms: Option<u64>,
+    pub scheduler_full_array_fingerprint: Option<&'a str>,
+    /// Whether this pass added a previously-unfrozen reduction to the served output.
+    pub scheduler_applied_reductions: bool,
     pub overlays: TransformOverlayBatch<'a>,
 }
 
@@ -6913,9 +7005,19 @@ impl McStore {
         &self,
         session_id: &str,
         observation: &PassSchedulerObservation,
+        request_observed_at_ms: Option<u64>,
+        full_array_fingerprint: Option<&str>,
     ) -> Result<(), McStoreError> {
-        let observation_json = serde_json::to_string(observation)
-            .map_err(|error| McStoreError::Serde(error.to_string()))?;
+        let observation_json = serialize_scheduler_observation(observation)?;
+        let interesting_json = scheduler_observation_is_inherently_interesting(observation)
+            .then(|| {
+                serialize_interesting_scheduler_observation(
+                    observation,
+                    request_observed_at_ms,
+                    full_array_fingerprint,
+                )
+            })
+            .transpose()?;
         self.inner.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO mc_pass_trace (
@@ -6927,8 +7029,12 @@ impl McStore {
                      reject_count,
                      receive_count,
                      first_divergence,
-                     scheduler_history
-                 ) VALUES (?1, 0, ?2, NULL, NULL, 0, 0, NULL, json_array(json(?3)))
+                     scheduler_history,
+                     scheduler_interesting_history
+                 ) VALUES (
+                     ?1, 0, ?2, NULL, NULL, 0, 0, NULL, json_array(json(?3)),
+                     CASE WHEN ?4 IS NOT NULL THEN json_array(json(?4)) ELSE '[]' END
+                 )
                  ON CONFLICT(session_id) DO UPDATE SET
                      first_divergence = NULL,
                      last_completed_at_ms = excluded.last_completed_at_ms,
@@ -6942,8 +7048,30 @@ impl McStore {
                                    WHERE key >= json_array_length(mc_pass_trace.scheduler_history) - 255),
                                  '$[#]', json(?3)
                              )
+                     END,
+                     scheduler_interesting_history = CASE
+                         WHEN ?4 IS NULL THEN mc_pass_trace.scheduler_interesting_history
+                         WHEN json_array_length(mc_pass_trace.scheduler_interesting_history) < 256 THEN
+                             json_insert(
+                                 mc_pass_trace.scheduler_interesting_history,
+                                 '$[#]', json(?4)
+                             )
+                         ELSE
+                             json_insert(
+                                 (SELECT json_group_array(json(value))
+                                    FROM json_each(mc_pass_trace.scheduler_interesting_history)
+                                   WHERE key >= json_array_length(
+                                       mc_pass_trace.scheduler_interesting_history
+                                   ) - 255),
+                                 '$[#]', json(?4)
+                             )
                      END",
-                params![session_id, observation.timestamp_ms, observation_json],
+                params![
+                    session_id,
+                    observation.timestamp_ms,
+                    observation_json,
+                    interesting_json
+                ],
             )?;
             Ok(())
         })?;
@@ -7076,6 +7204,109 @@ impl McStore {
             )?;
             let rows = statement
                 .query_map(params![session_id, start_ms, end_ms], |row| {
+                    let raw = row.get::<_, String>(0)?;
+                    serde_json::from_str(&raw).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?)
+    }
+
+    /// Load incident-worthy scheduler observations from the independently bounded retention set.
+    /// The inclusive module-clock range narrows candidates; sender time and fingerprint remain
+    /// available on each result for exact cross-system correlation.
+    pub fn load_interesting_pass_scheduler_history(
+        &self,
+        session_id: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<InterestingPassSchedulerObservation>, McStoreError> {
+        if start_ms > end_ms {
+            return Ok(Vec::new());
+        }
+        Ok(self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT history.value
+                   FROM mc_pass_trace AS trace,
+                        json_each(trace.scheduler_interesting_history) AS history
+                  WHERE trace.session_id = ?1
+                    AND CAST(json_extract(history.value, '$.timestamp_ms') AS INTEGER)
+                        BETWEEN ?2 AND ?3
+                  ORDER BY CAST(history.key AS INTEGER)",
+            )?;
+            let rows = statement
+                .query_map(params![session_id, start_ms, end_ms], |row| {
+                    let raw = row.get::<_, String>(0)?;
+                    serde_json::from_str(&raw).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?)
+    }
+
+    /// Find retained passes by the sender-stamped instant shared by both sides of an exchange.
+    pub fn load_interesting_pass_scheduler_history_by_request_time(
+        &self,
+        session_id: &str,
+        request_observed_at_ms: u64,
+    ) -> Result<Vec<InterestingPassSchedulerObservation>, McStoreError> {
+        let request_observed_at_ms = request_observed_at_ms.to_string();
+        Ok(self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT history.value
+                   FROM mc_pass_trace AS trace,
+                        json_each(trace.scheduler_interesting_history) AS history
+                  WHERE trace.session_id = ?1
+                    AND CAST(json_extract(
+                        history.value, '$.request_observed_at_ms'
+                    ) AS TEXT) = ?2
+                  ORDER BY CAST(history.key AS INTEGER)",
+            )?;
+            let rows = statement
+                .query_map(params![session_id, request_observed_at_ms], |row| {
+                    let raw = row.get::<_, String>(0)?;
+                    serde_json::from_str(&raw).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?)
+    }
+
+    /// Find retained passes by the caller-owned full-array fingerprint.
+    pub fn load_interesting_pass_scheduler_history_by_fingerprint(
+        &self,
+        session_id: &str,
+        full_array_fingerprint: &str,
+    ) -> Result<Vec<InterestingPassSchedulerObservation>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT history.value
+                   FROM mc_pass_trace AS trace,
+                        json_each(trace.scheduler_interesting_history) AS history
+                  WHERE trace.session_id = ?1
+                    AND json_extract(history.value, '$.full_array_fingerprint') = ?2
+                  ORDER BY CAST(history.key AS INTEGER)",
+            )?;
+            let rows = statement
+                .query_map(params![session_id, full_array_fingerprint], |row| {
                     let raw = row.get::<_, String>(0)?;
                     serde_json::from_str(&raw).map_err(|error| {
                         rusqlite::Error::FromSqlConversionFailure(
@@ -8472,6 +8703,9 @@ impl McStore {
                 project_root: None,
                 first_divergence: None,
                 scheduler_observation: None,
+                scheduler_request_observed_at_ms: None,
+                scheduler_full_array_fingerprint: None,
+                scheduler_applied_reductions: false,
                 overlays: TransformOverlayBatch::default(),
             },
         )
@@ -8494,6 +8728,9 @@ impl McStore {
             project_root,
             first_divergence,
             scheduler_observation,
+            scheduler_request_observed_at_ms,
+            scheduler_full_array_fingerprint,
+            scheduler_applied_reductions,
             overlays,
         } = request;
         let max_seen_ordinal = overlays
@@ -8528,10 +8765,23 @@ impl McStore {
         let meta_json =
             serde_json::to_string(meta).map_err(|e| McStoreError::Serde(e.to_string()))?;
         let scheduler_observation_json = scheduler_observation
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|error| McStoreError::Serde(error.to_string()))?;
+            .map(serialize_scheduler_observation)
+            .transpose()?;
         let next = expected.unwrap_or(0) + 1;
+        let scheduler_interesting_json = scheduler_observation
+            .filter(|observation| {
+                scheduler_applied_reductions
+                    || first_divergence.is_some()
+                    || scheduler_observation_is_inherently_interesting(observation)
+            })
+            .map(|observation| {
+                serialize_interesting_scheduler_observation(
+                    observation,
+                    scheduler_request_observed_at_ms,
+                    scheduler_full_array_fingerprint,
+                )
+            })
+            .transpose()?;
         let canonical_project_root = project_root
             .filter(|root| !root.is_empty())
             .map(|root| canonical_root(root).to_string_lossy().into_owned());
@@ -8639,13 +8889,15 @@ impl McStore {
                      receive_count,
                      first_divergence,
                      last_divergence,
-                     scheduler_history
+                     scheduler_history,
+                     scheduler_interesting_history
                  ) VALUES (
                      ?1, 0, 0, NULL, NULL, 0, 0, ?2,
                      CASE WHEN ?2 IS NOT NULL THEN
                          json_object('pass_id', ?3, 'timestamp_ms', ?4, 'divergence', json(?2))
                      ELSE NULL END,
-                     CASE WHEN ?5 IS NOT NULL THEN json_array(json(?5)) ELSE '[]' END
+                     CASE WHEN ?5 IS NOT NULL THEN json_array(json(?5)) ELSE '[]' END,
+                     CASE WHEN ?6 IS NOT NULL THEN json_array(json(?6)) ELSE '[]' END
                  )
                  ON CONFLICT(session_id) DO UPDATE SET
                      first_divergence = excluded.first_divergence,
@@ -8666,15 +8918,33 @@ impl McStore {
                                     FROM json_each(mc_pass_trace.scheduler_history)
                                    WHERE key >= json_array_length(mc_pass_trace.scheduler_history) - 255),
                                  '$[#]', json(?5)
-                             )
-                     END",
-                params![
-                    session_id,
-                    first_divergence,
-                    divergence_pass_id,
-                    divergence_at_ms,
-                    scheduler_observation_json
-                ],
+                              )
+                      END,
+                      scheduler_interesting_history = CASE
+                          WHEN ?6 IS NULL THEN mc_pass_trace.scheduler_interesting_history
+                          WHEN json_array_length(mc_pass_trace.scheduler_interesting_history) < 256 THEN
+                              json_insert(
+                                  mc_pass_trace.scheduler_interesting_history,
+                                  '$[#]', json(?6)
+                              )
+                          ELSE
+                              json_insert(
+                                  (SELECT json_group_array(json(value))
+                                     FROM json_each(mc_pass_trace.scheduler_interesting_history)
+                                    WHERE key >= json_array_length(
+                                        mc_pass_trace.scheduler_interesting_history
+                                    ) - 255),
+                                  '$[#]', json(?6)
+                              )
+                      END",
+                 params![
+                     session_id,
+                     first_divergence,
+                     divergence_pass_id,
+                     divergence_at_ms,
+                     scheduler_observation_json,
+                     scheduler_interesting_json
+                 ],
             )?;
             if let Some(project_root) = canonical_project_root.as_deref() {
                 // Durable root lineage is committed with the cache CAS, so a restart cannot
@@ -16710,6 +16980,9 @@ mod tests {
                         project_root: Some("/root-a"),
                         first_divergence: None,
                         scheduler_observation: None,
+                        scheduler_request_observed_at_ms: None,
+                        scheduler_full_array_fingerprint: None,
+                        scheduler_applied_reductions: false,
                         overlays: TransformOverlayBatch {
                             created_at_ms: observed_at,
                             ..Default::default()
@@ -16782,6 +17055,9 @@ mod tests {
                     project_root: Some(link_text),
                     first_divergence: None,
                     scheduler_observation: None,
+                    scheduler_request_observed_at_ms: None,
+                    scheduler_full_array_fingerprint: None,
+                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -16851,6 +17127,9 @@ mod tests {
                     project_root: Some(missing_text),
                     first_divergence: None,
                     scheduler_observation: None,
+                    scheduler_request_observed_at_ms: None,
+                    scheduler_full_array_fingerprint: None,
+                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -16983,6 +17262,9 @@ mod tests {
                     project_root: None,
                     first_divergence: None,
                     scheduler_observation: None,
+                    scheduler_request_observed_at_ms: None,
+                    scheduler_full_array_fingerprint: None,
+                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
                         tag_mints: &tag_mints,
@@ -17062,6 +17344,9 @@ mod tests {
                     project_root: None,
                     first_divergence: None,
                     scheduler_observation: None,
+                    scheduler_request_observed_at_ms: None,
+                    scheduler_full_array_fingerprint: None,
+                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
                         tag_mints: &tags,
@@ -17213,6 +17498,9 @@ mod tests {
                     project_root: None,
                     first_divergence: None,
                     scheduler_observation: None,
+                    scheduler_request_observed_at_ms: None,
+                    scheduler_full_array_fingerprint: None,
+                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -17916,6 +18204,9 @@ mod tests {
                         project_root: None,
                         first_divergence: None,
                         scheduler_observation: None,
+                        scheduler_request_observed_at_ms: None,
+                        scheduler_full_array_fingerprint: None,
+                        scheduler_applied_reductions: false,
                         overlays: TransformOverlayBatch {
                             max_seen_ordinal: Some(3),
                             temporal_marks: &temporal_marks,
@@ -17974,6 +18265,9 @@ mod tests {
                     project_root: None,
                     first_divergence: None,
                     scheduler_observation: None,
+                    scheduler_request_observed_at_ms: None,
+                    scheduler_full_array_fingerprint: None,
+                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(4),
                         temporal_marks: &late_mark,
@@ -18193,8 +18487,12 @@ mod tests {
             scheduler_decision: "Force85".to_string(),
             drain_latch_active: true,
         };
-        store.trace_pass_stable("scheduler-trace", &defer).unwrap();
-        store.trace_pass_stable("scheduler-trace", &force).unwrap();
+        store
+            .trace_pass_stable("scheduler-trace", &defer, None, None)
+            .unwrap();
+        store
+            .trace_pass_stable("scheduler-trace", &force, None, None)
+            .unwrap();
         let scheduler_trace = store.load_pass_trace("scheduler-trace").unwrap().unwrap();
         assert_eq!(
             scheduler_trace.scheduler_history,
@@ -18216,6 +18514,8 @@ mod tests {
                         scheduler_decision: "Execute".to_string(),
                         drain_latch_active: false,
                     },
+                    None,
+                    None,
                 )
                 .unwrap();
         }
@@ -18236,6 +18536,247 @@ mod tests {
             capped.last_reject_error.as_ref().unwrap().chars().count(),
             2_000
         );
+    }
+
+    #[test]
+    fn scheduler_interesting_pass_survives_ordinary_history_flood() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let interesting = PassSchedulerObservation {
+            timestamp_ms: 1,
+            scheduler_decision: "Force85".to_string(),
+            drain_latch_active: true,
+        };
+
+        store
+            .trace_pass_stable(
+                "scheduler-flood",
+                &interesting,
+                Some(10_001),
+                Some("oldest-interest"),
+            )
+            .unwrap();
+        for timestamp_ms in 2..=513 {
+            store
+                .trace_pass_stable(
+                    "scheduler-flood",
+                    &PassSchedulerObservation {
+                        timestamp_ms,
+                        scheduler_decision: "Defer".to_string(),
+                        drain_latch_active: false,
+                    },
+                    Some(10_000 + timestamp_ms as u64),
+                    None,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .load_interesting_pass_scheduler_history("scheduler-flood", 1, 1)
+                .unwrap(),
+            vec![InterestingPassSchedulerObservation::from_observation(
+                &interesting,
+                Some(10_001),
+                Some("oldest-interest"),
+            )],
+            "the oldest interesting pass must survive a recency-ring flood"
+        );
+        let recency = store.load_pass_trace("scheduler-flood").unwrap().unwrap();
+        assert_eq!(recency.scheduler_history.len(), PASS_SCHEDULER_HISTORY_CAP);
+        assert_eq!(recency.scheduler_history.first().unwrap().timestamp_ms, 258);
+    }
+
+    #[test]
+    fn scheduler_interesting_history_is_oldest_first_bounded_and_byte_bounded() {
+        let worst_observation = PassSchedulerObservation {
+            timestamp_ms: i64::MIN,
+            scheduler_decision: "Emergency95".to_string(),
+            drain_latch_active: false,
+        };
+        assert_eq!(
+            serialize_scheduler_observation(&worst_observation)
+                .unwrap()
+                .len(),
+            MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES
+        );
+        assert_eq!(
+            serialize_interesting_scheduler_observation(
+                &worst_observation,
+                Some(u64::MAX),
+                Some(&"\0".repeat(MAX_FULL_ARRAY_FINGERPRINT_BYTES)),
+            )
+            .unwrap()
+            .len(),
+            MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        for timestamp_ms in 0..=256 {
+            store
+                .trace_pass_stable(
+                    "interesting-bound",
+                    &PassSchedulerObservation {
+                        timestamp_ms,
+                        scheduler_decision: "Emergency95".to_string(),
+                        drain_latch_active: true,
+                    },
+                    Some(timestamp_ms as u64),
+                    Some(&"x".repeat(MAX_FULL_ARRAY_FINGERPRINT_BYTES)),
+                )
+                .unwrap();
+        }
+
+        let retained = store
+            .load_interesting_pass_scheduler_history("interesting-bound", i64::MIN, i64::MAX)
+            .unwrap();
+        assert_eq!(retained.len(), PASS_SCHEDULER_INTERESTING_HISTORY_CAP);
+        assert_eq!(retained.first().unwrap().timestamp_ms, 1);
+        assert_eq!(retained.last().unwrap().timestamp_ms, 256);
+        let telemetry_bytes = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT length(CAST(scheduler_history AS BLOB))
+                          + length(CAST(scheduler_interesting_history AS BLOB))
+                       FROM mc_pass_trace WHERE session_id = 'interesting-bound'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert!(telemetry_bytes as usize <= PASS_SCHEDULER_TELEMETRY_MAX_BYTES);
+    }
+
+    #[test]
+    fn scheduler_interesting_history_queries_time_and_shared_request_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let entries = [
+            (100, "Execute", 9_001, "fingerprint-a"),
+            (100, "Force85", 9_024, "fingerprint-b"),
+            (300, "Emergency95", 9_300, "fingerprint-c"),
+        ];
+        for (timestamp_ms, decision, request_time, fingerprint) in entries {
+            store
+                .trace_pass_stable(
+                    "interesting-query",
+                    &PassSchedulerObservation {
+                        timestamp_ms,
+                        scheduler_decision: decision.to_string(),
+                        drain_latch_active: decision == "Execute",
+                    },
+                    Some(request_time),
+                    Some(fingerprint),
+                )
+                .unwrap();
+        }
+
+        let range = store
+            .load_interesting_pass_scheduler_history("interesting-query", 100, 299)
+            .unwrap();
+        assert_eq!(range.len(), 2, "the module-clock range is inclusive");
+        assert_eq!(range[0].scheduler_decision, "Execute");
+        assert_eq!(range[1].scheduler_decision, "Force85");
+
+        for (request_time, fingerprint, expected_decision) in [
+            (9_001, "fingerprint-a", "Execute"),
+            (9_024, "fingerprint-b", "Force85"),
+        ] {
+            let by_request_time = store
+                .load_interesting_pass_scheduler_history_by_request_time(
+                    "interesting-query",
+                    request_time,
+                )
+                .unwrap();
+            assert_eq!(by_request_time.len(), 1);
+            assert_eq!(by_request_time[0].scheduler_decision, expected_decision);
+            assert_eq!(
+                by_request_time[0].full_array_fingerprint.as_deref(),
+                Some(fingerprint)
+            );
+
+            let by_fingerprint = store
+                .load_interesting_pass_scheduler_history_by_fingerprint(
+                    "interesting-query",
+                    fingerprint,
+                )
+                .unwrap();
+            assert_eq!(by_fingerprint.len(), 1);
+            assert_eq!(by_fingerprint[0].scheduler_decision, expected_decision);
+            assert_eq!(by_fingerprint[0].request_observed_at_ms, Some(request_time));
+        }
+
+        store
+            .trace_pass_stable(
+                "interesting-query",
+                &PassSchedulerObservation {
+                    timestamp_ms: 400,
+                    scheduler_decision: "Force85".to_string(),
+                    drain_latch_active: false,
+                },
+                None,
+                Some("fingerprint-without-sender-time"),
+            )
+            .unwrap();
+        let absent = store
+            .load_interesting_pass_scheduler_history_by_fingerprint(
+                "interesting-query",
+                "fingerprint-without-sender-time",
+            )
+            .unwrap();
+        assert_eq!(absent.len(), 1);
+        assert_eq!(absent[0].request_observed_at_ms, None);
+    }
+
+    #[test]
+    fn scheduler_interest_includes_reductions_and_output_divergence_on_defer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let core = CoreState::default();
+        let meta = ModuleMeta::default();
+        let observation = PassSchedulerObservation {
+            timestamp_ms: 500,
+            scheduler_decision: "Defer".to_string(),
+            drain_latch_active: false,
+        };
+
+        for (session_id, first_divergence, applied_reductions, fingerprint) in [
+            ("divergence-interest", Some("{}"), false, "diverged"),
+            ("reduction-interest", None, true, "reduced"),
+        ] {
+            store
+                .commit_transform(
+                    session_id,
+                    TransformCommit {
+                        expected: None,
+                        core: &core,
+                        meta: &meta,
+                        consumed_drop_ids: &[],
+                        first_applied_command_ids: &[],
+                        memory_revision: None,
+                        compartment_max_seq: None,
+                        project_root: None,
+                        first_divergence,
+                        scheduler_observation: Some(&observation),
+                        scheduler_request_observed_at_ms: Some(500),
+                        scheduler_full_array_fingerprint: Some(fingerprint),
+                        scheduler_applied_reductions: applied_reductions,
+                        overlays: TransformOverlayBatch::default(),
+                    },
+                )
+                .unwrap();
+            let retained = store
+                .load_interesting_pass_scheduler_history(session_id, 500, 500)
+                .unwrap();
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained[0].scheduler_decision, "Defer");
+            assert_eq!(
+                retained[0].full_array_fingerprint.as_deref(),
+                Some(fingerprint)
+            );
+        }
     }
 
     #[test]
@@ -18628,7 +19169,7 @@ mod tests {
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=47).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=48).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -18685,18 +19226,18 @@ mod tests {
             })
             .unwrap();
         assert_eq!(fresh_has_table.as_deref(), Some("mc_pass_trace"));
-        let fresh_has_scheduler_history = fresh
+        let fresh_has_scheduler_histories = fresh
             .inner
             .with_conn(|conn| {
                 conn.query_row(
                     "SELECT COUNT(*) FROM pragma_table_info('mc_pass_trace')
-                      WHERE name = 'scheduler_history'",
+                      WHERE name IN ('scheduler_history', 'scheduler_interesting_history')",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
             })
             .unwrap();
-        assert_eq!(fresh_has_scheduler_history, 1);
+        assert_eq!(fresh_has_scheduler_histories, 2);
         let fresh_has_import_table = fresh
             .inner
             .with_conn(|conn| {
@@ -18817,18 +19358,18 @@ mod tests {
             })
             .unwrap();
         assert_eq!(migrated_has_table.as_deref(), Some("mc_pass_trace"));
-        let migrated_has_scheduler_history = migrated
+        let migrated_has_scheduler_histories = migrated
             .inner
             .with_conn(|conn| {
                 conn.query_row(
                     "SELECT COUNT(*) FROM pragma_table_info('mc_pass_trace')
-                      WHERE name = 'scheduler_history'",
+                      WHERE name IN ('scheduler_history', 'scheduler_interesting_history')",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
             })
             .unwrap();
-        assert_eq!(migrated_has_scheduler_history, 1);
+        assert_eq!(migrated_has_scheduler_histories, 2);
         let migrated_has_import_table = migrated
             .inner
             .with_conn(|conn| {
@@ -22044,7 +22585,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=47).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=48).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)
@@ -24444,7 +24985,6 @@ mod lineage_descent_tests {
         }]
     }
 
-
     /// The CC-leg mid assigner is zero-based: a fresh replacement array's
     /// anchor sits at ordinal 0 (measured on the rig — ccm-0#1 carrying the
     /// stored summary). A fresh-origin anchor at 0 must descend exactly like
@@ -24519,7 +25059,7 @@ mod lineage_descent_tests {
     }
 
     #[test]
-        fn descent_copies_verbatim_ranges_writes_real_boundary_and_replay_does_not_rebump() {
+    fn descent_copies_verbatim_ranges_writes_real_boundary_and_replay_does_not_rebump() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         seed_lineage(&store, "A", 10);
@@ -24928,12 +25468,7 @@ mod lineage_descent_tests {
         let store = store(dir.path());
         seed_lineage(&store, "A", 10);
         store
-            .commit(
-                "B",
-                None,
-                &CoreState::default(),
-                &ModuleMeta::default(),
-            )
+            .commit("B", None, &CoreState::default(), &ModuleMeta::default())
             .unwrap();
         let target_before = store.load("B").unwrap();
         let prior_before = store.load("A").unwrap();
