@@ -66,6 +66,31 @@ describe("embeddingModelsMatch token-boundary semantics", () => {
             embeddingModelsMatch("text-embedding-3-small", "openai/text-embedding-3-small"),
         ).toBe(true);
     });
+    test("matches OpenRouter's canonicalized prefix and variant removal (#306)", () => {
+        expect(
+            embeddingModelsMatch(
+                "private/openrouter/nvidia/llama-nemotron-embed-vl-1b-v2",
+                "nvidia/llama-nemotron-embed-vl-1b-v2:free",
+            ),
+        ).toBe(true);
+    });
+    test("matches a single-sided variant tag", () => {
+        expect(embeddingModelsMatch("X:latest", "X")).toBe(true);
+    });
+    test("matches equal tags", () => {
+        expect(embeddingModelsMatch("X:free", "X:free")).toBe(true);
+    });
+    test("rejects different model-size tags", () => {
+        expect(embeddingModelsMatch("mxbai-embed-large:335m", "mxbai-embed-large:137m")).toBe(
+            false,
+        );
+        expect(embeddingModelsMatch("nomic-embed-text:v1", "nomic-embed-text:v1.5")).toBe(false);
+    });
+    test("still rejects a genuine substitution with a variant tag", () => {
+        expect(
+            embeddingModelsMatch("all-minilm-l6-v2", "nvidia/llama-nemotron-embed-vl-1b-v2:free"),
+        ).toBe(false);
+    });
     test("REJECTS a broad configured name contained as an interior token (corruption hole)", () => {
         // The bug: served `…-qwen3-embedding-0.6b` contains configured `qwen3-embedding`
         // but `0.6b` is a distinct model token, not a version suffix.
