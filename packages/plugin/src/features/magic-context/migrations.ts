@@ -350,6 +350,7 @@ export const MIGRATIONS: Migration[] = [
                     status TEXT NOT NULL DEFAULT 'active',
                     promoted_at INTEGER NOT NULL,
                     source_candidate_ids TEXT DEFAULT '[]',
+                    source_candidate_provenance TEXT,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
@@ -1849,6 +1850,7 @@ export const MIGRATIONS: Migration[] = [
                     last_observed_at INTEGER,
                     answer_refreshed_at INTEGER,
                     source_candidate_ids TEXT NOT NULL DEFAULT '[]',
+                    source_candidate_provenance TEXT,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
@@ -2771,6 +2773,18 @@ export const MIGRATIONS: Migration[] = [
                 "compile_status",
                 "TEXT CHECK(compile_status IN ('compiled', 'plain', 'refused'))",
             );
+        },
+    },
+    {
+        version: 77,
+        description: "persist scoped provenance for promoted user memories and primers",
+        up(db: Database): void {
+            if (tableExists(db, "user_memories")) {
+                ensureColumn(db, "user_memories", "source_candidate_provenance", "TEXT");
+            }
+            if (tableExists(db, "primers")) {
+                ensureColumn(db, "primers", "source_candidate_provenance", "TEXT");
+            }
         },
     },
 ];
