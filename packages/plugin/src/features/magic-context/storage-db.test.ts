@@ -31,6 +31,7 @@ import {
     closeDatabase,
     enforceSchemaFence,
     FORK_MIGRATION_VERSION_FLOOR,
+    formatInconclusiveOpenCodeMigrationWarning,
     getLiveMigrationBlockingProcesses,
     getMigrationOnOpenRefusal,
     getPersistedSchemaVersion,
@@ -439,6 +440,78 @@ describe("storage-db", () => {
             expect(getMigrationOnOpenRefusal()).toBeNull();
         });
 
+        for (const scenario of [
+            {
+                name: "a confirmed live OpenCode server",
+                pid: () => process.pid,
+                configure: () => setLinuxIdentityProbe(),
+                blocksMigration: true,
+            },
+            {
+                name: "a dead OpenCode server PID",
+                pid: () => 2_147_483_647,
+                configure: () => undefined,
+                blocksMigration: false,
+            },
+            {
+                name: "an OpenCode server probe that sandbox policy prevents from running",
+                pid: () => process.pid,
+                configure: () => {
+                    const permissionDenied = new Error(
+                        "sandbox denied process probe",
+                    ) as NodeJS.ErrnoException;
+                    permissionDenied.code = "EPERM";
+                    __setRpcIdentityTestHooks({
+                        platform: "linux",
+                        processKill: (() => {
+                            throw permissionDenied;
+                        }) as typeof process.kill,
+                        readFileSync: (() => {
+                            throw permissionDenied;
+                        }) as typeof readFileSync,
+                    });
+                },
+                blocksMigration: false,
+            },
+        ]) {
+            it(`#when RPC discovery finds ${scenario.name} #then only the confirmed server blocks migration`, () => {
+                const dataHome = useTempDataHome("storage-db-rpc-probe-matrix-");
+                const dbPath = seedPendingMigration(dataHome);
+                const portDir = join(dirname(dbPath), "rpc", "test-project");
+                mkdirSync(portDir, { recursive: true });
+                const pid = scenario.pid();
+                writeFileSync(
+                    join(portDir, `port-${pid}.json`),
+                    JSON.stringify({ port: 43123, pid, started_at: 1_200_000 }),
+                );
+                scenario.configure();
+
+                const opened = openDatabase();
+
+                expect(opened === null).toBe(scenario.blocksMigration);
+                expect(readPersistedVersion(dbPath)).toBe(
+                    scenario.blocksMigration
+                        ? LATEST_SUPPORTED_VERSION - 1
+                        : LATEST_SUPPORTED_VERSION,
+                );
+                if (!scenario.blocksMigration && pid === process.pid) {
+                    expect(inspectRpcServerDiscovery(dirname(dbPath))).toMatchObject({
+                        state: "inconclusive",
+                        serverPids: [],
+                        inconclusivePids: [process.pid],
+                    });
+                    // Sandbox uncertainty must not look like a real multi-instance
+                    // refusal: users need to know that migration continued safely.
+                    expect(
+                        formatInconclusiveOpenCodeMigrationWarning(dbPath, [process.pid]),
+                    ).toContain("continuing migration");
+                    expect(
+                        formatInconclusiveOpenCodeMigrationWarning(dbPath, [process.pid]),
+                    ).toContain("OS sandbox denied kill(0) or ps");
+                }
+            });
+        }
+
         it("#when an older Pi harness is live #then refuses a pending migration", () => {
             const dataHome = useTempDataHome("storage-db-live-pi-migration-");
             const dbPath = seedPendingMigration(dataHome);
@@ -457,6 +530,22 @@ describe("storage-db", () => {
                 { harness: "Pi harness", pid: 41001 },
             ]);
             expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
+        });
+
+        it("#when sandbox policy prevents the Pi process-list probe #then allows a pending migration", () => {
+            const dataHome = useTempDataHome("storage-db-inconclusive-pi-migration-");
+            const dbPath = seedPendingMigration(dataHome);
+            __setRpcIdentityTestHooks({
+                processListExecFileSync: (() => {
+                    const error = new Error("sandbox denied ps") as NodeJS.ErrnoException;
+                    error.code = "EPERM";
+                    throw error;
+                }) as typeof execFileSync,
+            });
+
+            expect(openDatabase()).not.toBeNull();
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+            expect(getMigrationOnOpenRefusal()).toBeNull();
         });
 
         it("#when every advertised PID is stale #then deletes stale files and allows migration", () => {

@@ -36,6 +36,39 @@ describe("resolveProjectIdentity directory fallback", () => {
         expect(resolveProjectIdentityForSession(homedir(), true)).toBe(expected);
     });
 
+    test("resolves a project identity when sandbox policy denies realpath for the home directory", () => {
+        const project = tempDir();
+        const deniedHome = tempDir();
+        const originalNative = realpathSync.native;
+        const permissionDenied = (): NodeJS.ErrnoException => {
+            const error = new Error("sandbox denied realpath") as NodeJS.ErrnoException;
+            error.code = "EPERM";
+            return error;
+        };
+        __setProjectIdentityTestHooks({ homeDirectory: () => deniedHome });
+        Object.defineProperty(realpathSync, "native", {
+            configurable: true,
+            value: (() => {
+                throw permissionDenied();
+            }) as typeof realpathSync.native,
+        });
+
+        try {
+            const expected = `dir:${createHash("md5")
+                .update(project, "utf8")
+                .digest("hex")
+                .slice(0, 12)}`;
+            expect(resolveProjectIdentityForSession(project)).toBe(expected);
+        } finally {
+            Object.defineProperty(realpathSync, "native", {
+                configurable: true,
+                value: originalNative,
+            });
+            rmSync(project, { recursive: true, force: true });
+            rmSync(deniedHome, { recursive: true, force: true });
+        }
+    });
+
     test("keeps a contained repository distinct from the home identity", () => {
         const contained = mkdtempSync(join(homedir(), "mc-home-identity-"));
         try {

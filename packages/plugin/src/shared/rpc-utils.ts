@@ -50,13 +50,20 @@ export function legacyRpcPortFilePath(storageDir: string, directory: string): st
     return join(rpcPortDir(storageDir, directory), "port");
 }
 
-export function isPidAlive(pid: number): boolean {
-    if (!Number.isInteger(pid) || pid <= 0) return false;
+export type PidLiveness = "alive" | "dead" | "inconclusive";
+
+/**
+ * Check whether the kernel confirms a PID is live without treating a denied
+ * probe as confirmation. Sandboxes commonly reject `kill(pid, 0)` with EPERM
+ * even when the PID does not exist outside their process view.
+ */
+export function isPidAlive(pid: number): PidLiveness {
+    if (!Number.isInteger(pid) || pid <= 0) return "dead";
     try {
-        process.kill(pid, 0);
-        return true;
-    } catch (err) {
-        return (err as NodeJS.ErrnoException).code === "EPERM";
+        rpcIdentityProcessKill(pid, 0);
+        return "alive";
+    } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ESRCH" ? "dead" : "inconclusive";
     }
 }
 
@@ -67,6 +74,7 @@ const OPEN_CODE_COMMAND_MARKERS = ["opencode", "node", "bun", "electron"];
 
 let rpcIdentityReadFileSync: typeof readFileSync = readFileSync;
 let rpcIdentityExecFileSync: typeof execFileSync = execFileSync;
+let rpcIdentityProcessKill: typeof process.kill = process.kill;
 let rpcProcessListExecFileSync: typeof execFileSync = execFileSync;
 let rpcProcessListTestOverride = false;
 let rpcIdentityPlatform: NodeJS.Platform = process.platform;
@@ -155,38 +163,44 @@ function commandLooksLikeOpenCode(command: string): boolean {
  * A PID can be reused after its original process exits. On Linux, procfs gives
  * us a process start time without spawning a helper; other platforms use `ps`
  * only on this cold database-open guard path. Legacy records without a start
- * time use a weaker command-name check, and every probe failure stays live so
- * this identity check cannot weaken the migration guard on uncertainty.
+ * time use a weaker command-name check. A failed filesystem or `ps` probe is
+ * inconclusive, not proof that this port record still belongs to OpenCode.
  */
-export function isPidIdentityPlausible(record: RpcPortFileRecord): boolean {
-    if (!Number.isInteger(record.pid) || record.pid <= 0) return false;
+export type PidIdentityPlausibility = "plausible" | "implausible" | "inconclusive";
+
+export function isPidIdentityPlausible(record: RpcPortFileRecord): PidIdentityPlausibility {
+    if (!Number.isInteger(record.pid) || record.pid <= 0) return "implausible";
 
     if (Number.isFinite(record.started_at) && record.started_at > 0) {
         const processStartTime =
             rpcIdentityPlatform === "linux"
                 ? readLinuxProcessStartTime(record.pid)
                 : readPsProcessStartTime(record.pid);
-        if (processStartTime === null) return true;
-        return processStartTime <= record.started_at + RPC_IDENTITY_SKEW_TOLERANCE_MS;
+        if (processStartTime === null) return "inconclusive";
+        return processStartTime <= record.started_at + RPC_IDENTITY_SKEW_TOLERANCE_MS
+            ? "plausible"
+            : "implausible";
     }
 
     const command =
         rpcIdentityPlatform === "linux"
             ? readLinuxProcessCommand(record.pid)
             : readPsProcessCommand(record.pid);
-    if (command === null) return true;
-    return commandLooksLikeOpenCode(command);
+    if (command === null) return "inconclusive";
+    return commandLooksLikeOpenCode(command) ? "plausible" : "implausible";
 }
 
 export function __setRpcIdentityTestHooks(hooks: {
     readFileSync?: typeof readFileSync;
     execFileSync?: typeof execFileSync;
+    processKill?: typeof process.kill;
     processListExecFileSync?: typeof execFileSync;
     platform?: NodeJS.Platform;
     nowMs?: () => number;
 }): void {
     rpcIdentityReadFileSync = hooks.readFileSync ?? readFileSync;
     rpcIdentityExecFileSync = hooks.execFileSync ?? execFileSync;
+    rpcIdentityProcessKill = hooks.processKill ?? process.kill;
     rpcProcessListExecFileSync = hooks.processListExecFileSync ?? execFileSync;
     rpcProcessListTestOverride = hooks.processListExecFileSync !== undefined;
     rpcIdentityPlatform = hooks.platform ?? process.platform;
@@ -196,6 +210,7 @@ export function __setRpcIdentityTestHooks(hooks: {
 export function __resetRpcIdentityTestHooks(): void {
     rpcIdentityReadFileSync = readFileSync;
     rpcIdentityExecFileSync = execFileSync;
+    rpcIdentityProcessKill = process.kill;
     rpcProcessListExecFileSync = execFileSync;
     rpcProcessListTestOverride = false;
     rpcIdentityPlatform = process.platform;
@@ -228,9 +243,9 @@ export interface PiProcessDiscovery {
 
 /**
  * Inspect Pi/OMP processes without converting a failed process-list probe into
- * false evidence that no harness is running. Destructive maintenance callers
- * use the unreadable state to fail closed; ordinary migration guards retain
- * their historical best-effort process list through discoverLivePiProcessIds().
+ * false evidence that no harness is running. Callers choose their own policy
+ * for the unreadable state: destructive maintenance can fail closed, while a
+ * migration guard can proceed after reporting that no live Pi process was confirmed.
  */
 export function inspectLivePiProcesses(): PiProcessDiscovery {
     if (process.env.NODE_ENV === "test" && !rpcProcessListTestOverride) {
