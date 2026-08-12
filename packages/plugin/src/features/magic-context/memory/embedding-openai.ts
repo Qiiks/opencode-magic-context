@@ -32,13 +32,44 @@ function normalizeEndpoint(endpoint?: string): string {
     return endpoint?.trim().replace(/\/+$/, "") ?? "";
 }
 
+type ParsedEmbeddingModel = {
+    base: string;
+    tag?: string;
+};
+
+function parseEmbeddingModel(model: string): ParsedEmbeddingModel {
+    const lastColon = model.lastIndexOf(":");
+    // Colons in host-like prefixes (for example `host:port/model`) are not
+    // model tags because they occur before the final slash.
+    if (lastColon > model.lastIndexOf("/")) {
+        return { base: model.slice(0, lastColon), tag: model.slice(lastColon + 1) };
+    }
+    return { base: model };
+}
+
+function matchNormalizedEmbeddingModels(a: string, b: string): boolean {
+    if (a.length === 0 || b.length === 0) return true; // can't compare → don't reject
+    if (a === b) return true;
+    const longer = a.length >= b.length ? a : b;
+    const shorter = a.length >= b.length ? b : a;
+    const isBoundary = (ch: string) => ch === "-" || ch === "/";
+    // Version-expansion: longer = shorter + boundary + suffix (e.g. `…-small` → `…-small-v1`).
+    if (longer.startsWith(shorter) && isBoundary(longer.charAt(shorter.length))) return true;
+    // Vendor-prefix trim: longer = prefix + boundary + shorter (e.g. `openai/X` ↔ `X`).
+    if (longer.endsWith(shorter) && isBoundary(longer.charAt(longer.length - shorter.length - 1)))
+        return true;
+    return false;
+}
+
 /**
  * Whether the model an endpoint served is the model we asked for.
  *
  * Exact match after trim+lowercase, with TOKEN-BOUNDARY prefix/suffix tolerance
  * so a server that version-expands a name (`text-embedding-3-small` →
  * `…-small-v1`) or trims a vendor prefix (`openai/text-embedding-3-small` →
- * `text-embedding-3-small`) still counts as a match.
+ * `text-embedding-3-small`) still counts as a match. OpenRouter routing tags
+ * such as `:free` are ignored when only one side has a tag, while tags on both
+ * sides must be equal so Ollama model-size tags remain distinct.
  *
  * Crucially this is NOT a plain substring test. A loose `a.includes(b)` would
  * MATCH a broadly-configured name against an unrelated served model that merely
@@ -51,17 +82,21 @@ function normalizeEndpoint(endpoint?: string): string {
 export function embeddingModelsMatch(served: string, requested: string): boolean {
     const a = served.trim().toLowerCase();
     const b = requested.trim().toLowerCase();
-    if (a.length === 0 || b.length === 0) return true; // can't compare → don't reject
-    if (a === b) return true;
-    const longer = a.length >= b.length ? a : b;
-    const shorter = a.length >= b.length ? b : a;
-    const isBoundary = (ch: string) => ch === "-" || ch === "/";
-    // Version-expansion: longer = shorter + boundary + suffix (e.g. `…-small` → `…-small-v1`).
-    if (longer.startsWith(shorter) && isBoundary(longer.charAt(shorter.length))) return true;
-    // Vendor-prefix trim: longer = prefix + boundary + shorter (e.g. `openai/X` ↔ `X`).
-    if (longer.endsWith(shorter) && isBoundary(longer.charAt(longer.length - shorter.length - 1)))
-        return true;
-    return false;
+    const servedModel = parseEmbeddingModel(a);
+    const requestedModel = parseEmbeddingModel(b);
+
+    // Matching tags identify the same provider-specific model variant. Different
+    // tags can identify different weights or sizes, so they must never be ignored.
+    if (
+        servedModel.tag !== undefined &&
+        requestedModel.tag !== undefined &&
+        servedModel.tag !== requestedModel.tag
+    ) {
+        return false;
+    }
+
+    // With zero or one tag, compare the untagged names using every existing rule.
+    return matchNormalizedEmbeddingModels(servedModel.base, requestedModel.base);
 }
 
 /**
@@ -316,7 +351,7 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
             if (this.model && servedModel && !embeddingModelsMatch(servedModel, this.model)) {
                 if (!this.modelMismatchLogged) {
                     log(
-                        `[magic-context] embedding endpoint served a DIFFERENT model than requested — refusing the substituted vectors (they have the wrong dimensions/space). requested="${this.model}" served="${servedModel}". The endpoint likely substituted a loaded model; load/select "${this.model}" on the endpoint, or set embedding.model to the served model.`,
+                        `[magic-context] embedding endpoint served a DIFFERENT model than requested — refusing the substituted vectors (they have the wrong dimensions/space). requested="${this.model}" served="${servedModel}". Check that the endpoint serves the requested model; variant suffixes and vendor prefixes are matched automatically.`,
                     );
                     this.modelMismatchLogged = true;
                 }
