@@ -1,7 +1,7 @@
+import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, test } from "bun:test";
 
 const REPOSITORY_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../../../..");
 const SOURCE_ROOTS = ["packages/plugin/src", "packages/pi-plugin/src"] as const;
@@ -39,62 +39,72 @@ const KNOWN_SLOTS: Record<string, KnownSlot> = {
         classification: "VERDICT",
         reason: "Correct: circuit state expires and a half-open probe re-evaluates the endpoint.",
     },
-    "packages/plugin/src/features/magic-context/memory/project-identity.ts:directoryFallbackCache": {
-        classification: "VERDICT",
-        reason: "Saved: each read checks for a newly-created .git directory and deletes the fallback before resolving again.",
-    },
-    "packages/plugin/src/features/magic-context/memory/project-identity.ts:transientFailureCooldown": {
-        classification: "VERDICT",
-        reason: "Saved: getActiveCooldown deletes an expired entry and forces a new git probe after five minutes.",
-    },
-    "packages/plugin/src/features/magic-context/message-index.ts:MESSAGE_HISTORY_ORPHAN_UNAVAILABLE_REPROBE_MS": {
-        classification: "VERDICT",
-        reason: "Saved: source_unavailable persists a future timestamp, then the normal cooldown arithmetic re-probes after one day.",
-    },
+    "packages/plugin/src/features/magic-context/memory/project-identity.ts:directoryFallbackCache":
+        {
+            classification: "VERDICT",
+            reason: "Saved: each read checks for a newly-created .git directory and deletes the fallback before resolving again.",
+        },
+    "packages/plugin/src/features/magic-context/memory/project-identity.ts:transientFailureCooldown":
+        {
+            classification: "VERDICT",
+            reason: "Saved: getActiveCooldown deletes an expired entry and forces a new git probe after five minutes.",
+        },
+    "packages/plugin/src/features/magic-context/message-index.ts:MESSAGE_HISTORY_ORPHAN_UNAVAILABLE_REPROBE_MS":
+        {
+            classification: "VERDICT",
+            reason: "Saved: source_unavailable persists a future timestamp, then the normal cooldown arithmetic re-probes after one day.",
+        },
     "packages/plugin/src/features/magic-context/mural/storage-mural-cues.ts:muralCueColumnCache": {
         classification: "VERDICT",
         reason: "Correct by scope: the database is fully migrated before this handle reaches cue reads, so its schema cannot gain this column during use.",
     },
-    "packages/plugin/src/features/magic-context/mural/storage-mural-cues.ts:muralCueRejectionColumnCache": {
-        classification: "VERDICT",
-        reason: "Correct by scope: the database is fully migrated before this handle reaches cue reads, so its schema cannot gain this column during use.",
-    },
+    "packages/plugin/src/features/magic-context/mural/storage-mural-cues.ts:muralCueRejectionColumnCache":
+        {
+            classification: "VERDICT",
+            reason: "Correct by scope: the database is fully migrated before this handle reaches cue reads, so its schema cannot gain this column during use.",
+        },
     "packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:asyncModulePromise": {
         classification: "VERDICT",
         reason: "DEFECT: a rejected dynamic-import/WASM-init promise is retained for every later smart-note check.",
     },
-    "packages/plugin/src/features/magic-context/storage-meta-session.ts:sessionMetaSelectColumnsCache": {
-        classification: "VERDICT",
-        reason: "Correct by scope: session_meta migration completes before the first projection is built for this database handle.",
-    },
-    "packages/plugin/src/features/magic-context/memory/storage-memory.ts:memoryImportanceColumnCache": {
-        classification: "VERDICT",
-        reason: "Correct by scope: memory schema migration completes before this database handle serves memory reads.",
-    },
+    "packages/plugin/src/features/magic-context/storage-meta-session.ts:sessionMetaSelectColumnsCache":
+        {
+            classification: "VERDICT",
+            reason: "Correct by scope: session_meta migration completes before the first projection is built for this database handle.",
+        },
+    "packages/plugin/src/features/magic-context/memory/storage-memory.ts:memoryImportanceColumnCache":
+        {
+            classification: "VERDICT",
+            reason: "Correct by scope: memory schema migration completes before this database handle serves memory reads.",
+        },
     "packages/plugin/src/features/magic-context/memory/storage-memory.ts:memoryScopeColumnCache": {
         classification: "VERDICT",
         reason: "Correct by scope: memory schema migration completes before this database handle serves memory reads.",
     },
-    "packages/plugin/src/features/magic-context/memory/storage-memory.ts:memoryShareableColumnCache": {
-        classification: "VERDICT",
-        reason: "Correct by scope: memory schema migration completes before this database handle serves memory reads.",
-    },
-    "packages/plugin/src/features/magic-context/memory/storage-memory.ts:memoryClassifiedAtColumnCache": {
-        classification: "VERDICT",
-        reason: "Correct by scope: memory schema migration completes before this database handle serves memory reads.",
-    },
-    "packages/plugin/src/hooks/magic-context/ctx-reduce-availability.ts:ctxReduceRegisteredGlobally": {
-        classification: "VERDICT",
-        reason: "Correct by scope: tool registration is resolved once at plugin boot and cannot change while that instance runs.",
-    },
+    "packages/plugin/src/features/magic-context/memory/storage-memory.ts:memoryShareableColumnCache":
+        {
+            classification: "VERDICT",
+            reason: "Correct by scope: memory schema migration completes before this database handle serves memory reads.",
+        },
+    "packages/plugin/src/features/magic-context/memory/storage-memory.ts:memoryClassifiedAtColumnCache":
+        {
+            classification: "VERDICT",
+            reason: "Correct by scope: memory schema migration completes before this database handle serves memory reads.",
+        },
+    "packages/plugin/src/hooks/magic-context/ctx-reduce-availability.ts:ctxReduceRegisteredGlobally":
+        {
+            classification: "VERDICT",
+            reason: "Correct by scope: tool registration is resolved once at plugin boot and cannot change while that instance runs.",
+        },
     "packages/plugin/src/hooks/magic-context/ctx-reduce-availability.ts:availabilityBySession": {
         classification: "VERDICT",
         reason: "Correct by contract: the first persisted user message freezes that session's tool surface.",
     },
-    "packages/plugin/src/hooks/magic-context/ctx-reduce-availability.ts:permissionDeniedBySession": {
-        classification: "DIAGNOSTIC",
-        reason: "Repeatedly assigned on each cache-busting permission read; later reads replace an earlier denial.",
-    },
+    "packages/plugin/src/hooks/magic-context/ctx-reduce-availability.ts:permissionDeniedBySession":
+        {
+            classification: "DIAGNOSTIC",
+            reason: "Repeatedly assigned on each cache-busting permission read; later reads replace an earlier denial.",
+        },
     "packages/plugin/src/hooks/magic-context/read-session-formatting.ts:tokenizerLoadAttempted": {
         classification: "VERDICT",
         reason: "DEFECT: a failed tokenizer load permanently selects heuristic token counts even if the package becomes available.",
@@ -166,14 +176,16 @@ function declaredOneShotSlots(source: string): string[] {
     // `let` is deliberate: this targets mutable module state, not constant lookup
     // tables or prepared-statement handles. The initializer restriction excludes
     // ordinary counters and per-call scratch values.
-    const declarations = /^(?:export\s+)?let\s+([A-Za-z_$][\w$]*)\b[^\n]*(?:=\s*(?:null|false|true)|Promise<)/gm;
-    const verdictName = /(?:attempted|availability|compatible|cooldown|disabled|failed|failure|latch|missing|permission|promise|registered|unavailable)/i;
+    const declarations =
+        /^(?:export\s+)?let\s+([A-Za-z_$][\w$]*)\b[^\n]*(?:=\s*(?:null|false|true)|Promise<)/gm;
+    const verdictName =
+        /(?:attempted|availability|compatible|cooldown|disabled|failed|failure|latch|missing|permission|promise|registered|unavailable)/i;
     const moduleSlots = [...source.matchAll(declarations)].map((match) => match[1]);
     // A provider-local permanent failure has the same operational effect as a
     // module slot: every later provider call short-circuits without re-probing.
-    const providerLatches = [...source.matchAll(/^\s*private\s+(permanentFailure)\s*=\s*false;/gm)].map(
-        (match) => match[1],
-    );
+    const providerLatches = [
+        ...source.matchAll(/^\s*private\s+(permanentFailure)\s*=\s*false;/gm),
+    ].map((match) => match[1]);
     return [...moduleSlots, ...providerLatches].filter(
         (name): name is string => name !== undefined && verdictName.test(name),
     );
