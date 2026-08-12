@@ -93,8 +93,8 @@ export interface PreparedCompartmentInjection {
  */
 const INJECTION_CACHE_MAX = 100;
 type InjectionCacheEntry =
-    | { kind: "empty"; compartmentEndMessageId: string; renderedBytes: number }
-    | { kind: "populated"; injection: PreparedCompartmentInjection };
+    | { db: Database; kind: "empty"; compartmentEndMessageId: string; renderedBytes: number }
+    | { db: Database; kind: "populated"; injection: PreparedCompartmentInjection };
 
 const injectionCache = new BoundedSessionMap<InjectionCacheEntry>(INJECTION_CACHE_MAX);
 
@@ -319,11 +319,19 @@ export function prepareCompartmentInjection(
     // On defer (cache-safe) passes, replay the cached injection result so that
     // historian publications between passes do not bust the prompt-cache prefix.
     const cached = injectionCache.get(sessionId);
-    if (!isCacheBusting && cached) {
-        if (cached.kind === "empty") {
+    if (cached && cached.db !== db) {
+        // Session ids are unique in production, but tests and explicit database
+        // paths can reuse one across independent stores. Never replay a block
+        // rendered from a different database into the current session.
+        injectionCache.delete(sessionId);
+    }
+    const usableCached = cached?.db === db ? cached : undefined;
+
+    if (!isCacheBusting && usableCached) {
+        if (usableCached.kind === "empty") {
             return null;
         }
-        const prepared = cached.injection;
+        const prepared = usableCached.injection;
         if (prepared.compartmentEndMessageId === null) {
             sessionLog(
                 sessionId,
@@ -418,6 +426,7 @@ export function prepareCompartmentInjection(
     // Nothing to inject if we have no compartments, no facts, and no memories
     if (compartments.length === 0 && facts.length === 0 && !memoryBlock) {
         injectionCache.set(sessionId, {
+            db,
             kind: "empty",
             compartmentEndMessageId: "",
             renderedBytes: 0,
@@ -462,7 +471,7 @@ export function prepareCompartmentInjection(
             memoryCount,
             rebuiltFromDb: true,
         };
-        injectionCache.set(sessionId, { kind: "populated", injection: result });
+        injectionCache.set(sessionId, { db, kind: "populated", injection: result });
         return result;
     }
 
@@ -527,7 +536,7 @@ export function prepareCompartmentInjection(
             memoryCount,
             rebuiltFromDb: true,
         };
-        injectionCache.set(sessionId, { kind: "populated", injection: result });
+        injectionCache.set(sessionId, { db, kind: "populated", injection: result });
         return result;
     }
 
@@ -614,7 +623,7 @@ export function prepareCompartmentInjection(
     if (needsFreshMaterialization) {
         result.needsFreshMaterialization = true;
     }
-    injectionCache.set(sessionId, { kind: "populated", injection: result });
+    injectionCache.set(sessionId, { db, kind: "populated", injection: result });
     return result;
 }
 
