@@ -1655,7 +1655,12 @@ fn record_stable_pass_trace(
             pass.scheduler_drain_latch_active,
             ctx.now_ms,
         );
-        let _ = store.trace_pass_stable(&req.session_id, &observation);
+        let _ = store.trace_pass_stable(
+            &req.session_id,
+            &observation,
+            req.request_observed_at_ms,
+            req.full_array_fingerprint.as_deref(),
+        );
     }
 }
 
@@ -2537,6 +2542,9 @@ fn apply_once(
                             false,
                             ctx.now_ms,
                         )),
+                        scheduler_request_observed_at_ms: req.request_observed_at_ms,
+                        scheduler_full_array_fingerprint: req.full_array_fingerprint.as_deref(),
+                        scheduler_applied_reductions: false,
                         overlays: TransformOverlayBatch::default(),
                     },
                 )?
@@ -2633,6 +2641,9 @@ fn apply_once(
                     false,
                     ctx.now_ms,
                 )),
+                scheduler_request_observed_at_ms: req.request_observed_at_ms,
+                scheduler_full_array_fingerprint: req.full_array_fingerprint.as_deref(),
+                scheduler_applied_reductions: false,
                 overlays: TransformOverlayBatch::default(),
             },
         )?;
@@ -4206,6 +4217,10 @@ fn apply_once(
     );
     let first_applied_command_ids =
         first_applied_pending_command_ids(&pending_agent_drops, &loaded.core, &core);
+    let frozen_reductions_before = frozen_red_targets(&loaded.core);
+    let scheduler_applied_reductions = frozen_red_targets(&core)
+        .iter()
+        .any(|target| !frozen_reductions_before.contains(target));
     let state_changed = core != loaded.core || meta != loaded.meta;
     if state_changed {
         meta.last_committed_pass_at_ms = ctx.now_ms;
@@ -4233,6 +4248,9 @@ fn apply_once(
                     scheduler_outcome.drain_latch.is_active(),
                     ctx.now_ms,
                 )),
+                scheduler_request_observed_at_ms: req.request_observed_at_ms,
+                scheduler_full_array_fingerprint: req.full_array_fingerprint.as_deref(),
+                scheduler_applied_reductions,
                 overlays: TransformOverlayBatch {
                     max_seen_ordinal: pending_overlays.max_seen_ordinal,
                     tag_mints: &tag_rows[pending_overlays.tag_mint_start
@@ -11342,12 +11360,10 @@ pub(crate) mod tests {
         context.now_ms = 102;
         transform(&store, &low_request, &context).unwrap();
         context.now_ms = 103;
-        transform(
-            &store,
-            &with_usage(req(SESSION, "cfg0", messages), 90, 100),
-            &context,
-        )
-        .unwrap();
+        let mut force_request = with_usage(req(SESSION, "cfg0", messages), 90, 100);
+        force_request.request_observed_at_ms = Some(100_003);
+        force_request.full_array_fingerprint = Some("force-fingerprint".to_string());
+        transform(&store, &force_request, &context).unwrap();
 
         let history = store
             .load_pass_trace(SESSION)
@@ -11376,6 +11392,15 @@ pub(crate) mod tests {
             .load_pass_scheduler_history(SESSION, 102, 103)
             .unwrap();
         assert_eq!(incident_window, history[1..]);
+        let correlated = store
+            .load_interesting_pass_scheduler_history_by_request_time(SESSION, 100_003)
+            .unwrap();
+        assert_eq!(correlated.len(), 1);
+        assert_eq!(correlated[0].scheduler_decision, "Force85");
+        assert_eq!(
+            correlated[0].full_array_fingerprint.as_deref(),
+            Some("force-fingerprint")
+        );
     }
 
     #[test]
@@ -20722,6 +20747,9 @@ pub(crate) mod tests {
                     project_root: None,
                     first_divergence: None,
                     scheduler_observation: None,
+                    scheduler_request_observed_at_ms: None,
+                    scheduler_full_array_fingerprint: None,
+                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -20802,6 +20830,9 @@ pub(crate) mod tests {
                     project_root: None,
                     first_divergence: None,
                     scheduler_observation: None,
+                    scheduler_request_observed_at_ms: None,
+                    scheduler_full_array_fingerprint: None,
+                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch::default(),
                 },
             )
@@ -23733,6 +23764,9 @@ pub(crate) mod tests {
                 project_root: None,
                 first_divergence: None,
                 scheduler_observation: None,
+                scheduler_request_observed_at_ms: None,
+                scheduler_full_array_fingerprint: None,
+                scheduler_applied_reductions: false,
                 overlays: TransformOverlayBatch::default(),
             },
         )
