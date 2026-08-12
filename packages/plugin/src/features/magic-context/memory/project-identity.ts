@@ -413,7 +413,15 @@ export function takeDubiousOwnershipProjectIdentityWarning(directory: string): s
  * checks descendants whose nearest git root is the home directory.
  */
 function canonicalUserHomeDirectory(): string {
-    return realpathSync.native(userHomeDirectoryForIdentity());
+    const homeDirectory = userHomeDirectoryForIdentity();
+    try {
+        return realpathSync.native(homeDirectory);
+    } catch {
+        // Sandboxed OpenCode processes may know $HOME but be denied access to its
+        // metadata. Returning the original path lets later checks still recognize
+        // projects under the user's home directory without aborting plugin startup.
+        return homeDirectory;
+    }
 }
 
 export function isUserHomeDirectory(directory: string): boolean {

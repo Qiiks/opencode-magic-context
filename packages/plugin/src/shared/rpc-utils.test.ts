@@ -8,6 +8,7 @@ import {
     __setRpcIdentityTestHooks,
     discoverLivePiProcessIds,
     inspectLivePiProcesses,
+    isPidAlive,
     isPidIdentityPlausible,
     type RpcPortFileRecord,
 } from "./rpc-utils";
@@ -80,6 +81,35 @@ describe("discoverLivePiProcessIds", () => {
     });
 });
 
+describe("isPidAlive", () => {
+    test("distinguishes confirmed, dead, and inaccessible PID probes", () => {
+        const probeFailure = (code: string): NodeJS.ErrnoException => {
+            const error = new Error(`kill failed: ${code}`) as NodeJS.ErrnoException;
+            error.code = code;
+            return error;
+        };
+
+        __setRpcIdentityTestHooks({
+            processKill: (() => true) as typeof process.kill,
+        });
+        expect(isPidAlive(PID)).toBe("alive");
+
+        __setRpcIdentityTestHooks({
+            processKill: (() => {
+                throw probeFailure("ESRCH");
+            }) as typeof process.kill,
+        });
+        expect(isPidAlive(PID)).toBe("dead");
+
+        __setRpcIdentityTestHooks({
+            processKill: (() => {
+                throw probeFailure("EPERM");
+            }) as typeof process.kill,
+        });
+        expect(isPidAlive(PID)).toBe("inconclusive");
+    });
+});
+
 describe("isPidIdentityPlausible", () => {
     test("rejects a reused Linux PID when proc start time is substantially newer", () => {
         const readPaths: string[] = [];
@@ -99,7 +129,7 @@ describe("isPidIdentityPlausible", () => {
             }) as typeof execFileSync,
         });
 
-        expect(isPidIdentityPlausible(record(500_000))).toBe(false);
+        expect(isPidIdentityPlausible(record(500_000))).toBe("implausible");
         expect(readPaths).toEqual([`/proc/${PID}/stat`, "/proc/uptime"]);
     });
 
@@ -115,10 +145,10 @@ describe("isPidIdentityPlausible", () => {
 
         // The mocked process start is 1,100,000ms. The 120s tolerance is part of
         // the contract because port-file creation follows process startup.
-        expect(isPidIdentityPlausible(record(1_000_000))).toBe(true);
+        expect(isPidIdentityPlausible(record(1_000_000))).toBe("plausible");
     });
 
-    test("treats an unreadable Linux start-time probe as live", () => {
+    test("reports an unreadable Linux start-time probe as inconclusive", () => {
         __setRpcIdentityTestHooks({
             platform: "linux",
             readFileSync: linuxFiles({
@@ -126,17 +156,17 @@ describe("isPidIdentityPlausible", () => {
             }),
         });
 
-        expect(isPidIdentityPlausible(record(500_000))).toBe(true);
+        expect(isPidIdentityPlausible(record(500_000))).toBe("inconclusive");
     });
 
-    test("uses the legacy Linux command fallback and fails closed on probe errors", () => {
+    test("uses the legacy Linux command fallback and distinguishes probe errors", () => {
         __setRpcIdentityTestHooks({
             platform: "linux",
             readFileSync: linuxFiles({
                 [`/proc/${PID}/cmdline`]: "/usr/sbin/opendkim --config /etc/opendkim.conf",
             }),
         });
-        expect(isPidIdentityPlausible(record(0))).toBe(false);
+        expect(isPidIdentityPlausible(record(0))).toBe("implausible");
 
         __setRpcIdentityTestHooks({
             platform: "linux",
@@ -144,7 +174,7 @@ describe("isPidIdentityPlausible", () => {
                 [`/proc/${PID}/cmdline`]: "/usr/local/bin/opencode serve",
             }),
         });
-        expect(isPidIdentityPlausible(record(0))).toBe(true);
+        expect(isPidIdentityPlausible(record(0))).toBe("plausible");
 
         __setRpcIdentityTestHooks({
             platform: "linux",
@@ -152,7 +182,7 @@ describe("isPidIdentityPlausible", () => {
                 [`/proc/${PID}/cmdline`]: new Error("procfs unavailable"),
             }),
         });
-        expect(isPidIdentityPlausible(record(0))).toBe(true);
+        expect(isPidIdentityPlausible(record(0))).toBe("inconclusive");
     });
 
     test("uses ps start time and command probes on non-Linux platforms", () => {
@@ -162,7 +192,7 @@ describe("isPidIdentityPlausible", () => {
         });
         expect(
             isPidIdentityPlausible(record(Date.parse("Mon Aug  7 00:00:00 1970") - 121_000)),
-        ).toBe(false);
+        ).toBe("implausible");
 
         __setRpcIdentityTestHooks({
             platform: "darwin",
@@ -170,24 +200,24 @@ describe("isPidIdentityPlausible", () => {
         });
         expect(
             isPidIdentityPlausible(record(Date.parse("Mon Aug  7 00:00:00 1970") - 120_000)),
-        ).toBe(true);
+        ).toBe("plausible");
 
         __setRpcIdentityTestHooks({
             platform: "darwin",
             execFileSync: psOutput("/usr/sbin/opendkim -f"),
         });
-        expect(isPidIdentityPlausible(record(0))).toBe(false);
+        expect(isPidIdentityPlausible(record(0))).toBe("implausible");
 
         __setRpcIdentityTestHooks({
             platform: "darwin",
             execFileSync: psOutput("/Applications/OpenCode.app/Contents/MacOS/opencode"),
         });
-        expect(isPidIdentityPlausible(record(0))).toBe(true);
+        expect(isPidIdentityPlausible(record(0))).toBe("plausible");
 
         __setRpcIdentityTestHooks({
             platform: "darwin",
             execFileSync: psOutput(new Error("ps unavailable")),
         });
-        expect(isPidIdentityPlausible(record(0))).toBe(true);
+        expect(isPidIdentityPlausible(record(0))).toBe("inconclusive");
     });
 });

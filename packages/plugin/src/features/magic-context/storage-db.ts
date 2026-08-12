@@ -20,6 +20,7 @@ import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
 import {
     discoverLivePiProcessIds,
+    inspectLivePiProcesses,
     isPidAlive,
     isPidIdentityPlausible,
     parseRpcPortFile,
@@ -314,9 +315,14 @@ export function enforceSchemaFence(
 export type RpcDiscoveryUnreadableArm = "parse" | "io";
 
 export interface RpcServerDiscovery {
-    state: "absent" | "stale" | "live" | "unreadable";
+    state: "absent" | "stale" | "live" | "unreadable" | "inconclusive";
     serverPids: number[];
     staleFiles: string[];
+    /**
+     * PIDs for which the process-existence or process-identity check could not
+     * run. That failure does not prove that the process is actively using RPC.
+     */
+    inconclusivePids?: number[];
     unreadableFile?: string;
     unreadableArm?: RpcDiscoveryUnreadableArm;
 }
@@ -447,6 +453,7 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
 
     const pids = new Set<number>();
     const staleFiles: string[] = [];
+    const inconclusivePids = new Set<number>();
     for (const portFile of portFiles) {
         let raw: string;
         try {
@@ -464,8 +471,15 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
             if (junk) return junk;
             continue;
         }
-        if (isPidAlive(record.pid) && isPidIdentityPlausible(record)) pids.add(record.pid);
-        else staleFiles.push(portFile);
+        const liveness = isPidAlive(record.pid);
+        const identity = liveness === "dead" ? "implausible" : isPidIdentityPlausible(record);
+        if (liveness === "alive" && identity === "plausible") {
+            pids.add(record.pid);
+        } else if (liveness === "dead" || identity === "implausible") {
+            staleFiles.push(portFile);
+        } else {
+            inconclusivePids.add(record.pid);
+        }
     }
 
     // Remove stale evidence even when another record still proves that a server
@@ -482,6 +496,15 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
     const serverPids = [...pids].sort((a, b) => a - b);
     if (serverPids.length > 0) {
         return { state: "live", serverPids, staleFiles };
+    }
+    const uncertainPids = [...inconclusivePids].sort((a, b) => a - b);
+    if (uncertainPids.length > 0) {
+        return {
+            state: "inconclusive",
+            serverPids: [],
+            staleFiles,
+            inconclusivePids: uncertainPids,
+        };
     }
     return { state: "stale", serverPids: [], staleFiles };
 }
@@ -502,6 +525,29 @@ export function getLiveMigrationBlockingProcesses(storageDir: string): FailClose
  * older build. OpenCode servers keep their plugin loaded, and a live Pi process
  * can spawn a child with its loaded extension after another process migrates.
  */
+export function formatInconclusiveOpenCodeMigrationWarning(
+    dbPath: string,
+    pids: readonly number[],
+): string {
+    return `[magic-context] storage warning: continuing migration for ${dbPath}; OpenCode server PID ${pids.join(", ")} was not confirmed because its liveness or identity check could not run. This commonly means an OS sandbox denied kill(0) or ps. No live OpenCode server was confirmed.`;
+}
+
+function logInconclusiveMigrationProbes(
+    dbPath: string,
+    discovery: RpcServerDiscovery,
+    piProbeState: "known" | "unreadable",
+): void {
+    const uncertainPids = discovery.inconclusivePids ?? [];
+    if (uncertainPids.length > 0) {
+        log(formatInconclusiveOpenCodeMigrationWarning(dbPath, uncertainPids));
+    }
+    if (piProbeState === "unreadable") {
+        log(
+            `[magic-context] storage warning: continuing migration for ${dbPath}; the Pi/OMP process-list probe could not run, which commonly means an OS sandbox denied ps. No live Pi harness was confirmed.`,
+        );
+    }
+}
+
 function enforceMigrationOnOpenGuard(
     db: Database,
     dbPath: string,
@@ -514,9 +560,16 @@ function enforceMigrationOnOpenGuard(
         return true;
     }
     const discovery = inspectRpcServerDiscovery(dbDir);
-    const piPids = discoverLivePiProcessIds();
-    if ((discovery.state === "absent" || discovery.state === "stale") && piPids.length === 0) {
+    const piDiscovery = inspectLivePiProcesses();
+    const piPids = piDiscovery.processIds;
+    if (
+        (discovery.state === "absent" ||
+            discovery.state === "stale" ||
+            discovery.state === "inconclusive") &&
+        piPids.length === 0
+    ) {
         lastMigrationOnOpenRefusal = null;
+        logInconclusiveMigrationProbes(dbPath, discovery, piDiscovery.state);
         return true;
     }
     const blockingPids = [...new Set([...discovery.serverPids, ...piPids])].sort(
@@ -541,11 +594,11 @@ function enforceMigrationOnOpenGuard(
         );
     } else {
         const blockers = [
-            ...discovery.serverPids.map((pid) => `OpenCode server PID ${pid}`),
-            ...piPids.map((pid) => `Pi harness PID ${pid}`),
+            ...discovery.serverPids.map((pid) => `confirmed OpenCode server PID ${pid}`),
+            ...piPids.map((pid) => `confirmed Pi harness PID ${pid}`),
         ];
         log(
-            `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while ${blockers.join(", ")} may still use the old plugin build. Restart the blocking harness, then retry this process.`,
+            `[magic-context] storage fatal: refusing to migrate ${dbPath} from upstream migration v${persistedVersion} to v${latestSupportedVersion} while ${blockers.join(", ")} still use the old plugin build. Restart the blocking harness, then retry this process.`,
         );
     }
     return false;

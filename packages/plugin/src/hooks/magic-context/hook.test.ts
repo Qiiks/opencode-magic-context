@@ -5,7 +5,7 @@ process.env.OPENCODE_CLIENT = "desktop";
 
 import { afterEach, describe, expect, it, mock } from "bun:test";
 import type { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
@@ -260,6 +260,34 @@ describe("magic-context hook", () => {
         deps.directory = projectDir;
 
         expect(createMagicContextHook(deps)).not.toBeNull();
+    });
+
+    it("constructs and resolves a project when sandbox policy denies realpath for the home directory", () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-realpath-sandbox-data-");
+        const projectDir = makeTempDir("hook-realpath-sandbox-project-");
+        const deniedHome = makeTempDir("hook-realpath-sandbox-home-");
+        const originalNative = realpathSync.native;
+        const permissionDenied = new Error("sandbox denied realpath") as NodeJS.ErrnoException;
+        permissionDenied.code = "EPERM";
+        __setProjectIdentityTestHooks({ homeDirectory: () => deniedHome });
+        Object.defineProperty(realpathSync, "native", {
+            configurable: true,
+            value: (() => {
+                throw permissionDenied;
+            }) as typeof realpathSync.native,
+        });
+        const deps = createMockDeps();
+        deps.directory = projectDir;
+
+        try {
+            expect(createMagicContextHook(deps)).not.toBeNull();
+            expect(resolveProjectIdentity(projectDir)).toMatch(/^dir:[0-9a-f]{12}$/);
+        } finally {
+            Object.defineProperty(realpathSync, "native", {
+                configurable: true,
+                value: originalNative,
+            });
+        }
     });
 
     it("rehydrates pending marker sessions into both deferred signal sets", () => {
