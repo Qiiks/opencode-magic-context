@@ -7,6 +7,7 @@ import { join } from "node:path";
 import {
     __resetProjectIdentityForTests,
     __setProjectIdentityTestHooks,
+    isLinkedGitWorktree,
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
 } from "./project-identity";
@@ -21,6 +22,33 @@ function returningRootCommit(rootCommit: string): typeof execFileSync {
 
 afterEach(() => {
     __resetProjectIdentityForTests();
+});
+
+describe("linked Git worktree detection", () => {
+    test("compares the per-checkout git dir with the shared common dir once per directory", () => {
+        const calls: string[] = [];
+        __setProjectIdentityTestHooks({
+            execFileSync: ((command: string, args: string[], options: { cwd?: string }) => {
+                expect(command).toBe("git");
+                expect(args).toEqual([
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-dir",
+                    "--git-common-dir",
+                ]);
+                const directory = String(options.cwd);
+                calls.push(directory);
+                return directory.endsWith("linked")
+                    ? "/repo/.git/worktrees/linked\n/repo/.git\n"
+                    : "/repo/.git\n/repo/.git\n";
+            }) as unknown as typeof execFileSync,
+        });
+
+        expect(isLinkedGitWorktree("/repo/primary")).toBe(false);
+        expect(isLinkedGitWorktree("/repo/linked")).toBe(true);
+        expect(isLinkedGitWorktree("/repo/linked")).toBe(true);
+        expect(calls).toEqual(["/repo/primary", "/repo/linked"]);
+    });
 });
 
 describe("resolveProjectIdentity directory fallback", () => {

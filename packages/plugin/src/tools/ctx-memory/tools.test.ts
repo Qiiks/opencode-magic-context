@@ -447,10 +447,32 @@ describe("createCtxMemoryTools", () => {
                 { action: "write", category: "CONSTRAINTS", content: "retry me" },
                 toolContext(),
             );
-            expect(result).toBe(
-                "Error: Rust memory authority is not ready; TypeScript fallback is disabled.",
-            );
+            expect(result).toContain("Write REFUSED and NOT saved");
+            expect(result).toContain("RESEND");
+            expect(result).toContain("Content to resend:\nretry me");
             expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
+        });
+
+        it("does not echo content attached to a read-only module refusal", async () => {
+            const moduleTools = createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                rustToolBackends: {
+                    authorityState: async () => "MODULE",
+                    memory: async () => ({
+                        error: { code: "authority_draining", message: "authority is draining" },
+                    }),
+                },
+            });
+            const result = await moduleTools.ctx_memory.execute(
+                { action: "get", ids: [1], content: "read-only content must not echo" },
+                toolContext(),
+            );
+            expect(result).toContain("REFUSED and NOT applied");
+            expect(result).toContain("RESEND");
+            expect(result).not.toContain("read-only content must not echo");
         });
 
         it("fails closed when module authority is active without the memory protocol", async () => {

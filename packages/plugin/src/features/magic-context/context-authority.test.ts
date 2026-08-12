@@ -134,6 +134,121 @@ describe("memory authority protocol", () => {
         });
     });
 
+    test("repeated note drains replace a re-minted module row for the same context note", async () => {
+        const database = db();
+        const contextStoreUuid = ensureContextStoreUuid(database);
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    "INSERT INTO notes (id, type, status, content, project_path, session_id, created_at, updated_at) VALUES (41, 'smart', 'active', 'local note', '/repo', 'session', 10, 20)",
+                )
+                .run();
+        });
+        installAuthorityManagedMarker(database, "/repo");
+
+        let feedSeq = 1;
+        let moduleRowId = 9;
+        let statusVersion = 1;
+        let state: AuthorityStatus["state"] = "MODULE";
+        const module: AuthorityModuleClient = {
+            authorityStatus: async (args) => ({
+                authority: {
+                    ...authority(args.domain === "notes" ? state : "TS", 1),
+                    domain: args.domain,
+                },
+            }),
+            authorityPrepare: async () => ({ authority: authority("MODULE", 1) }),
+            authorityDrain: async (args) => {
+                state = args.action === "finish" ? "TS" : "DRAINING";
+                return {
+                    authority: {
+                        ...authority(state, 1),
+                        domain: args.domain,
+                        captured_upper_bound: feedSeq,
+                        coordinator_token: "note-drain-token",
+                    },
+                };
+            },
+            mirrorPull: async (args) => ({
+                page: {
+                    domain: "notes",
+                    cursor: args.cursor,
+                    next_cursor: feedSeq,
+                    has_more: false,
+                    rows:
+                        args.cursor < feedSeq
+                            ? [
+                                  {
+                                      feed_seq: feedSeq,
+                                      domain: "notes",
+                                      op: "insert",
+                                      module_row_id: moduleRowId,
+                                      full_row_snapshot: {
+                                          context_store_uuid: contextStoreUuid,
+                                          context_row_id: 41,
+                                          project_path: "/repo",
+                                          session_id: "session",
+                                          content: `module note revision ${statusVersion}`,
+                                          status: "active",
+                                          status_version: statusVersion,
+                                          created_at_ms: 10,
+                                          updated_at_ms: 20 + statusVersion,
+                                      },
+                                      content_hash: null,
+                                  },
+                              ]
+                            : [],
+                },
+            }),
+        };
+
+        await drainAuthority({
+            db: database,
+            projectPath: "/repo",
+            domain: "notes",
+            module,
+            checksum: "same",
+        });
+
+        moduleRowId = 10;
+        feedSeq = 2;
+        statusVersion = 2;
+        state = "MODULE";
+        installAuthorityManagedMarker(database, "/repo");
+        await expect(
+            drainAuthority({
+                db: database,
+                projectPath: "/repo",
+                domain: "notes",
+                module,
+                checksum: "same",
+            }),
+        ).resolves.toMatchObject({ state: "TS" });
+
+        expect(
+            database
+                .prepare(
+                    "SELECT module_project, module_row_id, context_row_id, status_version FROM mirror_note_revisions",
+                )
+                .all(),
+        ).toEqual([
+            {
+                module_project: "/repo",
+                module_row_id: 10,
+                context_row_id: 41,
+                status_version: 2,
+            },
+        ]);
+        expect(
+            database
+                .prepare(
+                    "SELECT module_row_id, context_row_id FROM mirror_identity WHERE domain = 'notes'",
+                )
+                .all(),
+        ).toEqual([{ module_row_id: 10, context_row_id: 41 }]);
+        database.close();
+    });
+
     test("foreign-store note ids allocate a fresh row without clobbering a local collision", () => {
         const database = db();
         const localStoreUuid = ensureContextStoreUuid(database);
