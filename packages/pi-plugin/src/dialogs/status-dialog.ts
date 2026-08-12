@@ -402,8 +402,13 @@ export function buildPiStatusDetail(
 ): StatusDialogDetail {
 	const usage = ctx.getContextUsage?.();
 	const meta = getOrCreateSessionMeta(deps.db, sessionId);
-	const inputTokens =
-		typeof usage?.tokens === "number" ? usage.tokens : meta.lastInputTokens;
+	const hasPersistedPressure =
+		meta.lastInputTokens > 0 && meta.lastContextPercentage > 0;
+	const inputTokens = hasPersistedPressure
+		? meta.lastInputTokens
+		: typeof usage?.tokens === "number"
+			? usage.tokens
+			: 0;
 	let detectedContextLimit: number | undefined;
 	try {
 		const detected = getOverflowState(deps.db, sessionId).detectedContextLimit;
@@ -416,10 +421,9 @@ export function buildPiStatusDetail(
 			rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
 			model: ctx.model,
 			detectedContextLimit,
-		}) ??
-		(meta.lastContextPercentage > 0
-			? Math.round(inputTokens / (meta.lastContextPercentage / 100))
-			: 0);
+			persistedInputTokens: meta.lastInputTokens,
+			persistedPercentage: meta.lastContextPercentage,
+		}) ?? 0;
 	const usagePercentage =
 		contextLimit > 0 && inputTokens > 0
 			? (inputTokens / contextLimit) * 100
