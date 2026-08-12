@@ -2,7 +2,11 @@ import { describe, expect, it } from "bun:test";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { setSessionWorkMetrics } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
-import { createTestDb, fakeContext } from "../test-utils.test";
+import {
+	assistantMessage,
+	createTestDb,
+	fakeContext,
+} from "../test-utils.test";
 import { buildPiStatusDetail, showStatusDialog } from "./status-dialog";
 
 describe("Pi status dialog", () => {
@@ -37,6 +41,75 @@ describe("Pi status dialog", () => {
 			);
 			expect(detail.contextLimit).toBe(80_000);
 			expect(detail.usagePercentage).toBe(62.5);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("matches the persisted scheduler percentage when command context omits maxTokens", async () => {
+		const db = createTestDb();
+		try {
+			const sessionId = "ses-status-persisted-reserve";
+			const inputTokens = 105_932;
+			const { persistPiPressureFromMessageEnd } = await import("../index");
+			await persistPiPressureFromMessageEnd({
+				db,
+				sessionId,
+				message: assistantMessage("done", 1, {
+					usage: {
+						input: inputTokens,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: inputTokens,
+					},
+				}),
+				piContextWindow: 204_000,
+				piModel: {
+					provider: "anthropic",
+					id: "claude",
+					maxTokens: 30_625,
+				},
+			});
+
+			const schedulerPressure = db
+				.prepare<
+					[string],
+					{ last_context_percentage: number; last_input_tokens: number }
+				>(
+					"SELECT last_context_percentage, last_input_tokens FROM session_meta WHERE session_id = ?",
+				)
+				.get(sessionId);
+			const schedulerPercentage =
+				schedulerPressure?.last_context_percentage ?? 0;
+			const detail = buildPiStatusDetail(
+				{ getAllTools: () => [] } as never,
+				{
+					...fakeContext(sessionId),
+					model: {
+						provider: "anthropic",
+						id: "claude",
+						contextWindow: 204_000,
+					},
+					getContextUsage: () => ({
+						tokens: inputTokens,
+						percent: (inputTokens / 204_000) * 100,
+						contextWindow: 204_000,
+					}),
+					getSystemPrompt: () => "system prompt",
+				} as never,
+				{
+					db,
+					projectIdentity: resolveProjectIdentity(process.cwd()),
+				},
+				sessionId,
+			);
+
+			expect(schedulerPercentage).toBeCloseTo(61.1, 1);
+			expect(schedulerPressure?.last_input_tokens).toBe(inputTokens);
+			expect(detail.inputTokens).toBe(schedulerPressure?.last_input_tokens);
+			expect(detail.contextLimit).toBe(173_375);
+			expect(detail.usagePercentage).toBe(schedulerPercentage);
 		} finally {
 			closeQuietly(db);
 		}

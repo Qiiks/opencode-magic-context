@@ -112,10 +112,13 @@ export function registerCtxStatusCommand(
 				} catch {
 					// Status remains available when overflow metadata cannot be read.
 				}
+				const meta = getOrCreateSessionMeta(currentDeps.db, sessionId);
 				const usableContextLimit = resolvePiUsableContextLimit({
 					rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
 					model: ctx.model,
 					detectedContextLimit,
+					persistedInputTokens: meta.lastInputTokens,
+					persistedPercentage: meta.lastContextPercentage,
 				});
 				const statusText = executeStatus(
 					currentDeps.db,

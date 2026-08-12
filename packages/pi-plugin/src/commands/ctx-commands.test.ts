@@ -33,7 +33,12 @@ interface MockCommandContext {
 		custom: (factory: unknown, options?: unknown) => Promise<unknown>;
 		setStatus?: (key: string, text: string) => void;
 	};
-	model?: { provider: string; id: string };
+	model?: {
+		provider: string;
+		id: string;
+		contextWindow?: number;
+		maxTokens?: number;
+	};
 	sessionManager: {
 		getSessionId: () => string | undefined;
 		getBranch?: () => unknown[];
@@ -145,6 +150,55 @@ describe("Pi Magic Context commands", () => {
 		expect(sent).toHaveLength(1);
 		expect(sent[0]?.customType).toBe("ctx-status");
 		expect(sent[0]?.data.text).toContain("## Magic Status");
+	});
+
+	it("/ctx-status keeps the persisted usable limit when command context omits maxTokens", async () => {
+		const db = createDb();
+		const sessionId = "ses-status-persisted-reserve";
+		const inputTokens = 105_932;
+		const { persistPiPressureFromMessageEnd } = await import("../index");
+		await persistPiPressureFromMessageEnd({
+			db,
+			sessionId,
+			message: {
+				role: "assistant",
+				usage: {
+					input: inputTokens,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: inputTokens,
+				},
+			},
+			piContextWindow: 204_000,
+			piModel: {
+				provider: "anthropic",
+				id: "claude",
+				maxTokens: 30_625,
+			},
+		});
+		const { pi, handlers, sent } = createMockPi();
+		registerCtxStatusCommand(pi as never, {
+			db,
+			projectIdentity: "/tmp/project",
+		});
+
+		await handlers.get("ctx-status")?.("", {
+			...createCtx(sessionId),
+			model: {
+				provider: "anthropic",
+				id: "claude",
+				contextWindow: 204_000,
+			},
+			getContextUsage: () => ({
+				tokens: inputTokens,
+				percent: (inputTokens / 204_000) * 100,
+				contextWindow: 204_000,
+			}),
+		});
+
+		expect(sent[0]?.data.text).toContain("Last percentage: 61.1%");
+		expect(sent[0]?.data.text).toContain("Resolved context limit: 173,375");
 	});
 
 	it("refuses every context-management command in compaction-off mode without mutations", async () => {
