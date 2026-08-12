@@ -88,7 +88,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 76;
+export const LATEST_SUPPORTED_VERSION = 77;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -828,6 +828,7 @@ export function initializeDatabase(db: Database): void {
       last_observed_at INTEGER,
       answer_refreshed_at INTEGER,
       source_candidate_ids TEXT NOT NULL DEFAULT '[]',
+      source_candidate_provenance TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -1464,6 +1465,13 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "primer_candidates", "question_embedding", "BLOB");
     ensureColumn(db, "primer_candidates", "question_embedding_model_id", "TEXT");
     ensureColumn(db, "primers", "question_embedding_model_id", "TEXT");
+    ensureColumn(db, "primers", "source_candidate_provenance", "TEXT");
+    const hasUserMemoriesTable = db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'user_memories'")
+        .get();
+    if (hasUserMemoriesTable) {
+        ensureColumn(db, "user_memories", "source_candidate_provenance", "TEXT");
+    }
     db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_primer_candidates_occurrence
         ON primer_candidates(project_path, harness, session_id, source_start_message_id, source_end_message_id);
