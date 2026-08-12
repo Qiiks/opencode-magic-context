@@ -388,6 +388,22 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                 </box>
             )}
 
+            <box marginTop={1} width="100%">
+                <text fg={t().text}><b>Logger</b></text>
+                <R
+                    t={t()}
+                    l="Swallowed writes"
+                    v={String(s().loggerDiagnostics?.swallowedWriteCount ?? 0)}
+                    fg={(s().loggerDiagnostics?.swallowedWriteCount ?? 0) > 0 ? t().error : t().textMuted}
+                />
+                {s().loggerDiagnostics?.lastErrorMessage && (
+                    <R t={t()} l="Last error" v={s().loggerDiagnostics.lastErrorMessage} fg={t().error} />
+                )}
+                {s().loggerDiagnostics?.lastErrorTime && (
+                    <R t={t()} l="Last error time" v={s().loggerDiagnostics.lastErrorTime} fg={t().textMuted} />
+                )}
+            </box>
+
             {/* Footer */}
             <box marginTop={1} justifyContent="flex-end" width="100%">
                 <text fg={t().textMuted}>Esc to close</text>

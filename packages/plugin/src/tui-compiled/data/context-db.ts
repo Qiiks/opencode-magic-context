@@ -204,6 +204,11 @@ export async function loadStatusDetail(
         compressionBudget: null,
         compressionUsage: null,
         toastDurationMs: 5000,
+        loggerDiagnostics: {
+            swallowedWriteCount: 0,
+            lastErrorMessage: null,
+            lastErrorTime: null,
+        },
         storage_versions: {
             context_db_schema_version: null,
             plugin_supported_version: 0,

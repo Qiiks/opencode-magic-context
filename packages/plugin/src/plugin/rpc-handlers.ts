@@ -56,7 +56,7 @@ import {
     markAnnouncementSeen,
     shouldShowAnnouncement,
 } from "../shared/announcement";
-import { log } from "../shared/logger";
+import { getLoggerDiagnostics, log } from "../shared/logger";
 import type { MagicContextRpcServer } from "../shared/rpc-server";
 import type { EmbedDetail, SidebarSnapshot, StatusDetail } from "../shared/rpc-types";
 import { applyStickySnapshotCache } from "./sidebar-snapshot-cache";
@@ -629,6 +629,7 @@ export function buildStatusDetail(
         compressionUsage: null,
         toastDurationMs: 5000,
         mural: undefined,
+        loggerDiagnostics: getLoggerDiagnostics(),
         // Safe defaults; the live context.db value is filled in the try block below.
         storage_versions: {
             // null = the probe FAILED (read threw); 0 = probe succeeded on a fresh DB

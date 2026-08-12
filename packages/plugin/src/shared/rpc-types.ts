@@ -7,6 +7,7 @@ import type {
     DreamTaskBacklogMap,
     DreamTaskProgress,
 } from "../features/magic-context/dreamer/task-registry";
+import type { LoggerDiagnostics } from "./logger";
 
 export interface SidebarSnapshot {
     sessionId: string;
@@ -170,6 +171,8 @@ export interface StatusDetail extends SidebarSnapshot {
     toastDurationMs: number;
     /** One-line status data for the experimental memory mural. */
     mural?: { present: boolean; ageMs: number | null };
+    /** Runtime logger write failures observed by this plugin process. */
+    loggerDiagnostics: LoggerDiagnostics;
     /**
      * Stable storage-version probe: "which schema is the DB at, which fence does
      * this binary carry". Field names are deliberately snake_case, mirroring the

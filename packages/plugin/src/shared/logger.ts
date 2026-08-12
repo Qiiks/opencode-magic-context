@@ -9,23 +9,28 @@ let flushTimer: ReturnType<typeof setTimeout> | null = null;
 const FLUSH_INTERVAL_MS = 500;
 const BUFFER_SIZE_LIMIT = 50;
 
-// Cache the last log directory we mkdir'd successfully so we only retry the
-// filesystem call when the resolved path actually changes. The path is
-// re-evaluated on every flush because `setHarness("pi")` runs after module
-// load on Pi; we MUST NOT freeze it at import time, or Pi's first flush
-// could land in the OpenCode subtree.
-let lastEnsuredDir: string | null = null;
+export interface LoggerDiagnostics {
+    swallowedWriteCount: number;
+    lastErrorMessage: string | null;
+    lastErrorTime: string | null;
+}
+
+let swallowedWriteCount = 0;
+let lastErrorMessage: string | null = null;
+let lastErrorTime: string | null = null;
+
+function recordSwallowedWrite(error: unknown): void {
+    try {
+        swallowedWriteCount++;
+        lastErrorMessage = error instanceof Error ? error.message : String(error);
+        lastErrorTime = new Date().toISOString();
+    } catch {
+        // Diagnostics must not make the logger throw either.
+    }
+}
 
 function ensureDir(filePath: string): void {
-    const dir = path.dirname(filePath);
-    if (dir === lastEnsuredDir) return;
-    try {
-        fs.mkdirSync(dir, { recursive: true });
-        lastEnsuredDir = dir;
-    } catch {
-        // Intentional: logging must never throw. If mkdir fails we still
-        // try the append; failure there is also swallowed.
-    }
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
 }
 
 function flush(): void {
@@ -40,8 +45,8 @@ function flush(): void {
         const logFile = getMagicContextLogPath();
         ensureDir(logFile);
         fs.appendFileSync(logFile, data);
-    } catch {
-        // Intentional: logging must never throw
+    } catch (error) {
+        recordSwallowedWrite(error);
     }
 }
 
@@ -76,6 +81,19 @@ export function log(message: string, data?: unknown): void {
 
 export function sessionLog(sessionId: string, message: string, data?: unknown): void {
     log(`[magic-context][${sessionId}] ${message}`, data);
+}
+
+export function getLoggerDiagnostics(): LoggerDiagnostics {
+    return {
+        swallowedWriteCount,
+        lastErrorMessage,
+        lastErrorTime,
+    };
+}
+
+/** Flush buffered log entries immediately. Primarily useful to diagnostic readers and tests. */
+export function flushLogger(): void {
+    flush();
 }
 
 /**
