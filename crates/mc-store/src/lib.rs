@@ -410,10 +410,10 @@ const MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES: i64 = 8 * 1024 * 1024;
 const PASS_SCHEDULER_HISTORY_CAP: usize = 256;
 const PASS_SCHEDULER_INTERESTING_HISTORY_CAP: usize = 256;
 const MAX_FULL_ARRAY_FINGERPRINT_BYTES: usize = 256;
-/// The recency entry is at most 99 bytes. An interesting entry also has the sender clock and
-/// bounded opaque fingerprint; JSON's worst case expands each fingerprint byte to `\u00xx`.
+/// The recency entry is at most 99 bytes. An interesting entry is at most 1,906 bytes with
+/// sender identity and arc counters; JSON's worst case expands fingerprint bytes to `\u00xx`.
 const MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 99;
-const MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 1_709;
+const MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 1_906;
 /// Maximum combined UTF-8 bytes for both scheduler JSON arrays on one session row.
 pub const PASS_SCHEDULER_TELEMETRY_MAX_BYTES: usize = 1
     + PASS_SCHEDULER_HISTORY_CAP * (MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES + 1)
@@ -2707,6 +2707,21 @@ pub struct InterestingPassSchedulerObservation {
     /// Caller-owned full-array fingerprint echoed by the transform response. This is omitted
     /// only when the caller supplied no identity or exceeded the diagnostic byte bound.
     pub full_array_fingerprint: Option<String>,
+    /// Live superseded tool arcs observed when the ride gate opened, before downstream filters.
+    /// Missing means the gate stayed shut and selection did not run; zero is an observed empty set.
+    #[serde(default)]
+    pub eligible_supersession_count: Option<u64>,
+    /// Eligible supersession arcs whose final decisions were entirely removed by the newest-tag
+    /// block window. Unit: tool arcs.
+    #[serde(default)]
+    pub withheld_by_tag_window: Option<u64>,
+    /// Eligible supersession arcs whose final decisions were entirely removed by mutation-exempt
+    /// or lineage-anchor messages. Unit: tool arcs.
+    #[serde(default)]
+    pub withheld_by_exempt_message: Option<u64>,
+    /// Eligible supersession tool arcs represented in the final reduction decision list.
+    #[serde(default)]
+    pub applied_supersession_count: Option<u64>,
 }
 
 impl InterestingPassSchedulerObservation {
@@ -2714,6 +2729,10 @@ impl InterestingPassSchedulerObservation {
         observation: &PassSchedulerObservation,
         request_observed_at_ms: Option<u64>,
         full_array_fingerprint: Option<&str>,
+        eligible_supersession_count: Option<u64>,
+        withheld_by_tag_window: Option<u64>,
+        withheld_by_exempt_message: Option<u64>,
+        applied_supersession_count: Option<u64>,
     ) -> Self {
         Self {
             timestamp_ms: observation.timestamp_ms,
@@ -2723,6 +2742,10 @@ impl InterestingPassSchedulerObservation {
             full_array_fingerprint: full_array_fingerprint
                 .filter(|fingerprint| fingerprint.len() <= MAX_FULL_ARRAY_FINGERPRINT_BYTES)
                 .map(str::to_string),
+            eligible_supersession_count,
+            withheld_by_tag_window,
+            withheld_by_exempt_message,
+            applied_supersession_count,
         }
     }
 }
@@ -2742,19 +2765,30 @@ fn serialize_scheduler_observation(
     serde_json::to_string(observation).map_err(|error| McStoreError::Serde(error.to_string()))
 }
 
-fn scheduler_observation_is_inherently_interesting(observation: &PassSchedulerObservation) -> bool {
-    observation.scheduler_decision != "Defer"
+fn scheduler_pass_is_interesting(
+    applied_reduction: bool,
+    produced_output_divergence: bool,
+) -> bool {
+    applied_reduction || produced_output_divergence
 }
 
 fn serialize_interesting_scheduler_observation(
     observation: &PassSchedulerObservation,
     request_observed_at_ms: Option<u64>,
     full_array_fingerprint: Option<&str>,
+    eligible_supersession_count: Option<u64>,
+    withheld_by_tag_window: Option<u64>,
+    withheld_by_exempt_message: Option<u64>,
+    applied_supersession_count: Option<u64>,
 ) -> Result<String, McStoreError> {
     serde_json::to_string(&InterestingPassSchedulerObservation::from_observation(
         observation,
         request_observed_at_ms,
         full_array_fingerprint,
+        eligible_supersession_count,
+        withheld_by_tag_window,
+        withheld_by_exempt_message,
+        applied_supersession_count,
     ))
     .map_err(|error| McStoreError::Serde(error.to_string()))
 }
@@ -3761,6 +3795,12 @@ pub struct TransformCommit<'a> {
     /// Sender clock and exact full-array identity already carried on the transform request.
     pub scheduler_request_observed_at_ms: Option<u64>,
     pub scheduler_full_array_fingerprint: Option<&'a str>,
+    /// Eligible supersession tool arcs counted when an open ride gate runs selection. Missing
+    /// means selection did not run; zero means it ran and found none.
+    pub scheduler_eligible_supersession_count: Option<u64>,
+    pub scheduler_withheld_by_tag_window: Option<u64>,
+    pub scheduler_withheld_by_exempt_message: Option<u64>,
+    pub scheduler_applied_supersession_count: Option<u64>,
     /// Whether this pass added a previously-unfrozen reduction to the served output.
     pub scheduler_applied_reductions: bool,
     pub overlays: TransformOverlayBatch<'a>,
@@ -7005,19 +7045,11 @@ impl McStore {
         &self,
         session_id: &str,
         observation: &PassSchedulerObservation,
-        request_observed_at_ms: Option<u64>,
-        full_array_fingerprint: Option<&str>,
+        _request_observed_at_ms: Option<u64>,
+        _full_array_fingerprint: Option<&str>,
     ) -> Result<(), McStoreError> {
         let observation_json = serialize_scheduler_observation(observation)?;
-        let interesting_json = scheduler_observation_is_inherently_interesting(observation)
-            .then(|| {
-                serialize_interesting_scheduler_observation(
-                    observation,
-                    request_observed_at_ms,
-                    full_array_fingerprint,
-                )
-            })
-            .transpose()?;
+        let interesting_json: Option<String> = None;
         self.inner.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO mc_pass_trace (
@@ -8705,6 +8737,10 @@ impl McStore {
                 scheduler_observation: None,
                 scheduler_request_observed_at_ms: None,
                 scheduler_full_array_fingerprint: None,
+                scheduler_eligible_supersession_count: None,
+                scheduler_withheld_by_tag_window: None,
+                scheduler_withheld_by_exempt_message: None,
+                scheduler_applied_supersession_count: None,
                 scheduler_applied_reductions: false,
                 overlays: TransformOverlayBatch::default(),
             },
@@ -8730,6 +8766,10 @@ impl McStore {
             scheduler_observation,
             scheduler_request_observed_at_ms,
             scheduler_full_array_fingerprint,
+            scheduler_eligible_supersession_count,
+            scheduler_withheld_by_tag_window,
+            scheduler_withheld_by_exempt_message,
+            scheduler_applied_supersession_count,
             scheduler_applied_reductions,
             overlays,
         } = request;
@@ -8769,16 +8809,21 @@ impl McStore {
             .transpose()?;
         let next = expected.unwrap_or(0) + 1;
         let scheduler_interesting_json = scheduler_observation
-            .filter(|observation| {
-                scheduler_applied_reductions
-                    || first_divergence.is_some()
-                    || scheduler_observation_is_inherently_interesting(observation)
+            .filter(|_| {
+                scheduler_pass_is_interesting(
+                    scheduler_applied_reductions,
+                    first_divergence.is_some(),
+                )
             })
             .map(|observation| {
                 serialize_interesting_scheduler_observation(
                     observation,
                     scheduler_request_observed_at_ms,
                     scheduler_full_array_fingerprint,
+                    scheduler_eligible_supersession_count,
+                    scheduler_withheld_by_tag_window,
+                    scheduler_withheld_by_exempt_message,
+                    scheduler_applied_supersession_count,
                 )
             })
             .transpose()?;
@@ -16736,6 +16781,59 @@ mod tests {
         }
     }
 
+    fn commit_scheduler_observation(
+        store: &McStore,
+        session_id: &str,
+        expected: Option<u64>,
+        observation: &PassSchedulerObservation,
+        interest: (
+            bool,
+            Option<u64>,
+            Option<u64>,
+            Option<u64>,
+            Option<u64>,
+            u64,
+        ),
+        request_observed_at_ms: Option<u64>,
+        full_array_fingerprint: Option<&str>,
+    ) -> u64 {
+        let (
+            produced_output_divergence,
+            eligible_supersession_count,
+            withheld_by_tag_window_count,
+            withheld_by_exempt_message_count,
+            applied_supersession_count,
+            applied_reduction_count,
+        ) = interest;
+        let core = CoreState::default();
+        let meta = ModuleMeta::default();
+        store
+            .commit_transform(
+                session_id,
+                TransformCommit {
+                    expected,
+                    core: &core,
+                    meta: &meta,
+                    consumed_drop_ids: &[],
+                    first_applied_command_ids: &[],
+                    memory_revision: None,
+                    compartment_max_seq: None,
+                    project_root: None,
+                    first_divergence: produced_output_divergence.then_some("{}"),
+                    scheduler_observation: Some(observation),
+                    scheduler_request_observed_at_ms: request_observed_at_ms,
+                    scheduler_full_array_fingerprint: full_array_fingerprint,
+                    scheduler_eligible_supersession_count: eligible_supersession_count,
+                    scheduler_withheld_by_tag_window: withheld_by_tag_window_count,
+                    scheduler_withheld_by_exempt_message: withheld_by_exempt_message_count,
+                    scheduler_applied_supersession_count: applied_supersession_count,
+                    scheduler_applied_reductions: applied_reduction_count > 0,
+                    overlays: TransformOverlayBatch::default(),
+                },
+            )
+            .unwrap()
+    }
+
     fn command_ledger_ids(store: &McStore, session_id: &str) -> Vec<String> {
         command_ledger_rows(store, session_id)
             .into_iter()
@@ -16982,6 +17080,10 @@ mod tests {
                         scheduler_observation: None,
                         scheduler_request_observed_at_ms: None,
                         scheduler_full_array_fingerprint: None,
+                        scheduler_eligible_supersession_count: None,
+                        scheduler_withheld_by_tag_window: None,
+                        scheduler_withheld_by_exempt_message: None,
+                        scheduler_applied_supersession_count: None,
                         scheduler_applied_reductions: false,
                         overlays: TransformOverlayBatch {
                             created_at_ms: observed_at,
@@ -17057,6 +17159,10 @@ mod tests {
                     scheduler_observation: None,
                     scheduler_request_observed_at_ms: None,
                     scheduler_full_array_fingerprint: None,
+                    scheduler_eligible_supersession_count: None,
+                    scheduler_withheld_by_tag_window: None,
+                    scheduler_withheld_by_exempt_message: None,
+                    scheduler_applied_supersession_count: None,
                     scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch::default(),
                 },
@@ -17129,6 +17235,10 @@ mod tests {
                     scheduler_observation: None,
                     scheduler_request_observed_at_ms: None,
                     scheduler_full_array_fingerprint: None,
+                    scheduler_eligible_supersession_count: None,
+                    scheduler_withheld_by_tag_window: None,
+                    scheduler_withheld_by_exempt_message: None,
+                    scheduler_applied_supersession_count: None,
                     scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch::default(),
                 },
@@ -17264,6 +17374,10 @@ mod tests {
                     scheduler_observation: None,
                     scheduler_request_observed_at_ms: None,
                     scheduler_full_array_fingerprint: None,
+                    scheduler_eligible_supersession_count: None,
+                    scheduler_withheld_by_tag_window: None,
+                    scheduler_withheld_by_exempt_message: None,
+                    scheduler_applied_supersession_count: None,
                     scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
@@ -17346,6 +17460,10 @@ mod tests {
                     scheduler_observation: None,
                     scheduler_request_observed_at_ms: None,
                     scheduler_full_array_fingerprint: None,
+                    scheduler_eligible_supersession_count: None,
+                    scheduler_withheld_by_tag_window: None,
+                    scheduler_withheld_by_exempt_message: None,
+                    scheduler_applied_supersession_count: None,
                     scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
@@ -17500,6 +17618,10 @@ mod tests {
                     scheduler_observation: None,
                     scheduler_request_observed_at_ms: None,
                     scheduler_full_array_fingerprint: None,
+                    scheduler_eligible_supersession_count: None,
+                    scheduler_withheld_by_tag_window: None,
+                    scheduler_withheld_by_exempt_message: None,
+                    scheduler_applied_supersession_count: None,
                     scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch::default(),
                 },
@@ -18206,6 +18328,10 @@ mod tests {
                         scheduler_observation: None,
                         scheduler_request_observed_at_ms: None,
                         scheduler_full_array_fingerprint: None,
+                        scheduler_eligible_supersession_count: None,
+                        scheduler_withheld_by_tag_window: None,
+                        scheduler_withheld_by_exempt_message: None,
+                        scheduler_applied_supersession_count: None,
                         scheduler_applied_reductions: false,
                         overlays: TransformOverlayBatch {
                             max_seen_ordinal: Some(3),
@@ -18267,6 +18393,10 @@ mod tests {
                     scheduler_observation: None,
                     scheduler_request_observed_at_ms: None,
                     scheduler_full_array_fingerprint: None,
+                    scheduler_eligible_supersession_count: None,
+                    scheduler_withheld_by_tag_window: None,
+                    scheduler_withheld_by_exempt_message: None,
+                    scheduler_applied_supersession_count: None,
                     scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(4),
@@ -18539,7 +18669,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_interesting_pass_survives_ordinary_history_flood() {
+    fn scheduler_interesting_pass_survives_latched_execute_flood() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let interesting = PassSchedulerObservation {
@@ -18548,22 +18678,23 @@ mod tests {
             drain_latch_active: true,
         };
 
-        store
-            .trace_pass_stable(
-                "scheduler-flood",
-                &interesting,
-                Some(10_001),
-                Some("oldest-interest"),
-            )
-            .unwrap();
+        commit_scheduler_observation(
+            &store,
+            "scheduler-flood",
+            None,
+            &interesting,
+            (false, Some(3), Some(0), Some(0), Some(3), 1),
+            Some(10_001),
+            Some("oldest-interest"),
+        );
         for timestamp_ms in 2..=513 {
             store
                 .trace_pass_stable(
                     "scheduler-flood",
                     &PassSchedulerObservation {
                         timestamp_ms,
-                        scheduler_decision: "Defer".to_string(),
-                        drain_latch_active: false,
+                        scheduler_decision: "Execute".to_string(),
+                        drain_latch_active: true,
                     },
                     Some(10_000 + timestamp_ms as u64),
                     None,
@@ -18579,12 +18710,177 @@ mod tests {
                 &interesting,
                 Some(10_001),
                 Some("oldest-interest"),
+                Some(3),
+                Some(0),
+                Some(0),
+                Some(3),
             )],
-            "the oldest interesting pass must survive a recency-ring flood"
+            "the oldest reduction pass must survive a flood of latched Execute passes that applied nothing"
         );
         let recency = store.load_pass_trace("scheduler-flood").unwrap().unwrap();
         assert_eq!(recency.scheduler_history.len(), PASS_SCHEDULER_HISTORY_CAP);
         assert_eq!(recency.scheduler_history.first().unwrap().timestamp_ms, 258);
+    }
+
+    #[test]
+    fn scheduler_interesting_history_selects_only_reductions_and_divergence() {
+        const POPULATION_SIZE: usize = 402;
+        const LATCHED_PASSES: usize = 306;
+        const INTERESTING_PASSES: usize = 26;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let divergence_indices = [19, 79, 139, 219, 319, 401];
+        let mut expected = None;
+        let mut expected_timestamps = Vec::new();
+        let mut latched_count = 0;
+
+        for index in 0..POPULATION_SIZE {
+            let drain_latch_active = index < LATCHED_PASSES;
+            latched_count += usize::from(drain_latch_active);
+            let scheduler_decision = match index {
+                0..214 => "Execute",
+                214..306 => "Force85",
+                306..386 => "Execute",
+                386..400 => "Defer",
+                400 => "Force85",
+                _ => "Emergency95",
+            };
+            let applied_reduction = index < 400 && index % 20 == 0;
+            let produced_output_divergence = divergence_indices.contains(&index);
+            let timestamp_ms = index as i64 + 1;
+            if applied_reduction || produced_output_divergence {
+                expected_timestamps.push(timestamp_ms);
+            }
+            let fingerprint = format!("population-{index}");
+            expected = Some(commit_scheduler_observation(
+                &store,
+                "interesting-selectivity",
+                expected,
+                &PassSchedulerObservation {
+                    timestamp_ms,
+                    scheduler_decision: scheduler_decision.to_string(),
+                    drain_latch_active,
+                },
+                (
+                    produced_output_divergence,
+                    Some((index % 7) as u64),
+                    Some(0),
+                    Some(0),
+                    Some((index % 7) as u64),
+                    u64::from(applied_reduction),
+                ),
+                Some(20_000 + index as u64),
+                Some(&fingerprint),
+            ));
+        }
+
+        let retained = store
+            .load_interesting_pass_scheduler_history("interesting-selectivity", i64::MIN, i64::MAX)
+            .unwrap();
+        assert_eq!(latched_count, LATCHED_PASSES);
+        assert_eq!(expected_timestamps.len(), INTERESTING_PASSES);
+        assert_eq!(retained.len(), INTERESTING_PASSES);
+        assert_eq!(
+            retained
+                .iter()
+                .map(|observation| observation.timestamp_ms)
+                .collect::<Vec<_>>(),
+            expected_timestamps,
+            "only passes that applied a reduction or diverged belong in the interesting ring"
+        );
+
+        let recency = store
+            .load_pass_trace("interesting-selectivity")
+            .unwrap()
+            .unwrap()
+            .scheduler_history;
+        assert_eq!(recency.len(), PASS_SCHEDULER_HISTORY_CAP);
+        assert_eq!(recency.first().unwrap().timestamp_ms, 147);
+        assert_eq!(recency.last().unwrap().timestamp_ms, 402);
+    }
+
+    #[test]
+    fn scheduler_interesting_history_preserves_attributes_and_variable_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let reduction = PassSchedulerObservation {
+            timestamp_ms: 700,
+            scheduler_decision: "Execute".to_string(),
+            drain_latch_active: true,
+        };
+        let divergence = PassSchedulerObservation {
+            timestamp_ms: 701,
+            scheduler_decision: "Emergency95".to_string(),
+            drain_latch_active: false,
+        };
+
+        let first_version = commit_scheduler_observation(
+            &store,
+            "interesting-attributes",
+            None,
+            &reduction,
+            (false, Some(3), Some(1), Some(0), Some(1), 1),
+            Some(70_000),
+            Some("reduction-fingerprint"),
+        );
+        commit_scheduler_observation(
+            &store,
+            "interesting-attributes",
+            Some(first_version),
+            &divergence,
+            (false, Some(3), Some(0), Some(1), Some(2), 3),
+            None,
+            Some("divergence-fingerprint"),
+        );
+
+        let retained = store
+            .load_interesting_pass_scheduler_history("interesting-attributes", i64::MIN, i64::MAX)
+            .unwrap();
+        assert_eq!(
+            retained,
+            vec![
+                InterestingPassSchedulerObservation::from_observation(
+                    &reduction,
+                    Some(70_000),
+                    Some("reduction-fingerprint"),
+                    Some(3),
+                    Some(1),
+                    Some(0),
+                    Some(1),
+                ),
+                InterestingPassSchedulerObservation::from_observation(
+                    &divergence,
+                    None,
+                    Some("divergence-fingerprint"),
+                    Some(3),
+                    Some(0),
+                    Some(1),
+                    Some(2),
+                ),
+            ]
+        );
+        assert_ne!(
+            retained[0].scheduler_decision, retained[1].scheduler_decision,
+            "interesting entries must record each pass's actual scheduler decision"
+        );
+        assert_eq!(retained[1].request_observed_at_ms, None);
+        assert_eq!(
+            retained
+                .iter()
+                .map(|observation| observation.eligible_supersession_count)
+                .collect::<Vec<_>>(),
+            vec![Some(3), Some(3)],
+            "both passes must retain the identical pre-gate accumulator depth"
+        );
+        assert_eq!(
+            retained
+                .iter()
+                .map(|observation| observation.applied_supersession_count)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2)],
+            "the applied count must distinguish one landing member from the whole eligible group"
+        );
     }
 
     #[test]
@@ -18605,6 +18901,10 @@ mod tests {
                 &worst_observation,
                 Some(u64::MAX),
                 Some(&"\0".repeat(MAX_FULL_ARRAY_FINGERPRINT_BYTES)),
+                Some(u64::MAX),
+                Some(u64::MAX),
+                Some(u64::MAX),
+                Some(u64::MAX),
             )
             .unwrap()
             .len(),
@@ -18613,19 +18913,22 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let fingerprint = "x".repeat(MAX_FULL_ARRAY_FINGERPRINT_BYTES);
+        let mut expected = None;
         for timestamp_ms in 0..=256 {
-            store
-                .trace_pass_stable(
-                    "interesting-bound",
-                    &PassSchedulerObservation {
-                        timestamp_ms,
-                        scheduler_decision: "Emergency95".to_string(),
-                        drain_latch_active: true,
-                    },
-                    Some(timestamp_ms as u64),
-                    Some(&"x".repeat(MAX_FULL_ARRAY_FINGERPRINT_BYTES)),
-                )
-                .unwrap();
+            expected = Some(commit_scheduler_observation(
+                &store,
+                "interesting-bound",
+                expected,
+                &PassSchedulerObservation {
+                    timestamp_ms,
+                    scheduler_decision: "Emergency95".to_string(),
+                    drain_latch_active: true,
+                },
+                (false, Some(3), Some(0), Some(0), Some(3), 1),
+                Some(timestamp_ms as u64),
+                Some(&fingerprint),
+            ));
         }
 
         let retained = store
@@ -18658,19 +18961,21 @@ mod tests {
             (100, "Force85", 9_024, "fingerprint-b"),
             (300, "Emergency95", 9_300, "fingerprint-c"),
         ];
+        let mut expected = None;
         for (timestamp_ms, decision, request_time, fingerprint) in entries {
-            store
-                .trace_pass_stable(
-                    "interesting-query",
-                    &PassSchedulerObservation {
-                        timestamp_ms,
-                        scheduler_decision: decision.to_string(),
-                        drain_latch_active: decision == "Execute",
-                    },
-                    Some(request_time),
-                    Some(fingerprint),
-                )
-                .unwrap();
+            expected = Some(commit_scheduler_observation(
+                &store,
+                "interesting-query",
+                expected,
+                &PassSchedulerObservation {
+                    timestamp_ms,
+                    scheduler_decision: decision.to_string(),
+                    drain_latch_active: decision == "Execute",
+                },
+                (false, Some(3), Some(0), Some(0), Some(3), 1),
+                Some(request_time),
+                Some(fingerprint),
+            ));
         }
 
         let range = store
@@ -18708,18 +19013,19 @@ mod tests {
             assert_eq!(by_fingerprint[0].request_observed_at_ms, Some(request_time));
         }
 
-        store
-            .trace_pass_stable(
-                "interesting-query",
-                &PassSchedulerObservation {
-                    timestamp_ms: 400,
-                    scheduler_decision: "Force85".to_string(),
-                    drain_latch_active: false,
-                },
-                None,
-                Some("fingerprint-without-sender-time"),
-            )
-            .unwrap();
+        commit_scheduler_observation(
+            &store,
+            "interesting-query",
+            expected,
+            &PassSchedulerObservation {
+                timestamp_ms: 400,
+                scheduler_decision: "Force85".to_string(),
+                drain_latch_active: false,
+            },
+            (false, Some(3), Some(0), Some(0), Some(3), 1),
+            None,
+            Some("fingerprint-without-sender-time"),
+        );
         let absent = store
             .load_interesting_pass_scheduler_history_by_fingerprint(
                 "interesting-query",
@@ -18762,6 +19068,10 @@ mod tests {
                         scheduler_observation: Some(&observation),
                         scheduler_request_observed_at_ms: Some(500),
                         scheduler_full_array_fingerprint: Some(fingerprint),
+                        scheduler_eligible_supersession_count: None,
+                        scheduler_withheld_by_tag_window: None,
+                        scheduler_withheld_by_exempt_message: None,
+                        scheduler_applied_supersession_count: None,
                         scheduler_applied_reductions: applied_reductions,
                         overlays: TransformOverlayBatch::default(),
                     },
@@ -18772,6 +19082,10 @@ mod tests {
                 .unwrap();
             assert_eq!(retained.len(), 1);
             assert_eq!(retained[0].scheduler_decision, "Defer");
+            assert_eq!(
+                retained[0].eligible_supersession_count, None,
+                "Defer did not run supersession selection, so its depth must remain absent"
+            );
             assert_eq!(
                 retained[0].full_array_fingerprint.as_deref(),
                 Some(fingerprint)

@@ -2544,6 +2544,10 @@ fn apply_once(
                         )),
                         scheduler_request_observed_at_ms: req.request_observed_at_ms,
                         scheduler_full_array_fingerprint: req.full_array_fingerprint.as_deref(),
+                        scheduler_eligible_supersession_count: None,
+                        scheduler_withheld_by_tag_window: None,
+                        scheduler_withheld_by_exempt_message: None,
+                        scheduler_applied_supersession_count: None,
                         scheduler_applied_reductions: false,
                         overlays: TransformOverlayBatch::default(),
                     },
@@ -2643,6 +2647,10 @@ fn apply_once(
                 )),
                 scheduler_request_observed_at_ms: req.request_observed_at_ms,
                 scheduler_full_array_fingerprint: req.full_array_fingerprint.as_deref(),
+                scheduler_eligible_supersession_count: None,
+                scheduler_withheld_by_tag_window: None,
+                scheduler_withheld_by_exempt_message: None,
+                scheduler_applied_supersession_count: None,
                 scheduler_applied_reductions: false,
                 overlays: TransformOverlayBatch::default(),
             },
@@ -3070,7 +3078,7 @@ fn apply_once(
             loaded.meta.synthetic_todo.as_ref(),
             req.todo_tool_present,
         );
-    let mut protected_block_ids = if tagging_surface_requested {
+    let tag_window_protected_block_ids = if tagging_surface_requested {
         newest_active_tag_block_ids(
             &loaded.core,
             &loaded.meta,
@@ -3082,18 +3090,21 @@ fn apply_once(
     } else {
         HashSet::new()
     };
-    for mid in [mutation_exempt_mid, lineage_anchor_mid]
+    let exempt_message_protected_block_ids = [mutation_exempt_mid, lineage_anchor_mid]
         .into_iter()
         .flatten()
-    {
-        protected_block_ids.extend(
+        .flat_map(|mid| {
             projection
                 .blocks
                 .iter()
-                .filter(|block| block.mid == mid)
-                .map(|block| block.id.clone()),
-        );
-    }
+                .filter(move |block| block.mid == mid)
+                .map(|block| block.id.clone())
+        })
+        .collect::<HashSet<_>>();
+    let protected_block_ids = tag_window_protected_block_ids
+        .union(&exempt_message_protected_block_ids)
+        .cloned()
+        .collect::<HashSet<_>>();
     let selection_started_at = Instant::now();
     if scheduler_outcome.pass == scheduler::PassDecision::Emergency95 {
         let excluded_arcs =
@@ -3152,7 +3163,8 @@ fn apply_once(
                 first_applied_agent_drop_ids,
                 pass_already_busting,
                 supersession_ride_available,
-                protected_block_ids: protected_block_ids.clone(),
+                tag_window_protected_block_ids,
+                exempt_message_protected_block_ids,
             },
             &SelectionConfig {
                 smart_drops: ctx.smart_drops,
@@ -3162,6 +3174,14 @@ fn apply_once(
         SelectionOutcome::default()
     };
     timings.selection = elapsed_ms(selection_started_at);
+    let count_to_u64 =
+        |count: Option<usize>| count.map(|value| u64::try_from(value).unwrap_or(u64::MAX));
+    let eligible_supersession_count = count_to_u64(selection_outcome.eligible_supersession_count);
+    let supersession_withheld_by_tag_window_count =
+        count_to_u64(selection_outcome.supersession_withheld_by_tag_window_count);
+    let supersession_withheld_by_exempt_message_count =
+        count_to_u64(selection_outcome.supersession_withheld_by_exempt_message_count);
+    let applied_supersession_count = count_to_u64(selection_outcome.applied_supersession_count);
     let selected_reductions = selection_outcome.decisions;
     let two_pass_batch_can_apply = selection_outcome.two_pass_batch_can_apply;
     #[cfg(test)]
@@ -4250,6 +4270,10 @@ fn apply_once(
                 )),
                 scheduler_request_observed_at_ms: req.request_observed_at_ms,
                 scheduler_full_array_fingerprint: req.full_array_fingerprint.as_deref(),
+                scheduler_eligible_supersession_count: eligible_supersession_count,
+                scheduler_withheld_by_tag_window: supersession_withheld_by_tag_window_count,
+                scheduler_withheld_by_exempt_message: supersession_withheld_by_exempt_message_count,
+                scheduler_applied_supersession_count: applied_supersession_count,
                 scheduler_applied_reductions,
                 overlays: TransformOverlayBatch {
                     max_seen_ordinal: pending_overlays.max_seen_ordinal,
@@ -11395,11 +11419,9 @@ pub(crate) mod tests {
         let correlated = store
             .load_interesting_pass_scheduler_history_by_request_time(SESSION, 100_003)
             .unwrap();
-        assert_eq!(correlated.len(), 1);
-        assert_eq!(correlated[0].scheduler_decision, "Force85");
-        assert_eq!(
-            correlated[0].full_array_fingerprint.as_deref(),
-            Some("force-fingerprint")
+        assert!(
+            correlated.is_empty(),
+            "a scheduler arm without a reduction or divergence is not interesting"
         );
     }
 
@@ -20510,6 +20532,22 @@ pub(crate) mod tests {
             LATCHED_PASSES * 2,
             "every accumulated member must first-apply in the concrete bust"
         );
+        let retained = store
+            .load_interesting_pass_scheduler_history(SESSION, i64::MIN, i64::MAX)
+            .unwrap();
+        let riding_observation = retained.last().expect("the reduction pass is interesting");
+        assert_eq!(
+            riding_observation.eligible_supersession_count,
+            Some(LATCHED_PASSES as u64),
+            "the open gate must retain the accumulated selector depth"
+        );
+        assert_eq!(riding_observation.withheld_by_tag_window, Some(0));
+        assert_eq!(riding_observation.withheld_by_exempt_message, Some(0));
+        assert_eq!(
+            riding_observation.applied_supersession_count,
+            Some(LATCHED_PASSES as u64),
+            "the full accumulated group must land on the open ride"
+        );
         assert!(
             frozen_red_payload(&loaded.core, &format!("edit-call-{}#0", LATCHED_PASSES + 1),)
                 .is_none(),
@@ -20749,6 +20787,10 @@ pub(crate) mod tests {
                     scheduler_observation: None,
                     scheduler_request_observed_at_ms: None,
                     scheduler_full_array_fingerprint: None,
+                    scheduler_eligible_supersession_count: None,
+                    scheduler_withheld_by_tag_window: None,
+                    scheduler_withheld_by_exempt_message: None,
+                    scheduler_applied_supersession_count: None,
                     scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch::default(),
                 },
@@ -20832,6 +20874,10 @@ pub(crate) mod tests {
                     scheduler_observation: None,
                     scheduler_request_observed_at_ms: None,
                     scheduler_full_array_fingerprint: None,
+                    scheduler_eligible_supersession_count: None,
+                    scheduler_withheld_by_tag_window: None,
+                    scheduler_withheld_by_exempt_message: None,
+                    scheduler_applied_supersession_count: None,
                     scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch::default(),
                 },
@@ -23766,6 +23812,10 @@ pub(crate) mod tests {
                 scheduler_observation: None,
                 scheduler_request_observed_at_ms: None,
                 scheduler_full_array_fingerprint: None,
+                scheduler_eligible_supersession_count: None,
+                scheduler_withheld_by_tag_window: None,
+                scheduler_withheld_by_exempt_message: None,
+                scheduler_applied_supersession_count: None,
                 scheduler_applied_reductions: false,
                 overlays: TransformOverlayBatch::default(),
             },
