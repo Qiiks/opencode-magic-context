@@ -323,7 +323,12 @@ export function prepareCompartmentInjection(
         // Session ids are unique in production, but tests and explicit database
         // paths can reuse one across independent stores. Never replay a block
         // rendered from a different database into the current session.
-        injectionCache.delete(sessionId);
+        //
+        // clearInjectionCache (not a bare delete) so the degraded-mode re-anchor
+        // bookkeeping is dropped with it: that count gates a byte-CHANGING
+        // re-anchor, so inheriting another store's episode could re-anchor early
+        // — the same cross-store leak, on the path where it costs more.
+        clearInjectionCache(sessionId);
     }
     const usableCached = cached?.db === db ? cached : undefined;
 

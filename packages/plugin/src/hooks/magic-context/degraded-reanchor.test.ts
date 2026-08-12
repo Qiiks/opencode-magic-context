@@ -392,6 +392,38 @@ describe("Layer B — degraded-mode re-anchor (#264)", () => {
         expect(pass2Messages[1].info.id).toBe("msg_y");
     });
 
+    it("does not inherit another database's degraded count for the same session id", () => {
+        // The degraded count gates a byte-CHANGING re-anchor. If it leaks across
+        // stores sharing a session id, store B re-anchors on its FIRST degraded
+        // pass because it inherited store A's episode.
+        const makeVisible = (): MessageLike[] => [
+            userMessage("msg_c1_end", "compartment one end"),
+            userMessage("msg_x", "x"),
+        ];
+
+        // Store A: one degraded bust pass (count = 1, below the threshold).
+        seedTwoCompartments();
+        const storeAPass = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
+        expect(storeAPass?.compartmentEndMessageId).toBeNull();
+
+        // Store B: independent database, same session id, its FIRST degraded pass.
+        const storeA = db;
+        const storeB = makeContextDb();
+        try {
+            db = storeB;
+            seedTwoCompartments();
+            const messages = makeVisible();
+            const storeBPass = prepareCompartmentInjection(storeB, SESSION_ID, messages, true);
+            // Still pass 1 for THIS store: no re-anchor, nothing spliced.
+            expect(storeBPass?.compartmentEndMessageId).toBeNull();
+            expect(storeBPass?.skippedVisibleMessages).toBe(0);
+            expect(messages.length).toBe(2);
+        } finally {
+            db = storeA;
+            closeQuietly(storeB);
+        }
+    });
+
     it("does NOT re-anchor before the degraded-pass threshold", () => {
         seedTwoCompartments();
         const makeVisible = (): MessageLike[] => [
