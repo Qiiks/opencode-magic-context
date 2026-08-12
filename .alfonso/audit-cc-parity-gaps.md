@@ -159,7 +159,13 @@ These can be implemented on the Claude Code leg without changing the harness's f
 - **Source:** `crates/mc-module/src/lib.rs:8005-8008,8182`; empty schedule surface at `crates/mc-module/src/lib.rs:12425`.
 - **Classification:** incidental — missing task runners and scheduler.
 
-## I-22 — Serializer merge residuals differ by profile
+## I-22 — Serializer merge residuals differ by profile — **RECLASSIFIED CORRECTNESS (Thalamus wire evidence, 2026-08-12)**
+
+> **This is a wire-correctness bug, not a cosmetic gap.** The source below is accurate but its "incidental" classification was wrong. Anthropic COMBINES consecutive same-role assistant messages into one turn at the far end, then returns HTTP 400 (`thinking blocks in the latest assistant message cannot be modified`) on a merged turn carrying reasoning blocks it did not itself produce. Two adjacent assistants each carrying a reasoning block are individually well-formed and invalid only AFTER the provider's merge — which is exactly why a source-side `merges_consecutive_assistants: false` flag reads as safe and is not. Three of four production CC 400s were this shape. Thalamus fixtures `merged_reasoning_refused.json` (400) / `merged_reasoning_accepted.json` (200) verified against the live API; their `reject_merged_reasoning_turns` fence refuses exactly the 4 the provider refused across 364 replays, zero false positives — but a fence turns a 400 into a refused turn, it does not make the array valid. **The fix is upstream and is a design fork, NOT a port of OpenCode's strip** — see the caveat below.
+
+**FIX-SHAPE CAVEAT:** OpenCode's residual STRIPS reasoning from all-but-first merged assistant. That is invalid on CC: the provider 400 explicitly forbids MODIFYING a signed thinking block in the latest assistant, so stripping one is itself the failure. The CC-safe remedy is to never PRODUCE two adjacent reasoning-bearing assistants (prevent, or self-merge into one message preserving the blocks in order), which is the reasoning-adjacency doctrine, not the strip. Interacts with I-09: clearing old reasoning shrinks the population that can strand.
+
+### Original finding (source accurate, classification superseded)
 
 - **OpenCode:** its AI-SDK serializer can merge adjacent assistant messages, so the module strips all but the permitted reasoning block across a merged run.
 - **Pi:** does not merge adjacent assistants and reports its own empty-content/autofill healing behavior.
