@@ -322,6 +322,41 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
     });
 });
 
+describe("prepareCompartmentInjection — cross-database cache isolation", () => {
+    it("does not replay a block rendered from a different database", () => {
+        // The injection cache is process-global and keyed by session id alone,
+        // while the value it holds is rendered FROM a database. Two independent
+        // stores that share a session id must not see each other's blocks.
+        const first = makeDb();
+        try {
+            insertMemory(first, {
+                projectPath: PROJECT_PATH,
+                category: "CONSTRAINTS",
+                content: "MEMORY-ONLY-IN-FIRST-DATABASE",
+            });
+            const populated = prepareCompartmentInjection(
+                first,
+                SESSION_ID,
+                [userMessage("m1", "hi")],
+                true,
+                PROJECT_PATH,
+            );
+            expect(populated?.block).toContain("MEMORY-ONLY-IN-FIRST-DATABASE");
+        } finally {
+            closeQuietly(first);
+        }
+
+        // Second store: same session id, no memories, and a DEFER pass — the
+        // path that replays the cached injection.
+        db = makeDb();
+        const messages: MessageLike[] = [userMessage("m1", "hi")];
+        const replayed = prepareCompartmentInjection(db, SESSION_ID, messages, false, PROJECT_PATH);
+
+        expect(replayed?.block ?? "").not.toContain("MEMORY-ONLY-IN-FIRST-DATABASE");
+        expect(replayed).toBeNull();
+    });
+});
+
 describe("prepareCompartmentInjection — workspace memory sharing", () => {
     it("renders only explicitly shared foreign memory categories", () => {
         db = makeDb();
