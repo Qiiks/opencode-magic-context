@@ -511,7 +511,7 @@ try {
             realResponseTargetBytes,
         );
         let previousFingerprint = full.fingerprint;
-        for (const page of buildPagedModuleTransformPayloads(full.body)) {
+        for (const { page } of buildPagedModuleTransformPayloads(full.body)) {
             const response = (await client.request(
                 route,
                 page,

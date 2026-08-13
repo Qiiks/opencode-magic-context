@@ -235,6 +235,12 @@ export interface ModuleCompartmentMirrorRow {
 export interface ModuleCompartmentMirrorResponse {
     max_sequence: number;
     compartments: ModuleCompartmentMirrorRow[];
+    /** Present on session.status; a count of 0 after a non-empty cursor is a set wipe. */
+    compartment_count?: number;
+    /** Incremented when the published set is rebuilt, recomputed, or restored. Those rewrites can replace existing rows without advancing max_sequence. */
+    revert_epoch?: number;
+    /** Optional flag that the published set was rewritten in place. Older responses omit it. */
+    set_changed?: boolean;
 }
 
 /**
@@ -250,7 +256,101 @@ export interface ModuleCompartmentReader {
     ): Promise<ModuleCompartmentMirrorResponse>;
 }
 
-export async function mirrorModuleCompartments(args: {
+interface CompartmentMirrorCursor {
+    lastMaxSequence: number;
+    lastCompartmentCount?: number;
+    lastRevertEpoch?: number;
+}
+
+const compartmentMirrorCursors = new Map<string, CompartmentMirrorCursor>();
+
+export function clearCompartmentMirrorCursor(sessionId: string): void {
+    compartmentMirrorCursors.delete(sessionId);
+}
+
+export function resetCompartmentMirrorCursorsForTest(): void {
+    compartmentMirrorCursors.clear();
+}
+
+function validateMirrorRow(
+    compartment: ModuleCompartmentMirrorRow,
+    afterSequence: number,
+    maxSequence: number,
+): void {
+    if (
+        !Number.isSafeInteger(compartment.sequence) ||
+        compartment.sequence <= afterSequence ||
+        compartment.sequence > maxSequence ||
+        !Number.isSafeInteger(compartment.start_message) ||
+        !Number.isSafeInteger(compartment.end_message) ||
+        typeof compartment.start_message_id !== "string" ||
+        typeof compartment.end_message_id !== "string" ||
+        typeof compartment.title !== "string" ||
+        typeof compartment.content !== "string"
+    ) {
+        throw new Error("module compartment mirror returned an invalid authoritative row");
+    }
+}
+
+function validateMirrorPage(
+    published: ModuleCompartmentMirrorResponse,
+    maxSequence: number | null,
+): void {
+    if (
+        !Number.isSafeInteger(published.max_sequence) ||
+        published.max_sequence < -1 ||
+        (maxSequence !== null && published.max_sequence !== maxSequence)
+    ) {
+        throw new Error("module compartment mirror changed while its authoritative set was read");
+    }
+}
+
+function compartmentMirrorSetChanged(
+    published: ModuleCompartmentMirrorResponse,
+    cursor: CompartmentMirrorCursor,
+): boolean {
+    if (published.set_changed === true) return true;
+    if (
+        published.revert_epoch !== undefined &&
+        cursor.lastRevertEpoch !== undefined &&
+        published.revert_epoch !== cursor.lastRevertEpoch
+    ) {
+        return true;
+    }
+    // session.status reports max_sequence = after_sequence when the table is empty,
+    // so a wipe is invisible to the sequence cursor. A zero count is the set change.
+    if (
+        published.compartment_count === 0 &&
+        cursor.lastMaxSequence >= 0 &&
+        published.compartments.length === 0
+    ) {
+        return true;
+    }
+    if (
+        published.compartment_count !== undefined &&
+        published.compartments.length === 0 &&
+        published.max_sequence === cursor.lastMaxSequence &&
+        published.compartment_count !== (cursor.lastCompartmentCount ?? cursor.lastMaxSequence)
+    ) {
+        return true;
+    }
+    return false;
+}
+
+function rememberCompartmentMirrorCursor(
+    sessionId: string,
+    maxSequence: number,
+    published: ModuleCompartmentMirrorResponse,
+    authoritativeCount: number,
+): void {
+    compartmentMirrorCursors.set(sessionId, {
+        lastMaxSequence: maxSequence,
+        lastCompartmentCount: published.compartment_count ?? authoritativeCount,
+        lastRevertEpoch: published.revert_epoch,
+    });
+}
+
+async function resyncModuleCompartmentsFromAuthoritative(args: {
     db: ContextDatabase;
     sessionId: string;
     reader: ModuleCompartmentReader;
@@ -258,35 +358,17 @@ export async function mirrorModuleCompartments(args: {
     const authoritative: ModuleCompartmentMirrorRow[] = [];
     let afterSequence = -1;
     let maxSequence: number | null = null;
+    let lastPublished: ModuleCompartmentMirrorResponse | undefined;
 
     for (;;) {
         const published = await args.reader.getCompartmentsAfter(args.sessionId, afterSequence);
-        if (
-            !Number.isSafeInteger(published.max_sequence) ||
-            published.max_sequence < -1 ||
-            (maxSequence !== null && published.max_sequence !== maxSequence)
-        ) {
-            throw new Error(
-                "module compartment mirror changed while its authoritative set was read",
-            );
-        }
+        validateMirrorPage(published, maxSequence);
         maxSequence ??= published.max_sequence;
+        lastPublished = published;
 
         let pageAdvanced = false;
         for (const compartment of published.compartments) {
-            if (
-                !Number.isSafeInteger(compartment.sequence) ||
-                compartment.sequence <= afterSequence ||
-                compartment.sequence > maxSequence ||
-                !Number.isSafeInteger(compartment.start_message) ||
-                !Number.isSafeInteger(compartment.end_message) ||
-                typeof compartment.start_message_id !== "string" ||
-                typeof compartment.end_message_id !== "string" ||
-                typeof compartment.title !== "string" ||
-                typeof compartment.content !== "string"
-            ) {
-                throw new Error("module compartment mirror returned an invalid authoritative row");
-            }
+            validateMirrorRow(compartment, afterSequence, maxSequence);
             authoritative.push(compartment);
             afterSequence = compartment.sequence;
             pageAdvanced = true;
@@ -372,7 +454,49 @@ export async function mirrorModuleCompartments(args: {
             );
         }
     })();
+    rememberCompartmentMirrorCursor(
+        args.sessionId,
+        maxSequence,
+        lastPublished ?? { max_sequence: maxSequence, compartments: [] },
+        authoritative.length,
+    );
     return maxSequence;
+}
+
+export async function mirrorModuleCompartments(args: {
+    db: ContextDatabase;
+    sessionId: string;
+    reader: ModuleCompartmentReader;
+}): Promise<number> {
+    // A process-local cursor avoids re-reading the full authoritative set on every
+    // pass. The first call, a max_sequence regression, a sequence gap, or a set
+    // change the cursor cannot express still walks from -1.
+    const cursor = compartmentMirrorCursors.get(args.sessionId);
+    if (cursor !== undefined) {
+        const published = await args.reader.getCompartmentsAfter(
+            args.sessionId,
+            cursor.lastMaxSequence,
+        );
+        validateMirrorPage(published, null);
+        for (const compartment of published.compartments) {
+            validateMirrorRow(compartment, cursor.lastMaxSequence, published.max_sequence);
+        }
+        const firstNew = published.compartments[0];
+        const hasGap = firstNew !== undefined && firstNew.sequence !== cursor.lastMaxSequence + 1;
+        const regressed = published.max_sequence < cursor.lastMaxSequence;
+        const setChanged = compartmentMirrorSetChanged(published, cursor);
+        if (
+            !regressed &&
+            !hasGap &&
+            !setChanged &&
+            published.compartments.length === 0 &&
+            published.max_sequence === cursor.lastMaxSequence
+        ) {
+            return published.max_sequence;
+        }
+    }
+
+    return resyncModuleCompartmentsFromAuthoritative(args);
 }
 
 interface ModuleWorkspaceContext {

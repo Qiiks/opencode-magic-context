@@ -6,6 +6,8 @@ export interface LkgSlot {
     jsonPrefix: string;
     inputIdSeq: string[];
     inputContentDigests: string[];
+    /** Cheap content signatures aligned with `inputIdSeq`, used to reuse digests. */
+    inputContentSignatures?: string[];
     lastInputMessageId: string;
     modelKey: string | null;
     providerKey: string | null;
@@ -98,6 +100,53 @@ export function lkgContentDigestFromFields(fields: readonly LkgContentField[]): 
     return hash.digest("base64url");
 }
 
+export interface LkgDigestEntry {
+    id: string;
+    signature: string;
+    fields: readonly LkgContentField[];
+}
+
+export interface LkgDigestPrior {
+    ids: readonly string[];
+    signatures: readonly string[];
+    digests: readonly string[];
+}
+
+/**
+ * Reuse prior digests for the unchanged id+signature prefix and hash only from
+ * the first changed entry. Digest values must match a full recompute.
+ */
+export function incrementalLkgContentDigests(
+    entries: readonly LkgDigestEntry[],
+    prior?: LkgDigestPrior,
+): { digests: string[]; reusedPrefix: number } {
+    const aligned =
+        prior !== undefined &&
+        prior.ids.length === prior.signatures.length &&
+        prior.signatures.length === prior.digests.length;
+    let reusedPrefix = 0;
+    if (aligned && prior) {
+        while (
+            reusedPrefix < entries.length &&
+            reusedPrefix < prior.ids.length &&
+            entries[reusedPrefix]?.id === prior.ids[reusedPrefix] &&
+            entries[reusedPrefix]?.signature === prior.signatures[reusedPrefix]
+        ) {
+            reusedPrefix += 1;
+        }
+    }
+    const digests: string[] = [];
+    if (aligned && prior) {
+        for (let index = 0; index < reusedPrefix; index += 1) {
+            digests.push(prior.digests[index] as string);
+        }
+    }
+    for (let index = reusedPrefix; index < entries.length; index += 1) {
+        digests.push(lkgContentDigestFromFields(entries[index]?.fields ?? []));
+    }
+    return { digests, reusedPrefix };
+}
+
 /** Digest the full message tree to detect input drift before an LKG replay. */
 export function lkgContentDigest(message: MessageLike): string | null {
     const fields = lkgContentFields(message);
@@ -112,7 +161,10 @@ function touch(sessionId: string, entry: { slot: LkgSlot; bytes: number }): void
 export function captureSlot(sessionId: string, slot: LkgSlot): boolean {
     if (
         slot.inputContentDigests.length !== slot.inputIdSeq.length ||
-        slot.inputContentDigests.some((digest) => digest.length === 0)
+        slot.inputContentDigests.some((digest) => digest.length === 0) ||
+        (slot.inputContentSignatures !== undefined &&
+            (slot.inputContentSignatures.length !== slot.inputIdSeq.length ||
+                slot.inputContentSignatures.some((signature) => signature.length === 0)))
     ) {
         return false;
     }
@@ -149,6 +201,9 @@ export function captureSlot(sessionId: string, slot: LkgSlot): boolean {
             ...slot,
             inputIdSeq: [...slot.inputIdSeq],
             inputContentDigests: [...slot.inputContentDigests],
+            inputContentSignatures: slot.inputContentSignatures
+                ? [...slot.inputContentSignatures]
+                : undefined,
         },
         bytes,
     };
@@ -165,6 +220,9 @@ export function getSlot(sessionId: string): LkgSlot | undefined {
         ...entry.slot,
         inputIdSeq: [...entry.slot.inputIdSeq],
         inputContentDigests: [...entry.slot.inputContentDigests],
+        inputContentSignatures: entry.slot.inputContentSignatures
+            ? [...entry.slot.inputContentSignatures]
+            : undefined,
     };
 }
 

@@ -2,7 +2,12 @@
 
 import { describe, expect, it } from "bun:test";
 
-import { encodeOpenCodeMessagesToCk, resolveOrdinalsForModule } from "./module-wire";
+import {
+    buildPagedModuleTransformPayloads,
+    encodeOpenCodeMessagesToCk,
+    MODULE_PAGE_MAX_BYTES,
+    resolveOrdinalsForModule,
+} from "./module-wire";
 import { setRawMessageProvider } from "./read-session-chunk";
 import type { MessageLike } from "./transform-operations";
 
@@ -185,6 +190,38 @@ describe("resolveOrdinalsForModule provisional tails", () => {
             }
         } finally {
             result.unregister();
+        }
+    });
+});
+
+describe("buildPagedModuleTransformPayloads byte reuse", () => {
+    it("returns the first stringify length on the unpaged path", () => {
+        const body = {
+            method: "transform",
+            session_id: "ses-unpaged",
+            input: [{ mid: "m1", ordinal: 1, ck: { text: "hi" } }],
+        };
+        const pages = buildPagedModuleTransformPayloads(body);
+        expect(pages).toHaveLength(1);
+        expect(pages[0]?.page).toBe(body);
+        expect(pages[0]?.bytes).toBe(Buffer.byteLength(JSON.stringify(body)));
+    });
+
+    it("returns paging sizes that match a later stringify of each page", () => {
+        const body = {
+            method: "transform",
+            session_id: "ses-paged",
+            input: Array.from({ length: 80 }, (_, index) => ({
+                mid: `m${index}`,
+                ordinal: index + 1,
+                ck: { text: "x".repeat(8_000) },
+            })),
+        };
+        expect(Buffer.byteLength(JSON.stringify(body))).toBeGreaterThan(MODULE_PAGE_MAX_BYTES);
+        const pages = buildPagedModuleTransformPayloads(body);
+        expect(pages.length).toBeGreaterThan(1);
+        for (const { page, bytes } of pages) {
+            expect(bytes).toBe(Buffer.byteLength(JSON.stringify(page)));
         }
     });
 });

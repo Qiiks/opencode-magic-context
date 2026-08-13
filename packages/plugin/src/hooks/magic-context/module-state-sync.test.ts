@@ -29,6 +29,7 @@ import {
     loadModuleWatermarks,
     type ModuleStateSyncState,
     mirrorModuleCompartments,
+    resetCompartmentMirrorCursorsForTest,
     syncModuleState,
 } from "./module-state-sync";
 import {
@@ -48,6 +49,7 @@ afterEach(() => {
     if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = originalXdgDataHome;
     for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+    resetCompartmentMirrorCursorsForTest();
 });
 
 function useTempDataHome(prefix: string): void {
@@ -1036,7 +1038,7 @@ describe("module compartment mirror-back", () => {
         await mirrorModuleCompartments({ db, sessionId: "ses-mirror", reader });
         await mirrorModuleCompartments({ db, sessionId: "ses-mirror", reader });
 
-        expect(calls).toEqual([-1, -1]);
+        expect(calls).toEqual([-1, 2]);
         expect(getCompartments(db, "ses-mirror").map((row) => row.sequence)).toEqual([1, 2]);
     });
 
@@ -1091,6 +1093,203 @@ describe("module compartment mirror-back", () => {
                 title: "Recut third compartment",
                 content: "authoritative recut content",
             }),
+        );
+    });
+
+    function mirrorRow(
+        sequence: number,
+        extras: Partial<{
+            end_message: number;
+            end_message_id: string;
+            title: string;
+            content: string;
+        }> = {},
+    ) {
+        return {
+            sequence,
+            start_message: sequence * 2 - 1,
+            end_message: extras.end_message ?? sequence * 2,
+            start_message_id: `m${sequence * 2 - 1}#0`,
+            end_message_id: extras.end_message_id ?? `m${sequence * 2}#0`,
+            title: extras.title ?? `Compartment ${sequence}`,
+            content: extras.content ?? `content ${sequence}`,
+            created_at: sequence,
+        };
+    }
+
+    function pagingReader(
+        getRows: () => Array<ReturnType<typeof mirrorRow>>,
+        extra: () => {
+            set_changed?: boolean;
+            revert_epoch?: number;
+            compartment_count?: number;
+        } = () => ({}),
+    ) {
+        const calls: number[] = [];
+        return {
+            calls,
+            reader: {
+                async getCompartmentsAfter(_sessionId: string, afterSequence: number) {
+                    calls.push(afterSequence);
+                    const rows = getRows();
+                    const extras = extra();
+                    return {
+                        max_sequence: rows.at(-1)?.sequence ?? -1,
+                        compartments: rows
+                            .filter((row) => row.sequence > afterSequence)
+                            .slice(0, 2),
+                        ...extras,
+                    };
+                },
+            },
+        };
+    }
+
+    it("skips every local statement on the unchanged fast path", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-mirror-fast";
+        const rows = [mirrorRow(1), mirrorRow(2), mirrorRow(3)];
+        const { calls, reader } = pagingReader(() => rows);
+
+        await mirrorModuleCompartments({ db, sessionId, reader });
+        expect(calls[0]).toBe(-1);
+
+        const originalPrepare = db.prepare.bind(db);
+        let statements = 0;
+        db.prepare = ((sql: string) => {
+            statements += 1;
+            return originalPrepare(sql);
+        }) as typeof db.prepare;
+        const originalTransaction = db.transaction.bind(db);
+        let transactions = 0;
+        db.transaction = ((fn: Parameters<typeof db.transaction>[0]) => {
+            transactions += 1;
+            return originalTransaction(fn);
+        }) as typeof db.transaction;
+
+        calls.length = 0;
+        await mirrorModuleCompartments({ db, sessionId, reader });
+
+        expect(calls).toEqual([3]);
+        expect(statements).toBe(0);
+        expect(transactions).toBe(0);
+        expect(getCompartments(db, sessionId).map((row) => row.sequence)).toEqual([1, 2, 3]);
+    });
+
+    it("full-resyncs a recut that regresses max_sequence", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-mirror-recut-arm";
+        let rows = [mirrorRow(1), mirrorRow(2), mirrorRow(3), mirrorRow(4)];
+        const { calls, reader } = pagingReader(() => rows);
+
+        await mirrorModuleCompartments({ db, sessionId, reader });
+        rows = [
+            mirrorRow(1),
+            mirrorRow(2),
+            mirrorRow(3, {
+                end_message: 30,
+                end_message_id: "recut-m30#0",
+                title: "Recut",
+                content: "recut content",
+            }),
+        ];
+        calls.length = 0;
+        await mirrorModuleCompartments({ db, sessionId, reader });
+
+        expect(calls[0]).toBe(4);
+        expect(calls.slice(1)).toContain(-1);
+        expect(getCompartments(db, sessionId).map((row) => row.sequence)).toEqual([1, 2, 3]);
+        expect(getCompartments(db, sessionId)[2]).toEqual(
+            expect.objectContaining({ title: "Recut", content: "recut content" }),
+        );
+    });
+
+    it("full-resyncs a revert that truncates the published suffix", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-mirror-revert-arm";
+        let rows = [mirrorRow(1), mirrorRow(2), mirrorRow(3), mirrorRow(4), mirrorRow(5)];
+        let revertEpoch = 0;
+        const { calls, reader } = pagingReader(
+            () => rows,
+            () => ({ revert_epoch: revertEpoch }),
+        );
+
+        await mirrorModuleCompartments({ db, sessionId, reader });
+        rows = [mirrorRow(1), mirrorRow(2)];
+        revertEpoch = 1;
+        calls.length = 0;
+        await mirrorModuleCompartments({ db, sessionId, reader });
+
+        expect(calls[0]).toBe(5);
+        expect(calls.slice(1)).toContain(-1);
+        expect(getCompartments(db, sessionId).map((row) => row.sequence)).toEqual([1, 2]);
+    });
+
+    it("full-resyncs a recomp that rewrites the set at the same max_sequence", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-mirror-recomp-arm";
+        let rows = [mirrorRow(1), mirrorRow(2), mirrorRow(3)];
+        let setChanged = false;
+        const { calls, reader } = pagingReader(
+            () => rows,
+            () => (setChanged ? { set_changed: true } : {}),
+        );
+
+        await mirrorModuleCompartments({ db, sessionId, reader });
+        rows = [
+            mirrorRow(1, { title: "Rebuilt 1", content: "recomp 1" }),
+            mirrorRow(2, { title: "Rebuilt 2", content: "recomp 2" }),
+            mirrorRow(3, { title: "Rebuilt 3", content: "recomp 3" }),
+        ];
+        setChanged = true;
+        calls.length = 0;
+        await mirrorModuleCompartments({ db, sessionId, reader });
+
+        expect(calls[0]).toBe(3);
+        expect(calls.slice(1)).toContain(-1);
+        expect(getCompartments(db, sessionId).map((row) => row.content)).toEqual([
+            "recomp 1",
+            "recomp 2",
+            "recomp 3",
+        ]);
+    });
+
+    it("full-resyncs when a sequence gap appears after the cursor", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-mirror-gap-arm";
+        let rows = [mirrorRow(1), mirrorRow(2)];
+        const { calls, reader } = pagingReader(() => rows);
+
+        await mirrorModuleCompartments({ db, sessionId, reader });
+        rows = [mirrorRow(1), mirrorRow(2), mirrorRow(4)];
+        calls.length = 0;
+        await mirrorModuleCompartments({ db, sessionId, reader });
+
+        expect(calls[0]).toBe(2);
+        expect(calls.slice(1)).toContain(-1);
+        expect(getCompartments(db, sessionId).map((row) => row.sequence)).toEqual([1, 2, 4]);
+    });
+
+    it("still rejects an authoritative set that changes while it is read", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-mirror-changed-while-read";
+        let maxSequence = 3;
+        const reader = {
+            async getCompartmentsAfter(_sessionId: string, afterSequence: number) {
+                const page = {
+                    max_sequence: maxSequence,
+                    compartments: [
+                        mirrorRow(afterSequence + 1),
+                        mirrorRow(afterSequence + 2),
+                    ].filter((row) => row.sequence <= 3),
+                };
+                maxSequence = 4;
+                return page;
+            },
+        };
+
+        await expect(mirrorModuleCompartments({ db, sessionId, reader })).rejects.toThrow(
+            "module compartment mirror changed while its authoritative set was read",
         );
     });
 });

@@ -286,10 +286,19 @@ export function moduleWireBodyBytes(payload: {
  * markers are understood by the module and are only used when a single item is
  * larger than the normal page envelope.
  */
+export interface ModuleTransformWirePage {
+    page: Record<string, unknown>;
+    /** UTF-8 byte length of `JSON.stringify(page)`, counted while paging. */
+    bytes: number;
+}
+
 export function buildPagedModuleTransformPayloads(
     body: Record<string, unknown>,
-): Record<string, unknown>[] {
-    if (Buffer.byteLength(JSON.stringify(body)) <= MODULE_PAGE_MAX_BYTES) return [body];
+): ModuleTransformWirePage[] {
+    // The unpaged path must stringify once to know it fits. Return that length so
+    // the transport telemetry does not serialize the same body a second time.
+    const unpagedBytes = Buffer.byteLength(JSON.stringify(body));
+    if (unpagedBytes <= MODULE_PAGE_MAX_BYTES) return [{ page: body, bytes: unpagedBytes }];
 
     const arrayFields = [
         "input",
@@ -315,7 +324,7 @@ export function buildPagedModuleTransformPayloads(
         total: number;
         complete: boolean;
         arrays: Record<string, unknown[]>;
-    }): Record<string, unknown> => {
+    }): ModuleTransformWirePage => {
         const pageArrays = Object.fromEntries(
             arrayFields.map((field) => [field, args.arrays[field] ?? []]),
         );
@@ -335,7 +344,9 @@ export function buildPagedModuleTransformPayloads(
             ...pageArrays,
         };
         if (args.complete) Object.assign(page, scalarFields);
-        return page;
+        // Admission already counted candidate sizes incrementally. Stringify once
+        // here so transport telemetry can reuse the exact UTF-8 length.
+        return { page, bytes: Buffer.byteLength(JSON.stringify(page)) };
     };
     const hasItems = (arrays: Record<string, unknown[]>): boolean =>
         Object.values(arrays).some((values) => values.length > 0);
@@ -374,7 +385,7 @@ export function buildPagedModuleTransformPayloads(
 
     let assumedTotal = 1;
     for (let attempt = 0; attempt < 10; attempt += 1) {
-        const pages: Record<string, unknown>[] = [];
+        const pages: ModuleTransformWirePage[] = [];
         let current = emptyArrays();
         let currentBytes = Object.fromEntries(arrayFields.map((field) => [field, 2]));
         const appendUnit = (field: string, value: unknown): boolean => {
@@ -457,14 +468,7 @@ export function buildPagedModuleTransformPayloads(
             complete: true,
             arrays: current,
         });
-        if (
-            pageByteLength({
-                index: pages.length,
-                total: assumedTotal,
-                complete: true,
-                arrayBytes: currentBytes,
-            }) > MODULE_PAGE_MAX_BYTES
-        ) {
+        if (finalPage.bytes > MODULE_PAGE_MAX_BYTES) {
             if (!hasItems(current)) {
                 throw new Error("module transform scalar tail exceeds the 512 KiB page limit");
             }
@@ -484,14 +488,7 @@ export function buildPagedModuleTransformPayloads(
                 complete: true,
                 arrays: current,
             });
-            if (
-                pageByteLength({
-                    index: pages.length,
-                    total: assumedTotal,
-                    complete: true,
-                    arrayBytes: currentBytes,
-                }) > MODULE_PAGE_MAX_BYTES
-            ) {
+            if (finalPage.bytes > MODULE_PAGE_MAX_BYTES) {
                 throw new Error("module transform scalar tail exceeds the 512 KiB page limit");
             }
         }
