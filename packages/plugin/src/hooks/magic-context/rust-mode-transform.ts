@@ -48,6 +48,7 @@ import {
     captureSlot,
     dropSlot,
     getSlot,
+    incrementalLkgContentDigests,
     LKG_SNAPSHOT_ARRAY,
     LKG_SNAPSHOT_BOOLEAN,
     LKG_SNAPSHOT_KEY,
@@ -58,10 +59,10 @@ import {
     LKG_SNAPSHOT_UNDEFINED,
     type LkgContentField,
     type LkgEntryNote,
-    lkgContentDigestFromFields,
     noteEntry,
 } from "./lkg-slot";
 import {
+    clearCompartmentMirrorCursor,
     type ModuleCompartmentMirrorResponse,
     type ModuleCompartmentReader,
     type ModuleStateSyncClient,
@@ -446,6 +447,8 @@ interface RustPassTimings {
     transportBytes: number;
     apply: number;
     lkgSnapshot: number;
+    mirrorPull: number;
+    compartmentMirror: number;
 }
 
 function emptyRustPassTimings(): RustPassTimings {
@@ -461,6 +464,8 @@ function emptyRustPassTimings(): RustPassTimings {
         transportBytes: 0,
         apply: 0,
         lkgSnapshot: 0,
+        mirrorPull: 0,
+        compartmentMirror: 0,
     };
 }
 
@@ -486,9 +491,11 @@ function formatRustPassLog(args: {
         timings.transport +
         timings.apply +
         timings.lkgSnapshot;
+    // Mirror stages run after appliedAt and are excluded from elapsed, so they
+    // must not be subtracted into `other` or they would hide leftover serve work.
     const unattributed = Math.max(0, args.elapsedMs - measured);
     const rowVersion = Number.isSafeInteger(args.rowVersion) ? args.rowVersion : 0;
-    return `rust pass: decision=${args.decision} reason=${args.reason} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} row_version=${rowVersion} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} other:${unattributed.toFixed(1)}`;
+    return `rust pass: decision=${args.decision} reason=${args.reason} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} row_version=${rowVersion} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} mirror_pull:${timings.mirrorPull.toFixed(1)} compartment_mirror:${timings.compartmentMirror.toFixed(1)} other:${unattributed.toFixed(1)}`;
 }
 
 function isSyntheticUserMessage(message: MessageLike | undefined): boolean {
@@ -1351,13 +1358,31 @@ export function createRustModeTransform(
         ) {
             return "superseded";
         }
-        const inputContentDigests = plan.inputSnapshots.map((snapshot) =>
-            lkgContentDigestFromFields(snapshot.fields),
+        // Steady passes append one message onto an unchanged prefix. Reuse the
+        // previous slot's digests for every id+content-signature match and hash
+        // only from the first changed entry so the deferred commit stays off the
+        // event-loop budget.
+        const prior = getSlot(plan.sessionId);
+        const inputContentSignatures = plan.inputSnapshots.map((snapshot) => snapshot.signature);
+        const { digests: inputContentDigests } = incrementalLkgContentDigests(
+            plan.inputIds.map((id, index) => ({
+                id,
+                signature: inputContentSignatures[index] ?? "",
+                fields: plan.inputSnapshots[index]?.fields ?? [],
+            })),
+            prior?.inputContentSignatures
+                ? {
+                      ids: prior.inputIdSeq,
+                      signatures: prior.inputContentSignatures,
+                      digests: prior.inputContentDigests,
+                  }
+                : undefined,
         );
         const captured = captureSlot(plan.sessionId, {
             jsonPrefix: plan.jsonPrefix,
             inputIdSeq: plan.inputIds,
             inputContentDigests,
+            inputContentSignatures,
             lastInputMessageId: plan.inputIds[plan.inputIds.length - 1] as string,
             modelKey: plan.modelKey,
             providerKey: plan.providerKey,
@@ -2023,9 +2048,11 @@ export function createRustModeTransform(
                 detail = "",
             ): Promise<TransformSeriesResult> => {
                 const pages = buildPagedModuleTransformPayloads(payload);
-                const paged = pages.some((page) => typeof page.transform_page_id === "string");
+                const paged = pages.some(
+                    (entry) => typeof entry.page.transform_page_id === "string",
+                );
                 let response: Record<string, unknown> | undefined;
-                for (const [index, page] of pages.entries()) {
+                for (const [index, { page, bytes }] of pages.entries()) {
                     const transportStartedAt = performance.now();
                     let moduleResponse: unknown;
                     try {
@@ -2065,7 +2092,7 @@ export function createRustModeTransform(
                         };
                     }
                     response = responseValue(moduleResponse);
-                    timings.transportBytes += Buffer.byteLength(JSON.stringify(page));
+                    timings.transportBytes += bytes;
                     timings.transportPages += 1;
                     logStage(
                         sessionId,
@@ -2447,35 +2474,6 @@ export function createRustModeTransform(
                     );
                 }
             }
-            if (options.moduleClient.mirrorPull) {
-                try {
-                    await pullMemoryMirrorOnce({
-                        db: deps.db,
-                        module: options.moduleClient as AuthorityModuleClient,
-                    });
-                } catch (error) {
-                    sessionLog(sessionId, "rust memory mirror-back failed (ignored):", error);
-                }
-            }
-            const getCompartmentsAfter = options.moduleClient.getCompartmentsAfter;
-            if (getCompartmentsAfter) {
-                try {
-                    await mirrorModuleCompartments({
-                        db: deps.db,
-                        sessionId,
-                        reader: {
-                            getCompartmentsAfter: (mirroredSessionId, afterSequence) =>
-                                getCompartmentsAfter.call(
-                                    options.moduleClient,
-                                    mirroredSessionId,
-                                    afterSequence,
-                                ),
-                        } satisfies ModuleCompartmentReader,
-                    });
-                } catch (error) {
-                    sessionLog(sessionId, "rust compartment mirror-back failed (ignored):", error);
-                }
-            }
             // Provider overflow proves the prior wire failed, so successful local
             // materialization is not enough to clear recovery. Require either provider
             // usage observed after the arm or a trusted estimate of the bytes actually
@@ -2505,6 +2503,47 @@ export function createRustModeTransform(
             }
             wireCaches.set(sessionId, pendingWireCache);
             appliedAt = performance.now();
+            // Memory and compartment mirrors reconcile the host SQLite copy with the
+            // module. They are not on the serve path: the caller already has applied
+            // bytes, so appliedAt is recorded first and they stay out of pass elapsed.
+            // Neither result is read again in this pass. Keep the previous order
+            // (memories, then compartments) so a failure in one cannot affect the other;
+            // both errors are already ignored.
+            if (options.moduleClient.mirrorPull) {
+                const mirrorPullStartedAt = performance.now();
+                try {
+                    await pullMemoryMirrorOnce({
+                        db: deps.db,
+                        module: options.moduleClient as AuthorityModuleClient,
+                    });
+                } catch (error) {
+                    sessionLog(sessionId, "rust memory mirror-back failed (ignored):", error);
+                } finally {
+                    logStage(sessionId, "mirrorPull", mirrorPullStartedAt, timings);
+                }
+            }
+            const getCompartmentsAfter = options.moduleClient.getCompartmentsAfter;
+            if (getCompartmentsAfter) {
+                const compartmentMirrorStartedAt = performance.now();
+                try {
+                    await mirrorModuleCompartments({
+                        db: deps.db,
+                        sessionId,
+                        reader: {
+                            getCompartmentsAfter: (mirroredSessionId, afterSequence) =>
+                                getCompartmentsAfter.call(
+                                    options.moduleClient,
+                                    mirroredSessionId,
+                                    afterSequence,
+                                ),
+                        } satisfies ModuleCompartmentReader,
+                    });
+                } catch (error) {
+                    sessionLog(sessionId, "rust compartment mirror-back failed (ignored):", error);
+                } finally {
+                    logStage(sessionId, "compartmentMirror", compartmentMirrorStartedAt, timings);
+                }
+            }
             finishPass(true);
         } catch (error) {
             if (
@@ -2561,6 +2600,7 @@ export function createRustModeTransform(
             dropSlot(sessionId, "session-deleted");
             states.delete(sessionId);
             wireCaches.delete(sessionId);
+            clearCompartmentMirrorCursor(sessionId);
             if (projectRoot && options.moduleClient.deleteSession) {
                 void options.moduleClient
                     .deleteSession(sessionId, projectRoot)

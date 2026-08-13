@@ -797,7 +797,26 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                         "max_sequence" in record && typeof record.max_sequence === "number"
                             ? record.max_sequence
                             : afterSequence;
-                    return { max_sequence: maxSequence, compartments };
+                    const compartmentCount =
+                        "compartment_count" in record &&
+                        typeof record.compartment_count === "number"
+                            ? record.compartment_count
+                            : undefined;
+                    const revertEpoch =
+                        "revert_epoch" in record && typeof record.revert_epoch === "number"
+                            ? record.revert_epoch
+                            : undefined;
+                    return {
+                        max_sequence: maxSequence,
+                        compartments,
+                        ...(compartmentCount !== undefined
+                            ? { compartment_count: compartmentCount }
+                            : {}),
+                        ...(revertEpoch !== undefined ? { revert_epoch: revertEpoch } : {}),
+                        ...("set_changed" in record && record.set_changed === true
+                            ? { set_changed: true }
+                            : {}),
+                    };
                 },
             };
             return client;
