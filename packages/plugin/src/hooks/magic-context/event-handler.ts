@@ -33,6 +33,7 @@ import {
     scheduleOpenCodeTransformDecisionWrite,
 } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage, SessionMeta } from "../../features/magic-context/types";
+import { captureWindowReport } from "../../features/magic-context/window-report-ledger";
 import { log, sessionLog } from "../../shared/logger";
 import {
     refreshModelLimitsAfterAuthOnce,
@@ -305,6 +306,14 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 if (!detection.isOverflow) {
                     return;
                 }
+                captureWindowReport({
+                    db: deps.db,
+                    sessionID: errInfo.sessionID,
+                    matchedPattern: detection.matchedPattern,
+                    reportedLimit: detection.reportedLimit,
+                    reportedLimitProvenance: detection.reportedLimitProvenance,
+                    error: errInfo.error,
+                });
                 // Subagents cannot recover from overflow themselves — the
                 // transform-side emergency path (`needs_emergency_recovery` →
                 // 95% → historian) is gated by `fullFeatureMode` and skips
@@ -434,6 +443,20 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 if (detection.isOverflow) {
                     messageHadOverflowError = true;
                     try {
+                        captureWindowReport({
+                            db: deps.db,
+                            sessionID: info.sessionID,
+                            providerID: info.providerID,
+                            modelID: info.modelID,
+                            matchedPattern: detection.matchedPattern,
+                            reportedLimit: detection.reportedLimit,
+                            reportedLimitProvenance: detection.reportedLimitProvenance,
+                            attemptedTokens:
+                                (info.tokens?.input ?? 0) +
+                                (info.tokens?.cache?.read ?? 0) +
+                                (info.tokens?.cache?.write ?? 0),
+                            error: info.error,
+                        });
                         const overflowModelKey = resolveModelKey(info.providerID, info.modelID);
                         const metaForOverflow = getOrCreateSessionMeta(deps.db, info.sessionID);
                         if (metaForOverflow.isSubagent) {

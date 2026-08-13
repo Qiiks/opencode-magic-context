@@ -1,9 +1,10 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it, mock } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
 import {
     __resetMessageIndexAsyncForTests,
     isSessionReconciled,
@@ -38,6 +39,7 @@ import {
     __test as transformDecisionLogTest,
 } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
+import { getWindowReportsPath } from "../../features/magic-context/window-report-ledger";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { createEventHandler } from "./event-handler";
 
@@ -1159,6 +1161,96 @@ describe("createEventHandler — compaction-off overflow gating (issue #266 S3)"
         // The provider-reported limit stays useful for the raw-usage % the
         // sidebar renders in this mode.
         expect(state.detectedContextLimit).toBe(120000);
+    });
+
+    it("captures session.error overflow without guessing provider metadata", async () => {
+        useTempDataHome("context-event-window-report-session-error-");
+        const deps = createDeps(new Map());
+        updateSessionMeta(deps.db, "ses-session-error-report", {
+            lastObservedModelKey: "anthropic/claude-sonnet-4-5",
+        });
+        const handler = createEventHandler(deps);
+
+        await handler({
+            event: {
+                type: "session.error",
+                properties: { sessionID: "ses-session-error-report", error: OVERFLOW_ERROR },
+            },
+        });
+
+        const report = JSON.parse(readFileSync(getWindowReportsPath(), "utf8")) as Record<
+            string,
+            unknown
+        >;
+        expect(report).toMatchObject({
+            access_path: "api",
+            extracted_limit: 120000,
+            extracted_limit_units: "provider",
+            geometry: "combined",
+            path_may_forward: false,
+        });
+        // Session errors lack a model identity. A stale session value is not evidence.
+        expect("provider_id" in report).toBe(false);
+        expect("model_id" in report).toBe(false);
+    });
+
+    it("captures message.updated overflow with observed model, token, and routing facts", async () => {
+        useTempDataHome("context-event-window-report-message-updated-");
+        const deps = createDeps(new Map());
+        updateSessionMeta(deps.db, "ses-message-report", {
+            lastObservedModelKey: "openrouter/anthropic/claude-sonnet-4-5",
+            observedSafeInputTokens: 150,
+        });
+        const handler = createEventHandler(deps);
+
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "msg-window-report",
+                        sessionID: "ses-message-report",
+                        role: "assistant",
+                        providerID: "openrouter",
+                        modelID: "anthropic/claude-sonnet-4-5",
+                        error: { message: OVERFLOW_ERROR, status: 400 },
+                        finish: "stop",
+                        tokens: { input: 100, cache: { read: 50, write: 0 } },
+                        time: { completed: Date.now() },
+                    },
+                },
+            },
+        });
+
+        const report = JSON.parse(readFileSync(getWindowReportsPath(), "utf8")) as Record<
+            string,
+            unknown
+        >;
+        expect(report).toMatchObject({
+            provider_id: "openrouter",
+            model_id: "anthropic/claude-sonnet-4-5",
+            status: 400,
+            attempted_tokens: 150,
+            attempted_tokens_units: "estimate",
+            largest_success: 150,
+            largest_success_units: "estimate",
+            path_may_forward: true,
+            served_by_hint: "anthropic",
+        });
+    });
+
+    it("does not append reports for non-overflow errors", async () => {
+        useTempDataHome("context-event-window-report-non-overflow-");
+        const handler = createEventHandler(createDeps(new Map()));
+
+        await handler({
+            event: {
+                type: "session.error",
+                properties: { sessionID: "ses-non-overflow", error: "connection timed out" },
+            },
+        });
+
+        expect(existsSync(getWindowReportsPath())).toBe(false);
     });
 
     it("compaction OFF: message.updated overflow also records limit only, never arms", async () => {
