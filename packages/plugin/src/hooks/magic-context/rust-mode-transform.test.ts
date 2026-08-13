@@ -1333,6 +1333,166 @@ describe("Rust mode authority adapter", () => {
         expect(output.messages).toEqual(native);
     });
 
+    it("restarts a paged transform series after an attempt mismatch", async () => {
+        const sessionId = `rust-series-restart-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installAvailabilityDb(sessionId, {});
+        installRawProvider(sessionId);
+        const messages = makeMessages(sessionId);
+        messages[0]!.parts = [{ type: "text", text: "x".repeat(600_000) }];
+        const native = [{ role: "assistant", parts: [] }];
+        const transformBodies: Array<Record<string, unknown>> = [];
+        let failedPageId: unknown;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                const page = body as Record<string, unknown>;
+                transformBodies.push(page);
+                if (page.transform_page_index === 1 && failedPageId === undefined) {
+                    failedPageId = page.transform_page_id;
+                    throw Object.assign(
+                        new Error(
+                            "transform page generation or envelope changed during collection",
+                        ),
+                        { code: "authority_transform_page_attempt_mismatch" },
+                    );
+                }
+                return page.transform_page_complete === true
+                    ? { decision: "HARD", served_from: "transform", native_messages: native }
+                    : { staged: true };
+            },
+        };
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+            const output = { messages: messages as unknown[] };
+            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
+
+            const seriesStarts = transformBodies.filter((page) => page.transform_page_index === 0);
+            const pageIds = new Set(seriesStarts.map((page) => page.transform_page_id));
+            expect(seriesStarts).toHaveLength(2);
+            expect(pageIds.size).toBe(2);
+            expect(failedPageId).toBe(seriesStarts[0]?.transform_page_id);
+            expect(seriesStarts[1]?.transform_page_id).not.toBe(seriesStarts[0]?.transform_page_id);
+            expect(output.messages).toEqual(native);
+            const logged = logSpy.mock.calls
+                .filter(([loggedSession]) => loggedSession === sessionId)
+                .map(([, message]) => message);
+            expect(logged).toContain(
+                `transform_series_restart reason=attempt_mismatch pages=${seriesStarts[0]?.transform_page_total} at_page=1`,
+            );
+            expect(logged.some((message) => message.includes("served_from=transform"))).toBe(true);
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
+    it("restarts a paged transform series after a mid-series reconnect", async () => {
+        const sessionId = `rust-series-reconnect-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installAvailabilityDb(sessionId, {});
+        installRawProvider(sessionId);
+        const messages = makeMessages(sessionId);
+        messages[0]!.parts = [{ type: "text", text: "x".repeat(600_000) }];
+        const native = [{ role: "assistant", parts: [] }];
+        const transformCalls: Array<{
+            body: Record<string, unknown>;
+            generationSensitive: boolean | undefined;
+        }> = [];
+        let reconnectReported = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body, generationSensitive }) => {
+                if (method !== "transform") return { ok: true };
+                const page = body as Record<string, unknown>;
+                transformCalls.push({ body: page, generationSensitive });
+                if (page.transform_page_index === 1 && !reconnectReported) {
+                    reconnectReported = true;
+                    return {
+                        transport_status: "connection_generation_changed",
+                        previous_generation: 3,
+                        current_generation: 4,
+                    };
+                }
+                return page.transform_page_complete === true
+                    ? { decision: "HARD", served_from: "transform", native_messages: native }
+                    : { staged: true };
+            },
+        };
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+            const output = { messages: messages as unknown[] };
+            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
+
+            const seriesStarts = transformCalls.filter(
+                ({ body }) => body.transform_page_index === 0,
+            );
+            expect(seriesStarts).toHaveLength(2);
+            expect(new Set(seriesStarts.map(({ body }) => body.transform_page_id)).size).toBe(2);
+            expect(
+                transformCalls.find(({ body }) => body.transform_page_index === 1)
+                    ?.generationSensitive,
+            ).toBe(true);
+            expect(output.messages).toEqual(native);
+            const logged = logSpy.mock.calls
+                .filter(([loggedSession]) => loggedSession === sessionId)
+                .map(([, message]) => message);
+            expect(logged).toContain(
+                `transform_series_restart reason=reconnect pages=${seriesStarts[0]?.body.transform_page_total} at_page=1`,
+            );
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
+    it("falls through after a second paged transform series mismatch", async () => {
+        const sessionId = `rust-series-restart-bound-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installAvailabilityDb(sessionId, {});
+        installRawProvider(sessionId);
+        const messages = makeMessages(sessionId);
+        messages[0]!.parts = [{ type: "text", text: "x".repeat(600_000) }];
+        const transformBodies: Array<Record<string, unknown>> = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                const page = body as Record<string, unknown>;
+                transformBodies.push(page);
+                if (page.transform_page_index === 1) {
+                    throw Object.assign(new Error("attempt mismatch"), {
+                        code: "authority_transform_page_attempt_mismatch",
+                    });
+                }
+                return { staged: true };
+            },
+        };
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+            const output = { messages: [] as unknown[] };
+            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
+
+            const seriesStarts = transformBodies.filter((page) => page.transform_page_index === 0);
+            expect(seriesStarts).toHaveLength(2);
+            expect(new Set(seriesStarts.map((page) => page.transform_page_id)).size).toBe(2);
+            expect(output.messages).toEqual(messages);
+            const logged = logSpy.mock.calls
+                .filter(([loggedSession]) => loggedSession === sessionId)
+                .map(([, message]) => message);
+            expect(
+                logged.filter((message) => message.startsWith("transform_series_restart")),
+            ).toHaveLength(1);
+            expect(logged.some((message) => message.startsWith("rust transform failed"))).toBe(
+                true,
+            );
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
     it("re-primes all ordinal memo state after a durable message removal", async () => {
         const sessionId = `rust-removal-reprime-${Date.now()}`;
         sessions.push(sessionId);
