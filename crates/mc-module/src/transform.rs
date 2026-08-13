@@ -36,7 +36,7 @@ use crate::scheduler::{
 };
 use crate::selection::{
     filter_reasoning_ineligible_decisions, select_reductions_with_outcome, PassClass, SelItem,
-    SelKind, SelectionConfig, SelectionContext, SelectionOutcome,
+    SelKind, SelMessageRole, SelectionConfig, SelectionContext, SelectionOutcome,
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
@@ -5517,6 +5517,11 @@ fn sel_item_from_flat(block: &FlatBlock, tag_tokens_by_block: &HashMap<&str, usi
     SelItem {
         id: block.id.clone(),
         ordinal: block.ordinal,
+        message_role: if block.role == "assistant" {
+            SelMessageRole::Assistant
+        } else {
+            SelMessageRole::NonAssistant
+        },
         kind,
         provider_executed: block.provider_executed,
         byte_size: block.bytes.len(),
@@ -23962,6 +23967,333 @@ pub(crate) mod tests {
             frozen_red_targets(&s.load("reason-guard").unwrap().core).contains("a1#0"),
             "the poisoned unit stays frozen (monotonicity untouched), only inert"
         );
+    }
+
+    fn reasoning_adjacency_fixture(
+        first_has_reasoning: bool,
+        first_has_text: bool,
+        next_has_reasoning: bool,
+    ) -> Vec<CkIngressMessage> {
+        let call_id = "reasoning-adjacency-call";
+        let mut first_content = Vec::new();
+        if first_has_reasoning {
+            first_content.push(CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "signed reasoning before the tool".to_string(),
+                signature: Some("reasoning-adjacency-signature-left".to_string()),
+            }));
+        }
+        if first_has_text {
+            first_content.push(CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: "durable assistant text before the tool".to_string(),
+            }));
+        }
+        first_content.push(CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+            id: call_id.to_string(),
+            name: "read".to_string(),
+            input: json!({ "path": "large-reasoning-fixture.txt" }),
+            provider_executed: false,
+        }));
+
+        let first = CkIngressMessage {
+            mid: "reasoning-adjacency-left".to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                first_content,
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some("reasoning-adjacency-left".to_string()),
+                    ..Default::default()
+                },
+            ),
+        };
+        let bulk_output = "reasoning-adjacency-bulk-output-".repeat(256);
+        let result = tool_result("reasoning-adjacency-result", 2, call_id, &bulk_output);
+
+        let mut next_content = Vec::new();
+        if next_has_reasoning {
+            next_content.push(CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "signed reasoning after the tool".to_string(),
+                signature: Some("reasoning-adjacency-signature-right".to_string()),
+            }));
+        }
+        next_content.push(CkWireBlock::bare(ck_wire::CkKind::Text {
+            text: "assistant response after the tool".to_string(),
+        }));
+        let next = CkIngressMessage {
+            mid: "reasoning-adjacency-right".to_string(),
+            ordinal: 3,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                next_content,
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some("reasoning-adjacency-right".to_string()),
+                    ..Default::default()
+                },
+            ),
+        };
+
+        let mut messages = vec![
+            first,
+            result,
+            next,
+            item(
+                "reasoning-adjacency-padding-separator",
+                4,
+                "padding separator",
+            ),
+        ];
+        for index in 0..20 {
+            let ordinal = 5 + (index as u64 * 2);
+            let padding_call_id = format!("reasoning-adjacency-padding-{index}");
+            messages.push(assistant_tool_call(
+                &format!("reasoning-adjacency-padding-call-{index}"),
+                ordinal,
+                &padding_call_id,
+            ));
+            messages.push(tool_result(
+                &format!("reasoning-adjacency-padding-result-{index}"),
+                ordinal + 1,
+                &padding_call_id,
+                "small padding result",
+            ));
+        }
+        messages
+    }
+
+    fn fresh_age_reduction_and_render(
+        request: &TransformRequest,
+    ) -> (Vec<ReductionDecision>, Vec<CkWireMessage>) {
+        let projection = project_messages(&request.messages).unwrap();
+        let live = projection.blocks.iter().collect::<Vec<_>>();
+        let tag_tokens_by_block = HashMap::new();
+        let items = tail_sel_items(&live, None, &tag_tokens_by_block);
+        let decisions = crate::selection::select_reductions(
+            &items,
+            &HashSet::new(),
+            &SelectionContext {
+                pass_class: PassClass::Execute,
+                current_total_input_tokens: 1_000.0,
+                ceiling_tokens: 2_000.0,
+                protected_cutoff_ordinal: 0,
+                last_execute_ordinal: 1,
+                scheduler_pressure_execute: true,
+                prior_input_sample: 0.0,
+                has_prior_drop: false,
+                agent_drop_ids: Vec::new(),
+                agent_drop_command_ids: HashMap::new(),
+                first_applied_agent_drop_ids: HashSet::new(),
+                pass_already_busting: true,
+                supersession_ride_available: false,
+                tag_window_protected_block_ids: HashSet::new(),
+                exempt_message_protected_block_ids: HashSet::new(),
+            },
+            &SelectionConfig::default(),
+        );
+        let mut core = CoreState::default();
+        core.frozen_units = decisions
+            .iter()
+            .map(|decision| red_unit(&decision.target_id, &decision.kind, &decision.payload))
+            .collect();
+        let served = build_output(
+            &core,
+            &ModuleMeta::default(),
+            &projection,
+            request,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        (decisions, served)
+    }
+
+    fn message_has_reasoning(message: &CkWireMessage) -> bool {
+        message.content.iter().any(|block| {
+            matches!(
+                block.kind,
+                ck_wire::CkKind::Reasoning { .. } | ck_wire::CkKind::RedactedReasoning { .. }
+            )
+        })
+    }
+
+    fn has_reasoning_assistant_adjacency(messages: &[CkWireMessage]) -> bool {
+        messages.windows(2).any(|pair| {
+            pair[0].role == "assistant"
+                && pair[1].role == "assistant"
+                && (message_has_reasoning(&pair[0]) || message_has_reasoning(&pair[1]))
+        })
+    }
+
+    fn assert_fresh_reasoning_adjacency_messages_are_skeletonized(messages: Vec<CkIngressMessage>) {
+        let request = cc_req("reasoning-adjacency-fresh", "cfg0", messages);
+        let (decisions, served) = fresh_age_reduction_and_render(&request);
+        let call = decisions
+            .iter()
+            .find(|decision| decision.target_id.starts_with("reasoning-adjacency-left#"))
+            .expect("the old tool arc must be selected");
+        assert_eq!(call.kind, "skeleton", "{decisions:?}");
+
+        let result = served
+            .iter()
+            .find(|message| {
+                message.meta.harness_id.as_deref() == Some("reasoning-adjacency-result")
+            })
+            .expect("the skeletonized result must preserve the user-role separator");
+        let serialized_result = serde_json::to_string(result).unwrap();
+        assert!(
+            serialized_result.contains("[dropped"),
+            "{serialized_result}"
+        );
+        assert!(
+            !serialized_result.contains("reasoning-adjacency-bulk-output"),
+            "the result shell must reclaim the original output bytes: {serialized_result}"
+        );
+        assert!(
+            !has_reasoning_assistant_adjacency(&served),
+            "serialized output crossed a reasoning-bearing provider merge: {}",
+            serde_json::to_string(&served).unwrap()
+        );
+    }
+
+    fn assert_fresh_reasoning_adjacency_is_skeletonized(next_has_reasoning: bool) {
+        assert_fresh_reasoning_adjacency_messages_are_skeletonized(reasoning_adjacency_fixture(
+            true,
+            true,
+            next_has_reasoning,
+        ));
+    }
+
+    #[test]
+    fn reasoning_only_tool_arc_remains_unreduced_and_separated() {
+        let request = cc_req(
+            "reasoning-adjacency-reasoning-only",
+            "cfg0",
+            reasoning_adjacency_fixture(true, false, true),
+        );
+        let (decisions, served) = fresh_age_reduction_and_render(&request);
+        assert!(
+            decisions
+                .iter()
+                .all(|decision| !decision.target_id.starts_with("reasoning-adjacency-left#")),
+            "the existing reasoning-only guard must keep the whole arc: {decisions:?}"
+        );
+        let serialized = serde_json::to_string(&served).unwrap();
+        assert!(serialized.contains("reasoning-adjacency-bulk-output"));
+        assert!(!has_reasoning_assistant_adjacency(&served), "{serialized}");
+    }
+
+    #[test]
+    fn text_bearing_tool_arc_skeletonizes_between_two_reasoning_assistants() {
+        assert_fresh_reasoning_adjacency_is_skeletonized(true);
+    }
+
+    #[test]
+    fn text_bearing_tool_arc_skeletonizes_when_only_left_assistant_has_reasoning() {
+        assert_fresh_reasoning_adjacency_is_skeletonized(false);
+    }
+
+    #[test]
+    fn text_bearing_tool_arc_skeletonizes_across_redacted_reasoning() {
+        let mut messages = reasoning_adjacency_fixture(false, true, false);
+        let right = messages
+            .iter_mut()
+            .find(|message| message.mid == "reasoning-adjacency-right")
+            .expect("fixture has the right assistant");
+        right.ck.content.insert(
+            0,
+            CkWireBlock::bare(ck_wire::CkKind::RedactedReasoning {
+                data: "redacted-reasoning-adjacency".to_string(),
+            }),
+        );
+        right.ck.mark_modified();
+        assert_fresh_reasoning_adjacency_messages_are_skeletonized(messages);
+    }
+
+    #[test]
+    fn non_reasoning_adjacency_keeps_full_drop_mode() {
+        let request = cc_req(
+            "non-reasoning-adjacency",
+            "cfg0",
+            reasoning_adjacency_fixture(false, true, false),
+        );
+        let (decisions, served) = fresh_age_reduction_and_render(&request);
+        let call = decisions
+            .iter()
+            .find(|decision| decision.target_id.starts_with("reasoning-adjacency-left#"))
+            .expect("the old non-reasoning tool arc must be selected");
+        assert_eq!(call.kind, "drop", "{decisions:?}");
+        assert!(served.iter().all(|message| {
+            message.meta.harness_id.as_deref() != Some("reasoning-adjacency-result")
+        }));
+        assert!(!has_reasoning_assistant_adjacency(&served));
+    }
+
+    #[test]
+    fn historical_full_drop_replays_byte_identically_through_output_cache() {
+        let request = cc_req(
+            "reasoning-adjacency-frozen-full-drop",
+            "cfg0",
+            reasoning_adjacency_fixture(true, true, true),
+        );
+        let projection = project_messages(&request.messages).unwrap();
+        let mut core = CoreState::default();
+        core.frozen_units = vec![
+            red_unit("reasoning-adjacency-left#2", "drop", "[dropped]"),
+            red_unit("reasoning-adjacency-result#0", "drop", "[dropped]"),
+        ];
+        let meta = ModuleMeta::default();
+        let first = build_output_with_tags(
+            &core,
+            &meta,
+            &projection,
+            &request,
+            None,
+            false,
+            None,
+            &BTreeMap::new(),
+            0,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        let first_bytes = serde_json::to_vec(&first.messages).unwrap();
+        assert!(first.messages.iter().all(|message| {
+            message.meta.harness_id.as_deref() != Some("reasoning-adjacency-result")
+        }));
+        assert!(has_reasoning_assistant_adjacency(
+            &first
+                .messages
+                .iter()
+                .map(|message| (**message).clone())
+                .collect::<Vec<_>>()
+        ));
+
+        let snapshot = SerializedOutputCacheSnapshot {
+            entries: first.cache_entries.clone(),
+        };
+        let replay = build_output_with_tags(
+            &core,
+            &meta,
+            &projection,
+            &request,
+            None,
+            false,
+            None,
+            &BTreeMap::new(),
+            0,
+            false,
+            Some(&snapshot),
+            false,
+        )
+        .unwrap();
+        assert!(replay.cache_stats.reused_items > 0);
+        assert_eq!(serde_json::to_vec(&replay.messages).unwrap(), first_bytes);
+        assert!(core.frozen_units.iter().all(|unit| unit.kind == "drop"));
     }
 
     #[test]

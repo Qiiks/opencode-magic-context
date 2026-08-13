@@ -8,6 +8,8 @@
 //! caller-owned [`mc_store::ModuleMeta`] so the change can be committed in the same pass
 //! as the cache-state transition.
 
+#[cfg(test)]
+use crate::selection::SelMessageRole;
 use crate::selection::{SelItem, SelKind};
 use mc_store::{
     CkKind, CkOutputKind, CkToolOutput, CkWireBlock, CkWireMessage, FrozenSyntheticTodoPair,
@@ -516,6 +518,7 @@ mod tests {
         SelItem {
             id: id.to_string(),
             ordinal,
+            message_role: SelMessageRole::Assistant,
             kind: SelKind::ToolCall {
                 name: TODO_TOOL_NAME.to_string(),
                 input: serde_json::json!({ "todos": todos }),
