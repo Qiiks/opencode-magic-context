@@ -101,6 +101,13 @@ impl RedKind {
     }
 }
 
+/// The message role needed to reason about provider-side same-role merging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelMessageRole {
+    Assistant,
+    NonAssistant,
+}
+
 /// The typed content-kind projection selection branches on — CK#1 `ContentKind`
 /// reduced to exactly the fields the five selectors read.
 #[derive(Debug, Clone)]
@@ -128,6 +135,8 @@ pub enum SelKind {
 pub struct SelItem {
     pub id: String,
     pub ordinal: u64,
+    /// Provider-facing role of the owning message.
+    pub message_role: SelMessageRole,
     pub kind: SelKind,
     /// True = the model's own SERVER-side tool (stays verbatim; never targeted).
     pub provider_executed: bool,
@@ -358,6 +367,100 @@ struct ReasoningMessageShape {
 fn item_message_id(item: &SelItem) -> Option<&str> {
     let (mid, index) = item.id.rsplit_once('#')?;
     index.parse::<usize>().ok().map(|_| mid)
+}
+
+struct AdjacencyMessageShape<'a> {
+    mid: &'a str,
+    ordinal: u64,
+    role: SelMessageRole,
+    has_reasoning: bool,
+    items: Vec<&'a SelItem>,
+}
+
+impl AdjacencyMessageShape<'_> {
+    fn fully_removed_by_arc(&self) -> Option<&str> {
+        let arc_id = self.items.first()?.arc_id.as_deref()?;
+        self.items
+            .iter()
+            .all(|item| {
+                item.arc_id.as_deref() == Some(arc_id)
+                    && matches!(
+                        item.kind,
+                        SelKind::ToolCall { .. } | SelKind::ToolResult { .. }
+                    )
+            })
+            .then_some(arc_id)
+    }
+
+    fn is_result_separator(&self) -> bool {
+        self.role == SelMessageRole::NonAssistant
+            && self
+                .items
+                .iter()
+                .any(|item| matches!(item.kind, SelKind::ToolResult { .. }))
+    }
+}
+
+/// Arc ids whose complete removal would erase a tool-result separator and expose
+/// reasoning-bearing assistant content to a provider-side same-role merge.
+fn reasoning_adjacency_collapse_arc_ids(items: &[SelItem]) -> HashSet<String> {
+    let mut messages: HashMap<&str, AdjacencyMessageShape<'_>> = HashMap::new();
+    for item in items {
+        let Some(mid) = item_message_id(item) else {
+            continue;
+        };
+        let message = messages
+            .entry(mid)
+            .or_insert_with(|| AdjacencyMessageShape {
+                mid,
+                ordinal: item.ordinal,
+                role: item.message_role,
+                has_reasoning: false,
+                items: Vec::new(),
+            });
+        message.ordinal = message.ordinal.min(item.ordinal);
+        message.has_reasoning |=
+            matches!(item.kind, SelKind::Reasoning | SelKind::RedactedReasoning);
+        message.items.push(item);
+    }
+    let mut messages = messages.into_values().collect::<Vec<_>>();
+    messages.sort_by(|left, right| {
+        left.ordinal
+            .cmp(&right.ordinal)
+            .then_with(|| left.mid.cmp(right.mid))
+    });
+
+    let mut removable_by_arc: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, message) in messages.iter().enumerate() {
+        if let Some(arc_id) = message.fully_removed_by_arc() {
+            removable_by_arc.entry(arc_id).or_default().push(index);
+        }
+    }
+
+    removable_by_arc
+        .into_iter()
+        .filter_map(|(arc_id, indexes)| {
+            let hazardous = indexes
+                .chunk_by(|left, right| *right == *left + 1)
+                .any(|run| {
+                    let first = run[0];
+                    let last = run[run.len() - 1];
+                    let Some(left) = first.checked_sub(1).and_then(|index| messages.get(index))
+                    else {
+                        return false;
+                    };
+                    let Some(right) = messages.get(last + 1) else {
+                        return false;
+                    };
+                    run.iter()
+                        .any(|index| messages[*index].is_result_separator())
+                        && left.role == SelMessageRole::Assistant
+                        && right.role == SelMessageRole::Assistant
+                        && (left.has_reasoning || right.has_reasoning)
+                });
+            hazardous.then(|| arc_id.to_string())
+        })
+        .collect()
 }
 
 /// Tool arcs in an assistant that consists only of native reasoning plus reducible tool blocks
@@ -923,6 +1026,7 @@ pub(crate) fn select_reductions_with_outcome(
         .collect();
     let arcs = group_arcs(items, frozen_keys);
     let reasoning_ineligible_arcs = reasoning_ineligible_arc_ids(items);
+    let reasoning_adjacency_collapse_arcs = reasoning_adjacency_collapse_arc_ids(items);
     let mut messages_by_recency: Vec<(u64, String)> = items
         .iter()
         .filter_map(|item| Some((item.ordinal, item_message_id(item)?.to_owned())))
@@ -1019,10 +1123,10 @@ pub(crate) fn select_reductions_with_outcome(
         PassClass::Defer => unreachable!("defer returned early"),
     }
 
-    // Resolve the skeleton-window shape: a FullDrop arc inside the newest-window keeps
-    // a call SKELETON (pairing context) instead. Decided ONCE here (freeze-time) — the
-    // shape freezes with the payload; an arc aging past the window later is NOT
-    // re-decided (frozen_keys excludes it). EditMarker is window-independent.
+    // Resolve fresh full-drop intents to a skeleton when either recency or removal safety
+    // requires a result shell. Decided ONCE here (freeze-time): frozen_keys excludes replayed
+    // arcs, so neither an aging window nor a newly detected adjacency can change frozen bytes.
+    // EditMarker is window-independent.
     let mut newest_arcs: Vec<&&ToolArc> = active_arcs.iter().collect();
     newest_arcs.sort_by(|a, b| {
         b.ordinal
@@ -1047,13 +1151,14 @@ pub(crate) fn select_reductions_with_outcome(
         };
         let resolved = match shape {
             ArcShape::EditMarker => ArcShape::EditMarker,
-            ArcShape::FullDrop | ArcShape::Skeleton => {
-                if skeleton_window.contains(arc_id) {
-                    ArcShape::Skeleton
-                } else {
-                    ArcShape::FullDrop
-                }
+            ArcShape::Skeleton => ArcShape::Skeleton,
+            ArcShape::FullDrop
+                if reasoning_adjacency_collapse_arcs.contains(arc_id)
+                    || skeleton_window.contains(arc_id) =>
+            {
+                ArcShape::Skeleton
             }
+            ArcShape::FullDrop => ArcShape::FullDrop,
         };
         expand_arc(arc, resolved, frozen_keys, &mut out);
     }
@@ -1189,6 +1294,7 @@ mod tests {
         SelItem {
             id: id.clone(),
             ordinal,
+            message_role: SelMessageRole::Assistant,
             kind: SelKind::ToolCall {
                 name: name.to_string(),
                 input,
@@ -1204,6 +1310,7 @@ mod tests {
         SelItem {
             id: result_block_id(mid),
             ordinal,
+            message_role: SelMessageRole::NonAssistant,
             kind: SelKind::ToolResult {
                 tool_name: name.to_string(),
             },
@@ -1218,6 +1325,7 @@ mod tests {
         SelItem {
             id: reasoning_block_id(mid),
             ordinal,
+            message_role: SelMessageRole::Assistant,
             kind: SelKind::Reasoning,
             provider_executed: false,
             byte_size: bytes,
@@ -1230,6 +1338,7 @@ mod tests {
         SelItem {
             id: id.to_string(),
             ordinal,
+            message_role: SelMessageRole::Assistant,
             kind: SelKind::Reasoning,
             provider_executed: false,
             byte_size: bytes,
@@ -1242,6 +1351,7 @@ mod tests {
         SelItem {
             id: id.to_string(),
             ordinal,
+            message_role: SelMessageRole::NonAssistant,
             kind: SelKind::Text,
             provider_executed: false,
             byte_size: bytes,
@@ -1261,6 +1371,7 @@ mod tests {
         SelItem {
             id: id.to_string(),
             ordinal,
+            message_role: SelMessageRole::Assistant,
             kind: SelKind::ToolCall {
                 name: name.to_string(),
                 input,
@@ -1282,6 +1393,7 @@ mod tests {
         SelItem {
             id: id.to_string(),
             ordinal,
+            message_role: SelMessageRole::NonAssistant,
             kind: SelKind::ToolResult {
                 tool_name: name.to_string(),
             },
@@ -1317,6 +1429,7 @@ mod tests {
         let items = vec![SelItem {
             id: "drop".to_string(),
             ordinal: 1,
+            message_role: SelMessageRole::NonAssistant,
             kind: SelKind::Text,
             provider_executed: false,
             byte_size: 128,
@@ -1484,14 +1597,26 @@ mod tests {
             let mut items: Vec<SelItem> = case
                 .items
                 .iter()
-                .map(|i| SelItem {
-                    id: i.id.clone(),
-                    ordinal: i.ordinal,
-                    kind: parse_kind(&i.kind),
-                    provider_executed: i.provider_executed,
-                    byte_size: i.byte_size,
-                    token_count: i.token_count,
-                    arc_id: i.arc_id.clone(),
+                .map(|i| {
+                    let kind = parse_kind(&i.kind);
+                    let message_role = if matches!(
+                        kind,
+                        SelKind::ToolCall { .. } | SelKind::Reasoning | SelKind::RedactedReasoning
+                    ) {
+                        SelMessageRole::Assistant
+                    } else {
+                        SelMessageRole::NonAssistant
+                    };
+                    SelItem {
+                        id: i.id.clone(),
+                        ordinal: i.ordinal,
+                        message_role,
+                        kind,
+                        provider_executed: i.provider_executed,
+                        byte_size: i.byte_size,
+                        token_count: i.token_count,
+                        arc_id: i.arc_id.clone(),
+                    }
                 })
                 .collect();
             if case.smart_drops {
@@ -2304,7 +2429,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_with_a_durable_text_sibling_keeps_tool_reclaim_eligible() {
+    fn reasoning_with_a_durable_text_sibling_reclaims_via_separator_skeleton() {
         let target_arc = "assistant#1";
         let mut items = vec![
             reasoning_with_id("assistant#0", target_arc, 1, 100),
@@ -2343,9 +2468,16 @@ mod tests {
 
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         assert!(
-            out.iter()
-                .any(|decision| { decision.target_id == target_arc && decision.kind == "drop" }),
-            "the durable text sibling prevents a reasoning-only assistant: {out:?}"
+            out.iter().any(|decision| {
+                decision.target_id == target_arc && decision.kind == "skeleton"
+            }),
+            "the durable text sibling keeps the arc reclaimable while its result separates reasoning-bearing assistants: {out:?}"
+        );
+        assert!(
+            out.iter().any(|decision| {
+                decision.target_id == "tool-result#0" && decision.kind == "drop"
+            }),
+            "skeleton mode must reclaim the result payload through the existing drop placeholder: {out:?}"
         );
     }
 
@@ -2630,6 +2762,7 @@ mod tests {
         let items = vec![SelItem {
             id: "held#0".to_string(),
             ordinal: 1,
+            message_role: SelMessageRole::NonAssistant,
             kind: SelKind::Text,
             provider_executed: false,
             byte_size: 100,
@@ -2655,6 +2788,7 @@ mod tests {
             SelItem {
                 id: "held#0".to_string(),
                 ordinal: 1,
+                message_role: SelMessageRole::NonAssistant,
                 kind: SelKind::Text,
                 provider_executed: false,
                 byte_size: 100,
@@ -2664,6 +2798,7 @@ mod tests {
             SelItem {
                 id: "new#0".to_string(),
                 ordinal: 2,
+                message_role: SelMessageRole::NonAssistant,
                 kind: SelKind::Text,
                 provider_executed: false,
                 byte_size: 100,
@@ -2696,6 +2831,7 @@ mod tests {
             .map(|(index, kind)| SelItem {
                 id: format!("carrier#{index}"),
                 ordinal: 1,
+                message_role: SelMessageRole::NonAssistant,
                 kind,
                 provider_executed: false,
                 byte_size: 100,
