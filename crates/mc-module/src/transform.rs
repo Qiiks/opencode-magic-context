@@ -1014,6 +1014,12 @@ pub struct TransformTimings {
     #[serde(default)]
     pub native_cache_encoded_messages: usize,
     #[serde(default)]
+    pub native_cache_refused_store: usize,
+    #[serde(default)]
+    pub native_cache_degraded_store: usize,
+    #[serde(default)]
+    pub native_cache_evicted: usize,
+    #[serde(default)]
     pub response_encode: f64,
     #[serde(default)]
     pub frozen_units: usize,
@@ -1068,8 +1074,9 @@ pub fn format_pass_timing_line(
          build_output={:.1} build_identity={:.1} build_identity_max={:.1} build_frozen_unit_scan={:.1} \
          build_cache_lookup={:.1} build_serialize_misses={:.1} build_tail_loop={:.1} \
           divergence={:.1} store_commit={:.1} trigger_ms={:.1} trigger_tokenized_blocks={} \
-           post_attach_ms={:.1} native_cache_reused_messages={} native_cache_encoded_messages={} \
-           response_encode={response_encode_ms:.1} frozen_units={} tail_units_matched={} \
+            post_attach_ms={:.1} native_cache_reused_messages={} native_cache_encoded_messages={} \
+            native_cache_refused_store={} native_cache_degraded_store={} native_cache_evicted={} \
+            response_encode={response_encode_ms:.1} frozen_units={} tail_units_matched={} \
            projection_blocks={} tail_messages_emitted={} build_identity_messages={} \
            cache_hits={} cache_misses={} cache_dirty_skips={}",
         timings.total,
@@ -1117,6 +1124,9 @@ pub fn format_pass_timing_line(
         timings.post_attach,
         timings.native_cache_reused_messages,
         timings.native_cache_encoded_messages,
+        timings.native_cache_refused_store,
+        timings.native_cache_degraded_store,
+        timings.native_cache_evicted,
         timings.frozen_units,
         timings.tail_units_matched,
         timings.projection_blocks,
@@ -10483,6 +10493,9 @@ pub(crate) mod tests {
             "trigger_tokenized_blocks",
             "native_cache_reused_messages",
             "native_cache_encoded_messages",
+            "native_cache_refused_store",
+            "native_cache_degraded_store",
+            "native_cache_evicted",
             "frozen_units",
             "tail_units_matched",
             "projection_blocks",
