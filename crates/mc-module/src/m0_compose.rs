@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use mc_store::{McStore, McStoreError, MemoryRevision};
 
 use crate::compartment_coverage::{resolve_coverage, CoverageGap};
-use crate::decay_render::DecayRenderCompartment;
+use crate::decay_render::{extract_m0_block, DecayRenderCompartment};
 use crate::memory_render::{render_m0, render_memory_line, workspace_source_names, M0Inputs};
 use crate::project_docs::read_project_docs_canonical;
 
@@ -277,6 +277,47 @@ pub(crate) fn trim_user_profile_to_budget(
         .collect()
 }
 
+/// Count only the rendered `<session-history>` slice, matching the history budget's scope.
+fn history_slice_tokens(m0_text: &str, estimate_tokens: impl Fn(&str) -> usize) -> usize {
+    extract_m0_block(m0_text, "session-history").map_or(0, |slice| estimate_tokens(&slice))
+}
+
+/// Render m0 and, when the history slice overshoots, tighten decay pressure at most three times.
+/// The capped final render is retained even when its history still exceeds the slack threshold.
+fn render_m0_with_decay_pressure_retry(
+    inputs: &M0Inputs<'_>,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> String {
+    let render = |decay_pressure_multiplier| {
+        render_m0(
+            &M0Inputs {
+                project_docs: inputs.project_docs,
+                user_profile: inputs.user_profile,
+                covered_system_messages: inputs.covered_system_messages,
+                compartments: inputs.compartments,
+                memories: inputs.memories,
+                source_name_by_id: inputs.source_name_by_id,
+                history_budget_tokens: inputs.history_budget_tokens,
+                decay_pressure_multiplier,
+            },
+            estimate_tokens,
+        )
+    };
+    let mut decay_pressure_multiplier = 1.0;
+    let mut m0_bytes = render(decay_pressure_multiplier);
+    let mut attempts = 0;
+    while inputs.history_budget_tokens > 0.0
+        && history_slice_tokens(&m0_bytes, estimate_tokens) as f64
+            > inputs.history_budget_tokens * 1.05
+        && attempts < 3
+    {
+        decay_pressure_multiplier *= 1.15;
+        m0_bytes = render(decay_pressure_multiplier);
+        attempts += 1;
+    }
+    m0_bytes
+}
+
 /// Read the store and compose the HARD m0 bytes + watermarks. `estimate_tokens` is the
 /// token estimator used for every injection budget and the history fit.
 pub fn compose_m0_from_store(
@@ -362,7 +403,7 @@ pub fn compose_m0_from_store(
             rendered
         })
         .collect();
-    let m0_bytes = render_m0(
+    let m0_bytes = render_m0_with_decay_pressure_retry(
         &M0Inputs {
             project_docs: &docs.rendered_block,
             user_profile: &user_profile,
@@ -578,6 +619,284 @@ mod tests {
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         assert_eq!(composed.coverage_ordinal, Some(30));
         assert_eq!(composed.boundary_id, "m30");
+    }
+
+    fn pressure_compartments() -> Vec<StoredCompartment> {
+        (1..=40).map(pressure_comp).collect()
+    }
+
+    fn pressure_comp(seq: i64) -> StoredCompartment {
+        StoredCompartment {
+            sequence: seq,
+            start_message: seq,
+            end_message: seq,
+            end_message_id: format!("m{seq}"),
+            title: format!("Pressure {seq}"),
+            content: format!("legacy {seq}"),
+            p1: Some(format!("P1 {seq} {}", "full ".repeat(40))),
+            p2: Some(format!("P2 {seq} {}", "medium ".repeat(12))),
+            p3: Some(format!("P3 {seq} {}", "brief ".repeat(4))),
+            p4: Some(format!("P4 {seq}")),
+            importance: 50,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn retries_decay_pressure_when_history_slice_over_budget() {
+        use std::cell::Cell;
+
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
+        let project_dir = fixture.dir.path().join("repo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let compartments = pressure_compartments();
+        store
+            .replace_compartments("pressure", &compartments)
+            .unwrap();
+        let inputs = M0ComposeInputs {
+            session_id: "pressure",
+            project_path: "git:pressure",
+            project_directory: project_dir.to_str().unwrap(),
+            now_ms: 0,
+            history_budget_tokens: 300.0,
+            covered_system_messages: &[],
+            memory_enabled: false,
+            memory_budget_tokens: 0.0,
+            user_profile_budget_tokens: 0.0,
+            inject_docs: false,
+            temporal_awareness: true,
+        };
+        let decay_compartments = compartments
+            .iter()
+            .map(DecayRenderCompartment::from)
+            .collect::<Vec<_>>();
+        let baseline = render_m0(
+            &M0Inputs {
+                project_docs: "",
+                user_profile: &[],
+                covered_system_messages: &[],
+                compartments: &decay_compartments,
+                memories: &[],
+                source_name_by_id: &HashMap::new(),
+                history_budget_tokens: inputs.history_budget_tokens,
+                decay_pressure_multiplier: 1.0,
+            },
+            no_estimate,
+        );
+        let history_measurements = Cell::new(0usize);
+        let estimator = |text: &str| {
+            if text.starts_with("<session-history>") {
+                history_measurements.set(history_measurements.get() + 1);
+                1_000
+            } else {
+                0
+            }
+        };
+
+        let composed = compose_m0_from_store(store, &inputs, estimator).unwrap();
+
+        assert_eq!(
+            history_measurements.get(),
+            4,
+            "one initial render plus the three bounded retries"
+        );
+        assert!(
+            composed.m0_bytes.len() < baseline.len(),
+            "retry pressure must select lower tiers than the initial render"
+        );
+    }
+
+    fn pressure_render_compartments() -> Vec<DecayRenderCompartment> {
+        let stored = pressure_compartments();
+        stored.iter().map(DecayRenderCompartment::from).collect()
+    }
+
+    #[test]
+    fn exact_history_slack_boundary_does_not_retry() {
+        use std::cell::Cell;
+
+        let compartments = pressure_render_compartments();
+        let source_names = HashMap::new();
+        let inputs = M0Inputs {
+            project_docs: "",
+            user_profile: &[],
+            covered_system_messages: &[],
+            compartments: &compartments,
+            memories: &[],
+            source_name_by_id: &source_names,
+            history_budget_tokens: 300.0,
+            decay_pressure_multiplier: 1.0,
+        };
+        let baseline = render_m0(&inputs, no_estimate);
+        let history_measurements = Cell::new(0usize);
+        let estimator = |text: &str| {
+            if text.starts_with("<session-history>") {
+                history_measurements.set(history_measurements.get() + 1);
+                315
+            } else {
+                0
+            }
+        };
+
+        let rendered = render_m0_with_decay_pressure_retry(&inputs, estimator);
+
+        assert_eq!(history_measurements.get(), 1, "315 is exactly 1.05 × 300");
+        assert_eq!(
+            rendered, baseline,
+            "the retry gate is strictly greater-than"
+        );
+    }
+
+    #[test]
+    fn zero_history_budget_skips_retry_measurement() {
+        let compartments = pressure_render_compartments();
+        let source_names = HashMap::new();
+        let inputs = M0Inputs {
+            project_docs: "",
+            user_profile: &[],
+            covered_system_messages: &[],
+            compartments: &compartments,
+            memories: &[],
+            source_name_by_id: &source_names,
+            history_budget_tokens: 0.0,
+            decay_pressure_multiplier: 1.0,
+        };
+        let baseline = render_m0(&inputs, no_estimate);
+
+        let rendered = render_m0_with_decay_pressure_retry(&inputs, |_| {
+            panic!("zero budget must not measure the history slice")
+        });
+
+        assert_eq!(rendered, baseline);
+    }
+
+    #[test]
+    fn retry_fixture_requires_two_pressure_bumps() {
+        use std::cell::Cell;
+
+        let compartments = pressure_render_compartments();
+        let source_names = HashMap::new();
+        let inputs = M0Inputs {
+            project_docs: "",
+            user_profile: &[],
+            covered_system_messages: &[],
+            compartments: &compartments,
+            memories: &[],
+            source_name_by_id: &source_names,
+            history_budget_tokens: 300.0,
+            decay_pressure_multiplier: 1.0,
+        };
+        let history_measurements = Cell::new(0usize);
+        let estimator = |text: &str| {
+            if text.starts_with("<session-history>") {
+                let measurement = history_measurements.get() + 1;
+                history_measurements.set(measurement);
+                if measurement <= 2 {
+                    1_000
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        };
+
+        let rendered = render_m0_with_decay_pressure_retry(&inputs, estimator);
+        let expected = render_m0(
+            &M0Inputs {
+                decay_pressure_multiplier: 1.15 * 1.15,
+                ..inputs
+            },
+            no_estimate,
+        );
+
+        assert_eq!(
+            history_measurements.get(),
+            3,
+            "the fixture must take two retries"
+        );
+        assert_eq!(rendered, expected, "each retry multiplies pressure by 1.15");
+    }
+
+    #[test]
+    fn ts_retry_fixture_converges_to_the_same_tier_demotions() {
+        #[derive(serde::Deserialize)]
+        struct RetryFixture {
+            budget: f64,
+            attempts: usize,
+            tier_counts: [usize; 5],
+            m0_sha256: String,
+        }
+
+        let fixture: RetryFixture =
+            serde_json::from_str(include_str!("../testdata/m0-decay-pressure-retry.json"))
+                .expect("parse TS m0 retry fixture");
+        let compartments = pressure_render_compartments();
+        let source_names = HashMap::new();
+        let inputs = M0Inputs {
+            project_docs: "",
+            user_profile: &[],
+            covered_system_messages: &[],
+            compartments: &compartments,
+            memories: &[],
+            source_name_by_id: &source_names,
+            history_budget_tokens: fixture.budget,
+            decay_pressure_multiplier: 1.0,
+        };
+        let history_measurements = std::cell::Cell::new(0usize);
+        let estimator = |text: &str| {
+            if text.starts_with("<session-history>") {
+                history_measurements.set(history_measurements.get() + 1);
+            }
+            mc_tokenizer::estimate_tokens(text)
+        };
+
+        let rendered = render_m0_with_decay_pressure_retry(&inputs, estimator);
+        let history = extract_m0_block(&rendered, "session-history").expect("history slice");
+        let body = history
+            .strip_prefix("<session-history>\n")
+            .and_then(|value| value.strip_suffix("\n</session-history>"))
+            .unwrap_or("");
+        let sections = if body.is_empty() {
+            Vec::new()
+        } else {
+            body.split("\n\n").collect::<Vec<_>>()
+        };
+        let mut tier_counts = [0usize; 5];
+        for compartment in &compartments {
+            let heading = format!(
+                "## {}-{}",
+                compartment.start_message, compartment.end_message
+            );
+            let section = sections
+                .iter()
+                .find(|section| section.starts_with(&heading))
+                .copied();
+            let tier = (1..=5u8)
+                .find(|tier| {
+                    crate::decay_render::render_compartment_at_tier(compartment, *tier).as_str()
+                        == section.unwrap_or("")
+                })
+                .unwrap_or(5);
+            tier_counts[tier as usize - 1] += 1;
+        }
+
+        assert_eq!(
+            history_measurements.get(),
+            fixture.attempts + 1,
+            "the TS fixture's history slice must drive the same retry count"
+        );
+        assert_eq!(tier_counts, fixture.tier_counts);
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(rendered.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            hash, fixture.m0_sha256,
+            "m0 bytes drift from the TS fixture"
+        );
     }
 
     #[test]
