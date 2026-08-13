@@ -53,7 +53,11 @@ import { isDisposedInstanceDirectory } from "./plugin/instance-disposal";
 import { createMessagesTransformHandler } from "./plugin/messages-transform";
 import { registerRpcHandlers } from "./plugin/rpc-handlers";
 import { createToolRegistry } from "./plugin/tool-registry";
-import { type ConflictResult, detectConflicts } from "./shared/conflict-detector";
+import {
+    type ConflictResult,
+    detectConflicts,
+    resolveCompactionForBoot,
+} from "./shared/conflict-detector";
 import { getMagicContextStorageDir } from "./shared/data-path";
 import { registerExitAbort, unregisterExitAbort } from "./shared/exit-abort-registry";
 import { setKeepSubagents } from "./shared/keep-subagents";
@@ -164,10 +168,25 @@ const server: Plugin = async (ctx) => {
     // never re-derives it from the config path. In compaction-off mode,
     // native compaction.auto=true is NOT a conflict (native compaction is the
     // user's chosen window manager), so the plugin stays enabled.
+    //
+    // The native compaction state comes from the host's RESOLVED config
+    // (ctx.client.config.get() — the same object `opencode debug config`
+    // prints), NOT from re-reading config files ourselves (issue #309: the
+    // file-based re-derivation defaults to auto=true when no file resolves,
+    // wrongly disabling the plugin for users whose auto=false lives in a layer
+    // we cannot see). If the resolved fetch fails or times out, we fall back to
+    // the file-based check unchanged and log one line naming the fallback.
     let conflictResult: ConflictResult | null = null;
     if (pluginConfig.enabled) {
+        const resolvedCompaction = await resolveCompactionForBoot(ctx.client);
+        if (resolvedCompaction === null) {
+            log(
+                "[magic-context] resolved-config fetch failed; using file-based compaction detection (the running server's resolved config may differ — `opencode debug config` is authoritative)",
+            );
+        }
         conflictResult = detectConflicts(ctx.directory, {
             compactionEnabled: isCompactionEnabled(pluginConfig),
+            resolvedCompaction: resolvedCompaction ?? undefined,
         });
         if (conflictResult.hasConflict) {
             pluginConfig.enabled = false;

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { detectConflicts } from "./conflict-detector";
+import { detectConflicts, resolveCompactionForBoot } from "./conflict-detector";
 
 /**
  * Regression tests for plugin-conflict detection. The previous substring-
@@ -490,6 +490,159 @@ describe("detectConflicts", () => {
             } finally {
                 if (prev !== undefined) process.env.OPENCODE_DISABLE_AUTOCOMPACT = prev;
             }
+        });
+    });
+
+    // --- Resolved-config arm (issue #309) ---
+    // The plugin boot now consumes the host's RESOLVED config
+    // (ctx.client.config.get()) instead of re-deriving compaction from files.
+    // These tests exercise the resolved arm directly via the
+    // `resolvedCompaction` option and the `resolveCompactionForBoot` helper.
+    describe("resolved-config arm (issue #309)", () => {
+        // The suite beforeEach sets OPENCODE_DISABLE_AUTOCOMPACT=1 to isolate
+        // plugin detection from compaction detection. These tests exercise the
+        // resolved arm, so they clear it and restore it per-case.
+        function withoutAutoCompactEnv<T>(fn: () => T): T {
+            const prev = process.env.OPENCODE_DISABLE_AUTOCOMPACT;
+            delete process.env.OPENCODE_DISABLE_AUTOCOMPACT;
+            try {
+                return fn();
+            } finally {
+                if (prev !== undefined) process.env.OPENCODE_DISABLE_AUTOCOMPACT = prev;
+            }
+        }
+
+        it("resolved auto=false + file layer that would default true → NO conflict (#309)", () => {
+            // No compaction block in any file + no env override → the file-based
+            // arm would default to auto=true and wrongly disable the plugin.
+            // The resolved arm says auto=false, which must win.
+            withoutAutoCompactEnv(() => {
+                const result = detectConflicts(projectDir, {
+                    compactionEnabled: true,
+                    resolvedCompaction: { auto: false, prune: false },
+                });
+                expect(result.conflicts.compactionAuto).toBe(false);
+                expect(result.hasConflict).toBe(false);
+                expect(result.nativeCompaction.auto).toBe(false);
+            });
+        });
+
+        it("resolved auto=true → conflict, message carries '(resolved config)'", () => {
+            withoutAutoCompactEnv(() => {
+                const result = detectConflicts(projectDir, {
+                    compactionEnabled: true,
+                    resolvedCompaction: { auto: true, prune: false },
+                });
+                expect(result.conflicts.compactionAuto).toBe(true);
+                expect(result.hasConflict).toBe(true);
+                expect(result.reasons.join("; ")).toContain("(resolved config)");
+            });
+        });
+
+        it("resolved prune=true → conflict, message carries '(resolved config)'", () => {
+            withoutAutoCompactEnv(() => {
+                const result = detectConflicts(projectDir, {
+                    compactionEnabled: true,
+                    resolvedCompaction: { auto: false, prune: true },
+                });
+                expect(result.conflicts.compactionPrune).toBe(true);
+                expect(result.hasConflict).toBe(true);
+                expect(result.reasons.join("; ")).toContain("(resolved config)");
+            });
+        });
+
+        it("resolved arm is skipped when resolvedCompaction is absent (file-based fallback unchanged)", () => {
+            // No resolvedCompaction → the file-based check runs. With no
+            // compaction block and no env override, it defaults to auto=true.
+            withoutAutoCompactEnv(() => {
+                const result = detectConflicts(projectDir, { compactionEnabled: true });
+                expect(result.conflicts.compactionAuto).toBe(true);
+                expect(result.hasConflict).toBe(true);
+                // File-based arm does NOT carry the resolved-config label.
+                expect(result.reasons.join("; ")).not.toContain("(resolved config)");
+            });
+        });
+
+        it("OPENCODE_DISABLE_AUTOCOMPACT short-circuits the resolved arm", () => {
+            // Resolved says auto=true, but the env override must win.
+            process.env.OPENCODE_DISABLE_AUTOCOMPACT = "1";
+            try {
+                const result = detectConflicts(projectDir, {
+                    compactionEnabled: true,
+                    resolvedCompaction: { auto: true, prune: true },
+                });
+                expect(result.conflicts.compactionAuto).toBe(false);
+                expect(result.conflicts.compactionPrune).toBe(false);
+                expect(result.hasConflict).toBe(false);
+                expect(result.nativeCompaction.auto).toBe(false);
+                expect(result.nativeCompaction.prune).toBe(false);
+            } finally {
+                delete process.env.OPENCODE_DISABLE_AUTOCOMPACT;
+            }
+        });
+
+        it("compaction-off mode: resolved auto=true is NOT a conflict (native compaction active)", () => {
+            withoutAutoCompactEnv(() => {
+                const result = detectConflicts(projectDir, {
+                    compactionEnabled: false,
+                    resolvedCompaction: { auto: true, prune: false },
+                });
+                expect(result.conflicts.compactionAuto).toBe(false);
+                expect(result.hasConflict).toBe(false);
+                // Native compaction state is still reported honestly.
+                expect(result.nativeCompaction.auto).toBe(true);
+            });
+        });
+    });
+
+    // --- resolveCompactionForBoot (the resolved-config fetch helper) ---
+    describe("resolveCompactionForBoot", () => {
+        it("returns the resolved compaction block from the client", async () => {
+            const client = {
+                config: {
+                    get: async () => ({
+                        data: { compaction: { auto: false, prune: true } },
+                    }),
+                },
+            };
+            const result = await resolveCompactionForBoot(client);
+            expect(result).toEqual({ auto: false, prune: true });
+        });
+
+        it("mirrors the SDK default semantics when compaction is absent (auto=true, prune=false)", async () => {
+            // The OpenCode schema annotates compaction.auto with default true and
+            // compaction.prune with default false (packages/core/src/v1/config/
+            // config.ts in the opencode repo), so an absent compaction block
+            // resolves to { auto: true, prune: false }.
+            const client = {
+                config: {
+                    get: async () => ({ data: {} }),
+                },
+            };
+            const result = await resolveCompactionForBoot(client);
+            expect(result).toEqual({ auto: true, prune: false });
+        });
+
+        it("returns null when the client throws (file-based fallback used)", async () => {
+            const client = {
+                config: {
+                    get: async () => {
+                        throw new Error("boom");
+                    },
+                },
+            };
+            const result = await resolveCompactionForBoot(client);
+            expect(result).toBeNull();
+        });
+
+        it("returns null when the client times out (boot never hangs)", async () => {
+            const client = {
+                config: {
+                    get: () => new Promise<never>(() => {}), // never resolves
+                },
+            };
+            const result = await resolveCompactionForBoot(client, 20);
+            expect(result).toBeNull();
         });
     });
 });
