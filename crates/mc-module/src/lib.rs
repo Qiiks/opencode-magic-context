@@ -2040,7 +2040,13 @@ impl BoundaryTokenCache {
     }
 }
 
-const NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+// These cache budgets are sized for a representative workload of 4,600 messages and 15,000
+// blocks, whose native representation is roughly 49 MiB. After projection and removal of
+// sidecar trees, its retained keys and chunks remain below 192 MiB, while the 256 MiB total
+// allows more than one large session. Because these are charged estimates, the total remains
+// a hard upper bound so that one unusually large session cannot cause unbounded cache growth.
+const NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const NATIVE_ATTACHMENT_CACHE_ENTRY_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct NativeDeltaFrontier {
@@ -2070,6 +2076,9 @@ struct NativeEncodedChunk {
 struct NativeAttachmentCacheStats {
     reused_messages: usize,
     encoded_messages: usize,
+    refused_store: usize,
+    degraded_store: usize,
+    evicted: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -2082,6 +2091,57 @@ struct NativeAttachmentCacheSnapshot {
     sidecar_sizes: HashMap<String, usize>,
     chunks: Vec<NativeEncodedChunk>,
     projection: Option<Arc<crate::ck_wire::FlatProjection>>,
+}
+
+impl NativeAttachmentCacheSnapshot {
+    fn retained_bytes(&self, served_bytes: usize) -> usize {
+        let encoded_bytes = self
+            .chunks
+            .iter()
+            .map(|chunk| chunk.retained_bytes)
+            .sum::<usize>();
+        let sidecar_structure_bytes = std::mem::size_of::<codec::DecodeSidecar>()
+            .saturating_add(self.sidecar.order.iter().map(String::len).sum())
+            .saturating_add(self.sidecar.messages.keys().map(String::len).sum())
+            .saturating_add(
+                self.sidecar
+                    .mid_pins
+                    .iter()
+                    .map(|(key, value)| key.len().saturating_add(value.len()))
+                    .sum(),
+            );
+        let sidecar_bytes = self
+            .sidecar_sizes
+            .values()
+            .copied()
+            .sum::<usize>()
+            .saturating_add(sidecar_structure_bytes);
+        // Encoded canonical bytes stand in for shared served-message allocations (hence the ×2).
+        // Native sidecar trees are charged on top of the size estimate computed during hashing.
+        let projection_bytes = self
+            .projection
+            .as_deref()
+            .map_or(0, crate::ck_wire::FlatProjection::retained_bytes);
+        encoded_bytes
+            .saturating_add(served_bytes.saturating_mul(2))
+            .saturating_add(sidecar_bytes)
+            .saturating_add(projection_bytes)
+    }
+
+    fn discard_sidecar_trees(&mut self) -> bool {
+        let had_sidecar_trees = !self.sidecar.order.is_empty()
+            || !self.sidecar.messages.is_empty()
+            || !self.sidecar.mid_pins.is_empty()
+            || !self.sidecar_hashes.is_empty()
+            || !self.sidecar_sizes.is_empty();
+        if had_sidecar_trees {
+            let harness = self.sidecar.harness.clone();
+            self.sidecar = Arc::new(codec::DecodeSidecar::new(harness));
+            self.sidecar_hashes.clear();
+            self.sidecar_sizes.clear();
+        }
+        had_sidecar_trees
+    }
 }
 
 #[derive(Debug)]
@@ -2099,21 +2159,31 @@ struct NativeAttachmentCache {
     lru: VecDeque<String>,
     retained_bytes: usize,
     max_retained_bytes: usize,
+    max_entry_retained_bytes: usize,
 }
 
 impl Default for NativeAttachmentCache {
     fn default() -> Self {
-        Self::new(NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES)
+        Self::with_limits(
+            NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES,
+            NATIVE_ATTACHMENT_CACHE_ENTRY_BUDGET_BYTES,
+        )
     }
 }
 
 impl NativeAttachmentCache {
+    #[cfg(test)]
     fn new(max_retained_bytes: usize) -> Self {
+        Self::with_limits(max_retained_bytes, max_retained_bytes)
+    }
+
+    fn with_limits(max_retained_bytes: usize, max_entry_retained_bytes: usize) -> Self {
         Self {
             sessions: HashMap::new(),
             lru: VecDeque::new(),
             retained_bytes: 0,
             max_retained_bytes,
+            max_entry_retained_bytes: max_entry_retained_bytes.min(max_retained_bytes),
         }
     }
 
@@ -2151,46 +2221,42 @@ impl NativeAttachmentCache {
         &mut self,
         session_id: &str,
         revert_epoch: u64,
-        snapshot: NativeAttachmentCacheSnapshot,
-        stats: NativeAttachmentCacheStats,
+        mut snapshot: NativeAttachmentCacheSnapshot,
+        stats: &mut NativeAttachmentCacheStats,
         served_bytes: usize,
     ) {
-        self.remove(session_id);
-        let encoded_bytes = snapshot
-            .chunks
-            .iter()
-            .map(|chunk| chunk.retained_bytes)
-            .sum::<usize>();
-        let sidecar_structure_bytes = std::mem::size_of::<codec::DecodeSidecar>()
-            .saturating_add(snapshot.sidecar.order.iter().map(String::len).sum())
-            .saturating_add(snapshot.sidecar.messages.keys().map(String::len).sum())
-            .saturating_add(
-                snapshot
-                    .sidecar
-                    .mid_pins
-                    .iter()
-                    .map(|(key, value)| key.len().saturating_add(value.len()))
-                    .sum(),
+        let requested_bytes = snapshot.retained_bytes(served_bytes);
+        let mut retained_bytes = requested_bytes;
+        let mut dropped_projection = false;
+        let mut dropped_sidecar_trees = false;
+
+        if retained_bytes > self.max_entry_retained_bytes {
+            dropped_projection = snapshot.projection.take().is_some();
+            retained_bytes = snapshot.retained_bytes(served_bytes);
+        }
+        if retained_bytes > self.max_entry_retained_bytes {
+            dropped_sidecar_trees = snapshot.discard_sidecar_trees();
+            retained_bytes = snapshot.retained_bytes(served_bytes);
+        }
+        if retained_bytes > self.max_entry_retained_bytes
+            || retained_bytes > self.max_retained_bytes
+        {
+            stats.refused_store = stats.refused_store.saturating_add(1);
+            eprintln!(
+                "native-attachment-cache refused_store session={session_id} byte_charge={retained_bytes} requested_byte_charge={requested_bytes} entry_cap={} total_budget={}",
+                self.max_entry_retained_bytes,
+                self.max_retained_bytes,
             );
-        let sidecar_bytes = snapshot
-            .sidecar_sizes
-            .values()
-            .copied()
-            .sum::<usize>()
-            .saturating_add(sidecar_structure_bytes);
-        // Encoded canonical bytes stand in for shared served-message allocations (hence the ×2).
-        // Native sidecar trees are charged on top of the size estimate computed during hashing.
-        let projection_bytes = snapshot
-            .projection
-            .as_deref()
-            .map_or(0, crate::ck_wire::FlatProjection::retained_bytes);
-        let retained_bytes = encoded_bytes
-            .saturating_add(served_bytes.saturating_mul(2))
-            .saturating_add(sidecar_bytes)
-            .saturating_add(projection_bytes);
-        if retained_bytes > self.max_retained_bytes {
             return;
         }
+        if dropped_projection || dropped_sidecar_trees {
+            stats.degraded_store = stats.degraded_store.saturating_add(1);
+            eprintln!(
+                "native-attachment-cache degraded_store session={session_id} requested_byte_charge={requested_bytes} stored_byte_charge={retained_bytes} dropped_projection={dropped_projection} dropped_sidecar_trees={dropped_sidecar_trees}",
+            );
+        }
+
+        self.remove(session_id);
         self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
         self.sessions.insert(
             session_id.to_string(),
@@ -2198,7 +2264,7 @@ impl NativeAttachmentCache {
                 revert_epoch,
                 retained_bytes,
                 snapshot,
-                stats,
+                stats: *stats,
             },
         );
         self.lru.push_back(session_id.to_string());
@@ -2208,7 +2274,17 @@ impl NativeAttachmentCache {
             };
             if let Some(session) = self.sessions.remove(&oldest) {
                 self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+                stats.evicted = stats.evicted.saturating_add(1);
+                eprintln!(
+                    "native-attachment-cache evicted session={oldest} byte_charge={} retained_bytes={} total_budget={}",
+                    session.retained_bytes,
+                    self.retained_bytes,
+                    self.max_retained_bytes,
+                );
             }
+        }
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.stats = *stats;
         }
     }
 
@@ -6979,6 +7055,9 @@ impl McHandler {
             timings.trigger_tokenized_blocks = trigger_timings.tokenized_blocks;
             timings.native_cache_reused_messages = native_cache_stats.reused_messages;
             timings.native_cache_encoded_messages = native_cache_stats.encoded_messages;
+            timings.native_cache_refused_store = native_cache_stats.refused_store;
+            timings.native_cache_degraded_store = native_cache_stats.degraded_store;
+            timings.native_cache_evicted = native_cache_stats.evicted;
             timings.post_attach = post_attach_started_at.elapsed().as_secs_f64() * 1_000.0;
         }
         respond_transform(&parsed.session_id, response)
@@ -10494,9 +10573,10 @@ fn attach_native_messages_incremental(
         );
     }
 
-    let stats = NativeAttachmentCacheStats {
+    let mut stats = NativeAttachmentCacheStats {
         reused_messages: suffix_start,
         encoded_messages: message_keys.len().saturating_sub(suffix_start),
+        ..Default::default()
     };
     let served_bytes = response
         .messages()
@@ -10519,7 +10599,7 @@ fn attach_native_messages_incremental(
                 chunks,
                 projection,
             },
-            stats,
+            &mut stats,
             served_bytes,
         );
     response.native_messages = Some(native_messages);
@@ -14706,6 +14786,65 @@ mod tests {
         })
     }
 
+    fn native_cache_fixture(
+        session_id: &str,
+        message_count: usize,
+        block_count: usize,
+        target_native_wire_bytes: usize,
+    ) -> (TransformRequest, Vec<CkWireMessage>) {
+        assert!(block_count >= message_count);
+        let blocks_per_message = block_count / message_count;
+        let extra_blocks = block_count % message_count;
+        let payload = "x".repeat(target_native_wire_bytes / block_count);
+        let mut ingress = Vec::with_capacity(message_count);
+        let mut served = Vec::with_capacity(message_count);
+        let mut native = Vec::with_capacity(message_count);
+
+        for index in 0..message_count {
+            let mid = format!("{session_id}-{index}");
+            let part_count = blocks_per_message + usize::from(index < extra_blocks);
+            let texts = (0..part_count)
+                .map(|part| format!("{mid}-{part}:{payload}"))
+                .collect::<Vec<_>>();
+            let ck = CkWireMessage::from_parts(
+                "user",
+                texts
+                    .iter()
+                    .map(|text| CkWireBlock::bare(CkKind::Text { text: text.clone() }))
+                    .collect(),
+                None,
+                ProviderExtras::new(),
+                HarnessMeta {
+                    harness_id: Some(mid.clone()),
+                    ..Default::default()
+                },
+            );
+            served.push(ck.clone());
+            ingress.push(CkIngressMessage {
+                mid: mid.clone(),
+                ordinal: u64::try_from(index + 1).expect("fixture ordinal fits u64"),
+                ck,
+            });
+            native.push(json!({
+                "info": { "id": mid, "role": "user" },
+                "parts": texts
+                    .iter()
+                    .map(|text| json!({ "type": "text", "text": text }))
+                    .collect::<Vec<_>>(),
+            }));
+        }
+
+        (
+            native_cache_request(
+                session_id,
+                ingress,
+                native,
+                &format!("{session_id}-fixture-fingerprint"),
+            ),
+            served,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_native_cache_pass(
         cache: &Mutex<NativeAttachmentCache>,
@@ -14893,6 +15032,151 @@ mod tests {
             })
         }));
         assert_eq!(cache.lock().unwrap().stats("native-complex"), second_stats);
+    }
+
+    #[test]
+    fn astro_scale_snapshot_reuses_chunks_after_projection_and_sidecar_degrade() {
+        const ASTRO_MESSAGE_COUNT: usize = 4_600;
+        const ASTRO_BLOCK_COUNT: usize = 15_000;
+        const ASTRO_NATIVE_WIRE_BYTES: usize = 49 * 1024 * 1024;
+
+        let (request, served) = native_cache_fixture(
+            "native-astro-scale",
+            ASTRO_MESSAGE_COUNT,
+            ASTRO_BLOCK_COUNT,
+            ASTRO_NATIVE_WIRE_BYTES,
+        );
+        let cache = Mutex::new(NativeAttachmentCache::default());
+        let (first, first_stats) = run_native_cache_pass(
+            &cache,
+            &request,
+            served.clone(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(first_stats.reused_messages, 0);
+        assert_eq!(first_stats.degraded_store, 1, "{first_stats:?}");
+        {
+            let cache = cache.lock().unwrap();
+            let snapshot = &cache.sessions["native-astro-scale"].snapshot;
+            assert!(
+                snapshot.projection.is_none(),
+                "projection must degrade first"
+            );
+            assert!(
+                snapshot.sidecar.messages.is_empty(),
+                "sidecar trees must degrade when projection alone is not enough"
+            );
+        }
+        let first_bytes = serde_json::to_vec(
+            first
+                .native_messages
+                .as_ref()
+                .expect("first pass attaches native messages"),
+        )
+        .expect("native output serializes");
+        drop(first);
+
+        let (second, second_stats) = run_native_cache_pass(
+            &cache,
+            &request,
+            served.clone(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(
+            second_stats.reused_messages,
+            served.len(),
+            "an ASTRO-scale snapshot must retain reusable chunks instead of silently refusing storage"
+        );
+        assert_eq!(second_stats.encoded_messages, 0, "{second_stats:?}");
+        assert_eq!(
+            serde_json::to_vec(
+                second
+                    .native_messages
+                    .as_ref()
+                    .expect("second pass attaches native messages"),
+            )
+            .expect("native output serializes"),
+            first_bytes,
+            "degraded cache reuse must preserve native response bytes"
+        );
+    }
+
+    #[test]
+    fn multiple_large_sessions_do_not_ping_pong_under_the_native_cache_total_budget() {
+        const SESSION_NATIVE_WIRE_BYTES: usize = 5 * 1024 * 1024;
+        let cache = Mutex::new(NativeAttachmentCache::default());
+        let (request_a, served_a) = native_cache_fixture(
+            "native-large-session-a",
+            512,
+            1_536,
+            SESSION_NATIVE_WIRE_BYTES,
+        );
+        let (request_b, served_b) = native_cache_fixture(
+            "native-large-session-b",
+            512,
+            1_536,
+            SESSION_NATIVE_WIRE_BYTES,
+        );
+
+        run_native_cache_pass(
+            &cache,
+            &request_a,
+            served_a.clone(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        let charge_a = cache.lock().unwrap().sessions["native-large-session-a"].retained_bytes;
+        run_native_cache_pass(
+            &cache,
+            &request_b,
+            served_b.clone(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        let charge_b = cache.lock().unwrap().sessions["native-large-session-b"].retained_bytes;
+        assert!(
+            charge_a.saturating_add(charge_b) > 64 * 1024 * 1024,
+            "fixture must exceed the former shared 64 MiB budget"
+        );
+
+        let (_second_a, second_a_stats) = run_native_cache_pass(
+            &cache,
+            &request_a,
+            served_a.clone(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(
+            second_a_stats.reused_messages,
+            served_a.len(),
+            "session A was evicted by session B and re-encoded from scratch"
+        );
+        let (_second_b, second_b_stats) = run_native_cache_pass(
+            &cache,
+            &request_b,
+            served_b.clone(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(
+            second_b_stats.reused_messages,
+            served_b.len(),
+            "session B was evicted by session A and re-encoded from scratch"
+        );
     }
 
     #[test]
