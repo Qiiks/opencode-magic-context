@@ -1108,6 +1108,15 @@ export async function runDoctor(
     const compactionEnabled = resolveCompactionEnabledForDoctor();
     const conflictResult = detectConflicts(cwd, { compactionEnabled });
 
+    // Doctor has no OpenCode server handle, so it uses the file-based
+    // compaction check (the same one the plugin falls back to when its
+    // resolved-config fetch fails). Name the arm so a #309-shaped report tells
+    // us which check produced the verdict — the running server's resolved
+    // config may differ from what the file reader sees.
+    log.info(
+        "Compaction check: file-based; the running server's resolved config may differ — `opencode debug config` is authoritative",
+    );
+
     if (conflictResult.hasConflict) {
         for (const reason of conflictResult.reasons) {
             fail(`Conflict: ${reason}`);
