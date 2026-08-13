@@ -89,7 +89,9 @@ These can be implemented on the Claude Code leg without changing the harness's f
 - **Source:** `crates/mc-module/src/transform.rs:1692-1767`; provenance resolution at `crates/mc-module/src/config.rs:101-151` and binding use at `crates/mc-module/src/lib.rs:6658-6694`.
 - **Classification:** incidental as a scheduling policy difference. The wire location used to express the marker is structural and is listed below.
 
-## I-12 — Claude Code does not perform OpenCode/Pi's decay-pressure retry
+## I-12 — Claude Code does not perform OpenCode/Pi's decay-pressure retry — **FIXED (2026-08-13, magic-context a9a1f121)**
+
+> Ported the exact TS contract into `render_m0_with_decay_pressure_retry` (strict >1.05 gate on the history slice, ×1.15, max 3, keep-final), with a TS-generated differential fixture asserting retry count, tier demotions, and full m0 sha256 byte-identity.
 
 - **OpenCode/Pi:** after an m0 render, if rendered session history exceeds 105% of budget, retries up to three times, multiplying decay pressure by 1.15 each time: `packages/plugin/src/hooks/magic-context/inject-compartments.ts:2181-2212` (Pi uses the same shared renderer contract).
 - **Claude Code:** always calls the shared Rust renderer once with `decay_pressure_multiplier: 1.0`.
