@@ -221,10 +221,11 @@ These cannot use the same implementation mechanism because the host/harness surf
 ## S-05 — OpenCode's fail-closed abort/overflow control is host-owned
 
 - **OpenCode:** can call `client.session.abort`, distinguish a provider-proven overflow origin, and abort at the 95% band when no fold materialized: `packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts:651-719`.
-- **Claude Code:** the Rust scheduler can enter `Emergency95` and the module can return an error, but this repository has no readable CC provider-error hook/session-abort implementation proving the same user-visible abort/retry behavior.
-- **Source:** scheduler emergency decision at `crates/mc-module/src/scheduler.rs:689-769`.
-- **Reason structural:** aborting/retrying the active host request belongs to the gateway lifecycle, not the transform array.
-- **Evidence status:** the absence of a CC implementation is source-verified in this repository; behavior of the external gateway is **not independently readable**.
+- **Claude Code:** the gateway refuses any turn the transform cannot produce an array for with HTTP 503 and a structured body — never a passthrough of the harness's own array (`thalamus/crates/thalamus-core/src/proxy.rs`, `transform_unavailable`; covers Unavailable, RawOnlyFence, and provider 400/422 on a rewritten body). Claude Code retries a 503 with backoff (~12 attempts / ~180s) and renders the body beside the retry countdown, so a transform outage inside that window costs no turn. Pinned by Thalamus's container test `e2e/assert_refusal_is_retried.py` (real harness binary against a fake provider). 503 was chosen from measured harness behavior: it is the code CC treats as retryable; a 500 surfaces immediately.
+- **Source:** scheduler emergency decision at `crates/mc-module/src/scheduler.rs:689-769`; gateway refusal in the thalamus repository as above.
+- **Reason structural (narrowed):** both legs are fail-closed and neither serves an un-shrunk conversation; the difference is WHOSE LIFECYCLE OWNS THE RETRY — the OpenCode plugin owns the session and aborts it, the CC gateway owns the request and refuses it. The mechanism cannot be shared; the property is equivalent.
+- **Evidence status:** cross-repository — verified by Thalamus at source and by container test (2026-08-13, pm_ad490214); not re-verified from this repository.
+- **Residual gap (real, not wording):** the OpenCode abort distinguishes a PROVIDER-PROVEN OVERFLOW origin; the CC refusal has no equivalent signal — "context overflowed" and "transform unavailable" render the same sentence to the user. Closing it would need an origin discriminator in the refusal body.
 
 # VERIFIED SAME
 
