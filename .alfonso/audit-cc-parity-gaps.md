@@ -47,14 +47,18 @@ These can be implemented on the Claude Code leg without changing the harness's f
 - **Source:** schema at `crates/mc-module/src/lib.rs:12357-12376`; execution at `crates/mc-module/src/lib.rs:9076-9133`; the leg-specific light description explicitly says “literal, not semantic” at `crates/mc-module/src/prompt_surface.rs:32-34`.
 - **Classification:** incidental — facade/schema and search backend gaps.
 
-## I-06 — `ctx_expand` lacks OpenCode/Pi's verbose range mode
+## I-06 — `ctx_expand` lacks OpenCode/Pi's verbose range mode — **FIXED (2026-08-13, magic-context a1cc106d)**
+
+> Verbose advertised in the facade schema; separate dispatch renders per-message ordinal-tagged previews with bounded part previews; default range path untouched (byte-stable by construction).
 
 - **OpenCode/Pi:** accepts `verbose=true` for per-message/per-part previews before selecting a full single-message expansion: `packages/plugin/src/tools/ctx-expand/tools.ts:20-40,47-59`.
 - **Claude Code:** advertises only `start`, `end`, and `message`; the facade ignores `verbose` and always uses its one range renderer.
 - **Source:** `crates/mc-module/src/lib.rs:12378-12388`; `crates/mc-module/src/lib.rs:9136-9217`.
 - **Classification:** incidental — an omitted argument and renderer.
 
-## I-07 — `ctx_reduce` acknowledgement and validation are observably weaker on Claude Code
+## I-07 — `ctx_reduce` acknowledgement and validation are observably weaker on Claude Code — **FIXED (2026-08-13, magic-context a1cc106d)**
+
+> Ack now validates at call time: parse rejections surfaced, unknown tags named, already-queued named, protected reported, zero-valid-target REFUSED without a ledger commit. Input schema byte-identical (Thalamus authorizer contract held); command-id idempotency unchanged.
 
 - **OpenCode/Pi:** the tool call reports invalid range syntax, unknown tags, pre-compaction conflicts, already-queued tags, and immediate versus protected/deferred drops; see `packages/plugin/src/tools/ctx-reduce/tools.ts:75-210` (and Pi's matching implementation).
 - **Claude Code:** the MCP-facing facade always returns `Queued for context compaction.` without validating or storing anything; a later response observer owns delivery. The module delivery method silently filters unknown tag numbers and can commit a zero-target command rather than report the unknown IDs.
