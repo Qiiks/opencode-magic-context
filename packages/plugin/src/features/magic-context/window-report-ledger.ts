@@ -10,28 +10,149 @@ const ROTATED_WINDOW_REPORTS_FILE = `${WINDOW_REPORTS_FILE}.1`;
 export const WINDOW_REPORTS_ROTATION_BYTES = 16 * 1024 * 1024;
 
 /**
- * Presence is evidence that this provider can forward a request to another
- * upstream. Absence does not prove that a provider never forwards requests
- * (one-directional detector), which is why the emitter below never writes
- * `path_may_forward: false`: the schema pins absent = unknown routing
- * (refuses promotion, same as true), while an explicit false PERMITS
- * promotion — a claim this set structurally cannot support.
+ * Fusiform's full-catalog dual-detector admit sweep (pm_d3e23fcd, 2026-08-13:
+ * 125 providers / 5,680 models whose catalogs carry other vendors' models).
+ * An ADMIT list, not a classification — membership warrants
+ * `path_may_forward: true` at capture; absence clears nobody (a provider
+ * using an id convention neither detector knows is silently missing here),
+ * which is why the emitter never writes `false`: the report schema pins
+ * absent = unknown routing (refuses promotion, same as true), while an
+ * explicit false would PERMIT promotion — a claim this set structurally
+ * cannot support.
+ *
+ * `ollama-cloud` is deliberately EXCLUDED: the detectors admit it (it
+ * carries glm/deepseek/kimi weights) but it imposes its OWN wall from its
+ * own serving stack — and this field marks whose-wall-might-fire, not
+ * who-carries-whose-models. Other own-wall gateways may hide in this list;
+ * only per-cell evidence distinguishes them, and Fusiform's adjudicator
+ * refuses promotion for every admitted provider regardless, so a wrong
+ * `true` here degrades toward refusal, never toward a wrong mint.
  */
 export const FORWARDING_PROVIDER_IDS: ReadonlySet<string> = new Set([
-    "openrouter",
+    "302ai",
+    "abacus",
+    "ai-router",
+    "aiand",
+    "aihubmix",
+    "alibaba-cn",
+    "alibaba-coding-plan",
+    "alibaba-coding-plan-cn",
+    "alibaba-token-plan",
+    "alibaba-token-plan-cn",
+    "ambient",
+    "anyapi",
+    "auriko",
+    "azure",
+    "azure-cognitive-services",
+    "baseten",
+    "berget",
+    "blueclaw",
+    "chutes",
+    "clarifai",
+    "cline-pass",
+    "cloudferro-sherlock",
+    "cloudflare-ai-gateway",
+    "cloudflare-workers-ai",
+    "coralbricks",
+    "cortecs",
+    "crof",
+    "crossmodel",
+    "daoxe",
+    "deepinfra",
+    "digitalocean",
+    "dinference",
+    "drun",
+    "empiriolabs",
+    "evroc",
+    "fastrouter",
+    "fireworks-ai",
+    "freemodel",
+    "friendli",
+    "frogbot",
     "github-copilot",
-    // Fusiform's dual-detector sweep (e8d80fd): the eight largest no-cell
-    // providers whose catalogs carry other vendors' models. An ADMIT list,
-    // not a classification — membership warrants path_may_forward: true at
-    // capture; absence from this list clears nobody (a provider using an id
-    // convention neither detector knows would be silently missing here).
-    "nano-gpt",
+    "gmicloud",
+    "google-vertex",
+    "greenpt",
+    "groq",
+    "helicone",
+    "hetzner",
+    "hpc-ai",
+    "huggingface",
+    "hyper",
+    "iflowcn",
+    "impossibl",
+    "inceptron",
+    "inference",
+    "inferx",
+    "infomaniak",
+    "io-net",
+    "jiekou",
+    "kenari",
     "kilo",
-    "vercel",
+    "lilac",
     "llmgateway",
+    "lmstudio",
+    "meganova",
     "merge-gateway",
+    "mixlayer",
+    "modal",
+    "model-oracle-ai",
+    "modelis",
+    "modelscope",
+    "moonshotai-cn",
+    "nano-gpt",
+    "nearai",
+    "nebius",
+    "neon",
+    "neuralwatt",
+    "novita-ai",
+    "nvidia",
+    "ofox",
+    "opencode",
+    "opencode-go",
+    "openrouter",
+    "orcarouter",
+    "ovhcloud",
+    "perplexity-agent",
+    "pioneer",
     "poe",
+    "poolside",
+    "privatemode-ai",
+    "qihang-ai",
+    "qiniu-ai",
+    "qvac",
+    "regolo-ai",
+    "requesty",
+    "routing-run",
+    "salad-cloud",
+    "sap-ai-core",
+    "scaleway",
+    "siliconflow",
+    "siliconflow-cn",
+    "snowflake-cortex",
+    "stackit",
+    "subconscious",
+    "submodel",
+    "synthetic",
+    "tencent-coding-plan",
+    "tensorx",
+    "thinkingmachines",
+    "tinfoil",
+    "togetherai",
+    "unorouter",
+    "venice",
+    "vercel",
+    "vivgrid",
+    "vultr",
+    "wandb",
+    "watsonx",
+    "xpersona",
+    "zai",
+    "zai-coding-plan",
+    "zenifra",
     "zenmux",
+    "zhipuai",
+    "zhipuai-coding-plan",
 ]);
 
 export interface WindowReport {
