@@ -65,7 +65,9 @@ These can be implemented on the Claude Code leg without changing the harness's f
 - **Source:** acknowledgement-only facade at `crates/mc-module/src/lib.rs:8812-8818`; delayed validation/filtering at `crates/mc-module/src/lib.rs:4460-4537`.
 - **Classification:** incidental — the observer can return the same validation result before acknowledging.
 
-## I-08 — Claude Code does not run OpenCode/Pi's duplicate-tool heuristic
+## I-08 — Claude Code does not run OpenCode/Pi's duplicate-tool heuristic — **FIXED (2026-08-13, magic-context ec2d251f)**
+
+> Dedup lane in native selection: safe-tool set mirrored from TS, owner-scoped fingerprint in key AND value (Finding-1 invariant pinned cross-owner), keep-newest full-drop, busting-pass gate, drops demote through the I-22 reasoning-adjacency guard (ArcShape::DedupFullDrop). Both mutations executed red.
 
 - **OpenCode/Pi:** on heuristic passes, older same-owner duplicate calls for a safe tool/argument fingerprint are dropped while the newest is kept: `packages/plugin/src/hooks/magic-context/heuristic-cleanup.ts:202-258`; Pi mirrors this in `packages/pi-plugin/src/heuristic-cleanup-pi.ts`.
 - **Claude Code:** native selection implements two-pass age reclaim, emergency tiering, agent drops, and optional supersession, but has no safe-tool fingerprint/dedup candidate lane.
