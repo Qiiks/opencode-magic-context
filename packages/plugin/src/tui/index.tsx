@@ -11,6 +11,7 @@ import packageJson from "../../package.json"
 import { closeRpc, dismissUpgradeReminder, getAnnouncement, getCompartmentCount, getRpcGeneration, initRpcClient, loadEmbedDetail, loadStatusDetail, loadToastDurationMs, markAnnounced, requestRecomp, requestUpgrade, type EmbedDetail, type StatusDetail } from "./data/context-db"
 import { startNotificationSocket, stopNotificationSocket, type SocketNotification } from "./data/notification-socket"
 import { formatThresholdPercent } from "../shared/format-threshold"
+import { formatWindowDerivationLine } from "../shared/window-geometry"
 import { compactionOffSidebarRows, nativeCompactionContextLabel } from "./compaction-off"
 import { isCompactionEnabled } from "../config/agent-disable"
 import { loadPluginConfig } from "../config"
@@ -239,6 +240,11 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                     {fmt(s().inputTokens)} / {contextLimit() > 0 ? fmt(contextLimit()) : "?"} tokens
                 </text>
             </box>
+            {s().windowGeometry && (
+                <text fg={t().textMuted}>
+                    {formatWindowDerivationLine(s().inputTokens, s().windowGeometry!)}
+                </text>
+            )}
 
             {/* Segmented breakdown bar: flex row of colored boxes filling
                 the dialog width. See barSegments comment above. */}

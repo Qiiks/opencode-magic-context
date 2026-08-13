@@ -1189,6 +1189,16 @@
         }
       ]
     },
+    "models": {
+      "description": "User-only Fusiform window-overlay settings. The path defaults to <dataDir>/fusiform/window-overlay.json.",
+      "type": "object",
+      "properties": {
+        "window_overlay_path": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
     "toast_duration_ms": {
       "default": 5000,
       "description": "TUI toast lifetime in milliseconds for Magic Context notifications. Set to 0 to disable Magic Context toasts entirely (min: 0, max: 60000, default: 5000)",

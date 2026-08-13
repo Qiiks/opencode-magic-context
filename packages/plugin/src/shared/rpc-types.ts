@@ -136,6 +136,17 @@ export interface StatusDetail extends SidebarSnapshot {
     isSubagent: boolean;
     pendingOps: Array<{ tagId: number; operation: string }>;
     contextLimit: number;
+    windowGeometry?: {
+        usableSoft: number;
+        usableHard: number;
+        geometry: "shared_upfront" | "shared_truncating" | "separate";
+        derivation: {
+            window: number;
+            reserve: number;
+            reserveSource: "output_catalog" | "output_config" | "wall_margin" | "none";
+            geometry: "shared_upfront" | "shared_truncating" | "separate";
+        };
+    };
     /**
      * Parsed cache TTL in ms. -1 = never expires (cacheTtl "never"; Infinity
      * cannot ride JSON-RPC and 0 would be indistinguishable from unset). The

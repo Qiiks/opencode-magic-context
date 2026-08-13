@@ -203,7 +203,10 @@ import {
 	trimPiMessagesToCachedBoundary,
 } from "./inject-compartments-pi";
 import { hasVisibleNoteReadCallPi } from "./note-visibility-pi";
-import { resolvePiUsableContextLimit } from "./pi-context-limit";
+import {
+	resolvePiUsableContextLimit,
+	resolvePiWindowGeometry,
+} from "./pi-context-limit";
 import { type PiHistorianDeps, runPiHistorian } from "./pi-historian-runner";
 import { injectSyntheticTodowriteForPi } from "./pi-todo-inject";
 import {
@@ -2459,11 +2462,12 @@ export function registerPiContextHandler(
 					usageContextLimit = modelWindow;
 				}
 			}
-			usageContextLimit = resolvePiUsableContextLimit({
+			const windowGeometry = resolvePiWindowGeometry({
 				rawContextWindow: usageContextLimit,
 				model: ctx.model,
 				detectedContextLimit,
 			});
+			usageContextLimit = windowGeometry?.usableSoft;
 			const effectiveExecuteThresholdPercentage = resolveExecuteThreshold(
 				schedulerConfig.executeThresholdPercentage,
 				modelKey,
@@ -2683,8 +2687,19 @@ export function registerPiContextHandler(
 			//     turn forever if historian hangs. After 30s we fall
 			//     through to the normal pipeline (with drop-all-tools
 			//     still active via the derived force-band branch).
+			const hardUsagePercentage = needsEmergencyBump
+				? Math.max(EMERGENCY_BLOCK_PERCENTAGE, usagePercentage)
+				: windowGeometry?.usableHard && usageInputTokens > 0
+					? (usageInputTokens / windowGeometry.usableHard) * 100
+					: usagePercentage;
+			// Direct/test callers without a model cannot resolve geometry. Keep the
+			// prior denominator in that compatibility lane; production always has ctx.model.
+			const emergencyPercentage = ctx.model
+				? hardUsagePercentage
+				: usagePercentage;
 			const isEmergency =
-				!options.compactionOff && usagePercentage >= EMERGENCY_BLOCK_PERCENTAGE;
+				!options.compactionOff &&
+				emergencyPercentage >= EMERGENCY_BLOCK_PERCENTAGE;
 			if (isEmergency) {
 				const lastNotifiedAt =
 					lastEmergencyNotificationAtMs.get(sessionId) ?? 0;

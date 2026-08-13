@@ -195,7 +195,8 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *    loud inoperability gate; only the user may restore silent degrade.
  *  - `allow_home_project` — only the user may opt a home-directory session
  *    into a durable project identity.
- *  - `output_reserve` — only the user may change the process-wide safe input budget.
+ *  - `output_reserve` / `models.window_overlay_path` — only the user may change
+ *    process-wide window geometry inputs.
  *  - `language`: a repo must not inject prompt text through a user preference.
  *  - `sqlite` — `sqlite.cache_size_mb` / `mmap_size_mb` become PRAGMAs on the
  *    process-global shared DB handle (one connection across every project in the
@@ -265,6 +266,14 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         delete projectRaw.output_reserve;
         warnings.push(
             "Ignoring output_reserve from project config (security: output-token reservation only honors user-level config).",
+        );
+    }
+
+    const models = projectRaw.models;
+    if (isPlainObject(models) && "window_overlay_path" in models) {
+        delete models.window_overlay_path;
+        warnings.push(
+            "Ignoring models.window_overlay_path from project config (security: only user-level config may select model geometry metadata).",
         );
     }
 

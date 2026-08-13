@@ -38,6 +38,7 @@ import {
 } from "./ctx-reduce-availability";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
+    resolveContextWindowGeometry,
     resolveExecuteThreshold,
     resolveModelKey,
     resolveTrustedContextLimit,
@@ -1440,12 +1441,18 @@ export function createRustModeTransform(
         }
         const modelKey = model ? resolveModelKey(model.providerID, model.modelID) : null;
         let resolvedContextLimit: number | undefined;
+        let rawFallbackContextLimit: number | undefined;
         if (model) {
             try {
                 resolvedContextLimit = resolveTrustedContextLimit(model.providerID, model.modelID, {
                     db: deps.db,
                     sessionID: sessionId,
                 });
+                rawFallbackContextLimit = resolveContextWindowGeometry(
+                    model.providerID,
+                    model.modelID,
+                    { db: deps.db, sessionID: sessionId },
+                )?.usableHard;
             } catch (error) {
                 preflightError ??= error;
             }
@@ -1476,6 +1483,7 @@ export function createRustModeTransform(
         }
         const serveRawFallback = (cause?: unknown): void => {
             const contextLimit =
+                rawFallbackContextLimit ??
                 resolvedContextLimit ??
                 (overflowState && overflowState.detectedContextLimit > 0
                     ? overflowState.detectedContextLimit

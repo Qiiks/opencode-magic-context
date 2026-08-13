@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { detectConfigFile, isPrototypePollutionKey, parseJsonc } from "../shared/jsonc-parser";
 import { setOutputReserveConfig } from "../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../shared/prompt-surface";
+import { setWindowOverlayPath } from "../shared/window-geometry";
 import { isCompactionEnabled, migrateLegacyAgentEnabledInMemory } from "./agent-disable";
 import {
     cortexKitProjectConfigBasePath,
@@ -589,6 +590,7 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
     const recoveredTopLevelKeys: string[] = [];
     const config = parsePluginConfig(mergedRaw, recoveredTopLevelKeys);
     setOutputReserveConfig(config.output_reserve);
+    setWindowOverlayPath(config.models?.window_overlay_path);
     if (config.configWarnings?.length) {
         allWarnings.push(
             ...config.configWarnings.map((w) => {

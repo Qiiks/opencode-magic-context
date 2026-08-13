@@ -479,6 +479,8 @@ export interface MagicContextConfig {
     prompt_surface: PromptSurfaceConfig;
     /** User-only output-token reservation override. Zero disables reservation. */
     output_reserve?: number | { default: number; [modelKey: string]: number };
+    /** User-only model metadata inputs. */
+    models?: { window_overlay_path?: string };
     /** TUI toast lifetime in milliseconds for Magic Context notifications. Default: 5000. */
     toast_duration_ms?: number;
     execute_threshold_percentage: number | { default: number; [modelKey: string]: number };
@@ -720,6 +722,14 @@ export const MagicContextConfigSchema = z
             .optional()
             .describe(
                 'User-only output-token reservation override. Number or per-model object ({ default: 16384, "provider/model": 8192 }); 0 disables reservation. When unset, Magic Context reserves the catalog output limit (capped at 25% of context) for shared-window providers and keeps proven separate-quota Google/Gemini windows unchanged.',
+            ),
+        models: z
+            .object({
+                window_overlay_path: z.string().trim().min(1).optional(),
+            })
+            .optional()
+            .describe(
+                "User-only Fusiform window-overlay settings. The path defaults to <dataDir>/fusiform/window-overlay.json.",
             ),
         toast_duration_ms: z
             .number()
