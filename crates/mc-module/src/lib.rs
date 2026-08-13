@@ -456,6 +456,11 @@ const STATE_IMPORT_MAX_PENDING: usize = 64;
 const STATE_IMPORT_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const TRANSFORM_SNAPSHOT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const BOUNDARY_TOKEN_CACHE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+// Sized from the ASTRO-scale fixture (4,600 messages / 15,000 blocks): that
+// FlatProjection retains ~156 MiB, so one such session plus a smaller neighbor
+// fit without the native-attach 192 MiB entry cap evicting the projection.
+const PROJECTION_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const PROJECTION_CACHE_ENTRY_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 const ACTIVE_SNAPSHOT_LEASE_BUDGET_BYTES: usize = TRANSFORM_SNAPSHOT_BUDGET_BYTES;
 const MAX_ACTIVE_SNAPSHOT_LEASES: usize = 8;
 /// InFlight snapshot markers have no byte charge, so they need their own count bound:
@@ -2041,10 +2046,12 @@ impl BoundaryTokenCache {
 }
 
 // These cache budgets are sized for a representative workload of 4,600 messages and 15,000
-// blocks, whose native representation is roughly 49 MiB. After projection and removal of
-// sidecar trees, its retained keys and chunks remain below 192 MiB, while the 256 MiB total
-// allows more than one large session. Because these are charged estimates, the total remains
-// a hard upper bound so that one unusually large session cannot cause unbounded cache growth.
+// blocks, whose native representation is roughly 49 MiB. After removal of sidecar trees, its
+// retained keys and chunks remain below 192 MiB, while the 256 MiB total allows more than one
+// large session. The ingress FlatProjection lives in its own cache so an oversized native
+// snapshot can drop sidecar trees without discarding the projection. Because these are charged
+// estimates, the total remains a hard upper bound so that one unusually large session cannot
+// cause unbounded cache growth.
 const NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const NATIVE_ATTACHMENT_CACHE_ENTRY_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 
@@ -2090,7 +2097,6 @@ struct NativeAttachmentCacheSnapshot {
     sidecar_hashes: HashMap<String, [u8; 32]>,
     sidecar_sizes: HashMap<String, usize>,
     chunks: Vec<NativeEncodedChunk>,
-    projection: Option<Arc<crate::ck_wire::FlatProjection>>,
 }
 
 impl NativeAttachmentCacheSnapshot {
@@ -2118,14 +2124,10 @@ impl NativeAttachmentCacheSnapshot {
             .saturating_add(sidecar_structure_bytes);
         // Encoded canonical bytes stand in for shared served-message allocations (hence the ×2).
         // Native sidecar trees are charged on top of the size estimate computed during hashing.
-        let projection_bytes = self
-            .projection
-            .as_deref()
-            .map_or(0, crate::ck_wire::FlatProjection::retained_bytes);
+        // The ingress projection is owned by ProjectionCache and is not charged here.
         encoded_bytes
             .saturating_add(served_bytes.saturating_mul(2))
             .saturating_add(sidecar_bytes)
-            .saturating_add(projection_bytes)
     }
 
     fn discard_sidecar_trees(&mut self) -> bool {
@@ -2227,13 +2229,8 @@ impl NativeAttachmentCache {
     ) {
         let requested_bytes = snapshot.retained_bytes(served_bytes);
         let mut retained_bytes = requested_bytes;
-        let mut dropped_projection = false;
         let mut dropped_sidecar_trees = false;
 
-        if retained_bytes > self.max_entry_retained_bytes {
-            dropped_projection = snapshot.projection.take().is_some();
-            retained_bytes = snapshot.retained_bytes(served_bytes);
-        }
         if retained_bytes > self.max_entry_retained_bytes {
             dropped_sidecar_trees = snapshot.discard_sidecar_trees();
             retained_bytes = snapshot.retained_bytes(served_bytes);
@@ -2249,10 +2246,10 @@ impl NativeAttachmentCache {
             );
             return;
         }
-        if dropped_projection || dropped_sidecar_trees {
+        if dropped_sidecar_trees {
             stats.degraded_store = stats.degraded_store.saturating_add(1);
             eprintln!(
-                "native-attachment-cache degraded_store session={session_id} requested_byte_charge={requested_bytes} stored_byte_charge={retained_bytes} dropped_projection={dropped_projection} dropped_sidecar_trees={dropped_sidecar_trees}",
+                "native-attachment-cache degraded_store session={session_id} requested_byte_charge={requested_bytes} stored_byte_charge={retained_bytes} dropped_sidecar_trees={dropped_sidecar_trees}",
             );
         }
 
@@ -2297,6 +2294,135 @@ impl NativeAttachmentCache {
     }
 }
 
+/// Context fields that legitimately invalidate a cached ingress projection.
+///
+/// `transition_consumed` is intentionally absent: a transition found by the upcoming
+/// transform affects served native rendering but not the ingress CK projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectionCacheContext {
+    session_id: String,
+    serializer_profile: String,
+    render_config: String,
+    profile_epoch: u32,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectionCacheSnapshot {
+    context: ProjectionCacheContext,
+    full_array_fingerprint: Option<String>,
+    projection: Arc<crate::ck_wire::FlatProjection>,
+}
+
+#[derive(Debug)]
+struct ProjectionCacheSession {
+    revert_epoch: u64,
+    retained_bytes: usize,
+    snapshot: ProjectionCacheSnapshot,
+}
+
+#[derive(Debug)]
+struct ProjectionCache {
+    sessions: HashMap<String, ProjectionCacheSession>,
+    lru: VecDeque<String>,
+    retained_bytes: usize,
+    max_retained_bytes: usize,
+    max_entry_retained_bytes: usize,
+}
+
+impl Default for ProjectionCache {
+    fn default() -> Self {
+        Self::with_limits(
+            PROJECTION_CACHE_BUDGET_BYTES,
+            PROJECTION_CACHE_ENTRY_BUDGET_BYTES,
+        )
+    }
+}
+
+impl ProjectionCache {
+    #[cfg(test)]
+    fn new(max_retained_bytes: usize) -> Self {
+        Self::with_limits(max_retained_bytes, max_retained_bytes)
+    }
+
+    fn with_limits(max_retained_bytes: usize, max_entry_retained_bytes: usize) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            lru: VecDeque::new(),
+            retained_bytes: 0,
+            max_retained_bytes,
+            max_entry_retained_bytes: max_entry_retained_bytes.min(max_retained_bytes),
+        }
+    }
+
+    fn remove(&mut self, session_id: &str) {
+        if let Some(session) = self.sessions.remove(session_id) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+        }
+        self.lru.retain(|candidate| candidate != session_id);
+    }
+
+    fn snapshot(
+        &mut self,
+        session_id: &str,
+        revert_epoch: u64,
+    ) -> Option<ProjectionCacheSnapshot> {
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.revert_epoch != revert_epoch)
+        {
+            self.remove(session_id);
+        }
+        let snapshot = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.snapshot.clone());
+        if snapshot.is_some() {
+            self.lru.retain(|candidate| candidate != session_id);
+            self.lru.push_back(session_id.to_string());
+        }
+        snapshot
+    }
+
+    fn replace(
+        &mut self,
+        session_id: &str,
+        revert_epoch: u64,
+        snapshot: ProjectionCacheSnapshot,
+    ) {
+        let retained_bytes = snapshot.projection.retained_bytes();
+        if retained_bytes == 0
+            || retained_bytes > self.max_entry_retained_bytes
+            || retained_bytes > self.max_retained_bytes
+        {
+            return;
+        }
+        self.remove(session_id);
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.sessions.insert(
+            session_id.to_string(),
+            ProjectionCacheSession {
+                revert_epoch,
+                retained_bytes,
+                snapshot,
+            },
+        );
+        self.lru.push_back(session_id.to_string());
+        while self.retained_bytes > self.max_retained_bytes {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            if oldest == session_id {
+                self.lru.push_back(oldest);
+                break;
+            }
+            if let Some(session) = self.sessions.remove(&oldest) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+            }
+        }
+    }
+}
+
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (route channel → {project, session}).
 pub struct McHandler {
@@ -2313,6 +2439,7 @@ pub struct McHandler {
     transform_snapshots: Arc<Mutex<TransformSnapshotCache>>,
     serialized_outputs: Mutex<SerializedOutputCache>,
     native_attachments: Mutex<NativeAttachmentCache>,
+    projections: Mutex<ProjectionCache>,
     boundary_tokens: Mutex<BoundaryTokenCache>,
     scheduler_observations: Mutex<HashMap<String, SchedulerObservation>>,
     guidance_dates: Mutex<HashMap<String, String>>,
@@ -2746,6 +2873,7 @@ impl McHandler {
             ))),
             serialized_outputs: Mutex::new(SerializedOutputCache::default()),
             native_attachments: Mutex::new(NativeAttachmentCache::default()),
+            projections: Mutex::new(ProjectionCache::default()),
             boundary_tokens: Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES)),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
@@ -2841,6 +2969,7 @@ impl McHandler {
             ))),
             serialized_outputs: Mutex::new(SerializedOutputCache::default()),
             native_attachments: Mutex::new(NativeAttachmentCache::default()),
+            projections: Mutex::new(ProjectionCache::default()),
             boundary_tokens: Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES)),
             scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
@@ -3055,20 +3184,13 @@ impl McHandler {
             .ok()?
             .meta
             .revert_epoch;
-        let projection_cache = self
-            .native_attachments
-            .lock()
-            .expect("native attachment cache mutex")
-            .snapshot(&parsed.session_id, current_revert_epoch)
-            .and_then(|snapshot| {
-                validated_projection_cache_input(
-                    parsed,
-                    &snapshot,
-                    &after,
-                    replace_from,
-                    ProjectionCacheKeyMode::Normal,
-                )
-            });
+        let projection_cache = self.lookup_projection_cache(
+            parsed,
+            current_revert_epoch,
+            &after,
+            replace_from,
+            ProjectionCacheKeyMode::Normal,
+        );
         let mut current_native = parsed.native_messages.take()?;
         let previous_native = request.native_messages.as_ref()?;
         if native_replace_from > previous_native.len() {
@@ -3086,6 +3208,64 @@ impl McHandler {
             native_replace_from,
             projection_cache,
         })
+    }
+
+    fn lookup_projection_cache(
+        &self,
+        request: &TransformRequest,
+        revert_epoch: u64,
+        after: &str,
+        replace_from: usize,
+        mode: ProjectionCacheKeyMode,
+    ) -> Option<ProjectionCacheInput> {
+        self.projections
+            .lock()
+            .expect("projection cache mutex")
+            .snapshot(&request.session_id, revert_epoch)
+            .and_then(|snapshot| {
+                validated_projection_cache_input(request, &snapshot, after, replace_from, mode)
+            })
+    }
+
+    fn lookup_full_projection_cache(
+        &self,
+        request: &TransformRequest,
+    ) -> Option<ProjectionCacheInput> {
+        let after = request.full_array_fingerprint.as_deref()?;
+        let revert_epoch = self
+            .store
+            .get()?
+            .load(&request.session_id)
+            .ok()?
+            .meta
+            .revert_epoch;
+        self.lookup_projection_cache(
+            request,
+            revert_epoch,
+            after,
+            request.messages.len(),
+            ProjectionCacheKeyMode::Normal,
+        )
+    }
+
+    fn store_projection_cache(
+        &self,
+        request: &TransformRequest,
+        revert_epoch: u64,
+        projection: Arc<crate::ck_wire::FlatProjection>,
+    ) {
+        self.projections
+            .lock()
+            .expect("projection cache mutex")
+            .replace(
+                &request.session_id,
+                revert_epoch,
+                ProjectionCacheSnapshot {
+                    context: projection_cache_context(request),
+                    full_array_fingerprint: request.full_array_fingerprint.clone(),
+                    projection,
+                },
+            );
     }
 
     fn transform_page_in_progress(&self, session_id: &str) -> bool {
@@ -3148,6 +3328,10 @@ impl McHandler {
             self.native_attachments
                 .lock()
                 .expect("native attachment cache mutex")
+                .remove(&session);
+            self.projections
+                .lock()
+                .expect("projection cache mutex")
                 .remove(&session);
             self.boundary_tokens
                 .lock()
@@ -6709,6 +6893,10 @@ impl McHandler {
             None
         };
         let parsed = Arc::new(parsed);
+        let projection_cache_input = native_delta_frontier
+            .as_ref()
+            .and_then(|frontier| frontier.projection_cache.clone())
+            .or_else(|| self.lookup_full_projection_cache(&parsed));
         if !from_page_apply && self.transform_page_in_progress(&binding.session) {
             return HandlerOutcome::Error {
                 code: "authority_transform_page_in_progress".to_string(),
@@ -6817,9 +7005,7 @@ impl McHandler {
                 &parsed,
                 &producer_ctx,
                 &self.serialized_outputs,
-                native_delta_frontier
-                    .as_ref()
-                    .and_then(|frontier| frontier.projection_cache.as_ref()),
+                projection_cache_input.as_ref(),
             )
         };
         let reject_transform = |e: crate::transform::TransformError| {
@@ -7002,6 +7188,7 @@ impl McHandler {
         let lineage_anchor_mid = result.lineage_anchor_mid;
         let tag_numbers = result.tag_numbers;
         let projection = Arc::new(result.projection);
+        self.store_projection_cache(&parsed, revert_epoch, Arc::clone(&projection));
         let mut response = result.response;
         if response.committed {
             self.guidance_dates
@@ -7022,7 +7209,6 @@ impl McHandler {
                 native_delta_frontier.as_ref(),
                 revert_epoch,
                 &self.native_attachments,
-                Some(Arc::clone(&projection)),
                 NativeCacheKeyMode::Normal,
             )
         } else {
@@ -10126,15 +10312,24 @@ fn native_attachment_context(
     }
 }
 
-/// Select the ingress projection using the same immutable cache snapshot that supplies native
-/// attachments.
+fn projection_cache_context(request: &TransformRequest) -> ProjectionCacheContext {
+    let profile = SerializerProfile::parse(&request.serializer_profile);
+    ProjectionCacheContext {
+        session_id: request.session_id.clone(),
+        serializer_profile: request.serializer_profile.clone(),
+        render_config: request.render_config.clone(),
+        profile_epoch: profile.map(profile_render_epoch).unwrap_or_default(),
+    }
+}
+
+/// Select a cached ingress projection when the request's fingerprint and rendering context match.
 ///
-/// Include the cached transition salt when comparing cache inputs because a transition found by
-/// the upcoming transform affects served rendering but not the ingress CK projection. Reuse a
-/// cached prefix only when the request's profile and rendering fields also match.
+/// Transition salt is not part of this key: a transition found by the upcoming transform affects
+/// served native rendering but not the ingress CK projection. Reuse a cached prefix only when the
+/// request's profile and rendering fields also match.
 fn validated_projection_cache_input(
     request: &TransformRequest,
-    snapshot: &NativeAttachmentCacheSnapshot,
+    snapshot: &ProjectionCacheSnapshot,
     after: &str,
     replace_from: usize,
     mode: ProjectionCacheKeyMode,
@@ -10142,11 +10337,10 @@ fn validated_projection_cache_input(
     if snapshot.full_array_fingerprint.as_deref() != Some(after) {
         return None;
     }
-    let current_context = native_attachment_context(request, snapshot.context.transition_consumed);
-    if current_context != snapshot.context {
+    if projection_cache_context(request) != snapshot.context {
         return None;
     }
-    let projection = Arc::clone(snapshot.projection.as_ref()?);
+    let projection = Arc::clone(&snapshot.projection);
     #[cfg(test)]
     let prefix = if mode == ProjectionCacheKeyMode::CorruptFrontierForTest {
         replace_from.saturating_add(1)
@@ -10354,7 +10548,6 @@ fn attach_native_messages_incremental(
     native_delta_frontier: Option<&NativeDeltaFrontier>,
     revert_epoch: u64,
     cache: &Mutex<NativeAttachmentCache>,
-    projection: Option<Arc<crate::ck_wire::FlatProjection>>,
     mode: NativeCacheKeyMode,
 ) -> NativeAttachmentCacheStats {
     if !request.serve_native {
@@ -10597,7 +10790,6 @@ fn attach_native_messages_incremental(
                 sidecar_hashes,
                 sidecar_sizes,
                 chunks,
-                projection,
             },
             &mut stats,
             served_bytes,
@@ -12852,6 +13044,36 @@ mod tests {
     }
 
     #[test]
+    fn historian_trigger_cache_engages_at_astro_message_count() {
+        const MESSAGE_COUNT: usize = 4_667;
+        let cold_request =
+            transform_request(trigger_ingress_fixture(MESSAGE_COUNT, 24), 140_000, 200_000);
+        let cold_projection = crate::ck_wire::project_messages(&cold_request.messages).unwrap();
+        let token_cache = Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES));
+        let cold_started_at = Instant::now();
+        let cold = boundary_messages(&cold_request, &cold_projection, &token_cache);
+        let cold_ms = cold_started_at.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(cold.tokenized_blocks, MESSAGE_COUNT);
+        token_cache
+            .lock()
+            .unwrap()
+            .replace(&cold_request.session_id, cold.token_cache_snapshot);
+
+        let warm_started_at = Instant::now();
+        let warm = boundary_messages(&cold_request, &cold_projection, &token_cache);
+        let warm_ms = warm_started_at.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(
+            warm.tokenized_blocks, 0,
+            "steady ASTRO-scale pass must reuse the session-keyed trigger cache"
+        );
+        eprintln!(
+            "trigger-cache-astro n={MESSAGE_COUNT} blocks={} cold_ms={cold_ms:.1} warm_ms={warm_ms:.1} warm_tokenized={}",
+            cold_projection.blocks.len(),
+            warm.tokenized_blocks,
+        );
+    }
+
+    #[test]
     #[ignore = "run manually to compare production-sized historian trigger cost"]
     fn historian_trigger_token_reuse_benchmark() {
         let reference_cold = trigger_messages_fixture(1_400, 2_048);
@@ -14907,10 +15129,6 @@ mod tests {
             native_delta_frontier.as_ref(),
             revert_epoch,
             cache,
-            Some(Arc::new(
-                crate::ck_wire::project_messages(&request.messages)
-                    .expect("native cache test projection must succeed"),
-            )),
             mode,
         );
         (response, stats)
@@ -14934,6 +15152,14 @@ mod tests {
             false,
             revert_epoch,
             NativeCacheKeyMode::Normal,
+        );
+        handler.store_projection_cache(
+            request,
+            revert_epoch,
+            Arc::new(
+                crate::ck_wire::project_messages(&request.messages)
+                    .expect("seeded projection must succeed"),
+            ),
         );
         let retained_bytes = serde_json::to_vec(request).unwrap().len();
         let mut snapshots = handler
@@ -15057,18 +15283,20 @@ mod tests {
             NativeCacheKeyMode::Normal,
         );
         assert_eq!(first_stats.reused_messages, 0);
-        assert_eq!(first_stats.degraded_store, 1, "{first_stats:?}");
+        assert_eq!(first_stats.refused_store, 0, "{first_stats:?}");
         {
             let cache = cache.lock().unwrap();
+            assert!(
+                cache.sessions.contains_key("native-astro-scale"),
+                "an ASTRO-scale native snapshot must still be stored after sidecar degrade"
+            );
             let snapshot = &cache.sessions["native-astro-scale"].snapshot;
-            assert!(
-                snapshot.projection.is_none(),
-                "projection must degrade first"
-            );
-            assert!(
-                snapshot.sidecar.messages.is_empty(),
-                "sidecar trees must degrade when projection alone is not enough"
-            );
+            if first_stats.degraded_store == 1 {
+                assert!(
+                    snapshot.sidecar.messages.is_empty(),
+                    "sidecar trees must degrade when the native entry still exceeds the budget"
+                );
+            }
         }
         let first_bytes = serde_json::to_vec(
             first
@@ -15105,6 +15333,169 @@ mod tests {
             first_bytes,
             "degraded cache reuse must preserve native response bytes"
         );
+    }
+
+    #[test]
+    fn astro_scale_projection_cache_reuses_on_the_second_pass() {
+        const ASTRO_MESSAGE_COUNT: usize = 4_600;
+        const ASTRO_BLOCK_COUNT: usize = 15_000;
+        const ASTRO_NATIVE_WIRE_BYTES: usize = 49 * 1024 * 1024;
+
+        let (request, _served) = native_cache_fixture(
+            "astro-projection-reuse",
+            ASTRO_MESSAGE_COUNT,
+            ASTRO_BLOCK_COUNT,
+            ASTRO_NATIVE_WIRE_BYTES,
+        );
+        let first_started_at = Instant::now();
+        let projection = Arc::new(
+            crate::ck_wire::project_messages(&request.messages).expect("ASTRO projection"),
+        );
+        let first_ms = first_started_at.elapsed().as_secs_f64() * 1000.0;
+        let retained = projection.retained_bytes();
+        eprintln!(
+            "astro-projection-cache retained_bytes={retained} first_ms={first_ms:.1}"
+        );
+        assert!(
+            retained <= PROJECTION_CACHE_ENTRY_BUDGET_BYTES,
+            "ASTRO projection must fit the dedicated cache: retained={retained} cap={PROJECTION_CACHE_ENTRY_BUDGET_BYTES}"
+        );
+
+        let mut cache = ProjectionCache::default();
+        cache.replace(
+            &request.session_id,
+            0,
+            ProjectionCacheSnapshot {
+                context: projection_cache_context(&request),
+                full_array_fingerprint: request.full_array_fingerprint.clone(),
+                projection: Arc::clone(&projection),
+            },
+        );
+        let snapshot = cache
+            .snapshot(&request.session_id, 0)
+            .expect("ASTRO projection must survive in its own cache");
+        let reused = validated_projection_cache_input(
+            &request,
+            &snapshot,
+            request.full_array_fingerprint.as_deref().unwrap(),
+            request.messages.len(),
+            ProjectionCacheKeyMode::Normal,
+        )
+        .expect("second pass must hit the projection cache");
+        assert_eq!(reused.replace_from, ASTRO_MESSAGE_COUNT);
+
+        let second_started_at = Instant::now();
+        let incremental = crate::ck_wire::project_messages_incremental(
+            &request.messages,
+            &reused.projection,
+            reused.replace_from,
+        )
+        .expect("full-prefix incremental projection");
+        let second_ms = second_started_at.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(incremental, *projection);
+        assert!(
+            second_ms < first_ms / 10.0 || second_ms < 5.0,
+            "second-pass projection must be near zero: first={first_ms:.1}ms second={second_ms:.1}ms"
+        );
+    }
+
+    #[test]
+    fn projection_cache_invalidators_are_mutation_checked_in_both_directions() {
+        let ingress = vec![ck("inv-1", 1, "one"), ck("inv-2", 2, "two")];
+        let baseline = native_cache_request(
+            "projection-invalidators",
+            ingress,
+            vec![
+                native_text_message("inv-1", "user", "one"),
+                native_text_message("inv-2", "user", "two"),
+            ],
+            "inv-fp-1",
+        );
+        let snapshot = ProjectionCacheSnapshot {
+            context: projection_cache_context(&baseline),
+            full_array_fingerprint: baseline.full_array_fingerprint.clone(),
+            projection: Arc::new(
+                crate::ck_wire::project_messages(&baseline.messages).expect("baseline projection"),
+            ),
+        };
+
+        assert!(
+            validated_projection_cache_input(
+                &baseline,
+                &snapshot,
+                "inv-fp-1",
+                2,
+                ProjectionCacheKeyMode::Normal,
+            )
+            .is_some(),
+            "unchanged request must hit"
+        );
+
+        for (label, mutate) in [
+            (
+                "fingerprint",
+                Box::new(|request: &mut TransformRequest| {
+                    request.full_array_fingerprint = Some("inv-fp-mutated".to_string());
+                }) as Box<dyn Fn(&mut TransformRequest)>,
+            ),
+            (
+                "session_id",
+                Box::new(|request: &mut TransformRequest| {
+                    request.session_id = "projection-invalidators-other".to_string();
+                }),
+            ),
+            (
+                "serializer_profile",
+                Box::new(|request: &mut TransformRequest| {
+                    request.serializer_profile = "opencode-aisdk-next".to_string();
+                }),
+            ),
+            (
+                "render_config",
+                Box::new(|request: &mut TransformRequest| {
+                    request.render_config = "cfg1".to_string();
+                }),
+            ),
+        ] {
+            let mut mutated = baseline.clone();
+            mutate(&mut mutated);
+            let after = mutated
+                .full_array_fingerprint
+                .clone()
+                .unwrap_or_else(|| "inv-fp-1".to_string());
+            assert!(
+                validated_projection_cache_input(
+                    &mutated,
+                    &snapshot,
+                    &after,
+                    2,
+                    ProjectionCacheKeyMode::Normal,
+                )
+                .is_none(),
+                "{label} must invalidate the projection cache"
+            );
+            assert!(
+                validated_projection_cache_input(
+                    &baseline,
+                    &snapshot,
+                    "inv-fp-1",
+                    2,
+                    ProjectionCacheKeyMode::Normal,
+                )
+                .is_some(),
+                "{label} mutation must not poison the baseline hit"
+            );
+        }
+
+        // Transition salt is a native-render concern and must not bust ingress projection reuse.
+        let hit = validated_projection_cache_input(
+            &baseline,
+            &snapshot,
+            "inv-fp-1",
+            2,
+            ProjectionCacheKeyMode::Normal,
+        );
+        assert!(hit.is_some(), "transition salt is not a projection invalidator");
     }
 
     #[test]
@@ -15774,7 +16165,7 @@ mod tests {
     }
 
     #[test]
-    fn projected_prefix_is_charged_to_the_shared_native_lru_budget() {
+    fn projected_prefix_is_charged_to_the_projection_cache_not_native_lru() {
         let ingress = vec![ck("budget-projection", 1, &"x".repeat(4096))];
         let request = native_cache_request(
             "projection-budget",
@@ -15791,37 +16182,13 @@ mod tests {
             crate::ck_wire::project_messages(&request.messages)
                 .expect("budget projection must succeed"),
         );
-        let without_projection = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
-        let mut without_response = transform::TransformResponse::passthrough(
-            served.clone(),
-            request.full_array_fingerprint.clone(),
-        );
-        attach_native_messages_incremental(
-            &mut without_response,
-            &request,
-            0,
-            &BTreeMap::new(),
-            None,
-            None,
-            false,
-            None,
-            0,
-            &without_projection,
-            None,
-            NativeCacheKeyMode::Normal,
-        );
-        let without_charge = without_projection
-            .lock()
-            .expect("native attachment cache mutex")
-            .retained_bytes;
-
-        let with_projection = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
-        let mut with_response = transform::TransformResponse::passthrough(
+        let native = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let mut response = transform::TransformResponse::passthrough(
             served,
             request.full_array_fingerprint.clone(),
         );
         attach_native_messages_incremental(
-            &mut with_response,
+            &mut response,
             &request,
             0,
             &BTreeMap::new(),
@@ -15830,22 +16197,35 @@ mod tests {
             false,
             None,
             0,
-            &with_projection,
-            Some(Arc::clone(&projection)),
+            &native,
             NativeCacheKeyMode::Normal,
         );
-        let with_charge = with_projection
+        let native_charge = native
             .lock()
             .expect("native attachment cache mutex")
             .retained_bytes;
-        assert_eq!(
-            with_charge.saturating_sub(without_charge),
-            projection.retained_bytes()
+        assert!(native_charge > 0, "native attach still charges its own bytes");
+
+        let mut projections = ProjectionCache::new(1024 * 1024);
+        projections.replace(
+            &request.session_id,
+            0,
+            ProjectionCacheSnapshot {
+                context: projection_cache_context(&request),
+                full_array_fingerprint: request.full_array_fingerprint.clone(),
+                projection: Arc::clone(&projection),
+            },
+        );
+        assert_eq!(projections.retained_bytes, projection.retained_bytes());
+        assert_ne!(
+            native_charge,
+            projection.retained_bytes(),
+            "projection bytes must not be double-charged onto the native LRU"
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn handler_small_lru_evicts_projection_and_attachment_together_then_runs_cold() {
+    async fn handler_small_lru_evicts_attachment_without_dropping_projection() {
         let (handler, _store, _dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
         let session_a = "projection-lru-a";
@@ -15872,20 +16252,21 @@ mod tests {
         .await;
         assert_eq!(response_a["status"], "ok", "{response_a}");
         let (entry_charge, projection_weak, attachment_weak) = {
-            let mut cache = handler.native_attachments.lock().unwrap();
-            let entry = &cache.sessions[session_a];
-            let projection = entry.snapshot.projection.as_ref().unwrap();
-            let chunk = entry
+            let mut native = handler.native_attachments.lock().unwrap();
+            let projections = handler.projections.lock().unwrap();
+            let native_entry = &native.sessions[session_a];
+            let projection = &projections.sessions[session_a].snapshot.projection;
+            let chunk = native_entry
                 .snapshot
                 .chunks
                 .first()
                 .expect("encoded attachment chunk");
             let values = (
-                entry.retained_bytes,
+                native_entry.retained_bytes,
                 Arc::downgrade(projection),
                 Arc::downgrade(&chunk.value),
             );
-            cache.max_retained_bytes = entry.retained_bytes;
+            native.max_retained_bytes = native_entry.retained_bytes;
             values
         };
 
@@ -15906,11 +16287,16 @@ mod tests {
         .await;
         assert_eq!(response_b["status"], "ok", "{response_b}");
         {
-            let cache = handler.native_attachments.lock().unwrap();
-            assert!(!cache.sessions.contains_key(session_a));
-            assert!(cache.sessions.contains_key(session_b));
+            let native = handler.native_attachments.lock().unwrap();
+            let projections = handler.projections.lock().unwrap();
+            assert!(!native.sessions.contains_key(session_a));
+            assert!(native.sessions.contains_key(session_b));
+            assert!(
+                projections.sessions.contains_key(session_a),
+                "native LRU eviction must not drop the projection owner"
+            );
         }
-        assert!(projection_weak.upgrade().is_none());
+        assert!(projection_weak.upgrade().is_some());
         assert!(attachment_weak.upgrade().is_none());
 
         assert!(entry_charge > 1);
@@ -15941,30 +16327,39 @@ mod tests {
             .unwrap()
             .sessions
             .contains_key(session_c));
+        assert!(
+            handler
+                .projections
+                .lock()
+                .unwrap()
+                .sessions
+                .contains_key(session_c),
+            "refusing an oversized native snapshot must not refuse the projection"
+        );
 
-        let mut cold_delta = native_cache_request(
+        let mut warm_delta = native_cache_request(
             session_a,
             vec![ck("lru-a-tail", 2, "after")],
             Vec::new(),
             "lru-a-fp-2",
         );
-        cold_delta.tail_delta = Some(json!({
+        warm_delta.tail_delta = Some(json!({
             "after": "lru-a-fp-1",
             "replace_from": 1,
             "native_replace_from": 0,
         }));
-        let cold = call_transform_request_on_channel(
+        let warm = call_transform_request_on_channel(
             &handler,
             7,
-            serde_json::to_value(cold_delta).unwrap(),
+            serde_json::to_value(warm_delta).unwrap(),
         )
         .await;
-        assert_eq!(cold["status"], "ok", "{cold}");
-        assert_eq!(cold["timings"]["projection_reused_messages"], 0);
-        assert_eq!(cold["timings"]["projection_projected_messages"], 2);
-        assert_eq!(cold["timings"]["native_cache_reused_messages"], 0);
+        assert_eq!(warm["status"], "ok", "{warm}");
+        assert_eq!(warm["timings"]["projection_reused_messages"], 1);
+        assert_eq!(warm["timings"]["projection_projected_messages"], 1);
+        assert_eq!(warm["timings"]["native_cache_reused_messages"], 0);
         assert!(
-            cold["timings"]["native_cache_encoded_messages"]
+            warm["timings"]["native_cache_encoded_messages"]
                 .as_u64()
                 .unwrap()
                 > 0
@@ -15984,25 +16379,14 @@ mod tests {
             ],
             "projection-fp-1",
         );
-        let served = ingress
-            .iter()
-            .map(|message| message.ck.clone())
-            .collect::<Vec<_>>();
-        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
-        run_native_cache_pass(
-            &cache,
-            &request,
-            served,
-            &BTreeMap::new(),
-            false,
-            0,
-            NativeCacheKeyMode::Normal,
-        );
-        let snapshot = cache
-            .lock()
-            .expect("native attachment cache mutex")
-            .snapshot(&request.session_id, 0)
-            .expect("projection cache snapshot");
+        let snapshot = ProjectionCacheSnapshot {
+            context: projection_cache_context(&request),
+            full_array_fingerprint: request.full_array_fingerprint.clone(),
+            projection: Arc::new(
+                crate::ck_wire::project_messages(&request.messages)
+                    .expect("projection cache snapshot"),
+            ),
+        };
         let mut changed = request;
         changed.messages[1] = ck("p2", 2, "changed");
         changed.full_array_fingerprint = Some("projection-fp-2".to_string());
@@ -16158,19 +16542,19 @@ mod tests {
         );
 
         let cached_projection = cached_handler
-            .native_attachments
+            .projections
             .lock()
-            .expect("cached native attachment mutex")
+            .expect("cached projection mutex")
             .snapshot("ses", cached_store.load("ses").unwrap().meta.revert_epoch)
-            .and_then(|snapshot| snapshot.projection)
-            .expect("cached projection snapshot");
+            .expect("cached projection snapshot")
+            .projection;
         let full_projection = control_handler
-            .native_attachments
+            .projections
             .lock()
-            .expect("control native attachment mutex")
+            .expect("control projection mutex")
             .snapshot("ses", control_store.load("ses").unwrap().meta.revert_epoch)
-            .and_then(|snapshot| snapshot.projection)
-            .expect("full projection snapshot");
+            .expect("full projection snapshot")
+            .projection;
         assert_eq!(cached_projection, full_projection);
         assert_eq!(
             cached_projection.differential_bytes(),
@@ -16323,13 +16707,21 @@ mod tests {
             .ready_request_clone(session)
             .unwrap();
         let expected = crate::ck_wire::project_messages(&acknowledged.messages).unwrap();
-        let cache = handler
+        let native = handler
             .native_attachments
             .lock()
             .expect("native attachment cache mutex");
-        let cached = &cache.sessions[session];
-        assert_eq!(cached.revert_epoch, durable.meta.revert_epoch);
-        assert_eq!(cached.snapshot.projection.as_deref(), Some(&expected));
+        assert_eq!(
+            native.sessions[session].revert_epoch,
+            durable.meta.revert_epoch
+        );
+        let cached = handler
+            .projections
+            .lock()
+            .expect("projection cache mutex")
+            .snapshot(session, durable.meta.revert_epoch)
+            .expect("projection cache snapshot");
+        assert_eq!(cached.projection.as_ref(), &expected);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -16393,13 +16785,14 @@ mod tests {
             .ready_request_clone(session)
             .unwrap();
         let expected = crate::ck_wire::project_messages(&acknowledged.messages).unwrap();
-        let cache = handler.native_attachments.lock().unwrap();
-        let cached = cache.sessions[session]
-            .snapshot
-            .projection
-            .as_deref()
-            .expect("post-retry projection");
-        assert_eq!(cached, &expected);
+        let cached = handler
+            .projections
+            .lock()
+            .unwrap()
+            .snapshot(session, store.load(session).unwrap().meta.revert_epoch)
+            .expect("post-retry projection")
+            .projection;
+        assert_eq!(cached.as_ref(), &expected);
         assert_eq!(cached.differential_bytes(), expected.differential_bytes());
     }
 
@@ -16448,10 +16841,13 @@ mod tests {
             .unwrap();
         let expected = crate::ck_wire::project_messages(&acknowledged.messages).unwrap();
         assert_eq!(
-            handler.native_attachments.lock().unwrap().sessions[session]
-                .snapshot
-                .projection
-                .as_deref(),
+            handler
+                .projections
+                .lock()
+                .unwrap()
+                .snapshot(session, durable.meta.revert_epoch)
+                .as_ref()
+                .map(|snapshot| snapshot.projection.as_ref()),
             Some(&expected)
         );
     }
@@ -16573,9 +16969,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn handler_delta_normalization_matches_full_when_reserved_todo_starts_at_frontier() {
-        let (cached_handler, _cached_store, _cached_dir, _cached_project) =
+        let (cached_handler, cached_store, _cached_dir, _cached_project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        let (control_handler, _control_store, _control_dir, _control_project) =
+        let (control_handler, control_store, _control_dir, _control_project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
         let initial_messages = vec![
             ck("todo-prefix", 1, "prefix"),
@@ -16644,16 +17040,22 @@ mod tests {
         assert_eq!(cached["status"], "ok", "{cached}");
         assert_eq!(cached["timings"]["projection_reused_messages"], 1);
         assert_eq!(cached["ck_messages"], full["ck_messages"]);
-        let cached_projection = cached_handler.native_attachments.lock().unwrap().sessions["ses"]
-            .snapshot
-            .projection
-            .clone()
-            .unwrap();
-        let full_projection = control_handler.native_attachments.lock().unwrap().sessions["ses"]
-            .snapshot
-            .projection
-            .clone()
-            .unwrap();
+        let cached_epoch = cached_store.load("ses").unwrap().meta.revert_epoch;
+        let full_epoch = control_store.load("ses").unwrap().meta.revert_epoch;
+        let cached_projection = cached_handler
+            .projections
+            .lock()
+            .unwrap()
+            .snapshot("ses", cached_epoch)
+            .expect("cached projection")
+            .projection;
+        let full_projection = control_handler
+            .projections
+            .lock()
+            .unwrap()
+            .snapshot("ses", full_epoch)
+            .expect("full projection")
+            .projection;
         assert_eq!(cached_projection, full_projection);
         assert!(cached_projection
             .blocks
