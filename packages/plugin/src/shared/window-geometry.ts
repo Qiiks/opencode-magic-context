@@ -27,6 +27,13 @@ export type WindowOverlayUnknownWhy =
     | "placeholder_output_equals_context"
     | "placeholder_zero"
     | "never_measured"
+    // Asserts the KEY cannot hold one fact (e.g. a router samples heterogeneous
+    // backends per request), so measurement cannot settle it and measured
+    // reports must not be promoted into stated/bracket cells at this key.
+    // Added to the closed vocabulary 2026-08-13 without a schema bump: an
+    // additive vocabulary value degrades per-cell for ignorant consumers,
+    // whereas a version bump would trigger the file-level refusal rule.
+    | "not_single_valued_at_this_key"
     | "retracted";
 
 export type WindowOverlayFactValue =
@@ -108,6 +115,7 @@ const UNKNOWN_REASONS = new Set<WindowOverlayUnknownWhy>([
     "placeholder_output_equals_context",
     "placeholder_zero",
     "never_measured",
+    "not_single_valued_at_this_key",
     "retracted",
 ]);
 const NUMERIC_FACT_KEYS = new Set([
@@ -402,14 +410,25 @@ function numericOverlayFact(
     return fact ? scalarizeFact(fact.value) : undefined;
 }
 
+/**
+ * Three-state geometry resolution from the overlay. The absent-vs-unknown
+ * distinction is ratified contract semantics: a fact ABSENT from the cell was
+ * never considered (our static provider table still applies), while a fact
+ * present with kind "unknown" was considered and has no answer — the dataset
+ * owner checked the primary source and found the usual inference unsupported
+ * (e.g. Google's own docs contradict the separate-quota reading), so the
+ * static assumption built on that same inference must NOT apply either.
+ */
 function overlayGeometry(
     overlay: ResolvedWindowOverlayFacts | undefined,
-): WindowGeometry | undefined {
+): { kind: "stated"; value: WindowGeometry } | { kind: "unknown" } | undefined {
     const fact = overlay?.facts.geometry;
-    if (fact?.value.kind !== "stated") return undefined;
+    if (fact === undefined) return undefined;
+    if (fact.value.kind === "unknown") return { kind: "unknown" };
+    if (fact.value.kind !== "stated") return undefined;
     const value = fact.value.value;
     return value === "shared_upfront" || value === "shared_truncating" || value === "separate"
-        ? value
+        ? { kind: "stated", value }
         : undefined;
 }
 
@@ -482,8 +501,17 @@ export function deriveWindowGeometry(
     );
     const providerOutput = placeholderFilteredOutput(providerLimit?.output, softContext);
     const output = providerOutput ?? overlayOutput ?? catalogOutput;
-    const geometryOverride = overlayGeometry(options.overlay);
-    const geometry = geometryOverride ?? PROVIDER_GEOMETRY[providerID] ?? "shared_upfront";
+    const geometryFact = overlayGeometry(options.overlay);
+    // Considered-unknown demotes to shared_upfront — the conservative geometry
+    // in both directions (largest soft reserve, lowest hard wall) — until a
+    // measurement settles the cell. Absence falls through to the static table.
+    const geometry =
+        geometryFact?.kind === "stated"
+            ? geometryFact.value
+            : geometryFact?.kind === "unknown"
+              ? "shared_upfront"
+              : (PROVIDER_GEOMETRY[providerID] ?? "shared_upfront");
+    const geometryOverride = geometryFact?.kind === "stated" ? geometryFact.value : undefined;
 
     let usableSoft: number;
     let softReserve = 0;
