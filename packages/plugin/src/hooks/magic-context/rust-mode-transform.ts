@@ -69,6 +69,7 @@ import {
     mirrorModuleCompartments,
     syncModuleState,
 } from "./module-state-sync";
+import { isModuleTransportGenerationChangedResult } from "./module-transport";
 import {
     buildPagedModuleTransformPayloads,
     encodeOpenCodeMessagesToCk,
@@ -535,6 +536,25 @@ function responseValue(response: unknown): Record<string, unknown> {
     if (isRecord(response) && isRecord(response.result)) return response.result;
     if (isRecord(response)) return response;
     throw new Error("module transform returned a non-object response");
+}
+
+function isTransformPageAttemptMismatch(error: unknown): boolean {
+    let current = error;
+    const seen = new Set<unknown>();
+    while (isRecord(current) && !seen.has(current)) {
+        seen.add(current);
+        const code = typeof current.code === "string" ? current.code : "";
+        const message = typeof current.message === "string" ? current.message : "";
+        if (
+            code === "attempt_mismatch" ||
+            code === "authority_transform_page_attempt_mismatch" ||
+            /\b(?:authority_transform_page_)?attempt_mismatch\b/.test(message)
+        ) {
+            return true;
+        }
+        current = current.cause;
+    }
+    return false;
 }
 
 function mirrorRustRenderedMemoryIds(args: {
@@ -1983,7 +2003,6 @@ export function createRustModeTransform(
                 channel2NudgeState: String(passInputs.channel2_nudge_state ?? ""),
                 emergencyRecoveryArmed: passInputs.emergency_recovery_armed === true,
             });
-            const pages = buildPagedModuleTransformPayloads(body);
             logStage(
                 sessionId,
                 "wireBuild",
@@ -1991,31 +2010,103 @@ export function createRustModeTransform(
                 timings,
                 wireDelta ? `mode=tail_delta input=${encodedInput.length}` : "mode=full",
             );
-            let response: Record<string, unknown> | undefined;
+            type TransformSeriesRestart = {
+                reason: "attempt_mismatch" | "reconnect";
+                pages: number;
+                atPage: number;
+            };
+            type TransformSeriesResult =
+                | { response: Record<string, unknown> }
+                | { restart: TransformSeriesRestart };
+            const sendTransformSeries = async (
+                payload: Record<string, unknown>,
+                detail = "",
+            ): Promise<TransformSeriesResult> => {
+                const pages = buildPagedModuleTransformPayloads(payload);
+                const paged = pages.some((page) => typeof page.transform_page_id === "string");
+                let response: Record<string, unknown> | undefined;
+                for (const [index, page] of pages.entries()) {
+                    const transportStartedAt = performance.now();
+                    let moduleResponse: unknown;
+                    try {
+                        moduleResponse = await callModule({
+                            sessionId,
+                            projectRoot,
+                            method: "transform",
+                            body: page,
+                            // A reconnect discards a collecting page series. Page zero can be
+                            // retried safely, but later pages must make the caller restart it.
+                            generationSensitive: paged && index > 0,
+                        });
+                    } catch (error) {
+                        if (paged && isTransformPageAttemptMismatch(error)) {
+                            return {
+                                restart: {
+                                    reason: "attempt_mismatch",
+                                    pages: pages.length,
+                                    atPage: index,
+                                },
+                            };
+                        }
+                        throw error;
+                    }
+                    if (paged && isModuleTransportGenerationChangedResult(moduleResponse)) {
+                        return {
+                            restart: { reason: "reconnect", pages: pages.length, atPage: index },
+                        };
+                    }
+                    if (paged && isTransformPageAttemptMismatch(moduleResponse)) {
+                        return {
+                            restart: {
+                                reason: "attempt_mismatch",
+                                pages: pages.length,
+                                atPage: index,
+                            },
+                        };
+                    }
+                    response = responseValue(moduleResponse);
+                    timings.transportBytes += Buffer.byteLength(JSON.stringify(page));
+                    timings.transportPages += 1;
+                    logStage(
+                        sessionId,
+                        "transport",
+                        transportStartedAt,
+                        timings,
+                        `page=${index + 1}/${pages.length}${detail}`,
+                    );
+                }
+                if (!response) throw new Error("rust module returned no transform response");
+                return { response };
+            };
+            let transformSeriesRestarted = false;
+            const sendTransformSeriesWithSingleRestart = async (
+                payload: Record<string, unknown>,
+                detail = "",
+            ): Promise<Record<string, unknown>> => {
+                let result = await sendTransformSeries(payload, detail);
+                if (!("restart" in result)) return result.response;
+                if (transformSeriesRestarted) {
+                    throw new Error(
+                        `rust transform page series restart exhausted: reason=${result.restart.reason}`,
+                    );
+                }
+                transformSeriesRestarted = true;
+                sessionLog(
+                    sessionId,
+                    `transform_series_restart reason=${result.restart.reason} pages=${result.restart.pages} at_page=${result.restart.atPage}`,
+                );
+                result = await sendTransformSeries(payload, `${detail} restart=series`);
+                if ("restart" in result) {
+                    throw new Error(
+                        `rust transform page series restart exhausted: reason=${result.restart.reason}`,
+                    );
+                }
+                return result.response;
+            };
+            let response = await sendTransformSeriesWithSingleRestart(body);
             let servedFinalWireEstimate:
                 | ReturnType<typeof estimateFinalWireInputTokens>
                 | undefined;
-            for (const [index, page] of pages.entries()) {
-                timings.transportBytes += Buffer.byteLength(JSON.stringify(page));
-                const transportStartedAt = performance.now();
-                response = responseValue(
-                    await callModule({
-                        sessionId,
-                        projectRoot,
-                        method: "transform",
-                        body: page,
-                    }),
-                );
-                timings.transportPages += 1;
-                logStage(
-                    sessionId,
-                    "transport",
-                    transportStartedAt,
-                    timings,
-                    `page=${index + 1}/${pages.length}`,
-                );
-            }
-            if (!response) throw new Error("rust module returned no transform response");
             captureResponseTelemetry(response);
             if (isNeedFullSync(response)) {
                 // A module restart can retain durable state while changing the accepted
@@ -2128,31 +2219,9 @@ export function createRustModeTransform(
                         "retry=full",
                     );
                 }
-                response = undefined;
                 const retryWireBuildStartedAt = performance.now();
-                const retryPages = buildPagedModuleTransformPayloads(body);
+                response = await sendTransformSeriesWithSingleRestart(body, " retry=full");
                 logStage(sessionId, "wireBuild", retryWireBuildStartedAt, timings, "retry=full");
-                for (const [index, page] of retryPages.entries()) {
-                    timings.transportBytes += Buffer.byteLength(JSON.stringify(page));
-                    const transportStartedAt = performance.now();
-                    response = responseValue(
-                        await callModule({
-                            sessionId,
-                            projectRoot,
-                            method: "transform",
-                            body: page,
-                        }),
-                    );
-                    timings.transportPages += 1;
-                    logStage(
-                        sessionId,
-                        "transport",
-                        transportStartedAt,
-                        timings,
-                        `page=${index + 1}/${retryPages.length} retry=full`,
-                    );
-                }
-                if (!response) throw new Error("rust module returned no retry transform response");
                 captureResponseTelemetry(response);
                 if (isNeedFullSync(response)) {
                     // The retry was a genuine full send; a second need_full_sync means

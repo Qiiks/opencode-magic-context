@@ -922,14 +922,21 @@ impl TransformPageCoordinator {
         }
     }
 
-    fn discard(&mut self, session_id: &str) {
+    /// Drop the live collection and report its staged page count. Completed and applying
+    /// requests are still cleared, but only a collecting request represents discarded pages.
+    fn discard(&mut self, session_id: &str) -> Option<usize> {
         let phase = self.sessions.get_mut(session_id).map(|session| {
             session.completed = None;
             std::mem::replace(&mut session.phase, TransformPagePhase::Idle)
         });
+        let staged_pages = phase.as_ref().and_then(|phase| match phase {
+            TransformPagePhase::Collecting(pending) => Some(pending.pages.len()),
+            TransformPagePhase::Idle | TransformPagePhase::Applying { .. } => None,
+        });
         if let Some(phase) = phase {
             self.release_phase(&phase);
         }
+        staged_pages
     }
 
     fn set_phase(&mut self, session_id: &str, phase: TransformPagePhase) {
@@ -2277,6 +2284,8 @@ pub struct McHandler {
     transform_session_roots: Mutex<HashMap<String, HashSet<PathBuf>>>,
     state_sync_seeds: Mutex<StateSyncSeedCoordinator>,
     transform_pages: Mutex<TransformPageCoordinator>,
+    #[cfg(test)]
+    transform_page_discard_logs: Mutex<Vec<String>>,
     state_imports: Mutex<StateImportCoordinator>,
     /// Module-minted zero-tool dreamer sessions. Prefixes are diagnostics only;
     /// only registered ids may bypass transform after route validation.
@@ -2692,6 +2701,8 @@ impl McHandler {
             transform_session_roots: Mutex::new(HashMap::new()),
             state_sync_seeds: Mutex::new(StateSyncSeedCoordinator::default()),
             transform_pages: Mutex::new(TransformPageCoordinator::default()),
+            #[cfg(test)]
+            transform_page_discard_logs: Mutex::new(Vec::new()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
@@ -2776,6 +2787,8 @@ impl McHandler {
             transform_session_roots: Mutex::new(HashMap::new()),
             state_sync_seeds: Mutex::new(StateSyncSeedCoordinator::default()),
             transform_pages: Mutex::new(TransformPageCoordinator::default()),
+            #[cfg(test)]
+            transform_page_discard_logs: Mutex::new(Vec::new()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
@@ -2809,11 +2822,7 @@ impl McHandler {
                 .lock()
                 .expect("state sync seed mutex")
                 .evict(&session_id);
-            self.transform_pages
-                .lock()
-                .expect("transform page mutex")
-                .discard(&session_id);
-            self.refresh_oldest_queued_at_ms();
+            self.discard_transform_pages_for_route(&session_id, "route_replaced");
             self.state_imports
                 .lock()
                 .expect("state import mutex")
@@ -2897,6 +2906,30 @@ impl McHandler {
         DISPATCH_HEALTH
             .oldest_queued_at_ms
             .store(oldest, Ordering::Relaxed);
+    }
+
+    fn log_transform_page_discard(&self, session_id: &str, staged_pages: usize, trigger: &str) {
+        let line = format!(
+            "transform_page_collection_discarded session={session_id} staged_pages={staged_pages} trigger={trigger}"
+        );
+        eprintln!("mc-module: {line}");
+        #[cfg(test)]
+        self.transform_page_discard_logs
+            .lock()
+            .expect("transform page discard logs mutex")
+            .push(line);
+    }
+
+    fn discard_transform_pages_for_route(&self, session_id: &str, trigger: &str) {
+        let staged_pages = self
+            .transform_pages
+            .lock()
+            .expect("transform page mutex")
+            .discard(session_id);
+        if let Some(staged_pages) = staged_pages {
+            self.log_transform_page_discard(session_id, staged_pages, trigger);
+        }
+        self.refresh_oldest_queued_at_ms();
     }
 
     fn discard_transform_pages(&self, session_id: &str) {
@@ -3023,10 +3056,7 @@ impl McHandler {
                 .lock()
                 .expect("state sync seed mutex")
                 .evict(&session);
-            self.transform_pages
-                .lock()
-                .expect("transform page mutex")
-                .discard(&session);
+            self.discard_transform_pages_for_route(&session, "route_teardown");
             self.state_imports
                 .lock()
                 .expect("state import mutex")
@@ -25246,6 +25276,110 @@ mod tests {
             let response = handler.dispatch_value(channel, final_page).await;
             assert!(matches!(response, HandlerOutcome::Response(_)));
         }
+    }
+
+    #[tokio::test]
+    async fn route_discard_logs_partial_transform_pages_and_allows_a_fresh_series() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
+        let project_root = project.to_str().expect("test project path");
+        let first = paged_transform_page(
+            "transform",
+            "ses",
+            "discarded-series",
+            0,
+            0,
+            2,
+            false,
+            vec![serde_json::to_value(ck("discarded-m0", 0, "discarded first")).unwrap()],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, first).await,
+            HandlerOutcome::Response(_)
+        ));
+
+        handler.bind_route(7, binding(project_root, "replacement"));
+        let discard_logs = handler
+            .transform_page_discard_logs
+            .lock()
+            .expect("transform page discard logs mutex")
+            .clone();
+        assert_eq!(
+            discard_logs,
+            vec![
+                "transform_page_collection_discarded session=ses staged_pages=1 trigger=route_replaced"
+                    .to_string()
+            ]
+        );
+
+        handler.bind_route(7, binding(project_root, "ses"));
+        let fresh_first = paged_transform_page(
+            "transform",
+            "ses",
+            "fresh-series",
+            0,
+            0,
+            2,
+            false,
+            vec![serde_json::to_value(ck("fresh-m0", 0, "fresh first")).unwrap()],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, fresh_first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let fresh_final = paged_transform_page(
+            "transform",
+            "ses",
+            "fresh-series",
+            0,
+            1,
+            2,
+            true,
+            vec![serde_json::to_value(ck("fresh-m1", 1, "fresh final")).unwrap()],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, fresh_final).await,
+            HandlerOutcome::Response(_)
+        ));
+
+        handler.unbind_route(7);
+        assert_eq!(
+            handler
+                .transform_page_discard_logs
+                .lock()
+                .expect("transform page discard logs mutex")
+                .len(),
+            1,
+            "route teardown must not log when no transform pages were staged"
+        );
+
+        handler.bind_route(7, binding(project_root, "ses"));
+        let teardown_first = paged_transform_page(
+            "transform",
+            "ses",
+            "teardown-series",
+            0,
+            0,
+            2,
+            false,
+            vec![serde_json::to_value(ck("teardown-m0", 0, "teardown first")).unwrap()],
+        );
+        assert!(matches!(
+            handler.dispatch_value(7, teardown_first).await,
+            HandlerOutcome::Response(_)
+        ));
+        handler.unbind_route(7);
+        assert_eq!(
+            handler
+                .transform_page_discard_logs
+                .lock()
+                .expect("transform page discard logs mutex")
+                .as_slice(),
+            [
+                "transform_page_collection_discarded session=ses staged_pages=1 trigger=route_replaced",
+                "transform_page_collection_discarded session=ses staged_pages=1 trigger=route_teardown",
+            ]
+        );
     }
 
     #[tokio::test]
