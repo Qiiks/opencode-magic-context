@@ -960,6 +960,10 @@ pub struct TransformTimings {
     #[serde(default)]
     pub unit_mint: f64,
     #[serde(default)]
+    pub temporal: f64,
+    #[serde(default)]
+    pub caveman: f64,
+    #[serde(default)]
     pub tag_mint_candidates: usize,
     #[serde(default)]
     pub tag_mint_new: usize,
@@ -1066,7 +1070,7 @@ pub fn format_pass_timing_line(
          projection_reused_messages={} projection_projected_messages={} store_cache_state={:.1} store_tags={:.1} store_temporal={:.1} \
          store_user_hints={:.1} store_channel1={:.1} store_overlay_frontier={:.1} \
          store_notes={:.1} store_memories={:.1} pending_drops={:.1} coverage_resolve={:.1} \
-         tag_overlay={:.1} unit_mint={:.1} \
+         tag_overlay={:.1} unit_mint={:.1} temporal={:.1} caveman={:.1} \
          tag_mint_candidates={} tag_mint_new={} tag_mint_tokenized_bytes={} \
          decide={:.1} seed_or_sync={:.1} compose_m0m1={:.1} selection={:.1} \
          transition_detection={:.3} emergency_reasoning_exclusions={} todo={:.1} \
@@ -1097,6 +1101,8 @@ pub fn format_pass_timing_line(
         timings.coverage_resolve,
         timings.tag_overlay,
         timings.unit_mint,
+        timings.temporal,
+        timings.caveman,
         timings.tag_mint_candidates,
         timings.tag_mint_new,
         timings.tag_mint_tokenized_bytes,
@@ -1428,6 +1434,8 @@ struct PendingOverlayDecisions {
     tag_mint_count: usize,
     tag_mint_candidates: usize,
     tag_mint_tokenized_bytes: usize,
+    tag_mint_ms: f64,
+    temporal_ms: f64,
     temporal_marks: Vec<TemporalMarkInput>,
     user_hint: Option<UserHintDecisionInput>,
     channel1_append: Option<Channel1AppendRow>,
@@ -2739,6 +2747,8 @@ fn apply_once(
         timings.tag_mint_candidates = pending_overlays.tag_mint_candidates;
         timings.tag_mint_new = pending_overlays.tag_mint_count;
         timings.tag_mint_tokenized_bytes = pending_overlays.tag_mint_tokenized_bytes;
+        timings.tag_overlay += pending_overlays.tag_mint_ms;
+        timings.temporal += pending_overlays.temporal_ms;
         // The cutoff captured by a bust includes tags minted by that same accepted pass.
         // Deferring this refresh until the next request would split one eligible batch across
         // several provider-visible rewrites as a multi-step turn keeps minting tags.
@@ -3373,6 +3383,8 @@ fn apply_once(
         is_bust_pass,
         lineage_anchor_mid,
     );
+    timings.unit_mint = elapsed_ms(unit_mint_started_at);
+    let caveman_started_at = Instant::now();
     let caveman_age_basis_tag = if is_bust_pass && req.caveman_enabled {
         let basis = tag_rows
             .iter()
@@ -3393,7 +3405,7 @@ fn apply_once(
         is_bust_pass,
         caveman_age_basis_tag,
     );
-    timings.unit_mint = elapsed_ms(unit_mint_started_at);
+    timings.caveman = elapsed_ms(caveman_started_at);
     if loaded.meta.soft_refresh_pending && is_bust_pass {
         meta.soft_refresh_pending = false;
     }
@@ -6898,6 +6910,7 @@ fn compute_active_overlay_decisions(
         mutation_exempt_mid,
         lineage_anchor_mid,
     } = input;
+    let tag_mint_started_at = Instant::now();
     let tag_mint_work = {
         let existing_tag_ids = tag_rows
             .iter()
@@ -6930,6 +6943,8 @@ fn compute_active_overlay_decisions(
     let tag_mint_count = tag_mint_work.inputs.len();
     let tag_mint_start =
         append_tag_mint_rows(Arc::make_mut(tag_rows), tag_mint_work.inputs, ctx.now_ms);
+    let tag_mint_ms = elapsed_ms(tag_mint_started_at);
+    let temporal_started_at = Instant::now();
 
     let mint_by_block = tag_rows
         .iter()
@@ -7048,6 +7063,7 @@ fn compute_active_overlay_decisions(
     }
     let max_seen_ordinal =
         decided_frontier.filter(|ordinal| frontier.is_none_or(|current| *ordinal > current));
+    let temporal_ms = elapsed_ms(temporal_started_at);
 
     let user_hint = tagging_enabled
         .then_some(authored_tail)
@@ -7101,6 +7117,8 @@ fn compute_active_overlay_decisions(
         tag_mint_count,
         tag_mint_candidates,
         tag_mint_tokenized_bytes,
+        tag_mint_ms,
+        temporal_ms,
         temporal_marks,
         user_hint,
         channel1_append: None,
@@ -10483,6 +10501,8 @@ pub(crate) mod tests {
             "trigger_ms",
             "post_attach_ms",
             "response_encode",
+            "temporal",
+            "caveman",
         ] {
             assert_eq!(fields[key], "0.0", "{key} renders one decimal place");
         }
@@ -10507,6 +10527,107 @@ pub(crate) mod tests {
         ] {
             assert_eq!(fields[key], "0", "{key} renders as an integer");
         }
+    }
+
+    #[test]
+    fn apply_once_records_per_stage_timings() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let messages = (0..40)
+            .map(|index| item(&format!("stage-{index}"), index as u64 + 1, "stage payload"))
+            .collect::<Vec<_>>();
+        let request = req("stage-timings", "cfg0", messages);
+        let first = run(&store, &request, &[]);
+        let timings = first.timings.expect("apply_once records timings");
+        assert!(timings.projection >= 0.0);
+        assert!(timings.decide >= 0.0);
+        assert!(timings.compose_m0m1 >= 0.0);
+        assert!(timings.selection >= 0.0);
+        assert!(timings.todo >= 0.0);
+        assert!(timings.tag_overlay >= 0.0);
+        assert!(timings.unit_mint >= 0.0);
+        assert!(timings.temporal >= 0.0);
+        assert!(timings.caveman >= 0.0);
+        assert!(timings.build_frozen_unit_scan >= 0.0);
+        assert!(timings.build_frozen_unit_index >= 0.0);
+        eprintln!(
+            "apply_once-stage-breakdown projection={:.1} decide={:.1} tag_overlay={:.1} unit_mint={:.1} temporal={:.1} caveman={:.1} compose_m0m1={:.1} selection={:.1} todo={:.1} build_frozen_unit_scan={:.1} build_frozen_unit_index={:.1} build_output={:.1} total={:.1}",
+            timings.projection,
+            timings.decide,
+            timings.tag_overlay,
+            timings.unit_mint,
+            timings.temporal,
+            timings.caveman,
+            timings.compose_m0m1,
+            timings.selection,
+            timings.todo,
+            timings.build_frozen_unit_scan,
+            timings.build_frozen_unit_index,
+            timings.build_output,
+            timings.total,
+        );
+    }
+
+    #[test]
+    #[ignore = "run manually to decompose a production-sized apply_once"]
+    fn apply_once_stage_timings_large_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        const MESSAGE_COUNT: usize = 1_400;
+        let messages = (0..MESSAGE_COUNT)
+            .map(|index| {
+                item(
+                    &format!("large-{index}"),
+                    index as u64 + 1,
+                    &format!("payload {index} {}", "x".repeat(256)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let request = req("stage-timings-large", "cfg0", messages);
+        let first = run(&store, &request, &[]);
+        let first_timings = first.timings.expect("first apply_once records timings");
+        let second = run(&store, &request, &[]);
+        let second_timings = second.timings.expect("second apply_once records timings");
+        eprintln!(
+            "apply_once-large n={MESSAGE_COUNT} first_total={:.1} first_projection={:.1} first_decide={:.1} first_tag_overlay={:.1} first_unit_mint={:.1} first_temporal={:.1} first_caveman={:.1} first_compose={:.1} first_selection={:.1} first_todo={:.1} first_frozen_scan={:.1} first_frozen_index={:.1} first_build_output={:.1} first_store_commit={:.1}",
+            first_timings.total,
+            first_timings.projection,
+            first_timings.decide,
+            first_timings.tag_overlay,
+            first_timings.unit_mint,
+            first_timings.temporal,
+            first_timings.caveman,
+            first_timings.compose_m0m1,
+            first_timings.selection,
+            first_timings.todo,
+            first_timings.build_frozen_unit_scan,
+            first_timings.build_frozen_unit_index,
+            first_timings.build_output,
+            first_timings.store_commit,
+        );
+        eprintln!(
+            "apply_once-large-second n={MESSAGE_COUNT} total={:.1} projection={:.1} reused={} projected={} decide={:.1} tag_overlay={:.1} unit_mint={:.1} temporal={:.1} caveman={:.1} compose={:.1} selection={:.1} todo={:.1} frozen_scan={:.1} frozen_index={:.1} build_output={:.1} store_commit={:.1} store_tags={:.1} store_temporal={:.1} coverage_resolve={:.1} seed_or_sync={:.1}",
+            second_timings.total,
+            second_timings.projection,
+            second_timings.projection_reused_messages,
+            second_timings.projection_projected_messages,
+            second_timings.decide,
+            second_timings.tag_overlay,
+            second_timings.unit_mint,
+            second_timings.temporal,
+            second_timings.caveman,
+            second_timings.compose_m0m1,
+            second_timings.selection,
+            second_timings.todo,
+            second_timings.build_frozen_unit_scan,
+            second_timings.build_frozen_unit_index,
+            second_timings.build_output,
+            second_timings.store_commit,
+            second_timings.store_tags,
+            second_timings.store_temporal,
+            second_timings.coverage_resolve,
+            second_timings.seed_or_sync,
+        );
     }
 
     fn run_active_surface_test<T>(f: impl FnOnce() -> T) -> T {
@@ -17735,7 +17856,6 @@ pub(crate) mod tests {
             None,
             0,
             &cache,
-            None,
             crate::NativeCacheKeyMode::Normal,
         );
         assert_eq!(first_stats.encoded_messages, healed_ck.len());
@@ -17766,7 +17886,6 @@ pub(crate) mod tests {
             None,
             0,
             &cache,
-            None,
             crate::NativeCacheKeyMode::Normal,
         );
         assert_eq!(replay_stats.reused_messages, healed_ck.len());
@@ -17936,7 +18055,6 @@ pub(crate) mod tests {
             None,
             0,
             &cache,
-            None,
             crate::NativeCacheKeyMode::Normal,
         );
 
@@ -17964,7 +18082,6 @@ pub(crate) mod tests {
             None,
             0,
             &cache,
-            None,
             crate::NativeCacheKeyMode::Normal,
         );
         assert!(stats.encoded_messages > 0);
