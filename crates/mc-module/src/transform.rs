@@ -24297,6 +24297,128 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn duplicate_tool_full_drop_replays_byte_identically_through_output_cache() {
+        let calls = vec![
+            CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                id: "duplicate-old".to_string(),
+                name: "mcp_read".to_string(),
+                input: json!({ "path": "src/lib.rs", "line": 7 }),
+                provider_executed: false,
+            }),
+            CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                id: "duplicate-new".to_string(),
+                name: "mcp_read".to_string(),
+                input: json!({ "line": 7, "path": "src/lib.rs" }),
+                provider_executed: false,
+            }),
+        ];
+        let request = cc_req(
+            "duplicate-tool-output-cache",
+            "cfg0",
+            vec![
+                CkIngressMessage {
+                    mid: "duplicate-owner".to_string(),
+                    ordinal: 1,
+                    ck: CkWireMessage::from_parts(
+                        "assistant",
+                        calls,
+                        None,
+                        ck_wire::ProviderExtras::new(),
+                        ck_wire::HarnessMeta {
+                            harness_id: Some("duplicate-owner".to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                },
+                tool_result("duplicate-old-result", 2, "duplicate-old", "old output"),
+                tool_result("duplicate-new-result", 3, "duplicate-new", "new output"),
+            ],
+        );
+        let projection = project_messages(&request.messages).unwrap();
+        let live = projection.blocks.iter().collect::<Vec<_>>();
+        let items = tail_sel_items(&live, None, &HashMap::new());
+        let decisions = crate::selection::select_reductions(
+            &items,
+            &HashSet::new(),
+            &SelectionContext {
+                pass_class: PassClass::Execute,
+                current_total_input_tokens: 0.0,
+                ceiling_tokens: 0.0,
+                protected_cutoff_ordinal: 0,
+                last_execute_ordinal: 0,
+                scheduler_pressure_execute: false,
+                prior_input_sample: 0.0,
+                has_prior_drop: false,
+                agent_drop_ids: Vec::new(),
+                agent_drop_command_ids: HashMap::new(),
+                first_applied_agent_drop_ids: HashSet::new(),
+                pass_already_busting: false,
+                supersession_ride_available: true,
+                tag_window_protected_block_ids: HashSet::new(),
+                exempt_message_protected_block_ids: HashSet::new(),
+            },
+            &SelectionConfig::default(),
+        );
+        assert_eq!(
+            decisions
+                .iter()
+                .map(|decision| (decision.target_id.as_str(), decision.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("duplicate-old-result#0", "drop"),
+                ("duplicate-owner#0", "drop"),
+            ],
+            "only the older same-owner duplicate freezes as a full drop: {decisions:?}"
+        );
+
+        let core = CoreState {
+            frozen_units: decisions
+                .iter()
+                .map(|decision| red_unit(&decision.target_id, &decision.kind, &decision.payload))
+                .collect(),
+            ..Default::default()
+        };
+        let meta = ModuleMeta::default();
+        let first = build_output_with_tags(
+            &core,
+            &meta,
+            &projection,
+            &request,
+            None,
+            false,
+            None,
+            &BTreeMap::new(),
+            0,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        let first_bytes = canonical_output(&first.messages);
+        let snapshot = SerializedOutputCacheSnapshot {
+            entries: first.cache_entries.clone(),
+        };
+        let replay = build_output_with_tags(
+            &core,
+            &meta,
+            &projection,
+            &request,
+            None,
+            false,
+            None,
+            &BTreeMap::new(),
+            0,
+            false,
+            Some(&snapshot),
+            false,
+        )
+        .unwrap();
+        assert!(replay.cache_stats.reused_items > 0);
+        assert_eq!(canonical_output(&replay.messages), first_bytes);
+        assert!(core.frozen_units.iter().all(|unit| unit.kind == "drop"));
+    }
+
+    #[test]
     fn stored_split_coverage_arc_salts_once_and_never_serves_an_orphaned_result() {
         // These adapted messages model coverage ending at call 123 while its result remains live at
         // 124, making that result the first real tail message. Adapted bytes carry no provider verdict.
