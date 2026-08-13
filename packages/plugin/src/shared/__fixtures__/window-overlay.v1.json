@@ -320,7 +320,7 @@
         "geometry": {
           "value": {
             "kind": "unknown",
-            "why": "not_single_valued_at_this_key"
+            "why": "not_single_valued_at_key"
           },
           "grade": "measured",
           "units": "provider",
@@ -333,5 +333,5 @@
     }
   ],
   "source_revision_note": "Cells transcribed from mc-geometry-spec were read at c6a85d85 and their source_ref names 06a0e5ac, the current revision. The bump is verified rather than assumed: every row transcribed here is byte-identical between the two revisions (checked per row with git show). The Codex row DID change between them, and no cell here cites the spec for Codex \u2014 those cells cite codex-rs directly. Pointing at the newer revision matters because c6a85d85 carried a misattributed Codex number, and a reader resolving a source_ref should land on a document without a known bad row in it.",
-  "additive_note": "The reason value `not_single_valued_at_this_key` was added 2026-08-13 WITHOUT a schema version bump, deliberately. Bumping would trigger the file-level refusal rule and cost a consumer all 9 cells over one additive value affecting 1. Unbumped, a consumer that does not know the value skips that single cell and merges the other 8 \u2014 which is the correct degradation for an addition."
+  "additive_note": "The reason value `not_single_valued_at_key` was added 2026-08-13 WITHOUT a schema version bump, deliberately. Bumping would trigger the file-level refusal rule and cost a consumer all 9 cells over one additive value affecting 1. Unbumped, a consumer that does not know the value skips that single cell and merges the other 8 \u2014 which is the correct degradation for an addition."
 }

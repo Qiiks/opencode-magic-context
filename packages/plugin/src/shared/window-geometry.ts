@@ -30,10 +30,10 @@ export type WindowOverlayUnknownWhy =
     // Asserts the KEY cannot hold one fact (e.g. a router samples heterogeneous
     // backends per request), so measurement cannot settle it and measured
     // reports must not be promoted into stated/bracket cells at this key.
-    // Added to the closed vocabulary 2026-08-13 without a schema bump: an
+    // Ratified terminal at fusiform 080e70208aad713d (2026-08-13), added without a schema bump: an
     // additive vocabulary value degrades per-cell for ignorant consumers,
     // whereas a version bump would trigger the file-level refusal rule.
-    | "not_single_valued_at_this_key"
+    | "not_single_valued_at_key"
     | "retracted";
 
 export type WindowOverlayFactValue =
@@ -115,7 +115,7 @@ const UNKNOWN_REASONS = new Set<WindowOverlayUnknownWhy>([
     "placeholder_output_equals_context",
     "placeholder_zero",
     "never_measured",
-    "not_single_valued_at_this_key",
+    "not_single_valued_at_key",
     "retracted",
 ]);
 const NUMERIC_FACT_KEYS = new Set([
