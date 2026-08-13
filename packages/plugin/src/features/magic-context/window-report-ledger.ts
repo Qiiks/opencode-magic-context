@@ -20,6 +20,18 @@ export const WINDOW_REPORTS_ROTATION_BYTES = 16 * 1024 * 1024;
 export const FORWARDING_PROVIDER_IDS: ReadonlySet<string> = new Set([
     "openrouter",
     "github-copilot",
+    // Fusiform's dual-detector sweep (e8d80fd): the eight largest no-cell
+    // providers whose catalogs carry other vendors' models. An ADMIT list,
+    // not a classification — membership warrants path_may_forward: true at
+    // capture; absence from this list clears nobody (a provider using an id
+    // convention neither detector knows would be silently missing here).
+    "nano-gpt",
+    "kilo",
+    "vercel",
+    "llmgateway",
+    "merge-gateway",
+    "poe",
+    "zenmux",
 ]);
 
 export interface WindowReport {
