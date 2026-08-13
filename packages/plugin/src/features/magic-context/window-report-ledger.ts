@@ -11,7 +11,11 @@ export const WINDOW_REPORTS_ROTATION_BYTES = 16 * 1024 * 1024;
 
 /**
  * Presence is evidence that this provider can forward a request to another
- * upstream. Absence does not prove that a provider never forwards requests.
+ * upstream. Absence does not prove that a provider never forwards requests
+ * (one-directional detector), which is why the emitter below never writes
+ * `path_may_forward: false`: the schema pins absent = unknown routing
+ * (refuses promotion, same as true), while an explicit false PERMITS
+ * promotion — a claim this set structurally cannot support.
  */
 export const FORWARDING_PROVIDER_IDS: ReadonlySet<string> = new Set([
     "openrouter",
@@ -32,7 +36,14 @@ export interface WindowReport {
     observed_at_ms: number;
     largest_success?: number;
     largest_success_units?: "estimate";
-    path_may_forward: boolean;
+    /**
+     * Emitted ONLY as `true` (provider is a known forwarder) or omitted
+     * (unknown routing — refuses promotion by the schema's absent rule).
+     * Never `false`: this reporter has no evidence basis for asserting a
+     * path cannot forward, and explicit false is the one value that would
+     * permit promoting a measured report at a forwarded key.
+     */
+    path_may_forward?: true;
     /** Observed routing evidence only; never inferred from provider configuration. */
     served_by_hint?: string;
 }
@@ -158,7 +169,9 @@ export function buildWindowReport(input: AppendWindowReportInput): WindowReport 
         access_path: "api",
         geometry: input.reportedLimitProvenance ?? "unknown",
         observed_at_ms: input.observedAtMs ?? Date.now(),
-        path_may_forward: input.providerID ? FORWARDING_PROVIDER_IDS.has(input.providerID) : false,
+        ...(input.providerID && FORWARDING_PROVIDER_IDS.has(input.providerID)
+            ? { path_may_forward: true as const }
+            : {}),
     };
     if (input.providerID) report.provider_id = input.providerID;
     if (input.modelID) report.model_id = input.modelID;

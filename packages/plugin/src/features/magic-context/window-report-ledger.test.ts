@@ -97,8 +97,10 @@ describe("window report ledger", () => {
             matched_pattern: "prompt is too long",
             geometry: "unknown",
             observed_at_ms: 456,
-            path_may_forward: false,
         });
+        // Absent = unknown routing (refuses promotion); this reporter never
+        // asserts false — see the schema pin in the ledger module.
+        expect("path_may_forward" in report).toBe(false);
         expect("provider_id" in report).toBe(false);
         expect("model_id" in report).toBe(false);
         expect("served_by_hint" in report).toBe(false);
@@ -139,8 +141,8 @@ describe("window report ledger", () => {
                 providerID: "anthropic",
                 modelID: "claude-sonnet-4-5",
                 observedAtMs: 790,
-            }).path_may_forward,
-        ).toBe(false);
+            }),
+        ).not.toHaveProperty("path_may_forward");
     });
 
     it("rotates only after the ledger exceeds 16 MiB", () => {
@@ -151,14 +153,12 @@ describe("window report ledger", () => {
             access_path: "api",
             geometry: "unknown",
             observed_at_ms: 1,
-            path_may_forward: false,
         });
         writeFileSync(reportPath, Buffer.alloc(WINDOW_REPORTS_ROTATION_BYTES));
         appendWindowReport({
             access_path: "api",
             geometry: "unknown",
             observed_at_ms: 2,
-            path_may_forward: false,
         });
         expect(existsSync(`${reportPath}.1`)).toBe(false);
 
@@ -167,7 +167,6 @@ describe("window report ledger", () => {
             access_path: "api",
             geometry: "unknown",
             observed_at_ms: 3,
-            path_may_forward: false,
         });
         expect(statSync(`${reportPath}.1`).size).toBe(WINDOW_REPORTS_ROTATION_BYTES + 1);
         expect(readFileSync(reportPath, "utf8")).toContain('"observed_at_ms":3');

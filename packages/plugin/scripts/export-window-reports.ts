@@ -19,7 +19,13 @@ type FusiformWindowReport = {
     extracted_limit_units?: "provider";
     attempted_tokens_units?: "estimate";
     largest_success_units?: "estimate";
-    path_may_forward?: boolean;
+    /**
+     * Only ever `true` or absent in the export. The schema pins absent =
+     * unknown routing (refuses promotion, same as true); an explicit `false`
+     * would PERMIT promotion, a claim our one-directional forwarder detector
+     * cannot support — so this exporter never emits it.
+     */
+    path_may_forward?: true;
     served_by_hint?: string;
 };
 
@@ -70,7 +76,7 @@ export function parseWindowReportJsonl(contents: string): WindowReport[] {
                 largest_success: optionalNumber(parsed.largest_success),
                 largest_success_units:
                     parsed.largest_success_units === "estimate" ? "estimate" : undefined,
-                path_may_forward: parsed.path_may_forward === true,
+                path_may_forward: parsed.path_may_forward === true ? true : undefined,
                 served_by_hint: optionalString(parsed.served_by_hint),
             });
         } catch {
@@ -103,7 +109,7 @@ export function toFusiformWindowReport(report: WindowReport): FusiformWindowRepo
         const value = report[field];
         if (value !== undefined) exported[field] = value as never;
     }
-    exported.path_may_forward = report.path_may_forward;
+    if (report.path_may_forward === true) exported.path_may_forward = true;
     return exported;
 }
 

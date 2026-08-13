@@ -21,7 +21,6 @@ describe("export-window-reports", () => {
                         attempted_tokens_units: "estimate",
                         geometry: "unknown",
                         observed_at_ms: 1,
-                        path_may_forward: false,
                     }),
                     "",
                 ].join("\n"),
@@ -43,7 +42,6 @@ describe("export-window-reports", () => {
                         observed_at_ms: 2,
                         largest_success: 199_500,
                         largest_success_units: "estimate",
-                        path_may_forward: false,
                     }),
                     JSON.stringify({
                         provider_id: "openrouter",
@@ -78,7 +76,6 @@ describe("export-window-reports", () => {
                         geometry: "unknown",
                         observed_at_ms: 1,
                         reporter: "magic-context@0.36.1",
-                        path_may_forward: false,
                     },
                     {
                         provider_id: "anthropic",
@@ -95,7 +92,6 @@ describe("export-window-reports", () => {
                         observed_at_ms: 2,
                         reporter: "magic-context@0.36.1",
                         largest_success: 199_500,
-                        path_may_forward: false,
                     },
                     {
                         provider_id: "openrouter",

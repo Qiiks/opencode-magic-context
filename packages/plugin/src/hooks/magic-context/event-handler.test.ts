@@ -1187,11 +1187,14 @@ describe("createEventHandler — compaction-off overflow gating (issue #266 S3)"
             extracted_limit: 120000,
             extracted_limit_units: "provider",
             geometry: "combined",
-            path_may_forward: false,
         });
         // Session errors lack a model identity. A stale session value is not evidence.
         expect("provider_id" in report).toBe(false);
         expect("model_id" in report).toBe(false);
+        // Absent = unknown routing (refuses promotion); the reporter never
+        // asserts false — an explicit false would PERMIT promotion, a claim
+        // the one-directional forwarder detector cannot support.
+        expect("path_may_forward" in report).toBe(false);
     });
 
     it("captures message.updated overflow with observed model, token, and routing facts", async () => {
