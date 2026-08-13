@@ -33,9 +33,13 @@ import {
 	formatThresholdClampNote,
 	formatThresholdPercent,
 } from "@magic-context/core/shared/format-threshold";
+import {
+	formatWindowDerivationLine,
+	type WindowGeometryResult,
+} from "@magic-context/core/shared/window-geometry";
 import packageJson from "../../package.json";
 import { resolveSessionId } from "../commands/pi-command-utils";
-import { resolvePiUsableContextLimit } from "../pi-context-limit";
+import { resolvePiWindowGeometry } from "../pi-context-limit";
 import { isPiRecompInFlight } from "../pi-recomp-runner";
 
 // Mirror packages/plugin/src/tui/slots/sidebar-content.tsx COLORS so the Pi
@@ -93,6 +97,7 @@ interface StatusDialogDetail {
 	lastTransformError: string | null;
 	isSubagent: boolean;
 	contextLimit: number;
+	windowGeometry?: WindowGeometryResult;
 	executeThreshold: number;
 	/** Which config source produced `executeThreshold` (tokens vs percentage). */
 	executeThresholdMode: "percentage" | "tokens";
@@ -268,6 +273,9 @@ function renderInner(
 			theme.bold(`${s.usagePercentage.toFixed(1)}%`),
 		)} · ${fmt(s.inputTokens)} / ${s.contextLimit > 0 ? fmt(s.contextLimit) : "?"} tokens`,
 	);
+	if (s.windowGeometry) {
+		lines.push(formatWindowDerivationLine(s.inputTokens, s.windowGeometry));
+	}
 	lines.push(
 		`Work tokens ${fmt(s.newWorkTokens)} new · ${fmt(s.totalInputTokens)} total input`,
 	);
@@ -416,14 +424,14 @@ export function buildPiStatusDetail(
 	} catch {
 		// Status remains available when overflow metadata cannot be read.
 	}
-	const contextLimit =
-		resolvePiUsableContextLimit({
-			rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
-			model: ctx.model,
-			detectedContextLimit,
-			persistedInputTokens: meta.lastInputTokens,
-			persistedPercentage: meta.lastContextPercentage,
-		}) ?? 0;
+	const windowGeometry = resolvePiWindowGeometry({
+		rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
+		model: ctx.model,
+		detectedContextLimit,
+		persistedInputTokens: meta.lastInputTokens,
+		persistedPercentage: meta.lastContextPercentage,
+	});
+	const contextLimit = windowGeometry?.usableSoft ?? 0;
 	const usagePercentage =
 		contextLimit > 0 && inputTokens > 0
 			? (inputTokens / contextLimit) * 100
@@ -611,6 +619,7 @@ export function buildPiStatusDetail(
 		lastTransformError: meta.lastTransformError,
 		isSubagent: meta.isSubagent,
 		contextLimit,
+		windowGeometry,
 		executeThreshold: threshold.percentage,
 		executeThresholdMode: threshold.mode,
 		executeThresholdClamped: threshold.clamped,

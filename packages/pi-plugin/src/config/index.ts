@@ -27,6 +27,7 @@ import {
 } from "@magic-context/core/shared/jsonc-parser";
 import { setOutputReserveConfig } from "@magic-context/core/shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "@magic-context/core/shared/prompt-surface";
+import { setWindowOverlayPath } from "@magic-context/core/shared/window-geometry";
 import { parse as parseCommentJson } from "comment-json";
 
 export interface LoadPiConfigOptions {
@@ -424,6 +425,7 @@ export function loadPiConfig(
 
 	const parsed = parsePiConfig(rawConfig);
 	setOutputReserveConfig(parsed.config.output_reserve);
+	setWindowOverlayPath(parsed.config.models?.window_overlay_path);
 	warnings.push(
 		...parsed.warnings.map((warning) => `[merged config] ${warning}`),
 	);
@@ -596,6 +598,7 @@ export function loadPiConfigDetailed(
 	const recoveredTopLevelKeys: string[] = [];
 	const parsed = parsePiConfig(rawConfig, recoveredTopLevelKeys);
 	setOutputReserveConfig(parsed.config.output_reserve);
+	setWindowOverlayPath(parsed.config.models?.window_overlay_path);
 	warnings.push(
 		...parsed.warnings.map((warning) => `[merged config] ${warning}`),
 	);

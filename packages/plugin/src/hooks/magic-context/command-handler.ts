@@ -20,6 +20,7 @@ import {
     type PartialRecompRange,
     snapRangeToCompartments,
 } from "./compartment-runner-partial-recomp";
+import { resolveContextWindowGeometry } from "./event-resolvers";
 import { executeFlush } from "./execute-flush";
 import { executeStatus } from "./execute-status";
 import { MAX_WRAPUP_REQUEST_BUDGET_MS } from "./module-transport";
@@ -765,6 +766,15 @@ export function createMagicContextCommandHandler(deps: {
                 }
                 const liveModelKey = deps.getLiveModelKey?.(sessionId);
                 const liveContextLimit = deps.getContextLimit?.(sessionId);
+                const modelSlash = liveModelKey?.indexOf("/") ?? -1;
+                const windowGeometry =
+                    liveModelKey && modelSlash > 0
+                        ? resolveContextWindowGeometry(
+                              liveModelKey.slice(0, modelSlash),
+                              liveModelKey.slice(modelSlash + 1),
+                              { db: deps.db, sessionID: sessionId },
+                          )
+                        : undefined;
                 const statusOutput = executeStatus(
                     deps.db,
                     sessionId,
@@ -785,6 +795,7 @@ export function createMagicContextCommandHandler(deps: {
                               progress: deps.getDreamerProgress?.() ?? null,
                           }
                         : undefined,
+                    windowGeometry,
                 );
                 const moduleStatus = rustStatus ? `\n\n${formatRustStatusText(rustStatus)}` : "";
                 const modeStatus = deps.compactionOff

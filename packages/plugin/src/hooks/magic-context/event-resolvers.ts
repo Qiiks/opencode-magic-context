@@ -5,11 +5,41 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { escalationBands, MAX_EXECUTE_THRESHOLD } from "../../shared/escalation-bands";
 import { log, sessionLog } from "../../shared/logger";
-import { getSdkContextLimit, isSaneLimit } from "../../shared/models-dev-cache";
+import {
+    getSdkContextLimit,
+    getSdkWindowGeometry,
+    isSaneLimit,
+} from "../../shared/models-dev-cache";
 import { resolveModelConfigOrDefault } from "../../shared/prompt-surface";
 
 export { escalationBands, MAX_EXECUTE_THRESHOLD };
 export const DEFAULT_CONTEXT_LIMIT = 128_000;
+
+export function resolveContextWindowGeometry(
+    providerID: string | undefined,
+    modelID: string | undefined,
+    ctx?: { db?: ContextDatabase; sessionID?: string },
+) {
+    if (!providerID || !modelID) return undefined;
+    const modelKey = resolveModelKey(providerID, modelID);
+    let detected: number | undefined;
+    let detectedLimitProvenance: "prompt_only" | "combined" | "unknown" = "unknown";
+    if (ctx?.db && ctx.sessionID) {
+        try {
+            const overflow = getOverflowState(ctx.db, ctx.sessionID, modelKey);
+            if (overflow.detectedContextLimit > 0) {
+                detected = overflow.detectedContextLimit;
+                detectedLimitProvenance = overflow.detectedContextLimitProvenance;
+            }
+        } catch {
+            // Geometry resolution remains best-effort when session metadata is unavailable.
+        }
+    }
+    return getSdkWindowGeometry(providerID, modelID, detected, {
+        detectedLimitProvenance,
+        harness: "opencode",
+    });
+}
 
 type CacheTtlConfig = string | Record<string, string>;
 

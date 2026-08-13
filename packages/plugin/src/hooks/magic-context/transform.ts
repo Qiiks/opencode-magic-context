@@ -75,6 +75,7 @@ import { deriveTriggerBudget } from "./derive-budgets";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     escalationBands,
+    resolveContextWindowGeometry,
     resolveExecuteThreshold,
     resolveModelKey,
     resolveTrustedContextLimit,
@@ -1231,6 +1232,17 @@ export function createTransform(deps: TransformDeps) {
                   sessionID: sessionId,
               })
             : undefined;
+        const windowGeometry = modelForBudget
+            ? resolveContextWindowGeometry(modelForBudget.providerID, modelForBudget.modelID, {
+                  db,
+                  sessionID: sessionId,
+              })
+            : undefined;
+        const emergencyUsagePercentageEarly = usagePercentageSynthetic
+            ? Math.max(95, contextUsageEarly.percentage)
+            : windowGeometry?.usableHard && contextUsageEarly.inputTokens > 0
+              ? (contextUsageEarly.inputTokens / windowGeometry.usableHard) * 100
+              : contextUsageEarly.percentage;
         const currentModelKeyForBoundary = deps.getModelKey?.(sessionId);
         const thresholdContextLimit =
             resolvedContextLimit && resolvedContextLimit > 0
@@ -1403,7 +1415,7 @@ export function createTransform(deps: TransformDeps) {
         let skipCompartmentAwaitForThisPass = false;
 
         const startRecoveryRun = (): boolean => {
-            const scale = contextUsageEarly.percentage >= 95 ? 0.25 : 0.5;
+            const scale = emergencyUsagePercentageEarly >= 95 ? 0.25 : 0.5;
             let boundarySnapshot = getRunnableBoundaryForCompartment();
             if (!boundarySnapshot || !hasRunnableCompartmentWindow(boundarySnapshot)) {
                 boundarySnapshot = getRunnableBoundaryForCompartment(scale);
@@ -1476,7 +1488,7 @@ export function createTransform(deps: TransformDeps) {
             fullFeatureMode &&
             !compactionOff &&
             historianFailureState.failureCount > 0 &&
-            contextUsageEarly.percentage >= 95 &&
+            emergencyUsagePercentageEarly >= 95 &&
             !recoveryNoHeadEscapeActive
         ) {
             skipCompartmentAwaitForThisPass = true;
@@ -1490,7 +1502,7 @@ export function createTransform(deps: TransformDeps) {
             if (!recoveryStarted && !getEligibleHistoryForCompartment()) {
                 const noHeadSnapshot =
                     getRunnableBoundaryForCompartment(
-                        contextUsageEarly.percentage >= 95 ? 0.25 : 0.5,
+                        emergencyUsagePercentageEarly >= 95 ? 0.25 : 0.5,
                     ) ?? getRunnableBoundaryForCompartment();
                 if (noHeadSnapshot) {
                     recordHighPressureNoEligibleHead(db, noHeadSnapshot);
@@ -2217,8 +2229,13 @@ export function createTransform(deps: TransformDeps) {
             // Fresh-tokenize only in the emergency band. This estimate is telemetry,
             // never an abort gate: provider-accurate accounting is deferred to the
             // module-side implementation.
+            const emergencyUsagePercentage = usagePercentageSynthetic
+                ? Math.max(95, contextUsage.percentage)
+                : windowGeometry?.usableHard && contextUsage.inputTokens > 0
+                  ? (contextUsage.inputTokens / windowGeometry.usableHard) * 100
+                  : contextUsage.percentage;
             finalWireEstimate =
-                contextUsage.percentage >= 95
+                emergencyUsagePercentage >= 95
                     ? estimateFinalWireInputTokens({
                           messages,
                           systemPromptTokens: sessionMeta.systemPromptTokens,
@@ -2251,7 +2268,7 @@ export function createTransform(deps: TransformDeps) {
                     ? overflowStateForFinalWire.detectedContextLimit
                     : undefined;
             const emergencyFailClosed = evaluateEmergencyFailClosed({
-                usagePercentage: contextUsage.percentage,
+                usagePercentage: emergencyUsagePercentage,
                 emergencyRecoveryArmed,
                 emergencyRecoveryOrigin,
                 foldMaterializedThisPass: postTransformResult.historianFoldMaterializedThisPass,

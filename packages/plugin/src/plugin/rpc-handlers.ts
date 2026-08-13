@@ -32,6 +32,7 @@ import {
 import { getEmbedDrainUiStatus } from "../hooks/magic-context/embed-session-state";
 import {
     resolveContextLimit,
+    resolveContextWindowGeometry,
     resolveExecuteThresholdDetail,
 } from "../hooks/magic-context/event-resolvers";
 import { formatEmbedStatusText } from "../hooks/magic-context/format-embed-status";
@@ -707,6 +708,15 @@ export function buildStatusDetail(
             detail.pendingOps = ops.map((o) => ({ tagId: o.tag_id, operation: o.operation }));
         } catch {
             // pending_ops may not exist
+        }
+
+        const modelSlash = modelKey?.indexOf("/") ?? -1;
+        if (modelKey && modelSlash > 0) {
+            detail.windowGeometry = resolveContextWindowGeometry(
+                modelKey.slice(0, modelSlash),
+                modelKey.slice(modelSlash + 1),
+                { db, sessionID: sessionId },
+            );
         }
 
         // Derived context limit needed for tokens-based threshold resolution.

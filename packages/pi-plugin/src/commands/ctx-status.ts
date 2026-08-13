@@ -13,7 +13,7 @@ import { getTagsBySession } from "@magic-context/core/features/magic-context/sto
 import { executeStatus } from "@magic-context/core/hooks/magic-context/execute-status";
 import { describeError } from "@magic-context/core/shared/error-message";
 import { showStatusDialog } from "../dialogs/status-dialog";
-import { resolvePiUsableContextLimit } from "../pi-context-limit";
+import { resolvePiWindowGeometry } from "../pi-context-limit";
 import { resolveSessionId, sendCtxStatusMessage } from "./pi-command-utils";
 
 export interface RegisterCtxStatusDeps {
@@ -113,13 +113,14 @@ export function registerCtxStatusCommand(
 					// Status remains available when overflow metadata cannot be read.
 				}
 				const meta = getOrCreateSessionMeta(currentDeps.db, sessionId);
-				const usableContextLimit = resolvePiUsableContextLimit({
+				const windowGeometry = resolvePiWindowGeometry({
 					rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
 					model: ctx.model,
 					detectedContextLimit,
 					persistedInputTokens: meta.lastInputTokens,
 					persistedPercentage: meta.lastContextPercentage,
 				});
+				const usableContextLimit = windowGeometry?.usableSoft;
 				const statusText = executeStatus(
 					currentDeps.db,
 					sessionId,
@@ -137,6 +138,7 @@ export function registerCtxStatusCommand(
 							CANONICAL_DREAM_TASKS,
 						),
 					},
+					windowGeometry,
 				);
 				const details = buildStatusDetails(currentDeps, sessionId);
 				sendCtxStatusMessage(

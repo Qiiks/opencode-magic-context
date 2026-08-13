@@ -14,6 +14,10 @@ import { formatThresholdClampNote } from "../../shared/format-threshold";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import {
+    formatWindowDerivationLine,
+    type WindowGeometryResult,
+} from "../../shared/window-geometry";
+import {
     getProactiveCompartmentTriggerPercentage,
     POST_DROP_TARGET_RATIO,
 } from "./compartment-trigger";
@@ -61,6 +65,7 @@ export function executeStatus(
     executeThresholdTokens?: { default?: number; [modelKey: string]: number | undefined },
     contextLimit?: number,
     dreamer?: { backlog?: DreamTaskBacklogMap; progress?: DreamTaskProgress | null },
+    windowGeometry?: WindowGeometryResult,
 ): string {
     // Single source of truth — resolver tells us both the effective percentage AND
     // which config source won (tokens vs percentage). Previously /ctx-status
@@ -164,6 +169,9 @@ export function executeStatus(
                 `- Last percentage: ${meta.lastContextPercentage.toFixed(1)}%`,
                 `- Last input tokens: ${meta.lastInputTokens.toLocaleString()}`,
                 `- Resolved context limit: ${displayContextLimit > 0 ? displayContextLimit.toLocaleString() : "unknown"}`,
+                ...(windowGeometry
+                    ? [`- ${formatWindowDerivationLine(meta.lastInputTokens, windowGeometry)}`]
+                    : []),
                 `- Proactive compartment evaluation: ${proactiveCompartmentTrigger}%`,
                 `- Post-drop target for historian: ${(executeThresholdPercentage * POST_DROP_TARGET_RATIO).toFixed(0)}% (${executeThresholdPercentage}% * ${POST_DROP_TARGET_RATIO})`,
                 `- Commit cluster trigger: ${commitClusterTrigger?.enabled !== false ? `enabled (min ${commitClusterTrigger?.min_clusters ?? 3} clusters)` : "disabled"}, tail-size trigger: > 3x compartment budget`,

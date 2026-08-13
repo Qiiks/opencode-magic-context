@@ -1,0 +1,311 @@
+{
+  "schema": "fusiform-window-overlay/v1",
+  "generated_at": "2026-08-13T15:12:00Z",
+  "batch": "1 of N \u2014 the geometry spec's measured rows, transcribed",
+  "minted_provider_ids": [
+    "openai-chatgpt-oauth"
+  ],
+  "relay_note": "Cells whose source_ref names mc-geometry-spec are RELAYED: the grade records the evidence class that document assigns, not evidence this seat verified independently. Where a primary source was on disk it was read directly and the source_ref names it instead.",
+  "cells": [
+    {
+      "provider_id": "openai-chatgpt-oauth",
+      "model_id": "gpt-5.6",
+      "facts": {
+        "window.enforced": {
+          "value": {
+            "kind": "bracket",
+            "at_least": 340000
+          },
+          "grade": "measured",
+          "units": "estimate",
+          "boundary": "Observed",
+          "source_ref": "mc-geometry-spec@06a0e5ac#measured-per-model-findings:gpt-5.6-oauth (operator-confirmed live)",
+          "observed_at": "2026-08-13T12:54:15Z"
+        },
+        "window.advertised": {
+          "value": {
+            "kind": "unknown",
+            "why": "never_measured"
+          },
+          "grade": "unknown",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "codex-rs@32f4687b8c:models-manager/src/model_info.rs:125",
+          "observed_at": "2026-08-13T15:12:00Z"
+        },
+        "output.advertised": {
+          "value": {
+            "kind": "unknown",
+            "why": "never_measured"
+          },
+          "grade": "unknown",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "codex-rs@32f4687b8c:protocol/src/openai_models.rs:409",
+          "observed_at": "2026-08-13T15:12:00Z"
+        }
+      },
+      "note": "window.advertised is UNKNOWN rather than 272000. The seed spec reads the 272k in codex-rs as a server-delivered advertisement; the source has it only in model_info_from_slug, the fallback for unrecognised slugs, beside used_fallback_model_metadata: true. Every other occurrence is a test fixture inheriting it. The server may also send 272k; the source does not establish that. output.advertised is unknown because ModelInfo carries no output field at all, so the client cannot request a cap and nothing states one."
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.6",
+      "facts": {
+        "window.advertised": {
+          "value": {
+            "kind": "stated",
+            "value": 1050000
+          },
+          "grade": "provider_asserted_doc",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "mc-geometry-spec@06a0e5ac#measured-per-model-findings:gpt-5.6-platform",
+          "observed_at": "2026-08-13T12:54:15Z"
+        },
+        "output.advertised": {
+          "value": {
+            "kind": "stated",
+            "value": 128000
+          },
+          "grade": "provider_asserted_doc",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "mc-geometry-spec@06a0e5ac#measured-per-model-findings:gpt-5.6-platform",
+          "observed_at": "2026-08-13T12:54:15Z"
+        },
+        "geometry": {
+          "value": {
+            "kind": "stated",
+            "value": "shared_upfront"
+          },
+          "grade": "provider_asserted_doc",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "mc-geometry-spec@06a0e5ac#provider-geometry-classes:openai-platform",
+          "observed_at": "2026-08-13T12:54:15Z"
+        }
+      },
+      "note": "The catalog row agrees with both numbers for THIS path, which is why the access-path split matters: the same catalog row is correct here and wrong for openai-chatgpt-oauth. 400 up front when prompt plus requested output exceed the window, with truncation disabled."
+    },
+    {
+      "provider_id": "anthropic",
+      "model_id": "claude-opus-5",
+      "facts": {
+        "window.advertised": {
+          "value": {
+            "kind": "stated",
+            "value": 1000000
+          },
+          "grade": "provider_asserted_doc",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "mc-geometry-spec@06a0e5ac#measured-per-model-findings:claude-opus-5",
+          "observed_at": "2026-08-13T12:54:15Z"
+        },
+        "output.advertised": {
+          "value": {
+            "kind": "stated",
+            "value": 128000
+          },
+          "grade": "provider_asserted_doc",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "mc-geometry-spec@06a0e5ac#measured-per-model-findings:claude-opus-5",
+          "observed_at": "2026-08-13T12:54:15Z"
+        },
+        "geometry": {
+          "value": {
+            "kind": "stated",
+            "value": "shared_truncating"
+          },
+          "grade": "provider_asserted_doc",
+          "units": "provider",
+          "boundary": "Asserted",
+          "source_ref": "mc-geometry-spec@06a0e5ac#provider-geometry-classes:anthropic",
+          "observed_at": "2026-08-13T12:54:15Z"
+        }
+      },
+      "note": "NO access-path id minted. The window is 1M on both the OAuth and API paths, so by mint-on-divergence there is nothing to fork; only plan gating differs, which is not a window fact. The geometry boundary is Asserted rather than Observed because it is VERSION-GATED: 4.5+ truncates over-window output, older models 400 on the combined sum. A consumer resolving geometry for an older Claude must not inherit this cell."
+    },
+    {
+      "provider_id": "xai",
+      "model_id": "grok-4.6",
+      "facts": {
+        "window.enforced": {
+          "value": {
+            "kind": "stated",
+            "value": 500000
+          },
+          "grade": "measured",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "mc-geometry-spec@06a0e5ac#measured-per-model-findings:grok-4.6",
+          "observed_at": "2026-08-13T12:54:15Z"
+        },
+        "output.advertised": {
+          "value": {
+            "kind": "unknown",
+            "why": "placeholder_output_equals_context"
+          },
+          "grade": "unknown",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "models.dev@2026-08-13:xai/grok-4.6 (output=500000, context=500000)",
+          "observed_at": "2026-08-13T15:12:00Z"
+        },
+        "output.default": {
+          "value": {
+            "kind": "stated",
+            "value": 128000
+          },
+          "grade": "provider_asserted_doc",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "mc-geometry-spec@06a0e5ac#measured-per-model-findings:grok-4.6",
+          "observed_at": "2026-08-13T12:54:15Z"
+        },
+        "geometry": {
+          "value": {
+            "kind": "stated",
+            "value": "shared_truncating"
+          },
+          "grade": "measured",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "mc-geometry-spec@06a0e5ac#provider-geometry-classes:xai (error text 'maximum prompt length is N' is a prompt-only wall)",
+          "observed_at": "2026-08-13T12:54:15Z"
+        }
+      },
+      "note": "No output.enforced cell: the documented behaviour is no fixed cap, with the ceiling being window minus prompt. That is a FUNCTION of the request, not a constant, and this schema has no shape for it \u2014 geometry plus window is what a consumer needs to derive it. Writing a number here would state a constant that does not exist. The catalog's output=500000 equals its context and is a placeholder by the spec's own rule. This model arrived AFTER the embedded seed snapshot (seed fetched 2026-08-12T10:07:29Z, model first observed 16:12:49Z), so it cannot be join-checked against the seed; post_seed records how its existence was verified instead.",
+      "post_seed": {
+        "verified_at": "2026-08-13T15:12:00Z",
+        "evidence": "fusiform era history: existence observed present at 2026-08-12T16:12:49Z, changed between 15:42:49Z and 16:12:49Z",
+        "catalog_limit_at_verification": {
+          "context": 500000,
+          "output": 500000
+        }
+      }
+    },
+    {
+      "provider_id": "ollama-cloud",
+      "model_id": "deepseek-v4-flash",
+      "facts": {
+        "window.enforced": {
+          "value": {
+            "kind": "stated",
+            "value": 1048576
+          },
+          "grade": "provider_asserted_doc",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "mc-geometry-spec@06a0e5ac#measured-per-model-findings:deepseek-v4-flash-ollama-cloud",
+          "observed_at": "2026-08-13T12:54:15Z"
+        },
+        "output.enforced": {
+          "value": {
+            "kind": "stated",
+            "value": 65536
+          },
+          "grade": "provider_asserted_doc",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "https://github.com/ollama/ollama/issues/16890",
+          "observed_at": "2026-08-13T12:54:15Z"
+        },
+        "output.advertised": {
+          "value": {
+            "kind": "unknown",
+            "why": "placeholder_output_equals_context"
+          },
+          "grade": "unknown",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "models.dev@2026-08-13:ollama-cloud/deepseek-v4-flash (output=1048576, context=1048576)",
+          "observed_at": "2026-08-13T15:12:00Z"
+        }
+      },
+      "note": "The catalog row is wrong twice over here, which is why this cell leads the batch: output equals context so it is a placeholder by the spec's rule, AND the real cap is 16x smaller. A consumer trusting the row reserves 1M against a 64k wall and gets an HTTP 400. NOT written as a provider-wide wildcard: the evidence names this model, and asserting it for all 20 ollama-cloud models would manufacture a claim from absence. If the cap is genuinely path-wide, one report naming a second model promotes it."
+    },
+    {
+      "provider_id": "moonshotai",
+      "model_id": "kimi-k3",
+      "facts": {
+        "window.advertised": {
+          "value": {
+            "kind": "stated",
+            "value": 1048576
+          },
+          "grade": "provider_asserted_doc",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "mc-geometry-spec@06a0e5ac#measured-per-model-findings:kimi-k3",
+          "observed_at": "2026-08-13T12:54:15Z"
+        },
+        "output.default": {
+          "value": {
+            "kind": "stated",
+            "value": 131072
+          },
+          "grade": "provider_asserted_doc",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "mc-geometry-spec@06a0e5ac#measured-per-model-findings:kimi-k3",
+          "observed_at": "2026-08-13T12:54:15Z"
+        },
+        "output.advertised": {
+          "value": {
+            "kind": "stated",
+            "value": 1048576
+          },
+          "grade": "provider_asserted_doc",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "mc-geometry-spec@06a0e5ac#measured-per-model-findings:kimi-k3",
+          "observed_at": "2026-08-13T12:54:15Z"
+        }
+      },
+      "note": "The clearest case for output.default existing as its own fact. models.dev publishes output=131072 for this model, and 131072 is the DEFAULT you get without asking \u2014 the cap is 1M, configurable. Some aggregators read the same 131k as the context window. One number, three wrong readings, and the split is what stops a consumer from inheriting any of them."
+    },
+    {
+      "provider_id": "google",
+      "model_id": "gemini-3.5-flash",
+      "facts": {
+        "window.advertised": {
+          "value": {
+            "kind": "stated",
+            "value": 1048576
+          },
+          "grade": "provider_asserted_doc",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "mc-geometry-spec@06a0e5ac#measured-per-model-findings:gemini-3.5-flash",
+          "observed_at": "2026-08-13T12:54:15Z"
+        },
+        "output.advertised": {
+          "value": {
+            "kind": "stated",
+            "value": 65536
+          },
+          "grade": "provider_asserted_doc",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "mc-geometry-spec@06a0e5ac#measured-per-model-findings:gemini-3.5-flash",
+          "observed_at": "2026-08-13T12:54:15Z"
+        },
+        "geometry": {
+          "value": {
+            "kind": "stated",
+            "value": "separate"
+          },
+          "grade": "provider_asserted_doc",
+          "units": "provider",
+          "boundary": "Observed",
+          "source_ref": "mc-geometry-spec@06a0e5ac#provider-geometry-classes:google",
+          "observed_at": "2026-08-13T12:54:15Z"
+        }
+      },
+      "note": "NO antigravity id minted: 1M input and 65k output on both the Antigravity and generateContent paths, so nothing has diverged. Antigravity's self-compaction around 135k is harness behaviour, not a window, and does not belong in this dataset. Separate geometry means a smaller output request buys no input headroom \u2014 the input_token_limit is the usable input, full stop."
+    }
+  ],
+  "source_revision_note": "Cells transcribed from mc-geometry-spec were read at c6a85d85 and their source_ref names 06a0e5ac, the current revision. The bump is verified rather than assumed: every row transcribed here is byte-identical between the two revisions (checked per row with git show). The Codex row DID change between them, and no cell here cites the spec for Codex \u2014 those cells cite codex-rs directly. Pointing at the newer revision matters because c6a85d85 carried a misattributed Codex number, and a reader resolving a source_ref should land on a document without a known bad row in it."
+}
