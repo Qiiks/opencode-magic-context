@@ -396,7 +396,10 @@ pub const fn tagger_feature_epoch(tagging_surface_active: bool) -> u32 {
 const STORAGE_NAMESPACE: &str = "mc_cache";
 #[cfg(test)]
 const GUIDANCE_TEXT: &str = prompt_surface::GUIDANCE_FULL_PRIMARY;
-const CTX_REDUCE_ACKNOWLEDGEMENT: &str = "Queued for context compaction.";
+/// Matches the default OpenCode protected tag window. The Claude Code facade has no
+/// request-local transform config, so acknowledgement validation uses the durable tag
+/// ordering with the same default recency window as an omitted transform field.
+const DEFAULT_PROTECTED_TAGS: usize = 20;
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.enabled default.
 const DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED: bool = true;
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.min_clusters default.
@@ -3248,6 +3251,17 @@ impl McHandler {
         )
     }
 
+    /// The most recent full transform request retains raw CK parts until its bounded
+    /// snapshot is evicted. ctx_expand uses it only for a same-session recovery view;
+    /// persisted historian transcripts remain the durable fallback for the default view.
+    fn cached_expand_messages(&self, session_id: &str) -> Option<Vec<ck_wire::CkIngressMessage>> {
+        self.transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .ready_delta_request(session_id)
+            .map(|request| request.messages.clone())
+    }
+
     fn store_projection_cache(
         &self,
         request: &TransformRequest,
@@ -4801,19 +4815,34 @@ impl McHandler {
             .iter()
             .map(|row| (row.tag_number, &row.block_id))
             .collect::<HashMap<_, _>>();
-        let mut drop_ids = numbers
+        let requested_numbers = numbers;
+        let unknown_numbers = requested_numbers
+            .iter()
+            .copied()
+            .filter(|number| !by_number.contains_key(&(*number as i64)))
+            .collect::<Vec<_>>();
+        let mut drop_ids = requested_numbers
             .into_iter()
             .filter_map(|number| by_number.get(&(number as i64)).map(|id| (*id).clone()))
             .collect::<Vec<_>>();
         drop_ids.sort();
         drop_ids.dedup();
+        if drop_ids.is_empty() {
+            return HandlerOutcome::Error {
+                code: "bad_request".to_string(),
+                message: format!(
+                    "ctx_reduce drop request has no valid tags: {} not found",
+                    format_plain_tag_numbers(&unknown_numbers)
+                ),
+            };
+        }
 
         match store.append_pending_agent_drops_with_command(
             session_id,
             Some(&command_id),
             &drop_ids,
             now_ms(),
-            drop_ids.is_empty(),
+            false,
         ) {
             Ok(outcome) if outcome.duplicate => {
                 respond(json!({ "ok": true, "queued": 0, "duplicate": true }))
@@ -9104,13 +9133,108 @@ impl McHandler {
         })
     }
 
-    async fn handle_ctx_reduce_facade(&self, _channel: u16, request: &Value) -> HandlerOutcome {
-        // Parse the optional reduced-call envelope a model may repeat from context, even though
-        // this endpoint only acknowledges the request; the response observer performs delivery.
-        let _ = facade_arguments(request, &["drop"]);
-        // The MCP-facing route is acknowledgement-only. Destructive delivery is owned by
-        // the response observer, so this path must return before identity or storage work.
-        mcp_text_result(CTX_REDUCE_ACKNOWLEDGEMENT.to_string(), false)
+    async fn handle_ctx_reduce_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let Some(args) = facade_arguments(request, &["drop"]) else {
+            return invalid_params_error("ctx_reduce arguments must be an object");
+        };
+        let Some(raw_drop) = non_empty_string_arg(&args, "drop") else {
+            return tool_error_result("Error: 'drop' must be provided.".to_string());
+        };
+        let requested = match parse_tag_range_string(raw_drop) {
+            Ok(requested) => requested,
+            // The parser is the delivery-side canonicalizer. Surface its exact rejection so
+            // acknowledgement and asynchronous delivery cannot disagree about range syntax.
+            Err(error) => {
+                return tool_error_result(format!("Error: Invalid range syntax. {error}"))
+            }
+        };
+        let facade_scope = match self
+            .resolve_facade_scope(channel, Some(&args), "memories", false)
+            .await
+        {
+            Ok(scope) => scope,
+            Err(outcome) => return outcome,
+        };
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return store_unavailable_error(),
+        };
+        let session_id = facade_scope.conversation_key.as_str();
+        let tags = match store.load_tags_for_session(session_id) {
+            Ok(tags) => tags,
+            Err(error) => return tool_error_result(format!("Error: {error}")),
+        };
+        let pending = match store.load_pending_agent_drops(session_id) {
+            Ok(pending) => pending,
+            Err(error) => return tool_error_result(format!("Error: {error}")),
+        };
+        let by_number = tags
+            .iter()
+            .map(|tag| (tag.tag_number as u64, tag))
+            .collect::<HashMap<_, _>>();
+        let pending_ids = pending
+            .iter()
+            .map(|drop| drop.target_id.as_str())
+            .collect::<HashSet<_>>();
+        let unknown = requested
+            .iter()
+            .copied()
+            .filter(|number| !by_number.contains_key(number))
+            .collect::<Vec<_>>();
+        let already_queued = requested
+            .iter()
+            .copied()
+            .filter(|number| {
+                by_number
+                    .get(number)
+                    .is_some_and(|tag| pending_ids.contains(tag.block_id.as_str()))
+            })
+            .collect::<Vec<_>>();
+        let queueable = requested
+            .iter()
+            .copied()
+            .filter(|number| {
+                by_number
+                    .get(number)
+                    .is_some_and(|tag| !pending_ids.contains(tag.block_id.as_str()))
+            })
+            .collect::<Vec<_>>();
+        if queueable.is_empty() {
+            let reason = ctx_reduce_ack_details(&unknown, &already_queued);
+            return tool_error_result(format!(
+                "Refused: no valid tags to queue. {}",
+                if reason.is_empty() {
+                    "No requested tags are available for delivery.".to_string()
+                } else {
+                    reason
+                }
+            ));
+        }
+
+        let protected_start = tags
+            .len()
+            .checked_sub(DEFAULT_PROTECTED_TAGS)
+            .and_then(|index| tags.get(index))
+            .map(|tag| tag.tag_number as u64)
+            .unwrap_or(0);
+        let (deferred, immediate): (Vec<_>, Vec<_>) = queueable
+            .iter()
+            .copied()
+            .partition(|number| protected_start != 0 && *number >= protected_start);
+        let mut details = Vec::new();
+        if !immediate.is_empty() {
+            details.push(format!("drop {}", format_tag_numbers(&immediate)));
+        }
+        if !deferred.is_empty() {
+            details.push(format!("deferred drop {}", format_tag_numbers(&deferred)));
+        }
+        let validation_detail = ctx_reduce_ack_details(&unknown, &already_queued);
+        if !validation_detail.is_empty() {
+            details.push(validation_detail);
+        }
+        // This acknowledgement validates the durable tag state but deliberately does not
+        // mutate it. The response observer owns asynchronous delivery on this facade.
+        mcp_text_result(format!("Queued: {}.", details.join("; ")), false)
     }
 
     async fn handle_ctx_memory_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
@@ -9446,6 +9570,16 @@ impl McHandler {
         };
         let session_id = facade_scope.conversation_key.as_str();
         if let Some(message) = i64_arg(args, "message").filter(|value| *value > 0) {
+            if let Some(raw_message) =
+                self.cached_expand_messages(session_id)
+                    .and_then(|messages| {
+                        messages.into_iter().find(|candidate| {
+                            i64::try_from(candidate.ordinal).ok() == Some(message)
+                        })
+                    })
+            {
+                return mcp_text_result(render_cached_message_expand(&raw_message), false);
+            }
             return match store.load_chunk_transcript_for_message(session_id, message) {
                 Ok(Some(row)) => mcp_text_result(render_message_expand(row, message), false),
                 Ok(None) => mcp_text_result(
@@ -9505,6 +9639,20 @@ impl McHandler {
             Ok(transcripts) => transcripts,
             Err(error) => return tool_error_result(format!("Error: {error}")),
         };
+        if args.get("verbose").and_then(Value::as_bool) == Some(true) {
+            let rendered = self
+                .cached_expand_messages(session_id)
+                .map(|messages| render_verbose_range_expand(&messages, start, bounded_end))
+                .filter(|result| !result.text.is_empty())
+                .map(|result| render_verbose_expand_result(start, bounded_end, result))
+                // A process can restart or evict the bounded raw-request snapshot. Preserve
+                // the existing durable transcript fallback rather than claiming raw parts
+                // that no longer exist in the module process.
+                .unwrap_or_else(|| {
+                    render_verbose_transcript_range_expand(start, bounded_end, &transcripts)
+                });
+            return mcp_text_result(rendered, false);
+        }
         mcp_text_result(
             render_range_expand(start, bounded_end, &compartments, &transcripts),
             false,
@@ -11673,6 +11821,93 @@ fn render_message_expand(row: StoredChunkTranscript, message: i64) -> String {
     truncate_expand_output(lines.join("\n"))
 }
 
+/// Recover one raw CK message in the same bounded-snapshot window used by verbose
+/// ctx_expand. The durable transcript fallback above remains available when the snapshot
+/// is gone, but it intentionally cannot recover raw tool input or output bytes.
+fn render_cached_message_expand(message: &ck_wire::CkIngressMessage) -> String {
+    let role = match message.ck.role.as_str() {
+        "assistant" => "A (assistant)",
+        "user" => "U (user)",
+        role => role,
+    };
+    let parts = message
+        .ck
+        .content
+        .iter()
+        .filter_map(render_cached_expand_part)
+        .collect::<Vec<_>>();
+    let mut lines = vec![
+        format!("[{}] {role} — full recovery:", message.ordinal),
+        String::new(),
+    ];
+    if parts.is_empty() {
+        lines.push(
+            "  (no recoverable content — message had only structural/reasoning parts)".to_string(),
+        );
+    } else {
+        lines.extend(parts);
+    }
+    lines.join("\n")
+}
+
+fn render_cached_expand_part(part: &ck_wire::CkWireBlock) -> Option<String> {
+    match &part.kind {
+        ck_wire::CkKind::Text { text } if !text.trim().is_empty() => {
+            Some(format!("  [text]\n{text}"))
+        }
+        ck_wire::CkKind::ToolCall {
+            id, name, input, ..
+        } => Some(format!("  [tool: {name} #{id}]\n  input: {input}")),
+        ck_wire::CkKind::ToolResult {
+            id,
+            tool_name,
+            output,
+            ..
+        } => Some(format!(
+            "  [tool: {tool_name} #{id}]\n  output:\n{}",
+            expand_tool_output_text(output)
+        )),
+        ck_wire::CkKind::Media(_) => Some("  [media]".to_string()),
+        ck_wire::CkKind::Text { .. }
+        | ck_wire::CkKind::Reasoning { .. }
+        | ck_wire::CkKind::RedactedReasoning { .. }
+        | ck_wire::CkKind::Opaque(_) => None,
+    }
+}
+
+fn ctx_reduce_ack_details(unknown: &[u64], already_queued: &[u64]) -> String {
+    let mut details = Vec::new();
+    if !unknown.is_empty() {
+        details.push(format!(
+            "tags {} not found",
+            format_plain_tag_numbers(unknown)
+        ));
+    }
+    if !already_queued.is_empty() {
+        details.push(format!(
+            "tags {} already queued",
+            format_plain_tag_numbers(already_queued)
+        ));
+    }
+    details.join("; ")
+}
+
+fn format_plain_tag_numbers(numbers: &[u64]) -> String {
+    numbers
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_tag_numbers(numbers: &[u64]) -> String {
+    numbers
+        .iter()
+        .map(|number| format!("§{number}§"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn render_range_expand(
     start: i64,
     end: i64,
@@ -11715,6 +11950,257 @@ fn render_range_expand(
         }
     }
     truncate_expand_output(output)
+}
+
+const CTX_EXPAND_VERBOSE_TOKEN_BUDGET: usize = 15_000;
+const CTX_EXPAND_VERBOSE_TEXT_PREVIEW_CHARS: usize = 200;
+const CTX_EXPAND_VERBOSE_REASONING_PREVIEW_CHARS: usize = 120;
+const CTX_EXPAND_VERBOSE_ARGUMENT_PREVIEW_CHARS: usize = 60;
+
+struct VerboseRangeExpand {
+    text: String,
+    last_ordinal: i64,
+    truncated: bool,
+}
+
+/// Render each raw CK message separately, retaining only bounded previews. The transform
+/// snapshot carries the same pre-reduction parts the model used, including tool outputs,
+/// while the default ctx_expand route intentionally remains on its byte-stable transcript.
+fn render_verbose_range_expand(
+    messages: &[ck_wire::CkIngressMessage],
+    start: i64,
+    end: i64,
+) -> VerboseRangeExpand {
+    render_verbose_range_expand_with_budget(messages, start, end, CTX_EXPAND_VERBOSE_TOKEN_BUDGET)
+}
+
+fn render_verbose_range_expand_with_budget(
+    messages: &[ck_wire::CkIngressMessage],
+    start: i64,
+    end: i64,
+    token_budget: usize,
+) -> VerboseRangeExpand {
+    let mut output = Vec::new();
+    let mut used_tokens = 0;
+    let mut last_ordinal = start.saturating_sub(1);
+    let mut truncated = false;
+    for message in messages.iter().filter(|message| {
+        let ordinal = i64::try_from(message.ordinal).unwrap_or(i64::MAX);
+        ordinal >= start && ordinal <= end
+    }) {
+        let block = render_verbose_expand_message(message);
+        let block_tokens = mc_tokenizer::estimate_tokens(&block);
+        if used_tokens + block_tokens > token_budget && !output.is_empty() {
+            truncated = true;
+            break;
+        }
+        used_tokens += block_tokens;
+        last_ordinal = i64::try_from(message.ordinal).unwrap_or(i64::MAX);
+        output.push(block);
+    }
+    VerboseRangeExpand {
+        text: output.join("\n\n"),
+        last_ordinal,
+        truncated,
+    }
+}
+
+fn render_verbose_expand_result(start: i64, end: i64, result: VerboseRangeExpand) -> String {
+    let mut output = format!(
+        "Messages {start}-{} (verbose). Recover any one in full with ctx_expand(message=<ordinal>):\n\n{}",
+        result.last_ordinal, result.text
+    );
+    if result.truncated {
+        output.push_str(&format!(
+            "\n\nTruncated at message {} (budget: ~{CTX_EXPAND_VERBOSE_TOKEN_BUDGET} tokens). Call again with start={} end={end} verbose=true for more.",
+            result.last_ordinal,
+            result.last_ordinal.saturating_add(1),
+        ));
+    }
+    output
+}
+
+fn render_verbose_expand_message(message: &ck_wire::CkIngressMessage) -> String {
+    let role = match message.ck.role.as_str() {
+        "assistant" => "A (assistant)",
+        "user" => "U (user)",
+        role => role,
+    };
+    let previews = message
+        .ck
+        .content
+        .iter()
+        .filter_map(render_verbose_expand_part)
+        .collect::<Vec<_>>();
+    if previews.is_empty() {
+        format!("[{}] {role}", message.ordinal)
+    } else {
+        format!("[{}] {role}\n{}", message.ordinal, previews.join("\n"))
+    }
+}
+
+fn render_verbose_expand_part(part: &ck_wire::CkWireBlock) -> Option<String> {
+    match &part.kind {
+        ck_wire::CkKind::Text { text } => {
+            let preview = truncate_expand_preview(text, CTX_EXPAND_VERBOSE_TEXT_PREVIEW_CHARS);
+            (!preview.is_empty()).then(|| format!("    • {preview}"))
+        }
+        ck_wire::CkKind::ToolCall { name, input, .. } => {
+            let argument = verbose_expand_key_argument(input);
+            let head = if argument.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name}({argument})")
+            };
+            Some(format!("    • tool {head}"))
+        }
+        ck_wire::CkKind::ToolResult {
+            tool_name, output, ..
+        } => Some(format!(
+            "    • tool {tool_name} → output ~{} tok",
+            mc_tokenizer::estimate_tokens(&expand_tool_output_text(output))
+        )),
+        ck_wire::CkKind::Reasoning { text, .. } => Some(format!(
+            "    • [reasoning] {}",
+            truncate_expand_preview(text, CTX_EXPAND_VERBOSE_REASONING_PREVIEW_CHARS)
+        )),
+        ck_wire::CkKind::Media(_) => Some("    • [media]".to_string()),
+        ck_wire::CkKind::RedactedReasoning { .. } => Some("    • [redacted_reasoning]".to_string()),
+        ck_wire::CkKind::Opaque(opaque) => Some(format!("    • [{}]", opaque.kind)),
+    }
+}
+
+fn verbose_expand_key_argument(input: &Value) -> String {
+    let Some(input) = input.as_object() else {
+        return String::new();
+    };
+    for key in [
+        "filePath",
+        "path",
+        "pattern",
+        "query",
+        "symbol",
+        "module",
+        "action",
+        "description",
+    ] {
+        if let Some(value) = input
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            return truncate_expand_preview(value, CTX_EXPAND_VERBOSE_ARGUMENT_PREVIEW_CHARS);
+        }
+    }
+    String::new()
+}
+
+fn expand_tool_output_text(output: &ck_wire::CkToolOutput) -> String {
+    match &output.kind {
+        ck_wire::CkOutputKind::Text { text } | ck_wire::CkOutputKind::ErrorText { text } => {
+            text.clone()
+        }
+        ck_wire::CkOutputKind::Json { value } | ck_wire::CkOutputKind::ErrorJson { value } => {
+            value.to_string()
+        }
+        ck_wire::CkOutputKind::ExecutionDenied { reason } => reason.clone().unwrap_or_default(),
+        ck_wire::CkOutputKind::Content { blocks }
+        | ck_wire::CkOutputKind::ErrorContent { blocks } => {
+            serde_json::to_string(blocks).unwrap_or_default()
+        }
+    }
+}
+
+/// The durable fallback predates raw CK snapshot retention. It cannot reconstruct every
+/// part or tool-output size, but it keeps historical transcript recovery available after
+/// a module restart or cache eviction.
+fn render_verbose_transcript_range_expand(
+    start: i64,
+    end: i64,
+    transcripts: &[StoredChunkTranscript],
+) -> String {
+    let mut entries = Vec::new();
+    for transcript in transcripts {
+        let Some(transcript) = transcript.transcript.as_deref() else {
+            continue;
+        };
+        for line in transcript.lines() {
+            let Some((span, role_and_content)) = line
+                .strip_prefix('[')
+                .and_then(|line| line.split_once("] "))
+            else {
+                continue;
+            };
+            let Some((role, content)) = role_and_content.split_once(": ") else {
+                continue;
+            };
+            let Some((span_start, span_end)) = parse_expand_ordinal_span(span) else {
+                continue;
+            };
+            for ordinal in span_start.max(start)..=span_end.min(end) {
+                entries.push((ordinal, role, content, span_start, span_end));
+            }
+        }
+    }
+    entries.sort_by_key(|(ordinal, ..)| *ordinal);
+    entries.dedup_by_key(|(ordinal, ..)| *ordinal);
+    if entries.is_empty() {
+        return format!(
+            "No messages found in range {start}-{end}. The range may be outside this session's persisted historian transcripts."
+        );
+    }
+
+    let last_ordinal = entries
+        .last()
+        .map(|(ordinal, ..)| *ordinal)
+        .unwrap_or(start);
+    let mut output = format!(
+        "Messages {start}-{last_ordinal} (verbose). Recover any one in full with ctx_expand(message=<ordinal>):"
+    );
+    for (ordinal, role, content, span_start, span_end) in entries {
+        let label = match role {
+            "U" => "U (user)",
+            "A" => "A (assistant)",
+            _ => role,
+        };
+        let mut preview = truncate_expand_preview(content, CTX_EXPAND_VERBOSE_TEXT_PREVIEW_CHARS);
+        if span_start != span_end {
+            preview = format!("[historian span {span_start}-{span_end}] {preview}");
+        }
+        let part = if let Some(tool) = preview.strip_prefix("TC: ") {
+            format!("    • tool {tool}")
+        } else {
+            format!("    • {preview}")
+        };
+        if !append_expand_piece(&mut output, "\n\n")
+            || !append_expand_line(&mut output, &format!("[{ordinal}] {label}"))
+            || !append_expand_piece(&mut output, &part)
+        {
+            break;
+        }
+    }
+    truncate_expand_output(output)
+}
+
+fn parse_expand_ordinal_span(span: &str) -> Option<(i64, i64)> {
+    let (start, end) = match span.split_once('-') {
+        Some((start, end)) => (start.parse().ok()?, end.parse().ok()?),
+        None => {
+            let ordinal = span.parse().ok()?;
+            (ordinal, ordinal)
+        }
+    };
+    (start > 0 && end >= start).then_some((start, end))
+}
+
+/// Mirrors TypeScript's `trim().slice(0, max)` preview rule in UTF-16 units.
+fn truncate_expand_preview(value: &str, max_units: usize) -> String {
+    let value = value.trim();
+    let units = value.encode_utf16().collect::<Vec<_>>();
+    if units.len() <= max_units {
+        return value.to_string();
+    }
+    format!("{}…", String::from_utf16_lossy(&units[..max_units]))
 }
 
 fn render_notes(
@@ -12595,7 +13081,7 @@ fn ctx_search_description() -> String {
 }
 
 fn ctx_expand_description() -> String {
-    "Recover persisted historian chunk transcripts for compacted conversation ranges. This Claude Code leg serves the chunk-builder U:/A:/TC: view, not full raw message recovery.".to_string()
+    "Recover compacted conversation ranges. The default view serves persisted historian chunk transcripts; verbose=true separately previews each cached raw message part, including tool-output sizes, so an ordinal can be recovered in full while that bounded snapshot is available.".to_string()
 }
 
 fn ctx_note_description() -> String {
@@ -12684,7 +13170,8 @@ fn ctx_expand_schema() -> Value {
         "properties": {
             "start": { "type": "integer", "minimum": 1, "description": "First message ordinal to expand." },
             "end": { "type": "integer", "minimum": 1, "description": "Last message ordinal to expand, inclusive." },
-            "message": { "type": "integer", "minimum": 1, "description": "Recover the single persisted chunk transcript covering this message ordinal." },
+            "verbose": { "type": "boolean", "description": "With start/end: list each message separately with its ordinal [N] and per-part preview, including each tool call's output size, so one message can be recovered by ordinal." },
+            "message": { "type": "integer", "minimum": 1, "description": "Recover one message by ordinal in full from the cached raw request when available, otherwise its persisted historian chunk transcript." },
         }
     })
 }
@@ -18054,7 +18541,7 @@ mod tests {
                 primer_candidates: &[],
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 12,
-                chunk_transcript: Some("U: exact prompt text\nA: exact answer"),
+                chunk_transcript: Some("[10] U: exact prompt text\n[11] A: exact answer\n[12] A: TC: read(src/lib.rs) → output ~42 tok"),
             })
             .unwrap();
 
@@ -18078,15 +18565,98 @@ mod tests {
 
         let expanded =
             tool_text(call_facade(&handler, "ctx_expand", json!({"start": 10, "end": 12})).await);
-        assert!(expanded.contains("Compartment 1 (10-12)"));
-        assert!(expanded.contains("U: exact prompt text"));
+        assert_eq!(
+            expanded,
+            "Messages 10-12 from persisted historian chunk transcripts:\n\n### Compartment 1 (10-12)\n[10] U: exact prompt text\n[11] A: exact answer\n[12] A: TC: read(src/lib.rs) → output ~42 tok",
+            "verbose=false must preserve the pre-verbose range bytes"
+        );
+
+        let raw_messages = vec![
+            ck_with_role("m10", 10, "user", "exact prompt text"),
+            CkIngressMessage {
+                mid: "m11".to_string(),
+                ordinal: 11,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    vec![
+                        CkWireBlock::bare(CkKind::Text {
+                            text: "Reading it now.".to_string(),
+                        }),
+                        CkWireBlock::bare(CkKind::ToolCall {
+                            id: "read:1".to_string(),
+                            name: "read".to_string(),
+                            input: json!({ "filePath": "src/lib.rs" }),
+                            provider_executed: false,
+                        }),
+                    ],
+                    None,
+                    ProviderExtras::new(),
+                    HarnessMeta::default(),
+                ),
+            },
+            CkIngressMessage {
+                mid: "m12".to_string(),
+                ordinal: 12,
+                ck: CkWireMessage::from_parts(
+                    "user",
+                    vec![CkWireBlock::bare(CkKind::ToolResult {
+                        id: "read:1".to_string(),
+                        tool_name: "read".to_string(),
+                        output: CkToolOutput::bare(CkOutputKind::Text {
+                            text: "line1\nline2\nline3".to_string(),
+                        }),
+                        provider_executed: false,
+                    })],
+                    None,
+                    ProviderExtras::new(),
+                    HarnessMeta::default(),
+                ),
+            },
+        ];
+        let mut snapshots = handler
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex");
+        let generation = snapshots.begin("ses");
+        snapshots.finish_ready(
+            "ses",
+            generation,
+            Arc::new(transform_request(raw_messages, 45_000, 50_000)),
+            0,
+            0,
+        );
+        drop(snapshots);
+
+        let verbose = tool_text(
+            call_facade(
+                &handler,
+                "ctx_expand",
+                json!({"start": 10, "end": 12, "verbose": true}),
+            )
+            .await,
+        );
+        assert!(verbose.contains("[10] U (user)"));
+        assert!(verbose.contains("[11] A (assistant)"));
+        assert!(verbose.contains("[12] U (user)"));
+        assert!(verbose.contains("• tool read(src/lib.rs)"));
+        assert!(verbose.contains(&format!(
+            "• tool read → output ~{} tok",
+            mc_tokenizer::estimate_tokens("line1\nline2\nline3")
+        )));
+        let replayed_default =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"start": 10, "end": 12})).await);
+        assert_eq!(
+            replayed_default, expanded,
+            "verbose must not perturb the default renderer"
+        );
         let giant_range = tool_text(
             call_facade(&handler, "ctx_expand", json!({"start": 1, "end": i64::MAX})).await,
         );
         assert!(giant_range.contains("Messages 1-12"));
         assert!(giant_range.len() <= CTX_EXPAND_BYTE_BUDGET);
         let message = tool_text(call_facade(&handler, "ctx_expand", json!({"message": 11})).await);
-        assert!(message.contains("chunk-builder view"));
+        assert!(message.contains("[tool: read #read:1]"));
+        assert!(message.contains("input: {\"filePath\":\"src/lib.rs\"}"));
 
         let write = tool_text(
             call_facade(
@@ -19048,7 +19618,8 @@ mod tests {
         assert_eq!(echo_body["echo"]["kind"], "echo");
 
         let reduce = tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1-3" })).await);
-        assert_eq!(reduce, CTX_REDUCE_ACKNOWLEDGEMENT);
+        assert!(reduce.contains("Refused: no valid tags to queue"));
+        assert!(reduce.contains("tags 1, 2, 3 not found"));
     }
 
     #[test]
@@ -19076,8 +19647,79 @@ mod tests {
         assert_eq!(arguments["stray"], json!("kept"));
     }
 
+    #[test]
+    fn ctx_expand_verbose_range_separates_messages_and_previews_raw_parts() {
+        let output = "line1\nline2\nline3";
+        let messages = vec![
+            CkIngressMessage {
+                mid: "m10".to_string(),
+                ordinal: 10,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    vec![
+                        CkWireBlock::bare(CkKind::Text {
+                            text: "x".repeat(201),
+                        }),
+                        CkWireBlock::bare(CkKind::ToolCall {
+                            id: "read:1".to_string(),
+                            name: "read".to_string(),
+                            input: json!({ "filePath": "config.ts" }),
+                            provider_executed: false,
+                        }),
+                    ],
+                    None,
+                    ProviderExtras::new(),
+                    HarnessMeta::default(),
+                ),
+            },
+            CkIngressMessage {
+                mid: "m11".to_string(),
+                ordinal: 11,
+                ck: CkWireMessage::from_parts(
+                    "user",
+                    vec![CkWireBlock::bare(CkKind::ToolResult {
+                        id: "read:1".to_string(),
+                        tool_name: "read".to_string(),
+                        output: CkToolOutput::bare(CkOutputKind::Text {
+                            text: output.to_string(),
+                        }),
+                        provider_executed: false,
+                    })],
+                    None,
+                    ProviderExtras::new(),
+                    HarnessMeta::default(),
+                ),
+            },
+        ];
+
+        let rendered = render_verbose_range_expand(&messages, 10, 11);
+        assert!(rendered.text.contains("[10] A (assistant)"));
+        assert!(rendered.text.contains("[11] U (user)"));
+        assert!(rendered
+            .text
+            .contains(&format!("    • {}…", "x".repeat(200))));
+        assert!(rendered.text.contains("    • tool read(config.ts)"));
+        assert!(rendered.text.contains(&format!(
+            "    • tool read → output ~{} tok",
+            mc_tokenizer::estimate_tokens(output)
+        )));
+        assert_eq!(rendered.last_ordinal, 11);
+        assert!(!rendered.truncated);
+
+        let first = render_verbose_expand_message(&messages[0]);
+        let bounded = render_verbose_range_expand_with_budget(
+            &messages,
+            10,
+            11,
+            mc_tokenizer::estimate_tokens(&first),
+        );
+        assert_eq!(bounded.last_ordinal, 10);
+        assert!(bounded.truncated);
+        assert!(!bounded.text.contains("[11] U (user)"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn facade_ctx_reduce_is_inert_before_resolution_or_storage() {
+    async fn facade_ctx_reduce_resolves_the_session_before_validating_tags() {
         let producer = Arc::new(ProducerState::default());
         let resolver = FakeSessionResolver::with(&[("unresolvable", FakeResolve::None)]);
         let handler = McHandler::with_producer_factory_config_resolver(
@@ -19087,19 +19729,100 @@ mod tests {
         );
         handler.bind_route(8, binding("/path/that/does/not/exist", "unresolvable"));
 
-        let response = tool_text(
-            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "not parsed" }))
-                .await,
-        );
-        assert_eq!(response, CTX_REDUCE_ACKNOWLEDGEMENT);
-        assert!(
-            resolver.calls().is_empty(),
-            "the inert facade must not resolve tokens"
-        );
+        let response =
+            call_facade_on_channel(&handler, 8, "ctx_reduce", json!({ "drop": "1" })).await;
+        assert_eq!(error_code(response), "session_unresolved");
+        assert_eq!(resolver.calls(), vec!["unresolvable"]);
         assert!(
             handler.store.get().is_none(),
-            "the inert facade must not open or read storage"
+            "an unresolved session must not open storage to validate tags"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_ctx_reduce_ack_validates_unknown_queued_and_protected_tags_without_committing()
+    {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let tag_inputs = (1..=21)
+            .map(|number| TagMintInput {
+                block_id: format!("m{number}#0"),
+                kind: "tool_result".to_string(),
+                token_count: 10,
+                source_bytes: format!("output {number}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        store.seed_tags_for_test("ses", &tag_inputs, 1_000).unwrap();
+
+        let mixed_ack = tool_text(
+            call_facade(
+                &handler,
+                "ctx_reduce",
+                json!({ "drop": "1, 21, 99, 100", "command_id": "mixed-delivery" }),
+            )
+            .await,
+        );
+        assert!(mixed_ack.contains("drop §1§"));
+        assert!(mixed_ack.contains("deferred drop §21§"));
+        assert!(mixed_ack.contains("tags 99, 100 not found"));
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+
+        // The response observer delivers the same mixed request later. It queues only
+        // known tags, leaving acknowledgement validation side-effect free.
+        let delivered = handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1, 21, 99, 100",
+                "command_id": "mixed-delivery",
+            }),
+        );
+        assert_eq!(tool_body(delivered), json!({ "ok": true, "queued": 2 }));
+        let pending_after_delivery = store.load_pending_agent_drops("ses").unwrap();
+        let retry = handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1, 21, 99, 100",
+                "command_id": "mixed-delivery",
+            }),
+        );
+        assert_eq!(
+            tool_body(retry),
+            json!({ "ok": true, "queued": 0, "duplicate": true })
+        );
+        assert_eq!(
+            store.load_pending_agent_drops("ses").unwrap(),
+            pending_after_delivery
+        );
+
+        let queued_ack =
+            tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1, 2, 99" })).await);
+        assert!(queued_ack.contains("deferred drop §2§"));
+        assert!(queued_ack.contains("tags 1 already queued"));
+        assert!(queued_ack.contains("tags 99 not found"));
+
+        let refused = tool_body(call_facade(&handler, "ctx_reduce", json!({ "drop": "99" })).await);
+        assert_eq!(refused["isError"], json!(true));
+        assert!(refused["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Refused: no valid tags to queue. tags 99 not found"));
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 2);
+
+        let invalid =
+            tool_body(call_facade(&handler, "ctx_reduce", json!({ "drop": "3-1" })).await);
+        assert_eq!(invalid["isError"], json!(true));
+        assert!(invalid["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid range"));
     }
 
     #[test]
@@ -19129,7 +19852,7 @@ mod tests {
                 ],
             ),
             ("ctx_search", vec!["query", "limit"]),
-            ("ctx_expand", vec!["start", "end", "message"]),
+            ("ctx_expand", vec!["start", "end", "verbose", "message"]),
             (
                 "ctx_note",
                 vec![
@@ -19159,6 +19882,12 @@ mod tests {
                 "additionalProperties": false
             }),
             "ctx_reduce advertised schema must stay byte-canonical (authorizer contract)"
+        );
+
+        assert_eq!(
+            by_name["ctx_expand"].schema["properties"]["verbose"]["type"],
+            json!("boolean"),
+            "ctx_expand must advertise verbose range previews"
         );
 
         for (name, expected) in expected_fields {
@@ -22217,15 +22946,32 @@ mod tests {
         assert_eq!(store.load_pending_agent_drops("ses").unwrap(), pending);
     }
 
-    #[test]
-    fn ctx_reduce_no_targets_append_records_terminal_disposition() {
-        // When a drop range references tag numbers that don't exist in the session,
-        // the ledger row is still recorded (for idempotency) but with disposition='no_targets'
-        // and queued=0. A retry of the same command_id still dedupes.
-        let producer = Arc::new(ProducerState::default());
-        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_reduce_no_targets_refuses_without_a_ledger_row() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
 
-        // No tags minted, so drop "1" resolves zero targets.
+        // No tags minted, so acknowledgement and later delivery both refuse "1" rather
+        // than committing the terminal no_targets ledger row that used to hide this error.
+        let acknowledgement = tool_body(
+            call_facade(
+                &handler,
+                "ctx_reduce",
+                json!({ "drop": "1", "command_id": "no-target-cmd" }),
+            )
+            .await,
+        );
+        assert_eq!(acknowledgement["isError"], json!(true));
+        assert!(acknowledgement["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Refused: no valid tags to queue. tags 1 not found"));
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+
         let outcome = handler.handle_agent_drops_value(
             7,
             json!({
@@ -22235,35 +22981,18 @@ mod tests {
                 "command_id": "no-target-cmd",
             }),
         );
-        let body: Value = match outcome {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
-            other => panic!("unexpected outcome: {other:?}"),
-        };
-        assert_eq!(
-            body,
-            json!({ "ok": true, "queued": 0, "disposition": "no_targets" })
-        );
+        let (code, message) = error_frame(outcome);
+        assert_eq!(code, "bad_request");
+        assert!(message.contains("no valid tags: 1 not found"));
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
-        // Retry of the same command_id must still dedupe (idempotency).
-        let retry = handler.handle_agent_drops_value(
-            7,
-            json!({
-                "method": "agent_drops.append",
-                "session_id": "ses",
-                "drop": "1",
-                "command_id": "no-target-cmd",
-            }),
-        );
-        let retry_body: Value = match retry {
-            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
-            other => panic!("unexpected outcome: {other:?}"),
-        };
+        // Reusing this command id after a tag arrives must queue it. If refusal had
+        // committed a zero-target ledger row, this would be acknowledged as duplicate.
+        mint_drop_tag(&store, "a#0");
         assert_eq!(
-            retry_body,
-            json!({ "ok": true, "queued": 0, "duplicate": true })
+            queue_drop_command_with_id(&handler, "no-target-cmd"),
+            json!({ "ok": true, "queued": 1 })
         );
-        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
