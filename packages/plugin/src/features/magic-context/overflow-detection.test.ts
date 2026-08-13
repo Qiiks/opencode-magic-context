@@ -171,3 +171,29 @@ describe("overflow-detection / parseReportedLimit", () => {
         expect(parseReportedLimit(msg)).toEqual({ value: 128000, provenance: "combined" });
     });
 });
+
+describe("llama.cpp context-size limit extraction", () => {
+    // The old greedy pattern (/context size.*(\d+)/) backtracked to a
+    // single-digit capture that the plausibility clamp discarded, so these
+    // messages detected overflow but silently lost the limit value.
+    test("extracts the limit from llama.cpp-style messages", () => {
+        expect(
+            parseReportedLimit(
+                "context size has been exceeded: limit 200000 tokens, you sent 214311",
+            ),
+        ).toMatchObject({ value: 200000, provenance: "combined" });
+        expect(parseReportedLimit("context size exceeded: 128000 tokens maximum")).toMatchObject({
+            value: 128000,
+            provenance: "combined",
+        });
+    });
+
+    test("does not capture a number more than 40 chars past the phrase", () => {
+        // Guards the anchor: distant numbers (e.g. request ids) must not bind.
+        expect(
+            parseReportedLimit(
+                "context size problem occurred while handling the request submitted at position 99999999 tokens",
+            ),
+        ).toBeUndefined();
+    });
+});

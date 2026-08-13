@@ -75,7 +75,11 @@ const LIMIT_EXTRACTION_PATTERNS: ReadonlyArray<LimitExtractionPattern> = [
         pattern: /too large for model with (\d+) maximum context length/i,
         provenance: "combined",
     }, // Mistral
-    { pattern: /context size.*(\d+) tokens?/i, provenance: "combined" }, // llama.cpp variants
+    // Non-greedy digit gap: a greedy `.*` here backtracks to a single-digit
+    // capture ("limit 200000 tokens" → "0"), which the plausibility clamp then
+    // discards — so the limit was silently never extracted for llama.cpp-style
+    // messages. Anchor the capture to the first ≥4-digit number after the phrase.
+    { pattern: /context size[^0-9]{0,40}(\d{4,})\s*tokens?/i, provenance: "combined" }, // llama.cpp variants
     // "input length N exceeds the context length of M" — we want M (the limit),
     // NOT N (the actual prompt size). Explicit pattern keeps the fallback below
     // from greedily matching N.
