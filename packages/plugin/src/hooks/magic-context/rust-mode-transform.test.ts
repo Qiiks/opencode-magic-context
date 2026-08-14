@@ -960,6 +960,59 @@ describe("Rust mode authority adapter", () => {
         expect(secondOutput.messages).toEqual(native);
     });
 
+    it("forwards resolved auto-search controls, including an explicit disabled state", async () => {
+        const db = makeDb();
+        const requests: Record<string, unknown>[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform") requests.push(body as Record<string, unknown>);
+                return method === "transform" ? { native_messages: [] } : { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        const transform = createRustModeTransform(deps, { moduleClient });
+
+        const enabledSession = `rust-auto-search-enabled-${Date.now()}`;
+        sessions.push(enabledSession);
+        installRawProvider(enabledSession);
+        deps.autoSearch = { enabled: true, scoreThreshold: 0.73, minPromptChars: 47 };
+        const enabledMessages = makeMessages(enabledSession);
+        await transform.run(
+            enabledSession,
+            enabledMessages,
+            { messages: enabledMessages as unknown[] },
+            makeMeta(db, enabledSession),
+        );
+
+        expect(requests.at(-1)).toEqual(
+            expect.objectContaining({
+                auto_search_enabled: true,
+                auto_search_score_threshold: 0.73,
+                auto_search_min_prompt_chars: 47,
+            }),
+        );
+
+        const disabledSession = `rust-auto-search-disabled-${Date.now()}`;
+        sessions.push(disabledSession);
+        installRawProvider(disabledSession);
+        deps.autoSearch = { enabled: false, scoreThreshold: 0.91, minPromptChars: 83 };
+        const disabledMessages = makeMessages(disabledSession);
+        await transform.run(
+            disabledSession,
+            disabledMessages,
+            { messages: disabledMessages as unknown[] },
+            makeMeta(db, disabledSession),
+        );
+
+        expect(requests.at(-1)).toEqual(
+            expect.objectContaining({
+                auto_search_enabled: false,
+                auto_search_score_threshold: 0.91,
+                auto_search_min_prompt_chars: 83,
+            }),
+        );
+    });
+
     it("forwards the model-routed prompt preset and description overrides", async () => {
         const sessionId = `rust-prompt-surface-${Date.now()}`;
         sessions.push(sessionId);

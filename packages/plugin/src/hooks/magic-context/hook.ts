@@ -1101,15 +1101,15 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         historianTwoPass: deps.config.historian?.two_pass === true,
         liveModelBySession,
         sessionDirectoryBySession,
-        autoSearch: deps.config.memory?.auto_search?.enabled
-            ? {
-                  enabled: true,
-                  scoreThreshold: deps.config.memory?.auto_search.score_threshold,
-                  minPromptChars: deps.config.memory?.auto_search.min_prompt_chars,
-                  directory: deps.directory,
-                  ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
-              }
-            : undefined,
+        // Keep the resolved controls available to both renderers. Rust mode must receive
+        // an explicit false here rather than falling back to the module default.
+        autoSearch: {
+            enabled: deps.config.memory?.auto_search?.enabled ?? true,
+            scoreThreshold: deps.config.memory?.auto_search?.score_threshold ?? 0.6,
+            minPromptChars: deps.config.memory?.auto_search?.min_prompt_chars ?? 20,
+            directory: deps.directory,
+            ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+        },
         // Age-tier caveman text compression is an opt-in primary-session pass.
         // Subagents are excluded in transform.ts because their context is curated
         // by the parent and they have no ctx_expand recovery path.

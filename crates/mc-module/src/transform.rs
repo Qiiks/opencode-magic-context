@@ -2647,7 +2647,13 @@ fn apply_once(
                 req.session_id, fingerprint
             );
             let passthrough_overlay = tagging_active.then(|| {
-                tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends)
+                tag_overlay_state(
+                    &tag_rows,
+                    &temporal_marks,
+                    &user_hints,
+                    &channel1_appends,
+                    &loaded.meta.pending_user_hint_block_ids,
+                )
             });
             let passthrough_messages = pending_passthrough_messages(
                 &projection,
@@ -2753,8 +2759,15 @@ fn apply_once(
             ambiguous,
         ));
         meta.last_committed_pass_at_ms = ctx.now_ms;
-        let passthrough_overlay = tagging_active
-            .then(|| tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends));
+        let passthrough_overlay = tagging_active.then(|| {
+            tag_overlay_state(
+                &tag_rows,
+                &temporal_marks,
+                &user_hints,
+                &channel1_appends,
+                &meta.pending_user_hint_block_ids,
+            )
+        });
         let passthrough_messages = pending_passthrough_messages(
             &projection,
             req,
@@ -3491,22 +3504,34 @@ fn apply_once(
             plan,
             PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
         );
-    if auto_search_active && is_bust_pass {
-        if let Some(hint) = maybe_decide_user_hint_on_bust(
+    if auto_search_active {
+        if let Some(hint) = maybe_decide_live_user_hint(
             store,
             req,
             ctx,
             &projection,
             &user_hints,
+            overlay_frontier,
             mutation_exempt_mid,
             lineage_anchor_mid,
         )? {
-            user_hints.push(UserHintRow {
-                block_id: hint.block_id.clone(),
-                hint_text: hint.hint_text.clone(),
-                created_at: ctx.now_ms,
-            });
+            if !hint.hint_text.is_empty() {
+                meta.pending_user_hint_block_ids
+                    .insert(hint.block_id.clone());
+            }
+            if is_bust_pass {
+                user_hints.push(UserHintRow {
+                    block_id: hint.block_id.clone(),
+                    hint_text: hint.hint_text.clone(),
+                    created_at: ctx.now_ms,
+                });
+            }
             pending_overlays.user_hint = Some(hint);
+        }
+        if is_bust_pass {
+            // Hint decisions may safely write during a defer, but only a pass that already
+            // changes provider-visible bytes may make their overlay visible for the first time.
+            meta.pending_user_hint_block_ids.clear();
         }
     }
     if let Some(cutoff) =
@@ -4251,13 +4276,22 @@ fn apply_once(
     let result_action = action_str(&plan, &core);
 
     let mut tag_overlay = if tagging_active {
-        tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends)
+        tag_overlay_state(
+            &tag_rows,
+            &temporal_marks,
+            &user_hints,
+            &channel1_appends,
+            &meta.pending_user_hint_block_ids,
+        )
     } else if auto_search_active {
         // Auto-search replays only its own persisted hint when ctx_reduce/tagging is unavailable.
         TagOverlayState {
             user_hint_by_block_id: user_hints
                 .iter()
-                .filter(|row| !row.hint_text.is_empty())
+                .filter(|row| {
+                    !row.hint_text.is_empty()
+                        && !meta.pending_user_hint_block_ids.contains(&row.block_id)
+                })
                 .map(|row| (row.block_id.clone(), row.hint_text.clone()))
                 .collect(),
             ..TagOverlayState::default()
@@ -6715,6 +6749,7 @@ fn tag_overlay_state(
     temporal_marks: &[TemporalMarkRow],
     user_hints: &[UserHintRow],
     appends: &[Channel1AppendRow],
+    pending_user_hint_block_ids: &BTreeSet<String>,
 ) -> TagOverlayState {
     TagOverlayState {
         tag_by_block_id: tag_rows
@@ -6728,7 +6763,9 @@ fn tag_overlay_state(
             .collect(),
         user_hint_by_block_id: user_hints
             .iter()
-            .filter(|row| !row.hint_text.is_empty())
+            .filter(|row| {
+                !row.hint_text.is_empty() && !pending_user_hint_block_ids.contains(&row.block_id)
+            })
             .map(|row| (row.block_id.clone(), row.hint_text.clone()))
             .collect(),
         channel1_by_block_id: appends
@@ -7318,14 +7355,15 @@ fn compute_active_overlay_decisions(
     })
 }
 
-/// Decide one durable auto-search hint only when an unrelated transform action is already
-/// changing the provider-visible prefix. This keeps the hint from originating a cache bust.
-fn maybe_decide_user_hint_on_bust(
+/// Decide one durable auto-search hint for a new live user tail. The decision is DB-only;
+/// first rendering remains deferred until a pass that already busts the provider cache.
+fn maybe_decide_live_user_hint(
     store: &McStore,
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
     projection: &FlatProjection,
     user_hint_rows: &[UserHintRow],
+    overlay_frontier: Option<u64>,
     mutation_exempt_mid: Option<&str>,
     lineage_anchor_mid: Option<&str>,
 ) -> Result<Option<UserHintDecisionInput>, TransformError> {
@@ -7342,15 +7380,24 @@ fn maybe_decide_user_hint_on_bust(
     }) else {
         return Ok(None);
     };
-    if user_hint_rows.iter().any(|row| row.block_id == block.id) {
+    if user_hint_rows.iter().any(|row| row.block_id == block.id)
+        || overlay_frontier.is_some_and(|frontier| message.ordinal <= frontier)
+    {
         return Ok(None);
     }
 
-    let query = user_hint_query(message);
-    let hint_text = if query.chars().count() < req.auto_search_min_prompt_chars || query.is_empty()
+    // Suppression must inspect the raw user text before sanitization removes the markers that
+    // identify an existing augmentation. The length gate likewise uses the uncapped prompt so a
+    // long live request is not rejected merely because the search query has a safety cap.
+    let message_text = user_hint_message_text(message);
+    let raw_prompt = sanitize_user_hint_query(&message_text);
+    let hint_text = if has_stacked_user_hint_augmentation(&message_text)
+        || utf16_len(&raw_prompt) < req.auto_search_min_prompt_chars
+        || raw_prompt.is_empty()
     {
         String::new()
     } else {
+        let query = cap_user_hint_query(&raw_prompt);
         let results = run_user_hint_lexical_search(
             store,
             ctx.project_path,
@@ -7525,7 +7572,15 @@ fn run_user_hint_lexical_search(
 }
 
 fn user_hint_query(message: &CkIngressMessage) -> String {
-    let raw = message
+    cap_user_hint_query(&user_hint_raw_prompt(message))
+}
+
+fn user_hint_raw_prompt(message: &CkIngressMessage) -> String {
+    sanitize_user_hint_query(&user_hint_message_text(message))
+}
+
+fn user_hint_message_text(message: &CkIngressMessage) -> String {
+    message
         .ck
         .content
         .iter()
@@ -7534,8 +7589,20 @@ fn user_hint_query(message: &CkIngressMessage) -> String {
             _ => None,
         })
         .collect::<Vec<_>>()
-        .join("\n");
-    let normalized = sanitize_user_hint_query(&raw);
+        .join("\n")
+}
+
+fn has_stacked_user_hint_augmentation(raw_prompt: &str) -> bool {
+    [
+        "<sidekick-augmentation>",
+        "<ctx-search-hint>",
+        "<ctx-search-auto>",
+    ]
+    .iter()
+    .any(|marker| raw_prompt.contains(marker))
+}
+
+fn cap_user_hint_query(normalized: &str) -> String {
     let mut chars = normalized.chars();
     let mut capped = chars
         .by_ref()
@@ -7621,6 +7688,26 @@ fn strip_mc_tag_notation(text: &str) -> String {
     output
 }
 
+fn utf16_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// Keep whole Unicode scalars while measuring the prefix in UTF-16 code units, matching the
+/// TypeScript wire renderer without producing an invalid half-surrogate in Rust output.
+fn utf16_prefix(text: &str, limit: usize) -> &str {
+    let mut used = 0;
+    let mut end = 0;
+    for (start, character) in text.char_indices() {
+        let next = used + character.len_utf16();
+        if next > limit {
+            break;
+        }
+        used = next;
+        end = start + character.len_utf8();
+    }
+    &text[..end]
+}
+
 fn render_user_hint(results: &[crate::memory_tool::MemorySearchResult]) -> Option<String> {
     if results.is_empty() {
         return None;
@@ -7653,37 +7740,27 @@ fn render_user_hint(results: &[crate::memory_tool::MemorySearchResult]) -> Optio
     // Native search returns memory and compartment results only, so it does not emit commit
     // SHA/age metadata for a result without commit provenance.
     let wrapped = truncate_hint_to_total_cap(&wrapped, USER_HINT_TOTAL_CHAR_CAP);
-    debug_assert!(wrapped.chars().count() <= USER_HINT_TOTAL_CHAR_CAP);
+    debug_assert!(utf16_len(&wrapped) <= USER_HINT_TOTAL_CHAR_CAP);
     Some(format!("\n\n{wrapped}"))
 }
 
 fn truncate_hint_to_total_cap(wrapped: &str, limit: usize) -> String {
-    if wrapped.chars().count() <= limit {
+    if utf16_len(wrapped) <= limit {
         return wrapped.to_string();
     }
     let open = "<ctx-search-hint>\n";
     let close = "\n</ctx-search-hint>";
-    let body_limit = limit.saturating_sub(open.chars().count() + close.chars().count() + 1);
-    let body = wrapped
-        .strip_prefix(open)
-        .unwrap_or(wrapped)
-        .chars()
-        .take(body_limit)
-        .collect::<String>()
-        .trim_end()
-        .to_string();
+    let body_limit = limit.saturating_sub(utf16_len(open) + utf16_len(close) + 1);
+    let body = utf16_prefix(wrapped.strip_prefix(open).unwrap_or(wrapped), body_limit).trim_end();
     format!("{open}{body}…{close}")
 }
 
 fn one_line_fragment(text: &str, limit: usize) -> String {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= limit {
+    if utf16_len(&normalized) <= limit {
         return normalized;
     }
-    let mut truncated = normalized
-        .chars()
-        .take(limit.saturating_sub(1))
-        .collect::<String>()
+    let mut truncated = utf16_prefix(&normalized, limit.saturating_sub(1))
         .trim_end()
         .to_string();
     truncated.push('…');
@@ -19741,7 +19818,18 @@ pub(crate) mod tests {
             ),
             USER_HINT_TOTAL_CHAR_CAP,
         );
-        assert!(capped.chars().count() <= USER_HINT_TOTAL_CHAR_CAP);
+        assert!(utf16_len(&capped) <= USER_HINT_TOTAL_CHAR_CAP);
+
+        let astral_fragment = one_line_fragment(&"🦀".repeat(41), USER_HINT_FRAGMENT_CHAR_CAP);
+        assert_eq!(astral_fragment, format!("{}…", "🦀".repeat(39)));
+        assert!(astral_fragment.encode_utf16().count() <= USER_HINT_FRAGMENT_CHAR_CAP);
+
+        let astral_wrapped = format!(
+            "<ctx-search-hint>\n{}\n</ctx-search-hint>",
+            "🦀".repeat(USER_HINT_TOTAL_CHAR_CAP)
+        );
+        let astral_capped = truncate_hint_to_total_cap(&astral_wrapped, USER_HINT_TOTAL_CHAR_CAP);
+        assert!(astral_capped.encode_utf16().count() <= USER_HINT_TOTAL_CHAR_CAP);
     }
 
     #[test]
@@ -19765,12 +19853,13 @@ pub(crate) mod tests {
         );
         request.auto_search_min_prompt_chars = "rust ownership beta".chars().count();
         let projection = project_messages(&request.messages).unwrap();
-        let at_boundary = maybe_decide_user_hint_on_bust(
+        let at_boundary = maybe_decide_live_user_hint(
             &s,
             &request,
             &pctx("git:proj", "/nonexistent-docs", 1),
             &projection,
             &[],
+            None,
             None,
             None,
         )
@@ -19779,12 +19868,13 @@ pub(crate) mod tests {
         assert!(!at_boundary.hint_text.is_empty());
 
         request.auto_search_min_prompt_chars += 1;
-        let below_boundary = maybe_decide_user_hint_on_bust(
+        let below_boundary = maybe_decide_live_user_hint(
             &s,
             &request,
             &pctx("git:proj", "/nonexistent-docs", 1),
             &projection,
             &[],
+            None,
             None,
             None,
         )
@@ -19812,6 +19902,71 @@ pub(crate) mod tests {
         .unwrap();
         assert!(!admitted.is_empty());
         assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn auto_search_checks_uncapped_prompt_length_and_suppresses_stacked_augmentations() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.seed_memory(
+            1,
+            "git:proj",
+            "CONSTRAINTS",
+            "rust ownership beta durable context",
+            70,
+        )
+        .unwrap();
+        seed_unrelated_hint_candidates(&s);
+        USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
+
+        let long_prompt = "rust ownership beta ".repeat(40);
+        let mut long_request = active_cc_req(
+            "auto-search-uncapped-length",
+            "cfg0",
+            vec![wire_item("user", "m1", 1, &[&long_prompt])],
+        );
+        long_request.auto_search_min_prompt_chars = USER_HINT_QUERY_CHAR_CAP + 1;
+        let long_projection = project_messages(&long_request.messages).unwrap();
+        let long_decision = maybe_decide_live_user_hint(
+            &s,
+            &long_request,
+            &pctx("git:proj", "/nonexistent-docs", 1),
+            &long_projection,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!long_decision.hint_text.is_empty());
+        assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
+
+        let stacked_request = active_cc_req(
+            "auto-search-stacked",
+            "cfg0",
+            vec![wire_item(
+                "user",
+                "m1",
+                1,
+                &["rust ownership beta <sidekick-augmentation>existing</sidekick-augmentation>"],
+            )],
+        );
+        let stacked_projection = project_messages(&stacked_request.messages).unwrap();
+        let stacked_decision = maybe_decide_live_user_hint(
+            &s,
+            &stacked_request,
+            &pctx("git:proj", "/nonexistent-docs", 1),
+            &stacked_projection,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(stacked_decision.hint_text.is_empty());
+        assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
     }
 
     #[test]
@@ -19883,6 +20038,85 @@ pub(crate) mod tests {
             dormant.auto_search_enabled = false;
             let false_window = run(&s, &dormant, &spine());
             assert_eq!(tail_bytes(&false_window, "m1"), "rust ownership");
+        });
+    }
+
+    #[test]
+    fn user_hint_decides_on_low_pressure_pass_and_first_renders_on_bust() {
+        run_active_surface_test(|| {
+            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let session = "user-hint-low-pressure";
+            s.seed_memory(
+                1,
+                "git:proj",
+                "CONSTRAINTS",
+                "rust ownership beta durable context",
+                70,
+            )
+            .unwrap();
+            seed_unrelated_hint_candidates(&s);
+            s.replace_compartments(session, &[comp(1, 1, 1, "a", "SUMMARY")])
+                .unwrap();
+            run(
+                &s,
+                &req(session, "cfg0", vec![item("a", 1, "baseline")]),
+                &spine(),
+            );
+            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
+
+            let request = req(
+                session,
+                "cfg0",
+                vec![
+                    item("a", 1, "baseline"),
+                    wire_item("user", "m1", 2, &["rust ownership beta"]),
+                ],
+            );
+            let low_pressure = with_usage(request.clone(), 10, 100);
+            let mut ctx = pctx("git:proj", "/nonexistent-docs", 1);
+            ctx.cache_ttl = "never".to_string();
+
+            let first_defer = transform(&s, &low_pressure, &ctx).unwrap();
+            assert_eq!(first_defer.action, "SOFT+");
+            assert!(!tail_bytes(&first_defer, "m1").contains("<ctx-search-hint>"));
+            let after_decision = s.load(session).unwrap();
+            assert!(after_decision
+                .meta
+                .pending_user_hint_block_ids
+                .contains("m1#0"));
+            assert!(s
+                .load_user_hints(session)
+                .unwrap()
+                .iter()
+                .any(|row| row.block_id == "m1#0" && !row.hint_text.is_empty()));
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
+
+            for now_ms in 2..=3 {
+                ctx.now_ms = now_ms;
+                let deferred = transform(&s, &low_pressure, &ctx).unwrap();
+                assert_eq!(deferred.action, "SOFT+");
+                assert!(!tail_bytes(&deferred, "m1").contains("<ctx-search-hint>"));
+            }
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
+
+            ctx.now_ms = 4;
+            let mut bust_request = with_usage(request.clone(), 10, 100);
+            bust_request.render_config = "cfg1".to_string();
+            let force = transform(&s, &bust_request, &ctx).unwrap();
+            assert_eq!(force.action, "HARD");
+            assert!(tail_bytes(&force, "m1").contains("<ctx-search-hint>"));
+            assert!(s
+                .load(session)
+                .unwrap()
+                .meta
+                .pending_user_hint_block_ids
+                .is_empty());
+
+            ctx.now_ms = 5;
+            let replay = transform(&s, &low_pressure, &ctx).unwrap();
+            assert_eq!(tail_bytes(&replay, "m1"), tail_bytes(&force, "m1"));
         });
     }
 
