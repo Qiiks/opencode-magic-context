@@ -96,6 +96,19 @@ Environment honesty: `RustTestHarness.detectPrereqs()` preflights the stack
 the suite SKIPs with a printed reason when any is missing — never green-washing,
 never hanging.
 
+**Pressure technique (load-bearing apparatus rule):** scenarios reach high fill
+by SHRINKING the context limit against REAL message bytes, never by inflating
+reported usage. The two techniques are not interchangeable: inflated usage moves
+only fill-keyed conditions (execute thresholds, force bands) while every
+real-byte-keyed condition (reclaimable-tail pressure, tail-size trigger floors,
+chunk substance) stays silently unreachable — a harness built that way passes
+every fill-keyed test honestly while structurally unable to exercise the other
+axis, with nothing announcing the gap. (Observed live 2026-08-14 in a peer
+gateway's drive container: 44 passes, fill 80→86%, `eligible_chunk_tokens`
+pinned at exactly 0.0 the whole time.) If a scenario needs a shortcut, shrink
+the window; if you must inflate, document which asserted conditions become
+unreachable.
+
 Gated scenarios (skip with a printed reason until their dependency lands):
 
 - **Fold-dependent** (`fold-under-pressure`, `ctx-reduce-roundtrip`) — the Rust
