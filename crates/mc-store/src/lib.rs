@@ -3568,6 +3568,11 @@ pub struct ModuleMeta {
     /// Last Channel-1 severity band that appended a reminder. Empty means no active band.
     #[serde(default)]
     pub channel1_last_nudge_level: String,
+    /// Auto-search decisions are persisted immediately, but their first provider-visible
+    /// rendering waits for a cache-busting pass. This set is cleared only when that pass applies
+    /// the corresponding immutable hint rows.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub pending_user_hint_block_ids: BTreeSet<String>,
     /// Set by ctx_reduce after the agent has acted on a reminder. The next transform
     /// suppresses new Channel-1 appends while still replaying every stored append row.
     #[serde(default)]
