@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::transform::ReductionDecision;
+use crate::transform::{utf16_len, utf16_prefix, ReductionDecision};
 
 // --- ported TS constants (exact; the differential golden is the arbiter) ---
 
@@ -86,13 +86,7 @@ const T1_TOOLS: &[&str] = &["read", "todowrite", "task", "aft_outline", "aft_zoo
 const T2_TOOLS: &[&str] = &["edit", "write", "apply_patch", "grep", "glob", "aft_search"];
 /// Newest-window tool arcs keep a name-preserving call skeleton; older ones fully
 /// reduce the call block. The skeleton-vs-full choice is frozen at freeze time.
-const RECENT_TOOL_SKELETON_WINDOW: usize = 20;
-/// Supersession never rewrites an owner message in the newest window. The 20-message
-/// window matches the existing skeleton window and exceeds the observed maximum cache
-/// marker advance of 3 messages per pass, providing more than 6x margin. A future wire
-/// protocol could carry the exact marker index if measurement still finds rewrites of
-/// newly cached content.
-pub(crate) const RECENT_SUPERSESSION_WINDOW: usize = RECENT_TOOL_SKELETON_WINDOW;
+pub(crate) const RECENT_TOOL_SKELETON_WINDOW: usize = 20;
 
 /// The reduction kind emitted per block. `drop` = `[dropped]` placeholder;
 /// `skeleton` = a name-preserving ToolCall shell (newest window, pairing context);
@@ -239,7 +233,7 @@ pub struct SelectionConfig {
 /// arcs to reduce; the arc then expands to per-block decisions.
 struct ToolArc {
     arc_id: String,
-    /// Message that owns the ToolCall block; supersession recency is message-based.
+    /// Message that owns the ToolCall block; duplicate fingerprints are owner-qualified.
     owner_message_id: Option<String>,
     name: String,
     /// Original tool name, needed because the duplicate-safe set retains the `mcp_` prefix.
@@ -551,13 +545,8 @@ pub(crate) fn filter_reasoning_ineligible_decisions(
 /// reference when the target already has a minted visible tag number.
 const DROPPED_PLACEHOLDER: &str = "[dropped]";
 
-/// Slice without splitting a UTF-8 char boundary (mirrors the TS safeSlice, which
-/// guards surrogate pairs; Rust slicing must land on a char boundary).
 fn safe_prefix(s: &str, max_len: usize) -> &str {
-    if s.len() <= max_len {
-        return s;
-    }
-    let mut end = max_len;
+    let mut end = max_len.min(s.len());
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
@@ -565,20 +554,17 @@ fn safe_prefix(s: &str, max_len: usize) -> &str {
 }
 
 /// Clamp a diff value to a region hint (edit_marker): first `EDIT_REGION_HINT_LEN`
-/// chars + the sentinel. Idempotent (already-hinted values pass through). Pure.
+/// UTF-16 units + the sentinel. Idempotent (already-hinted values pass through). Pure.
 fn region_hint(value: &str) -> String {
     if value.ends_with(TRUNCATION_SENTINEL) {
         return value.to_string();
     }
-    if value.chars().count() > EDIT_REGION_HINT_LEN {
-        // char-count semantics mirror the TS `value.length` on the BMP; use a
-        // char-boundary-safe byte prefix sized to EDIT_REGION_HINT_LEN chars.
-        let byte_len: usize = value
-            .char_indices()
-            .nth(EDIT_REGION_HINT_LEN)
-            .map(|(i, _)| i)
-            .unwrap_or(value.len());
-        format!("{}{}", safe_prefix(value, byte_len), TRUNCATION_SENTINEL)
+    if utf16_len(value) > EDIT_REGION_HINT_LEN {
+        format!(
+            "{}{}",
+            utf16_prefix(value, EDIT_REGION_HINT_LEN),
+            TRUNCATION_SENTINEL
+        )
     } else {
         value.to_string()
     }
@@ -751,10 +737,7 @@ fn expand_arc(
 /// meta drop-all, ctx_note drop-on-zero-value-action; edit/write older-per-file →
 /// edit_marker. Returns per-arc intents so the caller expands + shapes them. Active
 /// (non-reduced, client-executed) arcs only.
-fn select_supersession(
-    arcs: &[&ToolArc],
-    recent_message_ids: &HashSet<String>,
-) -> HashMap<String, ArcIntent> {
+fn select_supersession(arcs: &[&ToolArc]) -> HashMap<String, ArcIntent> {
     let mut intents: HashMap<String, ArcIntent> = HashMap::new();
     // Newest-arc-first for keep-N and newest-per-file semantics.
     let mut newest_first: Vec<&&ToolArc> = arcs.iter().collect();
@@ -774,15 +757,9 @@ fn select_supersession(
         if is_edit_tool(name) {
             if let Some(fp) = read_input_str(&arc.input, FILE_PATH_KEYS) {
                 if seen_file.contains(&fp) {
-                    if arc
-                        .owner_message_id
-                        .as_ref()
-                        .is_some_and(|mid| !recent_message_ids.contains(mid))
-                    {
-                        intents
-                            .entry(arc.arc_id.clone())
-                            .or_insert(ArcIntent { edit_marker: true });
-                    }
+                    intents
+                        .entry(arc.arc_id.clone())
+                        .or_insert(ArcIntent { edit_marker: true });
                 } else {
                     seen_file.insert(fp); // newest edit to this file stays full
                 }
@@ -805,12 +782,7 @@ fn select_supersession(
         } else {
             false
         };
-        if is_drop_target
-            && arc
-                .owner_message_id
-                .as_ref()
-                .is_some_and(|mid| !recent_message_ids.contains(mid))
-        {
+        if is_drop_target {
             // A full drop supersedes an edit_marker for the same arc (drop wins).
             intents.insert(arc.arc_id.clone(), ArcIntent { edit_marker: false });
         }
@@ -1144,19 +1116,6 @@ pub(crate) fn select_reductions_with_outcome(
     let arcs = group_arcs(items, frozen_keys);
     let reasoning_ineligible_arcs = reasoning_ineligible_arc_ids(items);
     let reasoning_adjacency_collapse_arcs = reasoning_adjacency_collapse_arc_ids(items);
-    let mut messages_by_recency: Vec<(u64, String)> = items
-        .iter()
-        .filter_map(|item| Some((item.ordinal, item_message_id(item)?.to_owned())))
-        .collect();
-    messages_by_recency.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-    let mut seen_message_ids = HashSet::new();
-    messages_by_recency.retain(|(_, mid)| seen_message_ids.insert(mid.clone()));
-    let recent_supersession_message_ids: HashSet<String> = messages_by_recency
-        .into_iter()
-        .take(RECENT_SUPERSESSION_WINDOW)
-        .map(|(_, mid)| mid)
-        .collect();
-
     // The COMPOSED candidate pool: active (non-reduced), client-executed arcs only.
     // frozen_keys is applied per-block at emit time (expand_arc skips frozen ids); an
     // arc is "reduced/inactive" once ANY of its blocks is frozen — excluded here so it
@@ -1166,6 +1125,10 @@ pub(crate) fn select_reductions_with_outcome(
         .filter(|a| {
             !a.reduced && !a.provider_executed && !reasoning_ineligible_arcs.contains(&a.arc_id)
         })
+        .collect();
+    let arc_by_id: HashMap<&str, &ToolArc> = active_arcs
+        .iter()
+        .map(|arc| (arc.arc_id.as_str(), *arc))
         .collect();
 
     // Per-arc reduction intents (arc_id → shape), assembled in TS precedence order.
@@ -1215,7 +1178,7 @@ pub(crate) fn select_reductions_with_outcome(
             if cfg.smart_drops && (!emergency_arc_ids.is_empty() || !two_pass_arc_ids.is_empty()) {
                 // A superseded arc remains eligible while the ride gate is shut, so the count
                 // observed when it next opens summarizes everything accumulated between rides.
-                let intents = select_supersession(&active_arcs, &recent_supersession_message_ids);
+                let intents = select_supersession(&active_arcs);
                 eligible_supersession_arc_ids =
                     Some(intents.keys().cloned().collect::<HashSet<_>>());
                 for (arc_id, intent) in intents {
@@ -1229,11 +1192,11 @@ pub(crate) fn select_reductions_with_outcome(
         }
         PassClass::Execute => {
             // Order = dedup (drop) → two-pass (drop) → control-plane (drop) → edit (edit_marker).
-            // drop wins: a later edit_marker never overrides an assigned drop.
-            if ctx.supersession_ride_available || !two_pass_arc_ids.is_empty() {
-                for arc_id in &dedup_arc_ids {
-                    arc_shapes.insert(arc_id.clone(), ArcShape::DedupFullDrop);
-                }
+            // drop wins: a later edit_marker never overrides an assigned drop. The transform maps
+            // ordinary scheduler Execute here only when classification identifies an independent
+            // bust opportunity; an active background historian defers ordinary executes first.
+            for arc_id in &dedup_arc_ids {
+                arc_shapes.insert(arc_id.clone(), ArcShape::DedupFullDrop);
             }
             for arc_id in &two_pass_arc_ids {
                 arc_shapes
@@ -1246,7 +1209,7 @@ pub(crate) fn select_reductions_with_outcome(
             if cfg.smart_drops && (ctx.supersession_ride_available || !two_pass_arc_ids.is_empty())
             {
                 // Count the exact selector output before overlap precedence removes members.
-                let intents = select_supersession(&active_arcs, &recent_supersession_message_ids);
+                let intents = select_supersession(&active_arcs);
                 eligible_supersession_arc_ids =
                     Some(intents.keys().cloned().collect::<HashSet<_>>());
                 for (arc_id, intent) in intents {
@@ -1267,6 +1230,33 @@ pub(crate) fn select_reductions_with_outcome(
         PassClass::Defer => unreachable!("defer returned early"),
     }
 
+    // Supersession's recency floor follows the newest ACTIVE tag window rather than a second
+    // owner-message K=20 window. If either half has a protected active tag, retain the whole arc;
+    // otherwise filtering only the tagged result would leave a partially superseded pair.
+    let protected_supersession_arcs = |protected_block_ids: &HashSet<String>| {
+        eligible_supersession_arc_ids.as_ref().map(|eligible| {
+            eligible
+                .iter()
+                .filter(|arc_id| {
+                    arc_by_id.get(arc_id.as_str()).is_some_and(|arc| {
+                        arc.call_inputs
+                            .iter()
+                            .any(|(id, _)| protected_block_ids.contains(id))
+                            || arc
+                                .result_ids
+                                .iter()
+                                .any(|id| protected_block_ids.contains(id))
+                    })
+                })
+                .cloned()
+                .collect::<HashSet<_>>()
+        })
+    };
+    let supersession_arcs_with_tag_window_protection =
+        protected_supersession_arcs(&ctx.tag_window_protected_block_ids);
+    let supersession_arcs_with_exempt_message_protection =
+        protected_supersession_arcs(&ctx.exempt_message_protected_block_ids);
+
     // Resolve fresh full-drop intents to a skeleton when either recency or removal safety
     // requires a result shell. Decided ONCE here (freeze-time): frozen_keys excludes replayed
     // arcs, so neither an aging window nor a newly detected adjacency can change frozen bytes.
@@ -1283,16 +1273,20 @@ pub(crate) fn select_reductions_with_outcome(
         .map(|a| a.arc_id.clone())
         .collect();
 
-    let arc_by_id: HashMap<&str, &ToolArc> = active_arcs
-        .iter()
-        .map(|a| (a.arc_id.as_str(), *a))
-        .collect();
-
     let mut out: Vec<ReductionDecision> = Vec::new();
     for (arc_id, shape) in &arc_shapes {
         let Some(arc) = arc_by_id.get(arc_id.as_str()) else {
             continue;
         };
+        if supersession_arcs_with_tag_window_protection
+            .as_ref()
+            .is_some_and(|protected| protected.contains(arc_id))
+            || supersession_arcs_with_exempt_message_protection
+                .as_ref()
+                .is_some_and(|protected| protected.contains(arc_id))
+        {
+            continue;
+        }
         let resolved = match shape {
             ArcShape::EditMarker => ArcShape::EditMarker,
             ArcShape::Skeleton => ArcShape::Skeleton,
@@ -1326,31 +1320,6 @@ pub(crate) fn select_reductions_with_outcome(
             .get(decision.target_id.as_str())
             .is_none_or(|arc_id| !reasoning_ineligible_arcs.contains(*arc_id))
     });
-
-    let supersession_arcs_with_tag_window_protection =
-        eligible_supersession_arc_ids.as_ref().map(|eligible| {
-            out.iter()
-                .filter(|decision| {
-                    ctx.tag_window_protected_block_ids
-                        .contains(&decision.target_id)
-                })
-                .filter_map(|decision| arc_by_block_id.get(decision.target_id.as_str()).copied())
-                .filter(|arc_id| eligible.contains(*arc_id))
-                .map(str::to_string)
-                .collect::<HashSet<_>>()
-        });
-    let supersession_arcs_with_exempt_message_protection =
-        eligible_supersession_arc_ids.as_ref().map(|eligible| {
-            out.iter()
-                .filter(|decision| {
-                    ctx.exempt_message_protected_block_ids
-                        .contains(&decision.target_id)
-                })
-                .filter_map(|decision| arc_by_block_id.get(decision.target_id.as_str()).copied())
-                .filter(|arc_id| eligible.contains(*arc_id))
-                .map(str::to_string)
-                .collect::<HashSet<_>>()
-        });
 
     // Protection is block-specific, not an ordinal cutoff: remove protected targets from
     // both automatic arc decisions and agent-directed decisions before the stable merge.
@@ -1774,7 +1743,7 @@ mod tests {
                     .max()
                     .unwrap_or(0)
                     .saturating_add(1);
-                for n in 0..RECENT_SUPERSESSION_WINDOW {
+                for n in 0..RECENT_TOOL_SKELETON_WINDOW {
                     items.push(text_with_id(
                         &format!("golden-tail-{n}#0"),
                         first_padding_ordinal + n as u64,
@@ -1927,7 +1896,7 @@ mod tests {
             ),
             tool_result("c3", 3, "edit", 100),
         ];
-        for n in 0..RECENT_SUPERSESSION_WINDOW {
+        for n in 0..RECENT_TOOL_SKELETON_WINDOW {
             items.push(text_with_id(&format!("tail-{n}#0"), 4 + n as u64, 1));
         }
         let config = SelectionConfig { smart_drops: true };
@@ -2027,7 +1996,7 @@ mod tests {
             ),
             tool_result("c2", 3, "edit", 100),
         ];
-        for n in 0..RECENT_SUPERSESSION_WINDOW {
+        for n in 0..RECENT_TOOL_SKELETON_WINDOW {
             items.push(text_with_id(&format!("tail-{n}#0"), 4 + n as u64, 1));
         }
 
@@ -2163,7 +2132,7 @@ mod tests {
             ),
             tool_result("c2", 3, "edit", 100),
         ];
-        for n in 0..RECENT_SUPERSESSION_WINDOW {
+        for n in 0..RECENT_TOOL_SKELETON_WINDOW {
             items.push(text_with_id(&format!("tail-{n}#0"), 4 + n as u64, 1));
         }
 
@@ -2223,7 +2192,7 @@ mod tests {
                 100,
             ));
             next_ordinal += 1;
-            for message in 0..RECENT_SUPERSESSION_WINDOW {
+            for message in 0..RECENT_TOOL_SKELETON_WINDOW {
                 items.push(text_with_id(
                     &format!("pass-{pass}-tail-{message}#0"),
                     next_ordinal,
@@ -2262,7 +2231,7 @@ mod tests {
             ));
             items.push(tool_result(&format!("c{n}"), n, "edit", 100));
         }
-        for n in 0..RECENT_SUPERSESSION_WINDOW {
+        for n in 0..RECENT_TOOL_SKELETON_WINDOW {
             items.push(text_with_id(&format!("tail-{n}#0"), 5 + n as u64, 1));
         }
 
@@ -2309,7 +2278,7 @@ mod tests {
             ),
             tool_result("c2", 2, "edit", 100),
         ];
-        for n in 0..RECENT_SUPERSESSION_WINDOW {
+        for n in 0..RECENT_TOOL_SKELETON_WINDOW {
             items.push(text_with_id(&format!("tail-{n}#0"), 3 + n as u64, 1));
         }
 
@@ -2366,7 +2335,7 @@ mod tests {
                 100,
             ));
             next_ordinal += 1;
-            for message in 0..RECENT_SUPERSESSION_WINDOW {
+            for message in 0..RECENT_TOOL_SKELETON_WINDOW {
                 items.push(text_with_id(
                     &format!("pass-{pass}-tail-{message}#0"),
                     next_ordinal,
@@ -2453,7 +2422,7 @@ mod tests {
                 100,
             ));
             next_ordinal += 1;
-            for message in 0..RECENT_SUPERSESSION_WINDOW {
+            for message in 0..RECENT_TOOL_SKELETON_WINDOW {
                 items.push(text_with_id(
                     &format!("latched-{pass}-tail-{message}#0"),
                     next_ordinal,
@@ -2486,46 +2455,69 @@ mod tests {
     }
 
     #[test]
-    fn recent_supersession_floor_waits_until_the_owner_message_ages_out() {
-        let mut items = vec![
-            tool_call(
-                "c1",
-                1,
+    fn supersession_floor_tracks_active_tag_window_on_thirty_arc_fixture() {
+        let mut items = Vec::new();
+        for n in 1..=30u64 {
+            let call_id = format!("c{n}");
+            items.push(tool_call(
+                &call_id,
+                n,
                 "edit",
-                serde_json::json!({"filePath":"a.ts","oldString":"one"}),
+                serde_json::json!({"filePath":"a.ts","oldString":format!("edit-{n}")}),
                 500,
-            ),
-            tool_result("c1", 1, "edit", 100),
-            tool_call(
-                "c2",
-                2,
-                "edit",
-                serde_json::json!({"filePath":"a.ts","oldString":"two"}),
-                500,
-            ),
-            tool_result("c2", 2, "edit", 100),
-        ];
-        for n in 0..18u64 {
-            items.push(text_with_id(&format!("tail-{n}#0"), 3 + n, 1));
+            ));
+            items.push(tool_result(&call_id, n, "edit", 100));
         }
+
         let mut ctx = base_ctx(PassClass::Execute);
         ctx.pass_already_busting = true;
         ctx.supersession_ride_available = true;
-        let cfg = SelectionConfig { smart_drops: true };
+        // On this fixture the old owner-message floor and the active-tag floor differ:
+        //
+        // | floor basis          | supersession admits | retains                 |
+        // | owner-message K=20   | c1..c10             | c11..c30                |
+        // | active odd tool tags | c2,c4,..,c28        | c1,c3,..,c29 plus c30   |
+        //
+        // A tool tag is carried by its result block. Protecting that one block must retain
+        // the complete arc rather than partially rewriting the untagged call block.
+        for n in (1..30u64).step_by(2) {
+            ctx.tag_window_protected_block_ids
+                .insert(result_block_id(&format!("c{n}")));
+        }
 
-        assert!(select_reductions(&items, &HashSet::new(), &ctx, &cfg).is_empty());
-
-        items.push(text_with_id("tail-18#0", 21, 1));
-        let aged = select_reductions(&items, &HashSet::new(), &ctx, &cfg);
-        assert_eq!(aged.len(), 2);
-        assert!(aged
+        let decisions = select_reductions(
+            &items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig { smart_drops: true },
+        );
+        let admitted = decisions
             .iter()
-            .all(|decision| decision.target_id.starts_with("c1#")));
+            .filter_map(|decision| decision.target_id.split('#').next())
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        let expected = (2..30u64)
+            .step_by(2)
+            .map(|n| format!("c{n}"))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(admitted, expected);
+        assert_eq!(decisions.len(), expected.len() * 2);
     }
 
     #[test]
-    fn supersession_floor_keeps_more_than_six_times_the_measured_marker_advance() {
-        assert_eq!(RECENT_SUPERSESSION_WINDOW, 20);
+    fn edit_marker_region_hint_caps_utf16_and_backs_off_split_surrogate() {
+        let split_astral = format!("{}😀tail", "a".repeat(39));
+        assert_eq!(
+            region_hint(&split_astral),
+            format!("{}{}", "a".repeat(39), TRUNCATION_SENTINEL)
+        );
+
+        let complete_astral = format!("{}😀tail", "a".repeat(38));
+        assert_eq!(
+            region_hint(&complete_astral),
+            format!("{}😀{}", "a".repeat(38), TRUNCATION_SENTINEL)
+        );
     }
 
     #[test]
@@ -2899,7 +2891,7 @@ mod tests {
             tool_call("c9", 9, "read", serde_json::json!({}), 50),
             tool_result("c9", 9, "read", 300),
         ];
-        for n in 0..RECENT_SUPERSESSION_WINDOW {
+        for n in 0..RECENT_TOOL_SKELETON_WINDOW {
             items.push(text_with_id(&format!("tail-{n}#0"), 10 + n as u64, 1));
         }
         let c1_marker_payload = |ctx: &SelectionContext| -> Option<String> {
@@ -3224,7 +3216,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_safe_tools_wait_for_a_riding_bust_and_defer_passes() {
+    fn duplicate_safe_tools_run_on_execute_but_not_defer_passes() {
         let items = vec![
             tool_call_with_ids(
                 "owner#0",
@@ -3245,12 +3237,20 @@ mod tests {
             ),
             tool_result_with_ids("newer-result#0", "owner#1", 3, "mcp_read", 300),
         ];
-        let held = base_ctx(PassClass::Execute);
-        assert!(
-            select_reductions(&items, &HashSet::new(), &held, &SelectionConfig::default())
-                .is_empty(),
-            "duplicate selection must not create its own cache bust"
+        let execute = base_ctx(PassClass::Execute);
+        let selected = select_reductions(
+            &items,
+            &HashSet::new(),
+            &execute,
+            &SelectionConfig::default(),
         );
+        assert_eq!(selected.len(), 2);
+        assert!(selected
+            .iter()
+            .any(|decision| decision.target_id == "owner#0"));
+        assert!(selected
+            .iter()
+            .any(|decision| decision.target_id == "older-result#0"));
 
         let deferred = base_ctx(PassClass::Defer);
         assert!(

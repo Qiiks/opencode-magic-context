@@ -7820,13 +7820,13 @@ fn strip_mc_tag_notation(text: &str) -> String {
     output
 }
 
-fn utf16_len(text: &str) -> usize {
+pub(crate) fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
 }
 
 /// Keep whole Unicode scalars while measuring the prefix in UTF-16 code units, matching the
 /// TypeScript wire renderer without producing an invalid half-surrogate in Rust output.
-fn utf16_prefix(text: &str, limit: usize) -> &str {
+pub(crate) fn utf16_prefix(text: &str, limit: usize) -> &str {
     let mut used = 0;
     let mut end = 0;
     for (start, character) in text.char_indices() {
@@ -8427,15 +8427,100 @@ fn tag_stripped_text(text: &str) -> &str {
     }
 }
 
+const SYSTEM_INJECTION_MARKERS: &[&str] = &[
+    "<!-- OMO_INTERNAL_INITIATOR -->",
+    "[SYSTEM DIRECTIVE: MAGIC-CONTEXT",
+    "[SYSTEM DIRECTIVE: OH-MY-OPENCODE",
+    "[Category+Skill Reminder]",
+    "[EDIT ERROR - IMMEDIATE ACTION REQUIRED]",
+    "[task CALL FAILED - IMMEDIATE RETRY REQUIRED]",
+    "[EMERGENCY CONTEXT WINDOW WARNING]",
+    "Unstable background agent appears idle",
+    "**THE SUBAGENT JUST CLAIMED THIS TASK IS DONE.",
+];
+
 fn is_system_injected_text(text: &str) -> bool {
     let text = tag_stripped_text(text);
     text == "<!-- OMO_INTERNAL_INITIATOR -->"
         || (text.starts_with("<system-reminder>") && text.ends_with("</system-reminder>"))
         || text.starts_with("[SYSTEM DIRECTIVE:")
-        || text.starts_with("[Category+Skill Reminder]")
-        || text.starts_with("[EDIT ERROR - IMMEDIATE ACTION REQUIRED]")
         || text.starts_with("[task CALL FAILED")
-        || text.starts_with("[EMERGENCY CONTEXT WINDOW WARNING]")
+        || SYSTEM_INJECTION_MARKERS
+            .iter()
+            .any(|marker| text.starts_with(marker))
+}
+
+fn system_reminder_regex() -> &'static regex::Regex {
+    static SYSTEM_REMINDER: OnceLock<regex::Regex> = OnceLock::new();
+    SYSTEM_REMINDER
+        .get_or_init(|| regex::Regex::new(r"(?is)<system-reminder>.*?</system-reminder>").unwrap())
+}
+
+fn next_oh_my_directive(text: &str, from: usize) -> Option<usize> {
+    [
+        "[SYSTEM DIRECTIVE: OH-MY-OPENCODE",
+        "[SYSTEM DIRECTIVE: OH-MY-CLAUDE",
+    ]
+    .iter()
+    .filter_map(|marker| text[from..].find(marker).map(|offset| from + offset))
+    .min()
+}
+
+fn directive_block_end(text: &str, body_start: usize) -> usize {
+    let mut search_from = body_start;
+    while let Some(offset) = text[search_from..].find("\n\n") {
+        let boundary = search_from + offset;
+        let after_boundary = &text[boundary + 2..];
+        let next_non_whitespace = after_boundary.trim_start().chars().next();
+        if !matches!(next_non_whitespace, Some('-' | '*')) {
+            return boundary;
+        }
+        search_from = boundary + 2;
+    }
+    text.len()
+}
+
+/// Remove known injected regions while retaining authored text around them. A returned empty
+/// string means the caller should preserve the message/block shape with its provider sentinel.
+fn strip_system_injection(text: &str) -> Option<String> {
+    let has_injection = SYSTEM_INJECTION_MARKERS
+        .iter()
+        .any(|marker| text.contains(marker))
+        || system_reminder_regex().is_match(text);
+    if !has_injection {
+        return None;
+    }
+
+    let mut cleaned = system_reminder_regex().replace_all(text, "").into_owned();
+    cleaned = cleaned.replace("<!-- OMO_INTERNAL_INITIATOR -->", "");
+
+    let mut search_from = 0;
+    while let Some(start) = next_oh_my_directive(&cleaned, search_from) {
+        let Some(close_offset) = cleaned[start..].find(']') else {
+            search_from = start + 1;
+            continue;
+        };
+        let body_start = start + close_offset + 1;
+        let end = directive_block_end(&cleaned, body_start);
+        cleaned.replace_range(start..end, "");
+        search_from = start;
+    }
+
+    for marker in SYSTEM_INJECTION_MARKERS {
+        if marker.starts_with("<!-- ") || marker.starts_with("[SYSTEM DIRECTIVE") {
+            continue;
+        }
+        let Some(start) = cleaned.find(marker) else {
+            continue;
+        };
+        let end = cleaned[start + marker.len()..]
+            .find("\n\n")
+            .map(|offset| start + marker.len() + offset)
+            .unwrap_or(cleaned.len());
+        cleaned.replace_range(start..end, "");
+    }
+
+    Some(cleaned.trim().to_string())
 }
 
 fn is_dropped_placeholder_block(block: &CkWireBlock) -> bool {
@@ -8535,10 +8620,14 @@ fn message_strip_unit<'a>(core: &'a CoreState, kind: &str, mid: &str) -> Option<
     core.frozen_units.iter().find(|unit| unit.key == key)
 }
 
+fn block_strip_unit<'a>(core: &'a CoreState, kind: &str, block_id: &str) -> Option<&'a FrozenUnit> {
+    let key = format!("strip:{kind}:{block_id}");
+    core.frozen_units.iter().find(|unit| unit.key == key)
+}
+
 fn message_tag_number(message: &CkIngressMessage, tag_numbers: &BTreeMap<String, u64>) -> u64 {
-    // A missing tag has unknown age. Ordinals are a separate identity space and must never
-    // be substituted here: clearing an untagged message would make a partial tag snapshot
-    // destructively appear older than it is.
+    // TypeScript represents a missing tag as age zero for processed-image stripping. Reasoning
+    // callers separately require a positive tag before mutating signed or authored text.
     tag_numbers.get(&message.mid).copied().unwrap_or(0)
 }
 
@@ -8569,9 +8658,8 @@ fn tag_number_by_message(tags: &[McTagRow]) -> BTreeMap<String, u64> {
 }
 
 fn tag_age_cutoff(req: &TransformRequest, tag_numbers: &BTreeMap<String, u64>) -> Option<u64> {
-    let max_tag = tag_numbers.values().copied().max()?;
-    let cutoff = max_tag.saturating_sub(req.clear_reasoning_age);
-    (cutoff > 0).then_some(cutoff)
+    let max_tag = tag_numbers.values().copied().max().unwrap_or(0);
+    Some(max_tag.saturating_sub(req.clear_reasoning_age))
 }
 
 fn new_frozen_strip_units(
@@ -8612,13 +8700,35 @@ fn new_frozen_strip_units(
             // that older user content has already reached the model.
             has_assistant_response = true;
         }
-        if message.ck.role != "user" {
-            if index < protected_start && whole_system_injected(blocks) {
+        if index < protected_start {
+            if message.ck.role != "user" && whole_system_injected(blocks) {
                 let unit = strip_unit("system_injected", &message.mid, &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
                     units.insert(unit.key.clone(), unit);
                 }
+            } else {
+                // Surgical replacements freeze the cleaned text itself on this bust. Later defer
+                // passes look up the block id and replay these exact bytes without re-running the
+                // marker parser, so tail growth cannot trickle additional cache changes.
+                for (block_index, block) in blocks.iter().enumerate() {
+                    let ck_wire::CkKind::Text { text } = &block.kind else {
+                        continue;
+                    };
+                    let Some(cleaned) = strip_system_injection(text) else {
+                        continue;
+                    };
+                    if cleaned == *text {
+                        continue;
+                    }
+                    let target = format!("{}#{block_index}", message.mid);
+                    let unit = strip_unit("system_injected_block", &target, &cleaned);
+                    if !existing_keys.contains(unit.key.as_str()) {
+                        units.insert(unit.key.clone(), unit);
+                    }
+                }
             }
+        }
+        if message.ck.role != "user" {
             if request_accepts_empty_content(req)
                 && index < protected_start
                 && blocks.iter().any(is_reduce_block)
@@ -8655,8 +8765,9 @@ fn new_frozen_strip_units(
         if has_assistant_response
             && request_accepts_empty_content(req)
             && age_cutoff.is_some_and(|cutoff| {
-                let tag = message_tag_number(message, tag_numbers);
-                tag > 0 && tag <= cutoff
+                // Missing tags are age zero in the TypeScript lane. This decision is still
+                // minted only on a bust and then frozen by message/block id for stable replay.
+                message_tag_number(message, tag_numbers) <= cutoff
             })
             && blocks.iter().any(image_block_is_large)
         {
@@ -8720,6 +8831,16 @@ fn apply_surface_strips(
         if index >= rebuilt.content.len() {
             continue;
         }
+        if !reasoning_policy.exempt {
+            if let Some(unit) = block_strip_unit(core, "system_injected_block", block.id()) {
+                rebuilt.content[index].kind = ck_wire::CkKind::Text {
+                    text: unit.frozen_payload.clone(),
+                };
+                rebuilt.content[index].mark_modified();
+                touched = true;
+                continue;
+            }
+        }
         let clear_typed_reasoning = !reasoning_policy.exempt
             && message.ck.role == "assistant"
             && aged
@@ -8773,6 +8894,13 @@ fn surviving_strip_units(core: &CoreState, req: &TransformRequest) -> Vec<Frozen
         .iter()
         .map(|message| message.mid.as_str())
         .collect();
+    let live_block_ids = req
+        .messages
+        .iter()
+        .flat_map(|message| {
+            (0..message.ck.content.len()).map(|index| format!("{}#{index}", message.mid))
+        })
+        .collect::<HashSet<_>>();
     core.frozen_units
         .iter()
         .filter(|unit| unit.key.starts_with("strip:"))
@@ -8780,7 +8908,9 @@ fn surviving_strip_units(core: &CoreState, req: &TransformRequest) -> Vec<Frozen
             unit.key
                 .strip_prefix("strip:")
                 .and_then(|rest| rest.split_once(':'))
-                .is_some_and(|(_, mid)| live_mids.contains(mid))
+                .is_some_and(|(_, target)| {
+                    live_mids.contains(target) || live_block_ids.contains(target)
+                })
         })
         .cloned()
         .collect()
@@ -11471,6 +11601,99 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn mixed_system_injection_strips_on_bust_and_replays_frozen_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mixed = wire_item(
+            "user",
+            "mixed-injection",
+            1,
+            &["Keep this authored request.\n\n<system-reminder>hidden transport</system-reminder>"],
+        );
+        let mut request = req("surgical-strip", "cfg0", vec![mixed]);
+        request.protected_tags = 0;
+
+        let bust = run(&store, &request, &spine());
+        assert_eq!(bust.action, "HARD");
+        assert_eq!(
+            tail_bytes(&bust, "mixed-injection"),
+            "Keep this authored request."
+        );
+        let frozen = store.load("surgical-strip").unwrap();
+        let unit = frozen
+            .core
+            .frozen_units
+            .iter()
+            .find(|unit| unit.key == "strip:system_injected_block:mixed-injection#0")
+            .expect("bust must freeze the surgical block replacement");
+        assert_eq!(unit.frozen_payload, "Keep this authored request.");
+
+        let stabilization = run(&store, &request, &spine());
+        assert_eq!(
+            tail_bytes(&stabilization, "mixed-injection"),
+            unit.frozen_payload
+        );
+        let replay = run(&store, &request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(tail_bytes(&replay, "mixed-injection"), unit.frozen_payload);
+
+        for marker in [
+            "Unstable background agent appears idle",
+            "**THE SUBAGENT JUST CLAIMED THIS TASK IS DONE.",
+        ] {
+            let source = format!("authored\n\n{marker}\ntransport details");
+            assert_eq!(strip_system_injection(&source).as_deref(), Some("authored"));
+        }
+    }
+
+    #[test]
+    fn untagged_answered_image_strips_on_bust_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let image = CkIngressMessage {
+            mid: "image-user".to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "user",
+                vec![CkWireBlock::bare(ck_wire::CkKind::Media(
+                    ck_wire::MediaBlock {
+                        kind: ck_wire::MediaKind::Image,
+                        media_type: "image/png".to_string(),
+                        filename: None,
+                        source: json!({"type": "data_base64", "data": "x".repeat(300)}),
+                    },
+                ))],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some("image-user".to_string()),
+                    ..Default::default()
+                },
+            ),
+        };
+        let assistant = wire_item("assistant", "image-answer", 2, &["processed"]);
+        let mut request = req("untagged-image", "cfg0", vec![image, assistant]);
+        request.provider_id = Some("anthropic".to_string());
+        request.protected_tags = 0;
+
+        let bust = run(&store, &request, &spine());
+        assert_eq!(bust.action, "HARD");
+        assert_eq!(tail_bytes(&bust, "image-user"), "");
+        let frozen = store.load("untagged-image").unwrap();
+        assert!(frozen
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "strip:processed_image:image-user"));
+
+        let stabilization = run(&store, &request, &spine());
+        assert_eq!(tail_bytes(&stabilization, "image-user"), "");
+        let replay = run(&store, &request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(tail_bytes(&replay, "image-user"), "");
+    }
+
     /// Models copy the tag notation they see in history onto their own replies.
     /// The overlay must strip those imitation prefixes on assistant text at any
     /// line start while preserving mid-prose references on ACTIVE passes. False
@@ -13430,7 +13653,7 @@ pub(crate) mod tests {
         let mut hard_messages = vec![item("a", 1, "raw")];
         hard_messages.extend(todowrite_arc("hard_old", 2));
         hard_messages.extend(todowrite_arc("hard_new", 4));
-        for ordinal in 6..(6 + crate::selection::RECENT_SUPERSESSION_WINDOW as u64) {
+        for ordinal in 6..(6 + crate::selection::RECENT_TOOL_SKELETON_WINDOW as u64) {
             hard_messages.push(item(&format!("hard-tail-{ordinal}"), ordinal, "tail"));
         }
         let hard = transform(
@@ -13559,7 +13782,7 @@ pub(crate) mod tests {
         assert_eq!(boot.action, "HARD");
         messages.extend(todowrite_arc("tail_old", 3));
         messages.extend(todowrite_arc("tail_new", 5));
-        for ordinal in 7..(7 + crate::selection::RECENT_SUPERSESSION_WINDOW as u64) {
+        for ordinal in 7..(7 + crate::selection::RECENT_TOOL_SKELETON_WINDOW as u64) {
             messages.push(item(&format!("tail-{ordinal}"), ordinal, "tail"));
         }
         let mut loaded = s.load("ses").unwrap();
@@ -13611,7 +13834,7 @@ pub(crate) mod tests {
                 },
             ),
         });
-        for ordinal in 7..(7 + crate::selection::RECENT_SUPERSESSION_WINDOW as u64) {
+        for ordinal in 7..(7 + crate::selection::RECENT_TOOL_SKELETON_WINDOW as u64) {
             messages.push(item(&format!("tail-{ordinal}"), ordinal, "tail"));
         }
         let mut loaded = s.load("ses").unwrap();
@@ -21517,7 +21740,7 @@ pub(crate) mod tests {
                 &format!("result {edit_number}"),
             ));
             next_ordinal += 1;
-            for message in 0..crate::selection::RECENT_SUPERSESSION_WINDOW {
+            for message in 0..crate::selection::RECENT_TOOL_SKELETON_WINDOW {
                 messages.push(item(
                     &format!("latched-{pass}-tail-{message}"),
                     next_ordinal,
@@ -21611,7 +21834,7 @@ pub(crate) mod tests {
                 &format!("result {edit_number}"),
             ));
             next_ordinal += 1;
-            for message in 0..crate::selection::RECENT_SUPERSESSION_WINDOW {
+            for message in 0..crate::selection::RECENT_TOOL_SKELETON_WINDOW {
                 messages.push(item(
                     &format!("batch-{pass}-tail-{message}"),
                     next_ordinal,
@@ -21778,7 +22001,7 @@ pub(crate) mod tests {
                 &format!("result {edit_number}"),
             ));
             next_ordinal += 1;
-            for message in 0..crate::selection::RECENT_SUPERSESSION_WINDOW {
+            for message in 0..crate::selection::RECENT_TOOL_SKELETON_WINDOW {
                 messages.push(item(
                     &format!("pass-{pass}-tail-{message}"),
                     next_ordinal,
