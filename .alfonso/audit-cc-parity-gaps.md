@@ -19,21 +19,25 @@ These can be implemented on the Claude Code leg without changing the harness's f
 - **Source:** `crates/mc-module/src/transform.rs:2423-2430`; profile eligibility is defined at `crates/mc-module/src/lib.rs:373-382`.
 - **Classification:** incidental — this is one profile gate.
 
-## I-02 — The Claude Code auto-search switch is coupled to tagging and cannot honor `memory.auto_search`
+## I-02 — The Claude Code auto-search switch is coupled to tagging and cannot honor `memory.auto_search` — **FIXED (2026-08-13, magic-context a267d79f)**
+
+> auto_search { enabled, score_threshold, min_prompt_chars } on McModuleConfig with TS defaults; decoupled from tagging availability (auto-search holds its own overlay state and replays its persisted hint when ctx_reduce is unavailable).
 
 - **OpenCode/Pi:** auto-search is independently configurable (`enabled`, `score_threshold`, and `min_prompt_chars`) and runs only when enabled: `packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts:1841-1863`; Pi has the same gate at `packages/pi-plugin/src/context-handler.ts:2977-3001`.
 - **Claude Code:** a user hint is computed whenever the tagging overlay is enabled; there is no `auto_search` field in `McModuleConfig` and no request field carrying the three controls. Disabling OpenCode/Pi auto-search therefore has no Claude Code equivalent, while losing `ctx_reduce` availability also disables Claude Code auto-search.
 - **Source:** `crates/mc-module/src/transform.rs:7042-7079`; `crates/mc-module/src/config.rs:44-67`; `crates/mc-module/src/transform.rs:582-611`.
 - **Classification:** incidental — missing config and request plumbing.
 
-## I-03 — Claude Code auto-search uses a different corpus and ranker
+## I-03 — Claude Code auto-search uses a different corpus and ranker — **BLOCKED ON CUTOVER DATA-PLANE (ask_4f3736cd; .alfonso/plans/i03-cc-auto-search-corpus.md)**
 
 - **OpenCode/Pi:** unified search can use semantic embeddings and searches hidden memories, raw/compacted messages, and git commits; it filters already-visible memory IDs and applies the configured top-score threshold: `packages/plugin/src/hooks/magic-context/auto-search-runner.ts:311-381` and `packages/pi-plugin/src/context-handler.ts:2977-3001`.
 - **Claude Code:** performs a synchronous lexical overlap search over visible memory candidates and compartment bodies only. It requires two matched lexical tokens plus a rare-token and normalized-score test. It has no raw-message source, git-commit source, embedding path, visible-memory exclusion, or configured score threshold.
 - **Source:** `crates/mc-module/src/transform.rs:7117-7253`, especially candidate construction at `7137-7185` and scoring at `7191-7237`.
 - **Classification:** incidental — an unported search implementation.
 
-## I-04 — Claude Code auto-search sanitization and hint bytes differ
+## I-04 — Claude Code auto-search sanitization and hint bytes differ — **FIXED (2026-08-13, magic-context a267d79f)**
+
+> Sanitization set (reminders, HTML comments, XML/HTML tags, §N§) and hint bytes (3×80 fragments, 800 cap, singular/plural headers) matched to the TS spec; commit-metadata residual named against I-03.
 
 - **OpenCode/Pi:** removes nested reminders, HTML comments, generic XML/HTML tags, and `§N§` prefixes before search; renders up to three caveman-ultra fragments at 80 characters each, source-aware commit metadata, singular/plural headers, and an 800-character total cap: `packages/plugin/src/hooks/magic-context/auto-search-runner.ts:177-220`; `packages/plugin/src/hooks/magic-context/auto-search-hint.ts:25-27,55-85,96-130`.
 - **Claude Code:** removes only `<system-reminder>` wrappers and `§N§` notation, leaving other markup/comments in the query. It renders source-agnostic one-line snippets at 100 characters each, a fixed header/footer, and a 600-character debug-only cap.
@@ -111,7 +115,9 @@ These can be implemented on the Claude Code leg without changing the harness's f
 - **Source:** `crates/mc-module/src/m0_compose.rs:280-391`; config surface `crates/mc-module/src/config.rs:44-67`.
 - **Classification:** incidental — Anthropic supports image content and CK already has media carriers.
 
-## I-14 — Caveman exists in Rust but is not live through the Claude Code config/binding path
+## I-14 — Caveman exists in Rust but is not live through the Claude Code config/binding path — **FIXED (2026-08-13, magic-context a267d79f)**
+
+> caveman { enabled, min_size } on McModuleConfig; CC binding derives the request fields exactly as the OpenCode TS adapter does; selection/replay untouched, defaults preserve today's bytes.
 
 - **OpenCode/Pi:** resolve `caveman_text_compression`, send the enablement and minimum size into the transform, persist tier depth, and replay compression. OpenCode's native request wiring is `packages/plugin/src/hooks/magic-context/rust-mode-transform.ts:1638-1663`; Pi replay is `packages/pi-plugin/src/context-handler.ts:4869-4907`.
 - **Claude Code:** Rust has caveman selection/replay when `TransformRequest.caveman_enabled` is true, but the Claude Code-owned config has no caveman field and the binding does not derive one. The serde default is false, so a normal CC request that omits the unowned field never enables it.
