@@ -3219,7 +3219,8 @@ fn apply_once(
         Some(&mut m1_revision_read_timings),
     )?;
     let effective_usage = effective_usage(req.usage.as_ref(), loaded.meta.last_usage.as_ref());
-    let context_limit_tokens = effective_context_limit_tokens(&effective_usage);
+    let context_limit_tokens =
+        effective_context_limit_tokens(&effective_usage, req.geometry.as_ref());
     let hard_context_limit_tokens =
         effective_hard_context_limit_tokens(req.geometry.as_ref(), context_limit_tokens);
     let usage_input_tokens = effective_usage.current_total_input_tokens as f64;
@@ -5140,12 +5141,24 @@ fn effective_usage(request: Option<&ModuleUsage>, persisted: Option<&ModuleUsage
         .unwrap_or_default()
 }
 
-fn effective_context_limit_tokens(usage: &ModuleUsage) -> f64 {
+fn effective_context_limit_tokens(
+    usage: &ModuleUsage,
+    geometry: Option<&TransformGeometry>,
+) -> f64 {
     if usage.context_limit_tokens >= crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT {
-        usage.context_limit_tokens as f64
-    } else {
-        200_000.0
+        return usage.context_limit_tokens as f64;
     }
+    // Usage is unfilled on the first pass of a session (no observed pass yet),
+    // but geometry arrives on every request including the first. The resolved
+    // soft denominator is strictly better than the 200k constant guess: bands
+    // still read usage whenever it is present (the geometry contract's belt),
+    // so this only replaces the fallback arm.
+    if let Some(geometry) = geometry {
+        if geometry.usable_soft >= crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT {
+            return geometry.usable_soft as f64;
+        }
+    }
+    200_000.0
 }
 
 fn effective_hard_context_limit_tokens(
@@ -11422,28 +11435,76 @@ pub(crate) mod tests {
     #[test]
     fn effective_context_limit_falls_back_below_plausible_floor() {
         assert_eq!(
-            effective_context_limit_tokens(&ModuleUsage {
-                current_total_input_tokens: 1,
-                context_limit_tokens: 500,
-                ..ModuleUsage::default()
-            }),
+            effective_context_limit_tokens(
+                &ModuleUsage {
+                    current_total_input_tokens: 1,
+                    context_limit_tokens: 500,
+                    ..ModuleUsage::default()
+                },
+                None
+            ),
             200_000.0
         );
         assert_eq!(
-            effective_context_limit_tokens(&ModuleUsage {
-                current_total_input_tokens: 1,
-                context_limit_tokens: 0,
-                ..ModuleUsage::default()
-            }),
+            effective_context_limit_tokens(
+                &ModuleUsage {
+                    current_total_input_tokens: 1,
+                    context_limit_tokens: 0,
+                    ..ModuleUsage::default()
+                },
+                None
+            ),
             200_000.0
         );
         assert_eq!(
-            effective_context_limit_tokens(&ModuleUsage {
-                current_total_input_tokens: 1,
-                context_limit_tokens: crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT,
-                ..ModuleUsage::default()
-            }),
+            effective_context_limit_tokens(
+                &ModuleUsage {
+                    current_total_input_tokens: 1,
+                    context_limit_tokens: crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT,
+                    ..ModuleUsage::default()
+                },
+                None
+            ),
             crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT as f64
+        );
+    }
+
+    #[test]
+    fn first_pass_band_denominator_prefers_geometry_soft_over_the_constant_guess() {
+        // Turn one carries geometry (resolved at the gateway from headers) but
+        // no usage (no observed pass yet). The band denominator must read the
+        // resolved soft value, not the 200k constant; a present usage value
+        // still wins so the geometry-contract belt (bands read usage) holds.
+        let geometry = TransformGeometry {
+            usable_soft: 167_000,
+            usable_hard: 200_000,
+            derivation: "claude-code/200000 window; soft = 167000".to_string(),
+        };
+        assert_eq!(
+            effective_context_limit_tokens(&ModuleUsage::default(), Some(&geometry)),
+            167_000.0
+        );
+        // Usage present: geometry must NOT override the band denominator.
+        assert_eq!(
+            effective_context_limit_tokens(
+                &ModuleUsage {
+                    current_total_input_tokens: 1,
+                    context_limit_tokens: 150_000,
+                    ..ModuleUsage::default()
+                },
+                Some(&geometry)
+            ),
+            150_000.0
+        );
+        // Implausible geometry soft falls through to the constant.
+        let implausible = TransformGeometry {
+            usable_soft: 12,
+            usable_hard: 200_000,
+            derivation: String::new(),
+        };
+        assert_eq!(
+            effective_context_limit_tokens(&ModuleUsage::default(), Some(&implausible)),
+            200_000.0
         );
     }
 
