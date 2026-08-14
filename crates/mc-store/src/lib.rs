@@ -2378,6 +2378,20 @@ const MIGRATIONS: &[Migration] = &[
             ADD COLUMN scheduler_interesting_history TEXT NOT NULL DEFAULT '[]';
         ",
     },
+    Migration {
+        version: 49,
+        // The host renders murals, while every consumer profile composes the frozen m0 prefix.
+        // Keep the rendered bytes under the resolved project identity rather than a session key
+        // so a Claude Code route can inherit the last OpenCode-host-supplied artifact.
+        statements: "
+        CREATE TABLE IF NOT EXISTS mc_project_mural_artifacts (
+            project_path TEXT PRIMARY KEY NOT NULL,
+            data_url BLOB NOT NULL,
+            content_hash TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        ",
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -3907,6 +3921,15 @@ pub struct MemoryRevision {
 pub struct MemoryRenderSnapshot {
     pub memories: Vec<StoredMemory>,
     pub revision: MemoryRevision,
+}
+
+/// A rendered mural artifact shared by every session under one project identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectMuralArtifact {
+    pub project_path: String,
+    pub data_url: Vec<u8>,
+    pub content_hash: String,
+    pub updated_at: i64,
 }
 
 /// The read-consistent inputs used by the module's per-pass m1 revision signal.
@@ -6681,6 +6704,61 @@ impl McStore {
                 )
             })
             .map(|exists| exists != 0)
+            .map_err(Into::into)
+    }
+
+    /// Return the last OC-host-rendered mural for a resolved project identity.
+    pub fn load_project_mural_artifact(
+        &self,
+        project_path: &str,
+    ) -> Result<Option<ProjectMuralArtifact>, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT project_path, data_url, content_hash, updated_at
+                       FROM mc_project_mural_artifacts
+                      WHERE project_path = ?1",
+                    params![project_path],
+                    |row| {
+                        Ok(ProjectMuralArtifact {
+                            project_path: row.get(0)?,
+                            data_url: row.get(1)?,
+                            content_hash: row.get(2)?,
+                            updated_at: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()
+            })
+            .map_err(Into::into)
+    }
+
+    /// Store a host-rendered mural only when its content identity changes.
+    ///
+    /// A transform can carry the same host artifact on every pass. Updating `updated_at` in that
+    /// case would turn ordinary defer traffic into a write stream, so the hash is the sole gate.
+    pub fn upsert_project_mural_artifact(
+        &self,
+        project_path: &str,
+        data_url: &[u8],
+        content_hash: &str,
+        updated_at: i64,
+    ) -> Result<bool, McStoreError> {
+        self.inner
+            .with_conn_fenced(|tx| {
+                let changed = tx.execute(
+                    "INSERT INTO mc_project_mural_artifacts(
+                         project_path, data_url, content_hash, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(project_path) DO UPDATE SET
+                         data_url = excluded.data_url,
+                         content_hash = excluded.content_hash,
+                         updated_at = excluded.updated_at
+                     WHERE mc_project_mural_artifacts.content_hash <> excluded.content_hash",
+                    params![project_path, data_url, content_hash, updated_at],
+                )?;
+                Ok(changed != 0)
+            })
             .map_err(Into::into)
     }
 
@@ -19504,10 +19582,70 @@ mod tests {
     }
 
     #[test]
+    fn project_mural_artifact_upsert_is_hash_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+
+        assert!(store
+            .upsert_project_mural_artifact(
+                "git:project",
+                b"data:image/png;base64,YQ==",
+                "mural-a",
+                100,
+            )
+            .unwrap());
+        let first = store
+            .load_project_mural_artifact("git:project")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.data_url, b"data:image/png;base64,YQ==");
+        assert_eq!(first.content_hash, "mural-a");
+        assert_eq!(first.updated_at, 100);
+
+        assert!(!store
+            .upsert_project_mural_artifact(
+                "git:project",
+                b"data:image/png;base64,unexpected-but-same-hash",
+                "mural-a",
+                200,
+            )
+            .unwrap());
+        let unchanged = store
+            .load_project_mural_artifact("git:project")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged, first,
+            "same hash must not bump artifact identity"
+        );
+
+        assert!(store
+            .upsert_project_mural_artifact(
+                "git:project",
+                b"data:image/png;base64,Yg==",
+                "mural-b",
+                300,
+            )
+            .unwrap());
+        assert_eq!(
+            store
+                .load_project_mural_artifact("git:project")
+                .unwrap()
+                .unwrap(),
+            ProjectMuralArtifact {
+                project_path: "git:project".to_string(),
+                data_url: b"data:image/png;base64,Yg==".to_vec(),
+                content_hash: "mural-b".to_string(),
+                updated_at: 300,
+            }
+        );
+    }
+
+    #[test]
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=48).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=49).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -19576,6 +19714,22 @@ mod tests {
             })
             .unwrap();
         assert_eq!(fresh_has_scheduler_histories, 2);
+        let fresh_has_mural_artifacts = fresh
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT name FROM sqlite_master
+                      WHERE type = 'table' AND name = 'mc_project_mural_artifacts'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .unwrap();
+        assert_eq!(
+            fresh_has_mural_artifacts.as_deref(),
+            Some("mc_project_mural_artifacts")
+        );
         let fresh_has_import_table = fresh
             .inner
             .with_conn(|conn| {
@@ -19708,6 +19862,22 @@ mod tests {
             })
             .unwrap();
         assert_eq!(migrated_has_scheduler_histories, 2);
+        let migrated_has_mural_artifacts = migrated
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT name FROM sqlite_master
+                      WHERE type = 'table' AND name = 'mc_project_mural_artifacts'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .unwrap();
+        assert_eq!(
+            migrated_has_mural_artifacts.as_deref(),
+            Some("mc_project_mural_artifacts")
+        );
         let migrated_has_import_table = migrated
             .inner
             .with_conn(|conn| {
@@ -22923,7 +23093,7 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=48).collect::<Vec<_>>());
+        assert_eq!(versions, (1_i64..=49).collect::<Vec<_>>());
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)
