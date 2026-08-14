@@ -48,9 +48,9 @@ use mc_store::{
     BlockIdentity, Channel1AppendRow, DeferredExecuteState, LineageAnchor, LineageConstituent,
     LineageDescentDisposition, LineageDescentRequest, McStore, McStoreError, McTagRow,
     MemoryRevision, ModuleMeta, ModuleUsage, NoteDelivery, PassSchedulerObservation,
-    PendingAgentDrop, PendingRewriteState, ServedBlockFingerprint, StoredCompartment,
-    TagCacheSummary, TagMintInput, TemporalMarkInput, TemporalMarkRow, TransformCommit,
-    TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
+    PendingAgentDrop, PendingChannel2Directive, PendingRewriteState, ServedBlockFingerprint,
+    StoredCompartment, TagCacheSummary, TagMintInput, TemporalMarkInput, TemporalMarkRow,
+    TransformCommit, TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -764,6 +764,9 @@ pub struct TransformRequest {
     /// another module directive until the host re-arms it.
     #[serde(default)]
     pub channel2_nudge_state: String,
+    /// Claude Code gateway acknowledgement for the directive appended to the preceding request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel2_delivered_id: Option<String>,
     /// Durable provider-overflow recovery state. It controls historian discard-last healing.
     #[serde(default)]
     pub emergency_recovery_armed: bool,
@@ -924,6 +927,8 @@ struct TransformRequestWire {
     request_observed_at_ms: Option<u64>,
     #[serde(default)]
     channel2_nudge_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channel2_delivered_id: Option<String>,
     #[serde(default)]
     emergency_recovery_armed: bool,
     #[serde(default)]
@@ -1003,6 +1008,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             prev_response_completed_at_ms: wire.prev_response_completed_at_ms,
             request_observed_at_ms: wire.request_observed_at_ms,
             channel2_nudge_state: wire.channel2_nudge_state,
+            channel2_delivered_id: wire.channel2_delivered_id,
             emergency_recovery_armed: wire.emergency_recovery_armed,
             emergency_recovery_no_head_escape: wire.emergency_recovery_no_head_escape,
             detected_context_limit: wire.detected_context_limit,
@@ -1066,6 +1072,13 @@ pub enum SurfaceState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Channel2NudgeDirective {
     pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Channel2Directive {
+    pub text: String,
+    pub directive_id: String,
+    pub armed_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1373,6 +1386,9 @@ pub struct TransformResponse {
     /// persist delivery because the host owns the channel-2 lease and deduplication.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_directives: Option<HostDirectives>,
+    /// Claude Code gateway instruction. It is response metadata and never enters `ck_messages`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub channel2_directive: Option<Channel2Directive>,
     /// Delivery ledger rows whose note bytes were included in this bust. The host sends
     /// the existing transform.ack/nack after applying and validating the response.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1412,6 +1428,7 @@ impl TransformResponse {
             ck_messages: None,
             native_messages: None,
             host_directives: None,
+            channel2_directive: None,
             note_deliveries: None,
         }
     }
@@ -1450,6 +1467,7 @@ impl TransformResponse {
             ),
             native_messages: None,
             host_directives: None,
+            channel2_directive: None,
             note_deliveries: None,
         }
     }
@@ -2566,6 +2584,7 @@ fn apply_additive_only(
             ck_messages: Some(messages),
             native_messages: None,
             host_directives: None,
+            channel2_directive: None,
             note_deliveries: None,
         },
     })
@@ -4814,6 +4833,25 @@ fn apply_once(
         .map(|value| serde_json::to_string(value).expect("divergence is serializable"));
     meta.served_output_fingerprint = served_fingerprints;
 
+    let channel2_output = channel2_directives(
+        serializer_profile,
+        &req.session_id,
+        req.channel2_delivered_id.as_deref(),
+        &req.channel2_nudge_state,
+        ctx.now_ms,
+        Channel2DirectiveInput {
+            core: &core,
+            projection: &projection,
+            tag_rows: &tag_rows,
+            mutation_exempt_mid,
+            context_limit_tokens,
+            input_tokens: usage_input_tokens,
+            execute_threshold_percentage: ctx.execute_threshold_percentage,
+            protected_tags: req.protected_tags,
+        },
+        &mut meta,
+    );
+
     // Build the output before committing so a missing synthetic-todo anchor cannot
     // persist an unusable frozen pair. Pending rows are classified from the final plan:
     // live unfrozen targets remain durable, while applied or retired targets are consumed.
@@ -4920,22 +4958,6 @@ fn apply_once(
             row_version,
         );
     }
-    let host_directives = {
-        channel2_directive(Channel2DirectiveInput {
-            profile: serializer_profile,
-            core: &core,
-            meta: &meta,
-            projection: &projection,
-            tag_rows: &tag_rows,
-            mutation_exempt_mid,
-            context_limit_tokens,
-            input_tokens: usage_input_tokens,
-            execute_threshold_percentage: ctx.execute_threshold_percentage,
-            protected_tags: req.protected_tags,
-            channel2_nudge_state: &req.channel2_nudge_state,
-        })
-    };
-
     timings.store_memories = m1_revision_read_timings.memories_ms;
     timings.store_notes = m1_revision_read_timings.notes_ms;
     timings.total = elapsed_ms(total_started_at);
@@ -4977,7 +4999,8 @@ fn apply_once(
             historian: None,
             ck_messages: Some(ck_messages),
             native_messages: None,
-            host_directives,
+            host_directives: channel2_output.host_directives,
+            channel2_directive: channel2_output.channel2_directive,
             note_deliveries: (!note_deliveries.is_empty()).then_some(note_deliveries),
         },
     })
@@ -8425,9 +8448,7 @@ fn channel2_extra_token_lanes(
 }
 
 struct Channel2DirectiveInput<'a> {
-    profile: Option<SerializerProfile>,
     core: &'a CoreState,
-    meta: &'a ModuleMeta,
     projection: &'a FlatProjection,
     tag_rows: &'a [McTagRow],
     mutation_exempt_mid: Option<&'a str>,
@@ -8435,20 +8456,69 @@ struct Channel2DirectiveInput<'a> {
     input_tokens: f64,
     execute_threshold_percentage: f64,
     protected_tags: usize,
-    channel2_nudge_state: &'a str,
 }
 
-fn channel2_directive(input: Channel2DirectiveInput<'_>) -> Option<HostDirectives> {
-    // OpenCode is the host-delivery leg. CC and owned serializers retain their historic
-    // response shape; their host integrations own any channel-2 surface separately.
-    if input.profile != Some(SerializerProfile::OpencodeAiSdk)
-        || matches!(
-            input.channel2_nudge_state,
-            "pending" | "claimed" | "delivered"
-        )
-        || input.context_limit_tokens <= 0.0
-        || input.execute_threshold_percentage <= 0.0
-    {
+struct Channel2Pressure {
+    due: bool,
+    reclaimable_tokens: i64,
+    hint: Vec<(i64, String)>,
+}
+
+#[derive(Default)]
+struct Channel2DirectiveOutput {
+    host_directives: Option<HostDirectives>,
+    channel2_directive: Option<Channel2Directive>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn channel2_directives(
+    profile: Option<SerializerProfile>,
+    session_id: &str,
+    channel2_delivered_id: Option<&str>,
+    channel2_nudge_state: &str,
+    now_ms: i64,
+    input: Channel2DirectiveInput<'_>,
+    meta: &mut ModuleMeta,
+) -> Channel2DirectiveOutput {
+    match profile {
+        Some(SerializerProfile::OpencodeAiSdk) => {
+            if matches!(channel2_nudge_state, "pending" | "claimed" | "delivered") {
+                return Channel2DirectiveOutput::default();
+            }
+            let host_directives = channel2_pressure(input, meta)
+                .filter(|pressure| pressure.due)
+                .map(|pressure| HostDirectives {
+                    channel2_nudge: Some(Channel2NudgeDirective {
+                        text: build_channel2_host_reminder(
+                            pressure.reclaimable_tokens,
+                            &pressure.hint,
+                        ),
+                    }),
+                });
+            Channel2DirectiveOutput {
+                host_directives,
+                channel2_directive: None,
+            }
+        }
+        Some(SerializerProfile::ClaudeCodeAnthropic) => Channel2DirectiveOutput {
+            host_directives: None,
+            channel2_directive: claude_code_channel2_directive(
+                session_id,
+                channel2_delivered_id,
+                now_ms,
+                input,
+                meta,
+            ),
+        },
+        _ => Channel2DirectiveOutput::default(),
+    }
+}
+
+fn channel2_pressure(
+    input: Channel2DirectiveInput<'_>,
+    meta: &ModuleMeta,
+) -> Option<Channel2Pressure> {
+    if input.context_limit_tokens <= 0.0 || input.execute_threshold_percentage <= 0.0 {
         return None;
     }
     let working_window_tokens =
@@ -8457,7 +8527,7 @@ fn channel2_directive(input: Channel2DirectiveInput<'_>) -> Option<HostDirective
             .max(0.0) as i64;
     let active_tags = active_tags_for_channel2(
         input.core,
-        input.meta,
+        meta,
         input.projection,
         input.tag_rows,
         input.mutation_exempt_mid,
@@ -8469,15 +8539,74 @@ fn channel2_directive(input: Channel2DirectiveInput<'_>) -> Option<HostDirective
     let due = reclaimable_tokens >= CHANNEL2_MIN_RECLAIMABLE
         && (usable_tokens == 0.0
             || reclaimable_tokens as f64 >= usable_tokens * CHANNEL2_USABLE_FRACTION);
-    if !due {
+    let hint = if due {
+        oldest_channel2_hint(&active_tags, input.protected_tags)
+    } else {
+        Vec::new()
+    };
+    Some(Channel2Pressure {
+        due,
+        reclaimable_tokens,
+        hint,
+    })
+}
+
+fn claude_code_channel2_directive(
+    session_id: &str,
+    channel2_delivered_id: Option<&str>,
+    now_ms: i64,
+    input: Channel2DirectiveInput<'_>,
+    meta: &mut ModuleMeta,
+) -> Option<Channel2Directive> {
+    if channel2_delivered_id.is_some_and(|delivered_id| {
+        meta.pending_channel2_directive
+            .as_ref()
+            .is_some_and(|pending| pending.directive_id == delivered_id)
+    }) {
+        meta.pending_channel2_directive = None;
+    }
+
+    if let Some(pending) = meta.pending_channel2_directive.as_ref() {
+        return Some(Channel2Directive {
+            text: pending.text.clone(),
+            directive_id: pending.directive_id.clone(),
+            armed_at_ms: pending.armed_at_ms,
+        });
+    }
+
+    let pressure = channel2_pressure(input, meta)?;
+    if !pressure.due {
+        meta.channel2_pressure_latched = false;
         return None;
     }
-    let hint = oldest_channel2_hint(&active_tags, input.protected_tags);
-    Some(HostDirectives {
-        channel2_nudge: Some(Channel2NudgeDirective {
-            text: build_channel2_reminder(reclaimable_tokens, &hint),
-        }),
+    if meta.channel2_pressure_latched {
+        return None;
+    }
+
+    let arming_watermark = meta.channel2_arming_watermark.saturating_add(1);
+    let pending = PendingChannel2Directive {
+        text: build_channel2_reminder_text(pressure.reclaimable_tokens, &pressure.hint),
+        directive_id: channel2_directive_id(session_id, arming_watermark),
+        armed_at_ms: now_ms,
+        arming_watermark,
+    };
+    meta.channel2_arming_watermark = arming_watermark;
+    meta.channel2_pressure_latched = true;
+    meta.pending_channel2_directive = Some(pending.clone());
+    Some(Channel2Directive {
+        text: pending.text,
+        directive_id: pending.directive_id,
+        armed_at_ms: pending.armed_at_ms,
     })
+}
+
+fn channel2_directive_id(session_id: &str, arming_watermark: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mc-channel2-directive-v1\0");
+    hasher.update(session_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(arming_watermark.to_be_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn protected_tag_cutoff(active_tags: &[ActiveTagForNudge], protected_tags: usize) -> Option<i64> {
@@ -8530,12 +8659,17 @@ fn oldest_channel2_hint(
         .collect()
 }
 
-fn build_channel2_reminder(reclaimable_tokens: i64, hint: &[(i64, String)]) -> String {
+fn build_channel2_reminder_text(reclaimable_tokens: i64, hint: &[(i64, String)]) -> String {
     let amount = approx_thousands(reclaimable_tokens);
     let hint_text = format_reclaimable_hint(hint);
     format!(
-        "<system-reminder>\nRoutine context housekeeping is near: a large span of this session will be comparted soon, and ~{amount} tokens of tool output remain unreduced. Drop spent outputs with ctx_reduce first so the archived span is the part that matters.{hint_text}\n</system-reminder>"
+        "Routine context housekeeping is near: a large span of this session will be comparted soon, and ~{amount} tokens of tool output remain unreduced. Drop spent outputs with ctx_reduce first so the archived span is the part that matters.{hint_text}"
     )
+}
+
+fn build_channel2_host_reminder(reclaimable_tokens: i64, hint: &[(i64, String)]) -> String {
+    let text = build_channel2_reminder_text(reclaimable_tokens, hint);
+    format!("<system-reminder>\n{text}\n</system-reminder>")
 }
 
 fn decide_channel1(
@@ -12430,6 +12564,7 @@ pub(crate) mod tests {
             prev_response_completed_at_ms: None,
             request_observed_at_ms: None,
             channel2_nudge_state: String::new(),
+            channel2_delivered_id: None,
             emergency_recovery_armed: false,
             emergency_recovery_no_head_escape: false,
             detected_context_limit: 0,
@@ -29061,5 +29196,21 @@ pub(crate) mod tests {
         assert!(error
             .to_string()
             .contains("refusing silent re-base-to-1 fallback"));
+    }
+
+    #[test]
+    fn channel2_directive_id_hashes_session_and_arming_watermark_deterministically() {
+        assert_eq!(
+            channel2_directive_id("ses", 1),
+            "f585181359b732157103a0bd050a378a89c47585fcd12f5b90e13ec864aa70d8"
+        );
+        assert_ne!(
+            channel2_directive_id("ses", 1),
+            channel2_directive_id("ses", 2)
+        );
+        assert_ne!(
+            channel2_directive_id("ses", 1),
+            channel2_directive_id("other", 1)
+        );
     }
 }

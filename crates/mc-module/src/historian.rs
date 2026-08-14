@@ -1809,6 +1809,7 @@ mod tests {
             prev_response_completed_at_ms: None,
             request_observed_at_ms: None,
             channel2_nudge_state: String::new(),
+            channel2_delivered_id: None,
             emergency_recovery_armed: false,
             emergency_recovery_no_head_escape: false,
             detected_context_limit: 0,
