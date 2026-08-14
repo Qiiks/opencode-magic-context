@@ -609,18 +609,40 @@ describe("detectConflicts", () => {
             expect(result).toEqual({ auto: false, prune: true });
         });
 
-        it("mirrors the SDK default semantics when compaction is absent (auto=true, prune=false)", async () => {
-            // The OpenCode schema annotates compaction.auto with default true and
-            // compaction.prune with default false (packages/core/src/v1/config/
-            // config.ts in the opencode repo), so an absent compaction block
-            // resolves to { auto: true, prune: false }.
+        it("returns null when the compaction block is absent (file-based fallback, not host defaults)", async () => {
+            // An absent block means the response shape did not carry the resolved
+            // state (server version drift, a fetch racing boot) — NOT that the
+            // host resolved its defaults. Reading absence as auto=true disabled
+            // the plugin for real users whose auto=false lived in the file layer
+            // (issue #309, second arm: the 2026-08-14 desktop incident where
+            // every session overflowed with nothing managing the window).
             const client = {
                 config: {
                     get: async () => ({ data: {} }),
                 },
             };
             const result = await resolveCompactionForBoot(client);
-            expect(result).toEqual({ auto: true, prune: false });
+            expect(result).toBeNull();
+        });
+
+        it("returns null when compaction values are not explicit booleans", async () => {
+            const client = {
+                config: {
+                    get: async () => ({ data: { compaction: { auto: "true", prune: null } } }),
+                },
+            };
+            const result = await resolveCompactionForBoot(client);
+            expect(result).toBeNull();
+        });
+
+        it("returns null when the response data is missing entirely", async () => {
+            const client = {
+                config: {
+                    get: async () => ({}) as { data?: Record<string, unknown> },
+                },
+            };
+            const result = await resolveCompactionForBoot(client);
+            expect(result).toBeNull();
         });
 
         it("returns null when the client throws (file-based fallback used)", async () => {

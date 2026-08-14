@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readJsoncFile } from "./jsonc-parser";
+import { log } from "./logger";
 import { getOpenCodeConfigPaths } from "./opencode-config-dir";
 
 interface OpenCodeConfig {
@@ -232,14 +233,18 @@ interface ResolvedCompactionBlock {
  * read would be wrongly flagged. We never re-derive what the host will tell
  * us.
  *
- * The OpenCode schema annotates `compaction.auto` with default `true` and
- * `compaction.prune` with default `false` (see
- * packages/core/src/v1/config/config.ts in the opencode repo), so an absent
- * compaction block resolves to `{ auto: true, prune: false }` — mirroring the
- * host's own default semantics rather than inventing our own.
+ * A response WITHOUT a compaction block is INCONCLUSIVE, not "host defaults
+ * apply": a server whose `/config` shape drifted (OpenCode Desktop bundles
+ * its own server version) or a fetch racing boot returns data with no
+ * `compaction` key, and reading that absence as `auto=true` disables the
+ * plugin — the one wrong direction, because a false disable leaves NOTHING
+ * managing the window and every long session overflows (issue #309, second
+ * arm). Only an explicit boolean from the host resolves this arm; anything
+ * else returns `null` so the caller falls back to the file-based check,
+ * which reads the layers the user actually wrote.
  *
- * Returns `null` when the fetch fails or times out (bounded to `timeoutMs` so
- * boot never hangs), so the caller falls back to the file-based check.
+ * Returns `null` when the fetch fails, times out (bounded to `timeoutMs` so
+ * boot never hangs), or serves no explicit compaction block.
  */
 export async function resolveCompactionForBoot(
     client: OpencodeConfigClientLike,
@@ -255,11 +260,16 @@ export async function resolveCompactionForBoot(
         // The SDK's generated `Config` type has no `compaction` key, so read it
         // defensively from the runtime response.
         const compaction = (result?.data as ResolvedCompactionBlock | undefined)?.compaction;
-        // Mirror the host's defaults: auto defaults true, prune defaults false.
-        return {
-            auto: compaction?.auto ?? true,
-            prune: compaction?.prune ?? false,
-        };
+        // Explicit booleans only. An absent block (or non-boolean values) means
+        // the response shape did not carry the resolved state — fall back to the
+        // file arm rather than resolving to the plugin-disabling default.
+        if (typeof compaction?.auto !== "boolean" || typeof compaction?.prune !== "boolean") {
+            log(
+                `[magic-context] conflict-detector: resolved config carried no explicit compaction block (${JSON.stringify(compaction) ?? "absent"}); falling back to file-based detection`,
+            );
+            return null;
+        }
+        return { auto: compaction.auto, prune: compaction.prune };
     } catch {
         return null;
     }
