@@ -105,7 +105,6 @@ const CHANNEL1_GENTLE_FRACTION: f64 = 0.2;
 const CHANNEL2_MIN_RECLAIMABLE: i64 = 10_000;
 const CHANNEL2_USABLE_FRACTION: f64 = 1.0 / 3.0;
 const TEMPORAL_AWARENESS_THRESHOLD_MS: i64 = 5 * 60 * 1_000;
-const USER_HINT_QUERY_CHAR_CAP: usize = 500;
 const USER_HINT_FRAGMENT_CHAR_CAP: usize = 80;
 const USER_HINT_TOTAL_CHAR_CAP: usize = 800;
 const USER_HINT_CANDIDATE_LIMIT: usize = 100;
@@ -3800,23 +3799,25 @@ fn apply_once(
             overlay_frontier,
             mutation_exempt_mid,
             lineage_anchor_mid,
+            &meta.rendered_memory_ids,
         )? {
-            if !hint.hint_text.is_empty() {
+            if !hint.hint_text.is_empty()
+                && user_hint_target_was_served(&loaded.meta, &hint.block_id)
+                && !is_bust_pass
+            {
+                // A decision for a previously served block is immutable, but its first append
+                // must ride a later independent bust rather than rewriting the cached prefix.
                 meta.pending_user_hint_block_ids
                     .insert(hint.block_id.clone());
             }
-            if is_bust_pass {
-                user_hints.push(UserHintRow {
-                    block_id: hint.block_id.clone(),
-                    hint_text: hint.hint_text.clone(),
-                    created_at: ctx.now_ms,
-                });
-            }
+            user_hints.push(UserHintRow {
+                block_id: hint.block_id.clone(),
+                hint_text: hint.hint_text.clone(),
+                created_at: ctx.now_ms,
+            });
             pending_overlays.user_hint = Some(hint);
         }
         if is_bust_pass {
-            // Hint decisions may safely write during a defer, but only a pass that already
-            // changes provider-visible bytes may make their overlay visible for the first time.
             meta.pending_user_hint_block_ids.clear();
         }
     }
@@ -7598,6 +7599,15 @@ fn eligible_authored_user_tail(req: &TransformRequest) -> Option<&CkIngressMessa
     is_authored_user_message(tail).then_some(tail)
 }
 
+fn user_hint_target_was_served(meta: &ModuleMeta, block_id: &str) -> bool {
+    let Some((message_id, block_index)) = split_block_id(block_id) else {
+        return false;
+    };
+    meta.served_output_fingerprint.iter().any(|served| {
+        served.block_id == block_id || (block_index == 0 && served.block_id == message_id)
+    })
+}
+
 fn compute_active_overlay_decisions(
     input: OverlayComputation<'_, '_>,
 ) -> Result<PendingOverlayDecisions, TransformError> {
@@ -7784,8 +7794,8 @@ fn compute_active_overlay_decisions(
     })
 }
 
-/// Decide one durable auto-search hint for a new live user tail. The decision is DB-only;
-/// first rendering remains deferred until a pass that already busts the provider cache.
+/// Decide one durable auto-search hint for a new live user tail. The caller may render the
+/// frozen decision immediately only when this request has not served the target block before.
 #[allow(clippy::too_many_arguments)]
 fn maybe_decide_live_user_hint(
     store: &McStore,
@@ -7796,8 +7806,14 @@ fn maybe_decide_live_user_hint(
     overlay_frontier: Option<u64>,
     mutation_exempt_mid: Option<&str>,
     lineage_anchor_mid: Option<&str>,
+    rendered_memory_ids: &[i64],
 ) -> Result<Option<UserHintDecisionInput>, TransformError> {
     let Some(message) = eligible_authored_user_tail(req)
+        .filter(|message| {
+            req.messages
+                .last()
+                .is_some_and(|tail| tail.mid == message.mid)
+        })
         .filter(|message| mutation_exempt_mid != Some(message.mid.as_str()))
         .filter(|message| lineage_anchor_mid != Some(message.mid.as_str()))
     else {
@@ -7817,8 +7833,8 @@ fn maybe_decide_live_user_hint(
     }
 
     // Suppression must inspect the raw user text before sanitization removes the markers that
-    // identify an existing augmentation. The length gate likewise uses the uncapped prompt so a
-    // long live request is not rejected merely because the search query has a safety cap.
+    // identify an existing augmentation. Search and length admission use the same full sanitized
+    // prompt so terms late in a long authored request remain visible to ranking.
     let message_text = user_hint_message_text(message);
     let raw_prompt = sanitize_user_hint_query(&message_text);
     let hint_text = if has_stacked_user_hint_augmentation(&message_text)
@@ -7827,14 +7843,14 @@ fn maybe_decide_live_user_hint(
     {
         String::new()
     } else {
-        let query = cap_user_hint_query(&raw_prompt);
         let results = run_user_hint_lexical_search(
             store,
             ctx.project_path,
             &req.session_id,
-            &query,
+            &raw_prompt,
             ctx.memory_enabled,
             req.auto_search_score_threshold,
+            rendered_memory_ids,
         )?;
         render_user_hint(&results).unwrap_or_default()
     };
@@ -7869,6 +7885,7 @@ fn run_user_hint_lexical_search(
     query: &str,
     include_memories: bool,
     score_threshold: f64,
+    rendered_memory_ids: &[i64],
 ) -> Result<Vec<crate::memory_tool::MemorySearchResult>, TransformError> {
     #[cfg(test)]
     USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(count.get() + 1));
@@ -7888,6 +7905,9 @@ fn run_user_hint_lexical_search(
         for memory in
             store.load_visible_memory_candidates(project_path, USER_HINT_CANDIDATE_LIMIT)?
         {
+            if rendered_memory_ids.contains(&memory.id) {
+                continue;
+            }
             candidates.push(Candidate {
                 tokens: lexical_tokens(&memory.content),
                 recency: memory.updated_at,
@@ -7978,7 +7998,7 @@ fn run_user_hint_lexical_search(
                 })
                 .sum::<f64>();
             let normalized = score / total_query_weight.max(f64::EPSILON);
-            (normalized >= score_threshold).then_some((
+            Some((
                 normalized,
                 matched.len(),
                 candidate.recency,
@@ -7994,6 +8014,12 @@ fn run_user_hint_lexical_search(
             .then_with(|| right.2.cmp(&left.2))
             .then_with(|| left.3.id.cmp(&right.3.id))
     });
+    if scored
+        .first()
+        .is_none_or(|(score, _, _, _)| *score < score_threshold)
+    {
+        return Ok(Vec::new());
+    }
     Ok(scored
         .into_iter()
         .take(USER_HINT_RESULT_LIMIT)
@@ -8003,7 +8029,7 @@ fn run_user_hint_lexical_search(
 
 #[cfg(test)]
 fn user_hint_query(message: &CkIngressMessage) -> String {
-    cap_user_hint_query(&user_hint_raw_prompt(message))
+    user_hint_raw_prompt(message)
 }
 
 #[cfg(test)]
@@ -8032,27 +8058,6 @@ fn has_stacked_user_hint_augmentation(raw_prompt: &str) -> bool {
     ]
     .iter()
     .any(|marker| raw_prompt.contains(marker))
-}
-
-fn cap_user_hint_query(normalized: &str) -> String {
-    let mut chars = normalized.chars();
-    let mut capped = chars
-        .by_ref()
-        .take(USER_HINT_QUERY_CHAR_CAP)
-        .collect::<String>();
-    if chars.next().is_some_and(|next| !next.is_whitespace())
-        && capped
-            .chars()
-            .last()
-            .is_some_and(|last| !last.is_whitespace())
-    {
-        if let Some(boundary) = capped.rfind(char::is_whitespace) {
-            capped.truncate(boundary);
-        } else {
-            capped.clear();
-        }
-    }
-    capped
 }
 
 fn sanitize_user_hint_query(text: &str) -> String {
@@ -20752,7 +20757,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn user_hint_query_strips_tags_reminders_and_caps_input() {
+    fn user_hint_query_strips_transport_markup_and_keeps_full_input() {
         let long_tail = "x".repeat(600);
         let message = wire_item(
             "user",
@@ -20764,10 +20769,10 @@ pub(crate) mod tests {
             ],
         );
         let query = user_hint_query(&message);
-        assert_eq!(query, "keep words");
+        assert_eq!(query, format!("keep words {long_tail}"));
         assert!(!query.contains("§12§"));
         assert!(!query.contains("drop"));
-        assert!(query.chars().count() < USER_HINT_QUERY_CHAR_CAP);
+        assert!(query.chars().count() > 500);
     }
 
     #[test]
@@ -20915,6 +20920,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -20930,6 +20936,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -20942,6 +20949,7 @@ pub(crate) mod tests {
             "rust ownership beta gamma",
             true,
             0.6,
+            &[],
         )
         .unwrap();
         let rejected = run_user_hint_lexical_search(
@@ -20951,10 +20959,85 @@ pub(crate) mod tests {
             "rust ownership beta gamma",
             true,
             0.95,
+            &[],
         )
         .unwrap();
         assert!(!admitted.is_empty());
         assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn auto_search_threshold_gates_only_the_top_ranked_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        for id in 1..=30 {
+            let content = match id {
+                1 => "alpha beta gamma delta".to_string(),
+                2 => "alpha beta".to_string(),
+                _ => format!("unrelated archive material {id}"),
+            };
+            store
+                .seed_memory(id, "git:proj", "CONSTRAINTS", &content, 50)
+                .unwrap();
+        }
+
+        let results = run_user_hint_lexical_search(
+            &store,
+            "git:proj",
+            "top-result-threshold",
+            "alpha beta gamma delta",
+            true,
+            0.8,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            results.iter().map(|result| result.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn auto_search_excludes_memories_already_rendered_in_session_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .seed_memory(
+                1,
+                "git:proj",
+                "CONSTRAINTS",
+                "rust ownership beta already visible",
+                70,
+            )
+            .unwrap();
+        store
+            .seed_memory(
+                2,
+                "git:proj",
+                "CONSTRAINTS",
+                "rust ownership alternate context",
+                60,
+            )
+            .unwrap();
+        seed_unrelated_hint_candidates(&store);
+        let session = "auto-search-visible-memory";
+        let loaded = store.load(session).unwrap();
+        let mut meta = loaded.meta.clone();
+        meta.rendered_memory_ids = vec![1];
+        store
+            .commit(session, loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        let mut request = cc_req(
+            session,
+            "cfg0",
+            vec![wire_item("user", "m1", 1, &["rust ownership beta"])],
+        );
+        request.auto_search_score_threshold = 0.0;
+
+        let response = run(&store, &request, &spine());
+        let rendered = tail_bytes(&response, "m1");
+        assert!(rendered.contains("rust ownership alternate context"));
+        assert!(!rendered.contains("rust ownership beta already visible"));
     }
 
     #[test]
@@ -20978,7 +21061,7 @@ pub(crate) mod tests {
             "cfg0",
             vec![wire_item("user", "m1", 1, &[&long_prompt])],
         );
-        long_request.auto_search_min_prompt_chars = USER_HINT_QUERY_CHAR_CAP + 1;
+        long_request.auto_search_min_prompt_chars = 501;
         let long_projection = project_messages(&long_request.messages).unwrap();
         let long_decision = maybe_decide_live_user_hint(
             &s,
@@ -20989,6 +21072,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -21015,6 +21099,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -21095,7 +21180,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn user_hint_decides_on_low_pressure_pass_and_first_renders_on_bust() {
+    fn user_hint_new_physical_tail_renders_on_same_low_pressure_pass() {
         run_active_surface_test(|| {
             USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
             let dir = tempfile::tempdir().unwrap();
@@ -21112,11 +21197,11 @@ pub(crate) mod tests {
             seed_unrelated_hint_candidates(&s);
             s.replace_compartments(session, &[comp(1, 1, 1, "a", "SUMMARY")])
                 .unwrap();
-            run(
-                &s,
-                &req(session, "cfg0", vec![item("a", 1, "baseline")]),
-                &spine(),
-            );
+            let mut ctx = pctx("git:proj", "/nonexistent-docs", 1);
+            ctx.cache_ttl = "never".to_string();
+            ctx.memory_budget_tokens = 0.0;
+            let baseline = req(session, "cfg0", vec![item("a", 1, "baseline")]);
+            assert_eq!(transform(&s, &baseline, &ctx).unwrap().action, "HARD");
             USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
 
             let request = req(
@@ -21128,48 +21213,94 @@ pub(crate) mod tests {
                 ],
             );
             let low_pressure = with_usage(request.clone(), 10, 100);
-            let mut ctx = pctx("git:proj", "/nonexistent-docs", 1);
-            ctx.cache_ttl = "never".to_string();
+            let expected_hint = "\n\n<ctx-search-hint>\nYour memory may contain 1 related fragment:\n- rust ownership beta durable context\nIf the fragments above seem relevant to the current request, you may run ctx_search to retrieve full context. Otherwise ignore.\n</ctx-search-hint>";
 
             let first_defer = transform(&s, &low_pressure, &ctx).unwrap();
             assert_eq!(first_defer.action, "SOFT+");
-            assert!(!tail_bytes(&first_defer, "m1").contains("<ctx-search-hint>"));
+            assert_eq!(
+                tail_bytes(&first_defer, "m1"),
+                format!("rust ownership beta{expected_hint}")
+            );
             let after_decision = s.load(session).unwrap();
-            assert!(after_decision
-                .meta
-                .pending_user_hint_block_ids
-                .contains("m1#0"));
+            assert!(after_decision.meta.pending_user_hint_block_ids.is_empty());
             assert!(s
                 .load_user_hints(session)
                 .unwrap()
                 .iter()
-                .any(|row| row.block_id == "m1#0" && !row.hint_text.is_empty()));
+                .any(|row| row.block_id == "m1#0" && row.hint_text == expected_hint));
             assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
 
             for now_ms in 2..=3 {
                 ctx.now_ms = now_ms;
                 let deferred = transform(&s, &low_pressure, &ctx).unwrap();
                 assert_eq!(deferred.action, "SOFT+");
-                assert!(!tail_bytes(&deferred, "m1").contains("<ctx-search-hint>"));
+                assert_eq!(tail_bytes(&deferred, "m1"), tail_bytes(&first_defer, "m1"));
             }
             assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
 
             ctx.now_ms = 4;
-            let mut bust_request = with_usage(request.clone(), 10, 100);
+            let mut bust_request = with_usage(request, 10, 100);
             bust_request.render_config = "cfg1".to_string();
             let force = transform(&s, &bust_request, &ctx).unwrap();
             assert_eq!(force.action, "HARD");
-            assert!(tail_bytes(&force, "m1").contains("<ctx-search-hint>"));
+            assert_eq!(tail_bytes(&force, "m1"), tail_bytes(&first_defer, "m1"));
+        });
+    }
+
+    #[test]
+    fn user_hint_for_a_served_tail_waits_for_an_independent_bust() {
+        run_active_surface_test(|| {
+            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let session = "user-hint-served-tail";
+            s.seed_memory(
+                1,
+                "git:proj",
+                "CONSTRAINTS",
+                "rust ownership beta durable context",
+                70,
+            )
+            .unwrap();
+            seed_unrelated_hint_candidates(&s);
+            let messages = vec![wire_item("user", "m1", 1, &["rust ownership beta"])];
+            let mut dormant = req(session, "cfg0", messages.clone());
+            dormant.auto_search_enabled = false;
+            let mut ctx = pctx("git:proj", "/nonexistent-docs", 1);
+            ctx.cache_ttl = "never".to_string();
+            ctx.memory_budget_tokens = 0.0;
+            let first_serve = transform(&s, &dormant, &ctx).unwrap();
+            assert_eq!(first_serve.action, "HARD");
+            assert_eq!(tail_bytes(&first_serve, "m1"), "rust ownership beta");
+
+            let request = with_usage(req(session, "cfg0", messages.clone()), 10, 100);
+            ctx.now_ms = 2;
+            let deferred = transform(&s, &request, &ctx).unwrap();
+            assert_eq!(deferred.action, "SOFT+");
+            assert_eq!(tail_bytes(&deferred, "m1"), "rust ownership beta");
+            assert!(s
+                .load(session)
+                .unwrap()
+                .meta
+                .pending_user_hint_block_ids
+                .contains("m1#0"));
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
+
+            let mut bust_request = request;
+            bust_request.render_config = "cfg1".to_string();
+            ctx.now_ms = 3;
+            let bust = transform(&s, &bust_request, &ctx).unwrap();
+            assert_eq!(bust.action, "HARD");
+            assert_eq!(
+                tail_bytes(&bust, "m1"),
+                "rust ownership beta\n\n<ctx-search-hint>\nYour memory may contain 1 related fragment:\n- rust ownership beta durable context\nIf the fragments above seem relevant to the current request, you may run ctx_search to retrieve full context. Otherwise ignore.\n</ctx-search-hint>"
+            );
             assert!(s
                 .load(session)
                 .unwrap()
                 .meta
                 .pending_user_hint_block_ids
                 .is_empty());
-
-            ctx.now_ms = 5;
-            let replay = transform(&s, &low_pressure, &ctx).unwrap();
-            assert_eq!(tail_bytes(&replay, "m1"), tail_bytes(&force, "m1"));
         });
     }
 
@@ -21295,8 +21426,53 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn trailing_tool_role_transport_keeps_authored_user_eligible() {
+    fn synthetic_notification_after_user_blocks_same_pass_hint_decision() {
+        USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store
+            .seed_memory(
+                1,
+                "git:proj",
+                "CONSTRAINTS",
+                "rust ownership uses borrowing safely",
+                70,
+            )
+            .unwrap();
+        seed_unrelated_hint_candidates(&store);
+        let mut notification = wire_item("user", "notice", 2, &["synthetic notification"]);
+        notification.ck.meta.synthetic = true;
+        let request = active_cc_req(
+            "synthetic-tail",
+            "cfg0",
+            vec![
+                wire_item("user", "m1", 1, &["rust ownership"]),
+                notification,
+            ],
+        );
+        let projection = project_messages(&request.messages).unwrap();
+
+        assert_eq!(eligible_authored_user_tail(&request).unwrap().mid, "m1");
+        assert!(maybe_decide_live_user_hint(
+            &store,
+            &request,
+            &pctx("git:proj", "/nonexistent-docs", 1),
+            &projection,
+            &[],
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn trailing_tool_role_transport_blocks_same_pass_user_hint_mutation() {
         run_active_surface_test(|| {
+            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
             let dir = tempfile::tempdir().unwrap();
             let store = store(dir.path());
             store
@@ -21317,16 +21493,18 @@ pub(crate) mod tests {
                     wire_item("tool", "result", 2, &["transport output"]),
                 ],
             );
-            run(&store, &request, &spine());
+            assert_eq!(eligible_authored_user_tail(&request).unwrap().mid, "m1");
             let response = run(&store, &request, &spine());
-            assert!(tail_bytes(&response, "m1").contains("<ctx-search-hint>"));
-            assert_eq!(store.overlay_watermark("tool-role-tail").unwrap(), Some(1));
+            assert!(!tail_bytes(&response, "m1").contains("<ctx-search-hint>"));
+            assert!(store.load_user_hints("tool-role-tail").unwrap().is_empty());
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
         });
     }
 
     #[test]
-    fn user_role_result_carrier_neither_targets_overlays_nor_burns_frontier() {
+    fn user_role_result_carrier_blocks_hint_but_not_semantic_temporal_selection() {
         run_active_surface_test(|| {
+            USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
             let dir = tempfile::tempdir().unwrap();
             let store = store(dir.path());
             store
@@ -21355,7 +21533,12 @@ pub(crate) mod tests {
                 &pctx("git:proj", "/nonexistent-docs", 700_000),
             )
             .unwrap();
-            assert!(tail_bytes(&response, "m1").contains("<ctx-search-hint>"));
+            assert!(!tail_bytes(&response, "m1").contains("<ctx-search-hint>"));
+            assert!(store
+                .load_user_hints("user-result-tail")
+                .unwrap()
+                .is_empty());
+            assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
             assert_eq!(
                 store.overlay_watermark("user-result-tail").unwrap(),
                 Some(1)
@@ -21404,6 +21587,7 @@ pub(crate) mod tests {
             "rust ownership",
             true,
             DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
+            &[],
         )
         .unwrap();
         assert_eq!(related[0].id, 1);
@@ -21414,6 +21598,7 @@ pub(crate) mod tests {
             "galaxy telescope",
             true,
             DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
+            &[],
         )
         .unwrap();
         assert!(unrelated.is_empty());
@@ -21424,6 +21609,7 @@ pub(crate) mod tests {
             "quasar deployment",
             true,
             DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
+            &[],
         )
         .unwrap();
         assert!(one_common_token.is_empty());
@@ -21434,6 +21620,7 @@ pub(crate) mod tests {
             "fixture memory",
             true,
             DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
+            &[],
         )
         .unwrap();
         assert!(
@@ -21443,12 +21630,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn user_hint_query_drops_a_token_split_by_the_character_cap() {
-        let complete_prefix = "word ".repeat(99);
-        let split = format!("{complete_prefix}partialtoken suffix");
-        let query = user_hint_query(&wire_item("user", "m1", 1, &[&split]));
-        assert_eq!(query, complete_prefix.trim_end());
-        assert!(!query.contains("parti"));
+    fn user_hint_query_keeps_terms_beyond_the_old_character_cap() {
+        let complete_prefix = "word ".repeat(110);
+        let full_prompt = format!("{complete_prefix}discriminatingterm suffix");
+        let query = user_hint_query(&wire_item("user", "m1", 1, &[&full_prompt]));
+        assert_eq!(query, full_prompt.trim());
+        assert!(query.contains("discriminatingterm suffix"));
+        assert!(query.chars().count() > 500);
     }
 
     #[test]
@@ -21517,6 +21705,8 @@ pub(crate) mod tests {
             .unwrap();
             s.replace_compartments("pending-hint", &[comp(1, 1, 2, "t2#0", "summary")])
                 .unwrap();
+            let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+            ctx.memory_budget_tokens = 0.0;
             let present = active_cc_req(
                 "pending-hint",
                 "cfg0",
@@ -21525,8 +21715,8 @@ pub(crate) mod tests {
                     wire_item("assistant", "t3", 3, &["tail"]),
                 ],
             );
-            run(&s, &present, &spine());
-            run(&s, &present, &spine());
+            transform(&s, &present, &ctx).unwrap();
+            transform(&s, &present, &ctx).unwrap();
             let mut loaded = s.load("pending-hint").unwrap();
             loaded.meta.pending_rewrite = Some(PendingRewriteState {
                 armed_at_ms: 1,
@@ -21547,7 +21737,7 @@ pub(crate) mod tests {
                 "cfg0",
                 vec![wire_item("user", "foreign", 50, &["foreign prompt"])],
             );
-            let response = run(&s, &absent, &spine());
+            let response = transform(&s, &absent, &ctx).unwrap();
             assert_eq!(response.action, "PASSTHROUGH");
             assert!(!tail_bytes(&response, "foreign").contains("<ctx-search-hint>"));
             assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 0);
@@ -21565,7 +21755,7 @@ pub(crate) mod tests {
                     wire_item("user", "foreign", 50, &["foreign prompt"]),
                 ],
             );
-            let active = run(&s, &accepted, &spine());
+            let active = transform(&s, &accepted, &ctx).unwrap();
             assert_eq!(active.action, "HARD");
             assert!(tail_bytes(&active, "foreign").contains("<ctx-search-hint>"));
             assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
@@ -21777,8 +21967,10 @@ pub(crate) mod tests {
                 "cfg0",
                 vec![wire_item("user", "m1", 1, &["baseline prompt"])],
             );
-            run(&s, &baseline, &spine());
-            run(&s, &baseline, &spine());
+            let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+            ctx.memory_budget_tokens = 0.0;
+            transform(&s, &baseline, &ctx).unwrap();
+            transform(&s, &baseline, &ctx).unwrap();
             let tags_before = s.load_tags_for_session("overlay-reject").unwrap();
             let hints_before = s.load_user_hints("overlay-reject").unwrap();
             let temporal_before = s.load_temporal_marks("overlay-reject").unwrap();
@@ -21800,12 +21992,8 @@ pub(crate) mod tests {
                 ],
             );
             rejected.prev_response_completed_at_ms = Some(1);
-            let error = transform(
-                &s,
-                &rejected,
-                &pctx("git:proj", "/nonexistent-docs", 700_000),
-            )
-            .unwrap_err();
+            ctx.now_ms = 700_000;
+            let error = transform(&s, &rejected, &ctx).unwrap_err();
             assert!(matches!(error, TransformError::CoverageGap(_)));
             assert_eq!(
                 s.load_tags_for_session("overlay-reject").unwrap(),
@@ -21827,12 +22015,7 @@ pub(crate) mod tests {
 
             s.replace_compartments("overlay-reject", &[comp(1, 1, 3, "m3#0", "complete range")])
                 .unwrap();
-            transform(
-                &s,
-                &rejected,
-                &pctx("git:proj", "/nonexistent-docs", 700_000),
-            )
-            .unwrap();
+            transform(&s, &rejected, &ctx).unwrap();
             assert!(s
                 .load_user_hints("overlay-reject")
                 .unwrap()
