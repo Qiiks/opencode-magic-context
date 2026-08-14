@@ -1771,6 +1771,9 @@ mod tests {
     fn req(messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
             cache_ttl: None,
+            auto_search_enabled: true,
+            auto_search_score_threshold: 0.35,
+            auto_search_min_prompt_chars: 0,
             kind: "transform".to_string(),
             v: 2,
             serializer_profile: "owned-llmrunner".to_string(),

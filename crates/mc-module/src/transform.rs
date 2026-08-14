@@ -16,7 +16,9 @@
 
 use crate::ck_wire;
 use crate::compartment_coverage::{fold_m0_content_epoch, resolve_coverage, M0ContentEpoch};
-use crate::config::CacheTtlProvenance;
+use crate::config::{
+    CacheTtlProvenance, DEFAULT_AUTO_SEARCH_MIN_PROMPT_CHARS, DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
+};
 use crate::divergence::{self, FirstDivergence};
 use crate::healing::{self, quirk_residual, SerializerProfile};
 use crate::injection::{
@@ -47,6 +49,7 @@ use mc_store::{
     TagCacheSummary, TagMintInput, TemporalMarkInput, TemporalMarkRow, TransformCommit,
     TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -99,13 +102,12 @@ const CHANNEL2_MIN_RECLAIMABLE: i64 = 10_000;
 const CHANNEL2_USABLE_FRACTION: f64 = 1.0 / 3.0;
 const TEMPORAL_AWARENESS_THRESHOLD_MS: i64 = 5 * 60 * 1_000;
 const USER_HINT_QUERY_CHAR_CAP: usize = 500;
-const USER_HINT_FRAGMENT_CHAR_CAP: usize = 100;
-const USER_HINT_TOTAL_CHAR_CAP: usize = 600;
+const USER_HINT_FRAGMENT_CHAR_CAP: usize = 80;
+const USER_HINT_TOTAL_CHAR_CAP: usize = 800;
 const USER_HINT_CANDIDATE_LIMIT: usize = 100;
 const USER_HINT_TOKEN_CAP: usize = 24;
 const USER_HINT_RESULT_LIMIT: usize = 3;
 const USER_HINT_MIN_MATCHED_TOKENS: usize = 2;
-const USER_HINT_NORMALIZED_SCORE_FLOOR: f64 = 0.35;
 const DEFAULT_CLEAR_REASONING_AGE: u64 = 50;
 const DEFAULT_CAVEMAN_MIN_CHARS: usize = 500;
 const FIVE_MINUTE_CACHE_TTL_MS: u64 = 5 * 60 * 1_000;
@@ -579,6 +581,24 @@ pub struct TransformRequest {
     /// provider cache).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ttl: Option<String>,
+    /// Whether automatic memory hints may be appended on an independent cache-busting pass.
+    #[serde(
+        default = "default_auto_search_enabled",
+        skip_serializing_if = "is_default_auto_search_enabled"
+    )]
+    pub auto_search_enabled: bool,
+    /// Minimum normalized rank score that may admit an automatic memory hint.
+    #[serde(
+        default = "default_auto_search_score_threshold",
+        skip_serializing_if = "is_default_auto_search_score_threshold"
+    )]
+    pub auto_search_score_threshold: f64,
+    /// Minimum sanitized prompt length before automatic search is eligible.
+    #[serde(
+        default = "default_auto_search_min_prompt_chars",
+        skip_serializing_if = "is_default_auto_search_min_prompt_chars"
+    )]
+    pub auto_search_min_prompt_chars: usize,
     /// Whether deterministic caveman compression is enabled for this primary session.
     #[serde(default)]
     pub caveman_enabled: bool,
@@ -700,6 +720,30 @@ fn default_clear_reasoning_age() -> u64 {
     DEFAULT_CLEAR_REASONING_AGE
 }
 
+fn default_auto_search_enabled() -> bool {
+    true
+}
+
+fn is_default_auto_search_enabled(value: &bool) -> bool {
+    *value
+}
+
+fn default_auto_search_score_threshold() -> f64 {
+    DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD
+}
+
+fn is_default_auto_search_score_threshold(value: &f64) -> bool {
+    *value == DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD
+}
+
+fn default_auto_search_min_prompt_chars() -> usize {
+    DEFAULT_AUTO_SEARCH_MIN_PROMPT_CHARS
+}
+
+fn is_default_auto_search_min_prompt_chars(value: &usize) -> bool {
+    *value == DEFAULT_AUTO_SEARCH_MIN_PROMPT_CHARS
+}
+
 fn default_caveman_min_chars() -> usize {
     DEFAULT_CAVEMAN_MIN_CHARS
 }
@@ -734,6 +778,12 @@ struct TransformRequestWire {
     clear_reasoning_age: u64,
     #[serde(default)]
     cache_ttl: Option<String>,
+    #[serde(default = "default_auto_search_enabled")]
+    auto_search_enabled: bool,
+    #[serde(default = "default_auto_search_score_threshold")]
+    auto_search_score_threshold: f64,
+    #[serde(default = "default_auto_search_min_prompt_chars")]
+    auto_search_min_prompt_chars: usize,
     #[serde(default)]
     caveman_enabled: bool,
     #[serde(default = "default_caveman_min_chars")]
@@ -827,6 +877,9 @@ impl<'de> Deserialize<'de> for TransformRequest {
             model_key: wire.model_key,
             clear_reasoning_age: wire.clear_reasoning_age,
             cache_ttl: wire.cache_ttl,
+            auto_search_enabled: wire.auto_search_enabled,
+            auto_search_score_threshold: wire.auto_search_score_threshold,
+            auto_search_min_prompt_chars: wire.auto_search_min_prompt_chars,
             caveman_enabled: wire.caveman_enabled,
             caveman_min_chars: wire.caveman_min_chars,
             tool_present: wire.tool_present,
@@ -1442,16 +1495,14 @@ struct PendingOverlayDecisions {
 }
 
 struct OverlayComputation<'a, 'ctx> {
-    store: &'a McStore,
     req: &'a TransformRequest,
     ctx: &'a ProducerContext<'ctx>,
     projection: &'a FlatProjection,
     core: &'a CoreState,
     tag_rows: &'a mut Arc<Vec<McTagRow>>,
     temporal_rows: &'a mut Vec<TemporalMarkRow>,
-    user_hint_rows: &'a mut Vec<UserHintRow>,
     overlay_frontier: Option<u64>,
-    tagging_enabled: bool,
+    tag_mint_enabled: bool,
     temporal_enabled: bool,
     mutation_exempt_mid: Option<&'a str>,
     lineage_anchor_mid: Option<&'a str>,
@@ -2460,7 +2511,8 @@ fn apply_once(
     } else {
         Vec::new()
     };
-    let mut user_hints = if tagging_active {
+    let auto_search_active = !req.is_subagent && req.auto_search_enabled;
+    let mut user_hints = if tagging_active || auto_search_active {
         transform_snapshot.user_hints
     } else {
         Vec::new()
@@ -2730,16 +2782,14 @@ fn apply_once(
         && (loaded.meta.pending_rewrite.is_none() || clear_pending_rewrite_on_present)
     {
         pending_overlays = compute_active_overlay_decisions(OverlayComputation {
-            store,
             req,
             ctx,
             projection: &projection,
             core: &loaded.core,
             tag_rows: &mut tag_rows,
             temporal_rows: &mut temporal_marks,
-            user_hint_rows: &mut user_hints,
             overlay_frontier,
-            tagging_enabled: tagging_active,
+            tag_mint_enabled: tagging_active || caveman_tagging_requested,
             temporal_enabled: temporal_active,
             mutation_exempt_mid,
             lineage_anchor_mid,
@@ -3367,6 +3417,24 @@ fn apply_once(
             plan,
             PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
         );
+    if auto_search_active && is_bust_pass {
+        if let Some(hint) = maybe_decide_user_hint_on_bust(
+            store,
+            req,
+            ctx,
+            &projection,
+            &user_hints,
+            mutation_exempt_mid,
+            lineage_anchor_mid,
+        )? {
+            user_hints.push(UserHintRow {
+                block_id: hint.block_id.clone(),
+                hint_text: hint.hint_text.clone(),
+                created_at: ctx.now_ms,
+            });
+            pending_overlays.user_hint = Some(hint);
+        }
+    }
     if let Some(cutoff) =
         reasoning_clear_cutoff_with_tags(req, serializer_profile, is_bust_pass, &tag_numbers)
     {
@@ -4110,6 +4178,16 @@ fn apply_once(
 
     let mut tag_overlay = if tagging_active {
         tag_overlay_state(&tag_rows, &temporal_marks, &user_hints, &channel1_appends)
+    } else if auto_search_active {
+        // Auto-search replays only its own persisted hint when ctx_reduce/tagging is unavailable.
+        TagOverlayState {
+            user_hint_by_block_id: user_hints
+                .iter()
+                .filter(|row| !row.hint_text.is_empty())
+                .map(|row| (row.block_id.clone(), row.hint_text.clone()))
+                .collect(),
+            ..TagOverlayState::default()
+        }
     } else {
         TagOverlayState::default()
     };
@@ -4167,7 +4245,7 @@ fn apply_once(
         output_meta,
         &projection,
         req,
-        tagging_active.then_some(&tag_overlay),
+        (tagging_active || auto_search_active).then_some(&tag_overlay),
         tail_reclaim_enabled && !req.is_subagent,
         mutation_exempt_mid,
         &tag_numbers,
@@ -4184,7 +4262,7 @@ fn apply_once(
             output_meta,
             &projection,
             req,
-            tagging_active.then_some(&tag_overlay),
+            (tagging_active || auto_search_active).then_some(&tag_overlay),
             tail_reclaim_enabled && !req.is_subagent,
             mutation_exempt_mid,
             &tag_numbers,
@@ -6901,22 +6979,22 @@ fn compute_active_overlay_decisions(
     input: OverlayComputation<'_, '_>,
 ) -> Result<PendingOverlayDecisions, TransformError> {
     let OverlayComputation {
-        store,
         req,
         ctx,
         projection,
         core,
         tag_rows,
         temporal_rows,
-        user_hint_rows,
         overlay_frontier: frontier,
-        tagging_enabled,
+        tag_mint_enabled,
         temporal_enabled,
         mutation_exempt_mid,
         lineage_anchor_mid,
     } = input;
     let tag_mint_started_at = Instant::now();
-    let tag_mint_work = {
+    let tag_mint_work = if !tag_mint_enabled {
+        TagMintWork::default()
+    } else {
         let existing_tag_ids = tag_rows
             .iter()
             .map(|row| row.block_id.as_str())
@@ -7070,52 +7148,6 @@ fn compute_active_overlay_decisions(
         decided_frontier.filter(|ordinal| frontier.is_none_or(|current| *ordinal > current));
     let temporal_ms = elapsed_ms(temporal_started_at);
 
-    let user_hint = tagging_enabled
-        .then_some(authored_tail)
-        .flatten()
-        .filter(|message| frontier.is_none_or(|frontier| message.ordinal > frontier))
-        .filter(|message| mutation_exempt_mid != Some(message.mid.as_str()))
-        .filter(|message| lineage_anchor_mid != Some(message.mid.as_str()))
-        .and_then(|message| {
-            let block = projection.blocks.iter().find(|block| {
-                block.mid == message.mid
-                    && block.role == "user"
-                    && matches!(block.wire.kind, ck_wire::CkKind::Text { .. })
-            })?;
-            if user_hint_rows.iter().any(|row| row.block_id == block.id) {
-                return None;
-            }
-            Some((message, block.id.clone()))
-        })
-        .map(|(message, block_id)| {
-            let query = user_hint_query(message);
-            let hint_text = if query.is_empty() {
-                String::new()
-            } else {
-                let results = run_user_hint_lexical_search(
-                    store,
-                    ctx.project_path,
-                    &req.session_id,
-                    &query,
-                    ctx.memory_enabled,
-                )?;
-                render_user_hint(&results).unwrap_or_default()
-            };
-            Ok::<_, TransformError>(UserHintDecisionInput {
-                ordinal: message.ordinal,
-                block_id,
-                hint_text,
-            })
-        })
-        .transpose()?;
-    if let Some(hint) = &user_hint {
-        user_hint_rows.push(UserHintRow {
-            block_id: hint.block_id.clone(),
-            hint_text: hint.hint_text.clone(),
-            created_at: ctx.now_ms,
-        });
-    }
-
     Ok(PendingOverlayDecisions {
         max_seen_ordinal,
         tag_mint_start,
@@ -7125,9 +7157,59 @@ fn compute_active_overlay_decisions(
         tag_mint_ms,
         temporal_ms,
         temporal_marks,
-        user_hint,
+        user_hint: None,
         channel1_append: None,
     })
+}
+
+/// Decide one durable auto-search hint only when an unrelated transform action is already
+/// changing the provider-visible prefix. This keeps the hint from originating a cache bust.
+fn maybe_decide_user_hint_on_bust(
+    store: &McStore,
+    req: &TransformRequest,
+    ctx: &ProducerContext<'_>,
+    projection: &FlatProjection,
+    user_hint_rows: &[UserHintRow],
+    mutation_exempt_mid: Option<&str>,
+    lineage_anchor_mid: Option<&str>,
+) -> Result<Option<UserHintDecisionInput>, TransformError> {
+    let Some(message) = eligible_authored_user_tail(req)
+        .filter(|message| mutation_exempt_mid != Some(message.mid.as_str()))
+        .filter(|message| lineage_anchor_mid != Some(message.mid.as_str()))
+    else {
+        return Ok(None);
+    };
+    let Some(block) = projection.blocks.iter().find(|block| {
+        block.mid == message.mid
+            && block.role == "user"
+            && matches!(block.wire.kind, ck_wire::CkKind::Text { .. })
+    }) else {
+        return Ok(None);
+    };
+    if user_hint_rows.iter().any(|row| row.block_id == block.id) {
+        return Ok(None);
+    }
+
+    let query = user_hint_query(message);
+    let hint_text = if query.chars().count() < req.auto_search_min_prompt_chars || query.is_empty()
+    {
+        String::new()
+    } else {
+        let results = run_user_hint_lexical_search(
+            store,
+            ctx.project_path,
+            &req.session_id,
+            &query,
+            ctx.memory_enabled,
+            req.auto_search_score_threshold,
+        )?;
+        render_user_hint(&results).unwrap_or_default()
+    };
+    Ok(Some(UserHintDecisionInput {
+        ordinal: message.ordinal,
+        block_id: block.id.clone(),
+        hint_text,
+    }))
 }
 
 fn lexical_tokens(text: &str) -> BTreeSet<String> {
@@ -7153,6 +7235,7 @@ fn run_user_hint_lexical_search(
     session_id: &str,
     query: &str,
     include_memories: bool,
+    score_threshold: f64,
 ) -> Result<Vec<crate::memory_tool::MemorySearchResult>, TransformError> {
     #[cfg(test)]
     USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(count.get() + 1));
@@ -7262,7 +7345,7 @@ fn run_user_hint_lexical_search(
                 })
                 .sum::<f64>();
             let normalized = score / total_query_weight.max(f64::EPSILON);
-            (normalized >= USER_HINT_NORMALIZED_SCORE_FLOOR).then_some((
+            (normalized >= score_threshold).then_some((
                 normalized,
                 matched.len(),
                 candidate.recency,
@@ -7296,12 +7379,7 @@ fn user_hint_query(message: &CkIngressMessage) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let without_reminders = strip_system_reminder_wrappers(&raw);
-    let without_tags = strip_mc_tag_notation(&without_reminders);
-    let normalized = without_tags
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let normalized = sanitize_user_hint_query(&raw);
     let mut chars = normalized.chars();
     let mut capped = chars
         .by_ref()
@@ -7320,6 +7398,26 @@ fn user_hint_query(message: &CkIngressMessage) -> String {
         }
     }
     capped
+}
+
+fn sanitize_user_hint_query(text: &str) -> String {
+    let without_reminders = strip_system_reminder_wrappers(text);
+    let without_comments = html_comment_regex().replace_all(&without_reminders, "");
+    let without_markup = xml_html_tag_regex().replace_all(&without_comments, "");
+    strip_mc_tag_notation(&without_markup)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn html_comment_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?s)<!--.*?-->").expect("valid HTML comment regex"))
+}
+
+fn xml_html_tag_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"</?[a-zA-Z][^<>]*>").expect("valid XML/HTML tag regex"))
 }
 
 fn strip_system_reminder_wrappers(text: &str) -> String {
@@ -7375,9 +7473,11 @@ fn render_user_hint(results: &[crate::memory_tool::MemorySearchResult]) -> Optio
         .iter()
         .take(USER_HINT_RESULT_LIMIT)
         .map(|result| {
+            let fragment =
+                crate::caveman::compress(&result.snippet, crate::caveman::CavemanLevel::Ultra);
             format!(
                 "- {}",
-                one_line_fragment(&result.snippet, USER_HINT_FRAGMENT_CHAR_CAP)
+                one_line_fragment(&fragment, USER_HINT_FRAGMENT_CHAR_CAP)
             )
         })
         .filter(|line| line.len() > 2)
@@ -7385,12 +7485,38 @@ fn render_user_hint(results: &[crate::memory_tool::MemorySearchResult]) -> Optio
     if lines.is_empty() {
         return None;
     }
-    let hint = format!(
-        "\n\n<ctx-search-hint>\nYour memory may contain related fragments:\n{}\nIf relevant, run ctx_search to retrieve full context. Otherwise ignore.\n</ctx-search-hint>",
-        lines.join("\n")
-    );
-    debug_assert!(hint.chars().count() <= USER_HINT_TOTAL_CHAR_CAP);
-    Some(hint)
+    let header = if lines.len() == 1 {
+        "Your memory may contain 1 related fragment:".to_string()
+    } else {
+        format!("Your memory may contain {} related fragments:", lines.len())
+    };
+    let footer =
+        "If the fragments above seem relevant to the current request, you may run ctx_search to retrieve full context. Otherwise ignore.";
+    let body = [header, lines.join("\n"), footer.to_string()].join("\n");
+    let wrapped = format!("<ctx-search-hint>\n{body}\n</ctx-search-hint>");
+    // Native search returns memory and compartment results only, so it does not emit commit
+    // SHA/age metadata for a result without commit provenance.
+    let wrapped = truncate_hint_to_total_cap(&wrapped, USER_HINT_TOTAL_CHAR_CAP);
+    debug_assert!(wrapped.chars().count() <= USER_HINT_TOTAL_CHAR_CAP);
+    Some(format!("\n\n{wrapped}"))
+}
+
+fn truncate_hint_to_total_cap(wrapped: &str, limit: usize) -> String {
+    if wrapped.chars().count() <= limit {
+        return wrapped.to_string();
+    }
+    let open = "<ctx-search-hint>\n";
+    let close = "\n</ctx-search-hint>";
+    let body_limit = limit.saturating_sub(open.chars().count() + close.chars().count() + 1);
+    let body = wrapped
+        .strip_prefix(open)
+        .unwrap_or(wrapped)
+        .chars()
+        .take(body_limit)
+        .collect::<String>()
+        .trim_end()
+        .to_string();
+    format!("{open}{body}…{close}")
 }
 
 fn one_line_fragment(text: &str, limit: usize) -> String {
@@ -11149,6 +11275,9 @@ pub(crate) mod tests {
     fn req(session: &str, cfg: &str, messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
             cache_ttl: None,
+            auto_search_enabled: true,
+            auto_search_score_threshold: DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
+            auto_search_min_prompt_chars: 0,
             kind: "transform".to_string(),
             v: 2,
             serializer_profile: "owned-llmrunner".to_string(),
@@ -19355,6 +19484,210 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn user_hint_query_sanitizes_nested_reminders_comments_markup_and_tags() {
+        let cases = [
+            (
+                "nested system reminder",
+                "retained <system-reminder>drop <system-reminder>nested</system-reminder></system-reminder> text",
+                "retained text",
+            ),
+            ("HTML comment", "retained <!-- remove <hidden> --> text", "retained text"),
+            ("XML tag", "retained <project-note>visible</project-note>", "retained visible"),
+            ("Magic Context tag", "§12§ retained text", "retained text"),
+        ];
+        for (name, input, expected) in cases {
+            let message = wire_item("user", "query-sanitization", 1, &[input]);
+            assert_eq!(user_hint_query(&message), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn rendered_user_hint_matches_fragment_limits_and_headers() {
+        let single = vec![crate::memory_tool::MemorySearchResult {
+            source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
+            id: 1,
+            snippet: "single fragment".to_string(),
+            category: None,
+            sequence: None,
+            title: None,
+            note_status: None,
+            surface_condition: None,
+        }];
+        let singular = render_user_hint(&single).unwrap();
+        assert!(singular.contains("Your memory may contain 1 related fragment:"));
+
+        let results = (1..=4)
+            .map(|id| crate::memory_tool::MemorySearchResult {
+                source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
+                id,
+                snippet: format!("fragment {id} {}", "word ".repeat(40)),
+                category: None,
+                sequence: None,
+                title: None,
+                note_status: None,
+                surface_condition: None,
+            })
+            .collect::<Vec<_>>();
+        let hint = render_user_hint(&results).unwrap();
+        let bullets = hint
+            .lines()
+            .filter(|line| line.starts_with("- "))
+            .collect::<Vec<_>>();
+        assert_eq!(bullets.len(), 3);
+        assert!(bullets.iter().all(|line| line.chars().count() <= 82));
+        assert!(hint.contains("Your memory may contain 3 related fragments:"));
+        assert!(hint.contains("If the fragments above seem relevant to the current request"));
+        assert!(hint.chars().count() <= USER_HINT_TOTAL_CHAR_CAP + 2);
+
+        let golden = render_user_hint(&[
+            crate::memory_tool::MemorySearchResult {
+                source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
+                id: 1,
+                snippet: "alpha".to_string(),
+                category: None,
+                sequence: None,
+                title: None,
+                note_status: None,
+                surface_condition: None,
+            },
+            crate::memory_tool::MemorySearchResult {
+                source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
+                id: 2,
+                snippet: "beta".to_string(),
+                category: None,
+                sequence: None,
+                title: None,
+                note_status: None,
+                surface_condition: None,
+            },
+            crate::memory_tool::MemorySearchResult {
+                source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
+                id: 3,
+                snippet: "gamma".to_string(),
+                category: None,
+                sequence: None,
+                title: None,
+                note_status: None,
+                surface_condition: None,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            golden,
+            "\n\n<ctx-search-hint>\nYour memory may contain 3 related fragments:\n- alpha\n- beta\n- gamma\nIf the fragments above seem relevant to the current request, you may run ctx_search to retrieve full context. Otherwise ignore.\n</ctx-search-hint>"
+        );
+
+        let capped = truncate_hint_to_total_cap(
+            &format!(
+                "<ctx-search-hint>\n{}\n</ctx-search-hint>",
+                "x".repeat(2_000)
+            ),
+            USER_HINT_TOTAL_CHAR_CAP,
+        );
+        assert!(capped.chars().count() <= USER_HINT_TOTAL_CHAR_CAP);
+    }
+
+    #[test]
+    fn auto_search_respects_enabled_min_length_and_threshold_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        for id in 1..=30 {
+            let content = if id == 1 {
+                "rust ownership beta durable context".to_string()
+            } else {
+                format!("unrelated fixture content {id}")
+            };
+            s.seed_memory(id, "git:proj", "CONSTRAINTS", &content, 50)
+                .unwrap();
+        }
+
+        let mut request = active_cc_req(
+            "auto-search-controls",
+            "cfg0",
+            vec![wire_item("user", "m1", 1, &["rust ownership beta"])],
+        );
+        request.auto_search_min_prompt_chars = "rust ownership beta".chars().count();
+        let projection = project_messages(&request.messages).unwrap();
+        let at_boundary = maybe_decide_user_hint_on_bust(
+            &s,
+            &request,
+            &pctx("git:proj", "/nonexistent-docs", 1),
+            &projection,
+            &[],
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!at_boundary.hint_text.is_empty());
+
+        request.auto_search_min_prompt_chars += 1;
+        let below_boundary = maybe_decide_user_hint_on_bust(
+            &s,
+            &request,
+            &pctx("git:proj", "/nonexistent-docs", 1),
+            &projection,
+            &[],
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(below_boundary.hint_text.is_empty());
+
+        let admitted = run_user_hint_lexical_search(
+            &s,
+            "git:proj",
+            "auto-search-controls",
+            "rust ownership beta gamma",
+            true,
+            0.6,
+        )
+        .unwrap();
+        let rejected = run_user_hint_lexical_search(
+            &s,
+            "git:proj",
+            "auto-search-controls",
+            "rust ownership beta gamma",
+            true,
+            0.95,
+        )
+        .unwrap();
+        assert!(!admitted.is_empty());
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn auto_search_runs_without_tagging_but_not_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.seed_memory(
+            1,
+            "git:proj",
+            "CONSTRAINTS",
+            "rust ownership beta durable context",
+            70,
+        )
+        .unwrap();
+        seed_unrelated_hint_candidates(&s);
+        let messages = vec![wire_item("user", "m1", 1, &["rust ownership beta"])];
+
+        let mut enabled = cc_req("auto-search-untagged", "cfg0", messages.clone());
+        enabled.auto_search_min_prompt_chars = 0;
+        enabled.auto_search_score_threshold = DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD;
+        let hinted = run(&s, &enabled, &spine());
+        assert!(tail_bytes(&hinted, "m1").contains("<ctx-search-hint>"));
+        assert!(!tail_bytes(&hinted, "m1").contains("§1§"));
+
+        let mut disabled = active_cc_req("auto-search-disabled", "cfg0", messages);
+        disabled.auto_search_enabled = false;
+        disabled.auto_search_min_prompt_chars = 0;
+        disabled.auto_search_score_threshold = DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD;
+        let no_hint = run(&s, &disabled, &spine());
+        assert!(!tail_bytes(&no_hint, "m1").contains("<ctx-search-hint>"));
+    }
+
+    #[test]
     fn user_hint_is_computed_once_replayed_and_inactive_is_verbatim() {
         run_active_surface_test(|| {
             USER_HINT_LEXICAL_QUERY_COUNT.with(|count| count.set(0));
@@ -19373,7 +19706,7 @@ pub(crate) mod tests {
             let request = active_cc_req("user-hint", "cfg0", messages.clone());
             run(&s, &request, &spine());
             let first = run(&s, &request, &spine());
-            let expected_hint = "\n\n<ctx-search-hint>\nYour memory may contain related fragments:\n- rust ownership uses borrowing safely\nIf relevant, run ctx_search to retrieve full context. Otherwise ignore.\n</ctx-search-hint>";
+            let expected_hint = "\n\n<ctx-search-hint>\nYour memory may contain 1 related fragment:\n- rust ownership uses borrowing safely\nIf the fragments above seem relevant to the current request, you may run ctx_search to retrieve full context. Otherwise ignore.\n</ctx-search-hint>";
             assert_eq!(
                 tail_bytes(&first, "m1"),
                 format!("§1§ rust ownership{expected_hint}")
@@ -19389,7 +19722,8 @@ pub(crate) mod tests {
             );
             assert_eq!(s.load_user_hints("user-hint").unwrap().len(), 1);
 
-            let dormant = cc_req("user-hint", "cfg0", messages);
+            let mut dormant = cc_req("user-hint", "cfg0", messages);
+            dormant.auto_search_enabled = false;
             let false_window = run(&s, &dormant, &spine());
             assert_eq!(tail_bytes(&false_window, "m1"), "rust ownership");
         });
@@ -19619,21 +19953,45 @@ pub(crate) mod tests {
                 .unwrap();
         }
 
-        let related =
-            run_user_hint_lexical_search(&s, "git:proj", "lexical", "rust ownership", true)
-                .unwrap();
+        let related = run_user_hint_lexical_search(
+            &s,
+            "git:proj",
+            "lexical",
+            "rust ownership",
+            true,
+            DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
+        )
+        .unwrap();
         assert_eq!(related[0].id, 1);
-        let unrelated =
-            run_user_hint_lexical_search(&s, "git:proj", "lexical", "galaxy telescope", true)
-                .unwrap();
+        let unrelated = run_user_hint_lexical_search(
+            &s,
+            "git:proj",
+            "lexical",
+            "galaxy telescope",
+            true,
+            DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
+        )
+        .unwrap();
         assert!(unrelated.is_empty());
-        let one_common_token =
-            run_user_hint_lexical_search(&s, "git:proj", "lexical", "quasar deployment", true)
-                .unwrap();
+        let one_common_token = run_user_hint_lexical_search(
+            &s,
+            "git:proj",
+            "lexical",
+            "quasar deployment",
+            true,
+            DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
+        )
+        .unwrap();
         assert!(one_common_token.is_empty());
-        let ubiquitous_tokens =
-            run_user_hint_lexical_search(&s, "git:proj", "lexical", "fixture memory", true)
-                .unwrap();
+        let ubiquitous_tokens = run_user_hint_lexical_search(
+            &s,
+            "git:proj",
+            "lexical",
+            "fixture memory",
+            true,
+            DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
+        )
+        .unwrap();
         assert!(
             ubiquitous_tokens.is_empty(),
             "matches need at least one token present in less than half the candidate pool"
@@ -19752,9 +20110,11 @@ pub(crate) mod tests {
             assert!(s.load_user_hints("pending-hint").unwrap().is_empty());
             assert_eq!(s.overlay_watermark("pending-hint").unwrap(), None);
 
+            // The recovered request changes render identity, supplying the independent bust
+            // required before a fresh auto-search hint may append to the user tail.
             let accepted = active_cc_req(
                 "pending-hint",
-                "cfg0",
+                "cfg1",
                 vec![
                     present.messages[0].clone(),
                     present.messages[1].clone(),
@@ -19762,6 +20122,7 @@ pub(crate) mod tests {
                 ],
             );
             let active = run(&s, &accepted, &spine());
+            assert_eq!(active.action, "HARD");
             assert!(tail_bytes(&active, "foreign").contains("<ctx-search-hint>"));
             assert_eq!(USER_HINT_LEXICAL_QUERY_COUNT.with(std::cell::Cell::get), 1);
             assert_eq!(

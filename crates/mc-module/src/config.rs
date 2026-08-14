@@ -3,8 +3,8 @@
 //! This intentionally reads user and project tiers directly instead of depending on a
 //! daemon config plane. Per-leaf trust policy is enforced during the read: model choice
 //! is user-tier only because it affects spend; project config may only raise the execute
-//! threshold (fire less often), and may override memory, promotion, privacy, and context-limit
-//! settings. The Rust module intentionally keeps stricter model-selection policy than the current
+//! threshold (fire less often), and may override memory, auto-search, caveman, promotion, privacy,
+//! and context-limit settings. The Rust module intentionally keeps stricter model-selection policy than the current
 //! TypeScript implementation until both implementations are deliberately aligned.
 
 use std::fs;
@@ -34,6 +34,11 @@ pub const MAX_HISTORIAN_CHUNK_TOKENS: usize = 50_000;
 /// Matches the TypeScript historian fallback when no model catalog value is available.
 /// The explicit config override still wins when a binding supplies one.
 pub const DEFAULT_HISTORIAN_CONTEXT_LIMIT_TOKENS: usize = 128_000;
+/// Defaults shared with the TypeScript `memory.auto_search` schema.
+pub const DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD: f64 = 0.6;
+pub const DEFAULT_AUTO_SEARCH_MIN_PROMPT_CHARS: usize = 20;
+/// Defaults shared with the TypeScript `caveman_text_compression` schema.
+pub const DEFAULT_CAVEMAN_MIN_SIZE: usize = 500;
 
 /// Derive the historian producer budget from its own context window, as the TS runner does.
 pub fn derive_historian_chunk_tokens(context_limit_tokens: usize) -> usize {
@@ -42,10 +47,46 @@ pub fn derive_historian_chunk_tokens(context_limit_tokens: usize) -> usize {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct AutoSearchConfig {
+    pub enabled: bool,
+    pub score_threshold: f64,
+    pub min_prompt_chars: usize,
+}
+
+impl Default for AutoSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            score_threshold: DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
+            min_prompt_chars: DEFAULT_AUTO_SEARCH_MIN_PROMPT_CHARS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CavemanConfig {
+    pub enabled: bool,
+    pub min_size: usize,
+}
+
+impl Default for CavemanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_size: DEFAULT_CAVEMAN_MIN_SIZE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct McModuleConfig {
     pub model_chain: Vec<String>,
     pub execute_threshold_percentage: f64,
     pub memory_enabled: bool,
+    /// Independent transform-time hint controls from `memory.auto_search`.
+    pub auto_search: AutoSearchConfig,
+    /// Deterministic age-tier compression controls from `caveman_text_compression`.
+    pub caveman: CavemanConfig,
     /// Mirrors the TS auto-promote switch. Facts are dropped when this is false.
     pub auto_promote: bool,
     /// Privacy gate controlling whether historian user observations may be collected for later
@@ -72,6 +113,8 @@ impl Default for McModuleConfig {
             model_chain: Vec::new(),
             execute_threshold_percentage: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
             memory_enabled: true,
+            auto_search: AutoSearchConfig::default(),
+            caveman: CavemanConfig::default(),
             auto_promote: true,
             user_memory_collection_enabled: false,
             historian_context_limit_tokens: DEFAULT_HISTORIAN_CONTEXT_LIMIT_TOKENS,
@@ -267,6 +310,8 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         if let Some(enabled) = user.pointer("/memory/enabled").and_then(Value::as_bool) {
             cfg.memory_enabled = enabled;
         }
+        apply_auto_search_config(&mut cfg.auto_search, user);
+        apply_caveman_config(&mut cfg.caveman, user);
         if let Some(budget) = number_at(user, "/memory/budget_tokens") {
             cfg.memory_budget_tokens = budget.max(1.0);
         }
@@ -334,6 +379,8 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         if let Some(enabled) = project.pointer("/memory/enabled").and_then(Value::as_bool) {
             cfg.memory_enabled = enabled;
         }
+        apply_auto_search_config(&mut cfg.auto_search, project);
+        apply_caveman_config(&mut cfg.caveman, project);
         if let Some(enabled) = project
             .pointer("/memory/auto_promote")
             .and_then(Value::as_bool)
@@ -374,6 +421,34 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
         .clamp(1.0, MAX_EXECUTE_THRESHOLD_PERCENTAGE);
     cfg.model_chain.dedup();
     cfg
+}
+
+fn apply_auto_search_config(config: &mut AutoSearchConfig, value: &Value) {
+    if let Some(enabled) = value
+        .pointer("/memory/auto_search/enabled")
+        .and_then(Value::as_bool)
+    {
+        config.enabled = enabled;
+    }
+    if let Some(threshold) = number_at(value, "/memory/auto_search/score_threshold") {
+        config.score_threshold = threshold.clamp(0.3, 0.95);
+    }
+    if let Some(min_prompt_chars) = positive_usize_at(value, "/memory/auto_search/min_prompt_chars")
+    {
+        config.min_prompt_chars = min_prompt_chars.clamp(5, 500);
+    }
+}
+
+fn apply_caveman_config(config: &mut CavemanConfig, value: &Value) {
+    if let Some(enabled) = value
+        .pointer("/caveman_text_compression/enabled")
+        .and_then(Value::as_bool)
+    {
+        config.enabled = enabled;
+    }
+    if let Some(min_chars) = positive_usize_at(value, "/caveman_text_compression/min_chars") {
+        config.min_size = min_chars.clamp(100, 10_000);
+    }
 }
 
 fn user_memory_collection_at(value: &Value) -> Option<bool> {
@@ -605,6 +680,48 @@ mod tests {
     fn default_threshold_matches_typescript_schema() {
         let cfg = merge_tiers(None, None);
         assert_eq!(cfg.execute_threshold_percentage, 65.0);
+    }
+
+    #[test]
+    fn auto_search_and_caveman_config_follow_user_then_project_tiers() {
+        let user = serde_json::json!({
+            "memory": { "auto_search": {
+                "enabled": false,
+                "score_threshold": 0.4,
+                "min_prompt_chars": 100
+            }},
+            "caveman_text_compression": { "enabled": true, "min_chars": 900 }
+        });
+        let project = serde_json::json!({
+            "memory": { "auto_search": {
+                "enabled": true,
+                "score_threshold": 0.8,
+                "min_prompt_chars": 50
+            }},
+            "caveman_text_compression": { "enabled": false, "min_chars": 700 }
+        });
+        let cfg = merge_tiers(Some(&user), Some(&project));
+        assert_eq!(
+            cfg.auto_search,
+            AutoSearchConfig {
+                enabled: true,
+                score_threshold: 0.8,
+                min_prompt_chars: 50,
+            }
+        );
+        assert_eq!(
+            cfg.caveman,
+            CavemanConfig {
+                enabled: false,
+                min_size: 700,
+            }
+        );
+
+        assert_eq!(
+            merge_tiers(None, None).auto_search,
+            AutoSearchConfig::default()
+        );
+        assert_eq!(merge_tiers(None, None).caveman, CavemanConfig::default());
     }
 
     #[test]
