@@ -551,7 +551,20 @@ export function deriveWindowGeometry(
             );
         }
         const floor = Math.max(MIN_PLAUSIBLE_CONTEXT_LIMIT, softContext * 0.5);
-        softReserve = Math.min(softReserve, Math.max(0, softContext - floor));
+        const flooredReserve = Math.min(softReserve, Math.max(0, softContext - floor));
+        if (flooredReserve < softReserve) {
+            // A reserve large enough to hit the half-window floor means the
+            // catalog's context/output pair contradicts itself (93 live rows
+            // publish output > context — fusiform's negative-window detector).
+            // The floor keeps the window functional; the log keeps the
+            // degradation visible instead of silently halving the window.
+            logGeometryClampOnce(
+                `soft-floor|${providerID}/${modelID}|${softReserve}|${flooredReserve}`,
+                `output reserve clamped by the half-window floor for ${providerID}/${modelID}: reserve ${softReserve} → ${flooredReserve} (catalog context/output pair is contradictory)`,
+                options.log,
+            );
+        }
+        softReserve = flooredReserve;
         usableSoft = Math.floor(softContext - softReserve);
     } else {
         usableSoft = input as number;
