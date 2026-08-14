@@ -104,8 +104,9 @@ pub struct McModuleConfig {
     pub inject_docs: bool,
     /// Controls temporal gap overlays when the active wire surface supports overlays.
     pub temporal_awareness: bool,
-    /// Trusted USER-tier guidance bytes resolved by the host. The module never reads the
-    /// configured guidance path from the host filesystem.
+    /// Trusted USER-tier guidance bytes resolved from the user config directory at route bind.
+    /// Only the immutable contents are retained; transform and guidance requests never carry a
+    /// filesystem path.
     pub prompt_surface_guidance_override: Option<String>,
     pub smart_drops: bool,
     pub cache_ttl: String,
@@ -228,7 +229,11 @@ impl ConfigCache {
         let project_path = project_root.join(".cortexkit").join("magic-context.jsonc");
         let user = read_tier_cached(&mut self.user, user_path.to_path_buf());
         let project = read_tier_cached(&mut self.project, project_path);
-        self.effective = merge_tiers(user.as_ref(), project.as_ref());
+        let (mut effective, mut warnings) =
+            merge_tiers_with_warnings(user.as_ref(), project.as_ref());
+        resolve_user_guidance_override(&mut effective, user.as_ref(), user_path, &mut warnings);
+        emit_warnings(warnings);
+        self.effective = effective;
         self.effective.clone()
     }
 }
@@ -260,12 +265,109 @@ fn read_tier_cached(cache: &mut TierConfig, path: PathBuf) -> Option<Value> {
     cache.value.clone()
 }
 
+#[cfg(test)]
 fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig {
     let (cfg, warnings) = merge_tiers_with_warnings(user, project);
+    emit_warnings(warnings);
+    cfg
+}
+
+fn emit_warnings(warnings: Vec<String>) {
     for warning in warnings {
         eprintln!("mc-module: config warning: {warning}");
     }
-    cfg
+}
+
+fn resolve_user_guidance_override(
+    cfg: &mut McModuleConfig,
+    user: Option<&Value>,
+    user_config_path: &Path,
+    warnings: &mut Vec<String>,
+) {
+    let Some(configured_path) = user
+        .and_then(|value| value.pointer("/prompt_surface/guidance_override_path"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    if configured_path.is_empty() {
+        return;
+    }
+
+    // When a guidance override path is configured, use it as the only override source. An
+    // invalid path clears any pre-resolved text and falls back to built-in guidance.
+    cfg.prompt_surface_guidance_override = None;
+    let configured_path = Path::new(configured_path);
+    let path = if configured_path.is_absolute() {
+        configured_path.to_path_buf()
+    } else {
+        user_config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(configured_path)
+    };
+
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            warnings.push(format!(
+                "prompt_surface.guidance_override_path ({}) could not be read ({error}); using built-in guidance.",
+                path.display()
+            ));
+            return;
+        }
+    };
+    if !metadata.is_file() {
+        warnings.push(format!(
+            "prompt_surface.guidance_override_path ({}) is not a file; using built-in guidance.",
+            path.display()
+        ));
+        return;
+    }
+
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warnings.push(format!(
+                "prompt_surface.guidance_override_path ({}) could not be read ({error}); using built-in guidance.",
+                path.display()
+            ));
+            return;
+        }
+    };
+    let content = String::from_utf8_lossy(&bytes).into_owned();
+    if content.trim().is_empty() {
+        warnings.push(format!(
+            "prompt_surface.guidance_override_path ({}) is empty; using built-in guidance.",
+            path.display()
+        ));
+        return;
+    }
+
+    let markers = guidance_marker_count(&content);
+    if markers != 1 {
+        warnings.push(format!(
+            "prompt_surface.guidance_override_path ({}) must contain exactly one {:?} section marker; found {markers}. Using built-in guidance.",
+            path.display(),
+            GUIDANCE_MARKER
+        ));
+        return;
+    }
+
+    cfg.prompt_surface_guidance_override = Some(content);
+}
+
+const GUIDANCE_MARKER: &str = "## Magic Context";
+
+fn guidance_marker_count(content: &str) -> usize {
+    content
+        .split('\n')
+        .filter(|line| {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            line.strip_prefix(GUIDANCE_MARKER)
+                .is_some_and(|suffix| suffix.bytes().all(|byte| matches!(byte, b' ' | b'\t')))
+        })
+        .count()
 }
 
 fn merge_tiers_with_warnings(
@@ -917,6 +1019,77 @@ mod tests {
         assert!(warnings
             .iter()
             .all(|warning| warning.contains("user-tier only")));
+    }
+
+    #[test]
+    fn guidance_override_path_resolves_relative_to_user_config_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("magic-context.jsonc");
+        let guidance_path = dir.path().join("guidance.md");
+        let guidance = "## Magic Context\r\n\r\nTrusted route guidance.\r\n";
+        fs::write(&guidance_path, guidance).unwrap();
+        fs::write(
+            &user_path,
+            r#"{
+                "prompt_surface": {
+                    "guidance_override_path": "guidance.md"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mut cache = ConfigCache::default();
+        let cfg = cache.effective_for_paths(&user_path, dir.path());
+
+        assert_eq!(
+            cfg.prompt_surface_guidance_override.as_deref(),
+            Some(guidance)
+        );
+    }
+
+    #[test]
+    fn guidance_override_invalid_and_missing_files_warn_and_fall_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("magic-context.jsonc");
+        let invalid_path = dir.path().join("invalid.md");
+        fs::write(
+            &invalid_path,
+            "## Magic Context\n\nFirst.\n## Magic Context \t\n\nSecond.",
+        )
+        .unwrap();
+
+        for (configured_path, expected_warning) in [
+            (
+                "invalid.md",
+                "must contain exactly one \"## Magic Context\" section marker; found 2",
+            ),
+            ("missing.md", "could not be read"),
+        ] {
+            let user = serde_json::json!({
+                "prompt_surface": {
+                    "guidance_override_path": configured_path,
+                    "guidance_override_text": "## Magic Context\n\nStale text"
+                }
+            });
+            let (mut cfg, mut warnings) = merge_tiers_with_warnings(Some(&user), None);
+
+            resolve_user_guidance_override(&mut cfg, Some(&user), &user_path, &mut warnings);
+
+            assert!(cfg.prompt_surface_guidance_override.is_none());
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains(expected_warning), "{}", warnings[0]);
+            assert!(warnings[0]
+                .to_ascii_lowercase()
+                .contains("using built-in guidance"));
+        }
+    }
+
+    #[test]
+    fn guidance_marker_validation_matches_the_typescript_line_rule() {
+        assert_eq!(guidance_marker_count("## Magic Context"), 1);
+        assert_eq!(guidance_marker_count("## Magic Context \t\r\nbody"), 1);
+        assert_eq!(guidance_marker_count("prefix ## Magic Context\nbody"), 0);
+        assert_eq!(guidance_marker_count("## Magic Context extra\nbody"), 0);
     }
 
     #[test]
