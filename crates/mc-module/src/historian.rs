@@ -1771,6 +1771,7 @@ mod tests {
     fn req(messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
             cache_ttl: None,
+            effective_execute_threshold: None,
             auto_search_enabled: true,
             auto_search_score_threshold: 0.35,
             auto_search_min_prompt_chars: 0,
@@ -1839,6 +1840,7 @@ mod tests {
             temporal_awareness: true,
             now_ms: 0,
             execute_threshold_percentage: 65.0,
+            compaction_enabled: true,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
             cache_ttl_provenance: crate::config::CacheTtlProvenance::Default,

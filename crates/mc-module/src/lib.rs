@@ -1682,6 +1682,12 @@ impl ModuleMemoryMutationWire {
 }
 
 impl TransformRequest {
+    /// Prefer the request's host-resolved threshold. `None` specifically means an older host did
+    /// not send the field, so the caller's trusted config remains the compatibility fallback.
+    fn execute_threshold_or(&self, fallback: f64) -> f64 {
+        self.effective_execute_threshold.unwrap_or(fallback)
+    }
+
     /// Estimated bytes retained by one ready snapshot, including its cache keys and `Arc`.
     pub(crate) fn retained_bytes(&self) -> usize {
         use crate::retained_size::{
@@ -3067,13 +3073,14 @@ impl McHandler {
                 cache_ttl_by_model: std::collections::BTreeMap::new(),
                 model_chain: vec!["test/model".to_string()],
                 execute_threshold_percentage: 65.0,
+                compaction_enabled: true,
                 memory_enabled: true,
                 auto_search: crate::config::AutoSearchConfig::default(),
                 caveman: crate::config::CavemanConfig::default(),
                 auto_promote: true,
                 user_memory_collection_enabled: false,
                 historian_context_limit_tokens: 128_000,
-                memory_budget_tokens: 8_000.0,
+                memory_budget_tokens: 4_000.0,
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: true,
                 temporal_awareness: true,
@@ -4105,7 +4112,10 @@ impl McHandler {
                 &TriggerContext {
                     boundary: BoundaryContext {
                         context_limit,
-                        execute_threshold_percentage: cfg.execute_threshold_percentage,
+                        // Historian preparation reloads module config independently, but a host-
+                        // resolved request threshold is still authoritative for this pass.
+                        execute_threshold_percentage: parsed
+                            .execute_threshold_or(cfg.execute_threshold_percentage),
                         usage_percentage,
                         usage_input_tokens: input_tokens,
                         last_compartment_end_ordinal,
@@ -7276,7 +7286,12 @@ impl McHandler {
                 memory_budget_tokens: binding.config.memory_budget_tokens,
                 user_profile_budget_tokens: binding.config.user_profile_budget_tokens,
                 now_ms: pass_now,
-                execute_threshold_percentage: binding.config.execute_threshold_percentage,
+                // The host resolves per-model/token thresholds against this pass's usable window.
+                // Bind-time scalar config is only the old-host compatibility fallback.
+                execute_threshold_percentage: parsed
+                    .execute_threshold_or(binding.config.execute_threshold_percentage),
+                // TODO: The compaction-off output path consumes this transport flag.
+                compaction_enabled: binding.config.compaction_enabled,
                 smart_drops: binding.config.smart_drops,
                 // OpenCode/Pi send their host-resolved value. Claude Code omits it, so resolve the
                 // request's model while retaining whether the walk actually matched an entry.
@@ -14920,18 +14935,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wire_execute_threshold_overrides_config_and_absence_preserves_fallback_both_directions() {
+        fn decision(wire_threshold: Option<f64>, config_threshold: f64) -> scheduler::BaseDecision {
+            let mut request = json!({
+                "kind": "transform",
+                "v": 2,
+                "serializer_profile": "owned-llmrunner",
+                "session_id": "threshold-wire",
+                "render_config": "cfg",
+                "messages": []
+            });
+            if let Some(threshold) = wire_threshold {
+                request["effective_execute_threshold"] = json!(threshold);
+            }
+            let parsed: TransformRequest = serde_json::from_value(request).unwrap();
+            scheduler::should_execute(
+                &scheduler::SchedulerConfig {
+                    execute_threshold_percentage: scheduler::ExecuteThresholdConfig::Percentage(
+                        parsed.execute_threshold_or(config_threshold),
+                    ),
+                    execute_threshold_tokens: None,
+                },
+                &scheduler::SessionMeta {
+                    last_response_time_ms: 100,
+                    cache_ttl: "5m".to_string(),
+                },
+                &scheduler::ContextUsage {
+                    percentage: 60.0,
+                    input_tokens: 60_000.0,
+                },
+                100,
+                None,
+                Some(100_000.0),
+            )
+        }
+
+        assert_eq!(decision(Some(50.0), 70.0), scheduler::BaseDecision::Execute);
+        assert_eq!(decision(None, 70.0), scheduler::BaseDecision::Defer);
+        assert_eq!(decision(Some(70.0), 50.0), scheduler::BaseDecision::Defer);
+        assert_eq!(decision(None, 50.0), scheduler::BaseDecision::Execute);
+    }
+
     fn default_test_config() -> McModuleConfig {
         McModuleConfig {
             cache_ttl_by_model: std::collections::BTreeMap::new(),
             model_chain: vec!["test/model".to_string()],
             execute_threshold_percentage: 65.0,
+            compaction_enabled: true,
             memory_enabled: true,
             auto_search: crate::config::AutoSearchConfig::default(),
             caveman: crate::config::CavemanConfig::default(),
             auto_promote: true,
             user_memory_collection_enabled: false,
             historian_context_limit_tokens: 128_000,
-            memory_budget_tokens: 8_000.0,
+            memory_budget_tokens: 4_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
             temporal_awareness: true,
@@ -25199,6 +25257,7 @@ mod tests {
                 temporal_awareness: true,
                 now_ms: now_ms(),
                 execute_threshold_percentage: 65.0,
+                compaction_enabled: true,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
                 cache_ttl_provenance: config::CacheTtlProvenance::Default,
@@ -25973,6 +26032,7 @@ mod tests {
                 temporal_awareness: true,
                 now_ms: now_ms(),
                 execute_threshold_percentage: 65.0,
+                compaction_enabled: true,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
                 cache_ttl_provenance: config::CacheTtlProvenance::Default,

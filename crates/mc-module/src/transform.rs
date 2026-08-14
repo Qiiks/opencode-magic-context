@@ -531,8 +531,12 @@ pub struct ProducerContext<'a> {
     /// a HARD (the first materialization freezes it); every later pass reads the frozen
     /// meta value, never this, so expiry never drifts the bytes between passes.
     pub now_ms: i64,
-    /// Execute threshold frozen at route bind for scheduler and selection headroom.
+    /// Execute threshold resolved by the host for this request, or the route-bind fallback for
+    /// older hosts that omit `effective_execute_threshold`.
     pub execute_threshold_percentage: f64,
+    /// Transport-only mode flag.
+    /// TODO: Consume this when compaction-off output behavior is implemented.
+    pub compaction_enabled: bool,
     /// Smart-drop selector gate frozen at route bind.
     pub smart_drops: bool,
     /// Effective cache TTL used by the host-side idle predicate.
@@ -641,6 +645,10 @@ pub struct TransformRequest {
     /// provider cache).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ttl: Option<String>,
+    /// Host-resolved execute threshold for this model and usable context geometry. Absence means
+    /// the host did not send a value, so older hosts fall back to route-bind configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_execute_threshold: Option<f64>,
     /// Whether automatic memory hints may be appended on an independent cache-busting pass.
     #[serde(
         default = "default_auto_search_enabled",
@@ -838,6 +846,8 @@ struct TransformRequestWire {
     clear_reasoning_age: u64,
     #[serde(default)]
     cache_ttl: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effective_execute_threshold: Option<f64>,
     #[serde(default = "default_auto_search_enabled")]
     auto_search_enabled: bool,
     #[serde(default = "default_auto_search_score_threshold")]
@@ -937,6 +947,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             model_key: wire.model_key,
             clear_reasoning_age: wire.clear_reasoning_age,
             cache_ttl: wire.cache_ttl,
+            effective_execute_threshold: wire.effective_execute_threshold,
             auto_search_enabled: wire.auto_search_enabled,
             auto_search_score_threshold: wire.auto_search_score_threshold,
             auto_search_min_prompt_chars: wire.auto_search_min_prompt_chars,
@@ -11417,6 +11428,7 @@ pub(crate) mod tests {
     fn req(session: &str, cfg: &str, messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
             cache_ttl: None,
+            effective_execute_threshold: None,
             auto_search_enabled: true,
             auto_search_score_threshold: DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
             auto_search_min_prompt_chars: 0,
@@ -11612,6 +11624,7 @@ pub(crate) mod tests {
             temporal_awareness: true,
             now_ms,
             execute_threshold_percentage: 65.0,
+            compaction_enabled: true,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
             cache_ttl_provenance: CacheTtlProvenance::Default,
