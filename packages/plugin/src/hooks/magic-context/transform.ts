@@ -818,10 +818,9 @@ export function createTransform(deps: TransformDeps) {
         }
 
         // Rust mode is an authority adapter, not a second implementation of the
-        // TypeScript renderer. Compaction-off leaves native compaction in charge,
-        // so no mutating module transform may run after reconciliation.
+        // TypeScript renderer. Compaction-off still dispatches so the module can
+        // provide the shared additive-only memory/docs contract.
         if (deps.transformMode === "rust") {
-            if (compactionOff) return;
             if (!rustModeTransform) {
                 sessionLog(sessionId, "rust transform unavailable; using raw passthrough");
                 return;

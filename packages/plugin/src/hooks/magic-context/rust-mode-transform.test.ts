@@ -1223,7 +1223,7 @@ describe("Rust mode authority adapter", () => {
         ).toEqual({ title: "receiver-bound compartment" });
     });
 
-    it("sends tool_present false while availability remains provisional", async () => {
+    it("sends fail-closed tool verdicts while availability remains provisional", async () => {
         const sessionId = `rust-availability-provisional-${Date.now()}`;
         sessions.push(sessionId);
         installAvailabilityDb(sessionId);
@@ -1253,7 +1253,7 @@ describe("Rust mode authority adapter", () => {
 
         expect(requestBodies).toHaveLength(1);
         expect(requestBodies[0]?.tool_present).toBe(false);
-        expect(requestBodies[0]).not.toHaveProperty("todo_tool_present");
+        expect(requestBodies[0]?.todo_tool_present).toBe(false);
     });
 
     it("sends a frozen disabled todowrite verdict on the transform wire", async () => {
@@ -1280,6 +1280,45 @@ describe("Rust mode authority adapter", () => {
             makeMeta(db, sessionId),
         );
 
+        expect(requestBody?.todo_tool_present).toBe(false);
+    });
+
+    it("sends the combined todowrite map and live-permission verdict", async () => {
+        const sessionId = `rust-todo-permission-denied-${Date.now()}`;
+        sessions.push(sessionId);
+        installAvailabilityDb(sessionId, {});
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let requestBody: Record<string, unknown> | undefined;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform") requestBody = body as Record<string, unknown>;
+                return method === "transform" ? { native_messages: [] } : { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        const agents = mock(async () => ({
+            data: [{ name: "build", permission: { todowrite: "deny" } }],
+        }));
+        deps.client = {
+            app: { agents },
+            session: {
+                get: async () => ({ data: { agent: "build", directory: "/tmp/project" } }),
+            },
+        } as never;
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const messages = makeMessages(sessionId);
+        messages[0]!.info.tools = {};
+        (messages[0]!.info as { agent?: string }).agent = "build";
+
+        await transform.run(
+            sessionId,
+            messages,
+            { messages: messages as unknown[] },
+            makeMeta(db, sessionId),
+        );
+
+        expect(agents).toHaveBeenCalledTimes(1);
         expect(requestBody?.todo_tool_present).toBe(false);
     });
 

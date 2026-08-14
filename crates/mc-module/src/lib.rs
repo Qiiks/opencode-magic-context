@@ -158,6 +158,9 @@ fn apply_claude_code_config_controls(
     request.auto_search_min_prompt_chars = config.auto_search.min_prompt_chars;
     request.caveman_enabled = config.caveman.enabled;
     request.caveman_min_chars = config.caveman.min_size;
+    // Thalamus does not send a todowrite verdict and Claude Code has no native todowrite
+    // surface. The transform deliberately leaves None intact; synthesis treats missing
+    // authority as unavailable rather than manufacturing an unreachable tool call.
     if config.prompt_surface_guidance_override.is_some() {
         request.prompt_surface_guidance_override = config.prompt_surface_guidance_override.clone();
     }
@@ -7341,7 +7344,8 @@ impl McHandler {
                 // Bind-time scalar config is only the old-host compatibility fallback.
                 execute_threshold_percentage: parsed
                     .execute_threshold_or(binding.config.execute_threshold_percentage),
-                // TODO: The compaction-off output path consumes this transport flag.
+                // Route-bound configuration selects either the full pipeline or the
+                // additive-only memory/docs transform for every consumer profile.
                 compaction_enabled: binding.config.compaction_enabled,
                 smart_drops: binding.config.smart_drops,
                 // OpenCode/Pi send their host-resolved value. Claude Code omits it, so resolve the

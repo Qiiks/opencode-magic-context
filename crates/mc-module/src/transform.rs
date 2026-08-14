@@ -25,12 +25,15 @@ use crate::injection::{
     advance_injection_from_meta, capture_todo_state_on_bust, injection_pending_after_capture,
     is_synthetic_todo_id, InjectionOutcome,
 };
-use crate::m0_compose::compose_m0_from_store;
+use crate::m0_compose::{
+    compose_m0_from_store, trim_memories_to_budget, trim_user_profile_to_budget,
+};
 use crate::m1_compose::{
     claim_and_render_notes, compose_m1_from_store, m1_revision_signal_parts_for_pass_timed,
     M1RevisionReadTimings, M1RevisionSignal,
 };
-use crate::memory_render::M1_PLACEHOLDER;
+use crate::memory_render::{render_m0, workspace_source_names, M0Inputs, M1_PLACEHOLDER};
+use crate::project_docs::read_project_docs_canonical;
 use crate::prompt_surface::{PromptSurfacePreset, PromptSurfaceSelection};
 use crate::scheduler::{
     self, BoundaryBypass, ContextUsage, DeferredExecute, ExecuteThresholdConfig, LatchState,
@@ -535,8 +538,8 @@ pub struct ProducerContext<'a> {
     /// Execute threshold resolved by the host for this request, or the route-bind fallback for
     /// older hosts that omit `effective_execute_threshold`.
     pub execute_threshold_percentage: f64,
-    /// Transport-only mode flag.
-    /// TODO: Consume this when compaction-off output behavior is implemented.
+    /// Whether the full compaction pipeline is enabled. When false, the module emits only
+    /// additive m0/m1 memory and project-doc blocks ahead of the unchanged live array.
     pub compaction_enabled: bool,
     /// Smart-drop selector gate frozen at route bind.
     pub smart_drops: bool,
@@ -678,8 +681,9 @@ pub struct TransformRequest {
     /// deliberately false so older callers stay on the dormant byte path.
     #[serde(default)]
     pub tool_present: bool,
-    /// Frozen availability of OpenCode's native todowrite tool. None is a provisional or
-    /// legacy-sender verdict and fails open to preserve the existing injection behavior.
+    /// Combined host verdict for OpenCode's native todowrite tool (tool map and permission).
+    /// None is a provisional or legacy-sender verdict and fails closed: missing authority
+    /// must never manufacture a synthetic tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todo_tool_present: Option<bool>,
     /// Session-resolved prompt preset. Full is the wire default so older callers retain the
@@ -2291,6 +2295,267 @@ fn lineage_protocol_passthrough(
     }
 }
 
+fn todo_synthesis_verdict(req: &TransformRequest) -> Option<bool> {
+    // Normalize both explicit denial and missing host authority to the injection API's
+    // unavailable verdict so neither case can manufacture a synthetic tool call.
+    Some(req.todo_tool_present.unwrap_or(false))
+}
+
+struct AdditiveM0Composition {
+    m0_bytes: String,
+    rendered_memory_ids: Vec<i64>,
+    memory_mutation_cursor: i64,
+    max_memory_id: i64,
+}
+
+fn compose_additive_m0(
+    store: &McStore,
+    ctx: &ProducerContext<'_>,
+    expiry_cutoff_ms: i64,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> Result<AdditiveM0Composition, TransformError> {
+    let membership = store.resolve_workspace_membership(ctx.project_path)?;
+    let snapshot = if ctx.memory_enabled {
+        store.load_memory_render_snapshot(
+            ctx.project_path,
+            membership.as_ref(),
+            expiry_cutoff_ms,
+        )?
+    } else {
+        mc_store::MemoryRenderSnapshot {
+            memories: Vec::new(),
+            revision: MemoryRevision::default(),
+        }
+    };
+    let source_name_by_id = membership
+        .as_ref()
+        .map(|value| workspace_source_names(&snapshot.memories, value))
+        .unwrap_or_default();
+    let selected_memories = trim_memories_to_budget(
+        snapshot.memories,
+        membership.as_ref(),
+        &source_name_by_id,
+        ctx.memory_budget_tokens,
+        estimate_tokens,
+    );
+    let rendered_memory_ids = selected_memories.iter().map(|memory| memory.id).collect();
+    let user_profile = if ctx.memory_enabled {
+        store.load_active_user_memories()?
+    } else {
+        Vec::new()
+    };
+    let user_profile = trim_user_profile_to_budget(
+        user_profile,
+        ctx.user_profile_budget_tokens,
+        estimate_tokens,
+    );
+    let docs = if ctx.inject_docs {
+        read_project_docs_canonical(ctx.project_directory)
+    } else {
+        crate::project_docs::ProjectDocs::default()
+    };
+    let m0_bytes = render_m0(
+        &M0Inputs {
+            project_docs: &docs.rendered_block,
+            user_profile: &user_profile,
+            covered_system_messages: &[],
+            compartments: &[],
+            memories: &selected_memories,
+            source_name_by_id: &source_name_by_id,
+            history_budget_tokens: 0.0,
+            decay_pressure_multiplier: 1.0,
+        },
+        estimate_tokens,
+    );
+    Ok(AdditiveM0Composition {
+        m0_bytes,
+        rendered_memory_ids,
+        memory_mutation_cursor: snapshot.revision.mutation_cursor,
+        max_memory_id: snapshot.revision.max_memory_id,
+    })
+}
+
+fn apply_additive_only(
+    store: &McStore,
+    req: &TransformRequest,
+    ctx: &ProducerContext<'_>,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+) -> Result<TransformWithProjection, TransformError> {
+    let total_started_at = Instant::now();
+    let projection_started_at = Instant::now();
+    let projection = project_messages(&req.messages)?;
+    let mut timings = TransformTimings {
+        projection: elapsed_ms(projection_started_at),
+        projection_blocks: projection.blocks.len(),
+        projection_projected_messages: req.messages.len(),
+        ..TransformTimings::default()
+    };
+    if let Some(id) = duplicate_ids(&projection.blocks) {
+        return Err(TransformError::DuplicateBlockId(id));
+    }
+    for block in &projection.blocks {
+        if !block.synthetic() && block.id().starts_with(RESERVED_ID_PREFIX) {
+            return Err(TransformError::ReservedId);
+        }
+    }
+    let mut previous_ordinal = None;
+    for message in req
+        .messages
+        .iter()
+        .filter(|message| !message.ck.meta.synthetic)
+    {
+        if previous_ordinal.is_some_and(|ordinal| message.ordinal <= ordinal) {
+            return Err(TransformError::OrdinalViolation);
+        }
+        previous_ordinal = Some(message.ordinal);
+    }
+
+    let loaded = store.load(&req.session_id)?;
+    let additive_render_identity = format!(
+        "additive-only-v1|{}|system:{}|upgrade:{}|project:{}|memory:{}|docs:{}|mb:{:016x}|ub:{:016x}",
+        req.render_config,
+        req.system_prompt_hash,
+        req.upgrade_state,
+        ctx.project_path,
+        ctx.memory_enabled,
+        ctx.inject_docs,
+        ctx.memory_budget_tokens.to_bits(),
+        ctx.user_profile_budget_tokens.to_bits(),
+    );
+    let same_additive_epoch = loaded.meta.last_render_config == additive_render_identity;
+    let expiry_cutoff_ms = if same_additive_epoch {
+        loaded.meta.expiry_cutoff_ms
+    } else {
+        ctx.now_ms
+    };
+
+    let compose_started_at = Instant::now();
+    // The additive producer never reads old compartment rows. The unchanged request array below
+    // remains the complete history source; only project docs, profile, and memory are prepended.
+    let composition =
+        compose_additive_m0(store, ctx, expiry_cutoff_ms, estimate_tokens)?;
+    timings.compose_m0m1 = elapsed_ms(compose_started_at);
+
+    let stored_m0 = loaded
+        .core
+        .frozen_units
+        .iter()
+        .find(|unit| unit.key == "m0")
+        .map(|unit| unit.frozen_payload.as_str());
+    let stored_m1 = loaded
+        .core
+        .frozen_units
+        .iter()
+        .find(|unit| unit.key == "m1")
+        .map(|unit| unit.frozen_payload.as_str());
+    let materialized = !same_additive_epoch
+        || !loaded.core.boundary_id.is_empty()
+        || loaded.core.frozen_units.len() != 2
+        || stored_m0 != Some(composition.m0_bytes.as_str())
+        || stored_m1 != Some(M1_PLACEHOLDER);
+
+    let mut core = loaded.core.clone();
+    let mut meta = loaded.meta.clone();
+    let row_version = if materialized {
+        core.frozen_units.clear();
+        core.pending_changes.clear();
+        core.step(PassInput {
+            proposed: Some(mc_core::Action::Hard),
+            boundary_present: "-".to_string(),
+            rendered_units: vec![
+                synth_region("m0", composition.m0_bytes.clone()),
+                render_m1_placeholder(),
+            ],
+            new_boundary_id: Some(String::new()),
+            queued: Vec::new(),
+            run_started: false,
+        });
+        meta.initialized = true;
+        meta.bootstrap_seed_fold_pending = false;
+        meta.last_render_config = additive_render_identity;
+        meta.last_provider_id = req.provider_id.clone().unwrap_or_default();
+        meta.last_model_key = req.model_key.clone().unwrap_or_default();
+        meta.last_system_prompt_hash = req.system_prompt_hash.clone();
+        meta.last_upgrade_state = req.upgrade_state.clone();
+        meta.coverage_ordinal = None;
+        meta.coverage_start_ordinal = None;
+        meta.coverage_compartment_seq = None;
+        meta.folded_compartment_seq = 0;
+        meta.rendered_memory_ids = composition.rendered_memory_ids.clone();
+        meta.memory_mutation_cursor = composition.memory_mutation_cursor;
+        meta.max_memory_id = composition.max_memory_id;
+        meta.expiry_cutoff_ms = expiry_cutoff_ms;
+        meta.memory_disabled = !ctx.memory_enabled;
+        meta.synthetic_todo = None;
+        meta.m1_pending_since_ms = None;
+        store.commit(&req.session_id, loaded.row_version, &core, &meta)?
+    } else {
+        loaded.row_version.unwrap_or(0)
+    };
+
+    let build_started_at = Instant::now();
+    let mut messages = Vec::with_capacity(req.messages.len() + 2);
+    messages.push(ServedMessage::from_message(synthetic_m0_message(
+        composition.m0_bytes,
+        None,
+    )));
+    messages.push(ServedMessage::from_message(
+        CkWireMessage::synthetic_user_text(M1_PLACEHOLDER.to_string()),
+    ));
+    messages.extend(
+        req.messages
+            .iter()
+            .map(|message| ServedMessage::from_message(message.ck.clone())),
+    );
+    timings.build_output = elapsed_ms(build_started_at);
+    timings.tail_messages_emitted = req.messages.len();
+    timings.total = elapsed_ms(total_started_at);
+
+    let action = if materialized { "HARD" } else { "SOFT+" };
+    Ok(TransformWithProjection {
+        tag_numbers: BTreeMap::new(),
+        projection,
+        scheduler_pass: scheduler::PassDecision::Defer,
+        scheduler_drain_latch_active: false,
+        boundary_state: BoundaryState::Absent,
+        trim_mismatch: None,
+        revert_epoch: meta.revert_epoch,
+        reasoning_watermark: meta
+            .reasoning_cleared_through_tag
+            .max(meta.reasoning_cleared_through_ordinal),
+        transition_consumed: transition_consumed(&core),
+        mutation_exempt_mid: None,
+        lineage_anchor_mid: None,
+        response: TransformResponse {
+            status: TransformStatus::Ok,
+            served_from: ServedFrom::Transform,
+            full_array_fingerprint: req.full_array_fingerprint.clone(),
+            action: action.to_string(),
+            decision: action.to_string(),
+            materialize_reason: materialized.then(|| "additive_only".to_string()),
+            first_divergence: None,
+            timings: Some(timings),
+            boundary_id: String::new(),
+            reconcile_pending: false,
+            version: core.version,
+            row_version,
+            surface_state: SurfaceState::Inactive,
+            committed: materialized,
+            coverage_ordinal: None,
+            rendered_memory_ids: Some(composition.rendered_memory_ids),
+            lineage_switch_consumed_id: None,
+            lineage_descent_disposition: None,
+            cache_ttl: None,
+            ordinal_continuation_base: meta.ordinal_continuation_base,
+            historian: None,
+            ck_messages: Some(messages),
+            native_messages: None,
+            host_directives: None,
+            note_deliveries: None,
+        },
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_once(
     store: &McStore,
@@ -2303,6 +2568,9 @@ fn apply_once(
     boundary_divergence_detected: &mut bool,
 ) -> Result<TransformWithProjection, TransformError> {
     *boundary_divergence_detected = false;
+    if !ctx.compaction_enabled {
+        return apply_additive_only(store, req, ctx, estimate_tokens);
+    }
     let total_started_at = Instant::now();
     let mut timings = TransformTimings::default();
     let mut m1_revision_read_timings = M1RevisionReadTimings::default();
@@ -3251,7 +3519,7 @@ fn apply_once(
             &loaded.meta,
             &tail_for_selection,
             loaded.meta.synthetic_todo.as_ref(),
-            req.todo_tool_present,
+            todo_synthesis_verdict(req),
         );
     let tag_window_protected_block_ids = if tagging_surface_requested {
         newest_active_tag_block_ids(
@@ -3603,7 +3871,12 @@ fn apply_once(
     let tail_for_capture = tail_for_selection.clone();
     if is_bust_pass && tail_reclaim_enabled {
         let todo_started_at = Instant::now();
-        capture_todo_state_on_bust(&mut meta, &tail_for_capture, true, req.todo_tool_present);
+        capture_todo_state_on_bust(
+            &mut meta,
+            &tail_for_capture,
+            true,
+            todo_synthesis_verdict(req),
+        );
         todo_ms += elapsed_ms(todo_started_at);
     }
 
@@ -3887,7 +4160,7 @@ fn apply_once(
                         &mut meta,
                         &post_truncate_tail,
                         true,
-                        req.todo_tool_present,
+                        todo_synthesis_verdict(req),
                     );
                     todo_ms += elapsed_ms(todo_started_at);
                 }
@@ -6231,8 +6504,12 @@ fn advance_synthetic_todo(
     req: &TransformRequest,
 ) -> Result<(), TransformError> {
     let existing = meta.synthetic_todo.clone();
-    let outcome =
-        advance_injection_from_meta(meta, existing.as_ref(), is_bust_pass, req.todo_tool_present);
+    let outcome = advance_injection_from_meta(
+        meta,
+        existing.as_ref(),
+        is_bust_pass,
+        todo_synthesis_verdict(req),
+    );
     match outcome {
         InjectionOutcome::Replace(next) => {
             let anchor_mid = tail_end_mid(req, meta.coverage_ordinal);
@@ -11903,7 +12180,7 @@ pub(crate) mod tests {
             caveman_enabled: false,
             caveman_min_chars: DEFAULT_CAVEMAN_MIN_CHARS,
             tool_present: false,
-            todo_tool_present: None,
+            todo_tool_present: Some(true),
             prompt_surface_preset: PromptSurfacePreset::Full,
             prompt_surface_model_key: None,
             prompt_surface_config_identity: String::new(),
@@ -13994,6 +14271,69 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn compaction_off_is_additive_only_and_byte_stable_across_defers() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.insert_memory(memory_input(
+            "git:proj",
+            "USER_DIRECTIVES",
+            "Always use Bun",
+            0,
+        ))
+        .unwrap();
+        let mut expiring = memory_input(
+            "git:proj",
+            "CONSTRAINTS",
+            "Keep this frozen across the defer",
+            0,
+        );
+        expiring.expires_at = Some(10);
+        s.insert_memory(expiring).unwrap();
+        s.replace_compartments(
+            "off-additive",
+            &[comp(1, 1, 1, "head", "historian output must stay hidden")],
+        )
+        .unwrap();
+        let mut request = active_opencode_req(
+            "off-additive",
+            "cfg0",
+            vec![
+                item("head", 1, "raw head"),
+                item("tail", 2, "tool output body"),
+            ],
+        );
+        request.todo_tool_present = Some(true);
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.compaction_enabled = false;
+        ctx.injected_reductions = vec![reduce("tail#0", "drop", "[dropped by mutation]")];
+
+        let first = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(first.action, "HARD");
+        assert!(first.committed);
+        assert_eq!(first.messages().len(), request.messages.len() + 2);
+        assert_eq!(&*first.messages()[2], &request.messages[0].ck);
+        assert_eq!(&*first.messages()[3], &request.messages[1].ck);
+        assert!(m0_bytes(&first).contains("<project-memory>"));
+        assert!(m0_bytes(&first).contains("Always use Bun"));
+        assert!(m0_bytes(&first).contains("Keep this frozen across the defer"));
+        assert!(m0_bytes(&first).contains("<session-history></session-history>"));
+        assert!(!m0_bytes(&first).contains("historian output must stay hidden"));
+        assert_eq!(m1_bytes(&first), M1_PLACEHOLDER);
+        let first_bytes = serde_json::to_vec(first.messages()).unwrap();
+        let first_native = opencode_native_bytes(&first, "off-additive");
+        let text = String::from_utf8(first_bytes.clone()).unwrap();
+        assert!(!text.contains("§"));
+        assert!(!text.contains("[dropped by mutation]"));
+
+        ctx.now_ms = 20;
+        let defer = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(defer.action, "SOFT+");
+        assert!(!defer.committed);
+        assert_eq!(serde_json::to_vec(defer.messages()).unwrap(), first_bytes);
+        assert_eq!(opencode_native_bytes(&defer, "off-additive"), first_native);
+    }
+
+    #[test]
     fn execute_with_zero_delta_is_defer_shaped_and_byte_identical() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -14030,7 +14370,8 @@ pub(crate) mod tests {
     fn state_sync_todo_pending_rides_execute_to_native_wire_and_defers_identically() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        let request = req("todo-sync", "cfg0", vec![item("a", 1, "raw")]);
+        let mut request = req("todo-sync", "cfg0", vec![item("a", 1, "raw")]);
+        request.todo_tool_present = Some(true);
         assert_eq!(run(&s, &request, &spine()).action, "HARD");
 
         let state_json =
@@ -22707,18 +23048,55 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn missing_todo_tool_verdict_deserializes_as_provisional() {
-        let wire = serde_json::to_value(profile_req(
+    fn missing_todo_tool_verdict_deserializes_as_fail_closed() {
+        let mut wire = serde_json::to_value(profile_req(
             SerializerProfile::OpencodeAiSdk,
             "todo-verdict-default",
             "cfg0",
             vec![item("a", 1, "first")],
         ))
         .unwrap();
+        wire.as_object_mut().unwrap().remove("todo_tool_present");
         assert!(wire.get("todo_tool_present").is_none());
         let request: TransformRequest = serde_json::from_value(wire).unwrap();
 
         assert_eq!(request.todo_tool_present, None);
+    }
+
+    #[test]
+    fn missing_todo_tool_verdict_refuses_synthesis_on_a_bust() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = req(
+            "todo-missing-verdict",
+            "cfg0",
+            vec![
+                item("a", 1, "raw"),
+                todowrite_call(
+                    "todo-visible",
+                    2,
+                    json!([{
+                        "content": "Must not synthesize",
+                        "status": "in_progress",
+                        "priority": "high"
+                    }]),
+                ),
+            ],
+        );
+        request.todo_tool_present = None;
+
+        let response = run(&s, &request, &spine());
+        assert_eq!(response.action, "HARD");
+        assert!(response.messages().iter().all(|message| {
+            !message.meta.synthetic
+                || !matches!(
+                    message.content.first().map(|block| &block.kind),
+                    Some(ck_wire::CkKind::ToolCall { name, .. }) if name == "todowrite"
+                )
+        }));
+        let meta = s.load("todo-missing-verdict").unwrap().meta;
+        assert!(meta.last_todo_state.is_none());
+        assert!(meta.synthetic_todo.is_none());
     }
 
     #[test]

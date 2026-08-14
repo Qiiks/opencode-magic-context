@@ -325,9 +325,9 @@ export async function applyTodoSynthesis(args: {
 }
 
 /**
- * Apply the host-resident note and recall overlays after native Rust serving.
- * These anchors are deliberately appended after the module response lands: they
- * are TypeScript cache decisions, not module-owned CK bytes.
+ * Rebuild host-owned canonical representation after native Rust serving.
+ * The persisted compaction summary is restored with the same canonicalizer as the
+ * TypeScript lane, then note and recall anchors are replayed onto the native result.
  */
 export function runRustModePostprocess(args: {
     db: ContextDatabase;
@@ -335,8 +335,11 @@ export function runRustModePostprocess(args: {
     messages: MessageLike[];
     projectPath?: string;
     fullFeatureMode: boolean;
+    compactionOff?: boolean;
+    tagger: Tagger;
+    ctxReduceAvailability: CtxReduceAvailabilityVerdict;
 }): void {
-    if (!args.fullFeatureMode) return;
+    if (!args.fullFeatureMode || args.compactionOff) return;
     // Test doubles and older integrations may return the legacy bare message shape.
     // The host-side sticky phase only applies to OpenCode MessageLike objects, so leave
     // those responses untouched instead of treating a missing `info` object as a failure.
@@ -350,6 +353,16 @@ export function runRustModePostprocess(args: {
     ) {
         return;
     }
+    reconcileMarkerRepresentation(
+        args.messages,
+        getPersistedCompactionMarkerState(args.db, args.sessionId),
+        {
+            db: args.db,
+            sessionId: args.sessionId,
+            tagger: args.tagger,
+            ctxReduceAvailability: args.ctxReduceAvailability,
+        },
+    );
     for (const anchor of getNoteNudgeAnchors(args.db, args.sessionId)) {
         appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
     }
