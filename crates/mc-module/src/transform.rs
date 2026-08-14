@@ -4673,7 +4673,7 @@ fn apply_once(
             .expect("serialized output cache mutex")
             .snapshot(&req.session_id, meta.revert_epoch)
     });
-    let built_output = build_output_with_tags(
+    let mut built_output = build_output_with_tags(
         &core,
         output_meta,
         &projection,
@@ -4688,6 +4688,26 @@ fn apply_once(
         output_cache_snapshot.as_ref(),
         is_bust_pass,
     )?;
+    let new_merged_reasoning_units =
+        new_merged_reasoning_strip_units(&core, req, &built_output.messages, is_bust_pass);
+    if !new_merged_reasoning_units.is_empty() {
+        core.frozen_units.extend(new_merged_reasoning_units);
+        built_output = build_output_with_tags(
+            &core,
+            output_meta,
+            &projection,
+            req,
+            (tagging_active || auto_search_active).then_some(&tag_overlay),
+            tail_reclaim_enabled && !req.is_subagent,
+            mutation_exempt_mid,
+            &tag_numbers,
+            meta.reasoning_cleared_through_tag
+                .max(meta.reasoning_cleared_through_ordinal),
+            transition_committed,
+            output_cache_snapshot.as_ref(),
+            true,
+        )?;
+    }
     #[cfg(test)]
     if output_cache.is_some() {
         let fresh = build_output_with_tags(
@@ -7766,6 +7786,7 @@ fn compute_active_overlay_decisions(
 
 /// Decide one durable auto-search hint for a new live user tail. The decision is DB-only;
 /// first rendering remains deferred until a pass that already busts the provider cache.
+#[allow(clippy::too_many_arguments)]
 fn maybe_decide_live_user_hint(
     store: &McStore,
     req: &TransformRequest,
@@ -7980,10 +8001,12 @@ fn run_user_hint_lexical_search(
         .collect())
 }
 
+#[cfg(test)]
 fn user_hint_query(message: &CkIngressMessage) -> String {
     cap_user_hint_query(&user_hint_raw_prompt(message))
 }
 
+#[cfg(test)]
 fn user_hint_raw_prompt(message: &CkIngressMessage) -> String {
     sanitize_user_hint_query(&user_hint_message_text(message))
 }
@@ -9182,12 +9205,16 @@ fn surviving_strip_units(core: &CoreState, req: &TransformRequest) -> Vec<Frozen
         .iter()
         .filter(|unit| unit.key.starts_with("strip:"))
         .filter(|unit| {
-            unit.key
-                .strip_prefix("strip:")
-                .and_then(|rest| rest.split_once(':'))
-                .is_some_and(|(_, target)| {
-                    live_mids.contains(target) || live_block_ids.contains(target)
-                })
+            // A request may be a transient subset or revert. Keep applied message ids durable so
+            // their strip resumes deterministically if they return in a later full-array request.
+            unit.key.starts_with("strip:merged_reasoning:")
+                || unit
+                    .key
+                    .strip_prefix("strip:")
+                    .and_then(|rest| rest.split_once(':'))
+                    .is_some_and(|(_, target)| {
+                        live_mids.contains(target) || live_block_ids.contains(target)
+                    })
         })
         .cloned()
         .collect()
@@ -9980,6 +10007,53 @@ fn enforce_unique_tool_use_ids(
     messages
 }
 
+fn new_merged_reasoning_strip_units(
+    core: &CoreState,
+    req: &TransformRequest,
+    rendered_messages: &[ServedMessage],
+    is_bust_pass: bool,
+) -> Vec<FrozenUnit> {
+    if !is_bust_pass {
+        return Vec::new();
+    }
+    let Some(profile) = SerializerProfile::parse(&req.serializer_profile) else {
+        return Vec::new();
+    };
+    let existing_keys = core
+        .frozen_units
+        .iter()
+        .map(|unit| unit.key.as_str())
+        .collect::<HashSet<_>>();
+    let mutation_exempt_mid = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
+    let mut prev_assistant = false;
+    let mut units = Vec::new();
+    // Detect against the fully rendered message so earlier reductions and sentinel replacements
+    // participate in the keep rule. The preview is never served; any changed message id is frozen,
+    // then the output is rebuilt once with those durable decisions applied.
+    for rendered in rendered_messages {
+        let first_assistant_in_run = rendered.role == "assistant" && !prev_assistant;
+        if let Some(mid) = rendered.meta.harness_id.as_deref() {
+            let key = format!("strip:merged_reasoning:{mid}");
+            if !existing_keys.contains(key.as_str()) {
+                let mut candidate = rendered.clone().into_message();
+                let mutation_exempt = mutation_exempt_mid == Some(mid);
+                if apply_serializer_residual_to_message(
+                    profile,
+                    req.provider_id.as_deref(),
+                    mutation_exempt,
+                    first_assistant_in_run,
+                    &mut candidate,
+                ) > 0
+                {
+                    units.push(strip_unit("merged_reasoning", mid, ""));
+                }
+            }
+        }
+        prev_assistant = rendered.role == "assistant";
+    }
+    units
+}
+
 fn apply_serializer_residual_to_message(
     profile: SerializerProfile,
     provider_id: Option<&str>,
@@ -10459,7 +10533,9 @@ fn build_output_with_tags_inner(
                 || rendered.meta.synthetic
                 || !blocks_by_mid.contains_key(msg.mid.as_str());
             let output = if present {
-                if let Some(profile) = serializer_profile {
+                if let Some(profile) = serializer_profile
+                    .filter(|_| message_strip_unit(core, "merged_reasoning", &msg.mid).is_some())
+                {
                     apply_serializer_residual_to_message(
                         profile,
                         req.provider_id.as_deref(),
@@ -10887,12 +10963,12 @@ fn is_empty_reasoning_sentinel(part: &Value) -> bool {
         .is_some_and(|value| value.as_str() == Some(""))
 }
 
-fn is_empty_text_block(block: &CkWireBlock) -> bool {
-    matches!(&block.kind, ck_wire::CkKind::Text { text } if text.is_empty())
+fn is_sentinel_invisible_text_block(block: &CkWireBlock) -> bool {
+    matches!(&block.kind, ck_wire::CkKind::Text { text } if text.trim().is_empty())
 }
 
 fn is_reasoning_ignored_block(block: &CkWireBlock) -> bool {
-    if is_empty_text_block(block) {
+    if is_sentinel_invisible_text_block(block) {
         return true;
     }
     matches!(
@@ -15494,6 +15570,172 @@ pub(crate) mod tests {
             &messages[1].content[0].kind,
             ck_wire::CkKind::Text { text } if text.is_empty()
         ));
+    }
+
+    #[test]
+    fn reasoning_keep_rule_treats_whitespace_only_text_as_sentinel_invisible() {
+        let mut messages = vec![CkWireMessage::from_parts(
+            "assistant",
+            vec![
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: " \t\n".to_string(),
+                }),
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: "signed thinking".to_string(),
+                    signature: Some("sig".to_string()),
+                }),
+            ],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("whitespace-first".to_string()),
+                ..Default::default()
+            },
+        )];
+
+        assert_eq!(
+            apply_serializer_residuals_with_exemption(
+                SerializerProfile::OpencodeAiSdk,
+                &mut messages,
+                None,
+                Some("anthropic"),
+            ),
+            0
+        );
+        assert!(matches!(
+            &messages[0].content[1].kind,
+            ck_wire::CkKind::Reasoning { text, .. } if text == "signed thinking"
+        ));
+    }
+
+    #[test]
+    fn merged_reasoning_transition_waits_for_bust_then_replays_after_restart() {
+        fn assistant(mid: &str, ordinal: u64, reasoning: &str) -> CkIngressMessage {
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    vec![
+                        ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                            text: reasoning.to_string(),
+                            signature: Some(format!("sig-{mid}")),
+                        }),
+                        ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                            text: format!("answer-{mid}"),
+                        }),
+                    ],
+                    None,
+                    ck_wire::ProviderExtras::new(),
+                    ck_wire::HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        fn anthropic_request(
+            session: &str,
+            cfg: &str,
+            messages: Vec<CkIngressMessage>,
+        ) -> TransformRequest {
+            let mut request = profile_req(SerializerProfile::OpencodeAiSdk, session, cfg, messages);
+            request.provider_id = Some("anthropic".to_string());
+            request
+        }
+
+        fn message_bytes(response: &TransformResponse, mid: &str) -> Vec<u8> {
+            response
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some(mid))
+                .unwrap_or_else(|| panic!("missing served message {mid}"))
+                .canonical_bytes()
+                .to_vec()
+        }
+
+        fn response_bytes(response: &TransformResponse) -> Vec<Vec<u8>> {
+            response
+                .messages()
+                .iter()
+                .map(|message| message.canonical_bytes().to_vec())
+                .collect()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let transitioned_messages = vec![
+            assistant("first", 1, "keep-first"),
+            assistant("transition", 2, "freeze-on-bust"),
+            assistant("newest", 3, "exempt-newest"),
+        ];
+        let bust_bytes;
+        {
+            let store = store(dir.path());
+            let initial_messages = transitioned_messages[..2].to_vec();
+            let initial = run(
+                &store,
+                &anthropic_request("merged-transition", "cfg0", initial_messages),
+                &spine(),
+            );
+            assert_eq!(initial.action, "HARD");
+            let transition_before = message_bytes(&initial, "transition");
+
+            let defer = run(
+                &store,
+                &anthropic_request("merged-transition", "cfg0", transitioned_messages.clone()),
+                &spine(),
+            );
+            assert_eq!(defer.action, "SOFT+");
+            assert_eq!(
+                message_bytes(&defer, "transition"),
+                transition_before,
+                "losing newest status on a defer must not first-apply the merged strip"
+            );
+
+            let bust = run(
+                &store,
+                &anthropic_request("merged-transition", "cfg1", transitioned_messages.clone()),
+                &spine(),
+            );
+            assert_eq!(bust.action, "HARD");
+            assert!(matches!(
+                &bust
+                    .messages()
+                    .iter()
+                    .find(|message| {
+                        message.meta.harness_id.as_deref() == Some("transition")
+                    })
+                    .unwrap()
+                    .content[0]
+                    .kind,
+                ck_wire::CkKind::Text { text } if text.is_empty()
+            ));
+            let frozen_keys = store
+                .load("merged-transition")
+                .unwrap()
+                .core
+                .frozen_units
+                .into_iter()
+                .map(|unit| unit.key)
+                .collect::<BTreeSet<_>>();
+            assert!(frozen_keys.contains("strip:merged_reasoning:transition"));
+            assert!(!frozen_keys.contains("strip:merged_reasoning:newest"));
+            bust_bytes = response_bytes(&bust);
+        }
+
+        let restarted = store(dir.path());
+        let replay = run(
+            &restarted,
+            &anthropic_request("merged-transition", "cfg1", transitioned_messages),
+            &spine(),
+        );
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(
+            response_bytes(&replay),
+            bust_bytes,
+            "a defer after restart must replay the frozen merged strip byte-identically"
+        );
     }
 
     #[test]
