@@ -991,7 +991,11 @@ describe("beforeDeadline orphan safety", () => {
             });
             const beforeDeadline = (
                 transport as unknown as {
-                    beforeDeadline(op: Promise<never>, deadline: number, detail: string): Promise<never>;
+                    beforeDeadline(
+                        op: Promise<never>,
+                        deadline: number,
+                        detail: string,
+                    ): Promise<never>;
                 }
             ).beforeDeadline.bind(transport);
             // Deadline already passed relative to the operation: the race loses immediately.
