@@ -89,6 +89,8 @@ pub struct PromptSurfaceSelection {
     /// It participates only in materialization freezing, never provider-visible epochs.
     pub config_identity: String,
     pub preset: PromptSurfacePreset,
+    /// Complete trusted user-authored primary guidance bytes, resolved by the host.
+    pub guidance_override: Option<String>,
     pub tool_descriptions: BTreeMap<String, String>,
 }
 
@@ -98,6 +100,7 @@ impl Default for PromptSurfaceSelection {
             model_key: None,
             config_identity: String::new(),
             preset: PromptSurfacePreset::Full,
+            guidance_override: None,
             tool_descriptions: BTreeMap::new(),
         }
     }
@@ -127,6 +130,12 @@ pub fn guidance_asset(preset: PromptSurfacePreset, variant: GuidanceVariant) -> 
 
 pub fn is_known_tool_id(tool_id: &str) -> bool {
     PROMPT_SURFACE_TOOL_IDS.contains(&tool_id)
+}
+
+pub fn warn_ignored_unknown_tool_description(tool_id: &str) {
+    eprintln!(
+        "mc-module: config warning: prompt_surface.tool_descriptions.{tool_id} is not a known ctx_* tool ID; the override was ignored."
+    );
 }
 
 pub fn tool_manifest_falls_back(preset: PromptSurfacePreset) -> bool {
@@ -223,6 +232,9 @@ pub fn selection_freeze_identity(selection: &PromptSurfaceSelection) -> String {
     // still reselect while unchanged requests remain frozen.
     let mut hasher = Sha256::new();
     hash_part(&mut hasher, "preset", selection.preset.as_str());
+    if let Some(guidance) = &selection.guidance_override {
+        hash_part(&mut hasher, "guidance_override", guidance);
+    }
     for (tool_id, description) in &selection.tool_descriptions {
         hash_part(&mut hasher, "tool", tool_id);
         hash_part(&mut hasher, "description", description);

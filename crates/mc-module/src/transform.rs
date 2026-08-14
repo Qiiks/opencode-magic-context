@@ -79,6 +79,7 @@ const M0_ID: &str = "mc_m0";
 /// The reserved id prefix: a non-synthetic item bearing it is a contract violation.
 const RESERVED_ID_PREFIX: &str = "mc_";
 const SYNTH_REGION_KIND: &str = "synthesized-region";
+const M0_MURAL_KEY: &str = "m0-mural";
 /// Frozen-unit key prefix for a tail reduction (a reduced tool output / superseded edit).
 /// `red:<target_id>` — the target is the real tail item whose bytes are replaced.
 const RED_KEY_PREFIX: &str = "red:";
@@ -697,6 +698,13 @@ pub struct TransformRequest {
     /// USER-tier top-level description replacements. IDs and schemas remain module-owned.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub prompt_surface_tool_descriptions: BTreeMap<String, String>,
+    /// Trusted USER-tier primary guidance bytes resolved by the host, never a filesystem path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_surface_guidance_override: Option<String>,
+    /// Optional OpenCode mural payload. Claude Code remains disabled until Thalamus image-block
+    /// support is defined; the transform profile gate prevents this field from building CC bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mural: Option<crate::m0_compose::M0MuralInput>,
     /// Ask the module to include an OpenCode-native rendering alongside canonical CK.
     /// Missing input is deliberately false so existing responses remain byte-identical.
     #[serde(default)]
@@ -871,6 +879,10 @@ struct TransformRequestWire {
     #[serde(default)]
     prompt_surface_tool_descriptions: BTreeMap<String, String>,
     #[serde(default)]
+    prompt_surface_guidance_override: Option<String>,
+    #[serde(default)]
+    mural: Option<crate::m0_compose::M0MuralInput>,
+    #[serde(default)]
     serve_native: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     native_messages: Option<Vec<Value>>,
@@ -959,6 +971,8 @@ impl<'de> Deserialize<'de> for TransformRequest {
             prompt_surface_model_key: wire.prompt_surface_model_key,
             prompt_surface_config_identity: wire.prompt_surface_config_identity,
             prompt_surface_tool_descriptions: wire.prompt_surface_tool_descriptions,
+            prompt_surface_guidance_override: wire.prompt_surface_guidance_override,
+            mural: wire.mural,
             serve_native: wire.serve_native,
             native_messages: wire.native_messages,
             full_array_fingerprint: wire.full_array_fingerprint,
@@ -2558,11 +2572,15 @@ fn apply_once(
         transition_epoch: String::new(),
     };
     let render_identity = render_identity_base(req, &content_epoch.prompt_surface_epoch);
-    let stable_effective_render_config = fold_m0_content_epoch(&render_identity, &content_epoch);
+    let persisted_mural_hash = frozen_mural_hash(&loaded.core).to_string();
+    let stable_effective_render_config_base =
+        fold_m0_content_epoch(&render_identity, &content_epoch);
     if transition_due {
         content_epoch.transition_epoch = TRANSITION_EPOCH.to_string();
     }
-    let effective_render_config = fold_m0_content_epoch(&render_identity, &content_epoch);
+    let effective_render_config_base = fold_m0_content_epoch(&render_identity, &content_epoch);
+    let effective_render_config =
+        fold_mural_content_identity(&effective_render_config_base, &persisted_mural_hash);
     // A brand-new session has no provider-visible prefix to invalidate, so its bootstrap HARD
     // may mint and render tags immediately. Established dormant sessions still wait for the
     // coordinating identity fold before tags can change their replayed bytes.
@@ -3593,6 +3611,7 @@ fn apply_once(
     let compose_m0m1_started_at = Instant::now();
     let mut commit_memory_revision = None;
     let mut note_deliveries: Vec<NoteDelivery> = Vec::new();
+    let mut committed_mural_hash = persisted_mural_hash;
 
     if req.is_subagent {
         if !matches!(scheduler_outcome.pass, scheduler::PassDecision::Defer) {
@@ -3636,6 +3655,7 @@ fn apply_once(
                         user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                         inject_docs: ctx.inject_docs,
                         temporal_awareness: ctx.temporal_awareness,
+                        mural: m0_mural_input(req, serializer_profile),
                     },
                     estimate_tokens,
                 )?;
@@ -3736,6 +3756,7 @@ fn apply_once(
                                     user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                                     inject_docs: ctx.inject_docs,
                                     temporal_awareness: ctx.temporal_awareness,
+                                    mural: m0_mural_input(req, serializer_profile),
                                 },
                                 estimate_tokens,
                             )?;
@@ -3814,7 +3835,17 @@ fn apply_once(
                 } else {
                     render_m1_body(&note_body)
                 };
-                let mut rendered = vec![synth_region("m0", comp.m0_bytes), m1_unit];
+                let mural_unit = comp.mural.as_ref().map(render_mural_block);
+                committed_mural_hash = comp
+                    .mural
+                    .as_ref()
+                    .map(|mural| mural.content_hash.clone())
+                    .unwrap_or_default();
+                let mut rendered = vec![synth_region("m0", comp.m0_bytes)];
+                if let Some(mural_unit) = mural_unit {
+                    rendered.push(mural_unit);
+                }
+                rendered.push(m1_unit);
                 rendered.extend(survivors);
                 rendered.extend(strip_survivors);
                 rendered.extend(caveman_survivors);
@@ -3838,7 +3869,10 @@ fn apply_once(
                     meta.lineage_descent_materialized = true;
                 }
                 meta.memory_disabled = !ctx.memory_enabled;
-                meta.last_render_config = effective_render_config.clone();
+                meta.last_render_config = fold_mural_content_identity(
+                    &effective_render_config_base,
+                    &committed_mural_hash,
+                );
                 meta.last_provider_id = req.provider_id.clone().unwrap_or_default();
                 meta.last_model_key = req.model_key.clone().unwrap_or_default();
                 meta.last_system_prompt_hash = req.system_prompt_hash.clone();
@@ -3960,6 +3994,7 @@ fn apply_once(
                             user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                             inject_docs: ctx.inject_docs,
                             temporal_awareness: ctx.temporal_awareness,
+                            mural: m0_mural_input(req, serializer_profile),
                         },
                         estimate_tokens,
                     )?;
@@ -4019,7 +4054,17 @@ fn apply_once(
                     } else {
                         render_m1_body(&m1.notes_block)
                     };
-                    let mut rendered = vec![synth_region("m0", comp.m0_bytes), refold_m1_unit];
+                    let mural_unit = comp.mural.as_ref().map(render_mural_block);
+                    committed_mural_hash = comp
+                        .mural
+                        .as_ref()
+                        .map(|mural| mural.content_hash.clone())
+                        .unwrap_or_default();
+                    let mut rendered = vec![synth_region("m0", comp.m0_bytes)];
+                    if let Some(mural_unit) = mural_unit {
+                        rendered.push(mural_unit);
+                    }
+                    rendered.push(refold_m1_unit);
                     rendered.extend(survivors);
                     rendered.extend(strip_survivors);
                     rendered.extend(caveman_survivors);
@@ -4034,6 +4079,10 @@ fn apply_once(
                     plan = PassPlan::Hard;
                     materialize_reason = Some("pressure_refold".to_string());
                     meta.initialized = true;
+                    meta.last_render_config = fold_mural_content_identity(
+                        &effective_render_config_base,
+                        &committed_mural_hash,
+                    );
                     if meta.descent_completed {
                         meta.lineage_descent_materialized = true;
                     }
@@ -4236,7 +4285,10 @@ fn apply_once(
         // Record consumption after any bust that renders an affected shape. If the shape first
         // appeared during a pass that was already invalidating the cache for another reason, its
         // changed bytes rode that invalidation and replay must not trigger a second one.
-        meta.last_render_config = stable_effective_render_config.clone();
+        meta.last_render_config = fold_mural_content_identity(
+            &stable_effective_render_config_base,
+            &committed_mural_hash,
+        );
     }
     timings.compose_m0m1 = elapsed_ms(compose_m0m1_started_at);
 
@@ -4792,6 +4844,24 @@ fn memory_revision_fence(
     })
 }
 
+fn fold_mural_content_identity(render_config: &str, mural_hash: &str) -> String {
+    if mural_hash.is_empty() {
+        return render_config.to_string();
+    }
+    let Some(prefix) = render_config.strip_suffix(']') else {
+        return format!("{render_config}|mural:{}:{mural_hash}", mural_hash.len());
+    };
+    format!("{prefix};mur:{}:{mural_hash}]", mural_hash.len())
+}
+
+fn frozen_mural_hash(core: &CoreState) -> &str {
+    core.frozen_units
+        .iter()
+        .find(|unit| unit.key == M0_MURAL_KEY)
+        .map(|unit| unit.reset_rule.as_str())
+        .unwrap_or("")
+}
+
 fn render_config_base(render_config: &str) -> &str {
     render_config
         .split_once("|m0epoch[")
@@ -4816,6 +4886,17 @@ fn render_identity_base(req: &TransformRequest, prompt_surface_epoch: &str) -> S
     parts.join("|")
 }
 
+fn m0_mural_input(
+    req: &TransformRequest,
+    serializer_profile: Option<SerializerProfile>,
+) -> Option<&crate::m0_compose::M0MuralInput> {
+    // Thalamus image-block support is not yet defined, so Claude Code must not build a mural.
+    // OpenCode owns capability resolution and sends only its already-gated data URL.
+    (serializer_profile == Some(SerializerProfile::OpencodeAiSdk))
+        .then_some(req.mural.as_ref())
+        .flatten()
+}
+
 fn prompt_surface_selection(req: &TransformRequest) -> PromptSurfaceSelection {
     PromptSurfaceSelection {
         model_key: req
@@ -4824,6 +4905,7 @@ fn prompt_surface_selection(req: &TransformRequest) -> PromptSurfaceSelection {
             .or_else(|| req.model_key.clone()),
         config_identity: req.prompt_surface_config_identity.clone(),
         preset: req.prompt_surface_preset,
+        guidance_override: req.prompt_surface_guidance_override.clone(),
         tool_descriptions: req.prompt_surface_tool_descriptions.clone(),
     }
 }
@@ -4942,8 +5024,14 @@ fn is_legacy_baseline(core: &CoreState) -> bool {
 fn cached_m1_missing(core: &CoreState) -> bool {
     let m0 = core.frozen_units.iter().filter(|u| u.key == "m0").count();
     let m1 = core.frozen_units.iter().filter(|u| u.key == "m1").count();
+    let mural = core
+        .frozen_units
+        .iter()
+        .filter(|unit| unit.key == M0_MURAL_KEY)
+        .count();
     let rest_ok = core.frozen_units.iter().all(|u| {
         u.key == "m0"
+            || u.key == M0_MURAL_KEY
             || u.key.starts_with(RED_KEY_PREFIX)
             || u.key.starts_with("strip:")
             || u.key.starts_with(CAV_KEY_PREFIX)
@@ -4952,15 +5040,21 @@ fn cached_m1_missing(core: &CoreState) -> bool {
                 LEGACY_TRANSITION_CONSUMED_KEY | TRANSITION_CONSUMED_KEY
             )
     });
-    m0 == 1 && m1 == 0 && rest_ok
+    m0 == 1 && m1 == 0 && mural <= 1 && rest_ok
 }
 
 fn valid_m0m1_shape(core: &CoreState) -> bool {
     let m0 = core.frozen_units.iter().filter(|u| u.key == "m0").count();
     let m1 = core.frozen_units.iter().filter(|u| u.key == "m1").count();
+    let mural = core
+        .frozen_units
+        .iter()
+        .filter(|unit| unit.key == M0_MURAL_KEY)
+        .count();
     let rest_ok = core.frozen_units.iter().all(|u| {
         u.key == "m0"
             || u.key == "m1"
+            || u.key == M0_MURAL_KEY
             || u.key.starts_with(RED_KEY_PREFIX)
             || u.key.starts_with("strip:")
             || u.key.starts_with(CAV_KEY_PREFIX)
@@ -4969,7 +5063,7 @@ fn valid_m0m1_shape(core: &CoreState) -> bool {
                 LEGACY_TRANSITION_CONSUMED_KEY | TRANSITION_CONSUMED_KEY
             )
     });
-    m0 == 1 && m1 == 1 && rest_ok
+    m0 == 1 && m1 == 1 && mural <= 1 && rest_ok
 }
 
 fn caveman_depth(unit: &FrozenUnit) -> u8 {
@@ -5663,6 +5757,44 @@ fn surviving_red_units(
 }
 
 // --- render helpers (the ONLY producers of frozen bytes) ---
+
+/// Build the synthetic m0 message with the optional mural immediately after its text block.
+fn synthetic_m0_message(text: String, mural: Option<&FrozenUnit>) -> CkWireMessage {
+    let mut content = vec![CkWireBlock::bare(ck_wire::CkKind::Text { text })];
+    if let Some(mural) = mural {
+        content.push(CkWireBlock::bare(ck_wire::CkKind::Media(
+            ck_wire::MediaBlock {
+                kind: ck_wire::MediaKind::Image,
+                media_type: "image/png".to_string(),
+                filename: None,
+                source: serde_json::json!({
+                    "type": "url",
+                    "url": mural.frozen_payload.as_str(),
+                }),
+            },
+        )));
+    }
+    CkWireMessage::from_parts(
+        "user",
+        content,
+        None,
+        ck_wire::ProviderExtras::new(),
+        ck_wire::HarnessMeta {
+            synthetic: true,
+            ..Default::default()
+        },
+    )
+}
+
+fn render_mural_block(mural: &crate::m0_compose::M0MuralBlock) -> FrozenUnit {
+    FrozenUnit {
+        key: M0_MURAL_KEY.to_string(),
+        kind: SYNTH_REGION_KIND.to_string(),
+        frozen_payload: mural.data_url.clone(),
+        durability_class: mc_core::DurabilityClass::Lineage,
+        reset_rule: mural.content_hash.clone(),
+    }
+}
 
 /// The m1 placeholder unit (a HARD resets m1 to it; m1 is never fully empty).
 fn render_m1_placeholder() -> FrozenUnit {
@@ -9615,15 +9747,19 @@ fn build_output_with_tags_inner(
 
     if !req.is_subagent {
         if let Some(unit) = frozen_units.by_key("m0") {
+            let mural = frozen_units.by_key(M0_MURAL_KEY);
             let key = "synthetic:m0".to_string();
-            let identity = "m0".to_string();
+            let identity = mural.map_or_else(
+                || "m0".to_string(),
+                |mural| format!("m0:{}:{}", mural.reset_rule.len(), mural.reset_rule),
+            );
             let (served, reused) = cached_or_serialize_output(
                 cache_snapshot,
                 &key,
                 &identity,
                 prefix_dirty,
                 &mut build_timings,
-                || CkWireMessage::synthetic_user_text(unit.frozen_payload.clone()),
+                || synthetic_m0_message(unit.frozen_payload.clone(), mural),
             );
             record_output_item(
                 &mut cache_entries,
@@ -11549,6 +11685,8 @@ pub(crate) mod tests {
             prompt_surface_model_key: None,
             prompt_surface_config_identity: String::new(),
             prompt_surface_tool_descriptions: BTreeMap::new(),
+            prompt_surface_guidance_override: None,
+            mural: None,
             serve_native: false,
             native_messages: None,
             full_array_fingerprint: None,
@@ -14599,6 +14737,115 @@ pub(crate) mod tests {
             Some("hello")
         );
         assert_eq!(parsed.serializer_profile, "owned-llmrunner");
+    }
+
+    #[test]
+    fn mural_changes_wait_for_a_natural_hard_and_then_replay_byte_identically() {
+        fn request_with_mural(
+            session: &str,
+            render_config: &str,
+            hash: &str,
+            data: &str,
+        ) -> TransformRequest {
+            let mut request = req(session, render_config, vec![item("tail", 1, "raw")]);
+            request.serializer_profile = "opencode-aisdk".to_string();
+            request.mural = Some(crate::m0_compose::M0MuralInput {
+                enabled: true,
+                supports_vision: true,
+                data_url: Some(data.to_string()),
+                content_hash: Some(hash.to_string()),
+            });
+            request
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mural_a = request_with_mural(
+            "mural-replay",
+            "cfg0",
+            "mural-hash-a",
+            "data:image/png;base64,YQ==",
+        );
+        let first = run(&store, &mural_a, &spine());
+        assert_eq!(first.action, "HARD");
+        assert!(m0_bytes(&first).contains("<memory-mural>"));
+        let first_m0 = &first.messages()[0];
+        assert_eq!(first_m0.content.len(), 2);
+        assert!(matches!(
+            first_m0.content[0].kind,
+            ck_wire::CkKind::Text { .. }
+        ));
+        match &first_m0.content[1].kind {
+            ck_wire::CkKind::Media(media) => {
+                assert_eq!(media.kind, ck_wire::MediaKind::Image);
+                assert_eq!(media.source["url"], json!("data:image/png;base64,YQ=="));
+            }
+            other => panic!("expected mural image after m0 text, got {other:?}"),
+        }
+        let ck_messages = first
+            .messages()
+            .iter()
+            .map(|message| message.message.as_ref().clone())
+            .collect::<Vec<_>>();
+        let native = crate::codec::encode_opencode_with_session(
+            &ck_messages,
+            &crate::codec::DecodeSidecar::new("opencode"),
+            Some("mural-replay"),
+            None,
+        );
+        let native_m0 = serde_json::to_value(&native[0]).unwrap();
+        assert_eq!(native_m0["parts"][0]["synthetic"], json!(true));
+        assert_eq!(
+            native_m0["parts"][1],
+            json!({
+                "type": "file",
+                "mime": "image/png",
+                "url": "data:image/png;base64,YQ==",
+                "synthetic": true,
+            })
+        );
+        let identity_a = store.load("mural-replay").unwrap().meta.last_render_config;
+        assert!(identity_a.contains("mural-hash-a"));
+
+        let mural_b_defer = request_with_mural(
+            "mural-replay",
+            "cfg0",
+            "mural-hash-b",
+            "data:image/png;base64,Yg==",
+        );
+        let deferred = run(&store, &mural_b_defer, &spine());
+        assert_eq!(deferred.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_vec(&first.ck_messages).unwrap(),
+            serde_json::to_vec(&deferred.ck_messages).unwrap(),
+            "a live mural change must not self-bust the frozen m0 prefix"
+        );
+
+        let mural_b_hard = request_with_mural(
+            "mural-replay",
+            "cfg1",
+            "mural-hash-b",
+            "data:image/png;base64,Yg==",
+        );
+        let folded = run(&store, &mural_b_hard, &spine());
+        assert_eq!(folded.action, "HARD");
+        let identity_b = store.load("mural-replay").unwrap().meta.last_render_config;
+        assert_ne!(identity_b, identity_a);
+        assert!(identity_b.contains("mural-hash-b"));
+        match &folded.messages()[0].content[1].kind {
+            ck_wire::CkKind::Media(media) => {
+                assert_eq!(media.source["url"], json!("data:image/png;base64,Yg=="));
+            }
+            other => panic!("expected folded mural image, got {other:?}"),
+        }
+
+        let replayed = run(&store, &mural_b_hard, &spine());
+        assert_eq!(replayed.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_vec(&folded.ck_messages).unwrap(),
+            serde_json::to_vec(&replayed.ck_messages).unwrap(),
+            "the data URL belongs to the frozen m0 bytes"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ import {
 import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import { getMemoryVerifications } from "../../features/magic-context/memory/storage-memory-verifications";
+import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import {
     casChannel2NudgeState,
@@ -1036,6 +1037,25 @@ export function applyNativeMessagesVerbatim(
     return replaceMessagesInPlace(output, nativeMessages);
 }
 
+function muralInputForWire(
+    mural: ReturnType<typeof resolveMuralWire> | undefined,
+): Record<string, unknown> | undefined {
+    if (
+        !mural?.enabled ||
+        !mural.supportsVision ||
+        typeof mural.dataUrl !== "string" ||
+        mural.dataUrl.length === 0
+    ) {
+        return undefined;
+    }
+    return {
+        enabled: true,
+        supports_vision: true,
+        data_url: mural.dataUrl,
+        content_hash: mural.contentHash,
+    };
+}
+
 function buildTransformBody(args: {
     sessionId: string;
     input: unknown[];
@@ -1113,6 +1133,8 @@ function buildTransformBody(args: {
         prompt_surface_model_key: args.passInputs.prompt_surface_model_key,
         prompt_surface_config_identity: args.passInputs.prompt_surface_config_identity,
         prompt_surface_tool_descriptions: args.passInputs.prompt_surface_tool_descriptions ?? {},
+        prompt_surface_guidance_override: args.passInputs.prompt_surface_guidance_override,
+        mural: args.passInputs.mural,
         effective_execute_threshold: args.passInputs.effective_execute_threshold,
         auto_search_enabled: args.passInputs.auto_search_enabled === true,
         auto_search_score_threshold: args.passInputs.auto_search_score_threshold,
@@ -1691,7 +1713,24 @@ export function createRustModeTransform(
                 overflowState.needsEmergencyRecovery &&
                 loadProtectedTailMeta(deps.db, sessionId).recoveryNoEligibleHeadCount >=
                     RECOVERY_NO_HEAD_LIMIT;
-            const promptSurface = resolvePromptSurface(deps.promptSurface, modelKey ?? undefined);
+            const promptSurfaceGuidance = deps.promptSurfaceRuntime?.resolveGuidance(
+                deps.promptSurface,
+                modelKey ?? undefined,
+            );
+            const promptSurface =
+                promptSurfaceGuidance ??
+                resolvePromptSurface(deps.promptSurface, modelKey ?? undefined);
+            const resolvedMural =
+                !sessionMeta.isSubagent && deps.muralEnabled === true
+                    ? resolveMuralWire(
+                          deps.db,
+                          deps.projectPath,
+                          modelKey ?? undefined,
+                          true,
+                          deps.memoryConfig?.injectionBudgetTokens,
+                      )
+                    : undefined;
+            const mural = muralInputForWire(resolvedMural);
             const passInputs: Record<string, unknown> = {
                 now_ms: requestObservedAtMs,
                 model_key: modelKey,
@@ -1717,6 +1756,8 @@ export function createRustModeTransform(
                 prompt_surface_model_key: modelKey,
                 prompt_surface_config_identity: promptSurfaceConfigIdentity(deps.promptSurface),
                 prompt_surface_tool_descriptions: deps.promptSurface?.tool_descriptions ?? {},
+                prompt_surface_guidance_override: promptSurfaceGuidance?.primaryOverride,
+                mural,
                 protected_tags: deps.protectedTags ?? DEFAULT_PROTECTED_TAGS,
                 temporal_awareness: deps.experimentalTemporalAwareness === true,
                 channel2_nudge_state: getChannel2NudgeState(deps.db, sessionId),
@@ -2662,6 +2703,7 @@ export const __rustModeTransformTest = {
     messageContentSnapshot,
     messageMatchesContentSnapshot,
     buildTransformBody,
+    muralInputForWire,
     formatRustPassLog,
     shouldDisarmRustEmergencyRecovery,
     createRustModeTransform,

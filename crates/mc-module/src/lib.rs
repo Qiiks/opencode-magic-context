@@ -158,6 +158,9 @@ fn apply_claude_code_config_controls(
     request.auto_search_min_prompt_chars = config.auto_search.min_prompt_chars;
     request.caveman_enabled = config.caveman.enabled;
     request.caveman_min_chars = config.caveman.min_size;
+    if config.prompt_surface_guidance_override.is_some() {
+        request.prompt_surface_guidance_override = config.prompt_surface_guidance_override.clone();
+    }
 }
 
 /// Why a transform request can't be served: the route isn't bound, or the request's
@@ -1714,6 +1717,18 @@ impl TransformRequest {
             )
             .saturating_add(self.prompt_surface_config_identity.capacity())
             .saturating_add(
+                self.prompt_surface_guidance_override
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(self.mural.as_ref().map_or(0, |mural| {
+                mural
+                    .data_url
+                    .as_ref()
+                    .map_or(0, String::capacity)
+                    .saturating_add(mural.content_hash.as_ref().map_or(0, String::capacity))
+            }))
+            .saturating_add(
                 self.full_array_fingerprint
                     .as_ref()
                     .map_or(0, String::capacity),
@@ -3084,6 +3099,7 @@ impl McHandler {
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: true,
                 temporal_awareness: true,
+                prompt_surface_guidance_override: None,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
             },
@@ -6591,9 +6607,8 @@ impl McHandler {
             };
             for (tool_id, description) in object {
                 if !prompt_surface::is_known_tool_id(tool_id) {
-                    return Err(invalid_params_error(format!(
-                        "prompt_surface tool_descriptions contains unknown tool {tool_id:?}"
-                    )));
+                    prompt_surface::warn_ignored_unknown_tool_description(tool_id);
+                    continue;
                 }
                 let Some(description) = description.as_str() else {
                     return Err(invalid_params_error(format!(
@@ -6608,10 +6623,24 @@ impl McHandler {
                 tool_descriptions.insert(tool_id.clone(), description.to_string());
             }
         }
+        let guidance_override = match request
+            .get("guidance_override")
+            .or_else(|| request.get("prompt_surface_guidance_override"))
+        {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
+            Some(Value::String(_)) => None,
+            _ => {
+                return Err(invalid_params_error(
+                    "prompt_surface guidance_override must be a string",
+                ))
+            }
+        };
         Ok(PromptSurfaceSelection {
             model_key,
             config_identity,
             preset,
+            guidance_override,
             tool_descriptions,
         })
     }
@@ -6624,23 +6653,29 @@ impl McHandler {
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
             return invalid_params_error("manifest.get requires session_id");
         };
-        if let Err(error) = self.resolve_binding(channel, session_id) {
-            return match error {
-                BindingError::Unbound => HandlerOutcome::Error {
-                    code: "route_unbound".to_string(),
-                    message: "manifest.get on a channel with no session binding".to_string(),
-                },
-                BindingError::SessionMismatch => HandlerOutcome::Error {
-                    code: "session_mismatch".to_string(),
-                    message: "request session_id does not match the channel's bound session"
-                        .to_string(),
-                },
-            };
-        }
-        let requested = match self.prompt_surface_selection_from_value(request) {
+        let binding = match self.resolve_binding(channel, session_id) {
+            Ok(binding) => binding,
+            Err(error) => {
+                return match error {
+                    BindingError::Unbound => HandlerOutcome::Error {
+                        code: "route_unbound".to_string(),
+                        message: "manifest.get on a channel with no session binding".to_string(),
+                    },
+                    BindingError::SessionMismatch => HandlerOutcome::Error {
+                        code: "session_mismatch".to_string(),
+                        message: "request session_id does not match the channel's bound session"
+                            .to_string(),
+                    },
+                }
+            }
+        };
+        let mut requested = match self.prompt_surface_selection_from_value(request) {
             Ok(selection) => selection,
             Err(error) => return error,
         };
+        if requested.guidance_override.is_none() {
+            requested.guidance_override = binding.config.prompt_surface_guidance_override;
+        }
         let selection = self.freeze_prompt_surface_selection(session_id, requested);
         let tools = prompt_surface::session_tools(&selection);
         respond(json!({
@@ -6670,19 +6705,22 @@ impl McHandler {
                 message: "guidance.get requires session_id".to_string(),
             };
         };
-        if let Err(error) = self.resolve_binding(channel, session_id) {
-            return match error {
-                BindingError::Unbound => HandlerOutcome::Error {
-                    code: "route_unbound".to_string(),
-                    message: "guidance.get on a channel with no session binding".to_string(),
-                },
-                BindingError::SessionMismatch => HandlerOutcome::Error {
-                    code: "session_mismatch".to_string(),
-                    message: "request session_id does not match the channel's bound session"
-                        .to_string(),
-                },
-            };
-        }
+        let binding = match self.resolve_binding(channel, session_id) {
+            Ok(binding) => binding,
+            Err(error) => {
+                return match error {
+                    BindingError::Unbound => HandlerOutcome::Error {
+                        code: "route_unbound".to_string(),
+                        message: "guidance.get on a channel with no session binding".to_string(),
+                    },
+                    BindingError::SessionMismatch => HandlerOutcome::Error {
+                        code: "session_mismatch".to_string(),
+                        message: "request session_id does not match the channel's bound session"
+                            .to_string(),
+                    },
+                }
+            }
+        };
 
         let tool_present = match request.get("tool_present") {
             None => false,
@@ -6703,10 +6741,13 @@ impl McHandler {
                 None => return unknown_serializer_profile_error(),
             },
         };
-        let requested_selection = match self.prompt_surface_selection_from_value(request) {
+        let mut requested_selection = match self.prompt_surface_selection_from_value(request) {
             Ok(selection) => selection,
             Err(error) => return error,
         };
+        if requested_selection.guidance_override.is_none() {
+            requested_selection.guidance_override = binding.config.prompt_surface_guidance_override;
+        }
         let selection = self.freeze_prompt_surface_selection(session_id, requested_selection);
         let active = cc_u1_active(profile, tool_present);
         let expected_variant = if active { "full" } else { "no_reduce" };
@@ -6735,7 +6776,10 @@ impl McHandler {
             prompt_surface::GuidanceVariant::NoReduce
         };
         let asset = prompt_surface::guidance_asset(selection.preset, variant);
-        let base_text = asset.bytes;
+        let base_text = selection
+            .guidance_override
+            .as_deref()
+            .unwrap_or(asset.bytes);
         let language_text = request
             .get("language")
             .and_then(Value::as_str)
@@ -7151,12 +7195,17 @@ impl McHandler {
             }
         };
         apply_claude_code_config_controls(&mut parsed, &binding.config, serializer_profile);
+        parsed
+            .prompt_surface_tool_descriptions
+            .retain(|tool_id, _| {
+                if prompt_surface::is_known_tool_id(tool_id) {
+                    true
+                } else {
+                    prompt_surface::warn_ignored_unknown_tool_description(tool_id);
+                    false
+                }
+            });
         for (tool_id, description) in &parsed.prompt_surface_tool_descriptions {
-            if !prompt_surface::is_known_tool_id(tool_id) {
-                return invalid_params_error(format!(
-                    "prompt_surface tool_descriptions contains unknown tool {tool_id:?}"
-                ));
-            }
             if description.trim().is_empty() {
                 return invalid_params_error(format!(
                     "prompt_surface tool_descriptions.{tool_id} must not be empty"
@@ -7170,6 +7219,7 @@ impl McHandler {
                 .or_else(|| parsed.model_key.clone()),
             config_identity: parsed.prompt_surface_config_identity.clone(),
             preset: parsed.prompt_surface_preset,
+            guidance_override: parsed.prompt_surface_guidance_override.clone(),
             tool_descriptions: parsed.prompt_surface_tool_descriptions.clone(),
         };
         let frozen_prompt_surface =
@@ -7177,6 +7227,7 @@ impl McHandler {
         parsed.prompt_surface_preset = frozen_prompt_surface.preset;
         parsed.prompt_surface_model_key = frozen_prompt_surface.model_key;
         parsed.prompt_surface_config_identity = frozen_prompt_surface.config_identity;
+        parsed.prompt_surface_guidance_override = frozen_prompt_surface.guidance_override;
         parsed.prompt_surface_tool_descriptions = frozen_prompt_surface.tool_descriptions;
 
         let lineage_root = canonical_root(&binding.project_root);
@@ -14910,6 +14961,8 @@ mod tests {
         configured.auto_search.min_prompt_chars = 42;
         configured.caveman.enabled = true;
         configured.caveman.min_size = 900;
+        configured.prompt_surface_guidance_override =
+            Some("## Magic Context\n\nTrusted route guidance.".to_string());
         apply_claude_code_config_controls(
             &mut default_request,
             &configured,
@@ -14920,6 +14973,10 @@ mod tests {
         assert_eq!(default_request.auto_search_min_prompt_chars, 42);
         assert!(default_request.caveman_enabled);
         assert_eq!(default_request.caveman_min_chars, 900);
+        assert_eq!(
+            default_request.prompt_surface_guidance_override.as_deref(),
+            Some("## Magic Context\n\nTrusted route guidance.")
+        );
 
         let mut open_code_request: TransformRequest = serde_json::from_value(value).unwrap();
         open_code_request.serializer_profile = "opencode-aisdk".to_string();
@@ -14993,6 +15050,7 @@ mod tests {
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
             temporal_awareness: true,
+            prompt_surface_guidance_override: None,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
         }
@@ -18532,6 +18590,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn guidance_uses_resolved_route_text_without_reading_a_path() {
+        let producer = Arc::new(ProducerState::default());
+        let mut config = default_test_config();
+        config.prompt_surface_guidance_override =
+            Some("## Magic Context\n\nTrusted route guidance.".to_string());
+        let (handler, _store, _dir, project) = handler_with_store(producer, config.clone());
+        let mut route = binding(project.to_str().unwrap(), "ses");
+        route.config = config;
+        handler.bind_route(7, route);
+        handler.guidance_dates.lock().unwrap().insert(
+            "ses".to_string(),
+            "Today's date: Fri Jan 01 2016".to_string(),
+        );
+
+        let guidance = call_dispatch_request(
+            &handler,
+            json!({
+                "kind": "guidance.get",
+                "session_id": "ses",
+                "tool_present": true,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            guidance["bytes"],
+            json!("## Magic Context\n\nTrusted route guidance.\nToday's date: Fri Jan 01 2016")
+        );
+        assert_eq!(
+            guidance["content_hash"],
+            json!(prompt_surface::guidance_content_hash(
+                "## Magic Context\n\nTrusted route guidance.",
+                PromptSurfacePreset::Full,
+            ))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn guidance_presets_cover_both_authored_light_variants() {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -18604,6 +18700,51 @@ mod tests {
             assert_eq!(light["served_preset"], "light");
             assert_eq!(light["fallback_notice"], Value::Null);
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mixed_known_and_unknown_descriptions_apply_known_and_only_warn_for_unknown() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let transform = call_dispatch_request(
+            &handler,
+            json!({
+                "kind": "transform",
+                "v": 2,
+                "serializer_profile": "opencode-aisdk",
+                "session_id": "ses",
+                "render_config": "cfg",
+                "prompt_surface_config_identity": "mixed-descriptions",
+                "prompt_surface_tool_descriptions": {
+                    "ctx_search": "Known search override.",
+                    "ctx_typo": "Unknown override."
+                },
+                "messages": []
+            }),
+        )
+        .await;
+        assert_eq!(transform["status"], json!("ok"));
+
+        let manifest = call_dispatch_request(
+            &handler,
+            json!({
+                "kind": "manifest.get",
+                "session_id": "ses",
+                "config_identity": "mixed-descriptions",
+                "tool_descriptions": {}
+            }),
+        )
+        .await;
+        assert_eq!(manifest["tools"][3]["name"], json!("ctx_search"));
+        assert_eq!(
+            manifest["tools"][3]["description"],
+            json!("Known search override.")
+        );
+        assert!(manifest["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["name"] != json!("ctx_typo")));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -27759,6 +27900,7 @@ mod tests {
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: true,
                 temporal_awareness: true,
+                mural: None,
             },
             |_| 0,
         )

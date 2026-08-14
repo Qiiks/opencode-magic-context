@@ -58,6 +58,7 @@ import { getErrorMessage } from "../../shared/error-message";
 import { log, sessionLog } from "../../shared/logger";
 import { getSdkContextLimit } from "../../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
+import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
 import { applyMidTurnDeferral, detectMidTurnBypassReason } from "./boundary-execution";
 import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 import { replayCavemanCompression } from "./caveman-cleanup";
@@ -649,6 +650,8 @@ export interface TransformDeps {
     transformMode?: "ts" | "rust";
     /** Prompt-surface routing and USER description overrides forwarded to Rust mode. */
     promptSurface?: PromptSurfaceConfig;
+    /** Resolves trusted USER guidance files before crossing the module boundary. */
+    promptSurfaceRuntime?: PromptSurfaceRuntime;
     /** Module transport injected by the hook; tests use a deterministic mock. */
     rustModeModuleClient?: RustModeModuleClient;
     /** Test-only opt-out for transform-wire fixtures without the authority protocol. */

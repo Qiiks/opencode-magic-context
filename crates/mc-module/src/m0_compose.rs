@@ -12,11 +12,15 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use mc_store::{McStore, McStoreError, MemoryRevision};
+use sha2::{Digest, Sha256};
 
 use crate::compartment_coverage::{resolve_coverage, CoverageGap};
 use crate::decay_render::{extract_m0_block, DecayRenderCompartment};
 use crate::memory_render::{render_m0, render_memory_line, workspace_source_names, M0Inputs};
 use crate::project_docs::read_project_docs_canonical;
+
+const MEMORY_MURAL_BLOCK: &str =
+    "<memory-mural>\nThe project memory mural image follows.\n</memory-mural>";
 
 /// Why composing the HARD m0 from the store failed.
 #[derive(Debug)]
@@ -48,6 +52,8 @@ impl From<McStoreError> for M0ComposeError {
 pub struct M0Composition {
     /// The frozen m0 baseline bytes (docs + profile + decayed compartments + memories).
     pub m0_bytes: String,
+    /// Optional image block appended after the m0 text block on the OpenCode wire.
+    pub mural: Option<M0MuralBlock>,
     /// The last raw message id covered by m0 — the cache/revert anchor. Empty when the
     /// session has no compartments (nothing summarized → no covered prefix → the whole
     /// live array is the tail).
@@ -75,6 +81,24 @@ pub struct M0Composition {
     /// HARD trigger — see `M0ContentEpoch`). Records which docs version is in m0 so the
     /// next natural HARD re-reads current docs.
     pub docs_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct M0MuralInput {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub supports_vision: bool,
+    #[serde(default)]
+    pub data_url: Option<String>,
+    #[serde(default, alias = "content_epoch")]
+    pub content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct M0MuralBlock {
+    pub data_url: String,
+    pub content_hash: String,
 }
 
 /// The fixed expiry/budget inputs for an m0 compose, threaded from the caller so the
@@ -107,6 +131,30 @@ pub struct M0ComposeInputs<'a> {
     pub inject_docs: bool,
     /// Gate temporal heading dates at render time, including rows persisted by a prior pass.
     pub temporal_awareness: bool,
+    /// OpenCode-only image bytes already resolved and capability-gated by the host.
+    pub mural: Option<&'a M0MuralInput>,
+}
+
+fn resolved_mural(input: Option<&M0MuralInput>) -> Option<M0MuralBlock> {
+    let input = input?;
+    if !input.enabled || !input.supports_vision {
+        return None;
+    }
+    let data_url = input
+        .data_url
+        .as_deref()
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let content_hash = input
+        .content_hash
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{:x}", Sha256::digest(data_url.as_bytes())));
+    Some(M0MuralBlock {
+        data_url,
+        content_hash,
+    })
 }
 
 fn memory_selection_order(
@@ -403,7 +451,8 @@ pub fn compose_m0_from_store(
             rendered
         })
         .collect();
-    let m0_bytes = render_m0_with_decay_pressure_retry(
+    let mural = resolved_mural(inputs.mural);
+    let mut m0_bytes = render_m0_with_decay_pressure_retry(
         &M0Inputs {
             project_docs: &docs.rendered_block,
             user_profile: &user_profile,
@@ -416,9 +465,14 @@ pub fn compose_m0_from_store(
         },
         estimate_tokens,
     );
+    if mural.is_some() {
+        m0_bytes.push_str("\n\n");
+        m0_bytes.push_str(MEMORY_MURAL_BLOCK);
+    }
 
     Ok(M0Composition {
         m0_bytes,
+        mural,
         boundary_id,
         coverage_ordinal,
         first_covered_ordinal,
@@ -456,6 +510,40 @@ mod tests {
     }
 
     #[test]
+    fn mural_requires_enabled_vision_and_data_url() {
+        let enabled = M0MuralInput {
+            enabled: true,
+            supports_vision: true,
+            data_url: Some("data:image/png;base64,cG5n".to_string()),
+            content_hash: Some("mural-epoch-a".to_string()),
+        };
+        assert_eq!(
+            resolved_mural(Some(&enabled)),
+            Some(M0MuralBlock {
+                data_url: "data:image/png;base64,cG5n".to_string(),
+                content_hash: "mural-epoch-a".to_string(),
+            })
+        );
+
+        for disabled in [
+            M0MuralInput {
+                enabled: false,
+                ..enabled.clone()
+            },
+            M0MuralInput {
+                supports_vision: false,
+                ..enabled.clone()
+            },
+            M0MuralInput {
+                data_url: None,
+                ..enabled.clone()
+            },
+        ] {
+            assert!(resolved_mural(Some(&disabled)).is_none());
+        }
+    }
+
+    #[test]
     fn composes_m0_from_compartments_with_coverage_anchor() {
         let fixture = FixtureBuilder::store();
         let dir = &fixture.dir;
@@ -480,6 +568,7 @@ mod tests {
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
             temporal_awareness: true,
+            mural: None,
         };
         let m0 = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
 
@@ -512,6 +601,7 @@ mod tests {
             user_profile_budget_tokens: 4_000.0,
             inject_docs: false,
             temporal_awareness: true,
+            mural: None,
         };
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         assert!(!composed.m0_bytes.contains("secret docs"));
@@ -539,6 +629,7 @@ mod tests {
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
             temporal_awareness: true,
+            mural: None,
         };
         let m0 = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
 
@@ -580,6 +671,7 @@ mod tests {
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
             temporal_awareness: true,
+            mural: None,
         };
 
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
@@ -615,6 +707,7 @@ mod tests {
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
             temporal_awareness: true,
+            mural: None,
         };
         let composed = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         assert_eq!(composed.coverage_ordinal, Some(30));
@@ -666,6 +759,7 @@ mod tests {
             user_profile_budget_tokens: 0.0,
             inject_docs: false,
             temporal_awareness: true,
+            mural: None,
         };
         let decay_compartments = compartments
             .iter()
@@ -922,6 +1016,7 @@ mod tests {
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
             temporal_awareness: true,
+            mural: None,
         };
         let a = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
         let b = compose_m0_from_store(&store, &inputs, no_estimate).unwrap();
