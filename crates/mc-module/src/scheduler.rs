@@ -146,10 +146,14 @@ impl Default for SchedulerConfig {
 /// Provider-reported context pressure for the current pass.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ContextUsage {
-    /// Provider-reported context fill percentage.
+    /// Provider-reported context fill percentage against the soft scheduling window.
     pub percentage: f64,
     /// Provider-reported input tokens for this pass.
     pub input_tokens: f64,
+    /// Context fill percentage against the provider's absolute hard wall. Older callers omit
+    /// this value and retain the historical single-denominator behavior.
+    #[serde(default)]
+    pub hard_wall_percentage: Option<f64>,
 }
 
 /// Durable timing metadata needed for scheduler and idle-TTL predicates.
@@ -499,10 +503,24 @@ pub fn should_execute(
     }
 }
 
-/// Derive the pressure band from provider-reported usage percentage.
+/// Derive the pressure band when soft scheduling and the absolute wall share a denominator.
 pub fn derive_band(usage_percentage: f64, effective_threshold_percentage: f64) -> Band {
+    derive_band_with_hard_wall(
+        usage_percentage,
+        usage_percentage,
+        effective_threshold_percentage,
+    )
+}
+
+/// Derive the pressure band while keeping execute/force geometry independent from the provider
+/// wall. Only the absolute 95% arm reads `hard_wall_percentage`; the force arm remains soft-based.
+pub fn derive_band_with_hard_wall(
+    usage_percentage: f64,
+    hard_wall_percentage: f64,
+    effective_threshold_percentage: f64,
+) -> Band {
     let bands = escalation_bands(effective_threshold_percentage);
-    if usage_percentage >= bands.emergency_percentage {
+    if hard_wall_percentage >= bands.emergency_percentage {
         Band::Emergency95
     } else if usage_percentage >= bands.force_materialize_percentage {
         Band::Force85
@@ -723,7 +741,17 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
             PassDecision::Defer
         };
 
-    pass = match derive_band(inputs.usage.percentage, threshold) {
+    // The soft percentage still owns execute, force, and drain. The optional hard percentage is
+    // isolated to the absolute wall, so absent geometry and coinciding geometry preserve the old
+    // decision bytes while split geometry cannot move ordinary scheduling thresholds.
+    pass = match derive_band_with_hard_wall(
+        inputs.usage.percentage,
+        inputs
+            .usage
+            .hard_wall_percentage
+            .unwrap_or(inputs.usage.percentage),
+        threshold,
+    ) {
         Band::Emergency95 => PassDecision::Emergency95,
         Band::Force85 => PassDecision::Force85,
         Band::Normal => pass,
@@ -1000,6 +1028,7 @@ mod tests {
             usage: ContextUsage {
                 percentage: 10.0,
                 input_tokens: 10_000.0,
+                hard_wall_percentage: None,
             },
             session: SessionMeta {
                 last_response_time_ms: 1_000,
@@ -1179,6 +1208,30 @@ mod tests {
         assert_eq!(derive_band(85.0, 65.0), Band::Force85);
         assert_eq!(derive_band(94.9, 90.0), Band::Force85);
         assert_eq!(derive_band(95.0, 90.0), Band::Emergency95);
+    }
+
+    #[test]
+    fn split_geometry_keeps_force_soft_and_moves_only_the_absolute_wall() {
+        assert_eq!(
+            derive_band_with_hard_wall(96.0, 73.2, 65.0),
+            Band::Force85,
+            "soft pressure may force materialization before the provider wall"
+        );
+        assert_eq!(
+            derive_band_with_hard_wall(96.0, 95.0, 65.0),
+            Band::Emergency95
+        );
+    }
+
+    #[test]
+    fn absent_and_coinciding_hard_geometry_produce_identical_decision_bytes() {
+        let absent = base_inputs();
+        let mut coinciding = absent.clone();
+        coinciding.usage.hard_wall_percentage = Some(coinciding.usage.percentage);
+
+        let absent_bytes = serde_json::to_vec(&decide(&absent)).unwrap();
+        let coinciding_bytes = serde_json::to_vec(&decide(&coinciding)).unwrap();
+        assert_eq!(absent_bytes, coinciding_bytes);
     }
 
     #[test]

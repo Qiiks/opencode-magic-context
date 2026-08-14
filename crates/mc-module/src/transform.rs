@@ -577,6 +577,15 @@ pub struct DeclaredTrim {
     pub next_absolute_ordinal: u64,
 }
 
+/// Host-resolved context geometry. Both OpenCode and Claude Code use this host-neutral shape;
+/// `derivation` records the rule and numeric inputs used to calculate the geometry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransformGeometry {
+    pub usable_soft: u64,
+    pub usable_hard: u64,
+    pub derivation: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TrimMismatch {
     pub predicate: &'static str,
@@ -732,6 +741,10 @@ pub struct TransformRequest {
     pub tail_delta: Option<Value>,
     #[serde(default)]
     pub usage: Option<ModuleUsage>,
+    /// Host-resolved soft/hard window pair. The soft member is diagnostic redundancy because
+    /// scheduler bands continue reading `usage.context_limit_tokens` for compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry: Option<TransformGeometry>,
     #[serde(default)]
     pub provider_error: Option<String>,
     /// Shadow-only evidence that the newest assistant tail is still streaming. When true,
@@ -901,6 +914,8 @@ struct TransformRequestWire {
     #[serde(default)]
     usage: Option<ModuleUsage>,
     #[serde(default)]
+    geometry: Option<TransformGeometry>,
+    #[serde(default)]
     provider_error: Option<String>,
     #[serde(default)]
     mid_turn: bool,
@@ -983,6 +998,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             messages,
             tail_delta: wire.tail_delta,
             usage: wire.usage,
+            geometry: wire.geometry,
             provider_error: wire.provider_error,
             mid_turn: wire.mid_turn,
             prev_response_completed_at_ms: wire.prev_response_completed_at_ms,
@@ -1751,7 +1767,7 @@ impl From<crate::m1_compose::M1ComposeError> for TransformError {
 /// reductions are produced inside the pass from the scheduler-gated selector.
 ///
 /// The real Claude token estimator ([`mc_tokenizer::estimate_tokens`]) is injected into
-/// the m0 compose (the decay renderer's budget guard). It is reached ONLY on the
+/// the m0 compose and the legacy publication-floor backfill. Both are reached ONLY on the
 /// Hard/MigrateHard arm — never SOFT, defer, m1 compose, or the tail splice — so it can
 /// only change bytes during an intentional HARD rematerialization; determinism (the same
 /// text always counts identically, via the vendored+pinned vocab) is what preserves
@@ -3204,24 +3220,23 @@ fn apply_once(
     )?;
     let effective_usage = effective_usage(req.usage.as_ref(), loaded.meta.last_usage.as_ref());
     let context_limit_tokens = effective_context_limit_tokens(&effective_usage);
+    let hard_context_limit_tokens =
+        effective_hard_context_limit_tokens(req.geometry.as_ref(), context_limit_tokens);
     let usage_input_tokens = effective_usage.current_total_input_tokens as f64;
     let usage_percentage = if context_limit_tokens > 0.0 {
         usage_input_tokens / context_limit_tokens * 100.0
     } else {
         0.0
     };
-    let fallback_tail_allowance = if loaded.meta.initialized
-        && !req.is_subagent
-        && loaded.meta.publication_floor_ordinal.is_none()
-    {
-        protected_tail_floor_allowance(
-            &live,
-            context_limit_tokens,
-            ctx.execute_threshold_percentage,
-        )
+    let hard_wall_usage_percentage = if hard_context_limit_tokens > 0.0 {
+        usage_input_tokens / hard_context_limit_tokens * 100.0
     } else {
-        0
+        usage_percentage
     };
+    // A legacy row with no frozen publication floor receives no estimator-derived tolerance on a
+    // replay pass. If a real gap exists, the conservative recut is already HARD and backfills the
+    // floor atomically; an ordinary defer remains tokenizer-free until a natural HARD arrives.
+    let fallback_tail_allowance = 0;
     let mut divergence_candidate = if req.is_subagent {
         None
     } else {
@@ -3321,6 +3336,7 @@ fn apply_once(
         usage: ContextUsage {
             percentage: usage_percentage,
             input_tokens: usage_input_tokens,
+            hard_wall_percentage: Some(hard_wall_usage_percentage),
         },
         session: SessionMeta {
             last_response_time_ms: ctx
@@ -4502,6 +4518,20 @@ fn apply_once(
             }
         }
     }
+    if loaded.meta.initialized
+        && matches!(plan, PassPlan::Hard | PassPlan::MigrateHard)
+        && meta.coverage_ordinal.is_some()
+        && meta.publication_floor_ordinal.is_none()
+    {
+        // Freeze the estimator-derived floor only on a pass that is already rebuilding m0. Later
+        // SOFT/defer passes consume this ordinal and cannot change decisions when tokenizers change.
+        meta.publication_floor_ordinal = Some(protected_tail_floor_ordinal(
+            &live,
+            context_limit_tokens,
+            ctx.execute_threshold_percentage,
+            estimate_tokens,
+        ));
+    }
     // A todo-only SOFT splice changes neither the m0/m1 divider nor the covered tail. Keep
     // divergence evidence across that bust so repeated todo churn cannot postpone repair. A
     // structural boundary/coverage move, or a converged observation, still closes the episode.
@@ -5118,6 +5148,17 @@ fn effective_context_limit_tokens(usage: &ModuleUsage) -> f64 {
     }
 }
 
+fn effective_hard_context_limit_tokens(
+    geometry: Option<&TransformGeometry>,
+    soft_context_limit_tokens: f64,
+) -> f64 {
+    geometry
+        .filter(|geometry| geometry.usable_hard >= crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT)
+        .map_or(soft_context_limit_tokens, |geometry| {
+            geometry.usable_hard as f64
+        })
+}
+
 fn memory_revision_fence(
     store: &McStore,
     project_path: &str,
@@ -5608,10 +5649,11 @@ struct BoundaryDivergenceRecut {
     live_tail_allowance: u64,
 }
 
-fn protected_tail_floor_allowance(
+fn protected_tail_floor_ordinal(
     live: &[&FlatBlock],
     context_limit: f64,
     execute_threshold_percentage: f64,
+    estimate_tokens: impl Fn(&str) -> usize,
 ) -> u64 {
     let newest_live = live.iter().map(|block| block.ordinal).max().unwrap_or(0);
     let target =
@@ -5623,7 +5665,7 @@ fn protected_tail_floor_allowance(
     let floor_tokens = target.effective_floor.ceil().max(1.0) as usize;
     let mut tokens_by_ordinal = BTreeMap::<u64, usize>::new();
     for block in live.iter().filter(|block| block.role != "system") {
-        let tokens = mc_tokenizer::estimate_tokens(block.bytes.as_ref());
+        let tokens = estimate_tokens(block.bytes.as_ref());
         *tokens_by_ordinal.entry(block.ordinal).or_default() += tokens;
     }
     let mut accumulated = 0usize;
@@ -5635,9 +5677,7 @@ fn protected_tail_floor_allowance(
             break;
         }
     }
-    newest_live
-        .checked_sub(floor_ordinal)
-        .map_or(0, |span| span.saturating_add(1))
+    floor_ordinal.max(1)
 }
 
 fn post_end_revision_inputs_moved(before: &M1RevisionSignal, after: &M1RevisionSignal) -> bool {
@@ -11406,6 +11446,43 @@ pub(crate) mod tests {
             crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT as f64
         );
     }
+
+    #[test]
+    fn absent_geometry_falls_back_to_the_soft_usage_denominator() {
+        let soft = 128_000.0;
+        assert_eq!(effective_hard_context_limit_tokens(None, soft), soft);
+        assert_eq!(
+            effective_hard_context_limit_tokens(
+                Some(&TransformGeometry {
+                    usable_soft: 1,
+                    usable_hard: 168_000,
+                    derivation: "s1-pre-carve/input=128000".to_string(),
+                }),
+                soft,
+            ),
+            168_000.0,
+            "the transported soft member cannot move scheduler bands"
+        );
+    }
+
+    #[test]
+    fn transform_geometry_is_optional_and_round_trips_as_a_host_neutral_struct() {
+        let mut legacy = serde_json::to_value(req("geometry-wire", "cfg0", vec![])).unwrap();
+        legacy.as_object_mut().unwrap().remove("geometry");
+        let parsed: TransformRequest = serde_json::from_value(legacy).unwrap();
+        assert!(parsed.geometry.is_none());
+
+        let geometry = TransformGeometry {
+            usable_soft: 128_000,
+            usable_hard: 168_000,
+            derivation: "s1-pre-carve/input=128000".to_string(),
+        };
+        let mut current = req("geometry-wire", "cfg0", vec![]);
+        current.geometry = Some(geometry.clone());
+        let parsed: TransformRequest =
+            serde_json::from_value(serde_json::to_value(current).unwrap()).unwrap();
+        assert_eq!(parsed.geometry, Some(geometry));
+    }
     use serde_json::{json, Value};
 
     fn store(dir: &std::path::Path) -> McStore {
@@ -12269,6 +12346,7 @@ pub(crate) mod tests {
             messages,
             tail_delta: None,
             usage: None,
+            geometry: None,
             provider_error: None,
             mid_turn: false,
             prev_response_completed_at_ms: None,
@@ -13780,6 +13858,39 @@ pub(crate) mod tests {
         assert!(
             s.load(session).unwrap().meta.emergency_drain_active,
             "trusted estimates must not change the normal ≥95% arming path"
+        );
+    }
+
+    #[test]
+    fn split_geometry_uses_hard_only_for_the_absolute_emergency_wall() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut split = with_usage(
+            req("split-geometry", "cfg0", vec![item("m1", 1, "hello")]),
+            130_000,
+            128_000,
+        );
+        split.geometry = Some(TransformGeometry {
+            usable_soft: 128_000,
+            usable_hard: 168_000,
+            derivation: "s1-pre-carve/input=128000".to_string(),
+        });
+        let forced =
+            transform_with_projection(&s, &split, &pctx("git:proj", "/nonexistent-docs", 0))
+                .unwrap();
+        assert_eq!(forced.scheduler_pass, scheduler::PassDecision::Force85);
+
+        let no_geometry = with_usage(
+            req("single-geometry", "cfg0", vec![item("m1", 1, "hello")]),
+            130_000,
+            128_000,
+        );
+        let emergency =
+            transform_with_projection(&s, &no_geometry, &pctx("git:proj", "/nonexistent-docs", 0))
+                .unwrap();
+        assert_eq!(
+            emergency.scheduler_pass,
+            scheduler::PassDecision::Emergency95
         );
     }
 
@@ -18175,7 +18286,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn missing_publication_floor_uses_token_floor_and_detects_astro_gap() {
+    fn missing_publication_floor_recuts_conservatively_and_backfills_on_hard() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let mut request = astro_request("astro-missing-floor", 2_402);
@@ -18206,6 +18317,15 @@ pub(crate) mod tests {
             Some("boundary_divergence_recut")
         );
         assert_eq!(response.coverage_ordinal, Some(2_400));
+        assert!(
+            store
+                .load("astro-missing-floor")
+                .unwrap()
+                .meta
+                .publication_floor_ordinal
+                .is_some(),
+            "the recut HARD must freeze the estimator-derived floor"
+        );
     }
 
     #[test]
@@ -24039,13 +24159,8 @@ pub(crate) mod tests {
 
     #[test]
     fn token_estimator_is_hard_only_never_called_on_soft_or_defer() {
-        // The load-bearing cache claim behind wiring the real BPE estimator: it is
-        // reachable ONLY on the HARD m0 compose (the decay budget guard), never on a
-        // SOFT (m1 composes at fixed tier 1) or a defer (frozen replay). If it were
-        // ever called on a non-HARD pass, activating a real (non-zero) estimator could
-        // change bytes on a pass that must replay byte-identically. Prove it with a
-        // call-counting estimator: the counter must be >0 after a HARD and EXACTLY 0
-        // after a SOFT and a defer.
+        // The protected publication floor shares the injected BPE interface with m0 composition.
+        // It is frozen on an already-HARD pass; SOFT and replay passes must never recompute it.
         use std::cell::Cell;
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -24075,8 +24190,17 @@ pub(crate) mod tests {
         assert_eq!(boot.response.action, "HARD");
         assert!(
             calls.get() > 0,
-            "the HARD m0 compose must exercise the estimator (budget guard)"
+            "the HARD m0 compose must exercise the estimator"
         );
+        let loaded = s.load("ses").unwrap();
+        assert!(
+            loaded.meta.publication_floor_ordinal.is_none(),
+            "a bootstrap before historian publication must not advance the trigger floor"
+        );
+        let mut published_meta = loaded.meta;
+        published_meta.publication_floor_ordinal = Some(11);
+        s.commit("ses", loaded.row_version, &loaded.core, &published_meta)
+            .unwrap();
 
         // SOFT: a second compartment rides m1 at fixed tier 1 (no decay budget guard).
         s.replace_compartments(
@@ -24106,16 +24230,56 @@ pub(crate) mod tests {
             "a SOFT composes m1 without the m0 decay budget guard → estimator must NOT be called"
         );
 
-        // defer: replays frozen m0/m1, composes nothing.
+        // Defer replays frozen bytes under two deliberately incompatible estimator versions.
         calls.set(0);
-        let defer =
-            apply_once_with_estimator(&s, &req("ses", "cfg0", soft_items), &ctx, counting, None)
+        let first_defer = apply_once_with_estimator(
+            &s,
+            &req("ses", "cfg0", soft_items.clone()),
+            &ctx,
+            counting,
+            None,
+        )
+        .unwrap();
+        assert_eq!(first_defer.response.action, "SOFT+");
+        assert_eq!(calls.get(), 0, "a defer must not call the estimator");
+        let first_bytes = serde_json::to_vec(&first_defer.response.ck_messages).unwrap();
+
+        // Simulate an initialized legacy row that predates publication-floor persistence. With no
+        // coverage gap, it remains a pure defer and waits for a later HARD to backfill.
+        let loaded = s.load("ses").unwrap();
+        let mut legacy_meta = loaded.meta;
+        legacy_meta.publication_floor_ordinal = None;
+        s.commit("ses", loaded.row_version, &loaded.core, &legacy_meta)
+            .unwrap();
+
+        let alternate_calls = Cell::new(0usize);
+        let alternate = |_text: &str| -> usize {
+            alternate_calls.set(alternate_calls.get() + 1);
+            usize::MAX / 2
+        };
+        let second_defer =
+            apply_once_with_estimator(&s, &req("ses", "cfg0", soft_items), &ctx, alternate, None)
                 .unwrap();
-        assert_eq!(defer.response.action, "SOFT+");
+        assert_eq!(second_defer.response.action, "SOFT+");
+        assert_eq!(alternate_calls.get(), 0);
         assert_eq!(
-            calls.get(),
-            0,
-            "a defer replays frozen m0/m1 → estimator must NOT be called"
+            first_bytes,
+            serde_json::to_vec(&second_defer.response.ck_messages).unwrap(),
+            "defer bytes must be independent of estimator-version behavior"
+        );
+    }
+
+    #[test]
+    fn protected_floor_has_no_global_estimator_bypass() {
+        let source = include_str!("transform.rs");
+        let helper = source
+            .split_once("fn protected_tail_floor_ordinal(")
+            .and_then(|(_, rest)| rest.split_once("fn post_end_revision_inputs_moved"))
+            .map(|(body, _)| body)
+            .expect("protected-tail floor helper source");
+        assert!(
+            !helper.contains("mc_tokenizer::estimate_tokens("),
+            "the floor helper must use the injected estimator interface"
         );
     }
     fn profile_req(
