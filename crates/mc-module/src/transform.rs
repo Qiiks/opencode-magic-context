@@ -218,6 +218,30 @@ impl ServedMessage {
     pub(crate) fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }
+
+    fn retained_bytes(&self) -> usize {
+        use crate::retained_size::{ck_wire_message_retained_bytes, ARC_ALLOCATION_OVERHEAD_BYTES};
+        use std::mem::size_of;
+
+        ARC_ALLOCATION_OVERHEAD_BYTES
+            .saturating_add(ck_wire_message_retained_bytes(&self.message))
+            .saturating_add(ARC_ALLOCATION_OVERHEAD_BYTES)
+            .saturating_add(self.canonical_bytes.len())
+            .saturating_add(ARC_ALLOCATION_OVERHEAD_BYTES)
+            .saturating_add(self.output_identity.len())
+            .saturating_add(ARC_ALLOCATION_OVERHEAD_BYTES)
+            .saturating_add(
+                self.block_fingerprints
+                    .len()
+                    .saturating_mul(size_of::<(String, usize)>()),
+            )
+            .saturating_add(
+                self.block_fingerprints
+                    .iter()
+                    .map(|(fingerprint, _)| fingerprint.capacity())
+                    .sum::<usize>(),
+            )
+    }
 }
 
 impl Deref for ServedMessage {
@@ -308,6 +332,45 @@ impl SerializedOutputCache {
         }
     }
 
+    fn entries_retained_bytes(
+        session_id: &str,
+        entries: &HashMap<String, SerializedOutputCacheEntry>,
+    ) -> usize {
+        use crate::retained_size::{cloned_string_retained_bytes, hash_map_allocation_bytes};
+        use std::mem::size_of;
+
+        hash_map_allocation_bytes(entries)
+            .saturating_add(
+                entries
+                    .iter()
+                    .map(|(key, entry)| {
+                        key.capacity()
+                            .saturating_add(entry.identity.capacity())
+                            .saturating_add(
+                                entry
+                                    .served
+                                    .as_ref()
+                                    .map_or(0, ServedMessage::retained_bytes),
+                            )
+                    })
+                    .sum::<usize>(),
+            )
+            // Include the outer cache bucket/control slack and its two independently allocated
+            // session keys. The three-word allowance models hash-table control and load slack.
+            .saturating_add(size_of::<SerializedOutputSession>())
+            .saturating_add(size_of::<usize>() * 3)
+            .saturating_add(cloned_string_retained_bytes(session_id).saturating_mul(2))
+    }
+
+    pub(crate) fn metrics(&self) -> (usize, usize) {
+        let entry_count = self
+            .sessions
+            .values()
+            .map(|session| session.entries.len())
+            .sum();
+        (self.retained_bytes, entry_count)
+    }
+
     pub(crate) fn remove(&mut self, session_id: &str) {
         if let Some(session) = self.sessions.remove(session_id) {
             self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
@@ -343,11 +406,7 @@ impl SerializedOutputCache {
         stats: SerializedOutputCacheStats,
     ) {
         self.remove(session_id);
-        let retained_bytes = entries
-            .values()
-            .filter_map(|entry| entry.served.as_ref())
-            .map(|served| served.canonical_bytes.len())
-            .sum();
+        let retained_bytes = Self::entries_retained_bytes(session_id, &entries);
         if retained_bytes > self.max_retained_bytes {
             return;
         }
@@ -6138,6 +6197,13 @@ impl TagBaselineCache {
 fn tag_baseline_cache() -> &'static Mutex<TagBaselineCache> {
     static CACHE: OnceLock<Mutex<TagBaselineCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(TagBaselineCache::new(TAG_BASELINE_CACHE_BUDGET_BYTES)))
+}
+
+pub(crate) fn tag_baseline_cache_metrics() -> (usize, usize) {
+    let cache = tag_baseline_cache()
+        .lock()
+        .expect("tag baseline cache mutex");
+    (cache.retained_bytes, cache.sessions.len())
 }
 
 fn tag_baseline_retained_bytes(tags: &[McTagRow]) -> usize {
@@ -26270,6 +26336,164 @@ pub(crate) mod tests {
         assert_eq!(
             canonical_output(&folded.messages),
             canonical_output(&fresh.messages)
+        );
+    }
+
+    #[test]
+    fn serialized_output_cache_deep_charge_counts_message_metadata_and_none_rows() {
+        use std::mem::size_of;
+
+        fn manual_value_retained_bytes(value: &Value) -> usize {
+            fn heap(value: &Value) -> usize {
+                match value {
+                    Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+                    Value::String(value) => value.capacity(),
+                    Value::Array(values) => values
+                        .capacity()
+                        .saturating_mul(size_of::<Value>())
+                        .saturating_add(values.iter().map(heap).sum::<usize>()),
+                    Value::Object(values) => values
+                        .len()
+                        .saturating_mul(
+                            size_of::<String>() + size_of::<Value>() + size_of::<usize>() * 3,
+                        )
+                        .saturating_add(
+                            values
+                                .iter()
+                                .map(|(key, value)| key.capacity().saturating_add(heap(value)))
+                                .sum::<usize>(),
+                        ),
+                }
+            }
+            size_of::<Value>().saturating_add(heap(value))
+        }
+
+        let input = Value::Object(
+            (0..64)
+                .map(|index| {
+                    (
+                        format!("k{index}"),
+                        serde_json::json!({"value": format!("v{index}"), "n": index}),
+                    )
+                })
+                .collect(),
+        );
+        let constructed = CkWireMessage::from_parts(
+            "assistant",
+            vec![CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                id: "call-output-heavy".to_string(),
+                name: "fixture_tool".to_string(),
+                input,
+                provider_executed: false,
+            })],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("output-heavy".to_string()),
+                ..Default::default()
+            },
+        );
+        let message: CkWireMessage =
+            serde_json::from_value(serde_json::to_value(constructed).unwrap()).unwrap();
+        let served = ServedMessage::from_message(message);
+        let block = &served.message.content[0];
+        let block_json = serde_json::to_value(block).unwrap();
+        let message_json = serde_json::to_value(served.message.as_ref()).unwrap();
+        let ck_wire::CkKind::ToolCall {
+            id, name, input, ..
+        } = &block.kind
+        else {
+            panic!("fixture must retain a tool call");
+        };
+        let block_extra = id
+            .capacity()
+            .saturating_add(name.capacity())
+            .saturating_add(manual_value_retained_bytes(input).saturating_sub(size_of::<Value>()))
+            .saturating_add(manual_value_retained_bytes(&block_json));
+        let message_retained = size_of::<CkWireMessage>()
+            .saturating_add(served.message.role.capacity())
+            .saturating_add(
+                served
+                    .message
+                    .content
+                    .capacity()
+                    .saturating_mul(size_of::<CkWireBlock>()),
+            )
+            .saturating_add(block_extra)
+            .saturating_add(
+                served
+                    .message
+                    .meta
+                    .harness_id
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(manual_value_retained_bytes(&message_json));
+        let served_retained = crate::retained_size::ARC_ALLOCATION_OVERHEAD_BYTES
+            .saturating_add(message_retained)
+            .saturating_add(crate::retained_size::ARC_ALLOCATION_OVERHEAD_BYTES)
+            .saturating_add(served.canonical_bytes.len())
+            .saturating_add(crate::retained_size::ARC_ALLOCATION_OVERHEAD_BYTES)
+            .saturating_add(served.output_identity.len())
+            .saturating_add(crate::retained_size::ARC_ALLOCATION_OVERHEAD_BYTES)
+            .saturating_add(
+                served
+                    .block_fingerprints
+                    .len()
+                    .saturating_mul(size_of::<(String, usize)>()),
+            )
+            .saturating_add(
+                served
+                    .block_fingerprints
+                    .iter()
+                    .map(|(fingerprint, _)| fingerprint.capacity())
+                    .sum::<usize>(),
+            );
+        let mut entries = HashMap::new();
+        entries.insert(
+            "tail:output-heavy".to_string(),
+            SerializedOutputCacheEntry {
+                identity: "identity-output-heavy".to_string(),
+                served: Some(served.clone()),
+            },
+        );
+        let without_none =
+            SerializedOutputCache::entries_retained_bytes("fixture-session", &entries);
+        entries.insert(
+            "tail:metadata-only".to_string(),
+            SerializedOutputCacheEntry {
+                identity: "identity-metadata-only".to_string(),
+                served: None,
+            },
+        );
+        let buckets = entries.capacity().saturating_mul(8).saturating_add(6) / 7;
+        let map_allocation = buckets
+            .saturating_mul(size_of::<String>() + size_of::<SerializedOutputCacheEntry>() + 1);
+        let expected = map_allocation
+            .saturating_add(
+                entries
+                    .iter()
+                    .map(|(key, entry)| {
+                        key.capacity()
+                            .saturating_add(entry.identity.capacity())
+                            .saturating_add(entry.served.as_ref().map_or(0, |_| served_retained))
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(size_of::<SerializedOutputSession>())
+            .saturating_add(size_of::<usize>() * 3)
+            .saturating_add((size_of::<String>() + "fixture-session".len()).saturating_mul(2));
+        let retained = SerializedOutputCache::entries_retained_bytes("fixture-session", &entries);
+        let legacy = served.canonical_bytes.len();
+
+        assert!(retained >= legacy.saturating_mul(2));
+        assert!(
+            retained > without_none,
+            "served:None row must carry a charge"
+        );
+        assert!(
+            retained.abs_diff(expected) <= expected / 20,
+            "serialized-output estimate left 5% fixture tolerance: retained={retained} expected={expected}"
         );
     }
 

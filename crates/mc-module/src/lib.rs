@@ -38,6 +38,7 @@ pub mod memory_render;
 pub mod memory_tool;
 pub mod project_docs;
 pub mod prompt_surface;
+mod retained_size;
 pub mod scheduler;
 pub mod selection;
 pub mod session_resolver;
@@ -1680,6 +1681,112 @@ impl ModuleMemoryMutationWire {
     }
 }
 
+impl TransformRequest {
+    /// Estimated bytes retained by one ready snapshot, including its cache keys and `Arc`.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        use crate::retained_size::{
+            btree_map_allocation_bytes, ck_wire_message_retained_bytes,
+            cloned_string_retained_bytes, value_heap_bytes, ARC_ALLOCATION_OVERHEAD_BYTES,
+        };
+        use std::mem::size_of;
+
+        let direct_strings = self
+            .kind
+            .capacity()
+            .saturating_add(self.serializer_profile.capacity())
+            .saturating_add(self.session_id.capacity())
+            .saturating_add(self.render_config.capacity())
+            .saturating_add(self.system_prompt_hash.capacity())
+            .saturating_add(self.upgrade_state.capacity())
+            .saturating_add(self.provider_id.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.model_key.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.cache_ttl.as_ref().map_or(0, String::capacity))
+            .saturating_add(
+                self.prompt_surface_model_key
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(self.prompt_surface_config_identity.capacity())
+            .saturating_add(
+                self.full_array_fingerprint
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(self.provider_error.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.channel2_nudge_state.capacity())
+            .saturating_add(
+                self.detected_context_limit_model_key
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(self.prior_conversation_key.capacity());
+        let prompt_surface = btree_map_allocation_bytes::<String, String>(
+            self.prompt_surface_tool_descriptions.len(),
+        )
+        .saturating_add(
+            self.prompt_surface_tool_descriptions
+                .iter()
+                .map(|(key, value)| key.capacity().saturating_add(value.capacity()))
+                .sum::<usize>(),
+        );
+        let native_messages = self.native_messages.as_ref().map_or(0, |messages| {
+            messages
+                .capacity()
+                .saturating_mul(size_of::<Value>())
+                .saturating_add(messages.iter().map(value_heap_bytes).sum::<usize>())
+        });
+        let messages = self
+            .messages
+            .capacity()
+            .saturating_mul(size_of::<ck_wire::CkIngressMessage>())
+            .saturating_add(
+                self.messages
+                    .iter()
+                    .map(|message| {
+                        message.mid.capacity().saturating_add(
+                            ck_wire_message_retained_bytes(&message.ck)
+                                .saturating_sub(size_of::<ck_wire::CkWireMessage>()),
+                        )
+                    })
+                    .sum::<usize>(),
+            );
+        let tail_delta = self.tail_delta.as_ref().map_or(0, value_heap_bytes);
+        let declared_trim = self.declared_trim.as_ref().map_or(0, |trim| {
+            trim.flat_boundary_id
+                .capacity()
+                .saturating_add(trim.boundary_bare_message_id.capacity())
+        });
+        let constituents = self
+            .constituents
+            .capacity()
+            .saturating_mul(size_of::<(String, String, u64)>())
+            .saturating_add(
+                self.constituents
+                    .iter()
+                    .map(|(conversation, edge, _)| {
+                        conversation.capacity().saturating_add(edge.capacity())
+                    })
+                    .sum::<usize>(),
+            );
+        let cache_metadata = size_of::<TransformSnapshot>()
+            // One hash-table bucket/control/slack allowance, plus the independently allocated
+            // map key and ready-LRU key. Both clones use length-sized string allocations.
+            .saturating_add(size_of::<usize>() * 3)
+            .saturating_add(cloned_string_retained_bytes(&self.session_id).saturating_mul(2));
+
+        size_of::<Self>()
+            .saturating_add(direct_strings)
+            .saturating_add(prompt_surface)
+            .saturating_add(native_messages)
+            .saturating_add(messages)
+            .saturating_add(tail_delta)
+            .saturating_add(declared_trim)
+            .saturating_add(constituents)
+            .saturating_add(ARC_ALLOCATION_OVERHEAD_BYTES)
+            .saturating_add(cache_metadata)
+    }
+}
+
 enum TransformSnapshot {
     InFlight {
         generation: u64,
@@ -2333,6 +2440,30 @@ struct ProjectionCacheSnapshot {
     projection: Arc<crate::ck_wire::FlatProjection>,
 }
 
+impl ProjectionCacheSnapshot {
+    fn retained_bytes(&self, session_id: &str) -> usize {
+        use crate::retained_size::{cloned_string_retained_bytes, ARC_ALLOCATION_OVERHEAD_BYTES};
+        use std::mem::size_of;
+
+        self.projection
+            .retained_bytes()
+            .saturating_add(ARC_ALLOCATION_OVERHEAD_BYTES)
+            .saturating_add(self.context.session_id.capacity())
+            .saturating_add(self.context.serializer_profile.capacity())
+            .saturating_add(self.context.render_config.capacity())
+            .saturating_add(
+                self.full_array_fingerprint
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            // Include the session value's hash bucket plus its independently allocated map and
+            // LRU keys. A three-word allowance covers hash control/load slack.
+            .saturating_add(size_of::<ProjectionCacheSession>())
+            .saturating_add(size_of::<usize>() * 3)
+            .saturating_add(cloned_string_retained_bytes(session_id).saturating_mul(2))
+    }
+}
+
 #[derive(Debug)]
 struct ProjectionCacheSession {
     revert_epoch: u64,
@@ -2382,6 +2513,9 @@ impl ProjectionCache {
     }
 
     fn snapshot(&mut self, session_id: &str, revert_epoch: u64) -> Option<ProjectionCacheSnapshot> {
+        // TODO(memory-accounting): add an active-clone budget for this `Arc`, as identified by
+        // the module-memory audit. A running transform can retain it after LRU eviction, so the
+        // cache-only charge cannot bound that in-flight allocation.
         if self
             .sessions
             .get(session_id)
@@ -2401,7 +2535,7 @@ impl ProjectionCache {
     }
 
     fn replace(&mut self, session_id: &str, revert_epoch: u64, snapshot: ProjectionCacheSnapshot) {
-        let retained_bytes = snapshot.projection.retained_bytes();
+        let retained_bytes = snapshot.retained_bytes(session_id);
         if retained_bytes == 0
             || retained_bytes > self.max_entry_retained_bytes
             || retained_bytes > self.max_retained_bytes
@@ -6665,6 +6799,126 @@ impl McHandler {
             .unwrap_or_else(|| self.guidance_date_line()))
     }
 
+    fn memory_holder_metrics(&self) -> Value {
+        let (snapshot_bytes, snapshot_count, in_flight_count, lease_bytes, lease_count) = {
+            let snapshots = self
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            let ready_count = snapshots
+                .entries
+                .values()
+                .filter(|entry| matches!(entry, TransformSnapshot::Ready { .. }))
+                .count();
+            let in_flight_count = snapshots.entries.len().saturating_sub(ready_count);
+            let leases = snapshots
+                .active_leases
+                .lock()
+                .expect("snapshot lease budget mutex");
+            (
+                snapshots.ready_bytes,
+                ready_count,
+                in_flight_count,
+                leases.bytes,
+                leases.count,
+            )
+        };
+        let (projection_bytes, projection_count) = {
+            let cache = self.projections.lock().expect("projection cache mutex");
+            (cache.retained_bytes, cache.sessions.len())
+        };
+        let (native_bytes, native_count) = {
+            let cache = self
+                .native_attachments
+                .lock()
+                .expect("native attachment cache mutex");
+            (cache.retained_bytes, cache.sessions.len())
+        };
+        let (serialized_bytes, serialized_count) = self
+            .serialized_outputs
+            .lock()
+            .expect("serialized output cache mutex")
+            .metrics();
+        let (tag_baseline_bytes, tag_baseline_count) = transform::tag_baseline_cache_metrics();
+        let (boundary_bytes, boundary_count) = {
+            let cache = self
+                .boundary_tokens
+                .lock()
+                .expect("boundary token cache mutex");
+            (cache.retained_bytes, cache.sessions.len())
+        };
+        let (
+            page_bytes,
+            page_count,
+            completed_response_bytes,
+            completed_response_count,
+            collector_active,
+            oldest_queued_at_ms,
+        ) = {
+            let pages = self.transform_pages.lock().expect("transform page mutex");
+            let completed = pages
+                .sessions
+                .values()
+                .filter_map(|session| session.completed.as_ref())
+                .collect::<Vec<_>>();
+            (
+                pages.total_staged_bytes,
+                pages.pending_transform_count,
+                completed
+                    .iter()
+                    .map(|completed| completed.result.len())
+                    .sum::<usize>(),
+                completed.len(),
+                pages
+                    .sessions
+                    .values()
+                    .any(|session| matches!(&session.phase, TransformPagePhase::Collecting(_))),
+                pages.oldest_queued_at_ms(),
+            )
+        };
+
+        // Every byte/count field uses zero when that accounting domain is empty. `false` means no
+        // page collector is in Collecting. `oldest_queued_at_ms` uses `null` for no collector, while
+        // a numeric zero would mean the Unix epoch rather than absence.
+        json!({
+            "snapshots": {
+                "charged_bytes": snapshot_bytes,
+                "entry_count": snapshot_count,
+                "in_flight_entry_count": in_flight_count,
+                "active_lease_charged_bytes": lease_bytes,
+                "active_lease_entry_count": lease_count,
+            },
+            "projections": {
+                "charged_bytes": projection_bytes,
+                "entry_count": projection_count,
+            },
+            "native_attach": {
+                "charged_bytes": native_bytes,
+                "entry_count": native_count,
+            },
+            "serialized_output": {
+                "charged_bytes": serialized_bytes,
+                "entry_count": serialized_count,
+            },
+            "tag_baseline": {
+                "charged_bytes": tag_baseline_bytes,
+                "entry_count": tag_baseline_count,
+            },
+            "boundary_token": {
+                "charged_bytes": boundary_bytes,
+                "entry_count": boundary_count,
+            },
+            "page_coordinator": {
+                "charged_bytes": page_bytes,
+                "entry_count": page_count,
+                "completed_response_bytes": completed_response_bytes,
+                "completed_response_count": completed_response_count,
+                "collector_active": collector_active,
+                "oldest_queued_at_ms": oldest_queued_at_ms,
+            },
+        })
+    }
+
     fn handle_status_value(&self, request: &Value) -> HandlerOutcome {
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
@@ -6685,6 +6939,7 @@ impl McHandler {
                         "state_sync_deltas": true,
                     },
                     "storage_versions": storage_versions_block(&store),
+                    "memory_holders": self.memory_holder_metrics(),
                 })),
                 Err(e) => HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
@@ -6786,7 +7041,7 @@ impl McHandler {
         channel: u16,
         request: Value,
         from_page_apply: bool,
-        inbound_bytes: Option<usize>,
+        _inbound_bytes: Option<usize>,
         ticket: &TransformDispatchTicket<'_>,
     ) -> HandlerOutcome {
         let handler_started_at = Instant::now();
@@ -7257,14 +7512,10 @@ impl McHandler {
         };
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
         self.record_response_observation(&parsed.session_id, now_ms());
-        // The decoded request retains the same payload represented by its inbound JSON body, so
-        // charging the body's byte length conservatively bounds the parsed tree without a second
-        // O(B) serialization. Paged transforms pass the sum of their staged page bytes; the
-        // transport supplies the exact body length for unpaged transforms.
-        //
-        // Value-only test/replay callers cannot recover the original wire length. They use the
-        // transform frame cap as a conservative fallback; the transport path never takes it.
-        let retained_bytes = inbound_bytes.unwrap_or(MAX_TRANSFORM_FRAME_BYTES);
+        // Tail deltas have already been expanded at this point. Charge the retained request tree,
+        // not the much smaller inbound suffix, so the ready LRU and active-lease budget describe
+        // the same object their `Arc`s keep alive.
+        let retained_bytes = parsed.retained_bytes();
         self.transform_snapshots
             .lock()
             .expect("transform snapshots mutex")
@@ -15118,6 +15369,123 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn module_status_memory_metrics_match_budget_accounting_and_falsy_semantics() {
+        let (handler, _store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let response = call_transform_request(
+            &handler,
+            request(vec![ck("metrics", 1, "holder metrics fixture")]),
+        )
+        .await;
+        assert_eq!(response["status"], "ok");
+        let lease = {
+            let mut snapshots = handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            match snapshots.get("ses") {
+                TransformSnapshotLookup::Ready(lease) => lease,
+                _ => panic!("expected a ready snapshot lease"),
+            }
+        };
+        {
+            let mut pages = handler
+                .transform_pages
+                .lock()
+                .expect("transform page mutex");
+            let staged = pages
+                .stage(
+                    "collecting-session",
+                    "transform-1".to_string(),
+                    1,
+                    0,
+                    2,
+                    "digest-0".to_string(),
+                    json!({"messages": []}),
+                    123,
+                    false,
+                    456,
+                )
+                .unwrap();
+            assert!(matches!(staged, TransformPageStageAction::Ack(1)));
+            pages
+                .sessions
+                .entry("completed-session".to_string())
+                .or_default()
+                .completed = Some(CompletedTransformPage {
+                transform_id: "completed".to_string(),
+                generation: 1,
+                final_digest: "digest-final".to_string(),
+                result: vec![0; 17],
+            });
+        }
+
+        let outcome = handler.handle_status_value(&json!({"method": "status"}));
+        let HandlerOutcome::Response(bytes) = outcome else {
+            panic!("module status did not respond: {outcome:?}");
+        };
+        let status: Value = serde_json::from_slice(&bytes).unwrap();
+        let metrics = &status["memory_holders"];
+        let snapshot_charge = {
+            let snapshots = handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            assert_eq!(metrics["snapshots"]["charged_bytes"], snapshots.ready_bytes);
+            assert_eq!(metrics["snapshots"]["entry_count"], 1);
+            assert_eq!(metrics["snapshots"]["in_flight_entry_count"], 0);
+            let TransformSnapshot::Ready { retained_bytes, .. } =
+                snapshots.entries.get("ses").unwrap()
+            else {
+                panic!("expected ready snapshot");
+            };
+            *retained_bytes
+        };
+        assert_eq!(
+            metrics["snapshots"]["active_lease_charged_bytes"],
+            snapshot_charge
+        );
+        assert_eq!(metrics["snapshots"]["active_lease_entry_count"], 1);
+        assert_eq!(
+            metrics["projections"]["charged_bytes"],
+            handler
+                .projections
+                .lock()
+                .expect("projection cache mutex")
+                .retained_bytes
+        );
+        assert_eq!(
+            metrics["serialized_output"]["charged_bytes"],
+            handler
+                .serialized_outputs
+                .lock()
+                .expect("serialized output cache mutex")
+                .metrics()
+                .0
+        );
+        assert_eq!(metrics["native_attach"]["charged_bytes"], 0);
+        assert_eq!(metrics["native_attach"]["entry_count"], 0);
+        assert_eq!(metrics["page_coordinator"]["charged_bytes"], 123);
+        assert_eq!(metrics["page_coordinator"]["entry_count"], 1);
+        assert_eq!(metrics["page_coordinator"]["completed_response_bytes"], 17);
+        assert_eq!(metrics["page_coordinator"]["completed_response_count"], 1);
+        assert_eq!(metrics["page_coordinator"]["collector_active"], true);
+        assert_eq!(metrics["page_coordinator"]["oldest_queued_at_ms"], 456);
+        handler
+            .transform_pages
+            .lock()
+            .expect("transform page mutex")
+            .discard("collecting-session");
+        let idle_pages = handler.memory_holder_metrics();
+        assert_eq!(idle_pages["page_coordinator"]["collector_active"], false);
+        assert_eq!(
+            idle_pages["page_coordinator"]["oldest_queued_at_ms"],
+            Value::Null
+        );
+        drop(lease);
+    }
+
     #[test]
     fn transform_health_idle_is_ok_and_empty_queue_is_explicit_null() {
         let health = DispatchHealth::new();
@@ -16762,20 +17130,21 @@ mod tests {
             "native attach still charges its own bytes"
         );
 
+        let snapshot = ProjectionCacheSnapshot {
+            context: projection_cache_context(&request),
+            full_array_fingerprint: request.full_array_fingerprint.clone(),
+            projection: Arc::clone(&projection),
+        };
+        let projection_charge = snapshot.retained_bytes(&request.session_id);
         let mut projections = ProjectionCache::new(1024 * 1024);
-        projections.replace(
-            &request.session_id,
-            0,
-            ProjectionCacheSnapshot {
-                context: projection_cache_context(&request),
-                full_array_fingerprint: request.full_array_fingerprint.clone(),
-                projection: Arc::clone(&projection),
-            },
+        projections.replace(&request.session_id, 0, snapshot);
+        assert_eq!(projections.retained_bytes, projection_charge);
+        assert!(
+            projection_charge > projection.retained_bytes(),
+            "projection cache charge must include its outer context and session keys"
         );
-        assert_eq!(projections.retained_bytes, projection.retained_bytes());
         assert_ne!(
-            native_charge,
-            projection.retained_bytes(),
+            native_charge, projection_charge,
             "projection bytes must not be double-charged onto the native LRU"
         );
     }
@@ -25778,29 +26147,247 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transform_request_retained_bytes_tracks_typed_original_and_native_trees() {
+        use std::mem::size_of;
+
+        fn manual_value_retained_bytes(value: &Value) -> usize {
+            fn heap(value: &Value) -> usize {
+                match value {
+                    Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+                    Value::String(value) => value.capacity(),
+                    Value::Array(values) => values
+                        .capacity()
+                        .saturating_mul(size_of::<Value>())
+                        .saturating_add(values.iter().map(heap).sum::<usize>()),
+                    Value::Object(values) => values
+                        .len()
+                        .saturating_mul(
+                            size_of::<String>() + size_of::<Value>() + size_of::<usize>() * 3,
+                        )
+                        .saturating_add(
+                            values
+                                .iter()
+                                .map(|(key, value)| key.capacity().saturating_add(heap(value)))
+                                .sum::<usize>(),
+                        ),
+                }
+            }
+            size_of::<Value>().saturating_add(heap(value))
+        }
+
+        let input = Value::Object(
+            (0..48)
+                .map(|index| {
+                    (
+                        format!("k{index}"),
+                        json!({"flag": index % 2 == 0, "value": format!("v{index}")}),
+                    )
+                })
+                .collect(),
+        );
+        let message = CkIngressMessage {
+            mid: "tool-heavy-mid".to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![CkWireBlock::bare(CkKind::ToolCall {
+                    id: "call-tool-heavy".to_string(),
+                    name: "fixture_tool".to_string(),
+                    input: input.clone(),
+                    provider_executed: false,
+                })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta {
+                    harness_id: Some("tool-heavy-mid".to_string()),
+                    ..Default::default()
+                },
+            ),
+        };
+        let mut raw = request(vec![message]);
+        raw["native_messages"] = json!([{
+            "id": "native-tool-heavy",
+            "parts": [{"type": "tool", "input": input}]
+        }]);
+        let wire_bytes = serde_json::to_vec(&raw).unwrap().len();
+        let parsed: TransformRequest = serde_json::from_value(raw).unwrap();
+        let block = &parsed.messages[0].ck.content[0];
+        let block_original = serde_json::to_value(block).unwrap();
+        let message_original = serde_json::to_value(&parsed.messages[0].ck).unwrap();
+        let CkKind::ToolCall {
+            id, name, input, ..
+        } = &block.kind
+        else {
+            panic!("fixture must retain a tool call");
+        };
+        let typed_block_heap = id
+            .capacity()
+            .saturating_add(name.capacity())
+            .saturating_add(manual_value_retained_bytes(input).saturating_sub(size_of::<Value>()));
+        let block_extra =
+            typed_block_heap.saturating_add(manual_value_retained_bytes(&block_original));
+        let ck_tree = size_of::<CkWireMessage>()
+            .saturating_add(parsed.messages[0].ck.role.capacity())
+            .saturating_add(
+                parsed.messages[0]
+                    .ck
+                    .content
+                    .capacity()
+                    .saturating_mul(size_of::<CkWireBlock>()),
+            )
+            .saturating_add(block_extra)
+            .saturating_add(
+                parsed.messages[0]
+                    .ck
+                    .meta
+                    .harness_id
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(manual_value_retained_bytes(&message_original));
+        let message_tree = parsed
+            .messages
+            .capacity()
+            .saturating_mul(size_of::<CkIngressMessage>())
+            .saturating_add(parsed.messages[0].mid.capacity())
+            .saturating_add(ck_tree.saturating_sub(size_of::<CkWireMessage>()));
+        let native_tree = parsed.native_messages.as_ref().map_or(0, |messages| {
+            messages
+                .capacity()
+                .saturating_mul(size_of::<Value>())
+                .saturating_add(
+                    messages
+                        .iter()
+                        .map(|message| {
+                            manual_value_retained_bytes(message).saturating_sub(size_of::<Value>())
+                        })
+                        .sum::<usize>(),
+                )
+        });
+        let direct_strings = parsed
+            .kind
+            .capacity()
+            .saturating_add(parsed.serializer_profile.capacity())
+            .saturating_add(parsed.session_id.capacity())
+            .saturating_add(parsed.render_config.capacity())
+            .saturating_add(parsed.system_prompt_hash.capacity())
+            .saturating_add(parsed.upgrade_state.capacity())
+            .saturating_add(parsed.prompt_surface_config_identity.capacity())
+            .saturating_add(parsed.channel2_nudge_state.capacity())
+            .saturating_add(parsed.prior_conversation_key.capacity());
+        let cache_metadata = size_of::<TransformSnapshot>()
+            .saturating_add(size_of::<usize>() * 3)
+            .saturating_add((size_of::<String>() + parsed.session_id.len()).saturating_mul(2));
+        let expected = size_of::<TransformRequest>()
+            .saturating_add(direct_strings)
+            .saturating_add(message_tree)
+            .saturating_add(native_tree)
+            .saturating_add(crate::retained_size::ARC_ALLOCATION_OVERHEAD_BYTES)
+            .saturating_add(cache_metadata);
+        let retained = parsed.retained_bytes();
+        let delta = retained.abs_diff(expected);
+
+        assert!(
+            retained >= wire_bytes.saturating_mul(2),
+            "legacy wire-length charge was not at least 2x low: retained={retained} wire={wire_bytes}"
+        );
+        assert!(
+            delta <= expected / 10,
+            "retained-size estimate left 10% fixture tolerance: retained={retained} expected={expected}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn transform_snapshot_charge_uses_unpaged_body_length() {
+    async fn tail_delta_snapshot_charges_expanded_tree_and_evicts_at_budget() {
         let (handler, _store, _dir, _project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        let request = request(vec![ck("charge", 0, "body length")]);
-        let body_length = serde_json::to_vec(&request).unwrap().len();
+        let mut full = request(vec![ck("m1", 1, &"history ".repeat(2_000))]);
+        full["full_array_fingerprint"] = json!("fp-full");
+        full["native_messages"] = json!([]);
+        let full_body_bytes = serde_json::to_vec(&full).unwrap().len();
         let outcome = handler
-            .handle_transform_for_test_with_body_size(7, request, body_length)
+            .handle_transform_for_test_with_body_size(7, full, full_body_bytes)
             .await;
         assert!(
             matches!(outcome, HandlerOutcome::Response(_)),
             "{outcome:?}"
         );
-
-        let snapshots = handler
-            .transform_snapshots
-            .lock()
-            .expect("transform snapshots mutex");
-        let Some(TransformSnapshot::Ready { retained_bytes, .. }) = snapshots.entries.get("ses")
-        else {
-            panic!("expected retained transform snapshot");
+        let full_charge = {
+            let snapshots = handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            let Some(TransformSnapshot::Ready { retained_bytes, .. }) =
+                snapshots.entries.get("ses")
+            else {
+                panic!("expected retained full transform snapshot");
+            };
+            *retained_bytes
         };
-        assert_eq!(*retained_bytes, body_length);
+
+        let mut first_delta = request(vec![ck("m2", 2, "small tail")]);
+        first_delta["full_array_fingerprint"] = json!("fp-delta-1");
+        first_delta["native_messages"] = json!([]);
+        first_delta["tail_delta"] = json!({
+            "after": "fp-full",
+            "replace_from": 1,
+            "native_replace_from": 0,
+        });
+        let delta_body_bytes = serde_json::to_vec(&first_delta).unwrap().len();
+        let outcome = handler
+            .handle_transform_for_test_with_body_size(7, first_delta, delta_body_bytes)
+            .await;
+        assert!(
+            matches!(outcome, HandlerOutcome::Response(_)),
+            "{outcome:?}"
+        );
+        let expanded_charge = {
+            let snapshots = handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            let Some(TransformSnapshot::Ready { retained_bytes, .. }) =
+                snapshots.entries.get("ses")
+            else {
+                panic!("expected retained expanded transform snapshot");
+            };
+            *retained_bytes
+        };
+        assert!(expanded_charge >= full_charge);
+        assert!(expanded_charge >= delta_body_bytes.saturating_mul(2));
+
+        {
+            let mut snapshots = handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            snapshots.max_ready_bytes = expanded_charge.saturating_sub(1);
+        }
+        let mut second_delta = request(vec![ck("m3", 3, "tiny tail")]);
+        second_delta["full_array_fingerprint"] = json!("fp-delta-2");
+        second_delta["native_messages"] = json!([]);
+        second_delta["tail_delta"] = json!({
+            "after": "fp-delta-1",
+            "replace_from": 2,
+            "native_replace_from": 0,
+        });
+        let second_delta_body_bytes = serde_json::to_vec(&second_delta).unwrap().len();
+        let outcome = handler
+            .handle_transform_for_test_with_body_size(7, second_delta, second_delta_body_bytes)
+            .await;
+        assert!(
+            matches!(outcome, HandlerOutcome::Response(_)),
+            "{outcome:?}"
+        );
+        assert!(matches!(
+            handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex")
+                .get("ses"),
+            TransformSnapshotLookup::Missing
+        ));
     }
 
     #[allow(dead_code)]
@@ -26388,7 +26975,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paged_authority_transform_reassembles_and_executes() {
+    async fn paged_authority_transform_charges_reassembled_request_tree() {
         let state = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(state, default_test_config());
         let first = paged_transform_page(
@@ -26425,7 +27012,7 @@ mod tests {
         let mut final_page = final_page;
         final_page["native_messages"] = json!([{ "text": "b".repeat(280 * 1024) }]);
         final_page["transform_page_digest"] = json!(transform_page_content_digest(&final_page));
-        let expected_inbound_bytes = serde_json::to_vec(&first).unwrap().len()
+        let inbound_bytes = serde_json::to_vec(&first).unwrap().len()
             + serde_json::to_vec(&final_page).unwrap().len();
 
         let first_ack = handler.dispatch_value(7, first).await;
@@ -26441,11 +27028,19 @@ mod tests {
             .transform_snapshots
             .lock()
             .expect("transform snapshots mutex");
-        let Some(TransformSnapshot::Ready { retained_bytes, .. }) = snapshots.entries.get("ses")
+        let Some(TransformSnapshot::Ready {
+            request,
+            retained_bytes,
+            ..
+        }) = snapshots.entries.get("ses")
         else {
             panic!("expected retained transform snapshot");
         };
-        assert_eq!(*retained_bytes, expected_inbound_bytes);
+        assert_eq!(*retained_bytes, request.retained_bytes());
+        assert!(
+            *retained_bytes > inbound_bytes,
+            "paged snapshot must charge its parsed request tree, not staged wire length"
+        );
     }
 
     #[tokio::test]
