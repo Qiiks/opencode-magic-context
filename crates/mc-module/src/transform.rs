@@ -2425,8 +2425,11 @@ fn apply_once(
     }
 
     let serializer_profile = SerializerProfile::parse(&req.serializer_profile);
-    let mutation_exempt_mid =
-        latest_assistant_mutation_exempt_mid(&req.messages, serializer_profile, req.mid_turn);
+    let mutation_exempt_mid = latest_assistant_message_mutation_exempt_mid(
+        &req.messages,
+        serializer_profile,
+        req.mid_turn,
+    );
     let cc_u1_active = crate::cc_u1_active(serializer_profile, req.tool_present);
     let tagging_surface_requested =
         crate::tagging_surface_active(serializer_profile, req.tool_present);
@@ -5666,10 +5669,10 @@ fn sel_item_from_flat(block: &FlatBlock, tag_tokens_by_block: &HashMap<&str, usi
     SelItem {
         id: block.id.clone(),
         ordinal: block.ordinal,
-        message_role: if block.role == "assistant" {
-            SelMessageRole::Assistant
-        } else {
-            SelMessageRole::NonAssistant
+        message_role: match block.role.as_str() {
+            "assistant" => SelMessageRole::Assistant,
+            "system" => SelMessageRole::System,
+            _ => SelMessageRole::NonAssistant,
         },
         kind,
         provider_executed: block.provider_executed,
@@ -8471,6 +8474,11 @@ fn new_frozen_strip_units(
     units.into_values().collect()
 }
 
+struct ReasoningMutationPolicy {
+    watermark: u64,
+    exempt: bool,
+}
+
 fn apply_surface_strips(
     core: &CoreState,
     req: &TransformRequest,
@@ -8478,11 +8486,15 @@ fn apply_surface_strips(
     blocks: &[&FlatBlock],
     rebuilt: &mut CkWireMessage,
     tag_numbers: &BTreeMap<String, u64>,
-    reasoning_watermark: u64,
+    reasoning_policy: ReasoningMutationPolicy,
 ) {
     let sentinel = provider_sentinel_text(req);
-    let whole_strip = message_strip_unit(core, "placeholder", &message.mid)
-        .or_else(|| message_strip_unit(core, "system_injected", &message.mid));
+    let whole_strip = (!reasoning_policy.exempt)
+        .then(|| {
+            message_strip_unit(core, "placeholder", &message.mid)
+                .or_else(|| message_strip_unit(core, "system_injected", &message.mid))
+        })
+        .flatten();
     if whole_strip.is_some() {
         rebuilt.content = vec![CkWireBlock::bare(ck_wire::CkKind::Text { text: sentinel })];
         rebuilt.mark_modified();
@@ -8492,14 +8504,15 @@ fn apply_surface_strips(
     let stale_reduce = message_strip_unit(core, "stale_reduce", &message.mid).is_some();
     let image_seed = message_strip_unit(core, "processed_image", &message.mid).is_some();
     let message_tag = message_tag_number(message, tag_numbers);
-    let aged = message_tag > 0 && message_tag <= reasoning_watermark;
+    let aged = message_tag > 0 && message_tag <= reasoning_policy.watermark;
     let mut touched = false;
     for block in blocks {
         let index = block.block_index;
         if index >= rebuilt.content.len() {
             continue;
         }
-        let clear_typed_reasoning = message.ck.role == "assistant"
+        let clear_typed_reasoning = !reasoning_policy.exempt
+            && message.ck.role == "assistant"
             && aged
             && request_accepts_empty_content(req)
             && matches!(&block.wire.kind, ck_wire::CkKind::Reasoning { .. });
@@ -8528,7 +8541,7 @@ fn apply_surface_strips(
             touched = true;
             continue;
         }
-        if message.ck.role == "assistant" && aged {
+        if !reasoning_policy.exempt && message.ck.role == "assistant" && aged {
             if let ck_wire::CkKind::Text { text } = &block.wire.kind {
                 let replacement = inline_thinking_replacement(text);
                 if replacement != *text {
@@ -9071,6 +9084,7 @@ fn message_output_identity(
     reasoning_watermark: u64,
     full_drop_ids: &HashSet<String>,
     mutation_exempt: bool,
+    reasoning_mutation_exempt: bool,
     first_assistant_in_run: bool,
     frozen_unit_scan_ms: &mut f64,
 ) -> String {
@@ -9100,6 +9114,7 @@ fn message_output_identity(
     digest_field(&mut hasher, &[req.caveman_enabled as u8]);
     digest_field(&mut hasher, &[request_accepts_empty_content(req) as u8]);
     digest_field(&mut hasher, &[mutation_exempt as u8]);
+    digest_field(&mut hasher, &[reasoning_mutation_exempt as u8]);
     digest_field(&mut hasher, &[first_assistant_in_run as u8]);
     let message_tag = message_tag_number(message, tag_numbers);
     digest_field(&mut hasher, &message_tag.to_le_bytes());
@@ -9359,7 +9374,7 @@ fn apply_serializer_residual_to_message(
     if !quirk_residual(profile).strips_reasoning_from_merged_assistants
         || provider_id.is_some_and(|provider| provider != "anthropic")
         || message.role != "assistant"
-        || (mutation_exempt && first_assistant_in_run)
+        || mutation_exempt
     {
         return 0;
     }
@@ -9591,6 +9606,8 @@ fn build_output_with_tags_inner(
         HashSet::new()
     };
     let serializer_profile = SerializerProfile::parse(&req.serializer_profile);
+    let reasoning_mutation_exempt_mid =
+        latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
 
     if synthetic_todo_enabled {
         if let Some(pair) = meta
@@ -9659,6 +9676,8 @@ fn build_output_with_tags_inner(
             .is_some_and(|(anchor_mid, _)| anchor_mid == msg.mid);
         let mutation_exempt =
             mutation_exempt_mid == Some(msg.mid.as_str()) || lineage_anchor_exempt;
+        let reasoning_mutation_exempt =
+            reasoning_mutation_exempt_mid == Some(msg.mid.as_str()) || lineage_anchor_exempt;
         let first_assistant_in_run = msg.ck.role == "assistant" && !prev_assistant;
         let blocks = blocks_by_mid
             .get(msg.mid.as_str())
@@ -9677,6 +9696,7 @@ fn build_output_with_tags_inner(
             reasoning_watermark,
             &full_drop_ids,
             mutation_exempt,
+            reasoning_mutation_exempt,
             first_assistant_in_run,
             &mut build_timings.frozen_unit_scan,
         );
@@ -9778,7 +9798,10 @@ fn build_output_with_tags_inner(
                         blocks,
                         &mut rebuilt,
                         tag_numbers,
-                        reasoning_watermark,
+                        ReasoningMutationPolicy {
+                            watermark: reasoning_watermark,
+                            exempt: reasoning_mutation_exempt,
+                        },
                     );
                     let drop_indexes: HashSet<usize> = blocks
                         .iter()
@@ -9820,7 +9843,7 @@ fn build_output_with_tags_inner(
                     apply_serializer_residual_to_message(
                         profile,
                         req.provider_id.as_deref(),
-                        mutation_exempt,
+                        reasoning_mutation_exempt,
                         first_assistant_in_run,
                         &mut rendered,
                     );
@@ -9973,24 +9996,21 @@ fn is_reasoning_block(block: &CkWireBlock) -> bool {
     )
 }
 
-/// The TypeScript D2 contract for OpenCode clearing is:
-///
-/// * only assistant messages older than `clear_reasoning_age` are eligible;
-/// * the age cutoff is measured from the newest absolute message tag. CK ingress
-///   has no tag map, so this module uses its durable absolute message ordinals;
-/// * a completed historical assistant is eligible even when it is the newest
-///   assistant in the served tail. The old ingress exemption must not resurrect
-///   reasoning that D2 cleared;
-/// * an in-flight newest assistant is protected when `mid_turn` is true;
-/// * canonical OpenCode Anthropic serialization receives an empty text sentinel,
-///   not a rewritten signed reasoning block. The sentinel preserves part shape,
-///   and the serializer removes it before provider dispatch;
-/// * the cutoff is persisted in ModuleMeta and replayed on every later pass.
-///
-/// Anthropic verifies the latest assistant reasoning blocks against ingress bytes. Claude Code
-/// keeps its verbatim-tail behavior. OpenCode keeps an ingress exemption only for a genuinely
-/// live in-flight assistant; clearing has precedence for historical messages.
-fn latest_assistant_mutation_exempt_mid(
+/// Anthropic verifies the newest assistant's signed reasoning against the original response.
+/// Keep that assistant out of every reasoning-mutation lane, regardless of profile or whether
+/// the response is still in flight.
+fn latest_assistant_reasoning_mutation_exempt_mid(messages: &[CkIngressMessage]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| !message.ck.meta.synthetic && message.ck.role == "assistant")
+        .map(|message| message.mid.as_str())
+}
+
+/// Whole-message mutation protection is narrower than signed-reasoning protection. It keeps the
+/// existing live-response guard for tag, reduction, and overlay mutations without withholding
+/// those unrelated mutations from every completed latest assistant.
+fn latest_assistant_message_mutation_exempt_mid(
     messages: &[CkIngressMessage],
     profile: Option<SerializerProfile>,
     mid_turn: bool,
@@ -10138,7 +10158,7 @@ fn clear_served_native_reasoning_from_iter<'a>(
     served_messages: impl IntoIterator<Item = &'a CkWireMessage>,
     ingress_messages: &[CkIngressMessage],
     watermark: u64,
-    mid_turn: bool,
+    _mid_turn: bool,
     tag_numbers: &BTreeMap<String, u64>,
 ) -> usize {
     if profile != SerializerProfile::OpencodeAiSdk
@@ -10190,7 +10210,7 @@ fn clear_served_native_reasoning_from_iter<'a>(
             continue;
         };
         let age_number = tag_numbers.get(mid).copied().unwrap_or(ordinal);
-        if age_number > watermark || (mid_turn && newest_assistant_mid == Some(mid)) {
+        if age_number > watermark || newest_assistant_mid == Some(mid) {
             continue;
         }
 
@@ -14589,7 +14609,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn text_before_latest_reasoning_matches_ts_wire_shape() {
+    fn text_before_latest_reasoning_is_still_mutation_exempt() {
         let assistant = CkWireMessage::from_parts(
             "assistant",
             vec![
@@ -14627,27 +14647,21 @@ pub(crate) mod tests {
         }];
 
         assert_eq!(
-            latest_assistant_mutation_exempt_mid(
-                &ingress,
-                Some(SerializerProfile::OpencodeAiSdk),
-                false,
-            ),
-            None
+            latest_assistant_reasoning_mutation_exempt_mid(&ingress),
+            Some("msg_text_first")
         );
 
-        let mut served = vec![assistant];
+        let mut served = vec![assistant.clone()];
         assert_eq!(
-            apply_serializer_residuals(SerializerProfile::OpencodeAiSdk, &mut served),
-            1
+            apply_serializer_residuals_with_exemption(
+                SerializerProfile::OpencodeAiSdk,
+                &mut served,
+                Some("msg_text_first"),
+                Some("anthropic"),
+            ),
+            0
         );
-        assert!(matches!(
-            &served[0].content[1].kind,
-            ck_wire::CkKind::Text { text } if text == "§18240§ answer"
-        ));
-        assert!(matches!(
-            &served[0].content[2].kind,
-            ck_wire::CkKind::Text { text } if text.is_empty()
-        ));
+        assert_eq!(served, vec![assistant]);
     }
 
     #[test]
@@ -14696,12 +14710,9 @@ pub(crate) mod tests {
                 Some("latest"),
                 Some("anthropic"),
             ),
-            1
+            0
         );
-        assert!(matches!(
-            &served[1].content[0].kind,
-            ck_wire::CkKind::Text { text } if text.is_empty()
-        ));
+        assert_eq!(served[1], base[1]);
 
         let standalone = vec![
             assistant("older", "older thinking", "older answer"),
@@ -14777,14 +14788,10 @@ pub(crate) mod tests {
             Some("latest"),
         )
         .unwrap();
-        assert!(matches!(
-            &protected[1].content[0].kind,
-            ck_wire::CkKind::Text { text } if text.is_empty()
-        ));
-        assert_ne!(
+        assert_eq!(
             serde_json::to_vec(&protected[1]).unwrap(),
             serde_json::to_vec(&request.messages[1].ck).unwrap(),
-            "a merged latest assistant must follow the serializer healing rule"
+            "the newest assistant must remain byte-identical even in a merged run"
         );
     }
 
@@ -15148,7 +15155,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn newest_signed_reasoning_is_exempt_regardless_of_cutoff() {
+    fn completed_latest_claude_code_reasoning_is_untouched_post_transform() {
         let latest = CkIngressMessage {
             mid: "latest".to_string(),
             ordinal: 1,
@@ -15171,18 +15178,12 @@ pub(crate) mod tests {
                 },
             ),
         };
-        let mut request = active_opencode_req("newest-reasoning", "cfg0", vec![latest.clone()]);
+        let mut request = active_cc_req("newest-reasoning", "cfg0", vec![latest.clone()]);
         request.provider_id = Some("anthropic".to_string());
         request.serve_native = true;
-        request.mid_turn = true;
+        request.mid_turn = false;
         let projection = project_messages(&request.messages).unwrap();
         let tag_numbers = BTreeMap::from([("latest".to_string(), 1)]);
-        let exempt = latest_assistant_mutation_exempt_mid(
-            &request.messages,
-            Some(SerializerProfile::OpencodeAiSdk),
-            request.mid_turn,
-        );
-
         let output = build_output_with_tags(
             &CoreState::default(),
             &ModuleMeta::default(),
@@ -15190,7 +15191,7 @@ pub(crate) mod tests {
             &request,
             None,
             false,
-            exempt,
+            None,
             &tag_numbers,
             u64::MAX,
             false,
@@ -15511,17 +15512,14 @@ pub(crate) mod tests {
                 60,
                 false,
             ),
-            2,
-            "a completed historical latest assistant is still age-eligible"
+            1,
+            "the newest assistant is exempt even after completion"
         );
         assert_eq!(
             native[0]["parts"][0],
             json!({ "type": "reasoning", "text": "" })
         );
-        assert_eq!(
-            native[1]["parts"][0],
-            json!({ "type": "reasoning", "text": "" })
-        );
+        assert_eq!(native[1]["parts"][0]["text"], "thinking-latest");
         let first_pass = native.clone();
         assert_eq!(
             clear_served_native_reasoning(
@@ -15615,7 +15613,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn beat_five_replay_tail_strips_reasoning_from_merged_latest_assistant() {
+    fn beat_five_replay_tail_preserves_exempt_merged_latest_assistant() {
         fn message(mid: &str, role: &str, reasoning: Option<&str>) -> CkWireMessage {
             let mut content = Vec::new();
             if let Some(text) = reasoning {
@@ -15669,18 +15667,22 @@ pub(crate) mod tests {
                 Some("tail-66"),
                 Some("anthropic"),
             ),
-            5
+            4
         );
         assert!(matches!(
             &served[61].content[0].kind,
             ck_wire::CkKind::Reasoning { .. }
         ));
-        for message in &served[62..] {
+        for message in &served[62..66] {
             assert!(matches!(
                 &message.content[0].kind,
                 ck_wire::CkKind::Text { text } if text.is_empty()
             ));
         }
+        assert!(matches!(
+            &served[66].content[0].kind,
+            ck_wire::CkKind::Reasoning { ref text, .. } if text == "latest"
+        ));
     }
 
     #[test]

@@ -16230,9 +16230,10 @@ mod tests {
         assert!(encoded.contains("[dropped]"));
         assert!(native.iter().any(|message| {
             message["parts"].as_array().is_some_and(|parts| {
-                parts
-                    .iter()
-                    .any(|part| part["type"] == json!("reasoning") && part["text"] == json!(""))
+                parts.iter().any(|part| {
+                    part["type"] == json!("reasoning")
+                        && part["text"] == json!("signed historical thinking")
+                })
             })
         }));
         assert_eq!(cache.lock().unwrap().stats("native-complex"), second_stats);
@@ -18106,13 +18107,17 @@ mod tests {
             0,
             "serve_native must reuse transform tag rows instead of issuing a numbers-only scan"
         );
-        let cleared_reasoning = actual_native
+        let preserved_reasoning = actual_native
             .iter()
             .find(|message| message["info"]["id"] == json!("assistant-old"))
             .expect("tagged historical reasoning remains addressable");
         assert_eq!(
-            cleared_reasoning["parts"][0],
-            json!({ "type": "reasoning", "text": "" })
+            preserved_reasoning["parts"][0],
+            json!({
+                "type": "reasoning",
+                "text": "signed historical thinking",
+                "metadata": { "signature": "signature-assistant-old" }
+            })
         );
 
         let mut old_tag_numbers = std::collections::BTreeMap::new();

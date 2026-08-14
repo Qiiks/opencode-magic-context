@@ -118,6 +118,7 @@ impl RedKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelMessageRole {
     Assistant,
+    System,
     NonAssistant,
 }
 
@@ -258,9 +259,6 @@ struct ToolArc {
     /// FlatBlock ids of paired ToolResult blocks (absent when a result has not arrived).
     result_ids: Vec<String>,
     result_bytes: usize,
-    /// Adjacent Reasoning block ids dropped with the arc, + their bytes.
-    reasoning_ids: Vec<String>,
-    reasoning_bytes: usize,
     /// Persisted tag-token total; legacy arcs with no estimate remain reclaimable.
     reclaim_tokens: Option<usize>,
     /// True once ANY block of the arc is already frozen/reduced (arc is inactive).
@@ -268,9 +266,9 @@ struct ToolArc {
 }
 
 impl ToolArc {
-    /// Total bytes a full arc drop reclaims: call + result + adjacent reasoning.
+    /// Bytes a full arc drop actually removes from the wire. Signed reasoning stays verbatim.
     fn reclaim_bytes(&self) -> usize {
-        self.call_bytes + self.result_bytes + self.reasoning_bytes
+        self.call_bytes + self.result_bytes
     }
 }
 
@@ -324,8 +322,6 @@ fn group_arcs(items: &[SelItem], frozen: &HashSet<String>) -> Vec<ToolArc> {
             call_bytes: 0,
             result_ids: Vec::new(),
             result_bytes: 0,
-            reasoning_ids: Vec::new(),
-            reasoning_bytes: 0,
             reclaim_tokens: None,
             reduced: false,
         });
@@ -374,10 +370,6 @@ fn group_arcs(items: &[SelItem], frozen: &HashSet<String>) -> Vec<ToolArc> {
                 if item.provider_executed {
                     entry.provider_executed = true;
                 }
-            }
-            SelKind::Reasoning => {
-                entry.reasoning_ids.push(item.id.clone());
-                entry.reasoning_bytes += item.byte_size;
             }
             _ => {}
         }
@@ -978,15 +970,40 @@ fn bytes_to_tokens(bytes: usize) -> f64 {
     (bytes as f64 * TOKENS_PER_BYTE).round()
 }
 
+/// Reconstruct the active floor-tag population. A tool arc is one tag in the TS planner, so its
+/// call/result/reasoning bytes are aggregated before the per-tag token rounding is applied.
+fn active_floor_tokens(items: &[SelItem], frozen_keys: &HashSet<String>) -> f64 {
+    let mut tool_tag_bytes: HashMap<&str, usize> = HashMap::new();
+    let mut tokens = 0.0;
+    for item in items.iter().filter(|item| {
+        !frozen_keys.contains(&item.id)
+            && item.message_role != SelMessageRole::System
+            && !matches!(item.kind, SelKind::Opaque)
+    }) {
+        if let Some(arc_id) = item.arc_id.as_deref() {
+            tool_tag_bytes
+                .entry(arc_id)
+                .and_modify(|bytes| *bytes = bytes.saturating_add(item.byte_size))
+                .or_insert(item.byte_size);
+        } else {
+            tokens += bytes_to_tokens(item.byte_size);
+        }
+    }
+    tokens
+        + tool_tag_bytes
+            .into_values()
+            .map(bytes_to_tokens)
+            .sum::<f64>()
+}
+
 /// 1.3 Emergency tiered drop (derived force-band). Target headroom = fixedFloor + 0.30 ×
 /// (ceiling − fixedFloor); walk T3→T2→T1 oldest-first, skipping the protected tail
-/// and the newest-20% T1/T2 reserve, until reclaim met. Frozen arcs are INACTIVE
-/// (excluded from candidates, reserve, and the floor/reclaim accounting). Returns the
-/// arc ids to full-drop.
+/// and the newest-20% T1/T2 reserve, until reclaim met. The floor covers every active
+/// live tag class, while candidates remain active tool arcs. Returns the arc ids to full-drop.
 fn select_emergency(
     arcs: &[&ToolArc],
     ctx: &SelectionContext,
-    all_active_reclaim_tokens: f64,
+    all_active_floor_tokens: f64,
 ) -> HashSet<String> {
     // Guards mirror the TS planner: unknown ceiling/usage → no-op; idempotence latch.
     if !ctx.ceiling_tokens.is_finite() || ctx.ceiling_tokens <= 0.0 {
@@ -999,7 +1016,7 @@ fn select_emergency(
         return HashSet::new();
     }
 
-    let fixed_floor = (ctx.current_total_input_tokens - all_active_reclaim_tokens).max(0.0);
+    let fixed_floor = (ctx.current_total_input_tokens - all_active_floor_tokens).max(0.0);
     let working_span = (ctx.ceiling_tokens - fixed_floor).max(0.0);
     let target = fixed_floor + TARGET_FRACTION * working_span;
     // TS rounds the scalar target reclaim before applying the re-arm floor. Keep the
@@ -1168,11 +1185,12 @@ pub(crate) fn select_reductions_with_outcome(
         PassClass::EmergencyForce => {
             // Compute emergency first to learn whether this pass has concrete reclaim work;
             // dedup intent still enters before the age intent below.
-            let all_active_reclaim: f64 = active_arcs
-                .iter()
-                .map(|a| bytes_to_tokens(a.reclaim_bytes()))
-                .sum();
-            let emergency_arc_ids = select_emergency(&active_arcs, ctx, all_active_reclaim);
+            // Floor accounting and eviction candidates have different populations. Every
+            // unfrozen tagged-content class contributes to the fixed-floor derivation, including
+            // text, media, reasoning, and non-droppable tools; system-prefix and opaque metadata
+            // remain outside that population. Only active client tool arcs can be selected below.
+            let all_active_floor_tokens = active_floor_tokens(items, frozen_keys);
+            let emergency_arc_ids = select_emergency(&active_arcs, ctx, all_active_floor_tokens);
             if !emergency_arc_ids.is_empty() || !two_pass_arc_ids.is_empty() {
                 for arc_id in &dedup_arc_ids {
                     arc_shapes.insert(arc_id.clone(), ArcShape::DedupFullDrop);
@@ -2034,6 +2052,93 @@ mod tests {
         assert!(out
             .iter()
             .all(|decision| !decision.target_id.starts_with("c2#")));
+    }
+
+    #[test]
+    fn emergency_floor_counts_non_tool_live_text_and_reasoning() {
+        let mut items = Vec::new();
+        for index in 0..6 {
+            let mid = format!("emergency-{index}");
+            items.push(tool_call(
+                &mid,
+                index + 1,
+                "bash",
+                serde_json::json!({}),
+                20_000,
+            ));
+            items.push(tool_result(&mid, index + 1, "bash", 20_000));
+        }
+        items.push(text_with_id("heavy-text#0", 7, 30_000));
+        items.push(SelItem {
+            id: "heavy-reasoning#0".to_string(),
+            ordinal: 8,
+            message_role: SelMessageRole::Assistant,
+            kind: SelKind::Reasoning,
+            provider_executed: false,
+            byte_size: 10_000,
+            token_count: None,
+            arc_id: None,
+        });
+        items.push(SelItem {
+            id: "irreducible-system#0".to_string(),
+            ordinal: 9,
+            message_role: SelMessageRole::System,
+            kind: SelKind::Text,
+            provider_executed: false,
+            byte_size: 40_000,
+            token_count: None,
+            arc_id: None,
+        });
+
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.current_total_input_tokens = 90_000.0;
+        ctx.ceiling_tokens = 100_000.0;
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+
+        assert_eq!(
+            arc_decisions(&items, &out).len(),
+            5,
+            "the true live-tail floor includes active text/reasoning but not the system prefix: {out:?}"
+        );
+    }
+
+    #[test]
+    fn emergency_reclaim_does_not_count_retained_reasoning() {
+        let mut items = Vec::new();
+        for index in 0..4 {
+            let mid = format!("reasoned-{index}");
+            let ordinal = index + 1;
+            items.push(reasoning(&mid, ordinal, 32_000));
+            items.push(tool_call(
+                &mid,
+                ordinal,
+                "bash",
+                serde_json::json!({}),
+                4_000,
+            ));
+            items.push(SelItem {
+                id: format!("{mid}#3"),
+                ordinal,
+                message_role: SelMessageRole::Assistant,
+                kind: SelKind::Text,
+                provider_executed: false,
+                byte_size: 1,
+                token_count: None,
+                arc_id: None,
+            });
+            items.push(tool_result(&mid, ordinal, "bash", 4_000));
+        }
+
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.current_total_input_tokens = 90_000.0;
+        ctx.ceiling_tokens = 100_000.0;
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+
+        assert_eq!(
+            arc_decisions(&items, &out).len(),
+            4,
+            "reasoning stays on wire, so every available call/result arc is needed: {out:?}"
+        );
     }
 
     #[test]
