@@ -4109,7 +4109,8 @@ impl McHandler {
             }
             Ok(_) | Err(_) => None,
         };
-        let (context_limit, input_tokens, usage_percentage) = usage_numbers(parsed.usage.as_ref());
+        let (context_limit, input_tokens, usage_percentage) =
+            usage_numbers(parsed.usage.as_ref(), parsed.geometry.as_ref());
         let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile)
             .expect("serializer_profile validated upstream");
         let fold_is_only_reclaim = !tail_reclaim(serializer_profile);
@@ -13238,13 +13239,26 @@ fn sel_kind_for_flat(block: &crate::ck_wire::FlatBlock) -> SelKind {
     }
 }
 
-fn usage_numbers(usage: Option<&mc_store::ModuleUsage>) -> (f64, f64, f64) {
+fn usage_numbers(
+    usage: Option<&mc_store::ModuleUsage>,
+    geometry: Option<&crate::transform::TransformGeometry>,
+) -> (f64, f64, f64) {
     let input = usage
         .map(|u| u.current_total_input_tokens as f64)
         .unwrap_or(0.0);
+    // Fallback order mirrors transform.rs effective_context_limit_tokens — the
+    // historian trigger and the scheduler bands must resolve the same
+    // denominator from the same inputs (a first-pass request carries geometry
+    // but no usage, and two independent 200k fallbacks here and in
+    // transform.rs diverged the two paths on exactly that pass).
     let limit = usage
         .map(|u| u.context_limit_tokens as f64)
         .filter(|limit| *limit >= MIN_PLAUSIBLE_CONTEXT_LIMIT as f64)
+        .or_else(|| {
+            geometry
+                .map(|geometry| geometry.usable_soft as f64)
+                .filter(|soft| *soft >= MIN_PLAUSIBLE_CONTEXT_LIMIT as f64)
+        })
         .unwrap_or(200_000.0);
     let pct = if limit > 0.0 {
         input / limit * 100.0
@@ -13588,7 +13602,7 @@ mod tests {
             final_wire_input_tokens: 0,
             final_wire_trusted: false,
         };
-        let (limit, _, pct) = usage_numbers(Some(&tiny));
+        let (limit, _, pct) = usage_numbers(Some(&tiny), None);
         assert_eq!(limit, 200_000.0);
         assert!((pct - 25.0).abs() < 0.01, "pct={pct}");
 
@@ -13598,7 +13612,7 @@ mod tests {
             final_wire_input_tokens: 0,
             final_wire_trusted: false,
         };
-        let (limit, _, pct) = usage_numbers(Some(&ok));
+        let (limit, _, pct) = usage_numbers(Some(&ok), None);
         assert_eq!(limit, 167_000.0);
         assert!((pct - 79.64).abs() < 0.1, "pct={pct}");
 
@@ -13608,9 +13622,45 @@ mod tests {
             final_wire_input_tokens: 0,
             final_wire_trusted: false,
         };
-        let (limit, _, pct) = usage_numbers(Some(&one_m));
+        let (limit, _, pct) = usage_numbers(Some(&one_m), None);
         assert_eq!(limit, 1_000_000.0);
         assert!((pct - 80.0).abs() < 0.01, "pct={pct}");
+    }
+
+    #[test]
+    fn usage_numbers_first_pass_prefers_geometry_soft_over_the_constant() {
+        // First pass: geometry present, usage absent. The historian trigger
+        // must resolve the same denominator the scheduler bands resolve
+        // (transform.rs effective_context_limit_tokens) — a second private
+        // 200k fallback here made the two paths diverge on exactly this pass,
+        // observed live as identical trigger bars across a 167k/30k override
+        // pair (Thalamus consumption drive, arm 3).
+        let geometry = crate::transform::TransformGeometry {
+            usable_soft: 167_000,
+            usable_hard: 200_000,
+            derivation: "drive".to_string(),
+        };
+        let (limit, _, _) = usage_numbers(None, Some(&geometry));
+        assert_eq!(limit, 167_000.0);
+
+        // Usage present still wins over geometry.
+        let present = ModuleUsage {
+            current_total_input_tokens: 1,
+            context_limit_tokens: 150_000,
+            final_wire_input_tokens: 0,
+            final_wire_trusted: false,
+        };
+        let (limit, _, _) = usage_numbers(Some(&present), Some(&geometry));
+        assert_eq!(limit, 150_000.0);
+
+        // Implausible geometry soft falls through to the constant.
+        let implausible = crate::transform::TransformGeometry {
+            usable_soft: 12,
+            usable_hard: 200_000,
+            derivation: String::new(),
+        };
+        let (limit, _, _) = usage_numbers(None, Some(&implausible));
+        assert_eq!(limit, 200_000.0);
     }
 
     fn trigger_ingress_fixture(
