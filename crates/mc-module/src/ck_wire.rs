@@ -107,66 +107,123 @@ impl FlatProjection {
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
+        use crate::retained_size::{
+            btree_map_allocation_bytes, ck_wire_block_retained_bytes, value_retained_bytes,
+            ARC_ALLOCATION_OVERHEAD_BYTES,
+        };
+        use std::mem::size_of;
+
         let block_bytes = self
             .blocks
-            .iter()
-            .map(|block| {
-                std::mem::size_of::<FlatBlock>()
-                    .saturating_add(block.id.len())
-                    .saturating_add(block.mid.len())
-                    .saturating_add(block.role.len())
-                    .saturating_add(block.kind_tag.len())
-                    .saturating_add(block.name.as_deref().map_or(0, str::len))
-                    .saturating_add(block.file_path.as_deref().map_or(0, str::len))
-                    .saturating_add(block.arc_id.as_deref().map_or(0, str::len))
-                    .saturating_add(block.tool_call_id.as_deref().map_or(0, str::len))
-                    .saturating_add(block.output_kind.as_deref().map_or(0, str::len))
-                    // `bytes` is the serialized wire block. Charging it three times covers the
-                    // canonical string, the CK tree behind `wire`, and the separately retained
-                    // tool input (the third copy is intentionally conservative for non-tool data).
-                    .saturating_add(block.bytes.len().saturating_mul(3))
-            })
-            .sum::<usize>();
-        let identity_bytes = self
-            .identity_by_mid
-            .iter()
-            .map(|(mid, identities)| {
-                mid.len().saturating_add(
-                    identities
-                        .len()
-                        .saturating_mul(std::mem::size_of::<BlockIdentity>()),
-                )
-            })
-            .sum::<usize>();
+            .capacity()
+            .saturating_mul(size_of::<FlatBlock>())
+            .saturating_add(
+                self.blocks
+                    .iter()
+                    .map(|block| {
+                        block
+                            .id
+                            .capacity()
+                            .saturating_add(block.mid.capacity())
+                            .saturating_add(block.role.capacity())
+                            .saturating_add(block.kind_tag.capacity())
+                            .saturating_add(block.name.as_ref().map_or(0, String::capacity))
+                            .saturating_add(block.file_path.as_ref().map_or(0, String::capacity))
+                            .saturating_add(block.arc_id.as_ref().map_or(0, String::capacity))
+                            .saturating_add(block.tool_call_id.as_ref().map_or(0, String::capacity))
+                            .saturating_add(block.output_kind.as_ref().map_or(0, String::capacity))
+                            .saturating_add(ARC_ALLOCATION_OVERHEAD_BYTES)
+                            .saturating_add(block.bytes.len())
+                            .saturating_add(block.tool_input.as_ref().map_or(0, |input| {
+                                ARC_ALLOCATION_OVERHEAD_BYTES
+                                    .saturating_add(value_retained_bytes(input))
+                            }))
+                            // The cloned wire owns typed fields, its retained original block JSON,
+                            // and an `Arc` allocation independently of the canonical block string.
+                            .saturating_add(ARC_ALLOCATION_OVERHEAD_BYTES)
+                            .saturating_add(ck_wire_block_retained_bytes(&block.wire))
+                    })
+                    .sum::<usize>(),
+            );
+        let identity_bytes =
+            btree_map_allocation_bytes::<String, Vec<BlockIdentity>>(self.identity_by_mid.len())
+                .saturating_add(
+                    self.identity_by_mid
+                        .iter()
+                        .map(|(mid, identities)| {
+                            mid.capacity()
+                                .saturating_add(
+                                    identities
+                                        .capacity()
+                                        .saturating_mul(size_of::<BlockIdentity>()),
+                                )
+                                .saturating_add(
+                                    identities
+                                        .iter()
+                                        .map(|identity| {
+                                            identity.kind_tag.capacity().saturating_add(
+                                                identity.byte_fingerprint.capacity(),
+                                            )
+                                        })
+                                        .sum::<usize>(),
+                                )
+                        })
+                        .sum::<usize>(),
+                );
         let frontier_bytes = self
             .states_after_messages
-            .iter()
-            .map(|state| {
-                state
-                    .pending_calls
+            .capacity()
+            .saturating_mul(size_of::<Arc<ProjectionState>>())
+            .saturating_add(
+                self.states_after_messages
                     .iter()
-                    .map(|(call_id, arcs)| {
-                        call_id
-                            .len()
-                            .saturating_add(arcs.iter().map(String::len).sum::<usize>())
+                    .map(|state| {
+                        let pending_calls = btree_map_allocation_bytes::<String, VecDeque<String>>(
+                            state.pending_calls.len(),
+                        )
+                        .saturating_add(
+                            state
+                                .pending_calls
+                                .iter()
+                                .map(|(call_id, arcs)| {
+                                    call_id
+                                        .capacity()
+                                        .saturating_add(
+                                            arcs.capacity().saturating_mul(size_of::<String>()),
+                                        )
+                                        .saturating_add(
+                                            arcs.iter().map(String::capacity).sum::<usize>(),
+                                        )
+                                })
+                                .sum::<usize>(),
+                        );
+                        let call_arcs =
+                            btree_map_allocation_bytes::<String, String>(state.call_arcs.len())
+                                .saturating_add(
+                                    state
+                                        .call_arcs
+                                        .iter()
+                                        .map(|(block_id, arc_id)| {
+                                            block_id.capacity().saturating_add(arc_id.capacity())
+                                        })
+                                        .sum::<usize>(),
+                                );
+                        ARC_ALLOCATION_OVERHEAD_BYTES
+                            .saturating_add(size_of::<ProjectionState>())
+                            .saturating_add(pending_calls)
+                            .saturating_add(call_arcs)
                     })
-                    .sum::<usize>()
-                    .saturating_add(
-                        state
-                            .call_arcs
-                            .iter()
-                            .map(|(block_id, arc_id)| block_id.len().saturating_add(arc_id.len()))
-                            .sum::<usize>(),
-                    )
-            })
-            .sum::<usize>();
-        block_bytes
+                    .sum::<usize>(),
+            );
+
+        size_of::<Self>()
+            .saturating_add(block_bytes)
             .saturating_add(identity_bytes)
             .saturating_add(frontier_bytes)
             .saturating_add(
                 self.message_block_ends
-                    .len()
-                    .saturating_mul(std::mem::size_of::<usize>()),
+                    .capacity()
+                    .saturating_mul(size_of::<usize>()),
             )
     }
 
@@ -625,6 +682,247 @@ mod tests {
                 HarnessMeta::default(),
             ),
         }
+    }
+
+    #[test]
+    fn projection_retained_bytes_counts_original_tool_input_and_frontier_allocations() {
+        use std::mem::size_of;
+
+        fn manual_value_retained_bytes(value: &Value) -> usize {
+            fn heap(value: &Value) -> usize {
+                match value {
+                    Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+                    Value::String(value) => value.capacity(),
+                    Value::Array(values) => values
+                        .capacity()
+                        .saturating_mul(size_of::<Value>())
+                        .saturating_add(values.iter().map(heap).sum::<usize>()),
+                    Value::Object(values) => values
+                        .len()
+                        .saturating_mul(
+                            size_of::<String>() + size_of::<Value>() + size_of::<usize>() * 3,
+                        )
+                        .saturating_add(
+                            values
+                                .iter()
+                                .map(|(key, value)| key.capacity().saturating_add(heap(value)))
+                                .sum::<usize>(),
+                        ),
+                }
+            }
+            size_of::<Value>().saturating_add(heap(value))
+        }
+
+        let input = Value::Object(
+            (0..96)
+                .map(|index| {
+                    (
+                        format!("k{index}"),
+                        serde_json::json!({"v": format!("x{index}"), "ok": index % 2 == 0}),
+                    )
+                })
+                .collect(),
+        );
+        let constructed = CkIngressMessage {
+            mid: "tool-heavy".to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![CkWireBlock::bare(CkKind::ToolCall {
+                    id: "call-heavy".to_string(),
+                    name: "fixture_tool".to_string(),
+                    input,
+                    provider_executed: false,
+                })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta::default(),
+            ),
+        };
+        // Reparse through the wire so both CkWireMessage and CkWireBlock own original JSON.
+        let message: CkIngressMessage =
+            serde_json::from_value(serde_json::to_value(constructed).unwrap()).unwrap();
+        let projection = project_messages(&[message]).unwrap();
+        let block = &projection.blocks[0];
+        let wire_json = serde_json::to_value(block.wire.as_ref()).unwrap();
+        let CkKind::ToolCall {
+            id, name, input, ..
+        } = &block.wire.kind
+        else {
+            panic!("fixture must project a tool call");
+        };
+        let wire_retained = size_of::<CkWireBlock>()
+            .saturating_add(id.capacity())
+            .saturating_add(name.capacity())
+            .saturating_add(manual_value_retained_bytes(input).saturating_sub(size_of::<Value>()))
+            .saturating_add(manual_value_retained_bytes(&wire_json));
+        let block_heap = block
+            .id
+            .capacity()
+            .saturating_add(block.mid.capacity())
+            .saturating_add(block.role.capacity())
+            .saturating_add(block.kind_tag.capacity())
+            .saturating_add(block.name.as_ref().map_or(0, String::capacity))
+            .saturating_add(block.file_path.as_ref().map_or(0, String::capacity))
+            .saturating_add(block.arc_id.as_ref().map_or(0, String::capacity))
+            .saturating_add(block.tool_call_id.as_ref().map_or(0, String::capacity))
+            .saturating_add(block.output_kind.as_ref().map_or(0, String::capacity))
+            .saturating_add(crate::retained_size::ARC_ALLOCATION_OVERHEAD_BYTES)
+            .saturating_add(block.bytes.len())
+            .saturating_add(
+                crate::retained_size::ARC_ALLOCATION_OVERHEAD_BYTES
+                    + manual_value_retained_bytes(block.tool_input.as_ref().unwrap()),
+            )
+            .saturating_add(crate::retained_size::ARC_ALLOCATION_OVERHEAD_BYTES)
+            .saturating_add(wire_retained);
+        let blocks = projection
+            .blocks
+            .capacity()
+            .saturating_mul(size_of::<FlatBlock>())
+            .saturating_add(block_heap);
+        let identities = projection
+            .identity_by_mid
+            .len()
+            .saturating_mul(
+                size_of::<String>() + size_of::<Vec<BlockIdentity>>() + size_of::<usize>() * 3,
+            )
+            .saturating_add(
+                projection
+                    .identity_by_mid
+                    .iter()
+                    .map(|(mid, identities)| {
+                        mid.capacity()
+                            .saturating_add(
+                                identities
+                                    .capacity()
+                                    .saturating_mul(size_of::<BlockIdentity>()),
+                            )
+                            .saturating_add(
+                                identities
+                                    .iter()
+                                    .map(|identity| {
+                                        identity
+                                            .kind_tag
+                                            .capacity()
+                                            .saturating_add(identity.byte_fingerprint.capacity())
+                                    })
+                                    .sum::<usize>(),
+                            )
+                    })
+                    .sum::<usize>(),
+            );
+        let frontiers = projection
+            .states_after_messages
+            .capacity()
+            .saturating_mul(size_of::<Arc<ProjectionState>>())
+            .saturating_add(
+                projection
+                    .states_after_messages
+                    .iter()
+                    .map(|state| {
+                        let pending = state
+                            .pending_calls
+                            .len()
+                            .saturating_mul(
+                                size_of::<String>()
+                                    + size_of::<VecDeque<String>>()
+                                    + size_of::<usize>() * 3,
+                            )
+                            .saturating_add(
+                                state
+                                    .pending_calls
+                                    .iter()
+                                    .map(|(key, values)| {
+                                        key.capacity()
+                                            .saturating_add(
+                                                values
+                                                    .capacity()
+                                                    .saturating_mul(size_of::<String>()),
+                                            )
+                                            .saturating_add(
+                                                values.iter().map(String::capacity).sum::<usize>(),
+                                            )
+                                    })
+                                    .sum::<usize>(),
+                            );
+                        let arcs = state
+                            .call_arcs
+                            .len()
+                            .saturating_mul(size_of::<String>() * 2 + size_of::<usize>() * 3)
+                            .saturating_add(
+                                state
+                                    .call_arcs
+                                    .iter()
+                                    .map(|(key, value)| {
+                                        key.capacity().saturating_add(value.capacity())
+                                    })
+                                    .sum::<usize>(),
+                            );
+                        crate::retained_size::ARC_ALLOCATION_OVERHEAD_BYTES
+                            .saturating_add(size_of::<ProjectionState>())
+                            .saturating_add(pending)
+                            .saturating_add(arcs)
+                    })
+                    .sum::<usize>(),
+            );
+        let expected = size_of::<FlatProjection>()
+            .saturating_add(blocks)
+            .saturating_add(identities)
+            .saturating_add(frontiers)
+            .saturating_add(
+                projection
+                    .message_block_ends
+                    .capacity()
+                    .saturating_mul(size_of::<usize>()),
+            );
+        let legacy = projection
+            .blocks
+            .iter()
+            .map(|block| {
+                size_of::<FlatBlock>()
+                    + block.id.len()
+                    + block.mid.len()
+                    + block.role.len()
+                    + block.kind_tag.len()
+                    + block.name.as_deref().map_or(0, str::len)
+                    + block.file_path.as_deref().map_or(0, str::len)
+                    + block.arc_id.as_deref().map_or(0, str::len)
+                    + block.tool_call_id.as_deref().map_or(0, str::len)
+                    + block.output_kind.as_deref().map_or(0, str::len)
+                    + block.bytes.len() * 3
+            })
+            .sum::<usize>()
+            + projection
+                .identity_by_mid
+                .iter()
+                .map(|(mid, identities)| mid.len() + identities.len() * size_of::<BlockIdentity>())
+                .sum::<usize>()
+            + projection
+                .states_after_messages
+                .iter()
+                .map(|state| {
+                    state
+                        .pending_calls
+                        .iter()
+                        .map(|(key, values)| {
+                            key.len() + values.iter().map(String::len).sum::<usize>()
+                        })
+                        .sum::<usize>()
+                        + state
+                            .call_arcs
+                            .iter()
+                            .map(|(key, value)| key.len() + value.len())
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
+            + projection.message_block_ends.len() * size_of::<usize>();
+        let retained = projection.retained_bytes();
+
+        assert!(retained >= legacy.saturating_mul(2));
+        assert!(
+            retained.abs_diff(expected) <= expected / 20,
+            "projection estimate left 5% fixture tolerance: retained={retained} expected={expected}"
+        );
     }
 
     #[test]
