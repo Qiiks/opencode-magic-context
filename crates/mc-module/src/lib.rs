@@ -18802,11 +18802,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn guidance_uses_resolved_route_text_without_reading_a_path() {
+    async fn guidance_uses_user_path_text_resolved_before_route_bind() {
         let producer = Arc::new(ProducerState::default());
-        let mut config = default_test_config();
-        config.prompt_surface_guidance_override =
-            Some("## Magic Context\n\nTrusted route guidance.".to_string());
+        let config_dir = tempfile::tempdir().unwrap();
+        let user_config_path = config_dir.path().join("magic-context.jsonc");
+        std::fs::write(
+            config_dir.path().join("cc-guidance.md"),
+            "## Magic Context\n\nTrusted route guidance.",
+        )
+        .unwrap();
+        std::fs::write(
+            &user_config_path,
+            r#"{
+                "prompt_surface": {
+                    "guidance_override_path": "cc-guidance.md"
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut config_cache = ConfigCache::default();
+        let config = config_cache.effective_for_paths(&user_config_path, config_dir.path());
         let (handler, _store, _dir, project) = handler_with_store(producer, config.clone());
         let mut route = binding(project.to_str().unwrap(), "ses");
         route.config = config;
