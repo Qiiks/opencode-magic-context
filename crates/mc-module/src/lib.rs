@@ -1739,6 +1739,11 @@ impl TransformRequest {
             .saturating_add(self.provider_error.as_ref().map_or(0, String::capacity))
             .saturating_add(self.channel2_nudge_state.capacity())
             .saturating_add(
+                self.channel2_delivered_id
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(
                 self.detected_context_limit_model_key
                     .as_ref()
                     .map_or(0, String::capacity),
@@ -15001,13 +15006,29 @@ mod tests {
             "messages": []
         });
         let mut default_request: TransformRequest = serde_json::from_value(value.clone()).unwrap();
+        assert!(default_request.channel2_delivered_id.is_none());
         let before = serde_json::to_vec(&default_request).unwrap();
+        assert!(
+            serde_json::from_slice::<Value>(&before)
+                .unwrap()
+                .get("channel2_delivered_id")
+                .is_none(),
+            "an absent delivery echo must remain absent on the compatibility wire"
+        );
         apply_claude_code_config_controls(
             &mut default_request,
             &McModuleConfig::default(),
             Some(SerializerProfile::ClaudeCodeAnthropic),
         );
         assert_eq!(serde_json::to_vec(&default_request).unwrap(), before);
+
+        let mut echoed_value = value.clone();
+        echoed_value["channel2_delivered_id"] = json!("directive-1");
+        let echoed_request: TransformRequest = serde_json::from_value(echoed_value).unwrap();
+        assert_eq!(
+            echoed_request.channel2_delivered_id.as_deref(),
+            Some("directive-1")
+        );
 
         let mut configured = McModuleConfig::default();
         configured.auto_search.enabled = false;
@@ -18405,14 +18426,17 @@ mod tests {
             "serializer_profile": "opencode-aisdk",
             "session_id": "ses",
             "render_config": "cfg0",
+            "protected_tags": 0,
             "usage": { "current_total_input_tokens": 90_000, "context_limit_tokens": 100_000 },
-            "messages": messages,
+            "messages": messages.clone(),
         });
         let first = call_transform_request(&handler, opencode_request.clone()).await;
         let first_text = first["host_directives"]["channel2_nudge"]["text"]
             .as_str()
             .expect("due OpenCode pass must carry channel2 text");
         assert!(first_text.contains("Routine context housekeeping is near"));
+        assert!(first.get("channel2_directive").is_none());
+
         let mut terminal_request = opencode_request;
         terminal_request["channel2_nudge_state"] = json!("delivered");
         let second = call_transform_request(&handler, terminal_request).await;
@@ -18427,21 +18451,154 @@ mod tests {
         assert!(not_due_response.get("host_directives").is_none());
 
         handler.bind_route(8, binding("/tmp/cc", "cc-ses"));
-        let mut cc_request = json!({
-            "kind": "transform",
-            "v": 2,
-            "serializer_profile": "claude-code-anthropic",
-            "tool_present": true,
-            "session_id": "cc-ses",
-            "render_config": "cfg0",
-            "usage": { "current_total_input_tokens": 90_000, "context_limit_tokens": 100_000 },
-            "messages": first["ck_messages"],
-        });
-        // The CC response is used only to prove the additive directive remains profile-gated;
-        // its transformed messages are not a request fixture for the OpenCode lane.
-        cc_request["messages"] = json!([ck("cc-short", 1, "small")]);
-        let cc_response = call_transform_request_on_channel(&handler, 8, cc_request).await;
+        let cc_response = call_transform_request_on_channel(
+            &handler,
+            8,
+            json!({
+                "kind": "transform",
+                "v": 2,
+                "serializer_profile": "claude-code-anthropic",
+                "tool_present": true,
+                "session_id": "cc-ses",
+                "render_config": "cfg0",
+                "protected_tags": 0,
+                "usage": { "current_total_input_tokens": 90_000, "context_limit_tokens": 100_000 },
+                "messages": messages.clone(),
+            }),
+        )
+        .await;
+        let cc_directive = cc_response["channel2_directive"]
+            .as_object()
+            .expect("due Claude Code pass must carry the gateway directive");
+        let cc_text = cc_directive["text"].as_str().unwrap();
+        assert!(cc_text.contains("Routine context housekeeping is near"));
+        assert!(!cc_text.contains("<system-reminder>"));
+        assert_eq!(cc_directive["directive_id"].as_str().unwrap().len(), 64);
+        assert!(cc_directive["armed_at_ms"].as_i64().unwrap() > 0);
         assert!(cc_response.get("host_directives").is_none());
+
+        handler.bind_route(9, binding("/tmp/pi", "pi-ses"));
+        let pi_response = call_transform_request_on_channel(
+            &handler,
+            9,
+            json!({
+                "kind": "transform",
+                "v": 2,
+                "serializer_profile": "pi",
+                "session_id": "pi-ses",
+                "render_config": "cfg0",
+                "protected_tags": 0,
+                "usage": { "current_total_input_tokens": 90_000, "context_limit_tokens": 100_000 },
+                "messages": messages,
+            }),
+        )
+        .await;
+        assert!(pi_response.get("host_directives").is_none());
+        assert!(pi_response.get("channel2_directive").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_code_channel2_lease_is_frozen_idempotent_and_pressure_rearmable() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let messages_for = |pair_count: u64| {
+            let output = "tool output ".repeat(1_500);
+            let mut messages = Vec::new();
+            for index in 0..pair_count {
+                messages.push(assistant_tool_call(
+                    &format!("call-cc-{index}"),
+                    index * 2 + 1,
+                ));
+                messages.push(tool_result(
+                    &format!("result-cc-{index}"),
+                    index * 2 + 2,
+                    &output,
+                ));
+            }
+            messages
+        };
+        let request_for =
+            |messages: Vec<CkIngressMessage>, input_tokens: u64, context_limit: u64| {
+                json!({
+                    "kind": "transform",
+                    "v": 2,
+                    "serializer_profile": "claude-code-anthropic",
+                    "tool_present": true,
+                    "session_id": "ses",
+                    "render_config": "cfg0",
+                    "protected_tags": 0,
+                    "usage": {
+                        "current_total_input_tokens": input_tokens,
+                        "context_limit_tokens": context_limit,
+                    },
+                    "messages": messages,
+                })
+            };
+
+        let initial_messages = messages_for(12);
+        let initial_request = request_for(initial_messages, 79_000, 100_000);
+        let first = call_transform_request(&handler, initial_request.clone()).await;
+        let first_directive = first["channel2_directive"].clone();
+        let first_id = first_directive["directive_id"]
+            .as_str()
+            .expect("first pressure crossing must arm a directive")
+            .to_string();
+        assert!(!first_directive["text"]
+            .as_str()
+            .unwrap()
+            .contains("<system-reminder>"));
+
+        let retry = call_transform_request(&handler, initial_request).await;
+        assert_eq!(retry["channel2_directive"], first_directive);
+
+        let grown_messages = messages_for(16);
+        let grown_request = request_for(grown_messages.clone(), 79_000, 100_000);
+        let grown_pending = call_transform_request(&handler, grown_request.clone()).await;
+        assert_eq!(
+            grown_pending["channel2_directive"], first_directive,
+            "pending directive bytes must not be re-derived after pressure changes"
+        );
+        let pending_ck_bytes = serde_json::to_vec(&grown_pending["ck_messages"]).unwrap();
+
+        let mut delivered_request = grown_request.clone();
+        delivered_request["channel2_delivered_id"] = json!(first_id);
+        let delivered = call_transform_request(&handler, delivered_request.clone()).await;
+        assert!(delivered.get("channel2_directive").is_none());
+        assert_eq!(
+            serde_json::to_vec(&delivered["ck_messages"]).unwrap(),
+            pending_ck_bytes,
+            "response-side delivery metadata must not alter served message bytes"
+        );
+        let after_delivery = store.load("ses").unwrap();
+        assert!(after_delivery.meta.pending_channel2_directive.is_none());
+        assert!(after_delivery.meta.channel2_pressure_latched);
+        assert_eq!(after_delivery.meta.channel2_arming_watermark, 1);
+
+        let double_echo = call_transform_request(&handler, delivered_request).await;
+        assert!(double_echo.get("channel2_directive").is_none());
+        let after_double_echo = store.load("ses").unwrap();
+        assert!(after_double_echo.meta.pending_channel2_directive.is_none());
+        assert_eq!(after_double_echo.meta.channel2_arming_watermark, 1);
+
+        let low_pressure = call_transform_request(
+            &handler,
+            request_for(grown_messages.clone(), 79_000, 1_000_000),
+        )
+        .await;
+        assert!(low_pressure.get("channel2_directive").is_none());
+        let after_reclaim = store.load("ses").unwrap();
+        assert!(!after_reclaim.meta.channel2_pressure_latched);
+        assert_eq!(after_reclaim.meta.channel2_arming_watermark, 1);
+
+        let rearmed =
+            call_transform_request(&handler, request_for(grown_messages, 79_000, 100_000)).await;
+        let second_id = rearmed["channel2_directive"]["directive_id"]
+            .as_str()
+            .expect("a fresh pressure crossing after reclaim must re-arm");
+        assert_ne!(second_id, first_id);
+        let after_rearm = store.load("ses").unwrap();
+        assert_eq!(after_rearm.meta.channel2_arming_watermark, 2);
+        assert!(after_rearm.meta.pending_channel2_directive.is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -23522,7 +23679,17 @@ mod tests {
                 session_id,
                 None,
                 &CoreState::default(),
-                &ModuleMeta::default(),
+                &ModuleMeta {
+                    pending_channel2_directive: Some(mc_store::PendingChannel2Directive {
+                        text: "frozen reminder".to_string(),
+                        directive_id: "directive-id".to_string(),
+                        armed_at_ms: 1,
+                        arming_watermark: 1,
+                    }),
+                    channel2_pressure_latched: true,
+                    channel2_arming_watermark: 1,
+                    ..Default::default()
+                },
             )
             .unwrap();
         store
@@ -23546,6 +23713,12 @@ mod tests {
         assert!(deleted["deleted_rows"].as_u64().unwrap() >= 2);
         assert!(!store.has_cache_state(session_id).unwrap());
         assert!(store.load_tags_for_session(session_id).unwrap().is_empty());
+        assert!(store
+            .load(session_id)
+            .unwrap()
+            .meta
+            .pending_channel2_directive
+            .is_none());
     }
 
     #[test]
@@ -26471,6 +26644,7 @@ mod tests {
             "id": "native-tool-heavy",
             "parts": [{"type": "tool", "input": input}]
         }]);
+        raw["channel2_delivered_id"] = json!("directive-echo".repeat(100));
         let wire_bytes = serde_json::to_vec(&raw).unwrap().len();
         let parsed: TransformRequest = serde_json::from_value(raw).unwrap();
         let block = &parsed.messages[0].ck.content[0];
@@ -26536,6 +26710,12 @@ mod tests {
             .saturating_add(parsed.upgrade_state.capacity())
             .saturating_add(parsed.prompt_surface_config_identity.capacity())
             .saturating_add(parsed.channel2_nudge_state.capacity())
+            .saturating_add(
+                parsed
+                    .channel2_delivered_id
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
             .saturating_add(parsed.prior_conversation_key.capacity());
         let cache_metadata = size_of::<TransformSnapshot>()
             .saturating_add(size_of::<usize>() * 3)

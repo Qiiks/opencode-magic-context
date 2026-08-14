@@ -3335,6 +3335,16 @@ fn u8_is_zero(value: &u8) -> bool {
     *value == 0
 }
 
+/// A response-side Channel-2 directive awaiting a gateway delivery acknowledgement.
+/// The text is stored verbatim because Claude Code does not retain the injected prompt block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingChannel2Directive {
+    pub text: String,
+    pub directive_id: String,
+    pub armed_at_ms: i64,
+    pub arming_watermark: u64,
+}
+
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
@@ -3631,6 +3641,15 @@ pub struct ModuleMeta {
     /// Channel-2 host lease state copied from the TypeScript session metadata.
     #[serde(default)]
     pub channel2_nudge_state: String,
+    /// Claude Code directive bytes awaiting an idempotent delivery echo from the gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_channel2_directive: Option<PendingChannel2Directive>,
+    /// True from a pressure crossing until a later below-threshold observation rearms the cycle.
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub channel2_pressure_latched: bool,
+    /// Monotonic cycle identity used to make directive IDs deterministic across retries.
+    #[serde(default)]
+    pub channel2_arming_watermark: u64,
     /// Emergency drain latch active bit.
     #[serde(default)]
     pub emergency_drain_active: bool,
