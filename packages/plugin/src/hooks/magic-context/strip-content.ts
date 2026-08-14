@@ -527,6 +527,7 @@ function planMergedAssistantReasoningStrip(
             const part = message.parts[i];
             if (!isRecord(part)) continue;
             if (!REASONING_PART_TYPES.has(part.type as string)) continue;
+            if (part.cache_control !== undefined) continue;
             if (i === keepIndex) {
                 keptReasoningInRun = true;
                 continue;

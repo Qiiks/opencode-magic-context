@@ -3,6 +3,7 @@
 import { beforeEach, describe, expect, it, mock } from "bun:test";
 import {
     clearOldReasoning,
+    findMergedReasoningStripCandidateIds,
     replayStrippedInlineThinking,
     stripClearedReasoning,
     stripDroppedPlaceholderMessages,
@@ -751,6 +752,34 @@ describe("strip-content", () => {
                 expect(a2.parts).toHaveLength(2);
                 expect(a2.parts[0]).toEqual(SENTINEL);
                 expect(a2.parts[1]).toEqual({ type: "text", text: "second response" });
+            });
+        });
+
+        describe("#given cache control on reasoning that would otherwise be stripped", () => {
+            it("#then excludes that reasoning from first-application candidates", () => {
+                const first = message("m-first", "assistant", [
+                    { type: "text", text: "first response" },
+                ]);
+                const cached = message("m-cached", "assistant", [
+                    {
+                        type: "reasoning",
+                        text: "cached reasoning",
+                        cache_control: { type: "ephemeral" },
+                    },
+                    { type: "text", text: "cached response" },
+                ]);
+                const newest = message("m-newest", "assistant", [
+                    { type: "text", text: "newest response" },
+                ]);
+                const messages = [first, cached, newest];
+
+                expect(findMergedReasoningStripCandidateIds(messages, "anthropic")).toEqual([]);
+                expect(stripReasoningFromMergedAssistants(messages, "anthropic")).toBe(0);
+                expect(cached.parts[0]).toEqual({
+                    type: "reasoning",
+                    text: "cached reasoning",
+                    cache_control: { type: "ephemeral" },
+                });
             });
         });
 
