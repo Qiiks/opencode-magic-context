@@ -23,9 +23,11 @@ import {
     getChannel2NudgeState,
     getEmergencyRecoveryArmedAt,
     getOverflowState,
+    getPersistedTodoPermissionDenied,
     isEmergencyRecoveryArmed,
     isProviderOverflowReconfirmed,
     loadProtectedTailMeta,
+    setPersistedTodoPermissionDenied,
     setPersistedTodoSyntheticAnchor,
 } from "../../features/magic-context/storage-meta-persisted";
 import { writeRustTransformDecision } from "../../features/magic-context/transform-decision-log";
@@ -33,9 +35,12 @@ import type { ContextUsage } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
 import { promptSurfaceConfigIdentity, resolvePromptSurface } from "../../shared/prompt-surface";
 import {
+    cachedToolPermissionDenied,
     resolveCtxReduceAvailability,
     resolveTodowriteAvailability,
     resolveTodowriteAvailabilityFromMessages,
+    type ToolAvailabilityVerdict,
+    todowritePermissionDenied,
 } from "./ctx-reduce-availability";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
@@ -106,6 +111,48 @@ export const RUST_PARK_RETRY_INTERVAL = 5;
 export const RUST_EMERGENCY_WALL_PCT = 95;
 export const RUST_PARK_PROBE_PRESSURE_BYPASS_PCT = 90;
 const RUST_SEND_TIMEOUT_MS = 15_000;
+
+function activeAgentFromMessages(messages: readonly MessageLike[]): string | undefined {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const info = messages[index]?.info as { role?: unknown; agent?: unknown } | undefined;
+        if (info?.role !== "user") continue;
+        return typeof info.agent === "string" && info.agent.length > 0 ? info.agent : undefined;
+    }
+    return undefined;
+}
+
+async function resolveCombinedTodowriteVerdict(
+    deps: TransformDeps,
+    sessionId: string,
+    messages: readonly MessageLike[],
+    availability: ToolAvailabilityVerdict,
+): Promise<boolean> {
+    if (!availability.frozen || !availability.callable || deps.compactionOff === true) return false;
+
+    let permissionDenied =
+        cachedToolPermissionDenied(sessionId, "todowrite") ??
+        getPersistedTodoPermissionDenied(deps.db, sessionId) ??
+        false;
+    if (deps.client) {
+        try {
+            permissionDenied = await todowritePermissionDenied(
+                deps.client,
+                sessionId,
+                activeAgentFromMessages(messages),
+            );
+            setPersistedTodoPermissionDenied(deps.db, sessionId, permissionDenied);
+        } catch (error) {
+            // A failed SDK read cannot turn a prior denial into an allow. Keep the last
+            // in-memory or durable verdict until a later pass obtains authoritative data.
+            sessionLog(
+                sessionId,
+                "todowrite permission read failed; retaining the last successful verdict:",
+                error,
+            );
+        }
+    }
+    return !permissionDenied;
+}
 const RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN = 4;
 
 function rawFallbackSerializedBytes(messages: readonly MessageLike[]): number | null {
@@ -1672,14 +1719,18 @@ export function createRustModeTransform(
             }
         }
         const reduceAvailability = resolveCtxReduceAvailability(sessionId);
-        // Freeze the native todo-tool verdict before state sync reads it. Rust owns
-        // synthetic-todo bytes, but the host still observes OpenCode's per-session map.
+        // Freeze the native todo-tool map verdict before state sync reads it, then combine it
+        // with OpenCode's live permission decision. The module receives one authoritative bool;
+        // provisional or missing host evidence fails closed for synthesis.
         resolveTodowriteAvailabilityFromMessages(sessionId, messages);
         const todoAvailability = resolveTodowriteAvailability(sessionId);
-        // A provisional fail-open verdict must not activate ctx_reduce provider bytes. The
-        // first persisted user message freezes each verdict for all later transform passes.
         const toolPresent = reduceAvailability.frozen && reduceAvailability.callable;
-        const todoToolPresent = todoAvailability.frozen ? todoAvailability.callable : undefined;
+        const todoToolPresent = await resolveCombinedTodowriteVerdict(
+            deps,
+            sessionId,
+            messages,
+            todoAvailability,
+        );
         try {
             if (preflightError) throw preflightError;
             if (!overflowState) throw new Error("rust overflow state unavailable");
@@ -2358,6 +2409,9 @@ export function createRustModeTransform(
                     messages: appliedMessages as MessageLike[],
                     projectPath: memoryProjectPath,
                     fullFeatureMode: !sessionMeta.isSubagent,
+                    compactionOff: deps.compactionOff,
+                    tagger: deps.tagger,
+                    ctxReduceAvailability: reduceAvailability,
                 });
                 const boundaryId = response.boundary_id;
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {

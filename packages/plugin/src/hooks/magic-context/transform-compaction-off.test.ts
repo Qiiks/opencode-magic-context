@@ -253,7 +253,7 @@ function guardDeepMutations<T extends object>(
 }
 
 describe("compaction-off transform — additive-only proof (issue #266 S3)", () => {
-    it("reconciles a Rust session flip before skipping module dispatch", async () => {
+    it("reconciles a Rust session flip before additive-only module dispatch", async () => {
         useTempDataHome("co-rust-transition-");
         const sessionId = "ses-rust-off";
         createOpenCodeDbForSession(sessionId);
@@ -309,7 +309,23 @@ describe("compaction-off transform — additive-only proof (issue #266 S3)", () 
         getOrCreateSessionMeta(db, sessionId);
         setCompactionModeRecord(db, sessionId, "on");
         queuePendingOp(db, sessionId, 1, "drop");
-        const moduleCall = mock(async (_request: Record<string, unknown>) => ({ ok: true }));
+        const moduleCall = mock(async (request: Record<string, unknown>) => {
+            if (request.method !== "transform") return { ok: true };
+            return {
+                action: "SOFT+",
+                native_messages: [
+                    {
+                        info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                        parts: [{ type: "text", text: "additive m0", synthetic: true }],
+                    },
+                    {
+                        info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                        parts: [{ type: "text", text: "additive m1", synthetic: true }],
+                    },
+                    ...makeMessages(sessionId),
+                ],
+            };
+        });
         const { transform } = makeOffTransform({
             sessionId,
             transformMode: "rust",
@@ -320,8 +336,13 @@ describe("compaction-off transform — additive-only proof (issue #266 S3)", () 
 
         await transform({}, { messages: first });
 
-        expect(first).toEqual(raw);
-        expect(moduleCall).not.toHaveBeenCalled();
+        expect(first).toHaveLength(raw.length + 2);
+        expect(textOf(first[0]!, 0)).toBe("additive m0");
+        expect(
+            moduleCall.mock.calls.some(
+                (call) => (call[0] as Record<string, unknown>).method === "transform",
+            ),
+        ).toBe(true);
         expect(getPendingOps(db, sessionId)).toHaveLength(0);
         expect(getCompactionModeRecord(db, sessionId)).toBe("off");
         const cleaned = new Database(opencodePath, { readonly: true });
@@ -333,10 +354,15 @@ describe("compaction-off transform — additive-only proof (issue #266 S3)", () 
         ).toBeNull();
         cleaned.close();
 
+        const firstBytes = JSON.stringify(first);
         const stable = makeMessages(sessionId);
         await transform({}, { messages: stable });
-        expect(stable).toEqual(raw);
-        expect(moduleCall).not.toHaveBeenCalled();
+        expect(JSON.stringify(stable)).toBe(firstBytes);
+        expect(
+            moduleCall.mock.calls.filter(
+                (call) => (call[0] as Record<string, unknown>).method === "transform",
+            ),
+        ).toHaveLength(2);
     });
 
     it("memory injection SURVIVES compaction-off (mutation direction: gating the injection off makes this red)", async () => {

@@ -58,6 +58,7 @@ import {
     finalizeMessageRepresentation,
     reconcileMarkerRepresentation,
     runPostTransformPhase,
+    runRustModePostprocess,
 } from "./transform-postprocess-phase";
 
 const SESSION_ID = "ses-postprocess-drift";
@@ -431,6 +432,60 @@ describe("deferred compaction marker representation", () => {
         reconcileMarkerRepresentation(replay, state, options);
         expect(serializeAnthropicWireWithAdjacentAssistantMerge(replay)).toBe(firstWire);
         expect(replay).toEqual(messages);
+    });
+
+    it("rebuilds byte-identical summary rows in TypeScript and Rust lanes", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-marker-rust-parity";
+        const state = {
+            boundaryMessageId: "boundary",
+            summaryMessageId: "summary",
+            compactionPartId: "compaction",
+            summaryPartId: "summary-part",
+            boundaryOrdinal: 10,
+            targetEndMessageId: "boundary",
+        };
+        setPersistedCompactionMarkerState(db, sessionId, state);
+        const source = [
+            {
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                parts: [{ type: "text", text: "m0", synthetic: true }],
+            },
+            {
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                parts: [{ type: "text", text: "m1", synthetic: true }],
+            },
+            {
+                info: { id: "tail", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "new turn" }],
+            },
+        ] as unknown as MessageLike[];
+        const ctxReduceAvailability = { callable: true, frozen: true };
+        const tsMessages = structuredClone(source);
+        reconcileMarkerRepresentation(tsMessages, state, {
+            db,
+            sessionId,
+            tagger: createTagger(),
+            ctxReduceAvailability,
+        });
+
+        const rustMessages = structuredClone(source);
+        runRustModePostprocess({
+            db,
+            sessionId,
+            messages: rustMessages,
+            fullFeatureMode: true,
+            tagger: createTagger(),
+            ctxReduceAvailability,
+        });
+
+        const tsIndex = tsMessages.findIndex((message) => message.info.summary === true);
+        const rustIndex = rustMessages.findIndex((message) => message.info.summary === true);
+        expect(tsIndex).toBe(2);
+        expect(rustIndex).toBe(tsIndex);
+        expect(JSON.stringify(rustMessages[rustIndex])).toBe(JSON.stringify(tsMessages[tsIndex]));
+        expect(rustMessages).toEqual(tsMessages);
     });
 
     it("keeps a provisional marker untagged and freezes the callable tag choice", () => {
