@@ -132,6 +132,7 @@ fn reset_emergency_reasoning_exclusion_count() {
 
 const SERIALIZED_OUTPUT_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const TAG_BASELINE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const TAG_MINT_FRONTIER_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 /// One served CK message plus the canonical bytes used by the module response writer.
 /// The typed value stays behind an `Arc`, so a cache hit does not clone large tool output trees.
@@ -6430,11 +6431,87 @@ fn tag_mint_inputs_from(
     work
 }
 
+/// Bounded process-wide cache of tag-mint frontiers. The frontier is rebuilt from
+/// the projection when evicted, so the cache may trade tokenization work for a
+/// bounded daemon footprint without affecting served output.
+#[derive(Debug)]
+struct TagMintFrontierCache {
+    sessions: HashMap<String, TagMintFrontierMemo>,
+    lru: VecDeque<String>,
+    retained_bytes: usize,
+    max_retained_bytes: usize,
+}
+
+impl TagMintFrontierCache {
+    fn new(max_retained_bytes: usize) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            lru: VecDeque::new(),
+            retained_bytes: 0,
+            max_retained_bytes,
+        }
+    }
+
+    fn memo_retained_bytes(session_id: &str, memo: &TagMintFrontierMemo) -> usize {
+        session_id
+            .len()
+            .saturating_add(std::mem::size_of::<TagMintFrontierMemo>())
+            .saturating_add(
+                memo.block_keys
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<[u8; 32]>()),
+            )
+            // Include a conservative allowance for the HashMap bucket and owned key.
+            .saturating_add(64)
+    }
+
+    fn snapshot(&mut self, session_id: &str) -> Option<TagMintFrontierMemo> {
+        let memo = self.sessions.get(session_id)?.clone();
+        self.lru.retain(|candidate| candidate != session_id);
+        self.lru.push_back(session_id.to_string());
+        Some(memo)
+    }
+
+    fn remove(&mut self, session_id: &str) {
+        if let Some(memo) = self.sessions.remove(session_id) {
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_sub(Self::memo_retained_bytes(session_id, &memo));
+        }
+        self.lru.retain(|candidate| candidate != session_id);
+    }
+
+    fn replace(&mut self, session_id: &str, memo: TagMintFrontierMemo) {
+        self.remove(session_id);
+        let retained_bytes = Self::memo_retained_bytes(session_id, &memo);
+        if retained_bytes > self.max_retained_bytes {
+            return;
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.sessions.insert(session_id.to_string(), memo);
+        self.lru.push_back(session_id.to_string());
+        while self.retained_bytes > self.max_retained_bytes {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            if let Some(memo) = self.sessions.remove(&oldest) {
+                self.retained_bytes = self
+                    .retained_bytes
+                    .saturating_sub(Self::memo_retained_bytes(&oldest, &memo));
+            }
+        }
+    }
+}
+
 /// Process-wide per-session mint frontier. Invalidated when the retained projection
 /// prefix or frozen-target set no longer matches the memoized sequence identity.
-fn tag_mint_frontier_cache() -> &'static Mutex<HashMap<String, TagMintFrontierMemo>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, TagMintFrontierMemo>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn tag_mint_frontier_cache() -> &'static Mutex<TagMintFrontierCache> {
+    static CACHE: OnceLock<Mutex<TagMintFrontierCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(TagMintFrontierCache::new(
+            TAG_MINT_FRONTIER_CACHE_BUDGET_BYTES,
+        ))
+    })
 }
 
 fn append_tag_mint_rows(
@@ -7004,8 +7081,7 @@ fn compute_active_overlay_decisions(
         let mut memo = tag_mint_frontier_cache()
             .lock()
             .expect("tag mint frontier cache mutex")
-            .get(&req.session_id)
-            .cloned()
+            .snapshot(&req.session_id)
             .unwrap_or_default();
         let work = tag_mint_inputs_from(
             projection,
@@ -7018,7 +7094,7 @@ fn compute_active_overlay_decisions(
         tag_mint_frontier_cache()
             .lock()
             .expect("tag mint frontier cache mutex")
-            .insert(req.session_id.clone(), memo);
+            .replace(&req.session_id, memo);
         work
     };
     let tag_mint_candidates = tag_mint_work.candidate_count;
@@ -20428,6 +20504,36 @@ pub(crate) mod tests {
             assert_eq!(tail_bytes(&extended, "m1"), "§1§ alpha");
             assert_eq!(tail_bytes(&extended, "m2"), "§2§ beta");
         });
+    }
+
+    #[test]
+    fn tag_mint_frontier_cache_bounds_sessions_and_refreshes_reinserted_recency() {
+        let memo = TagMintFrontierMemo {
+            block_keys: vec![[7; 32]],
+            ..TagMintFrontierMemo::default()
+        };
+        let cap = 3;
+        let budget = TagMintFrontierCache::memo_retained_bytes("a", &memo) * cap;
+        let mut cache = TagMintFrontierCache::new(budget);
+
+        for session in ["a", "b", "c"] {
+            cache.replace(session, memo.clone());
+        }
+        assert_eq!(cache.sessions.len(), cap);
+
+        // Replacing a live session is a fresh tagging pass and must move it to the
+        // most-recent position before the next distinct session forces eviction.
+        cache.replace("a", memo.clone());
+        cache.replace("d", memo);
+
+        assert!(cache.sessions.len() <= cap);
+        assert!(cache.sessions.contains_key("a"));
+        assert!(cache.sessions.contains_key("c"));
+        assert!(cache.sessions.contains_key("d"));
+        assert!(
+            !cache.sessions.contains_key("b"),
+            "the least-recently-used session must evict after more distinct sessions than the cap"
+        );
     }
 
     #[test]

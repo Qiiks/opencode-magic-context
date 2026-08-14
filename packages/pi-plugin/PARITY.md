@@ -888,6 +888,37 @@ context pair that would consume that captured state is gated off.
 
 ---
 
+## 28. Supersede deltas force-render eligible replacements omitted from m[0]
+
+Both harnesses render a `<superseded>` pointer only when its eligible replacement
+is also visible in m[1]. If the replacement predates the m[0] max-id marker but
+was omitted from m[0]'s rendered subset, the delta force-renders its full memory
+content under `<new-memories>`. This prevents a pointer to content the model has
+not received; ordinary new memories remain budget-trimmed and the forced subset
+is capped at ten entries in both harnesses.
+
+---
+
+## 29. Idle TTL boundary is strict in both harnesses
+
+Both OpenCode and Pi treat `elapsed == cache_ttl` as a defer pass. The hard-fold
+predicate is strict `elapsed > ttl`, so the exact boundary does not pay for a
+provider-cache rebuild. Pi keeps the same comparator and parity rationale in
+`context-handler.ts`.
+
+---
+
+## 30. Pending-operation reads are cache-stable on Pi defer passes
+
+OpenCode reads pending operations only on an execute, explicit materialization,
+force-materialization, known hard-fold, or in-flight-compartment pass. Pi now
+uses the same gate: ordinary defer passes replay durable tag/drop state without
+reading new `pending_ops` rows. A later eligible pass reads and applies the queued
+operations normally, preserving replay bytes while avoiding an unnecessary SQL
+read on every defer pass.
+
+---
+
 ## Pending parity
 
 - Last-known-good transform capture and replay for OpenCode and rust-mode sessions is pending for Pi.

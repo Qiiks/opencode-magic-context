@@ -29,7 +29,6 @@ import {
 	getMaxMemoryIdForProjects,
 	getMemoriesByProject,
 	getMemoriesByProjects,
-	readNewMemoriesForM1Union,
 } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import type { Memory } from "@magic-context/core/features/magic-context/memory/types";
 import { resolveMuralWire } from "@magic-context/core/features/magic-context/mural/render-trigger";
@@ -301,6 +300,7 @@ export const __test = {
 
 const PI_M1_PLACEHOLDER =
 	"<session-history-since>(no new content since last materialization)</session-history-since>";
+const MAX_FORCED_MEMORIES_PER_DELTA = 10;
 // Pi uses a STATIC upgrade-state marker, intentionally diverging from OpenCode's
 // dynamic getUpgradeState(db, sessionId). OpenCode flips this per-session when a
 // `/ctx-session-upgrade` recomp transitions legacy→v2, forcing an m[0] refold.
@@ -1657,9 +1657,8 @@ function renderMemoryUpdatesBlockPi(args: {
 	workspace: WorkspaceRenderContext;
 	afterId: number;
 	renderedMemoryIds: readonly number[];
-}): { block: string; count: number } {
-	if (args.renderedMemoryIds.length === 0) return { block: "", count: 0 };
-
+	eligibleMemoryIds: ReadonlySet<number>;
+}): { block: string; count: number; forcedMemoryIds: number[] } {
 	const renderedIds = new Set(args.renderedMemoryIds);
 	const mutations = args.workspace.isWorkspaced
 		? getMemoryMutationsForRenderByProjects(
@@ -1674,37 +1673,66 @@ function renderMemoryUpdatesBlockPi(args: {
 				args.afterId,
 				args.renderedMemoryIds,
 			);
-	if (mutations.length === 0) return { block: "", count: 0 };
+	if (mutations.length === 0) {
+		return { block: "", count: 0, forcedMemoryIds: [] };
+	}
 
+	const forcedIds = new Set<number>();
 	const lines = [
 		"These memories changed since the snapshot below — trust these:",
 	];
 	for (const mutation of mutations) {
-		if (mutation.mutationType === "update") {
-			lines.push(
-				`  <updated id="${mutation.targetMemoryId}">${escapeXmlContent(mutation.newContent ?? "")}</updated>`,
-			);
-			continue;
-		}
 		if (mutation.mutationType === "superseded") {
+			const replacementId = mutation.supersededById;
 			if (
-				mutation.supersededById !== null &&
-				renderedIds.has(mutation.supersededById)
+				replacementId !== null &&
+				!renderedIds.has(replacementId) &&
+				args.eligibleMemoryIds.has(replacementId)
 			) {
+				forcedIds.add(replacementId);
+			}
+			if (!renderedIds.has(mutation.targetMemoryId)) continue;
+			if (replacementId !== null && args.eligibleMemoryIds.has(replacementId)) {
 				lines.push(
-					`  <superseded id="${mutation.targetMemoryId}" by="${mutation.supersededById}"/>`,
+					`  <superseded id="${mutation.targetMemoryId}" by="${replacementId}"/>`,
 				);
 			} else {
 				lines.push(`  <removed id="${mutation.targetMemoryId}"/>`);
 			}
 			continue;
 		}
+
+		if (!renderedIds.has(mutation.targetMemoryId)) {
+			if (
+				mutation.visibilityChanged &&
+				args.eligibleMemoryIds.has(mutation.targetMemoryId)
+			) {
+				forcedIds.add(mutation.targetMemoryId);
+			}
+			continue;
+		}
+		if (!args.eligibleMemoryIds.has(mutation.targetMemoryId)) {
+			lines.push(`  <removed id="${mutation.targetMemoryId}"/>`);
+			continue;
+		}
+		if (mutation.visibilityChanged && mutation.newContent === null) continue;
+		if (mutation.mutationType === "update") {
+			lines.push(
+				`  <updated id="${mutation.targetMemoryId}">${escapeXmlContent(mutation.newContent ?? "")}</updated>`,
+			);
+			continue;
+		}
 		lines.push(`  <removed id="${mutation.targetMemoryId}"/>`);
 	}
 
+	const forcedMemoryIds = [...forcedIds]
+		.sort((left, right) => left - right)
+		.slice(0, MAX_FORCED_MEMORIES_PER_DELTA);
+	if (lines.length === 1) return { block: "", count: 0, forcedMemoryIds };
 	return {
 		block: `<memory-updates>\n${lines.join("\n")}\n</memory-updates>`,
-		count: mutations.length,
+		count: lines.length - 1,
+		forcedMemoryIds,
 	};
 }
 
@@ -1730,6 +1758,26 @@ function renderM1PiWithMetadata(
 	const workspace = resolveWorkspaceRenderContextPi(state, db);
 
 	const memPath = memoryProjectPath(state);
+	const eligibleMemories = memPath
+		? workspace.isWorkspaced
+			? getMemoriesByProjects(
+					db,
+					workspace.expandedIdentities,
+					["active", "permanent"],
+					markers.materializedAt,
+					workspace.ownIdentities,
+					workspace.shareCategories,
+				)
+			: getMemoriesByProject(
+					db,
+					memPath,
+					["active", "permanent"],
+					markers.materializedAt,
+				)
+		: [];
+	const eligibleMemoryIds = new Set(
+		eligibleMemories.map((memory) => memory.id),
+	);
 	const memoryUpdates = memPath
 		? renderMemoryUpdatesBlockPi({
 				db,
@@ -1737,8 +1785,9 @@ function renderM1PiWithMetadata(
 				workspace,
 				afterId: markers.maxMemoryMutationId,
 				renderedMemoryIds,
+				eligibleMemoryIds,
 			})
-		: { block: undefined as string | undefined, count: 0 };
+		: { block: undefined as string | undefined, count: 0, forcedMemoryIds: [] };
 	if (memoryUpdates.block) sections.push(memoryUpdates.block);
 
 	const newCompartments = (
@@ -1752,58 +1801,40 @@ function renderM1PiWithMetadata(
 		sections.push(`<new-compartments>\n${body}\n</new-compartments>`);
 	}
 
-	const newMemories = memPath
-		? workspace.isWorkspaced
-			? readNewMemoriesForM1Union(
-					db,
-					workspace.expandedIdentities,
-					markers.maxMemoryId,
-					// Freeze expiry to the m[0] materialization timestamp (parity with
-					// OpenCode readNewMemoriesForM1): defer passes replay the same markers,
-					// so a memory crossing expires_at between passes can't silently shift
-					// m[1].
-					markers.materializedAt,
-					workspace.ownIdentities,
-					workspace.shareCategories,
-				)
-			: getMemoriesByProject(
-					db,
-					memPath,
-					["active", "permanent"],
-					// Freeze expiry to the m[0] materialization timestamp (parity with
-					// OpenCode readNewMemoriesForM1): defer passes replay the same markers,
-					// so a memory crossing expires_at between passes can't silently shift
-					// m[1].
-					markers.materializedAt,
-				).filter((memory) => memory.id > markers.maxMemoryId)
-		: [];
-	if (newMemories.length > 0) {
-		// Trim to 25% of the memory budget and V2-render with the "new-memories"
-		// wrapper — same helper, shape, AND budget cap OpenCode's renderM1 uses.
-		// Without the cap, m[1] grows unbounded as memories accumulate between
-		// m[0] materializations (m[1] is the volatile delta; it must stay small).
-		const memoryBudget =
-			state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
-		const memoryRenderOptions: MemoryRenderOptions = {
-			sourceNameByMemoryId: sourceNamesForPiMemories({
-				memories: newMemories,
-				projectPath: memPath,
-				workspace,
-			}),
-		};
-		const trimmedNewMemories = trimMemoriesToBudgetV2(
-			state.sessionId,
-			newMemories,
-			Math.max(1, Math.floor(memoryBudget * 0.25)),
-			memoryRenderOptions,
-		).renderOrder;
-		const newMemoriesBlock = renderMemoryBlockV2(
-			trimmedNewMemories,
-			"new-memories",
-			memoryRenderOptions,
-		);
-		if (newMemoriesBlock) sections.push(newMemoriesBlock);
-	}
+	const forcedMemoryIds = new Set(memoryUpdates.forcedMemoryIds);
+	const newMemories = eligibleMemories.filter(
+		(memory) =>
+			memory.id > markers.maxMemoryId && !forcedMemoryIds.has(memory.id),
+	);
+	// Trim ordinary new memories to 25% of the budget, but always include eligible
+	// memories referenced by a supersede operation. Such a replacement may have an
+	// ID at or below the first marker's maximum while still not appearing in the
+	// memories already rendered.
+	const memoryBudget =
+		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
+	const memoryRenderOptions: MemoryRenderOptions = {
+		sourceNameByMemoryId: sourceNamesForPiMemories({
+			memories: eligibleMemories,
+			projectPath: memPath,
+			workspace,
+		}),
+	};
+	const trimmedNewMemories = trimMemoriesToBudgetV2(
+		state.sessionId,
+		newMemories,
+		Math.max(1, Math.floor(memoryBudget * 0.25)),
+		memoryRenderOptions,
+	).renderOrder;
+	const deltaMemories = [
+		...trimmedNewMemories,
+		...eligibleMemories.filter((memory) => forcedMemoryIds.has(memory.id)),
+	];
+	const newMemoriesBlock = renderMemoryBlockV2(
+		deltaMemories,
+		"new-memories",
+		memoryRenderOptions,
+	);
+	if (newMemoriesBlock) sections.push(newMemoriesBlock);
 
 	// new-user-profile delta: when the global user-profile version advanced since
 	// this m[0] baseline was materialized, surface the current profile under a

@@ -1202,6 +1202,65 @@ describe("injectM0M1Pi", () => {
 		}
 	});
 
+	it("force-renders an eligible supersede replacement that predates the m0 marker", () => {
+		const db = createTestDb();
+		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-forced-supersede-"));
+		try {
+			const state = piState("ses-pi-m1-forced-supersede", cwd);
+			const replacement = insertMemory(db, {
+				projectPath: state.projectIdentity,
+				category: "ARCHITECTURE",
+				content: "Replacement content must render in the delta.",
+			});
+			const source = insertMemory(db, {
+				projectPath: state.projectIdentity,
+				category: "ARCHITECTURE",
+				content: "Baseline source memory.",
+			});
+			const markers = {
+				maxCompartmentSeq: -1,
+				maxMemoryId: source.id,
+				maxMutationId: 0,
+				maxMemoryMutationId: 0,
+				projectMemoryEpoch: 0,
+				workspaceFingerprint: null,
+				projectUserProfileVersion: 0,
+				projectDocsHash: "",
+				sessionFactsVersion: 0,
+				materializedAt: Date.now(),
+				upgradeState: "",
+				compartmentRenderEpoch: null,
+				lastBaselineEndMessageId: null,
+				systemHash: "",
+				modelKey: "",
+				projectIdentity: state.projectIdentity,
+				muralEnabled: false,
+				renderBudgetIdentity: "",
+			};
+
+			db.prepare(
+				"UPDATE memories SET status = 'archived', superseded_by_memory_id = ? WHERE id = ?",
+			).run(replacement.id, source.id);
+			queueMemoryMutation(db, {
+				projectPath: state.projectIdentity,
+				mutationType: "superseded",
+				targetMemoryId: source.id,
+				supersededById: replacement.id,
+				queuedAt: markers.materializedAt + 1,
+			});
+
+			const m1 = renderM1Pi(state, db, markers, [source.id]);
+			expect(m1).toContain(
+				`<superseded id="${source.id}" by="${replacement.id}"/>`,
+			);
+			expect(m1).toContain("Replacement content must render in the delta.");
+			expect(m1).not.toContain(`<removed id="${source.id}"/>`);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+			closeQuietly(db);
+		}
+	});
+
 	it("skips memory mutation deltas for memories trimmed out of m0", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-trimmed-delta-"));

@@ -257,6 +257,18 @@ const FORWARD_PRESSURE_LIMIT_FACTOR = 0.85;
 // misses. Keep ONLY .tokens (forward, input-side); .percent is discarded (counts
 // output on Pi's own denominator). Immune to NULL token_count (live array, not
 // our tag store). NEVER lowers (max), so it's never less reactive than today.
+function isPiHardCacheExpired(
+	lastResponseTime: number,
+	ttlMs: number,
+	now: number,
+): boolean {
+	// Strict > matches the Rust scheduler's predicate exactly: at elapsed == ttl
+	// both sides DEFER (one more pass at the boundary is safe; a premature HARD
+	// fold is a paid cache rebuild). Keep the comparators identical — the Rust
+	// doc comment asserts this parity and an audit caught them disagreeing.
+	return lastResponseTime > 0 && now - lastResponseTime > ttlMs;
+}
+
 function applyForwardPressureFloor(
 	trailingPercentage: number,
 	trailingInputTokens: number,
@@ -291,6 +303,7 @@ let afterFallbackAdoptionForTests:
 
 export const __test = {
 	FORWARD_PRESSURE_LIMIT_FACTOR,
+	isPiHardCacheExpired,
 	adoptPiFallbackTags,
 	applyForwardPressureFloor,
 	buildEntryFingerprintMap,
@@ -4512,9 +4525,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 							? hardMeta.systemPromptHash
 							: "",
 					modelKey: liveModelBySession.get(args.sessionId) ?? "",
-					cacheExpired:
-						hardMeta.lastResponseTime > 0 &&
-						Date.now() - hardMeta.lastResponseTime >= piTtlMs,
+					cacheExpired: isPiHardCacheExpired(
+						hardMeta.lastResponseTime,
+						piTtlMs,
+						Date.now(),
+					),
 					lastResponseTime: hardMeta.lastResponseTime,
 				};
 			})()
@@ -4695,14 +4710,29 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		args.sessionId,
 	);
 	const deferredHistoryRefreshWasPending = deferredHistoryWasPendingAtPassStart;
-	const pendingOps = getPendingOps(args.db, args.sessionId);
-	const pendingOperationTags = getTagsForPendingOperations(
-		args.db,
-		args.sessionId,
-		pendingOps.map((operation) => operation.tagId),
-		args.protectedTags,
-		RECENT_TOOL_SKELETON_WINDOW,
-	);
+	// Defer passes replay persisted tag statuses below; they never apply newly
+	// queued operations. Avoid reading pending_ops unless this pass can consume
+	// them, matching OpenCode's cache-stable per-pass gate.
+	const shouldReadPendingOps =
+		!args.compactionOff &&
+		(args.schedulerDecision === "execute" ||
+			args.forceMaterialization ||
+			hasPendingMaterializeSignal ||
+			m0HardFoldThisPass ||
+			historianRunning);
+	const pendingOps = shouldReadPendingOps
+		? getPendingOps(args.db, args.sessionId)
+		: [];
+	const pendingOperationTags =
+		pendingOps.length > 0
+			? getTagsForPendingOperations(
+					args.db,
+					args.sessionId,
+					pendingOps.map((operation) => operation.tagId),
+					args.protectedTags,
+					RECENT_TOOL_SKELETON_WINDOW,
+				)
+			: [];
 	// The deferred-execute flag is drain-on-success ONLY — it must NOT appear
 	// here. OpenCode never gates work on the flag (peekDeferredExecutePending is
 	// read solely by the drain in transform-postprocess-phase.ts); the idempotent
