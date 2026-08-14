@@ -118,13 +118,15 @@ export type DeferredCompactionMarkerClearOutcome =
     | "cas-lost-already-cleared";
 
 function isSyntheticHeadMessage(message: MessageLike): boolean {
-    // The flag alone is input-controlled metadata: a persisted or foreign row
-    // could carry it and absorb a real message into the injected head, shifting
-    // the summary's canonical position. Require the exact shape only
-    // prependM0M1Messages produces: an ID-less user message whose every part is
-    // marked synthetic. Persisted OpenCode rows always carry an id, so they can
-    // never satisfy this regardless of their metadata.
-    if (message.info.syntheticHead !== true) return false;
+    // Structural shape only — an ID-less user message whose every part is
+    // marked synthetic. Persisted OpenCode rows always carry an id, so no
+    // persisted or foreign row can satisfy this regardless of its metadata;
+    // the shape is exactly what the TS lane's prependM0M1Messages and the
+    // Rust module's m0/m1 encode both produce. The TS lane additionally sets
+    // info.syntheticHead, but the Rust encode does not — requiring the flag
+    // here made the head walk stop at index 0 on rust-mode output and splice
+    // the compaction summary AHEAD of m0, failing the m0 wire invariant on
+    // every pass for sessions with persisted marker state.
     if (message.info.id !== undefined) return false;
     if (message.info.role !== "user") return false;
     const parts = message.parts;

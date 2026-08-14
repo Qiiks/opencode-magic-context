@@ -3128,3 +3128,55 @@ describe("todo synthesis — disabled todowrite tool gate", () => {
         expect(getPersistedTodoSyntheticAnchor(db, sessionId)?.stateJson).toBe(TODO_ACTIVE_STATE);
     });
 });
+
+describe("reconcileMarkerRepresentation on rust-mode output heads", () => {
+    it("#then inserts the summary after the module-encoded m0/m1 head, never ahead of m0", () => {
+        // The Rust module's m0/m1 encode produces ID-less synthetic user
+        // messages WITHOUT the TS lane's info.syntheticHead flag. The head
+        // walk must still recognize them: requiring the flag spliced the
+        // compaction summary in at index 0 — an assistant ahead of m0 —
+        // which fails the rust-mode m0 wire invariant on every pass for
+        // sessions carrying persisted marker state.
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-marker-rust-head";
+        const state = {
+            boundaryMessageId: "boundary",
+            summaryMessageId: "summary",
+            compactionPartId: "compaction",
+            summaryPartId: "summary-part",
+            boundaryOrdinal: 10,
+            targetEndMessageId: "boundary",
+        };
+        const rustM0 = {
+            info: { role: "user", sessionID: sessionId },
+            parts: [
+                { type: "text", text: "<session-history>…</session-history>", synthetic: true },
+            ],
+        };
+        const rustM1 = {
+            info: { role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "(no new history)", synthetic: true }],
+        };
+        const tail = {
+            info: { id: "msg_real1", role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "hello" }],
+        };
+        const messages = [rustM0, rustM1, tail] as unknown as MessageLike[];
+
+        const changed = reconcileMarkerRepresentation(messages, state, {
+            db,
+            sessionId,
+            tagger: createTagger(),
+            ctxReduceAvailability: { callable: true, frozen: true },
+        });
+        expect(changed).toBe(true);
+        expect(messages.map((message) => message.info.id)).toEqual([
+            undefined,
+            undefined,
+            "summary",
+            "msg_real1",
+        ]);
+        expect(messages[2]?.info.role).toBe("assistant");
+    });
+});
