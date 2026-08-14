@@ -537,7 +537,7 @@ export function moduleRawBlockMappings(message: RawMessageParts | null): ModuleR
             blockIndex += 1;
             continue;
         }
-        if (type === "reasoning") {
+        if (["reasoning", "thinking", "redacted_thinking"].includes(type)) {
             mappings.push({ blockIndex, partIndex, kind: "reasoning" });
             blockIndex += 1;
             continue;
@@ -632,7 +632,8 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
                 content.push({
                     kind: { type: "text", text: typeof part.text === "string" ? part.text : "" },
                 });
-            } else if (type === "reasoning") {
+            } else if (type === "reasoning" || type === "thinking") {
+                const signature = typeof part.signature === "string" ? part.signature : undefined;
                 content.push({
                     kind: {
                         type: "reasoning",
@@ -642,7 +643,34 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
                                 : typeof part.thinking === "string"
                                   ? part.thinking
                                   : "",
+                        ...(signature ? { signature } : {}),
                     },
+                    ...(part.cache_control !== undefined
+                        ? {
+                              provider_extras: {
+                                  opencode: { cache_control: part.cache_control },
+                              },
+                          }
+                        : {}),
+                });
+            } else if (type === "redacted_thinking") {
+                content.push({
+                    kind: {
+                        type: "redacted_reasoning",
+                        data:
+                            typeof part.data === "string"
+                                ? part.data
+                                : typeof part.redacted === "string"
+                                  ? part.redacted
+                                  : "",
+                    },
+                    ...(part.cache_control !== undefined
+                        ? {
+                              provider_extras: {
+                                  opencode: { cache_control: part.cache_control },
+                              },
+                          }
+                        : {}),
                 });
             } else if (type === "tool") {
                 const state =

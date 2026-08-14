@@ -3801,11 +3801,11 @@ fn apply_once(
         materialize_reason = Some("lineage_anchor_mismatch".to_string());
     }
 
-    let is_bust_pass = !req.is_subagent
-        && matches!(
-            plan,
-            PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
-        );
+    let is_provider_prefix_mutation_pass = matches!(
+        plan,
+        PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
+    );
+    let is_bust_pass = !req.is_subagent && is_provider_prefix_mutation_pass;
     if auto_search_active {
         if let Some(hint) = maybe_decide_live_user_hint(
             store,
@@ -4720,8 +4720,12 @@ fn apply_once(
         output_cache_snapshot.as_ref(),
         is_bust_pass,
     )?;
-    let new_merged_reasoning_units =
-        new_merged_reasoning_strip_units(&core, req, &built_output.messages, is_bust_pass);
+    let new_merged_reasoning_units = new_merged_reasoning_strip_units(
+        &core,
+        req,
+        &built_output.messages,
+        is_provider_prefix_mutation_pass,
+    );
     if !new_merged_reasoning_units.is_empty() {
         core.frozen_units.extend(new_merged_reasoning_units);
         built_output = build_output_with_tags(
@@ -10069,9 +10073,9 @@ fn new_merged_reasoning_strip_units(
     core: &CoreState,
     req: &TransformRequest,
     rendered_messages: &[ServedMessage],
-    is_bust_pass: bool,
+    can_mutate_provider_prefix: bool,
 ) -> Vec<FrozenUnit> {
-    if !is_bust_pass {
+    if !can_mutate_provider_prefix {
         return Vec::new();
     }
     let Some(profile) = SerializerProfile::parse(&req.serializer_profile) else {
@@ -10120,7 +10124,7 @@ fn apply_serializer_residual_to_message(
     message: &mut CkWireMessage,
 ) -> usize {
     if !quirk_residual(profile).strips_reasoning_from_merged_assistants
-        || provider_id.is_some_and(|provider| provider != "anthropic")
+        || provider_id != Some("anthropic")
         || message.role != "assistant"
         || mutation_exempt
     {
@@ -10132,12 +10136,12 @@ fn apply_serializer_residual_to_message(
             .iter()
             .enumerate()
             .find(|(_, block)| !is_reasoning_ignored_block(block))
-            .and_then(|(index, block)| is_reasoning_block(block).then_some(index))
+            .and_then(|(index, block)| is_mutable_merged_reasoning_block(block).then_some(index))
     });
     let keep_index = keep_index.flatten();
     let mut stripped = 0;
     for (index, block) in message.content.iter_mut().enumerate() {
-        if !is_reasoning_block(block) || Some(index) == keep_index {
+        if !is_mutable_merged_reasoning_block(block) || Some(index) == keep_index {
             continue;
         }
         *block = CkWireBlock::bare(ck_wire::CkKind::Text {
@@ -10713,7 +10717,7 @@ fn apply_serializer_residuals_with_exemption(
     provider_id: Option<&str>,
 ) -> usize {
     if quirk_residual(profile).strips_reasoning_from_merged_assistants
-        && provider_id.is_none_or(|provider| provider == "anthropic")
+        && provider_id == Some("anthropic")
     {
         strip_reasoning_from_merged_assistants_with_exemption(messages, mutation_exempt_mid)
     } else {
@@ -10748,6 +10752,14 @@ fn is_reasoning_block(block: &CkWireBlock) -> bool {
         &block.kind,
         ck_wire::CkKind::Reasoning { .. } | ck_wire::CkKind::RedactedReasoning { .. }
     )
+}
+
+fn is_mutable_merged_reasoning_block(block: &CkWireBlock) -> bool {
+    is_reasoning_block(block)
+        && !block
+            .provider_extras
+            .get("opencode")
+            .is_some_and(|extras| extras.contains_key("cache_control"))
 }
 
 /// Anthropic verifies the newest assistant's signed reasoning against the original response.
@@ -15750,6 +15762,145 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn merged_reasoning_requires_an_explicit_anthropic_provider() {
+        fn candidate() -> CkWireMessage {
+            CkWireMessage::from_parts(
+                "assistant",
+                vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: "signed thinking".to_string(),
+                    signature: Some("sig".to_string()),
+                })],
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta {
+                    harness_id: Some("candidate".to_string()),
+                    ..Default::default()
+                },
+            )
+        }
+
+        let mut absent_provider = candidate();
+        assert_eq!(
+            apply_serializer_residual_to_message(
+                SerializerProfile::OpencodeAiSdk,
+                None,
+                false,
+                false,
+                &mut absent_provider,
+            ),
+            0
+        );
+        assert!(matches!(
+            &absent_provider.content[0].kind,
+            ck_wire::CkKind::Reasoning { .. }
+        ));
+
+        let mut anthropic = candidate();
+        assert_eq!(
+            apply_serializer_residual_to_message(
+                SerializerProfile::OpencodeAiSdk,
+                Some("anthropic"),
+                false,
+                false,
+                &mut anthropic,
+            ),
+            1
+        );
+        assert!(matches!(
+            &anthropic.content[0].kind,
+            ck_wire::CkKind::Text { text } if text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn adapter_reasoning_goldens_reach_the_module_strip_contract() {
+        #[derive(serde::Deserialize)]
+        struct Golden {
+            generator_version: u32,
+            cases: Vec<GoldenCase>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct GoldenCase {
+            name: String,
+            target_mid: String,
+            expect_strip: bool,
+            encoded_input: Vec<CkIngressMessage>,
+        }
+
+        let golden: Golden = serde_json::from_str(include_str!(
+            "../testdata/merged-reasoning-adapter-golden.json"
+        ))
+        .unwrap();
+        assert_eq!(golden.generator_version, 1);
+        assert_eq!(
+            golden
+                .cases
+                .iter()
+                .map(|fixture| fixture.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "reasoning",
+                "thinking",
+                "redacted_thinking",
+                "reasoning_cache_control",
+            ]
+        );
+
+        for fixture in golden.cases {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let mut request = opencode_req(
+                &format!("adapter-golden-{}", fixture.name),
+                "cfg0",
+                fixture.encoded_input,
+            );
+            request.provider_id = Some("anthropic".to_string());
+
+            let response = run(&store, &request, &spine());
+            assert_eq!(response.action, "HARD");
+            let target = response
+                .messages()
+                .iter()
+                .find(|message| {
+                    message.meta.harness_id.as_deref() == Some(fixture.target_mid.as_str())
+                })
+                .unwrap_or_else(|| panic!("missing adapter target for {}", fixture.name));
+            let stripped = matches!(
+                &target.content[0].kind,
+                ck_wire::CkKind::Text { text } if text.is_empty()
+            );
+            assert_eq!(
+                stripped, fixture.expect_strip,
+                "adapter case {} disagreed with its first-apply contract",
+                fixture.name
+            );
+            let frozen = store
+                .load(&request.session_id)
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == format!("strip:merged_reasoning:{}", fixture.target_mid));
+            assert_eq!(
+                frozen, fixture.expect_strip,
+                "adapter case {} disagreed with its frozen applied set",
+                fixture.name
+            );
+
+            let first_bytes = serde_json::to_vec(response.messages()).unwrap();
+            let replay = run(&store, &request, &spine());
+            assert_eq!(replay.action, "SOFT+");
+            assert_eq!(
+                serde_json::to_vec(replay.messages()).unwrap(),
+                first_bytes,
+                "adapter case {} did not replay byte-identically",
+                fixture.name
+            );
+        }
+    }
+
+    #[test]
     fn reasoning_keep_rule_treats_whitespace_only_text_as_sentinel_invisible() {
         let mut messages = vec![CkWireMessage::from_parts(
             "assistant",
@@ -15912,6 +16063,133 @@ pub(crate) mod tests {
             response_bytes(&replay),
             bust_bytes,
             "a defer after restart must replay the frozen merged strip byte-identically"
+        );
+    }
+
+    #[test]
+    fn subagent_merged_reasoning_first_applies_only_on_execute_and_replays_on_defer() {
+        fn assistant(mid: &str, ordinal: u64, parts: Vec<CkWireBlock>) -> CkIngressMessage {
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    parts,
+                    None,
+                    ck_wire::ProviderExtras::new(),
+                    ck_wire::HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        fn request(
+            session: &str,
+            config: &str,
+            messages: Vec<CkIngressMessage>,
+        ) -> TransformRequest {
+            let mut request = opencode_req(session, config, messages);
+            request.provider_id = Some("anthropic".to_string());
+            request.is_subagent = true;
+            request
+        }
+
+        fn target_is_stripped(response: &TransformResponse) -> bool {
+            let target = response
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some("older"))
+                .expect("older assistant must be served");
+            matches!(
+                &target.content[1].kind,
+                ck_wire::CkKind::Text { text } if text.is_empty()
+            )
+        }
+
+        let older = assistant(
+            "older",
+            1,
+            vec![
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: "answer before thinking".to_string(),
+                }),
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: "older signed thinking".to_string(),
+                    signature: Some("sig-older".to_string()),
+                }),
+            ],
+        );
+        let newest = assistant(
+            "newest",
+            2,
+            vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: "newest answer".to_string(),
+            })],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "subagent-merged-reasoning";
+
+        let prime = run(
+            &store,
+            &request(session, "cfg0", vec![older.clone()]),
+            &spine(),
+        );
+        assert!(!target_is_stripped(&prime));
+
+        let eligible_on_defer = run(
+            &store,
+            &request(session, "cfg0", vec![older.clone(), newest.clone()]),
+            &spine(),
+        );
+        assert_eq!(eligible_on_defer.action, "SOFT+");
+        assert!(
+            !target_is_stripped(&eligible_on_defer),
+            "a defer must not first-apply a newly eligible provider-prefix mutation"
+        );
+
+        let loaded = store.load(session).unwrap();
+        let mut execute_meta = loaded.meta.clone();
+        execute_meta.soft_refresh_pending = true;
+        store
+            .commit(session, loaded.row_version, &loaded.core, &execute_meta)
+            .unwrap();
+        let execute = run(
+            &store,
+            &request(session, "cfg0", vec![older.clone(), newest.clone()]),
+            &spine(),
+        );
+        assert_eq!(execute.action, "SOFT");
+        assert!(
+            target_is_stripped(&execute),
+            "an ordinary subagent execute must first-apply the merged-reasoning strip"
+        );
+        assert!(store
+            .load(session)
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "strip:merged_reasoning:older"));
+        let execute_bytes = serde_json::to_vec(execute.messages()).unwrap();
+
+        let loaded = store.load(session).unwrap();
+        let mut defer_meta = loaded.meta.clone();
+        defer_meta.soft_refresh_pending = false;
+        store
+            .commit(session, loaded.row_version, &loaded.core, &defer_meta)
+            .unwrap();
+        let replay = run(
+            &store,
+            &request(session, "cfg0", vec![older, newest]),
+            &spine(),
+        );
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_vec(replay.messages()).unwrap(),
+            execute_bytes
         );
     }
 

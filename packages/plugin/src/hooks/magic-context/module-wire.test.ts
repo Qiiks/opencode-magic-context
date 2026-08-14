@@ -1,6 +1,8 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import {
     buildPagedModuleTransformPayloads,
@@ -36,6 +38,36 @@ describe("encodeOpenCodeMessagesToCk", () => {
             harness_id: "msg_synthetic_todo",
             synthetic: true,
         });
+    });
+
+    it("matches the module golden generated from raw OpenCode reasoning parts", () => {
+        const golden = JSON.parse(
+            readFileSync(
+                join(
+                    import.meta.dir,
+                    "../../../../../crates/mc-module/testdata/merged-reasoning-adapter-golden.json",
+                ),
+                "utf8",
+            ),
+        ) as {
+            generator_version: number;
+            cases: Array<{
+                name: string;
+                raw_messages: unknown[];
+                encoded_input: unknown[];
+            }>;
+        };
+
+        expect(golden.generator_version).toBe(1);
+        expect(golden.cases.map((fixture) => fixture.name)).toEqual([
+            "reasoning",
+            "thinking",
+            "redacted_thinking",
+            "reasoning_cache_control",
+        ]);
+        for (const fixture of golden.cases) {
+            expect(encodeOpenCodeMessagesToCk(fixture.raw_messages)).toEqual(fixture.encoded_input);
+        }
     });
 });
 
