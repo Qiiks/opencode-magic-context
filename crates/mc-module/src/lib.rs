@@ -15025,6 +15025,7 @@ mod tests {
                 &scheduler::ContextUsage {
                     percentage: 60.0,
                     input_tokens: 60_000.0,
+                    hard_wall_percentage: None,
                 },
                 100,
                 None,

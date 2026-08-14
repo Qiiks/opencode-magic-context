@@ -1803,6 +1803,7 @@ mod tests {
             messages,
             tail_delta: None,
             usage: None,
+            geometry: None,
             provider_error: None,
             mid_turn: false,
             prev_response_completed_at_ms: None,

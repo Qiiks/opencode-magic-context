@@ -349,6 +349,59 @@ describe("Rust mode authority adapter", () => {
         expect(authorityRoots.every((root) => root === "/session/root-b")).toBe(true);
     });
 
+    it("transports S1 geometry and bases host preflight on the hard wall", () => {
+        const geometry = __rustModeTransformTest.transformGeometryForWire({
+            usableSoft: 128_000,
+            usableHard: 168_000,
+            geometry: "separate",
+            derivation: {
+                window: 168_000,
+                reserve: 40_000,
+                reserveSource: "output_catalog",
+                geometry: "separate",
+            },
+        });
+        expect(geometry).toEqual({
+            usable_soft: 128_000,
+            usable_hard: 168_000,
+            derivation: "s1-pre-carve/input=128000",
+        });
+        expect(
+            __rustModeTransformTest.hardWallUsagePercentage(
+                { inputTokens: 130_000, percentage: (130_000 / 128_000) * 100 },
+                geometry,
+            ),
+        ).toBeCloseTo((130_000 / 168_000) * 100);
+
+        const body = __rustModeTransformTest.buildTransformBody({
+            sessionId: "geometry-wire",
+            input: [],
+            nativeMessages: [],
+            passInputs: {},
+            usage: { context_limit_tokens: 128_000 },
+            geometry,
+            modelKey: null,
+            providerId: null,
+            midTurn: false,
+        });
+        expect(body.usage).toEqual({ context_limit_tokens: 128_000 });
+        expect(body.geometry).toEqual(geometry);
+    });
+
+    it("omits geometry without changing the legacy transform shape", () => {
+        const body = __rustModeTransformTest.buildTransformBody({
+            sessionId: "legacy-geometry-wire",
+            input: [],
+            nativeMessages: [],
+            passInputs: {},
+            usage: { context_limit_tokens: 128_000 },
+            modelKey: null,
+            providerId: null,
+            midTurn: false,
+        });
+        expect("geometry" in body).toBe(false);
+    });
+
     it("copies the resolved history budget onto the authority wire", () => {
         const body = __rustModeTransformTest.buildTransformBody({
             sessionId: "budget-wire",

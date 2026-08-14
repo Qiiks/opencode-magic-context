@@ -34,6 +34,7 @@ import { writeRustTransformDecision } from "../../features/magic-context/transfo
 import type { ContextUsage } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
 import { promptSurfaceConfigIdentity, resolvePromptSurface } from "../../shared/prompt-surface";
+import type { WindowGeometryResult } from "../../shared/window-geometry";
 import {
     cachedToolPermissionDenied,
     resolveCtxReduceAvailability,
@@ -593,9 +594,7 @@ function assertNativeBoundary(output: unknown[], sessionId: string, boundaryId: 
         const partDesc = mParts
             .slice(0, 5)
             .map((part) =>
-                isRecord(part)
-                    ? `${String(part.type)}${part.synthetic === true ? "" : "!"}`
-                    : "?",
+                isRecord(part) ? `${String(part.type)}${part.synthetic === true ? "" : "!"}` : "?",
             )
             .join(",");
         return `role=${String(mi.role)} sid=${mi.sessionID === sessionId ? "ok" : String(mi.sessionID ?? "absent")} id=${String(mi.id ?? "-").slice(0, 24)} parts=[${partDesc}]`;
@@ -769,6 +768,43 @@ function passUsage(usage: ContextUsage, limit: number): Record<string, number> {
         current_total_input_tokens: usage.inputTokens,
         context_limit_tokens: limit,
     };
+}
+
+interface TransformGeometryWire {
+    usable_soft: number;
+    usable_hard: number;
+    derivation: string;
+}
+
+function transformGeometryForWire(
+    geometry: WindowGeometryResult | undefined,
+): TransformGeometryWire | undefined {
+    if (!geometry) return undefined;
+    const { window, reserve } = geometry.derivation;
+    let derivation: string;
+    if (geometry.geometry === "separate" && geometry.usableSoft < geometry.usableHard) {
+        derivation = `s1-pre-carve/input=${geometry.usableSoft}`;
+    } else if (geometry.geometry === "separate") {
+        derivation = `s1-separate/context=${window}`;
+    } else {
+        derivation =
+            `s1-shared/context-output/context=${window}/output=${reserve}` +
+            `/mode=${geometry.geometry}/usable-hard=${geometry.usableHard}`;
+    }
+    return {
+        usable_soft: geometry.usableSoft,
+        usable_hard: geometry.usableHard,
+        derivation,
+    };
+}
+
+function hardWallUsagePercentage(
+    usage: ContextUsage,
+    geometry: TransformGeometryWire | undefined,
+): number {
+    return geometry && geometry.usable_hard > 0 && usage.inputTokens > 0
+        ? (usage.inputTokens / geometry.usable_hard) * 100
+        : usage.percentage;
 }
 
 function shouldDisarmRustEmergencyRecovery(input: {
@@ -1126,6 +1162,7 @@ function buildTransformBody(args: {
     nativeMessages: unknown[];
     passInputs: Record<string, unknown>;
     usage: Record<string, number | boolean>;
+    geometry?: TransformGeometryWire;
     modelKey: string | null;
     providerId: string | null;
     systemPromptHash: string;
@@ -1177,6 +1214,7 @@ function buildTransformBody(args: {
               }
             : {}),
         usage: args.usage,
+        ...(args.geometry ? { geometry: args.geometry } : {}),
         provider_error: args.passInputs.provider_error,
         mid_turn: args.midTurn,
         prev_response_completed_at_ms: args.prevResponseCompletedAtMs,
@@ -1530,18 +1568,18 @@ export function createRustModeTransform(
         }
         const modelKey = model ? resolveModelKey(model.providerID, model.modelID) : null;
         let resolvedContextLimit: number | undefined;
-        let rawFallbackContextLimit: number | undefined;
+        let resolvedWindowGeometry: WindowGeometryResult | undefined;
         if (model) {
             try {
                 resolvedContextLimit = resolveTrustedContextLimit(model.providerID, model.modelID, {
                     db: deps.db,
                     sessionID: sessionId,
                 });
-                rawFallbackContextLimit = resolveContextWindowGeometry(
+                resolvedWindowGeometry = resolveContextWindowGeometry(
                     model.providerID,
                     model.modelID,
                     { db: deps.db, sessionID: sessionId },
-                )?.usableHard;
+                );
             } catch (error) {
                 preflightError ??= error;
             }
@@ -1552,10 +1590,13 @@ export function createRustModeTransform(
         } catch (error) {
             preflightError ??= error;
         }
+        const transformGeometry = transformGeometryForWire(resolvedWindowGeometry);
+        const hasTrustedEmergencyWall = transformGeometry
+            ? transformGeometry.usable_hard > 0
+            : resolvedContextLimit !== undefined && resolvedContextLimit > 0;
         emergencyFailClosed =
-            passUsageSnapshot.percentage >= RUST_EMERGENCY_WALL_PCT &&
-            resolvedContextLimit !== undefined &&
-            resolvedContextLimit > 0;
+            hardWallUsagePercentage(passUsageSnapshot, transformGeometry) >=
+                RUST_EMERGENCY_WALL_PCT && hasTrustedEmergencyWall;
         if (overflowState) {
             const detectedLimitMatchesModel =
                 overflowState.detectedContextLimitModelKey === null ||
@@ -1572,7 +1613,7 @@ export function createRustModeTransform(
         }
         const serveRawFallback = (cause?: unknown): void => {
             const contextLimit =
-                rawFallbackContextLimit ??
+                transformGeometry?.usable_hard ??
                 resolvedContextLimit ??
                 (overflowState && overflowState.detectedContextLimit > 0
                     ? overflowState.detectedContextLimit
@@ -1804,6 +1845,7 @@ export function createRustModeTransform(
                 model_key: modelKey,
                 provider_id: model?.providerID ?? null,
                 usage: passUsage(usage, contextLimit),
+                geometry: transformGeometry,
                 effective_execute_threshold: threshold,
                 auto_search_enabled: deps.autoSearch?.enabled ?? true,
                 auto_search_score_threshold: deps.autoSearch?.scoreThreshold ?? 0.6,
@@ -2140,6 +2182,7 @@ export function createRustModeTransform(
                     final_wire_input_tokens: finalWireEstimate?.tokens ?? 0,
                     final_wire_trusted: finalWireEstimate?.trusted === true,
                 },
+                geometry: transformGeometry,
                 modelKey: modelKey ?? null,
                 providerId: model?.providerID ?? null,
                 systemPromptHash: sessionMeta.systemPromptHash ?? "",
@@ -2348,6 +2391,7 @@ export function createRustModeTransform(
                             final_wire_input_tokens: finalWireEstimate?.tokens ?? 0,
                             final_wire_trusted: finalWireEstimate?.trusted === true,
                         },
+                        geometry: transformGeometry,
                         modelKey: modelKey ?? null,
                         providerId: model?.providerID ?? null,
                         systemPromptHash: sessionMeta.systemPromptHash ?? "",
@@ -2774,6 +2818,8 @@ export const __rustModeTransformTest = {
     messageContentSnapshot,
     messageMatchesContentSnapshot,
     buildTransformBody,
+    transformGeometryForWire,
+    hardWallUsagePercentage,
     muralInputForWire,
     formatRustPassLog,
     shouldDisarmRustEmergencyRecovery,
