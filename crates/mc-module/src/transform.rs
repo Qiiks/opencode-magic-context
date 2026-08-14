@@ -644,10 +644,9 @@ pub struct TransformRequest {
     /// provider field. The canonical `anthropic/...` prefix is the same provider gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_key: Option<String>,
-    /// Number of message ordinals kept as recent reasoning before the OpenCode
-    /// native serve pass clears older assistant reasoning. This mirrors the TS
-    /// `clear_reasoning_age` setting; the module uses absolute ordinals because
-    /// its CK ingress does not carry TS tag numbers.
+    /// Number of tag positions kept as recent reasoning before older assistant reasoning is
+    /// cleared. OpenCode removes its empty native sentinels at dispatch; Claude Code removes the
+    /// complete signed thinking block. This mirrors the TS `clear_reasoning_age` setting.
     #[serde(default = "default_clear_reasoning_age")]
     pub clear_reasoning_age: u64,
     /// TS-resolved per-model TTL (session_meta.cacheTtl). None when the consumer does
@@ -2755,6 +2754,7 @@ fn apply_once(
     timings.store_cache_state = transform_snapshot.timings.cache_state_ms;
     let tag_hydration_started_at = Instant::now();
     let mut tag_rows = load_cached_tags(store, &req.session_id)?;
+    let hydrated_tag_count = tag_rows.len();
     timings.store_tags = elapsed_ms(tag_hydration_started_at);
     timings.store_temporal = transform_snapshot.timings.temporal_ms;
     timings.store_user_hints = transform_snapshot.timings.user_hints_ms;
@@ -2883,12 +2883,15 @@ fn apply_once(
     let effective_render_config_base = fold_m0_content_epoch(&render_identity, &content_epoch);
     let effective_render_config =
         fold_mural_content_identity(&effective_render_config_base, &persisted_mural_hash);
-    // A brand-new session has no provider-visible prefix to invalidate, so its bootstrap HARD
-    // may mint and render tags immediately. Established dormant sessions still wait for the
-    // coordinating identity fold before tags can change their replayed bytes.
+    // A brand-new session has no provider-visible prefix to invalidate, so the first requested
+    // tagging surface may mint and render tags on its bootstrap HARD. This is safe for both CC and
+    // OpenCode: the store namespace already exists when the transform snapshot and tags are loaded,
+    // and the tag rows commit atomically with that first cache-state row. Established dormant
+    // sessions still wait for the coordinating identity fold before tags can change replayed bytes.
     // Subagents intentionally share this bootstrap arm; they have no provider-cache prefix.
-    let bootstrap_tagging_active = !loaded.meta.initialized
-        && matches!(serializer_profile, Some(SerializerProfile::OpencodeAiSdk));
+    let bootstrap_tagging_active = !loaded.meta.initialized;
+    let suppress_bootstrap_reduction_tag_overlay = bootstrap_tagging_active
+        && serializer_profile == Some(SerializerProfile::ClaudeCodeAnthropic);
     let tagging_active =
         tagging_surface_requested && (persisted_tagging_surface_active || bootstrap_tagging_active);
     // Previously stored overlay rows may still replay when boundary-lineage validation
@@ -3557,11 +3560,19 @@ fn apply_once(
             todo_synthesis_verdict(req),
         );
     let tag_window_protected_block_ids = if tagging_surface_requested {
+        // Same-pass bootstrap mints have never been provider-visible and must not protect a block
+        // from reduction before its first render. Hydrated rows retain their normal protection;
+        // the newly minted suffix becomes eligible on the next pass after this atomic commit.
+        let protection_tags = if suppress_bootstrap_reduction_tag_overlay {
+            &tag_rows[..hydrated_tag_count]
+        } else {
+            tag_rows.as_slice()
+        };
         newest_active_tag_block_ids(
             &loaded.core,
             &loaded.meta,
             &projection,
-            &tag_rows,
+            protection_tags,
             mutation_exempt_mid,
             req.protected_tags,
         )
@@ -3857,9 +3868,9 @@ fn apply_once(
             meta.pending_user_hint_block_ids.clear();
         }
     }
-    if let Some(cutoff) =
-        reasoning_clear_cutoff_with_tags(req, serializer_profile, is_bust_pass, &tag_numbers)
-    {
+    let reasoning_clear_cutoff =
+        reasoning_clear_cutoff_with_tags(req, serializer_profile, is_bust_pass, &tag_numbers);
+    if let Some(cutoff) = reasoning_clear_cutoff {
         meta.reasoning_cleared_through_tag = meta.reasoning_cleared_through_tag.max(cutoff);
         // Keep the legacy ordinal watermark populated so readers that predate the tag-number
         // watermark, including older native rendering paths, continue to observe the same cutoff.
@@ -3870,6 +3881,7 @@ fn apply_once(
         &loaded.core,
         req,
         &tag_numbers,
+        reasoning_clear_cutoff,
         is_bust_pass,
         lineage_anchor_mid,
     );
@@ -3928,7 +3940,13 @@ fn apply_once(
             core.step(PassInput {
                 proposed: Some(mc_core::Action::Soft),
                 boundary_present: boundary_token,
-                rendered_units: new_reduction_units(&core, &selected_reductions, &live, None),
+                rendered_units: new_reduction_units(
+                    &core,
+                    &selected_reductions,
+                    &live,
+                    None,
+                    suppress_bootstrap_reduction_tag_overlay,
+                ),
                 new_boundary_id: None,
                 queued: Vec::new(),
                 run_started: false,
@@ -4119,7 +4137,11 @@ fn apply_once(
                 // Keep reductions whose targets remain in the new tail; discard reductions covered
                 // by the new m0 summary or orphaned by a revert. Because apply_units cannot remove
                 // those obsolete units in place, rebuild the frozen unit set.
-                let effective = effective_reductions(&core, &selected_reductions);
+                let effective = effective_reductions(
+                    &core,
+                    &selected_reductions,
+                    suppress_bootstrap_reduction_tag_overlay,
+                );
                 let survivors = surviving_red_units(&effective, &live, comp.coverage_ordinal);
                 let mut strip_survivors = surviving_strip_units(&core, req);
                 strip_survivors.extend(new_strip_units.clone());
@@ -4343,7 +4365,11 @@ fn apply_once(
                         }
                     }
 
-                    let effective = effective_reductions(&core, &selected_reductions);
+                    let effective = effective_reductions(
+                        &core,
+                        &selected_reductions,
+                        suppress_bootstrap_reduction_tag_overlay,
+                    );
                     let survivors = surviving_red_units(&effective, &live, comp.coverage_ordinal);
                     let mut strip_survivors = surviving_strip_units(&core, req);
                     strip_survivors.extend(new_strip_units.clone());
@@ -4428,6 +4454,7 @@ fn apply_once(
                         &selected_reductions,
                         &live,
                         loaded.meta.coverage_ordinal,
+                        suppress_bootstrap_reduction_tag_overlay,
                     ));
                     rendered.extend(new_strip_units.clone());
                     rendered.extend(new_caveman_units.clone());
@@ -5977,6 +6004,8 @@ fn consumed_pending_drop_ids(
         .collect()
 }
 
+const RED_SUPPRESS_TAG_OVERLAY_RULE: &str = "suppress_tag_overlay";
+
 /// Build a `red:<target>` frozen unit (Lineage — it persists + replays byte-identical).
 fn red_unit(target: &str, kind: &str, payload: &str) -> FrozenUnit {
     FrozenUnit {
@@ -5986,6 +6015,21 @@ fn red_unit(target: &str, kind: &str, payload: &str) -> FrozenUnit {
         durability_class: mc_core::DurabilityClass::Lineage,
         reset_rule: String::new(),
     }
+}
+
+fn red_unit_with_tag_policy(
+    target: &str,
+    kind: &str,
+    payload: &str,
+    suppress_tag_overlay: bool,
+) -> FrozenUnit {
+    let mut unit = red_unit(target, kind, payload);
+    if suppress_tag_overlay {
+        // The source and its reduction first become provider-visible in the same bootstrap pass.
+        // Freeze the untagged placeholder so the durable tag row cannot alter it on a later defer.
+        unit.reset_rule = RED_SUPPRESS_TAG_OVERLAY_RULE.to_string();
+    }
+    unit
 }
 
 /// Fail-loud monotonicity guard (runs EVERY pass, before classify). If the selector
@@ -6032,6 +6076,7 @@ fn new_reduction_units(
     reductions: &[ReductionDecision],
     live: &[&FlatBlock],
     coverage: Option<u64>,
+    suppress_tag_overlay: bool,
 ) -> Vec<FrozenUnit> {
     let frozen = frozen_red_targets(core);
     let tail: std::collections::HashSet<&str> = live
@@ -6054,9 +6099,9 @@ fn new_reduction_units(
             continue;
         }
         if tail.contains(r.target_id.as_str()) && !frozen.contains(&r.target_id) {
-            by_target
-                .entry(r.target_id.clone())
-                .or_insert_with(|| red_unit(&r.target_id, &r.kind, &r.payload));
+            by_target.entry(r.target_id.clone()).or_insert_with(|| {
+                red_unit_with_tag_policy(&r.target_id, &r.kind, &r.payload, suppress_tag_overlay)
+            });
         }
     }
     by_target.into_values().collect()
@@ -6068,19 +6113,33 @@ fn new_reduction_units(
 fn effective_reductions(
     core: &CoreState,
     reductions: &[ReductionDecision],
-) -> BTreeMap<String, (String, String)> {
-    let mut eff: BTreeMap<String, (String, String)> = BTreeMap::new();
+    suppress_tag_overlay: bool,
+) -> BTreeMap<String, (String, String, String)> {
+    let mut eff: BTreeMap<String, (String, String, String)> = BTreeMap::new();
     for u in &core.frozen_units {
         if let Some(target) = u.key.strip_prefix(RED_KEY_PREFIX) {
             eff.insert(
                 target.to_string(),
-                (u.kind.clone(), u.frozen_payload.clone()),
+                (
+                    u.kind.clone(),
+                    u.frozen_payload.clone(),
+                    u.reset_rule.clone(),
+                ),
             );
         }
     }
     for r in reductions {
-        eff.entry(r.target_id.clone())
-            .or_insert_with(|| (r.kind.clone(), r.payload.clone()));
+        eff.entry(r.target_id.clone()).or_insert_with(|| {
+            (
+                r.kind.clone(),
+                r.payload.clone(),
+                if suppress_tag_overlay {
+                    RED_SUPPRESS_TAG_OVERLAY_RULE.to_string()
+                } else {
+                    String::new()
+                },
+            )
+        });
     }
     eff
 }
@@ -6114,7 +6173,7 @@ fn prune_covered_red_units(
 /// (reverted away) is dropped as an orphan. So a unit survives iff its target is in the
 /// live array AND still in the tail after the fold.
 fn surviving_red_units(
-    effective: &BTreeMap<String, (String, String)>,
+    effective: &BTreeMap<String, (String, String, String)>,
     live: &[&FlatBlock],
     new_coverage: Option<u64>,
 ) -> Vec<FrozenUnit> {
@@ -6122,8 +6181,12 @@ fn surviving_red_units(
     effective
         .iter()
         .filter_map(
-            |(target, (kind, payload))| match live_ord.get(target.as_str()) {
-                Some(&ord) if is_tail(ord, new_coverage) => Some(red_unit(target, kind, payload)),
+            |(target, (kind, payload, reset_rule))| match live_ord.get(target.as_str()) {
+                Some(&ord) if is_tail(ord, new_coverage) => {
+                    let mut unit = red_unit(target, kind, payload);
+                    unit.reset_rule = reset_rule.clone();
+                    Some(unit)
+                }
                 _ => None,
             },
         )
@@ -9162,6 +9225,7 @@ fn new_frozen_strip_units(
     core: &CoreState,
     req: &TransformRequest,
     tag_numbers: &BTreeMap<String, u64>,
+    reasoning_clear_cutoff: Option<u64>,
     is_bust_pass: bool,
     lineage_anchor_mid: Option<&str>,
 ) -> Vec<FrozenUnit> {
@@ -9179,6 +9243,15 @@ fn new_frozen_strip_units(
         .len()
         .saturating_sub(req.protected_tags.saturating_mul(2));
     let age_cutoff = tag_age_cutoff(req, tag_numbers);
+    let reasoning_mutation_exempt_mid =
+        latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
+    let cc_reasoning_cutoff = if SerializerProfile::parse(&req.serializer_profile)
+        == Some(SerializerProfile::ClaudeCodeAnthropic)
+    {
+        reasoning_clear_cutoff
+    } else {
+        None
+    };
     let mut units = BTreeMap::<String, FrozenUnit>::new();
     let mut has_assistant_response = false;
 
@@ -9225,6 +9298,24 @@ fn new_frozen_strip_units(
             }
         }
         if message.ck.role != "user" {
+            // CC cannot rewrite or truncate an Anthropic-signed thinking block. Record the
+            // message in the same durable strip-unit applied set used by merged-reasoning healing,
+            // then remove whole reasoning blocks at render time. The unit is first minted only on
+            // this already-busting pass and replays unchanged on defers; selection.rs continues to
+            // exclude every reasoning block from ReductionDecision targets.
+            if message.ck.role == "assistant"
+                && reasoning_mutation_exempt_mid != Some(message.mid.as_str())
+                && cc_reasoning_cutoff.is_some_and(|cutoff| {
+                    let tag = message_tag_number(message, tag_numbers);
+                    tag > 0 && tag <= cutoff
+                })
+                && blocks.iter().any(is_reasoning_block)
+            {
+                let unit = strip_unit("reasoning_age", &message.mid, "");
+                if !existing_keys.contains(unit.key.as_str()) {
+                    units.insert(unit.key.clone(), unit);
+                }
+            }
             if request_accepts_empty_content(req)
                 && index < protected_start
                 && blocks.iter().any(is_reduce_block)
@@ -9293,6 +9384,31 @@ fn new_frozen_strip_units(
 struct ReasoningMutationPolicy {
     watermark: u64,
     exempt: bool,
+}
+
+fn remove_frozen_historical_reasoning(
+    core: &CoreState,
+    message: &CkIngressMessage,
+    reasoning_mutation_exempt: bool,
+    rebuilt: &mut CkWireMessage,
+) -> usize {
+    if reasoning_mutation_exempt
+        || message.ck.role != "assistant"
+        || message_strip_unit(core, "reasoning_age", &message.mid).is_none()
+    {
+        return 0;
+    }
+
+    let before = rebuilt.content.len();
+    // Anthropic signatures authenticate the complete thinking block. Removing the block is safe;
+    // replacing or truncating its text would retain an invalid signature and produce a provider
+    // 400. Perform removal after overlays so original block indexes remain valid while rendering.
+    rebuilt.content.retain(|block| !is_reasoning_block(block));
+    let removed = before.saturating_sub(rebuilt.content.len());
+    if removed > 0 {
+        rebuilt.mark_modified();
+    }
+    removed
 }
 
 fn apply_surface_strips(
@@ -9401,9 +9517,11 @@ fn surviving_strip_units(core: &CoreState, req: &TransformRequest) -> Vec<Frozen
         .iter()
         .filter(|unit| unit.key.starts_with("strip:"))
         .filter(|unit| {
-            // A request may be a transient subset or revert. Keep applied message ids durable so
-            // their strip resumes deterministically if they return in a later full-array request.
+            // A request may be a transient subset or revert. Keep reasoning applied-set message
+            // ids durable so their strip resumes deterministically if they return in a later
+            // full-array request.
             unit.key.starts_with("strip:merged_reasoning:")
+                || unit.key.starts_with("strip:reasoning_age:")
                 || unit
                     .key
                     .strip_prefix("strip:")
@@ -10616,7 +10734,7 @@ fn build_output_with_tags_inner(
                 );
                 rebuilt
             } else {
-                let reduced: BTreeMap<usize, &str> = if mutation_exempt {
+                let reduced: BTreeMap<usize, &FrozenUnit> = if mutation_exempt {
                     BTreeMap::new()
                 } else {
                     blocks
@@ -10632,7 +10750,7 @@ fn build_output_with_tags_inner(
                             frozen_units
                                 .by_key(&format!("{RED_KEY_PREFIX}{}", block.id()))
                                 .filter(|unit| unit.kind != "image")
-                                .map(|unit| (block.block_index, unit.frozen_payload.as_str()))
+                                .map(|unit| (block.block_index, unit))
                         })
                         .collect()
                 };
@@ -10640,8 +10758,9 @@ fn build_output_with_tags_inner(
                 if !reduced.is_empty() {
                     rebuilt.mark_modified();
                     for block in blocks {
-                        if let Some(payload) = reduced.get(&block.block_index) {
-                            let display_payload = (*payload == "[dropped]")
+                        if let Some(unit) = reduced.get(&block.block_index) {
+                            let display_payload = (unit.frozen_payload == "[dropped]"
+                                && unit.reset_rule != RED_SUPPRESS_TAG_OVERLAY_RULE)
                                 .then(|| {
                                     tag_overlay
                                         .and_then(|overlay| overlay.tag_by_block_id.get(&block.id))
@@ -10650,7 +10769,9 @@ fn build_output_with_tags_inner(
                                 .flatten();
                             rebuilt.content[block.block_index] = reduced_block(
                                 &block.wire,
-                                display_payload.as_deref().unwrap_or(payload),
+                                display_payload
+                                    .as_deref()
+                                    .unwrap_or(unit.frozen_payload.as_str()),
                                 block.file_path.as_deref(),
                             );
                         }
@@ -10724,6 +10845,7 @@ fn build_output_with_tags_inner(
                 }
                 rebuilt
             };
+            remove_frozen_historical_reasoning(core, msg, reasoning_mutation_exempt, &mut rendered);
 
             let present = !rendered.content.is_empty()
                 || rendered.meta.synthetic
@@ -10947,28 +11069,36 @@ pub(crate) fn request_accepts_empty_content(req: &TransformRequest) -> bool {
     req.provider_id.as_deref() == Some("anthropic")
 }
 
-/// Capture the next durable D2 reasoning cutoff only on a pass that is already busting.
+/// Capture the next durable reasoning cutoff only on a pass that is already busting.
 ///
 /// The cutoff is the bust cycle's immutable basis, not merely the highest message changed on
 /// that pass. Persisting it even when no currently visible assistant is eligible prevents a
 /// restart or a later tail step from re-deriving a newer cutoff and trickling old reasoning out
-/// one message at a time. Mid-turn busts still capture the historical cutoff; the newest live
-/// assistant remains protected by the render and native-serving exemptions.
+/// one message at a time. OpenCode clears at its final native boundary; Claude Code freezes a
+/// whole-block-removal unit because Anthropic-signed thinking may never be text-rewritten.
+/// Mid-turn busts still capture the historical cutoff; the newest live assistant remains
+/// protected by the render and native-serving exemptions.
 fn reasoning_clear_cutoff_with_tags(
     req: &TransformRequest,
     profile: Option<SerializerProfile>,
     is_bust_pass: bool,
     tag_numbers: &BTreeMap<String, u64>,
 ) -> Option<u64> {
-    if profile != Some(SerializerProfile::OpencodeAiSdk)
-        || !request_accepts_empty_content(req)
-        || !req.serve_native
-        || !is_bust_pass
-    {
+    if !is_bust_pass {
         return None;
     }
-
-    tag_age_cutoff(req, tag_numbers)
+    let profile_supported = match profile {
+        Some(SerializerProfile::OpencodeAiSdk) => {
+            request_accepts_empty_content(req) && req.serve_native
+        }
+        Some(SerializerProfile::ClaudeCodeAnthropic) => true,
+        _ => false,
+    };
+    if profile_supported {
+        tag_age_cutoff(req, tag_numbers)
+    } else {
+        None
+    }
 }
 
 /// Apply the final OpenCode D2 replay to native message parts.
@@ -17095,6 +17225,142 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn claude_code_reasoning_age_waits_for_bust_then_removes_whole_signed_blocks() {
+        fn signed_assistant(mid: &str, ordinal: u64) -> CkIngressMessage {
+            let mut content = vec![CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: format!("thinking-{mid}"),
+                signature: Some(format!("signature-{mid}")),
+            })];
+            if mid == "old" {
+                content.push(CkWireBlock::bare(ck_wire::CkKind::RedactedReasoning {
+                    data: "redacted-old".to_string(),
+                }));
+            }
+            content.push(CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: format!("answer-{mid}"),
+            }));
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    content,
+                    None,
+                    ck_wire::ProviderExtras::new(),
+                    ck_wire::HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        fn reasoning_count(response: &TransformResponse, mid: &str) -> usize {
+            response
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some(mid))
+                .unwrap_or_else(|| panic!("missing assistant {mid}"))
+                .content
+                .iter()
+                .filter(|block| is_reasoning_block(block))
+                .count()
+        }
+
+        fn request(config: &str, clear_reasoning_age: u64) -> TransformRequest {
+            let messages = vec![
+                signed_assistant("old", 1),
+                wire_item(
+                    "assistant",
+                    "adjacent-plain",
+                    2,
+                    &["plain assistant sibling"],
+                ),
+                item("separator", 3, "separate the latest response"),
+                signed_assistant("latest", 4),
+            ];
+            let mut request = active_cc_req("cc-reasoning-age", config, messages);
+            request.clear_reasoning_age = clear_reasoning_age;
+            request
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = store(dir.path());
+        let baseline = run(&db, &request("cfg0", 100), &spine());
+        assert_eq!(baseline.action, "HARD");
+        assert_eq!(reasoning_count(&baseline, "old"), 2);
+        let baseline_messages = baseline
+            .messages()
+            .iter()
+            .cloned()
+            .map(ServedMessage::into_message)
+            .collect::<Vec<_>>();
+        assert!(
+            has_reasoning_assistant_adjacency(&baseline_messages),
+            "the fixture must exercise an adjacency that removal resolves"
+        );
+        let baseline_bytes = serde_json::to_vec(baseline.messages()).unwrap();
+
+        let waiting_request = request("cfg0", 2);
+        let waiting = run(&db, &waiting_request, &spine());
+        assert_eq!(waiting.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_vec(waiting.messages()).unwrap(),
+            baseline_bytes
+        );
+        let waiting_state = db.load("cc-reasoning-age").unwrap();
+        assert_eq!(waiting_state.meta.reasoning_cleared_through_tag, 0);
+        assert!(waiting_state
+            .core
+            .frozen_units
+            .iter()
+            .all(|unit| unit.key != "strip:reasoning_age:old"));
+
+        let bust_request = request("cfg1", 2);
+        let applied = run(&db, &bust_request, &spine());
+        assert_eq!(applied.action, "HARD");
+        assert_eq!(reasoning_count(&applied, "old"), 0);
+        assert_eq!(reasoning_count(&applied, "latest"), 1);
+        assert!(tail_bytes(&applied, "old").contains("§1§ answer-old"));
+        assert!(
+            !has_reasoning_assistant_adjacency(
+                &applied
+                    .messages()
+                    .iter()
+                    .cloned()
+                    .map(ServedMessage::into_message)
+                    .collect::<Vec<_>>()
+            ),
+            "whole-block removal must still pass the reasoning-adjacency skeleton check"
+        );
+        let applied_state = db.load("cc-reasoning-age").unwrap();
+        assert_eq!(applied_state.meta.reasoning_cleared_through_tag, 1);
+        assert!(applied_state
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "strip:reasoning_age:old"));
+        let applied_bytes = serde_json::to_vec(applied.messages()).unwrap();
+
+        let replay = run(&db, &bust_request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_vec(replay.messages()).unwrap(),
+            applied_bytes
+        );
+        assert!(!replay.committed, "a frozen replay needs no state write");
+
+        drop(db);
+        let restarted = store(dir.path());
+        let cold_replay = run(&restarted, &bust_request, &spine());
+        assert_eq!(cold_replay.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_vec(cold_replay.messages()).unwrap(),
+            applied_bytes
+        );
+    }
+
+    #[test]
     fn opencode_d2_watermark_persists_and_defer_does_not_recompute_it() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -20884,6 +21150,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn claude_code_first_requested_surface_tags_bootstrap_pass_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let request = active_cc_req("cc-first-active", "cfg0", vec![item("m1", 1, "hello")]);
+
+        let first = run(&s, &request, &spine());
+        assert_eq!(first.action, "HARD");
+        assert_eq!(first.surface_state, SurfaceState::Transition);
+        assert_eq!(tail_bytes(&first, "m1"), "§1§ hello");
+        let rows = s.load_tags_for_session("cc-first-active").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].block_id, "m1#0");
+        let first_bytes = serde_json::to_vec(first.messages()).unwrap();
+
+        let replay = run(&s, &request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(replay.surface_state, SurfaceState::Active);
+        assert_eq!(serde_json::to_vec(replay.messages()).unwrap(), first_bytes);
+        assert!(!replay.committed, "bootstrap tag replay needs no state write");
+    }
+
+    #[test]
     fn transform_projection_tag_numbers_include_same_pass_mints() {
         run_active_surface_test(|| {
             let dir = tempfile::tempdir().unwrap();
@@ -21159,14 +21447,19 @@ pub(crate) mod tests {
                 "cfg0",
                 vec![wire_item("user", "m1", 1, &["question"])],
             );
-            run(&s, &request, &spine());
-
-            let loaded = s.load("temporal-frontier").unwrap();
-            let mut core = loaded.core.clone();
+            // Seed the reduction before the first active transform. The bootstrap tagger must skip
+            // the already-frozen placeholder so it does not consume the tag position or advance the
+            // temporal boundary; both remain available if the block is restored later.
+            let mut core = CoreState::default();
             core.frozen_units
                 .push(red_unit("m1#0", "drop", "[dropped]"));
-            s.commit("temporal-frontier", loaded.row_version, &core, &loaded.meta)
-                .unwrap();
+            s.commit(
+                "temporal-frontier",
+                None,
+                &core,
+                &ModuleMeta::default(),
+            )
+            .unwrap();
 
             let mut gap_request = request.clone();
             gap_request.prev_response_completed_at_ms = Some(100_000);
@@ -22470,12 +22763,6 @@ pub(crate) mod tests {
                 &active_cc_req("mint", "cfg0", messages.clone()),
                 &spine(),
             );
-            assert!(store_a.load_tags_for_session("mint").unwrap().is_empty());
-            run(
-                &store_a,
-                &active_cc_req("mint", "cfg0", messages.clone()),
-                &spine(),
-            );
             let first = store_a.load_tags_for_session("mint").unwrap();
             assert_eq!(
                 first
@@ -22631,7 +22918,7 @@ pub(crate) mod tests {
             let s = store(dir.path());
             let first_req = active_cc_req("stable", "cfg0", vec![item("m1", 1, "alpha")]);
             let transition = run(&s, &first_req, &spine());
-            assert_eq!(tail_bytes(&transition, "m1"), "alpha");
+            assert_eq!(tail_bytes(&transition, "m1"), "§1§ alpha");
             let first = run(&s, &first_req, &spine());
             let replay = run(&s, &first_req, &spine());
             assert_eq!(tail_bytes(&first, "m1"), "§1§ alpha");

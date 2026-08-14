@@ -2709,16 +2709,19 @@ mod tests {
     }
 
     #[test]
-    fn agent_drop_on_reasoning_block_is_refused() {
-        // ctx_reduce ids aimed at reasoning blocks are filtered at the live-ids
-        // boundary, same as Media/Opaque pass-through carriers.
+    fn age_eligible_reasoning_block_never_becomes_a_reduction_target() {
+        // Historical reasoning cleanup has its own bust-frozen whole-block lane. Even when this
+        // old arc is eligible for age reclaim and ctx_reduce names the exact reasoning id, the
+        // selection contract must never emit signed reasoning in ReductionDecision targets.
         let items = vec![
             reasoning("c1", 1, 100),
             tool_call("c1", 1, "bash", serde_json::json!({}), 50),
             tool_result("c1", 1, "bash", 300),
         ];
         let mut ctx = base_ctx(PassClass::Execute);
-        ctx.last_execute_ordinal = 1;
+        ctx.last_execute_ordinal = 100;
+        ctx.scheduler_pressure_execute = true;
+        ctx.pass_already_busting = true;
         ctx.agent_drop_ids = vec![reasoning_block_id("c1")];
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         assert!(
