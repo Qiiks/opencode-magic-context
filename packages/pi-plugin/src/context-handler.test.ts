@@ -172,6 +172,26 @@ describe("applyForwardPressureFloor", () => {
 	});
 });
 
+describe("Pi hard cache expiry", () => {
+	const { isPiHardCacheExpired } = contextHandlerInternals;
+
+	it("defers rather than hard-folds at the exact TTL boundary", () => {
+		const lastResponseTime = 1_700_000_000_000;
+		const ttlMs = 5 * 60 * 1_000;
+
+		expect(
+			isPiHardCacheExpired(lastResponseTime, ttlMs, lastResponseTime + ttlMs),
+		).toBe(false);
+		expect(
+			isPiHardCacheExpired(
+				lastResponseTime,
+				ttlMs,
+				lastResponseTime + ttlMs + 1,
+			),
+		).toBe(true);
+	});
+});
+
 describe("stable tag identity reuse window", () => {
 	it("contains only real ids from the latest successful pass", () => {
 		const sessionId = "ses-reuse-window";
@@ -1498,6 +1518,71 @@ describe("registerPiContextHandler", () => {
 				getTagsBySession(db, "ses-context").map((tag) => tag.type),
 			).toEqual(["message", "message", "tool", "message"]);
 		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("replays a queued-pending-op defer pass byte-identically without a pending-ops read", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-pending-read-gate";
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				protectedTags: 0,
+				scheduler: { executeThresholdPercentage: 80 },
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			const runDeferPass = async () => {
+				const messages = [
+					userMessage("keep user", 1),
+					assistantMessage("queued drop stays pending", 2),
+				] as never[];
+				return handler(
+					{ messages },
+					fakeContext(
+						sessionId,
+						process.cwd(),
+						["entry-user", "entry-assistant"],
+						messages as never,
+					) as never,
+				);
+			};
+
+			await runDeferPass();
+			const baseline = await runDeferPass();
+			const baselineBytes = JSON.stringify(baseline.messages);
+			const pendingTag = getTagsBySession(db, sessionId).find(
+				(tag) => tag.type === "message" && tag.tagNumber === 2,
+			);
+			if (!pendingTag) throw new Error("expected assistant tag to queue");
+			queuePendingOp(db, sessionId, pendingTag.tagNumber, "drop");
+			updateSessionMeta(db, sessionId, {
+				lastResponseTime: Date.now(),
+				cacheTtl: "59m",
+			});
+
+			const originalPrepare = db.prepare.bind(db);
+			let pendingOpsReads = 0;
+			db.prepare = ((sql: string) => {
+				if (sql.includes("FROM pending_ops")) pendingOpsReads += 1;
+				return originalPrepare(sql);
+			}) as typeof db.prepare;
+			let queued: { messages: never[] };
+			try {
+				queued = await runDeferPass();
+			} finally {
+				db.prepare = originalPrepare as typeof db.prepare;
+			}
+
+			expect(JSON.stringify(queued.messages)).toBe(baselineBytes);
+			expect(pendingOpsReads).toBe(0);
+			expect(getPendingOps(db, sessionId)).toHaveLength(1);
+		} finally {
+			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
 		}
 	});
