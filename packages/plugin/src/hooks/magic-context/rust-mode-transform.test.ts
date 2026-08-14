@@ -363,6 +363,44 @@ describe("Rust mode authority adapter", () => {
         expect(body.history_budget_tokens).toBe(42_000);
     });
 
+    it("gates and copies a mural payload onto the transform wire", () => {
+        const resolved = {
+            enabled: true,
+            supportsVision: true,
+            dataUrl: "data:image/png;base64,cG5n",
+            contentHash: "mural-epoch-a",
+        };
+        const mural = __rustModeTransformTest.muralInputForWire(resolved);
+        expect(mural).toEqual({
+            enabled: true,
+            supports_vision: true,
+            data_url: resolved.dataUrl,
+            content_hash: resolved.contentHash,
+        });
+        expect(
+            __rustModeTransformTest.muralInputForWire({ ...resolved, enabled: false }),
+        ).toBeUndefined();
+        expect(
+            __rustModeTransformTest.muralInputForWire({ ...resolved, supportsVision: false }),
+        ).toBeUndefined();
+        expect(
+            __rustModeTransformTest.muralInputForWire({ ...resolved, dataUrl: undefined }),
+        ).toBeUndefined();
+
+        const body = __rustModeTransformTest.buildTransformBody({
+            sessionId: "mural-wire",
+            input: [],
+            nativeMessages: [],
+            passInputs: { mural },
+            usage: {},
+            modelKey: "anthropic/vision-model",
+            providerId: "anthropic",
+            midTurn: false,
+        });
+
+        expect(body.mural).toEqual(mural);
+    });
+
     it("passes lineage-switch transport fields through opaquely", () => {
         const constituents: Array<[string, string, number]> = [
             ["prior", "middle", 8],
@@ -1032,7 +1070,18 @@ describe("Rust mode authority adapter", () => {
         deps.promptSurface = {
             default: "full",
             models: { "anthropic/opus": "light" },
+            guidance_override_path: "trusted-guidance.md",
             tool_descriptions: { ctx_search: "Search the project memory index." },
+        };
+        deps.promptSurfaceRuntime = {
+            resolveRegistration: () => ({
+                preset: "full",
+                descriptionFor: (_toolId, fullDescription) => fullDescription,
+            }),
+            resolveGuidance: () => ({
+                preset: "light",
+                primaryOverride: "## Magic Context\n\nTrusted user guidance.",
+            }),
         };
         const transform = createRustModeTransform(deps, { moduleClient });
         const messages = makeMessages(sessionId);
@@ -1053,6 +1102,12 @@ describe("Rust mode authority adapter", () => {
         expect(transformRequest?.prompt_surface_tool_descriptions).toEqual({
             ctx_search: "Search the project memory index.",
         });
+        expect(transformRequest?.prompt_surface_guidance_override).toBe(
+            "## Magic Context\n\nTrusted user guidance.",
+        );
+        expect(transformRequest?.prompt_surface_guidance_override).not.toBe(
+            deps.promptSurface.guidance_override_path,
+        );
     });
 
     it("mirrors rendered memory ids for ctx_search without rewriting a stable manifest", async () => {

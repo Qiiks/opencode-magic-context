@@ -1795,6 +1795,8 @@ mod tests {
             prompt_surface_model_key: None,
             prompt_surface_config_identity: String::new(),
             prompt_surface_tool_descriptions: BTreeMap::new(),
+            prompt_surface_guidance_override: None,
+            mural: None,
             serve_native: false,
             native_messages: None,
             full_array_fingerprint: None,

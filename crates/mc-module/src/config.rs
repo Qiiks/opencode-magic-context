@@ -104,6 +104,9 @@ pub struct McModuleConfig {
     pub inject_docs: bool,
     /// Controls temporal gap overlays when the active wire surface supports overlays.
     pub temporal_awareness: bool,
+    /// Trusted USER-tier guidance bytes resolved by the host. The module never reads the
+    /// configured guidance path from the host filesystem.
+    pub prompt_surface_guidance_override: Option<String>,
     pub smart_drops: bool,
     pub cache_ttl: String,
     /// Per-model TTL overrides from the object config shape. Resolution uses the
@@ -127,6 +130,7 @@ impl Default for McModuleConfig {
             user_profile_budget_tokens: DEFAULT_USER_PROFILE_BUDGET_TOKENS,
             inject_docs: true,
             temporal_awareness: true,
+            prompt_surface_guidance_override: None,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
             cache_ttl_by_model: std::collections::BTreeMap::new(),
@@ -370,6 +374,13 @@ fn merge_tiers_with_warnings(
         if let Some(enabled) = user.pointer("/temporal_awareness").and_then(Value::as_bool) {
             cfg.temporal_awareness = enabled;
         }
+        if let Some(guidance) = user
+            .pointer("/prompt_surface/guidance_override_text")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            cfg.prompt_surface_guidance_override = Some(guidance.to_string());
+        }
         match user.pointer("/cache_ttl") {
             Some(Value::String(cache_ttl)) => {
                 if !cache_ttl.trim().is_empty() {
@@ -440,6 +451,16 @@ fn merge_tiers_with_warnings(
         {
             cfg.temporal_awareness = enabled;
         }
+        warn_ignored_project_key(
+            project,
+            "/prompt_surface/guidance_override_text",
+            &mut warnings,
+        );
+        warn_ignored_project_key(
+            project,
+            "/prompt_surface/guidance_override_path",
+            &mut warnings,
+        );
     }
 
     cfg.execute_threshold_percentage = cfg
@@ -870,6 +891,32 @@ mod tests {
         let defaults = merge_tiers(None, None);
         assert!(defaults.inject_docs);
         assert!(defaults.temporal_awareness);
+    }
+
+    #[test]
+    fn guidance_override_accepts_resolved_user_text_and_ignores_project_injection() {
+        let user = serde_json::json!({
+            "prompt_surface": {
+                "guidance_override_text": "## Magic Context\n\nTrusted user guidance."
+            }
+        });
+        let project = serde_json::json!({
+            "prompt_surface": {
+                "guidance_override_text": "## Magic Context\n\nProject injection.",
+                "guidance_override_path": "/repo/untrusted.md"
+            }
+        });
+
+        let (cfg, warnings) = merge_tiers_with_warnings(Some(&user), Some(&project));
+
+        assert_eq!(
+            cfg.prompt_surface_guidance_override.as_deref(),
+            Some("## Magic Context\n\nTrusted user guidance.")
+        );
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings
+            .iter()
+            .all(|warning| warning.contains("user-tier only")));
     }
 
     #[test]
