@@ -811,6 +811,58 @@ describe("strip-content", () => {
             });
         });
 
+        describe("#given a frozen message-id replay set", () => {
+            it("#then neutralizes only set members across fresh message objects", () => {
+                const buildFixture = () => {
+                    const newest = message("m-newest", "assistant", [
+                        { type: "reasoning", text: "newest remains exempt" },
+                    ]);
+                    return {
+                        newest,
+                        messages: [
+                            message("m-u", "user", [{ type: "text", text: "continue" }]),
+                            message("m-first", "assistant", [{ type: "text", text: "first" }]),
+                            message("m-frozen", "assistant", [
+                                { type: "thinking", thinking: "frozen reasoning" },
+                                { type: "text", text: "frozen continuation" },
+                            ]),
+                            message("m-unfrozen", "assistant", [
+                                { type: "thinking", thinking: "not frozen yet" },
+                                { type: "text", text: "unfrozen continuation" },
+                            ]),
+                            newest,
+                        ],
+                    };
+                };
+
+                const first = buildFixture();
+                expect(
+                    stripReasoningFromMergedAssistants(first.messages, "anthropic", {
+                        frozenMessageIds: new Set(["m-frozen"]),
+                        mutationExemptMessage: first.newest,
+                    }),
+                ).toBe(1);
+                expect(first.messages[2]?.parts[0]).toEqual(SENTINEL);
+                expect(first.messages[3]?.parts[0]).toEqual({
+                    type: "thinking",
+                    thinking: "not frozen yet",
+                });
+
+                const rebuilt = buildFixture();
+                expect(
+                    stripReasoningFromMergedAssistants(rebuilt.messages, "anthropic", {
+                        frozenMessageIds: new Set(["m-frozen"]),
+                        mutationExemptMessage: rebuilt.newest,
+                    }),
+                ).toBe(1);
+                expect(rebuilt.messages[2]?.parts[0]).toEqual(SENTINEL);
+                expect(rebuilt.messages[3]?.parts[0]).toEqual({
+                    type: "thinking",
+                    thinking: "not frozen yet",
+                });
+            });
+        });
+
         describe("#given a long consecutive assistant run with tool calls and reasoning", () => {
             it("#then keeps only the first reasoning; intermediate reasoning becomes sentinels", () => {
                 const u = message("m-u", "user", [{ type: "text", text: "do it" }]);

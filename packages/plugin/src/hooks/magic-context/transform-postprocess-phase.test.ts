@@ -22,6 +22,7 @@ import {
 } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
+    getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
     getPersistedTodoPermissionDenied,
     getPersistedTodoSyntheticAnchor,
@@ -2625,6 +2626,131 @@ describe("final message representation", () => {
         expect(JSON.stringify(nonAnthropicMessages)).toBe(nonAnthropicBefore);
     });
 
+    it("freezes first merged-strip application onto a bust and replays it across fresh rebuilds", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-merged-reasoning-transition";
+        const buildMessages = (includeNewest: boolean): MessageLike[] => {
+            const messages = [
+                {
+                    info: { id: "user", role: "user" },
+                    parts: [{ type: "text", text: "continue" }],
+                },
+                {
+                    info: { id: "assistant-first", role: "assistant" },
+                    parts: [{ type: "text", text: "first assistant content" }],
+                },
+                {
+                    info: { id: "assistant-transitioned", role: "assistant" },
+                    parts: [
+                        {
+                            type: "thinking",
+                            thinking: "accepted while newest",
+                            signature: "accepted-signature",
+                        },
+                        { type: "text", text: "tool-use continuation" },
+                    ],
+                },
+            ] as unknown as MessageLike[];
+            if (includeNewest) {
+                messages.push({
+                    info: { id: "assistant-newest", role: "assistant" },
+                    parts: [{ type: "text", text: "new newest assistant" }],
+                } as unknown as MessageLike);
+            }
+            return messages;
+        };
+
+        const acceptedPass = buildMessages(false);
+        const acceptedTarget = findMessage(acceptedPass, "assistant-transitioned");
+        const acceptedBytes = JSON.stringify(acceptedTarget.parts);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, acceptedPass, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+        expect(JSON.stringify(acceptedTarget.parts)).toBe(acceptedBytes);
+
+        // Pass N: the same persisted assistant is no longer newest, but a defer
+        // cannot alter bytes that Anthropic already accepted while it was exempt.
+        const transitionedDefer = buildMessages(true);
+        const deferTarget = findMessage(transitionedDefer, "assistant-transitioned");
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, transitionedDefer, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+        expect(JSON.stringify(deferTarget.parts)).toBe(acceptedBytes);
+        expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
+
+        // Pass N+1: execute is the existing cache-busting gate, so first
+        // application and persistence happen together.
+        const bustMessages = buildMessages(true);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, bustMessages, {
+                schedulerDecision: "execute",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+        const bustTarget = findMessage(bustMessages, "assistant-transitioned");
+        expect(bustTarget.parts[0]).toEqual({ type: "text", text: "" });
+        expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(
+            new Set(["assistant-transitioned"]),
+        );
+        expect(getMergedReasoningStrippedIds(db, sessionId).has("assistant-newest")).toBe(false);
+
+        // Pass N+2: OpenCode rebuilt every object, but id-keyed replay reproduces
+        // the stripped wire exactly without opening detection on the defer.
+        const replayMessages = buildMessages(true);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, replayMessages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+        expect(serializeAnthropicWirePrefix(replayMessages)).toBe(
+            serializeAnthropicWirePrefix(bustMessages),
+        );
+        expect(findMessage(replayMessages, "assistant-transitioned").parts[0]).toEqual({
+            type: "text",
+            text: "",
+        });
+    });
+
+    it("skips merged-assistant reasoning persistence and stripping in compaction-off mode", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-merged-reasoning-compaction-off";
+        const messages = [
+            {
+                info: { id: "assistant-first", role: "assistant" },
+                parts: [{ type: "text", text: "first" }],
+            },
+            {
+                info: { id: "assistant-target", role: "assistant" },
+                parts: [{ type: "thinking", thinking: "must remain", signature: "sig" }],
+            },
+            {
+                info: { id: "assistant-newest", role: "assistant" },
+                parts: [{ type: "text", text: "newest" }],
+            },
+        ] as unknown as MessageLike[];
+        const before = JSON.stringify(messages);
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                compactionOff: true,
+                schedulerDecision: "execute",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+
+        expect(JSON.stringify(messages)).toBe(before);
+        expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
+    });
+
     it("preserves the newest assistant reasoning through final representation", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
@@ -2671,7 +2797,10 @@ describe("final message representation", () => {
             }),
         );
 
-        expect(messages[2]?.parts[0]).toEqual({ type: "text", text: "" });
+        expect(messages[2]?.parts[0]).toEqual({
+            type: "thinking",
+            thinking: "older merged reasoning",
+        });
         expect(JSON.stringify(latest.parts.slice(0, 2))).toBe(latestBefore);
     });
 

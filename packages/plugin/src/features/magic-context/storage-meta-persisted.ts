@@ -2088,6 +2088,64 @@ export function removeStrippedPlaceholderId(
     return true;
 }
 
+// ── Merged-assistant reasoning stripped IDs (frozen replay watermark) ──
+
+/**
+ * Assistant message ids whose merged-run reasoning neutralization has already
+ * been first-applied on a cache-busting pass. The set is replayed on every pass
+ * and never shrinks while the session exists, so tail growth or a fresh object
+ * rebuild cannot introduce a new prefix mutation on a defer pass.
+ */
+export function getMergedReasoningStrippedIds(db: Database, sessionId: string): Set<string> {
+    const row = db
+        .prepare("SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?")
+        .get(sessionId) as { merged_reasoning_stripped_ids?: string } | null;
+    return new Set(parseStrippedBlob(row?.merged_reasoning_stripped_ids));
+}
+
+/**
+ * Atomically merge assistant message ids into the persisted applied set. Persistence
+ * must succeed before callers first mutate newly detected messages; otherwise a
+ * later defer pass could not reproduce those bytes from a fresh rebuild.
+ */
+export function addMergedReasoningStrippedIds(
+    db: Database,
+    sessionId: string,
+    ids: Iterable<string>,
+): boolean {
+    const add = [...ids];
+    if (add.length === 0) return true;
+    ensureSessionMetaRow(db, sessionId);
+
+    for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt += 1) {
+        const row = db
+            .prepare("SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?")
+            .get(sessionId) as { merged_reasoning_stripped_ids?: string | null } | undefined;
+        const rawStored = row ? (row.merged_reasoning_stripped_ids ?? null) : null;
+        const current = new Set<string>(parseStrippedBlob(rawStored));
+        let changed = false;
+        for (const id of add) {
+            if (!current.has(id)) {
+                current.add(id);
+                changed = true;
+            }
+        }
+        if (!changed) return true;
+        const nextBlob = JSON.stringify([...current]);
+        const result = db
+            .prepare(
+                "UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ? AND merged_reasoning_stripped_ids IS ?",
+            )
+            .run(nextBlob, sessionId, rawStored);
+        if (result.changes > 0) return true;
+    }
+    sessionLog(
+        sessionId,
+        `merged_reasoning_stripped_ids CAS: ${CAS_RETRY_LIMIT} retries exhausted`,
+    );
+    return false;
+}
+
 // ── Stale ctx_reduce stripped message IDs (frozen replay watermark) ──
 
 /**

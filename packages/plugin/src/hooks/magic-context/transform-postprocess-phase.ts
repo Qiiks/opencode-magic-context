@@ -26,6 +26,8 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import {
+    addMergedReasoningStrippedIds,
+    getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
     type PersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
@@ -73,6 +75,7 @@ import { estimateTokens } from "./read-session-formatting";
 import { modelAcceptsEmptyContent, replaySentinelByMessageIds } from "./sentinel";
 import {
     clearOldReasoning,
+    findMergedReasoningStripCandidateIds,
     stripClearedReasoning,
     stripDroppedPlaceholderMessages,
     stripInlineThinking,
@@ -725,6 +728,8 @@ export function finalizeMessageRepresentation(
         prependedMessageCount?: number;
         reasoningMutatedMessages?: Iterable<MessageLike>;
         reasoningMutationExemptMessage?: MessageLike;
+        mergedReasoningStrippedIds?: ReadonlySet<string>;
+        skipMergedReasoningStrip?: boolean;
     },
 ): { clearedParts: number; mergedReasoningParts: number } {
     let clearedParts = 0;
@@ -747,9 +752,12 @@ export function finalizeMessageRepresentation(
             clearedParts = stripClearedReasoning(targetedMessages);
         }
     }
-    const mergedReasoningParts = stripReasoningFromMergedAssistants(messages, resolvedProviderID, {
-        mutationExemptMessage: options?.reasoningMutationExemptMessage,
-    });
+    const mergedReasoningParts = options?.skipMergedReasoningStrip
+        ? 0
+        : stripReasoningFromMergedAssistants(messages, resolvedProviderID, {
+              mutationExemptMessage: options?.reasoningMutationExemptMessage,
+              frozenMessageIds: options?.mergedReasoningStrippedIds,
+          });
     return { clearedParts, mergedReasoningParts };
 }
 
@@ -1894,7 +1902,7 @@ export async function runPostTransformPhase(
         m0RematerializedThisPass ||
         explicitMaterializedSuccessfully ||
         deferredMaterializedSuccessfully;
-    const bustedThisPass =
+    let bustedThisPass =
         args.didMutateFromFlushedStatuses ||
         pendingOpsDidMutate ||
         heuristicOrReasoningDidMutate ||
@@ -1929,6 +1937,51 @@ export async function runPostTransformPhase(
     // head count plus owning mutation targets preserves the old full-array result
     // without repeating its O(session) walk. A legacy/custom target that omits its
     // owner pays one mutation-pass discovery scan above; steady defer never does.
+    // Merged-assistant reasoning follows the same frozen WRITE/REPLAY split as
+    // stale ctx_reduce and processed images. Detection opens only on the shared
+    // cache-busting gate; replay applies the persisted id set on every pass.
+    // Persist before first mutation so a fresh defer rebuild can always reproduce
+    // any stripped bytes. The newest assistant is excluded from both detection
+    // and replay because Anthropic requires its signed blocks byte-identically.
+    const mergedReasoningStrippedIds = new Set<string>();
+    if (canUseEmptySentinels && !compactionOff) {
+        try {
+            for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
+                mergedReasoningStrippedIds.add(id);
+            }
+            if (isCacheBustingPass) {
+                const candidates = findMergedReasoningStripCandidateIds(
+                    args.messages,
+                    args.resolvedProviderID,
+                    { mutationExemptMessage: reasoningMutationExemptMessage },
+                );
+                const newlyDetectedIds = candidates.filter(
+                    (id) => !mergedReasoningStrippedIds.has(id),
+                );
+                if (newlyDetectedIds.length > 0) {
+                    const persisted = addMergedReasoningStrippedIds(
+                        args.db,
+                        args.sessionId,
+                        newlyDetectedIds,
+                    );
+                    if (persisted) {
+                        for (const id of newlyDetectedIds) mergedReasoningStrippedIds.add(id);
+                        bustedThisPass = true;
+                    } else {
+                        args.passOutcome?.record("merged-reasoning-strip-persistence-failure");
+                        sessionLog(
+                            args.sessionId,
+                            "merged reasoning strip: persistence failed; leaving newly detected assistants intact",
+                        );
+                    }
+                }
+            }
+        } catch (error) {
+            args.passOutcome?.record("merged-reasoning-strip-exception");
+            sessionLog(args.sessionId, "transform failed freezing merged reasoning strip:", error);
+        }
+    }
+
     const tFinalRepresentation = performance.now();
     const finalRepresentation = finalizeMessageRepresentation(
         args.messages,
@@ -1937,6 +1990,8 @@ export async function runPostTransformPhase(
             prependedMessageCount,
             reasoningMutatedMessages,
             reasoningMutationExemptMessage,
+            mergedReasoningStrippedIds,
+            skipMergedReasoningStrip: compactionOff,
         },
     );
     sessionLog(

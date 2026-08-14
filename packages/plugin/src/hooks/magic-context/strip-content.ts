@@ -453,6 +453,117 @@ const REASONING_IGNORED_PART_TYPES = new Set([
 // Anthropic block ends with thinking at position 0 and at most one present.
 const REASONING_PART_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
 
+interface MergedReasoningStripPlan {
+    message: MessageLike;
+    stripIndices: number[];
+}
+
+function planMergedAssistantReasoningStrip(
+    messages: MessageLike[],
+    mutationExemptMessage?: MessageLike,
+): MergedReasoningStripPlan[] {
+    const plan: MergedReasoningStripPlan[] = [];
+    let prevRole: string | undefined;
+    let keptReasoningInRun = false;
+
+    for (const message of messages) {
+        const role = message.info.role;
+
+        if (role !== "assistant") {
+            prevRole = role;
+            keptReasoningInRun = false;
+            continue;
+        }
+
+        const firstInRun = prevRole !== "assistant";
+        if (firstInRun) keptReasoningInRun = false;
+
+        if (message === mutationExemptMessage) {
+            prevRole = role;
+            continue;
+        }
+
+        // Determine which reasoning/thinking part (if any) to KEEP for this
+        // run. Only eligible: the first assistant in a run, no reasoning
+        // kept yet, AND the first non-metadata content part is a
+        // reasoning/thinking/redacted_thinking part.
+        //
+        // Sentinels (from stripStructuralNoise and other in-place strips) are
+        // `{type:"text", text:""}` and occupy positions previously held by
+        // structural-noise parts. They are invisible on the wire (OpenCode's
+        // provider transform drops empty text) so the "first non-metadata" rule
+        // must treat them as equivalent to the structural parts they replaced
+        // — otherwise a reasoning part that would have been first-after-strip
+        // is wrongly considered non-first and gets neutralized, stripping the
+        // last thinking from a run that has one eligible to keep.
+        let keepIndex = -1;
+        if (firstInRun && !keptReasoningInRun) {
+            for (let i = 0; i < message.parts.length; i++) {
+                const part = message.parts[i];
+                if (!isRecord(part)) continue;
+                const partType = part.type as string;
+                if (REASONING_IGNORED_PART_TYPES.has(partType)) continue;
+                if (part.ignored === true) continue;
+                if (isSentinel(part)) continue;
+                // Anthropic has already accepted newest assistants with a leading
+                // whitespace block before thinking. Treat that wire-invisible text
+                // like a sentinel so losing newest status does not change the rule.
+                if (
+                    partType === "text" &&
+                    typeof part.text === "string" &&
+                    part.text.trim() === ""
+                ) {
+                    continue;
+                }
+                if (REASONING_PART_TYPES.has(partType)) {
+                    keepIndex = i;
+                }
+                break;
+            }
+        }
+
+        const stripIndices: number[] = [];
+        for (let i = 0; i < message.parts.length; i++) {
+            const part = message.parts[i];
+            if (!isRecord(part)) continue;
+            if (!REASONING_PART_TYPES.has(part.type as string)) continue;
+            if (i === keepIndex) {
+                keptReasoningInRun = true;
+                continue;
+            }
+            stripIndices.push(i);
+        }
+        if (stripIndices.length > 0) plan.push({ message, stripIndices });
+
+        prevRole = role;
+    }
+
+    return plan;
+}
+
+/**
+ * Find the stable assistant message ids whose reasoning the current merge rule
+ * would neutralize. The caller freezes these ids only on a cache-busting pass;
+ * replay uses the persisted set instead of rerunning membership detection.
+ */
+export function findMergedReasoningStripCandidateIds(
+    messages: MessageLike[],
+    providerID?: string,
+    options?: { mutationExemptMessage?: MessageLike },
+): string[] {
+    if (providerID !== "anthropic") return [];
+
+    const ids = new Set<string>();
+    for (const entry of planMergedAssistantReasoningStrip(
+        messages,
+        options?.mutationExemptMessage,
+    )) {
+        const id = entry.message.info.id;
+        if (typeof id === "string" && id.length > 0) ids.add(id);
+    }
+    return [...ids];
+}
+
 /**
  * Work around @ai-sdk/anthropic's groupIntoBlocks behavior plus opus-4.7's
  * strict thinking-block position validation.
@@ -486,6 +597,8 @@ const REASONING_PART_TYPES = new Set(["reasoning", "thinking", "redacted_thinkin
  *   - Leave a supplied mutation-exempt assistant byte-identical. OpenCode
  *     uses this for the newest assistant because Anthropic requires its signed
  *     thinking and redacted-thinking blocks to be replayed unchanged.
+ *   - When frozenMessageIds is supplied, mutate only those persisted ids. An
+ *     empty set therefore performs replay without first-applying new candidates.
  *
  * Trade-off: the model loses visibility into its own intermediate-step
  * reasoning for multi-step turns. The first step's reasoning is preserved
@@ -499,7 +612,10 @@ const REASONING_PART_TYPES = new Set(["reasoning", "thinking", "redacted_thinkin
 export function stripReasoningFromMergedAssistants(
     messages: MessageLike[],
     providerID?: string,
-    options?: { mutationExemptMessage?: MessageLike },
+    options?: {
+        mutationExemptMessage?: MessageLike;
+        frozenMessageIds?: ReadonlySet<string>;
+    },
 ): number {
     // Anthropic-only workaround for @ai-sdk/anthropic's groupIntoBlocks
     // index-0-thinking rule. openai-compatible providers like Kimi/
@@ -510,96 +626,20 @@ export function stripReasoningFromMergedAssistants(
     if (providerID !== "anthropic") return 0;
 
     let stripped = 0;
-    let prevRole: string | undefined;
-    let keptReasoningInRun = false;
-
-    for (const message of messages) {
-        const role = message.info.role;
-
-        if (role !== "assistant") {
-            prevRole = role;
-            keptReasoningInRun = false;
-            continue;
+    for (const entry of planMergedAssistantReasoningStrip(
+        messages,
+        options?.mutationExemptMessage,
+    )) {
+        if (options?.frozenMessageIds) {
+            const id = entry.message.info.id;
+            if (typeof id !== "string" || !options.frozenMessageIds.has(id)) continue;
         }
-
-        const firstInRun = prevRole !== "assistant";
-        if (firstInRun) keptReasoningInRun = false;
-
-        if (message === options?.mutationExemptMessage) {
-            prevRole = role;
-            continue;
-        }
-
-        // Determine which reasoning/thinking part (if any) to KEEP for this
-        // run. Only eligible: the first assistant in a run, no reasoning
-        // kept yet, AND the first non-metadata content part is a
-        // reasoning/thinking/redacted_thinking part.
-        //
-        // Sentinels (from stripStructuralNoise and other in-place strips) are
-        // `{type:"text", text:""}` and occupy positions previously held by
-        // structural-noise parts. They are invisible on the wire (OpenCode's
-        // provider transform drops empty text) so the "first non-metadata" rule
-        // must treat them as equivalent to the structural parts they replaced
-        // — otherwise a reasoning part that would have been first-after-strip
-        // is wrongly considered non-first and gets neutralized, stripping the
-        // last thinking from a run that has one eligible to keep.
-        let keepIndex = -1;
-        if (firstInRun && !keptReasoningInRun) {
-            for (let i = 0; i < message.parts.length; i++) {
-                const part = message.parts[i];
-                if (!isRecord(part)) continue;
-                const partType = part.type as string;
-                if (REASONING_IGNORED_PART_TYPES.has(partType)) continue;
-                if (part.ignored === true) continue;
-                // Skip sentinels — see comment above.
-                if (isSentinel(part)) continue;
-                // Whitespace-only text is a sentinel one byte longer: models
-                // emit a leading " " text block before thinking, and treating
-                // it as content makes the keep-rule pass over the thinking
-                // block. The assistant then keeps its reasoning while newest
-                // (mutationExemptMessage) and loses it on the first pass after
-                // it stops being newest — a byte change at a new position every
-                // turn, so the provider cache re-creates everything from that
-                // point on every pass. The exempted newest already ships this
-                // exact shape to Anthropic and is accepted, so keeping the
-                // thinking behind a whitespace text block is provider-safe.
-                if (
-                    partType === "text" &&
-                    typeof part.text === "string" &&
-                    part.text.trim() === ""
-                ) {
-                    continue;
-                }
-                // First non-metadata part found — is it reasoning-like?
-                if (REASONING_PART_TYPES.has(partType)) {
-                    keepIndex = i;
-                }
-                break;
-            }
-        }
-
-        // Forward pass: neutralize all reasoning/thinking/redacted_thinking
-        // parts except the one we decided to keep (if any). Replace in place
-        // with empty-text sentinels so message.parts length stays constant
-        // across passes — preserving cache-prefix stability for proxy
-        // providers that hash the message array. For Anthropic, OpenCode's
-        // provider/transform.ts:65 drops empty text parts before the wire,
-        // so the "thinking-block must be at index 0" rule the AI SDK cares
-        // about is still satisfied (the kept reasoning part is the only
-        // non-empty content at its position, empty sentinels vanish).
-        for (let i = 0; i < message.parts.length; i++) {
-            const part = message.parts[i];
-            if (!isRecord(part)) continue;
-            if (!REASONING_PART_TYPES.has(part.type as string)) continue;
-            if (i === keepIndex) {
-                keptReasoningInRun = true;
-                continue;
-            }
-            message.parts[i] = makeSentinel(part);
+        // Replace in place with empty-text sentinels so message.parts length
+        // stays stable. OpenCode filters these sentinels from Anthropic's wire.
+        for (const index of entry.stripIndices) {
+            entry.message.parts[index] = makeSentinel(entry.message.parts[index]);
             stripped++;
         }
-
-        prevRole = role;
     }
 
     return stripped;
