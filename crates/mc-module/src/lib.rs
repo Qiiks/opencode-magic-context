@@ -142,6 +142,23 @@ pub struct SessionBinding {
     pub history_budget_tokens: f64,
 }
 
+fn apply_claude_code_config_controls(
+    request: &mut TransformRequest,
+    config: &McModuleConfig,
+    serializer_profile: Option<SerializerProfile>,
+) {
+    if serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic) {
+        return;
+    }
+    // Claude Code does not carry these controls in its transform request. Route config is
+    // daemon-owned and frozen at bind, so it is the only authority for this transport leg.
+    request.auto_search_enabled = config.auto_search.enabled;
+    request.auto_search_score_threshold = config.auto_search.score_threshold;
+    request.auto_search_min_prompt_chars = config.auto_search.min_prompt_chars;
+    request.caveman_enabled = config.caveman.enabled;
+    request.caveman_min_chars = config.caveman.min_size;
+}
+
 /// Why a transform request can't be served: the route isn't bound, or the request's
 /// session doesn't match the channel's bound session. Both fail LOUD — never default to
 /// a project (a default would be a cross-project read of another project's store).
@@ -2364,11 +2381,7 @@ impl ProjectionCache {
         self.lru.retain(|candidate| candidate != session_id);
     }
 
-    fn snapshot(
-        &mut self,
-        session_id: &str,
-        revert_epoch: u64,
-    ) -> Option<ProjectionCacheSnapshot> {
+    fn snapshot(&mut self, session_id: &str, revert_epoch: u64) -> Option<ProjectionCacheSnapshot> {
         if self
             .sessions
             .get(session_id)
@@ -2387,12 +2400,7 @@ impl ProjectionCache {
         snapshot
     }
 
-    fn replace(
-        &mut self,
-        session_id: &str,
-        revert_epoch: u64,
-        snapshot: ProjectionCacheSnapshot,
-    ) {
+    fn replace(&mut self, session_id: &str, revert_epoch: u64, snapshot: ProjectionCacheSnapshot) {
         let retained_bytes = snapshot.projection.retained_bytes();
         if retained_bytes == 0
             || retained_bytes > self.max_entry_retained_bytes
@@ -2926,6 +2934,8 @@ impl McHandler {
                 model_chain: vec!["test/model".to_string()],
                 execute_threshold_percentage: 65.0,
                 memory_enabled: true,
+                auto_search: crate::config::AutoSearchConfig::default(),
+                caveman: crate::config::CavemanConfig::default(),
                 auto_promote: true,
                 user_memory_collection_enabled: false,
                 historian_context_limit_tokens: 128_000,
@@ -5088,10 +5098,11 @@ impl McHandler {
     }
 
     fn handle_session_delete_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let (session_id, binding) = match self.management_binding(channel, request, "session.delete") {
-            Ok(scope) => scope,
-            Err(outcome) => return outcome,
-        };
+        let (session_id, binding) =
+            match self.management_binding(channel, request, "session.delete") {
+                Ok(scope) => scope,
+                Err(outcome) => return outcome,
+            };
         let store = match self.store.get() {
             Some(store) => store,
             None => return store_unavailable_error(),
@@ -6874,6 +6885,7 @@ impl McHandler {
                 }
             }
         };
+        apply_claude_code_config_controls(&mut parsed, &binding.config, serializer_profile);
         for (tool_id, description) in &parsed.prompt_surface_tool_descriptions {
             if !prompt_surface::is_known_tool_id(tool_id) {
                 return invalid_params_error(format!(
@@ -11065,9 +11077,7 @@ fn drive_fault() -> Option<DriveFault> {
         // Initialize the remaining fault count alongside the arm selection.
         // This runs exactly once per process (OnceLock), so DRIVE_FAULT_REMAINING
         // is set before any respond_transform call can read it.
-        let count = parse_drive_fault_count(
-            std::env::var("MC_DRIVE_FAULT_COUNT").ok().as_deref(),
-        );
+        let count = parse_drive_fault_count(std::env::var("MC_DRIVE_FAULT_COUNT").ok().as_deref());
         DRIVE_FAULT_REMAINING.store(count, std::sync::atomic::Ordering::Relaxed);
         fault
     })
@@ -11123,9 +11133,9 @@ fn respond_transform(
         // If the count was already 0, checked_sub returns None and we skip — no underflow.
         // If the count was > 0, the previous value is returned as Ok(prev) and we fire.
         use std::sync::atomic::Ordering;
-        match DRIVE_FAULT_REMAINING.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            n.checked_sub(1)
-        }) {
+        match DRIVE_FAULT_REMAINING
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+        {
             Ok(prev) if prev > 0 => apply_drive_fault(&mut response, fault),
             _ => {} // exhausted — response passes through cleanly
         }
@@ -13846,7 +13856,10 @@ mod tests {
             panic!("magic-context must expose a tool provider role");
         };
         assert_eq!(
-            tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "transform",
                 "ctx_reduce",
@@ -14606,12 +14619,64 @@ mod tests {
         (handler, store, dir, project)
     }
 
+    #[test]
+    fn claude_code_config_controls_fill_request_without_changing_default_request_bytes() {
+        let value = json!({
+            "kind": "transform",
+            "v": 2,
+            "serializer_profile": "claude-code-anthropic",
+            "session_id": "config-controls",
+            "render_config": "cfg",
+            "messages": []
+        });
+        let mut default_request: TransformRequest = serde_json::from_value(value.clone()).unwrap();
+        let before = serde_json::to_vec(&default_request).unwrap();
+        apply_claude_code_config_controls(
+            &mut default_request,
+            &McModuleConfig::default(),
+            Some(SerializerProfile::ClaudeCodeAnthropic),
+        );
+        assert_eq!(serde_json::to_vec(&default_request).unwrap(), before);
+
+        let mut configured = McModuleConfig::default();
+        configured.auto_search.enabled = false;
+        configured.auto_search.score_threshold = 0.8;
+        configured.auto_search.min_prompt_chars = 42;
+        configured.caveman.enabled = true;
+        configured.caveman.min_size = 900;
+        apply_claude_code_config_controls(
+            &mut default_request,
+            &configured,
+            Some(SerializerProfile::ClaudeCodeAnthropic),
+        );
+        assert!(!default_request.auto_search_enabled);
+        assert_eq!(default_request.auto_search_score_threshold, 0.8);
+        assert_eq!(default_request.auto_search_min_prompt_chars, 42);
+        assert!(default_request.caveman_enabled);
+        assert_eq!(default_request.caveman_min_chars, 900);
+
+        let mut open_code_request: TransformRequest = serde_json::from_value(value).unwrap();
+        open_code_request.serializer_profile = "opencode-aisdk".to_string();
+        let unchanged = open_code_request.clone();
+        apply_claude_code_config_controls(
+            &mut open_code_request,
+            &configured,
+            Some(SerializerProfile::OpencodeAiSdk),
+        );
+        assert_eq!(
+            serde_json::to_vec(&open_code_request).unwrap(),
+            serde_json::to_vec(&unchanged).unwrap()
+        );
+    }
+
     fn default_test_config() -> McModuleConfig {
         McModuleConfig {
             cache_ttl_by_model: std::collections::BTreeMap::new(),
             model_chain: vec!["test/model".to_string()],
             execute_threshold_percentage: 65.0,
             memory_enabled: true,
+            auto_search: crate::config::AutoSearchConfig::default(),
+            caveman: crate::config::CavemanConfig::default(),
             auto_promote: true,
             user_memory_collection_enabled: false,
             historian_context_limit_tokens: 128_000,
@@ -15840,9 +15905,7 @@ mod tests {
         );
         let first_ms = first_started_at.elapsed().as_secs_f64() * 1000.0;
         let retained = projection.retained_bytes();
-        eprintln!(
-            "astro-projection-cache retained_bytes={retained} first_ms={first_ms:.1}"
-        );
+        eprintln!("astro-projection-cache retained_bytes={retained} first_ms={first_ms:.1}");
         assert!(
             retained <= PROJECTION_CACHE_ENTRY_BUDGET_BYTES,
             "ASTRO projection must fit the dedicated cache: retained={retained} cap={PROJECTION_CACHE_ENTRY_BUDGET_BYTES}"
@@ -15982,7 +16045,10 @@ mod tests {
             2,
             ProjectionCacheKeyMode::Normal,
         );
-        assert!(hit.is_some(), "transition salt is not a projection invalidator");
+        assert!(
+            hit.is_some(),
+            "transition salt is not a projection invalidator"
+        );
     }
 
     #[test]
@@ -16691,7 +16757,10 @@ mod tests {
             .lock()
             .expect("native attachment cache mutex")
             .retained_bytes;
-        assert!(native_charge > 0, "native attach still charges its own bytes");
+        assert!(
+            native_charge > 0,
+            "native attach still charges its own bytes"
+        );
 
         let mut projections = ProjectionCache::new(1024 * 1024);
         projections.replace(
@@ -22043,7 +22112,6 @@ mod tests {
         assert!(m0_text(&second).contains("autonomous summary"));
     }
 
-
     /// Imported compartments whose anchor mids never appear in the live array
     /// must refuse at the bootstrap fold: the minted boundary has to name a real
     /// live block. Pins the anchor-acceptance rule that seeded/imported sessions
@@ -22142,7 +22210,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn state_import_synthetic_anchors_refuse_at_bootstrap_fold() {
         let producer = Arc::new(ProducerState::default());
-        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
         let imported = call_dispatch_request(
             &handler,
             state_import_request(
