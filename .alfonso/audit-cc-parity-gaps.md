@@ -196,17 +196,9 @@ Original reclassification entry follows.
 - **Source:** profile coverage at `crates/mc-module/src/healing.rs:98-117`; residual table at `crates/mc-module/src/healing.rs:144-157`; application at `crates/mc-module/src/transform.rs:9040-9065`.
 - **Classification:** incidental as model-visible behavior — a CC gateway can deliberately apply the same merge/residual policy even though its native serializer does not require it.
 
-## I-23 — Known cache-anchor count differs
+## I-23 — Known cache-anchor count differs — **CLOSED (2026-08-14, ck-thalamus 20663c1 deployed)**
 
-- **OpenCode:** places provider cache anchors on both synthetic head messages, m0 and m1.
-- **Claude Code:** the gateway places one anchor.
-- **Source seam:** the module constructs both independent synthetic heads at `crates/mc-module/src/transform.rs:9212-9254`; cache-marker ownership is outside this repository.
-- **Classification:** incidental — nothing prevents marking the second head.
-- **Evidence status:** **inferred from the task's stated known example, not independently readable in this worktree.**
-
-# STRUCTURAL DIFFERENCES
-
-These cannot use the same implementation mechanism because the host/harness surface is different. Matching behavior requires a different integration.
+> Both synthetic heads now anchored on the CC leg, matching OpenCode's placement: wire-verified 4/4 provider breakpoints (guidance on last system block, m0, m1, newest tail). The freed slot came from consolidating Claude Code's two byte-identical system markers onto the last block (prefix-match covers everything before it) — no fifth marker, the provider's cap holds. The m1 delta anchor is withheld unless m0 is anchored beside it (an anchor is only reachable when everything ahead matched). Residual watch: first real OAuth session post-deploy exercises the anti-spoofing surface (Thalamus reports either way; rollback is one bounce).
 
 ## S-01 — Claude Code has no in-repo encode/decode codec
 
