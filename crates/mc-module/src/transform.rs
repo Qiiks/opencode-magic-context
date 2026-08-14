@@ -5292,11 +5292,14 @@ fn m0_mural_input(
     req: &TransformRequest,
     serializer_profile: Option<SerializerProfile>,
 ) -> Option<&crate::m0_compose::M0MuralInput> {
-    // Thalamus image-block support is not yet defined, so Claude Code must not build a mural.
-    // OpenCode owns capability resolution and sends only its already-gated data URL.
-    (serializer_profile == Some(SerializerProfile::OpencodeAiSdk))
-        .then_some(req.mural.as_ref())
-        .flatten()
+    // OpenCode supplies an already capability-gated mural. Claude Code receives the same input
+    // only after the bound route resolves the project artifact persisted from that OC supply.
+    matches!(
+        serializer_profile,
+        Some(SerializerProfile::OpencodeAiSdk | SerializerProfile::ClaudeCodeAnthropic)
+    )
+    .then_some(req.mural.as_ref())
+    .flatten()
 }
 
 fn prompt_surface_selection(req: &TransformRequest) -> PromptSurfaceSelection {

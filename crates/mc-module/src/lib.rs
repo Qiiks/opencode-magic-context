@@ -166,6 +166,44 @@ fn apply_claude_code_config_controls(
     }
 }
 
+/// Normalize the OC host's already-rendered mural to the exact m0 input contract.
+fn host_mural_artifact(input: Option<&m0_compose::M0MuralInput>) -> Option<(String, String)> {
+    let input = input?;
+    if !input.enabled || !input.supports_vision {
+        return None;
+    }
+    let data_url = input
+        .data_url
+        .as_deref()
+        .filter(|value| !value.is_empty())?;
+    let content_hash = input
+        .content_hash
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{:x}", Sha256::digest(data_url.as_bytes())));
+    Some((data_url.to_string(), content_hash))
+}
+
+/// Rehydrate the input accepted by the shared m0 composer from one project artifact.
+fn cc_mural_input(
+    store: &McStore,
+    project_path: &str,
+) -> Result<Option<m0_compose::M0MuralInput>, McStoreError> {
+    let Some(artifact) = store.load_project_mural_artifact(project_path)? else {
+        return Ok(None);
+    };
+    let Ok(data_url) = String::from_utf8(artifact.data_url) else {
+        return Ok(None);
+    };
+    Ok((!data_url.is_empty()).then_some(m0_compose::M0MuralInput {
+        enabled: true,
+        supports_vision: true,
+        data_url: Some(data_url),
+        content_hash: Some(artifact.content_hash),
+    }))
+}
+
 /// Why a transform request can't be served: the route isn't bound, or the request's
 /// session doesn't match the channel's bound session. Both fail LOUD — never default to
 /// a project (a default would be a cross-project read of another project's store).
@@ -7258,11 +7296,6 @@ impl McHandler {
         } else {
             None
         };
-        let parsed = Arc::new(parsed);
-        let projection_cache_input = native_delta_frontier
-            .as_ref()
-            .and_then(|frontier| frontier.projection_cache.clone())
-            .or_else(|| self.lookup_full_projection_cache(&parsed));
         if !from_page_apply && self.transform_page_in_progress(&binding.session) {
             return HandlerOutcome::Error {
                 code: "authority_transform_page_in_progress".to_string(),
@@ -7304,6 +7337,45 @@ impl McHandler {
                 }
             };
         let pass_now = now_ms();
+        match serializer_profile {
+            Some(SerializerProfile::OpencodeAiSdk) => {
+                if let Some((data_url, content_hash)) = host_mural_artifact(parsed.mural.as_ref()) {
+                    if let Err(error) = store.upsert_project_mural_artifact(
+                        &project_path,
+                        data_url.as_bytes(),
+                        &content_hash,
+                        pass_now,
+                    ) {
+                        return HandlerOutcome::Error {
+                            code: "mural_artifact_store_failed".to_string(),
+                            message: error.to_string(),
+                        };
+                    }
+                }
+            }
+            Some(SerializerProfile::ClaudeCodeAnthropic) => {
+                match cc_mural_input(&store, &project_path) {
+                    Ok(mural) => {
+                        // The mural renderer is host-side by design. CC inherits the last OC artifact
+                        // for this project and never renders or trusts a request-supplied mural itself.
+                        // A CC-only project has no artifact, so it correctly composes without a mural.
+                        parsed.mural = mural;
+                    }
+                    Err(error) => {
+                        return HandlerOutcome::Error {
+                            code: "mural_artifact_store_failed".to_string(),
+                            message: error.to_string(),
+                        };
+                    }
+                }
+            }
+            _ => {}
+        }
+        let parsed = Arc::new(parsed);
+        let projection_cache_input = native_delta_frontier
+            .as_ref()
+            .and_then(|frontier| frontier.projection_cache.clone())
+            .or_else(|| self.lookup_full_projection_cache(&parsed));
         // A previous publish may have committed while one independent side channel failed.
         // Retry on normal traffic rather than creating another background timer.
         let _ = store.drain_historian_side_channels(
@@ -15524,6 +15596,88 @@ mod tests {
 
     async fn call_transform(handler: &McHandler, messages: Vec<CkIngressMessage>) -> Value {
         call_transform_request(handler, request(messages)).await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cc_inherits_oc_project_mural_on_a_natural_hard_without_defer_first_apply() {
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        handler.bind_route(8, binding(project.to_str().unwrap(), "cc-mural"));
+        let messages = vec![ck("tail", 1, "raw")];
+        let mural_a = json!({
+            "enabled": true,
+            "supports_vision": true,
+            "data_url": "data:image/png;base64,YQ==",
+            "content_hash": "mural-a",
+        });
+        let mural_b = json!({
+            "enabled": true,
+            "supports_vision": true,
+            "data_url": "data:image/png;base64,Yg==",
+            "content_hash": "mural-b",
+        });
+
+        let mut oc_request = request(messages.clone());
+        oc_request["serializer_profile"] = json!("opencode-aisdk");
+        oc_request["mural"] = mural_a;
+        let oc_first = call_transform_request_on_channel(&handler, 7, oc_request.clone()).await;
+        assert_eq!(oc_first["action"], "HARD", "{oc_first}");
+        assert_eq!(
+            store
+                .load_project_mural_artifact(project.to_str().unwrap())
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            "mural-a"
+        );
+
+        let mut cc_request = request(messages);
+        cc_request["serializer_profile"] = json!("claude-code-anthropic");
+        cc_request["session_id"] = json!("cc-mural");
+        let cc_first = call_transform_request_on_channel(&handler, 8, cc_request.clone()).await;
+        assert_eq!(cc_first["action"], "HARD", "{cc_first}");
+        assert_eq!(
+            serde_json::to_vec(&oc_first["ck_messages"][0]).unwrap(),
+            serde_json::to_vec(&cc_first["ck_messages"][0]).unwrap(),
+            "the same project artifact must compose the same frozen m0 bytes for OC and CC"
+        );
+
+        oc_request["mural"] = mural_b;
+        let oc_deferred = call_transform_request_on_channel(&handler, 7, oc_request).await;
+        assert_eq!(oc_deferred["action"], "SOFT+", "{oc_deferred}");
+        assert_eq!(
+            store
+                .load_project_mural_artifact(project.to_str().unwrap())
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            "mural-b"
+        );
+
+        let cc_deferred = call_transform_request_on_channel(&handler, 8, cc_request.clone()).await;
+        assert_eq!(cc_deferred["action"], "SOFT+", "{cc_deferred}");
+        assert_eq!(
+            serde_json::to_vec(&cc_deferred["ck_messages"]).unwrap(),
+            serde_json::to_vec(&cc_first["ck_messages"]).unwrap(),
+            "a newly inherited artifact must wait for CC's next natural HARD"
+        );
+
+        cc_request["render_config"] = json!("cfg1");
+        let cc_refolded = call_transform_request_on_channel(&handler, 8, cc_request).await;
+        assert_eq!(cc_refolded["action"], "HARD", "{cc_refolded}");
+        assert_eq!(
+            cc_refolded["ck_messages"][0]["content"][1]["kind"]["source"]["url"],
+            "data:image/png;base64,Yg=="
+        );
+        assert!(
+            store
+                .load("cc-mural")
+                .unwrap()
+                .meta
+                .last_render_config
+                .contains("mural-b"),
+            "the inherited content identity must ride the HARD render fold"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
