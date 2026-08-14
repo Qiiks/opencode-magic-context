@@ -252,6 +252,14 @@ export class SubcModuleTransport {
         deadlineMs: number,
         detail: string,
     ): Promise<T> {
+        // The race can abandon `operation` (deadline fires first, or the caller's
+        // catch invalidates the connection). A later rejection of the abandoned
+        // promise — close() failing every pending request with "client closed" —
+        // would then be UNHANDLED and Bun prints a crash-shaped stack to the
+        // host's stderr. Subscribe a no-op handler up front: the race still
+        // receives the original settlement, and a post-race rejection is
+        // delivered here instead of the process-level unhandled hook.
+        operation.catch(() => {});
         const remainingMs = deadlineMs - Date.now();
         if (remainingMs <= 0) throw this.deadlineError(detail);
         let timer: ReturnType<typeof setTimeout> | undefined;

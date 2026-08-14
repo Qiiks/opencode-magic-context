@@ -975,3 +975,35 @@ describe("SubcModuleTransport", () => {
         expect(internals.routes.get(routeKey)).toEqual({ route: newRoute, generation: 1 });
     });
 });
+
+describe("beforeDeadline orphan safety", () => {
+    it("a request rejecting after the deadline lost the race never raises an unhandled rejection", async () => {
+        const transport = new SubcModuleTransport("/nonexistent-connection-file");
+        const unhandled: unknown[] = [];
+        const onUnhandled = (error: unknown) => {
+            unhandled.push(error);
+        };
+        process.on("unhandledRejection", onUnhandled);
+        try {
+            let rejectLater: ((error: Error) => void) | undefined;
+            const operation = new Promise<never>((_resolve, reject) => {
+                rejectLater = reject;
+            });
+            const beforeDeadline = (
+                transport as unknown as {
+                    beforeDeadline(op: Promise<never>, deadline: number, detail: string): Promise<never>;
+                }
+            ).beforeDeadline.bind(transport);
+            // Deadline already passed relative to the operation: the race loses immediately.
+            await expect(beforeDeadline(operation, Date.now() + 5, "test")).rejects.toThrow();
+            // The abandoned operation now rejects — exactly what close() does to
+            // every pending request when a connection is invalidated.
+            rejectLater?.(new Error("client closed"));
+            // Give the runtime a macrotask to surface an unhandled rejection if any.
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            expect(unhandled).toHaveLength(0);
+        } finally {
+            process.off("unhandledRejection", onUnhandled);
+        }
+    });
+});
