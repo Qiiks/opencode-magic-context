@@ -11355,6 +11355,7 @@ fn replay_dream_task_response(response_json: &str) -> HandlerOutcome {
 enum DriveFault {
     FingerprintSkew,
     OmitCkMessages,
+    Channel2Arm,
 }
 
 /// Map the raw MC_DRIVE_FAULT value to a fault arm. Pure (no env access) so the
@@ -11366,6 +11367,7 @@ fn parse_drive_fault(raw: Option<&str>) -> Option<DriveFault> {
     match raw {
         Some("fingerprint_skew") => Some(DriveFault::FingerprintSkew),
         Some("omit_ck_messages") => Some(DriveFault::OmitCkMessages),
+        Some("channel2_arm") => Some(DriveFault::Channel2Arm),
         _ => None,
     }
 }
@@ -11435,6 +11437,24 @@ fn apply_drive_fault(response: &mut transform::TransformResponse, fault: DriveFa
             response.ck_messages = None;
             eprintln!(
                 "mc-module: WARN MC_DRIVE_FAULT=omit_ck_messages active — response deliberately corrupted for drive"
+            );
+        }
+        DriveFault::Channel2Arm => {
+            // Force a channel-2 directive onto the response regardless of pressure so
+            // the DELIVERY contract (same-pass append → echo → delivered-mark →
+            // frozen re-serve on a refused pass) can be driven end-to-end without
+            // faking a large reclaimable tail. The pressure math upstream is covered
+            // by unit tests; a drive container cannot honestly reach the condition
+            // (its harness compacts real tail bytes away faster than a drive
+            // accumulates them), so earning the directive there would require a
+            // conversation shape no real session has.
+            response.channel2_directive = Some(transform::Channel2Directive {
+                text: "Context pressure is high. Review older tool outputs and reduce what you no longer need.".to_string(),
+                directive_id: "drive-fault-channel2".to_string(),
+                armed_at_ms: 0,
+            });
+            eprintln!(
+                "mc-module: WARN MC_DRIVE_FAULT=channel2_arm active — directive force-armed for drive"
             );
         }
     }
