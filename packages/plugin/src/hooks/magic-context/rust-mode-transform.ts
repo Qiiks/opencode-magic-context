@@ -583,8 +583,25 @@ function assertNativeBoundary(output: unknown[], sessionId: string, boundaryId: 
     const synthetic =
         parts.length > 0 && parts.every((part) => isRecord(part) && part.synthetic === true);
     if (info.role === "user" && info.sessionID === sessionId && synthetic) return;
+    // The failure arm names WHICH clause failed and what the head actually was:
+    // without it, every violation reads identically and the defect is
+    // undiagnosable from logs alone (a live incident required a binary
+    // bisect that a single log line would have answered).
+    const headSummary = output.slice(0, 3).map((message) => {
+        const mi = messageInfo(message);
+        const mParts = isRecord(message) && Array.isArray(message.parts) ? message.parts : [];
+        const partDesc = mParts
+            .slice(0, 5)
+            .map((part) =>
+                isRecord(part)
+                    ? `${String(part.type)}${part.synthetic === true ? "" : "!"}`
+                    : "?",
+            )
+            .join(",");
+        return `role=${String(mi.role)} sid=${mi.sessionID === sessionId ? "ok" : String(mi.sessionID ?? "absent")} id=${String(mi.id ?? "-").slice(0, 24)} parts=[${partDesc}]`;
+    });
     throw new Error(
-        `rust transform wire invariant failed: boundary=${boundaryId} expected a synthetic m0 user message scoped to session ${sessionId}`,
+        `rust transform wire invariant failed: boundary=${boundaryId} expected a synthetic m0 user message scoped to session ${sessionId}; head: ${headSummary.join(" | ")}`,
     );
 }
 
