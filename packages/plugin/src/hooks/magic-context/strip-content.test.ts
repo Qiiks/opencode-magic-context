@@ -660,6 +660,57 @@ describe("strip-content", () => {
     });
 
     describe("stripReasoningFromMergedAssistants (sentinel-based groupIntoBlocks workaround)", () => {
+        describe("#given a leading whitespace-only text block before the reasoning", () => {
+            it("#then keeps the reasoning — whitespace text is sentinel-invisible to the keep-rule", () => {
+                // Regression shape: the model emits [" ", thinking, tool_use, " "].
+                // Treating the leading " " as content made the keep-rule skip the
+                // thinking block, so the assistant kept reasoning while newest
+                // (exempt) and lost it on the first pass after — a byte change at
+                // a new position every turn, re-creating the provider cache from
+                // that point on every pass.
+                const u = message("m-u", "user", [{ type: "text", text: "hi" }]);
+                const a1 = message("m-a", "assistant", [
+                    { type: "text", text: " " },
+                    { type: "reasoning", text: "thinking body" },
+                    { type: "tool", callID: "c1", tool: "bash", state: { status: "completed" } },
+                    { type: "text", text: " " },
+                ]);
+                const u2 = message("m-u2", "user", [{ type: "text", text: "next" }]);
+                const newest = message("m-a2", "assistant", [
+                    { type: "text", text: " " },
+                    { type: "reasoning", text: "newer thinking" },
+                    { type: "tool", callID: "c2", tool: "bash", state: { status: "completed" } },
+                ]);
+
+                // Not exempt: a1 is no longer the newest assistant — the exact
+                // transition that previously stripped it.
+                const stripped = stripReasoningFromMergedAssistants(
+                    [u, a1, u2, newest],
+                    "anthropic",
+                    {
+                        mutationExemptMessage: newest,
+                    },
+                );
+
+                expect(stripped).toBe(0);
+                expect(a1.parts[1]).toMatchObject({ type: "reasoning", text: "thinking body" });
+            });
+
+            it("#then still strips reasoning behind REAL leading text (merge rule intact)", () => {
+                const u = message("m-u", "user", [{ type: "text", text: "hi" }]);
+                const a1 = message("m-a", "assistant", [
+                    { type: "text", text: "real prose first" },
+                    { type: "reasoning", text: "thinking body" },
+                ]);
+                const a2 = message("m-a2", "assistant", [{ type: "text", text: "second in run" }]);
+
+                const stripped = stripReasoningFromMergedAssistants([u, a1, a2], "anthropic");
+
+                expect(stripped).toBe(1);
+                expect(a1.parts[1]).toMatchObject({ type: "text", text: "" });
+            });
+        });
+
         describe("#given a single assistant with reasoning", () => {
             it("#then leaves it untouched (no merge risk — standalone assistant)", () => {
                 const u = message("m-u", "user", [{ type: "text", text: "hi" }]);

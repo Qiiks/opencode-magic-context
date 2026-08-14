@@ -553,6 +553,23 @@ export function stripReasoningFromMergedAssistants(
                 if (part.ignored === true) continue;
                 // Skip sentinels — see comment above.
                 if (isSentinel(part)) continue;
+                // Whitespace-only text is a sentinel one byte longer: models
+                // emit a leading " " text block before thinking, and treating
+                // it as content makes the keep-rule pass over the thinking
+                // block. The assistant then keeps its reasoning while newest
+                // (mutationExemptMessage) and loses it on the first pass after
+                // it stops being newest — a byte change at a new position every
+                // turn, so the provider cache re-creates everything from that
+                // point on every pass. The exempted newest already ships this
+                // exact shape to Anthropic and is accepted, so keeping the
+                // thinking behind a whitespace text block is provider-safe.
+                if (
+                    partType === "text" &&
+                    typeof part.text === "string" &&
+                    part.text.trim() === ""
+                ) {
+                    continue;
+                }
                 // First non-metadata part found — is it reasoning-like?
                 if (REASONING_PART_TYPES.has(partType)) {
                     keepIndex = i;
