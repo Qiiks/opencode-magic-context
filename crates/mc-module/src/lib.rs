@@ -473,11 +473,6 @@ const DEFAULT_HISTORIAN_CHUNK_TOKENS: usize = 32_000;
 /// TypeScript evaluates every nonempty eligible chunk after trigger checks. Rust keeps
 /// this minimum at zero so it does not impose an additional minimum-token requirement.
 const DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS: usize = 0;
-/// Thalamus clamps the prompt argument to the same range before forwarding it.
-/// Changing either bound requires a coordinated module and Thalamus update so a
-/// retried prompt resolves to the same keep watermark on both sides.
-const WRAPUP_KEEP_MIN: usize = 5;
-const WRAPUP_KEEP_MAX: usize = 100;
 /// Maximum number of newly published compartments returned by one status page.
 const SESSION_STATUS_COMPARTMENT_PAGE_LIMIT: usize = 50;
 /// After a historian abandon, suppress refires for this long so a persistently
@@ -5959,12 +5954,14 @@ impl McHandler {
         }
         let keep = match request.get("keep") {
             None => 20,
-            // Any signed integer clamps into [WRAPUP_KEEP_MIN, WRAPUP_KEEP_MAX]; a negative
-            // keep is a clamp input, not an error, matching the boundary-side contract.
+            // The requested keep watermark is honored as given: it counts raw messages of
+            // every role, matching the TypeScript orchestrator, which accepts any positive
+            // integer and applies only a floor of 1 (the boundary resolver enforces that
+            // floor). A negative or zero keep therefore floors to 1 rather than erroring,
+            // and no upper clamp exists — a caller asking to keep more than the live tail
+            // simply gets a nothing-to-compact outcome.
             Some(value) => match value.as_i64() {
-                Some(value) => usize::try_from(value.max(0))
-                    .unwrap_or(usize::MAX)
-                    .clamp(WRAPUP_KEEP_MIN, WRAPUP_KEEP_MAX),
+                Some(value) => usize::try_from(value.max(0)).unwrap_or(usize::MAX),
                 None => {
                     return HandlerOutcome::Error {
                         code: "bad_request".to_string(),
@@ -6068,7 +6065,21 @@ impl McHandler {
             .iter()
             .map(|compartment| compartment.end_message as u64)
             .max();
-        let plan = boundary::resolve_wrapup_boundary(&boundary_messages, initial_end, keep);
+        // The wrapup boundary snaps against the session's real geometry, resolved with
+        // the same usage -> soft-geometry -> fallback order and host-threshold preference
+        // as the historian trigger, so the user-boundary snap window matches the
+        // TypeScript wrapup resolver instead of a synthetic constant.
+        let wrapup_cfg = self.effective_config(&binding.project_root);
+        let (wrapup_context_limit, _, _) =
+            usage_numbers(parsed.usage.as_ref(), parsed.geometry.as_ref());
+        let wrapup_threshold = parsed.execute_threshold_or(wrapup_cfg.execute_threshold_percentage);
+        let plan = boundary::resolve_wrapup_boundary(
+            &boundary_messages,
+            initial_end,
+            keep,
+            wrapup_context_limit,
+            wrapup_threshold,
+        );
         let target = plan.target_protected_start_ordinal;
         match self.wrapup_snapshot_is_current(
             &store,
@@ -6119,7 +6130,10 @@ impl McHandler {
         // This observation is local to the current runner loop execution. A runner that is
         // still starting gets one bounded chance before a repeated route absence becomes terminal.
         let mut unknown_module_observed_at = None;
-        while rounds < historian::MAX_WRAPUP_ROUNDS {
+        // No round-count cap: the drain loops until the keep watermark is reached or a
+        // stop condition trips. The request budget is the ceiling — every round re-checks
+        // the deadline before driving, matching the TypeScript drain-until-target loop.
+        loop {
             if Self::remaining_wrapup_budget(deadline).is_none() {
                 failure = Some((
                     RetryableWrapupReason::BudgetExhausted,
@@ -6343,7 +6357,15 @@ impl McHandler {
         let compartments_created = final_compartments
             .len()
             .saturating_sub(initial_compartments.len());
-        let remaining = wrapup_has_remaining_messages(&parsed.messages, final_end, target);
+        // The drain loop only exits without a failure after the no-remaining-messages
+        // check, and compartments never shrink, so a failure-free exit has reached the
+        // keep watermark. Assert the invariant instead of carrying a round-cap fallback;
+        // failure exits legitimately stop short of the watermark.
+        debug_assert!(
+            failure.is_some()
+                || terminal_failure.is_some()
+                || !wrapup_has_remaining_messages(&parsed.messages, final_end, target)
+        );
         if let Some((reason, detail)) = terminal_failure {
             return self.terminal_wrapup_response(
                 &store,
@@ -6362,15 +6384,6 @@ impl McHandler {
                     include_rounds_without_command: true,
                 },
             );
-        }
-        if failure.is_none() && remaining {
-            failure = Some((
-                RetryableWrapupReason::SnapshotUnavailable,
-                format!(
-                    "stopped at the {}-round cap before the keep watermark",
-                    historian::MAX_WRAPUP_ROUNDS
-                ),
-            ));
         }
         let effect = "takes effect on your next message";
         match failure {
@@ -23281,12 +23294,34 @@ mod tests {
         cache_wrapup_messages_for_session(handler, "ses", messages);
     }
 
+    fn cache_wrapup_messages_with_limit(
+        handler: &McHandler,
+        messages: Vec<CkIngressMessage>,
+        context_limit_tokens: u64,
+    ) {
+        cache_wrapup_messages_for_session_with_limit(
+            handler,
+            "ses",
+            messages,
+            context_limit_tokens,
+        );
+    }
+
     fn cache_wrapup_messages_for_session(
         handler: &McHandler,
         session_id: &str,
         messages: Vec<CkIngressMessage>,
     ) {
-        let mut parsed = transform_request(messages, 1, 200_000);
+        cache_wrapup_messages_for_session_with_limit(handler, session_id, messages, 200_000);
+    }
+
+    fn cache_wrapup_messages_for_session_with_limit(
+        handler: &McHandler,
+        session_id: &str,
+        messages: Vec<CkIngressMessage>,
+        context_limit_tokens: u64,
+    ) {
+        let mut parsed = transform_request(messages, 1, context_limit_tokens);
         parsed.session_id = session_id.to_string();
         parsed.serializer_profile = SerializerProfile::ClaudeCodeAnthropic.wire_id().to_string();
         let retained_bytes = serde_json::to_vec(&parsed).unwrap().len();
@@ -25022,7 +25057,10 @@ mod tests {
             .unwrap()
             .contains("takes effect on your next message"));
         let starts = producer.starts.load(Ordering::SeqCst);
-        assert!((2..=historian::MAX_WRAPUP_ROUNDS).contains(&starts));
+        assert!(
+            starts >= 2,
+            "the drain needs as many rounds as the backlog requires: {starts}"
+        );
         let final_end = store
             .load_compartments("ses")
             .unwrap()
@@ -25047,6 +25085,156 @@ mod tests {
             .unwrap()
             .contains("nothing to compact"));
         assert_eq!(producer.starts.load(Ordering::SeqCst), starts);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_drains_beyond_five_rounds_to_the_keep_watermark() {
+        // The drain is bounded by the request budget, not a round-count cap: this
+        // backlog needs more producer rounds than the historical five-round limit,
+        // and one session.wrapup call must still reach the keep watermark.
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(320, 800));
+
+        let body = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
+                )
+                .await,
+        );
+
+        assert_eq!(body["ok"], json!(true), "{body}");
+        assert_eq!(body["disposition"], json!("completed"), "{body}");
+        let starts = producer.starts.load(Ordering::SeqCst);
+        assert!(
+            starts >= 6,
+            "the backlog requires more than five producer rounds: {starts}"
+        );
+        let final_end = store
+            .load_compartments("ses")
+            .unwrap()
+            .iter()
+            .map(|compartment| compartment.end_message)
+            .max()
+            .unwrap();
+        assert_eq!(final_end, 300, "the drain must reach the keep watermark");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_honors_requested_keep_watermark_without_clamping() {
+        // keep=1 is honored as given (floored only to the boundary's one-message
+        // minimum): the drain compacts everything except the protected tail. The
+        // user-boundary snap then retains the final user message as well, leaving
+        // exactly the last two messages (79..=80) unwrapped. A clamping module
+        // would stop earlier.
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+
+        let body = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": 1
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(body["ok"], json!(true), "{body}");
+        assert_eq!(body["disposition"], json!("completed"), "{body}");
+        let final_end = store
+            .load_compartments("ses")
+            .unwrap()
+            .iter()
+            .map(|compartment| compartment.end_message)
+            .max()
+            .unwrap();
+        assert_eq!(final_end, 78, "keep=1 must keep a one-message tail: {body}");
+
+        // keep=250 exceeds the live tail and must be honored unchanged: nothing is
+        // compacted. A module clamping keep to 100 would instead compact 50 messages.
+        let producer_large = Arc::new(ProducerState::default());
+        let (handler_large, _store_large, _dir_large, _project_large) =
+            handler_with_store(Arc::clone(&producer_large), default_test_config());
+        cache_wrapup_messages(&handler_large, wrapup_messages(150, 40));
+        let large = tool_body(
+            handler_large
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": 250
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(large["disposition"], json!("nothing_to_compact"), "{large}");
+        assert!(
+            large["summary"]
+                .as_str()
+                .unwrap()
+                .contains("keep watermark of 250"),
+            "{large}"
+        );
+        assert_eq!(producer_large.starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_user_snap_uses_session_geometry() {
+        // A meaningful user message sits about 10k tokens before the raw keep
+        // candidate. With the session's 1M-context geometry the derived trigger
+        // budget is about 32.5k, so the snap window reaches the user message and
+        // retains it; the legacy hard-coded 128k/65 budget floors at 5k and would
+        // keep the later candidate instead.
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let messages = vec![
+            ck_with_role("m1", 1, "user", "start the session"),
+            ck_with_role("m2", 2, "assistant", &"preamble filler ".repeat(4_000)),
+            ck_with_role("m3", 3, "user", "now the real request"),
+            ck_with_role("m4", 4, "assistant", &"followup filler ".repeat(2_500)),
+            ck_with_role("m5", 5, "assistant", "interim note"),
+            ck_with_role("m6", 6, "user", "latest prompt"),
+        ];
+        cache_wrapup_messages_with_limit(&handler, messages, 1_000_000);
+
+        let body = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "keep": 2
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(body["ok"], json!(true), "{body}");
+        assert_eq!(body["disposition"], json!("completed"), "{body}");
+        let final_end = store
+            .load_compartments("ses")
+            .unwrap()
+            .iter()
+            .map(|compartment| compartment.end_message)
+            .max()
+            .unwrap();
+        assert_eq!(
+            final_end, 2,
+            "the geometry-sized snap must retain the user message at ordinal 3: {body}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -25114,7 +25302,11 @@ mod tests {
             other => panic!("empty command_id must reject, got {other:?}"),
         }
 
-        // Negative keep is a clamp input, not an error: [WRAPUP_KEEP_MIN, WRAPUP_KEEP_MAX].
+        // Negative keep is not an error: it floors to the one-message watermark the
+        // TypeScript orchestrator applies (Math.max(1, ...)), so the drain compacts
+        // everything except the protected tail. With uniform text messages the
+        // user-boundary snap retains the final user message too, leaving exactly the
+        // last two messages (79..=80) unwrapped.
         let negative_keep = tool_body(
             handler
                 .dispatch_value(
@@ -25130,8 +25322,6 @@ mod tests {
         );
         assert_eq!(negative_keep["ok"], json!(true), "{negative_keep}");
         assert_eq!(negative_keep["disposition"], json!("completed"));
-        // keep=-3 clamps to WRAPUP_KEEP_MIN=5: coverage must reach past keep=20's
-        // watermark (60), proving the clamp floor was used, not the default or a reject.
         let final_end = _store
             .load_compartments("ses")
             .unwrap()
@@ -25139,9 +25329,9 @@ mod tests {
             .map(|compartment| compartment.end_message)
             .max()
             .unwrap();
-        assert!(
-            final_end > 60,
-            "keep must clamp to MIN=5, got end {final_end}"
+        assert_eq!(
+            final_end, 78,
+            "keep must floor to 1 (not clamp to a larger minimum), got end {final_end}"
         );
     }
 
@@ -25884,7 +26074,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn session_wrapup_stops_at_the_five_round_cap() {
+    async fn session_wrapup_drains_huge_chunks_past_the_old_round_cap() {
+        // Each message is one historian chunk, so this backlog needs ten producer
+        // rounds. The drain is bounded by the request budget rather than the
+        // historical five-round cap, so one call must compact all ten messages and
+        // reach the keep watermark instead of stopping halfway.
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
@@ -25899,15 +26093,10 @@ mod tests {
                 .await,
         );
 
-        assert_eq!(body["ok"], json!(false), "{body}");
-        assert_eq!(body["disposition"], json!("retryable"));
-        assert_eq!(body["reason"], json!("snapshot_unavailable"));
-        assert!(body["summary"]
-            .as_str()
-            .unwrap()
-            .contains("stopped at the 5-round cap"));
-        assert_eq!(producer.starts.load(Ordering::SeqCst), 5);
-        assert_eq!(store.load_compartments("ses").unwrap().len(), 5);
+        assert_eq!(body["ok"], json!(true), "{body}");
+        assert_eq!(body["disposition"], json!("completed"), "{body}");
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 10);
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 10);
     }
 
     #[tokio::test(flavor = "current_thread")]
