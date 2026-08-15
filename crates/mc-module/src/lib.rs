@@ -2286,54 +2286,111 @@ struct NativeAttachmentCacheStats {
 struct NativeAttachmentCacheSnapshot {
     context: NativeAttachmentContext,
     full_array_fingerprint: Option<String>,
+    // Message order and message ID (`mid`) pins identify a delta;
+    // `sidecar.messages` holds optional raw trees.
     sidecar: Arc<codec::DecodeSidecar>,
     message_keys: Vec<[u8; 32]>,
+    // Hashes let a retained prefix keep its cache keys after the corresponding raw tree is dropped.
     sidecar_hashes: HashMap<String, [u8; 32]>,
+    // Sizes exist only for raw trees still present in `sidecar.messages`.
     sidecar_sizes: HashMap<String, usize>,
     chunks: Vec<NativeEncodedChunk>,
+    reattachable_native_prefix: usize,
 }
 
 impl NativeAttachmentCacheSnapshot {
     fn retained_bytes(&self, served_bytes: usize) -> usize {
+        use crate::retained_size::{
+            btree_map_allocation_bytes, cloned_string_retained_bytes, hash_map_allocation_bytes,
+            ARC_ALLOCATION_OVERHEAD_BYTES,
+        };
+        use std::mem::size_of;
+
         let encoded_bytes = self
             .chunks
-            .iter()
-            .map(|chunk| chunk.retained_bytes)
-            .sum::<usize>();
-        let sidecar_structure_bytes = std::mem::size_of::<codec::DecodeSidecar>()
-            .saturating_add(self.sidecar.order.iter().map(String::len).sum())
-            .saturating_add(self.sidecar.messages.keys().map(String::len).sum())
+            .capacity()
+            .saturating_mul(size_of::<NativeEncodedChunk>())
+            .saturating_add(
+                self.chunks
+                    .iter()
+                    .map(|chunk| ARC_ALLOCATION_OVERHEAD_BYTES.saturating_add(chunk.retained_bytes))
+                    .sum::<usize>(),
+            );
+        let sidecar_core_bytes = size_of::<codec::DecodeSidecar>()
+            .saturating_add(self.sidecar.harness.capacity())
+            .saturating_add(
+                self.sidecar
+                    .order
+                    .capacity()
+                    .saturating_mul(size_of::<String>()),
+            )
+            .saturating_add(self.sidecar.order.iter().map(String::capacity).sum())
+            .saturating_add(btree_map_allocation_bytes::<String, String>(
+                self.sidecar.mid_pins.len(),
+            ))
             .saturating_add(
                 self.sidecar
                     .mid_pins
                     .iter()
-                    .map(|(key, value)| key.len().saturating_add(value.len()))
+                    .map(|(key, value)| key.capacity().saturating_add(value.capacity()))
                     .sum(),
+            )
+            .saturating_add(hash_map_allocation_bytes(&self.sidecar_hashes))
+            .saturating_add(
+                self.sidecar_hashes
+                    .keys()
+                    .map(String::capacity)
+                    .sum::<usize>(),
             );
-        let sidecar_bytes = self
-            .sidecar_sizes
-            .values()
-            .copied()
-            .sum::<usize>()
-            .saturating_add(sidecar_structure_bytes);
+        let sidecar_bulk_bytes = btree_map_allocation_bytes::<
+            String,
+            Arc<codec::sidecar::HarnessMessageMeta>,
+        >(self.sidecar.messages.len())
+        .saturating_add(
+            self.sidecar
+                .messages
+                .keys()
+                .map(|key| key.capacity().saturating_add(ARC_ALLOCATION_OVERHEAD_BYTES))
+                .sum(),
+        )
+        .saturating_add(hash_map_allocation_bytes(&self.sidecar_sizes))
+        .saturating_add(
+            self.sidecar_sizes
+                .keys()
+                .map(String::capacity)
+                .sum::<usize>(),
+        )
+        .saturating_add(self.sidecar_sizes.values().copied().sum::<usize>());
+        let cache_structure_bytes = self
+            .message_keys
+            .capacity()
+            .saturating_mul(size_of::<[u8; 32]>())
+            .saturating_add(self.context.session_id.capacity())
+            .saturating_add(self.context.serializer_profile.capacity())
+            .saturating_add(self.context.render_config.capacity())
+            .saturating_add(
+                self.full_array_fingerprint
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(size_of::<NativeAttachmentCacheSession>())
+            .saturating_add(size_of::<usize>() * 3)
+            .saturating_add(
+                cloned_string_retained_bytes(&self.context.session_id).saturating_mul(2),
+            );
         // Encoded canonical bytes stand in for shared served-message allocations (hence the ×2).
-        // Native sidecar trees are charged on top of the size estimate computed during hashing.
-        // The ingress projection is owned by ProjectionCache and is not charged here.
+        // The ingress projection is owned and charged by ProjectionCache, never by this LRU.
         encoded_bytes
             .saturating_add(served_bytes.saturating_mul(2))
-            .saturating_add(sidecar_bytes)
+            .saturating_add(sidecar_core_bytes)
+            .saturating_add(sidecar_bulk_bytes)
+            .saturating_add(cache_structure_bytes)
     }
 
-    fn discard_sidecar_trees(&mut self) -> bool {
-        let had_sidecar_trees = !self.sidecar.order.is_empty()
-            || !self.sidecar.messages.is_empty()
-            || !self.sidecar.mid_pins.is_empty()
-            || !self.sidecar_hashes.is_empty()
-            || !self.sidecar_sizes.is_empty();
+    fn discard_optional_sidecar_trees(&mut self) -> bool {
+        let had_sidecar_trees = !self.sidecar.messages.is_empty() || !self.sidecar_sizes.is_empty();
         if had_sidecar_trees {
-            let harness = self.sidecar.harness.clone();
-            self.sidecar = Arc::new(codec::DecodeSidecar::new(harness));
-            self.sidecar_hashes.clear();
+            Arc::make_mut(&mut self.sidecar).messages.clear();
             self.sidecar_sizes.clear();
         }
         had_sidecar_trees
@@ -2413,6 +2470,39 @@ impl NativeAttachmentCache {
         snapshot
     }
 
+    fn delta_native_prefix(
+        &mut self,
+        session_id: &str,
+        revert_epoch: u64,
+        after: &str,
+        prefix_messages: usize,
+    ) -> Option<Vec<Value>> {
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.revert_epoch != revert_epoch)
+        {
+            self.remove(session_id);
+        }
+        let prefix = self.sessions.get(session_id).and_then(|session| {
+            let snapshot = &session.snapshot;
+            (snapshot.full_array_fingerprint.as_deref() == Some(after)
+                && prefix_messages <= snapshot.reattachable_native_prefix
+                && prefix_messages <= snapshot.chunks.len())
+            .then(|| {
+                snapshot
+                    .chunks
+                    .iter()
+                    .take(prefix_messages)
+                    .map(|chunk| chunk.value.as_ref().clone())
+                    .collect::<Vec<_>>()
+            })
+        })?;
+        self.lru.retain(|candidate| candidate != session_id);
+        self.lru.push_back(session_id.to_string());
+        Some(prefix)
+    }
+
     fn replace(
         &mut self,
         session_id: &str,
@@ -2426,7 +2516,7 @@ impl NativeAttachmentCache {
         let mut dropped_sidecar_trees = false;
 
         if retained_bytes > self.max_entry_retained_bytes {
-            dropped_sidecar_trees = snapshot.discard_sidecar_trees();
+            dropped_sidecar_trees = snapshot.discard_optional_sidecar_trees();
             retained_bytes = snapshot.retained_bytes(served_bytes);
         }
         if retained_bytes > self.max_entry_retained_bytes
@@ -3361,10 +3451,9 @@ impl McHandler {
         self.refresh_oldest_queued_at_ms();
     }
 
-    /// Reconstruct a full ingress snapshot from the last successful request plus a validated
-    /// caller tail. The returned native frontier is used only for this request and is never stored
-    /// as authoritative cache state. Native attachment and prefix projection each verify the same
-    /// cache entry and `after` identity before reusing it.
+    /// Reconstruct a full ingress snapshot from bounded projection/native cores plus a validated
+    /// caller tail. Small entries may fall back to their full transform snapshot, but a
+    /// giant request does not need to retain provider sidecar trees to keep delta transport alive.
     fn expand_transform_tail_delta(
         &self,
         parsed: &mut TransformRequest,
@@ -3380,19 +3469,10 @@ impl McHandler {
             .and_then(Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())?;
         parsed.full_array_fingerprint.as_ref()?;
-        let request = self
-            .transform_snapshots
-            .lock()
-            .expect("transform snapshots mutex")
-            .ready_delta_request(&parsed.session_id)?;
-        if request.full_array_fingerprint.as_deref() != Some(after.as_str())
-            || replace_from > request.messages.len()
-        {
-            return None;
-        }
+
         // A store-side rewrite can advance the epoch without updating this process's request
-        // snapshot. Load the persisted epoch first, then inspect the shared native/projection
-        // cache, so stale request state cannot select an outdated entry.
+        // snapshot. Load the persisted epoch first, then inspect the bounded projection and native
+        // cores so stale process state cannot select an outdated entry.
         let current_revert_epoch = self
             .store
             .get()?
@@ -3407,15 +3487,46 @@ impl McHandler {
             replace_from,
             ProjectionCacheKeyMode::Normal,
         );
+        let fallback_request = self
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .ready_delta_request(&parsed.session_id)
+            .filter(|request| request.full_array_fingerprint.as_deref() == Some(after.as_str()));
+
+        let mut messages = projection_cache
+            .as_ref()
+            .and_then(|cache| cache.projection.reattach_messages_prefix(replace_from))
+            .or_else(|| {
+                let request = fallback_request.as_ref()?;
+                (replace_from <= request.messages.len())
+                    .then(|| request.messages[..replace_from].to_vec())
+            })?;
+        let mut current_messages = std::mem::take(&mut parsed.messages);
+        messages.append(&mut current_messages);
+
+        let mut native_messages = if native_replace_from == 0 {
+            Vec::new()
+        } else {
+            self.native_attachments
+                .lock()
+                .expect("native attachment cache mutex")
+                .delta_native_prefix(
+                    &parsed.session_id,
+                    current_revert_epoch,
+                    &after,
+                    native_replace_from,
+                )
+                .or_else(|| {
+                    let request = fallback_request.as_ref()?;
+                    let previous_native = request.native_messages.as_ref()?;
+                    (native_replace_from <= previous_native.len())
+                        .then(|| previous_native[..native_replace_from].to_vec())
+                })?
+        };
         let mut current_native = parsed.native_messages.take()?;
-        let previous_native = request.native_messages.as_ref()?;
-        if native_replace_from > previous_native.len() {
-            return None;
-        }
-        let mut messages = request.messages[..replace_from].to_vec();
-        messages.append(&mut parsed.messages);
-        let mut native_messages = previous_native[..native_replace_from].to_vec();
         native_messages.append(&mut current_native);
+
         parsed.messages = messages;
         parsed.native_messages = Some(native_messages);
         parsed.tail_delta = None;
@@ -11000,22 +11111,7 @@ fn native_message_key(
 }
 
 fn native_value_retained_bytes(value: &Value) -> usize {
-    match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) => std::mem::size_of::<Value>(),
-        Value::String(text) => std::mem::size_of::<Value>().saturating_add(text.len()),
-        Value::Array(values) => std::mem::size_of::<Value>().saturating_add(
-            values
-                .iter()
-                .map(native_value_retained_bytes)
-                .sum::<usize>(),
-        ),
-        Value::Object(object) => std::mem::size_of::<Value>().saturating_add(
-            object
-                .iter()
-                .map(|(key, value)| key.len().saturating_add(native_value_retained_bytes(value)))
-                .sum::<usize>(),
-        ),
-    }
+    crate::retained_size::value_retained_bytes(value)
 }
 
 fn native_reasoning_should_clear(
@@ -11145,30 +11241,49 @@ fn attach_native_messages_incremental(
     let mut message_keys = Vec::with_capacity(response.messages().len());
     for (position, served) in response.messages().iter().enumerate() {
         let meta = codec::sidecar::meta_for_ck(&sidecar, served, position);
-        let sidecar_hash = meta.map(|meta| {
-            let slot = meta.mid.clone();
+        let slot = meta.map(|meta| meta.mid.as_str()).or_else(|| {
+            if served.meta.synthetic {
+                None
+            } else {
+                served
+                    .meta
+                    .harness_id
+                    .as_deref()
+                    .filter(|mid| sidecar_positions.contains_key(*mid))
+                    .or_else(|| sidecar.order.get(position).map(String::as_str))
+            }
+        });
+        let sidecar_hash = slot.and_then(|slot| {
             let trusted = sidecar_positions
-                .get(meta.mid.as_str())
+                .get(slot)
                 .is_some_and(|index| *index < trusted_prefix);
-            let (hash, retained_bytes) = if trusted {
+            let cached_hash = if trusted {
                 cached
                     .as_ref()
-                    .and_then(|snapshot| {
-                        Some((
-                            *snapshot.sidecar_hashes.get(&slot)?,
-                            *snapshot.sidecar_sizes.get(&slot)?,
-                        ))
-                    })
-                    .unwrap_or_else(|| native_sidecar_hash_and_size(meta))
+                    .and_then(|snapshot| snapshot.sidecar_hashes.get(slot).copied())
             } else {
-                native_sidecar_hash_and_size(meta)
+                None
             };
-            sidecar_hashes.insert(slot.clone(), hash);
-            sidecar_sizes.insert(slot, retained_bytes);
-            hash
+            let cached_size = if trusted {
+                cached
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.sidecar_sizes.get(slot).copied())
+            } else {
+                None
+            };
+            let computed = (cached_hash.is_none() || cached_size.is_none())
+                .then(|| meta.map(native_sidecar_hash_and_size))
+                .flatten();
+            let hash = cached_hash.or_else(|| computed.map(|(hash, _)| hash))?;
+            if let Some(retained_bytes) =
+                cached_size.or_else(|| computed.map(|(_, retained_bytes)| retained_bytes))
+            {
+                sidecar_sizes.insert(slot.to_string(), retained_bytes);
+            }
+            sidecar_hashes.insert(slot.to_string(), hash);
+            Some(hash)
         });
-        let meta_mid = meta.map(|meta| meta.mid.as_str());
-        let mutation_exempt = meta_mid.is_some_and(|mid| mutation_exempt_mids.contains(&mid));
+        let mutation_exempt = slot.is_some_and(|mid| mutation_exempt_mids.contains(&mid));
         let (tag_number, reasoning_should_clear) = native_reasoning_should_clear(
             served,
             request,
@@ -11190,22 +11305,7 @@ fn attach_native_messages_incremental(
         if sidecar_sizes.contains_key(slot) {
             continue;
         }
-        let trusted = sidecar_positions
-            .get(slot.as_str())
-            .is_some_and(|index| *index < trusted_prefix);
-        let (hash, retained_bytes) = if trusted {
-            cached
-                .as_ref()
-                .and_then(|snapshot| {
-                    Some((
-                        *snapshot.sidecar_hashes.get(slot)?,
-                        *snapshot.sidecar_sizes.get(slot)?,
-                    ))
-                })
-                .unwrap_or_else(|| native_sidecar_hash_and_size(meta))
-        } else {
-            native_sidecar_hash_and_size(meta)
-        };
+        let (hash, retained_bytes) = native_sidecar_hash_and_size(meta);
         sidecar_hashes.insert(slot.clone(), hash);
         sidecar_sizes.insert(slot.clone(), retained_bytes);
     }
@@ -11305,6 +11405,13 @@ fn attach_native_messages_incremental(
         .iter()
         .map(|chunk| Arc::clone(&chunk.value))
         .collect::<Vec<_>>();
+    let reattachable_native_prefix = request.native_messages.as_deref().map_or(0, |input| {
+        input
+            .iter()
+            .zip(&chunks)
+            .take_while(|(input, chunk)| *input == chunk.value.as_ref())
+            .count()
+    });
 
     if native_attachment_differential_enabled() {
         let full = encode_full_native_messages(
@@ -11349,6 +11456,7 @@ fn attach_native_messages_incremental(
                 sidecar_hashes,
                 sidecar_sizes,
                 chunks,
+                reattachable_native_prefix,
             },
             &mut stats,
             served_bytes,
@@ -16548,78 +16656,218 @@ mod tests {
     }
 
     #[test]
-    fn astro_scale_snapshot_reuses_chunks_after_projection_and_sidecar_degrade() {
-        const ASTRO_MESSAGE_COUNT: usize = 4_600;
-        const ASTRO_BLOCK_COUNT: usize = 15_000;
-        const ASTRO_NATIVE_WIRE_BYTES: usize = 49 * 1024 * 1024;
-
-        let (request, served) = native_cache_fixture(
-            "native-astro-scale",
-            ASTRO_MESSAGE_COUNT,
-            ASTRO_BLOCK_COUNT,
-            ASTRO_NATIVE_WIRE_BYTES,
+    fn native_delta_core_stops_at_the_first_changed_output_message() {
+        let ingress = vec![
+            ck("core-1", 1, "one"),
+            ck("core-2", 2, "two"),
+            ck("core-3", 3, "three"),
+        ];
+        let request = native_cache_request(
+            "native-prefix-core",
+            ingress.clone(),
+            vec![
+                native_text_message("core-1", "user", "one"),
+                native_text_message("core-2", "user", "two"),
+                native_text_message("core-3", "user", "three"),
+            ],
+            "native-prefix-core-fp",
         );
-        let cache = Mutex::new(NativeAttachmentCache::default());
-        let (first, first_stats) = run_native_cache_pass(
+        let mut served = ingress
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect::<Vec<_>>();
+        if let CkKind::Text { text } = &mut served[2].content[0].kind {
+            *text = "changed response tail".to_string();
+        }
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        run_native_cache_pass(
             &cache,
             &request,
-            served.clone(),
+            served,
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+
+        let mut cache = cache.lock().unwrap();
+        assert_eq!(
+            cache.sessions["native-prefix-core"]
+                .snapshot
+                .reattachable_native_prefix,
+            2
+        );
+        assert_eq!(
+            cache
+                .delta_native_prefix("native-prefix-core", 0, "native-prefix-core-fp", 2)
+                .map(|prefix| prefix.len()),
+            Some(2)
+        );
+        assert!(cache
+            .delta_native_prefix("native-prefix-core", 0, "native-prefix-core-fp", 3)
+            .is_none());
+    }
+
+    #[test]
+    fn giant_degraded_snapshot_accepts_tail_delta_and_reuses_projection() {
+        const GIANT_MESSAGE_COUNT: usize = 5_001;
+        const GIANT_BLOCK_COUNT: usize = GIANT_MESSAGE_COUNT;
+        const GIANT_NATIVE_WIRE_BYTES: usize = 26 * 1024 * 1024;
+        const SESSION_ID: &str = "native-giant-degraded";
+
+        let (request, served) = native_cache_fixture(
+            SESSION_ID,
+            GIANT_MESSAGE_COUNT,
+            GIANT_BLOCK_COUNT,
+            GIANT_NATIVE_WIRE_BYTES,
+        );
+        let request = Arc::new(request);
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(producer, default_test_config());
+        handler.bind_route(7, binding(project.to_str().unwrap(), SESSION_ID));
+
+        let projection = Arc::new(
+            crate::ck_wire::project_messages(&request.messages).expect("giant projection"),
+        );
+        let projection_charge = ProjectionCacheSnapshot {
+            context: projection_cache_context(&request),
+            full_array_fingerprint: request.full_array_fingerprint.clone(),
+            projection: Arc::clone(&projection),
+        }
+        .retained_bytes(SESSION_ID);
+        assert!(
+            projection_charge <= PROJECTION_CACHE_ENTRY_BUDGET_BYTES,
+            "required projection core must fit: charge={projection_charge} cap={PROJECTION_CACHE_ENTRY_BUDGET_BYTES}"
+        );
+        handler.store_projection_cache(&request, 0, Arc::clone(&projection));
+
+        let (first, first_stats) = run_native_cache_pass(
+            &handler.native_attachments,
+            &request,
+            served,
             &BTreeMap::new(),
             false,
             0,
             NativeCacheKeyMode::Normal,
         );
         assert_eq!(first_stats.reused_messages, 0);
+        assert_eq!(first_stats.degraded_store, 1, "{first_stats:?}");
         assert_eq!(first_stats.refused_store, 0, "{first_stats:?}");
-        {
-            let cache = cache.lock().unwrap();
-            assert!(
-                cache.sessions.contains_key("native-astro-scale"),
-                "an ASTRO-scale native snapshot must still be stored after sidecar degrade"
-            );
-            let snapshot = &cache.sessions["native-astro-scale"].snapshot;
-            if first_stats.degraded_store == 1 {
-                assert!(
-                    snapshot.sidecar.messages.is_empty(),
-                    "sidecar trees must degrade when the native entry still exceeds the budget"
-                );
-            }
-        }
-        let first_bytes = serde_json::to_vec(
-            first
-                .native_messages
-                .as_ref()
-                .expect("first pass attaches native messages"),
-        )
-        .expect("native output serializes");
         drop(first);
 
-        let (second, second_stats) = run_native_cache_pass(
-            &cache,
-            &request,
-            served.clone(),
+        {
+            let cache = handler.native_attachments.lock().unwrap();
+            let entry = &cache.sessions[SESSION_ID];
+            let snapshot = &entry.snapshot;
+            assert!(entry.retained_bytes <= cache.max_entry_retained_bytes);
+            assert!(cache.retained_bytes <= cache.max_retained_bytes);
+            assert!(snapshot.sidecar.messages.is_empty());
+            assert!(snapshot.sidecar_sizes.is_empty());
+            assert_eq!(snapshot.sidecar.order.len(), GIANT_MESSAGE_COUNT);
+            assert_eq!(snapshot.sidecar.mid_pins.len(), GIANT_MESSAGE_COUNT);
+            assert_eq!(snapshot.sidecar_hashes.len(), GIANT_MESSAGE_COUNT);
+            assert_eq!(snapshot.reattachable_native_prefix, GIANT_MESSAGE_COUNT);
+        }
+
+        let request_charge = request.retained_bytes();
+        assert!(
+            request_charge > TRANSFORM_SNAPSHOT_BUDGET_BYTES,
+            "fixture must exceed the legacy full-request snapshot budget: charge={request_charge}"
+        );
+        {
+            let mut snapshots = handler.transform_snapshots.lock().unwrap();
+            let generation = snapshots.begin(SESSION_ID);
+            snapshots.finish_ready(
+                SESSION_ID,
+                generation,
+                Arc::clone(&request),
+                0,
+                request_charge,
+            );
+            assert!(
+                snapshots.ready_delta_request(SESSION_ID).is_none(),
+                "the regression must be served by required cores, not a retained full request"
+            );
+        }
+
+        let tail = ck(
+            &format!("{SESSION_ID}-{}", GIANT_MESSAGE_COUNT),
+            u64::try_from(GIANT_MESSAGE_COUNT + 1).unwrap(),
+            "new tail",
+        );
+        let tail_native = native_text_message(&tail.mid, "user", "new tail");
+        let mut delta = native_cache_request(
+            SESSION_ID,
+            vec![tail],
+            vec![tail_native],
+            "native-giant-degraded-next-fingerprint",
+        );
+        delta.tail_delta = Some(json!({
+            "after": request.full_array_fingerprint.as_deref().unwrap(),
+            "replace_from": GIANT_MESSAGE_COUNT,
+            "native_replace_from": GIANT_MESSAGE_COUNT,
+        }));
+
+        let frontier = handler
+            .expand_transform_tail_delta(&mut delta)
+            .expect("required cores must accept the tail delta without a full-request snapshot");
+        let reusable_projection = frontier
+            .projection_cache
+            .as_ref()
+            .expect("giant tail delta retains its incremental projection");
+        assert_eq!(reusable_projection.replace_from, GIANT_MESSAGE_COUNT);
+        assert_eq!(delta.messages.len(), GIANT_MESSAGE_COUNT + 1);
+        assert_eq!(
+            delta.native_messages.as_ref().map(Vec::len),
+            Some(GIANT_MESSAGE_COUNT + 1)
+        );
+        let incremental = crate::ck_wire::project_messages_incremental(
+            &delta.messages,
+            &reusable_projection.projection,
+            reusable_projection.replace_from,
+        )
+        .expect("giant suffix projection");
+        assert_eq!(incremental.message_count(), GIANT_MESSAGE_COUNT + 1);
+        assert!(Arc::ptr_eq(
+            &incremental.blocks[0].wire,
+            &projection.blocks[0].wire
+        ));
+
+        let mut response = transform::TransformResponse::passthrough(
+            delta
+                .messages
+                .iter()
+                .map(|message| message.ck.clone())
+                .collect(),
+            delta.full_array_fingerprint.clone(),
+        );
+        let second_stats = attach_native_messages_incremental(
+            &mut response,
+            &delta,
+            1,
             &BTreeMap::new(),
+            None,
+            None,
             false,
+            Some(&frontier),
             0,
+            &handler.native_attachments,
             NativeCacheKeyMode::Normal,
         );
-        assert_eq!(
-            second_stats.reused_messages,
-            served.len(),
-            "an ASTRO-scale snapshot must retain reusable chunks instead of silently refusing storage"
+        assert!(
+            second_stats.reused_messages >= GIANT_MESSAGE_COUNT - 1,
+            "{second_stats:?}"
         );
-        assert_eq!(second_stats.encoded_messages, 0, "{second_stats:?}");
-        assert_eq!(
-            serde_json::to_vec(
-                second
-                    .native_messages
-                    .as_ref()
-                    .expect("second pass attaches native messages"),
-            )
-            .expect("native output serializes"),
-            first_bytes,
-            "degraded cache reuse must preserve native response bytes"
-        );
+        assert!(second_stats.encoded_messages <= 2, "{second_stats:?}");
+        assert_eq!(second_stats.degraded_store, 0, "{second_stats:?}");
+
+        let cache = handler.native_attachments.lock().unwrap();
+        let entry = &cache.sessions[SESSION_ID];
+        assert!(entry.retained_bytes <= cache.max_entry_retained_bytes);
+        assert!(cache.retained_bytes <= cache.max_retained_bytes);
+        assert_eq!(entry.snapshot.sidecar.order.len(), GIANT_MESSAGE_COUNT + 1);
+        assert_eq!(entry.snapshot.sidecar.messages.len(), 1);
+        assert_eq!(entry.snapshot.sidecar_sizes.len(), 1);
     }
 
     #[test]
