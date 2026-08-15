@@ -2241,8 +2241,8 @@ impl BoundaryTokenCache {
 
 // These cache budgets are sized for a representative workload of 4,600 messages and 15,000
 // blocks, whose native representation is roughly 49 MiB. After removal of sidecar trees, its
-// retained keys and chunks remain below 192 MiB, while the 256 MiB total allows more than one
-// large session. The ingress FlatProjection lives in its own cache so an oversized native
+// retained keys plus encoded and ingress chunks remain below 192 MiB, while the 256 MiB total
+// allows more than one large session. The ingress FlatProjection lives in its own cache so an oversized native
 // snapshot can drop sidecar trees without discarding the projection. Because these are charged
 // estimates, the total remains a hard upper bound so that one unusually large session cannot
 // cause unbounded cache growth.
@@ -2253,6 +2253,7 @@ const NATIVE_ATTACHMENT_CACHE_ENTRY_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 struct NativeDeltaFrontier {
     after: String,
     native_replace_from: usize,
+    native_prefix: Vec<Arc<Value>>,
     projection_cache: Option<ProjectionCacheInput>,
 }
 
@@ -2295,7 +2296,9 @@ struct NativeAttachmentCacheSnapshot {
     // Sizes exist only for raw trees still present in `sidecar.messages`.
     sidecar_sizes: HashMap<String, usize>,
     chunks: Vec<NativeEncodedChunk>,
-    reattachable_native_prefix: usize,
+    // Transform-generated m0/m1 messages can shift every served-output position away from raw
+    // ingress. Preserve the acknowledged ingress because `native_replace_from` indexes that input.
+    ingress_chunks: Vec<Arc<Value>>,
 }
 
 impl NativeAttachmentCacheSnapshot {
@@ -2314,6 +2317,25 @@ impl NativeAttachmentCacheSnapshot {
                 self.chunks
                     .iter()
                     .map(|chunk| ARC_ALLOCATION_OVERHEAD_BYTES.saturating_add(chunk.retained_bytes))
+                    .sum::<usize>(),
+            );
+        let mut charged_values = self
+            .chunks
+            .iter()
+            .map(|chunk| Arc::as_ptr(&chunk.value))
+            .collect::<HashSet<_>>();
+        let ingress_bytes = self
+            .ingress_chunks
+            .capacity()
+            .saturating_mul(size_of::<Arc<Value>>())
+            .saturating_add(
+                self.ingress_chunks
+                    .iter()
+                    .filter(|value| charged_values.insert(Arc::as_ptr(value)))
+                    .map(|value| {
+                        ARC_ALLOCATION_OVERHEAD_BYTES
+                            .saturating_add(native_value_retained_bytes(value))
+                    })
                     .sum::<usize>(),
             );
         let sidecar_core_bytes = size_of::<codec::DecodeSidecar>()
@@ -2381,6 +2403,7 @@ impl NativeAttachmentCacheSnapshot {
         // Encoded canonical bytes stand in for shared served-message allocations (hence the ×2).
         // The ingress projection is owned and charged by ProjectionCache, never by this LRU.
         encoded_bytes
+            .saturating_add(ingress_bytes)
             .saturating_add(served_bytes.saturating_mul(2))
             .saturating_add(sidecar_core_bytes)
             .saturating_add(sidecar_bulk_bytes)
@@ -2476,7 +2499,7 @@ impl NativeAttachmentCache {
         revert_epoch: u64,
         after: &str,
         prefix_messages: usize,
-    ) -> Option<Vec<Value>> {
+    ) -> Option<Vec<Arc<Value>>> {
         if self
             .sessions
             .get(session_id)
@@ -2487,16 +2510,8 @@ impl NativeAttachmentCache {
         let prefix = self.sessions.get(session_id).and_then(|session| {
             let snapshot = &session.snapshot;
             (snapshot.full_array_fingerprint.as_deref() == Some(after)
-                && prefix_messages <= snapshot.reattachable_native_prefix
-                && prefix_messages <= snapshot.chunks.len())
-            .then(|| {
-                snapshot
-                    .chunks
-                    .iter()
-                    .take(prefix_messages)
-                    .map(|chunk| chunk.value.as_ref().clone())
-                    .collect::<Vec<_>>()
-            })
+                && prefix_messages <= snapshot.ingress_chunks.len())
+            .then(|| snapshot.ingress_chunks[..prefix_messages].to_vec())
         })?;
         self.lru.retain(|candidate| candidate != session_id);
         self.lru.push_back(session_id.to_string());
@@ -3505,7 +3520,7 @@ impl McHandler {
         let mut current_messages = std::mem::take(&mut parsed.messages);
         messages.append(&mut current_messages);
 
-        let mut native_messages = if native_replace_from == 0 {
+        let native_prefix = if native_replace_from == 0 {
             Vec::new()
         } else {
             self.native_attachments
@@ -3520,10 +3535,19 @@ impl McHandler {
                 .or_else(|| {
                     let request = fallback_request.as_ref()?;
                     let previous_native = request.native_messages.as_ref()?;
-                    (native_replace_from <= previous_native.len())
-                        .then(|| previous_native[..native_replace_from].to_vec())
+                    (native_replace_from <= previous_native.len()).then(|| {
+                        previous_native[..native_replace_from]
+                            .iter()
+                            .cloned()
+                            .map(Arc::new)
+                            .collect()
+                    })
                 })?
         };
+        let mut native_messages = native_prefix
+            .iter()
+            .map(|message| message.as_ref().clone())
+            .collect::<Vec<_>>();
         let mut current_native = parsed.native_messages.take()?;
         native_messages.append(&mut current_native);
 
@@ -3533,6 +3557,7 @@ impl McHandler {
         Some(NativeDeltaFrontier {
             after,
             native_replace_from,
+            native_prefix,
             projection_cache,
         })
     }
@@ -11182,6 +11207,41 @@ fn encode_full_native_messages(
     native_messages
 }
 
+fn native_ingress_chunks(
+    request: &TransformRequest,
+    encoded_chunks: &[NativeEncodedChunk],
+    frontier: Option<&NativeDeltaFrontier>,
+) -> Vec<Arc<Value>> {
+    let native_messages = request.native_messages.as_deref().unwrap_or_default();
+    let reusable_prefix = frontier
+        .filter(|frontier| {
+            frontier.native_prefix.len() == frontier.native_replace_from
+                && frontier.native_replace_from <= native_messages.len()
+        })
+        .map_or(0, |frontier| frontier.native_replace_from);
+    let mut ingress_chunks = frontier
+        .filter(|_| reusable_prefix > 0)
+        .map(|frontier| frontier.native_prefix.clone())
+        .unwrap_or_default();
+    ingress_chunks.reserve(native_messages.len().saturating_sub(reusable_prefix));
+    let output_chunks_by_start = encoded_chunks
+        .iter()
+        .filter(|chunk| chunk.end_index == chunk.start_index.saturating_add(1))
+        .map(|chunk| (chunk.start_index, chunk))
+        .collect::<HashMap<_, _>>();
+    for (index, message) in native_messages.iter().enumerate().skip(reusable_prefix) {
+        let shared_output = output_chunks_by_start
+            .get(&index)
+            .filter(|chunk| chunk.value.as_ref() == message);
+        ingress_chunks.push(
+            shared_output
+                .map(|chunk| Arc::clone(&chunk.value))
+                .unwrap_or_else(|| Arc::new(message.clone())),
+        );
+    }
+    ingress_chunks
+}
+
 static NATIVE_ATTACHMENT_DIFFERENTIAL: OnceLock<bool> = OnceLock::new();
 
 fn native_attachment_differential_enabled() -> bool {
@@ -11405,13 +11465,7 @@ fn attach_native_messages_incremental(
         .iter()
         .map(|chunk| Arc::clone(&chunk.value))
         .collect::<Vec<_>>();
-    let reattachable_native_prefix = request.native_messages.as_deref().map_or(0, |input| {
-        input
-            .iter()
-            .zip(&chunks)
-            .take_while(|(input, chunk)| *input == chunk.value.as_ref())
-            .count()
-    });
+    let ingress_chunks = native_ingress_chunks(request, &chunks, native_delta_frontier);
 
     if native_attachment_differential_enabled() {
         let full = encode_full_native_messages(
@@ -11456,7 +11510,7 @@ fn attach_native_messages_incremental(
                 sidecar_hashes,
                 sidecar_sizes,
                 chunks,
-                reattachable_native_prefix,
+                ingress_chunks,
             },
             &mut stats,
             served_bytes,
@@ -16374,6 +16428,84 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn cold_soft_plus_full_sync_primes_the_next_tail_delta() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let first_native = json!({
+            "info": {
+                "id": "m1",
+                "sessionID": "ses",
+                "role": "user",
+                "customInfo": "preserve-me"
+            },
+            "parts": [{ "type": "text", "text": "hello", "customPart": 7 }]
+        });
+        let full_request = |fingerprint: &str| {
+            let mut body = request(vec![ck("m1", 1, "hello")]);
+            body["serializer_profile"] = json!("opencode-aisdk");
+            body["serve_native"] = json!(true);
+            body["native_messages"] = json!([first_native.clone()]);
+            body["full_array_fingerprint"] = json!(fingerprint);
+            body
+        };
+
+        let initialized = call_transform_request(&handler, full_request("warmup")).await;
+        assert_eq!(initialized["status"], "ok", "{initialized}");
+        handler.projections.lock().unwrap().remove("ses");
+        handler.native_attachments.lock().unwrap().remove("ses");
+        handler.transform_snapshots.lock().unwrap().remove("ses");
+        handler.serialized_outputs.lock().unwrap().remove("ses");
+        handler.transform_snapshots.lock().unwrap().max_ready_bytes = 1;
+
+        let cold = call_transform_request(&handler, full_request("cold-fp-1")).await;
+        assert_eq!(cold["status"], "ok", "{cold}");
+        assert_eq!(cold["action"], "SOFT+", "{cold}");
+        assert!(cold["native_messages"]
+            .as_array()
+            .is_some_and(|messages| messages.first() != Some(&first_native)));
+        assert!(handler
+            .transform_snapshots
+            .lock()
+            .unwrap()
+            .ready_delta_request("ses")
+            .is_none());
+
+        let second_native = json!({
+            "info": { "id": "m2", "sessionID": "ses", "role": "user" },
+            "parts": [{ "type": "text", "text": "next" }]
+        });
+        let mut delta = request(vec![ck("m2", 2, "next")]);
+        delta["serializer_profile"] = json!("opencode-aisdk");
+        delta["serve_native"] = json!(true);
+        delta["native_messages"] = json!([second_native]);
+        delta["full_array_fingerprint"] = json!("cold-fp-2");
+        delta["tail_delta"] = json!({
+            "after": "cold-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 1,
+        });
+        let delta_bytes = serde_json::to_vec(&delta).unwrap().len();
+        let mut full_followup = request(vec![ck("m1", 1, "hello"), ck("m2", 2, "next")]);
+        full_followup["serializer_profile"] = json!("opencode-aisdk");
+        full_followup["serve_native"] = json!(true);
+        full_followup["native_messages"] = json!([first_native, second_native]);
+        full_followup["full_array_fingerprint"] = json!("cold-fp-2");
+        assert!(delta_bytes < serde_json::to_vec(&full_followup).unwrap().len());
+
+        let attached = call_transform_request(&handler, delta).await;
+        assert_eq!(attached["status"], "ok", "{attached}");
+        assert_eq!(attached["action"], "SOFT+", "{attached}");
+        assert_eq!(attached["timings"]["projection_reused_messages"], 1);
+        assert!(
+            attached["timings"]["native_cache_reused_messages"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "tail delta must reuse the transformed native prefix: {attached}"
+        );
+    }
+
     fn native_cache_request(
         session_id: &str,
         messages: Vec<CkIngressMessage>,
@@ -16509,6 +16641,7 @@ mod tests {
                         delta.get("native_replace_from")?.as_u64()?,
                     )
                     .ok()?,
+                    native_prefix: Vec::new(),
                     projection_cache: None,
                 })
             });
@@ -16656,7 +16789,7 @@ mod tests {
     }
 
     #[test]
-    fn native_delta_core_stops_at_the_first_changed_output_message() {
+    fn native_delta_ingress_core_is_independent_of_changed_output_messages() {
         let ingress = vec![
             ck("core-1", 1, "one"),
             ck("core-2", 2, "two"),
@@ -16694,18 +16827,18 @@ mod tests {
         assert_eq!(
             cache.sessions["native-prefix-core"]
                 .snapshot
-                .reattachable_native_prefix,
-            2
+                .ingress_chunks
+                .len(),
+            3
         );
-        assert_eq!(
-            cache
-                .delta_native_prefix("native-prefix-core", 0, "native-prefix-core-fp", 2)
-                .map(|prefix| prefix.len()),
-            Some(2)
-        );
-        assert!(cache
+        let prefix = cache
             .delta_native_prefix("native-prefix-core", 0, "native-prefix-core-fp", 3)
-            .is_none());
+            .expect("the raw ingress prefix remains attachable");
+        assert_eq!(prefix.len(), 3);
+        assert_eq!(
+            prefix[2].as_ref(),
+            &request.native_messages.as_ref().unwrap()[2]
+        );
     }
 
     #[test]
@@ -16766,7 +16899,7 @@ mod tests {
             assert_eq!(snapshot.sidecar.order.len(), GIANT_MESSAGE_COUNT);
             assert_eq!(snapshot.sidecar.mid_pins.len(), GIANT_MESSAGE_COUNT);
             assert_eq!(snapshot.sidecar_hashes.len(), GIANT_MESSAGE_COUNT);
-            assert_eq!(snapshot.reattachable_native_prefix, GIANT_MESSAGE_COUNT);
+            assert_eq!(snapshot.ingress_chunks.len(), GIANT_MESSAGE_COUNT);
         }
 
         let request_charge = request.retained_bytes();
