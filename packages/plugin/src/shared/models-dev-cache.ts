@@ -30,7 +30,7 @@ import { join } from "node:path";
 import type { ContextLimitProvenance } from "./context-limit-provenance";
 import { getMagicContextStorageDir } from "./data-path";
 import { getHarness } from "./harness";
-import { piModelRefToCanonical } from "./harness-provider-map";
+import { modelRefLookupOrder } from "./harness-provider-map";
 import { sessionLog } from "./logger";
 import { shouldEnforcePrivateStoragePermissions } from "./storage-permissions";
 import {
@@ -202,14 +202,11 @@ function isFinitePositive(value: number | undefined): value is number {
 }
 
 function modelKeyLookupOrder(providerID: string, modelID: string): string[] {
-    const full = `${providerID}/${modelID}`;
-    const canonicalFull = piModelRefToCanonical(full);
-    const candidates = [full, canonicalFull, modelID];
+    const candidates = [...modelRefLookupOrder(`${providerID}/${modelID}`), modelID];
     const colon = modelID.lastIndexOf(":");
     if (colon > 0) {
         const bareModel = modelID.slice(0, colon);
-        const providerBare = `${providerID}/${bareModel}`;
-        candidates.push(providerBare, piModelRefToCanonical(providerBare), bareModel);
+        candidates.push(...modelRefLookupOrder(`${providerID}/${bareModel}`), bareModel);
     }
     return [...new Set(candidates)];
 }

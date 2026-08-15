@@ -1,3 +1,5 @@
+import { modelRefLookupOrder } from "./harness-provider-map";
+
 /** The built-in prompt-surface variants. */
 export type PromptSurfacePreset = "full" | "light";
 
@@ -69,6 +71,8 @@ export interface ModelKeyCandidate {
  * provider/model boundary is the first slash; the rest of the string remains
  * the model ID, including additional slashes. Candidates are case-sensitive.
  *
+ * Known harness provider aliases are checked canonical-first at each specificity,
+ * so one shared config works on every harness and canonical wins on collisions.
  * Provider wildcards are checked after progressively less-specific model keys,
  * but before the caller's default. That keeps an exact or base-model override
  * authoritative while still allowing `provider/*` to cover otherwise-unlisted
@@ -82,10 +86,15 @@ export function modelKeyLookupOrder(modelKey: string | undefined): ModelKeyCandi
 
     const provider = modelKey.slice(0, slash);
     let modelID = modelKey.slice(slash + 1);
+    const providerRefs = modelRefLookupOrder(`${provider}/${modelID}`);
     const candidates: ModelKeyCandidate[] = [];
 
     while (modelID.length > 0) {
-        candidates.push({ key: `${provider}/${modelID}`, source: "exact" });
+        for (const providerRef of providerRefs) {
+            const providerSlash = providerRef.indexOf("/");
+            const providerPrefix = providerRef.slice(0, providerSlash);
+            candidates.push({ key: `${providerPrefix}/${modelID}`, source: "exact" });
+        }
         candidates.push({ key: modelID, source: "bare" });
 
         const lastDash = modelID.lastIndexOf("-");
@@ -93,7 +102,11 @@ export function modelKeyLookupOrder(modelKey: string | undefined): ModelKeyCandi
         modelID = modelID.slice(0, lastDash);
     }
 
-    candidates.push({ key: `${provider}/*`, source: "wildcard" });
+    for (const providerRef of providerRefs) {
+        const providerSlash = providerRef.indexOf("/");
+        const providerPrefix = providerRef.slice(0, providerSlash);
+        candidates.push({ key: `${providerPrefix}/*`, source: "wildcard" });
+    }
 
     const seen = new Set<string>();
     return candidates.filter((candidate) => {

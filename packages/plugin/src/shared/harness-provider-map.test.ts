@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+    modelRefLookupOrder,
     ompModelRefToCanonical,
     piModelRefToCanonical,
     resolveModelRefForOmp,
@@ -63,6 +64,25 @@ describe("harness-provider-map", () => {
         it("round-trips with resolveModelRefForPi", () => {
             const piForm = "openai-codex/gpt-5.5";
             expect(resolveModelRefForPi(piModelRefToCanonical(piForm))).toBe(piForm);
+        });
+
+        describe("modelRefLookupOrder (config read edge)", () => {
+            it("tries canonical before the Pi-native spelling", () => {
+                expect(modelRefLookupOrder("openai-codex/gpt-5.6-sol")).toEqual([
+                    "openai/gpt-5.6-sol",
+                    "openai-codex/gpt-5.6-sol",
+                ]);
+                expect(modelRefLookupOrder("openai/gpt-5.6-sol")).toEqual([
+                    "openai/gpt-5.6-sol",
+                    "openai-codex/gpt-5.6-sol",
+                ]);
+            });
+
+            it("keeps unknown provider prefixes as a single passthrough key", () => {
+                expect(modelRefLookupOrder("custom-provider/model")).toEqual([
+                    "custom-provider/model",
+                ]);
+            });
         });
     });
 });

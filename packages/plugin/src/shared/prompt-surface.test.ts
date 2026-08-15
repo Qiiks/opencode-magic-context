@@ -47,6 +47,44 @@ describe("prompt-surface resolution", () => {
         }
     });
 
+    it("resolves Pi-native and canonical model keys with canonical precedence", () => {
+        const nativeKey = "openai-codex/gpt-5.6-sol";
+        const canonicalKey = "openai/gpt-5.6-sol";
+
+        expect(resolveCacheTtl({ default: "5m", [nativeKey]: "60m" }, canonicalKey)).toBe("60m");
+        expect(
+            resolvePromptSurface(
+                { default: "full", models: { [nativeKey]: "light" } },
+                canonicalKey,
+            ),
+        ).toEqual({ preset: "light", source: "exact" });
+        expect(
+            resolveCacheTtl(
+                { default: "5m", [nativeKey]: "60m", [canonicalKey]: "30m" },
+                nativeKey,
+            ),
+        ).toBe("30m");
+        expect(
+            resolvePromptSurface(
+                { default: "full", models: { [nativeKey]: "light", [canonicalKey]: "full" } },
+                nativeKey,
+            ),
+        ).toEqual({ preset: "full", source: "exact" });
+    });
+
+    it("leaves unknown provider keys unchanged", () => {
+        expect(
+            resolveCacheTtl(
+                { default: "5m", "custom-provider/model": "1m" },
+                "custom-provider/model",
+            ),
+        ).toBe("1m");
+        expect(modelKeyLookupOrder("custom-provider/model")[0]).toEqual({
+            key: "custom-provider/model",
+            source: "exact",
+        });
+    });
+
     it("derives a stable config identity independent of object key order", () => {
         const left = promptSurfaceConfigIdentity({
             default: "full",

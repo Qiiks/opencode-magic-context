@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getDataDir } from "./data-path";
-import { piModelRefToCanonical } from "./harness-provider-map";
+import { modelRefLookupOrder } from "./harness-provider-map";
 import { sessionLog } from "./logger";
 import type { ModelLimit, OutputReserveConfig } from "./models-dev-cache";
 
@@ -140,14 +140,11 @@ function isFinitePositive(value: unknown): value is number {
 }
 
 function modelKeyLookupOrder(providerID: string, modelID: string): string[] {
-    const full = `${providerID}/${modelID}`;
-    const canonicalFull = piModelRefToCanonical(full);
-    const candidates = [full, canonicalFull, modelID];
+    const candidates = [...modelRefLookupOrder(`${providerID}/${modelID}`), modelID];
     const colon = modelID.lastIndexOf(":");
     if (colon > 0) {
         const bareModel = modelID.slice(0, colon);
-        const providerBare = `${providerID}/${bareModel}`;
-        candidates.push(providerBare, piModelRefToCanonical(providerBare), bareModel);
+        candidates.push(...modelRefLookupOrder(`${providerID}/${bareModel}`), bareModel);
     }
     return [...new Set(candidates)];
 }
@@ -381,13 +378,12 @@ export function resolveWindowOverlayFacts(
     overlay: WindowOverlay | undefined = getWindowOverlay(),
 ): ResolvedWindowOverlayFacts | undefined {
     if (!overlay) return undefined;
-    const canonical = piModelRefToCanonical(`${providerID}/${modelID}`);
-    const slash = canonical.indexOf("/");
-    const providerCandidates = new Set([
-        providerID,
-        slash > 0 ? canonical.slice(0, slash) : providerID,
+    const modelRefs = modelRefLookupOrder(`${providerID}/${modelID}`);
+    const providerCandidates = new Set(modelRefs.map((ref) => ref.slice(0, ref.indexOf("/"))));
+    const modelCandidates = new Set([
+        modelID,
+        ...modelRefs.map((ref) => ref.slice(ref.indexOf("/") + 1)),
     ]);
-    const modelCandidates = new Set([modelID, slash > 0 ? canonical.slice(slash + 1) : modelID]);
     const colon = modelID.lastIndexOf(":");
     if (colon > 0) modelCandidates.add(modelID.slice(0, colon));
 

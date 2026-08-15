@@ -4,6 +4,7 @@ import {
     loadPersistedUsage,
 } from "../../features/magic-context/storage-meta-persisted";
 import { escalationBands, MAX_EXECUTE_THRESHOLD } from "../../shared/escalation-bands";
+import { modelRefLookupOrder } from "../../shared/harness-provider-map";
 import { log, sessionLog } from "../../shared/logger";
 import {
     getSdkContextLimit,
@@ -238,11 +239,14 @@ function isFinitePositive(v: unknown): v is number {
  */
 function* modelKeyLookupOrder(modelKey: string): Generator<string> {
     const slash = modelKey.indexOf("/");
-    const provider = slash >= 0 ? modelKey.slice(0, slash) : "";
+    const providerRefs = slash >= 0 ? modelRefLookupOrder(modelKey) : [];
     let modelId = slash >= 0 ? modelKey.slice(slash + 1) : modelKey;
 
     while (modelId.length > 0) {
-        if (provider) yield `${provider}/${modelId}`;
+        for (const providerRef of providerRefs) {
+            const providerSlash = providerRef.indexOf("/");
+            yield `${providerRef.slice(0, providerSlash)}/${modelId}`;
+        }
         yield modelId;
         const lastDash = modelId.lastIndexOf("-");
         if (lastDash <= 0) break;
