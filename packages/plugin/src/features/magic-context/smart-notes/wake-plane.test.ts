@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
@@ -53,6 +53,13 @@ function dueCompiledNote(db: Database) {
     );
     return note;
 }
+
+// A different test file (ctx-note tools) exercises the gate and can leave the
+// module-level verdict cache populated when the full suite interleaves files, so
+// this file must clear it on entry, not only on exit.
+beforeEach(() => {
+    __wakePlaneTest.reset();
+});
 
 afterEach(() => {
     __wakePlaneTest.reset();
