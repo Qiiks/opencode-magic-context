@@ -2335,15 +2335,17 @@ fn todo_synthesis_verdict(req: &TransformRequest) -> Option<bool> {
 
 struct AdditiveM0Composition {
     m0_bytes: String,
+    mural: Option<crate::m0_compose::M0MuralBlock>,
     rendered_memory_ids: Vec<i64>,
-    memory_mutation_cursor: i64,
-    max_memory_id: i64,
+    memory_revision: MemoryRevision,
 }
 
 fn compose_additive_m0(
     store: &McStore,
+    req: &TransformRequest,
     ctx: &ProducerContext<'_>,
     expiry_cutoff_ms: i64,
+    serializer_profile: Option<SerializerProfile>,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Result<AdditiveM0Composition, TransformError> {
     let membership = store.resolve_workspace_membership(ctx.project_path)?;
@@ -2386,7 +2388,8 @@ fn compose_additive_m0(
     } else {
         crate::project_docs::ProjectDocs::default()
     };
-    let m0_bytes = render_m0(
+    let mural = crate::m0_compose::resolved_mural(m0_mural_input(req, serializer_profile));
+    let mut m0_bytes = render_m0(
         &M0Inputs {
             project_docs: &docs.rendered_block,
             user_profile: &user_profile,
@@ -2399,11 +2402,15 @@ fn compose_additive_m0(
         },
         estimate_tokens,
     );
+    if mural.is_some() {
+        m0_bytes.push_str("\n\n");
+        m0_bytes.push_str(crate::m0_compose::MEMORY_MURAL_BLOCK);
+    }
     Ok(AdditiveM0Composition {
         m0_bytes,
+        mural,
         rendered_memory_ids,
-        memory_mutation_cursor: snapshot.revision.mutation_cursor,
-        max_memory_id: snapshot.revision.max_memory_id,
+        memory_revision: snapshot.revision,
     })
 }
 
@@ -2416,6 +2423,11 @@ fn apply_additive_only(
     let total_started_at = Instant::now();
     let projection_started_at = Instant::now();
     let projection = project_messages(&req.messages)?;
+    let live = projection
+        .blocks
+        .iter()
+        .filter(|block| !block.synthetic())
+        .collect::<Vec<_>>();
     let mut timings = TransformTimings {
         projection: elapsed_ms(projection_started_at),
         projection_blocks: projection.blocks.len(),
@@ -2425,8 +2437,8 @@ fn apply_additive_only(
     if let Some(id) = duplicate_ids(&projection.blocks) {
         return Err(TransformError::DuplicateBlockId(id));
     }
-    for block in &projection.blocks {
-        if !block.synthetic() && block.id().starts_with(RESERVED_ID_PREFIX) {
+    for block in &live {
+        if block.id().starts_with(RESERVED_ID_PREFIX) {
             return Err(TransformError::ReservedId);
         }
     }
@@ -2443,96 +2455,355 @@ fn apply_additive_only(
     }
 
     let loaded = store.load(&req.session_id)?;
+    let serializer_profile = SerializerProfile::parse(&req.serializer_profile);
+    let tagging_surface_requested =
+        crate::tagging_surface_active(serializer_profile, req.tool_present);
+    let content_epoch = m0_content_epoch_for_pass(
+        store,
+        req,
+        ctx,
+        serializer_profile,
+        tagging_surface_requested,
+    )?;
     let additive_render_identity = format!(
-        "additive-only-v1|{}|system:{}|upgrade:{}|project:{}|memory:{}|docs:{}|mb:{:016x}|ub:{:016x}",
-        req.render_config,
-        req.system_prompt_hash,
-        req.upgrade_state,
-        ctx.project_path,
-        ctx.memory_enabled,
-        ctx.inject_docs,
-        ctx.memory_budget_tokens.to_bits(),
-        ctx.user_profile_budget_tokens.to_bits(),
+        "additive-only-v2|{}",
+        render_identity_base(req, &content_epoch.prompt_surface_epoch)
     );
-    let same_additive_epoch = loaded.meta.last_render_config == additive_render_identity;
-    let expiry_cutoff_ms = if same_additive_epoch {
+    let effective_render_config_base =
+        fold_m0_content_epoch(&additive_render_identity, &content_epoch);
+    let persisted_mural_hash = frozen_mural_hash(&loaded.core).to_string();
+    let effective_render_config =
+        fold_mural_content_identity(&effective_render_config_base, &persisted_mural_hash);
+    let (render_config_changed, identity_observed, coordinator_identity) =
+        render_config_change(&loaded.meta, req, &effective_render_config, false);
+
+    let mut m1_revision_read_timings = M1RevisionReadTimings::default();
+    let m1_visibility_cutoff_ms = if loaded.meta.initialized {
         loaded.meta.expiry_cutoff_ms
     } else {
         ctx.now_ms
     };
+    let m1_signal = m1_revision_signal_parts_for_pass_timed(
+        store,
+        ctx.project_path,
+        ctx.note_project_path,
+        &req.session_id,
+        loaded.meta.user_profile_version,
+        ctx.memory_enabled,
+        m1_visibility_cutoff_ms,
+        Some(&mut m1_revision_read_timings),
+    )?;
+    let external_revision_changed = loaded.meta.initialized
+        && loaded.meta.m1_external_revision != 0
+        && m1_signal.external_revision != loaded.meta.m1_external_revision;
+    let project_memory_epoch_hard_due = loaded.meta.project_memory_epoch_pending;
 
-    let compose_started_at = Instant::now();
-    // The additive producer never reads old compartment rows. The unchanged request array below
-    // remains the complete history source; only project docs, profile, and memory are prepended.
-    let composition =
-        compose_additive_m0(store, ctx, expiry_cutoff_ms, estimate_tokens)?;
-    timings.compose_m0m1 = elapsed_ms(compose_started_at);
+    let effective_usage = effective_usage(req.usage.as_ref(), loaded.meta.last_usage.as_ref());
+    let context_limit_tokens =
+        effective_context_limit_tokens(&effective_usage, req.geometry.as_ref());
+    let hard_context_limit_tokens =
+        effective_hard_context_limit_tokens(req.geometry.as_ref(), context_limit_tokens);
+    let usage_input_tokens = effective_usage.current_total_input_tokens as f64;
+    let usage_percentage = if context_limit_tokens > 0.0 {
+        usage_input_tokens / context_limit_tokens * 100.0
+    } else {
+        0.0
+    };
+    let hard_wall_usage_percentage = if hard_context_limit_tokens > 0.0 {
+        usage_input_tokens / hard_context_limit_tokens * 100.0
+    } else {
+        usage_percentage
+    };
+    let decide_scheduler_started_at = Instant::now();
+    let mut scheduler_outcome = scheduler::decide(&SchedulerInputs {
+        config: scheduler_config(ctx.execute_threshold_percentage),
+        usage: ContextUsage {
+            percentage: usage_percentage,
+            input_tokens: usage_input_tokens,
+            hard_wall_percentage: Some(hard_wall_usage_percentage),
+        },
+        session: SessionMeta {
+            last_response_time_ms: ctx
+                .observed_last_response_at_ms
+                .map(|timestamp| timestamp.max(0) as u64)
+                .unwrap_or(0),
+            cache_ttl: internal_assumed_cache_lifetime_for_profile(
+                serializer_profile,
+                req.is_subagent,
+                &ctx.cache_ttl,
+                ctx.cache_ttl_provenance,
+            ),
+        },
+        now_ms: ctx.now_ms.max(0) as u64,
+        model_key: ctx.model_key.clone(),
+        context_limit: Some(context_limit_tokens),
+        tail_state: tail_state_from_live(&live),
+        deferred_execute: loaded
+            .meta
+            .deferred_execute_state
+            .as_ref()
+            .map(deferred_from_meta),
+        boundary_bypass: BoundaryBypass {
+            explicit_bust: loaded.meta.soft_refresh_pending,
+            subagent: req.is_subagent,
+        },
+        drain_latch: latch_from_meta(&loaded.meta),
+        overflow_error_text: req.provider_error.clone(),
+        emergency_recovery_armed: req.emergency_recovery_armed
+            && !req.emergency_recovery_no_head_escape,
+    });
+    if loaded.meta.soft_refresh_pending && scheduler_outcome.pass == scheduler::PassDecision::Defer
+    {
+        scheduler_outcome.pass = scheduler::PassDecision::Execute;
+        scheduler_outcome.deferred_execute = None;
+    }
+    timings.decide = elapsed_ms(decide_scheduler_started_at);
 
-    let stored_m0 = loaded
-        .core
-        .frozen_units
-        .iter()
-        .find(|unit| unit.key == "m0")
-        .map(|unit| unit.frozen_payload.as_str());
-    let stored_m1 = loaded
-        .core
-        .frozen_units
-        .iter()
-        .find(|unit| unit.key == "m1")
-        .map(|unit| unit.frozen_payload.as_str());
-    let materialized = !same_additive_epoch
-        || !loaded.core.boundary_id.is_empty()
-        || loaded.core.frozen_units.len() != 2
-        || stored_m0 != Some(composition.m0_bytes.as_str())
-        || stored_m1 != Some(M1_PLACEHOLDER);
+    let hard_fold_requested = scheduler_outcome.idle_ttl_fired
+        || external_revision_changed
+        || project_memory_epoch_hard_due;
+    let ordinary_historian_veto = ctx.historian_active
+        && scheduler_outcome.pass == scheduler::PassDecision::Execute
+        && !hard_fold_requested
+        && !loaded.meta.soft_refresh_pending
+        && !render_config_changed
+        && loaded.meta.initialized;
+    let bust_opportunity = (scheduler_outcome.pass != scheduler::PassDecision::Defer
+        && !ordinary_historian_veto)
+        || loaded.meta.soft_refresh_pending
+        || render_config_changed
+        || hard_fold_requested;
+    let m1_revision_changed =
+        m1_signal.revision != loaded.meta.m1_revision || loaded.meta.soft_refresh_pending;
+    let plan = classify(&ClassifierInput {
+        initialized: loaded.meta.initialized && !loaded.meta.bootstrap_seed_fold_pending,
+        is_legacy_baseline: is_legacy_baseline(&loaded.core),
+        valid_m0m1_shape: valid_m0m1_shape(&loaded.core),
+        cached_m1_missing: cached_m1_missing(&loaded.core),
+        render_config_changed,
+        hard_fold_requested,
+        // Compaction-off returns every raw request message, so refreshing m1 cannot trim
+        // messages at a stored coverage boundary and does not require a boundary anchor. It
+        // still requires a scheduler or config event that permits provider-visible bytes to change.
+        boundary_present: true,
+        reconcile_pending: false,
+        m1_revision_changed,
+        reductions_pending: false,
+        bust_opportunity,
+    });
+    if let PassPlan::Reject(message) = plan {
+        return Err(TransformError::UnknownShape(message));
+    }
+    let additive_shape_clean = loaded.core.boundary_id.is_empty()
+        && loaded.core.pending_changes.is_empty()
+        && loaded
+            .core
+            .frozen_units
+            .iter()
+            .all(|unit| matches!(unit.key.as_str(), "m0" | "m1" | M0_MURAL_KEY));
+    if !matches!(plan, PassPlan::Hard | PassPlan::MigrateHard) && !additive_shape_clean {
+        return Err(TransformError::UnknownShape(
+            "compaction-off frozen set contains historical mutation units",
+        ));
+    }
 
     let mut core = loaded.core.clone();
     let mut meta = loaded.meta.clone();
-    let row_version = if materialized {
-        core.frozen_units.clear();
-        core.pending_changes.clear();
-        core.step(PassInput {
-            proposed: Some(mc_core::Action::Hard),
-            boundary_present: "-".to_string(),
-            rendered_units: vec![
-                synth_region("m0", composition.m0_bytes.clone()),
-                render_m1_placeholder(),
-            ],
-            new_boundary_id: Some(String::new()),
-            queued: Vec::new(),
-            run_started: false,
-        });
-        meta.initialized = true;
-        meta.bootstrap_seed_fold_pending = false;
-        meta.last_render_config = additive_render_identity;
+    if !identity_observed && coordinator_identity {
         meta.last_provider_id = req.provider_id.clone().unwrap_or_default();
         meta.last_model_key = req.model_key.clone().unwrap_or_default();
         meta.last_system_prompt_hash = req.system_prompt_hash.clone();
         meta.last_upgrade_state = req.upgrade_state.clone();
-        meta.coverage_ordinal = None;
-        meta.coverage_start_ordinal = None;
-        meta.coverage_compartment_seq = None;
-        meta.folded_compartment_seq = 0;
-        meta.rendered_memory_ids = composition.rendered_memory_ids.clone();
-        meta.memory_mutation_cursor = composition.memory_mutation_cursor;
-        meta.max_memory_id = composition.max_memory_id;
-        meta.expiry_cutoff_ms = expiry_cutoff_ms;
-        meta.memory_disabled = !ctx.memory_enabled;
-        meta.synthetic_todo = None;
-        meta.m1_pending_since_ms = None;
-        store.commit(&req.session_id, loaded.row_version, &core, &meta)?
-    } else {
-        loaded.row_version.unwrap_or(0)
-    };
+        meta.last_render_config = effective_render_config.clone();
+    }
+    let provisional_tail_mid = provisional_tail_mid(req);
+    apply_ingress_meta(&mut meta, req, &projection, provisional_tail_mid, None, &[]);
+    let cc_u1_active = crate::cc_u1_active(serializer_profile, req.tool_present);
+    meta.cc_u1_active = cc_u1_active;
+    meta.tagging_surface_active = tagging_surface_requested;
+    if cc_u1_active {
+        meta.last_serializer_profile = req.serializer_profile.clone();
+    }
+    apply_scheduler_meta(&mut meta, &scheduler_outcome);
+
+    let compose_started_at = Instant::now();
+    let mut commit_memory_revision = None;
+    let mut commit_compartment_max_seq = None;
+    let mut note_deliveries = Vec::new();
+    match plan {
+        PassPlan::Hard | PassPlan::MigrateHard => {
+            let composition = compose_additive_m0(
+                store,
+                req,
+                ctx,
+                ctx.now_ms,
+                serializer_profile,
+                estimate_tokens,
+            )?;
+            let (note_body, hard_note_deliveries) = claim_and_render_notes(
+                store,
+                ctx.note_project_path,
+                &req.session_id,
+                &format!("m1:{}:{}", m1_signal.revision, ctx.now_ms),
+                &format!("m1:{}:{}", m1_signal.revision, ctx.now_ms),
+                ctx.now_ms,
+            )?;
+            note_deliveries = hard_note_deliveries;
+            let m1_unit = if note_body.is_empty() {
+                render_m1_placeholder()
+            } else {
+                render_m1_body(&note_body)
+            };
+            let mural_unit = composition.mural.as_ref().map(render_mural_block);
+            let committed_mural_hash = composition
+                .mural
+                .as_ref()
+                .map(|mural| mural.content_hash.clone())
+                .unwrap_or_default();
+            let mut rendered_units = vec![synth_region("m0", composition.m0_bytes)];
+            if let Some(mural_unit) = mural_unit {
+                rendered_units.push(mural_unit);
+            }
+            rendered_units.push(m1_unit);
+            core.frozen_units.clear();
+            core.pending_changes.clear();
+            core.step(PassInput {
+                proposed: Some(mc_core::Action::Hard),
+                boundary_present: "-".to_string(),
+                rendered_units,
+                new_boundary_id: Some(String::new()),
+                queued: Vec::new(),
+                run_started: false,
+            });
+
+            let applied_m1_signal = m1_revision_signal_parts_for_pass_timed(
+                store,
+                ctx.project_path,
+                ctx.note_project_path,
+                &req.session_id,
+                meta.user_profile_version,
+                ctx.memory_enabled,
+                ctx.now_ms,
+                Some(&mut m1_revision_read_timings),
+            )?;
+            meta.initialized = true;
+            meta.bootstrap_seed_fold_pending = false;
+            meta.last_render_config =
+                fold_mural_content_identity(&effective_render_config_base, &committed_mural_hash);
+            meta.last_provider_id = req.provider_id.clone().unwrap_or_default();
+            meta.last_model_key = req.model_key.clone().unwrap_or_default();
+            meta.last_system_prompt_hash = req.system_prompt_hash.clone();
+            meta.last_upgrade_state = req.upgrade_state.clone();
+            meta.coverage_ordinal = None;
+            meta.coverage_start_ordinal = None;
+            meta.coverage_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
+            // Compaction-off ignores stored compartments. Record the current maximum sequence
+            // so rows created before this mode was enabled do not reappear in m1 as new history.
+            meta.folded_compartment_seq = applied_m1_signal.max_compartment_seq;
+            meta.rendered_memory_ids = composition.rendered_memory_ids;
+            meta.memory_mutation_cursor = composition.memory_revision.mutation_cursor;
+            meta.max_memory_id = composition.memory_revision.max_memory_id;
+            meta.expiry_cutoff_ms = ctx.now_ms;
+            meta.memory_disabled = !ctx.memory_enabled;
+            meta.m1_revision = applied_m1_signal.revision;
+            meta.m1_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
+            meta.m1_user_profile_version = meta.user_profile_version;
+            meta.m1_external_revision = applied_m1_signal.external_revision;
+            meta.project_memory_epoch_pending = false;
+            meta.synthetic_todo = None;
+            meta.m1_pending_since_ms = None;
+            meta.soft_refresh_pending = false;
+            commit_compartment_max_seq = Some(applied_m1_signal.max_compartment_seq);
+            commit_memory_revision = Some(composition.memory_revision);
+        }
+        PassPlan::Soft => {
+            let mut additive_meta = meta.clone();
+            additive_meta.folded_compartment_seq = m1_signal.max_compartment_seq;
+            additive_meta.coverage_ordinal = None;
+            let m1 = compose_m1_from_store(
+                store,
+                ctx.project_path,
+                ctx.note_project_path,
+                &req.session_id,
+                &additive_meta,
+                meta.expiry_cutoff_ms,
+                ctx.memory_enabled,
+                ctx.memory_budget_tokens,
+                ctx.user_profile_budget_tokens,
+                ctx.temporal_awareness,
+                mc_tokenizer::estimate_tokens,
+            )?;
+            note_deliveries = m1.note_deliveries.clone();
+            let profile_rendered = m1.profile_rendered;
+            core.step(PassInput {
+                proposed: Some(mc_core::Action::Soft),
+                boundary_present: "-".to_string(),
+                rendered_units: vec![render_m1_body(&m1.body)],
+                new_boundary_id: None,
+                queued: Vec::new(),
+                run_started: false,
+            });
+            let applied_m1_signal = m1_revision_signal_parts_for_pass_timed(
+                store,
+                ctx.project_path,
+                ctx.note_project_path,
+                &req.session_id,
+                meta.user_profile_version,
+                ctx.memory_enabled,
+                meta.expiry_cutoff_ms,
+                Some(&mut m1_revision_read_timings),
+            )?;
+            meta.memory_disabled = !ctx.memory_enabled;
+            meta.m1_revision = applied_m1_signal.revision;
+            meta.m1_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
+            meta.coverage_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
+            meta.folded_compartment_seq = applied_m1_signal.max_compartment_seq;
+            if profile_rendered {
+                meta.m1_user_profile_version = meta.user_profile_version;
+            }
+            meta.m1_pending_since_ms = None;
+            meta.soft_refresh_pending = false;
+            commit_compartment_max_seq = Some(applied_m1_signal.max_compartment_seq);
+            if ctx.memory_enabled {
+                commit_memory_revision = Some(memory_revision_fence(
+                    store,
+                    ctx.project_path,
+                    meta.expiry_cutoff_ms,
+                    &applied_m1_signal,
+                )?);
+            }
+        }
+        PassPlan::Defer => {
+            if m1_signal.revision != loaded.meta.m1_revision {
+                log_pending_m1_delta(&req.session_id, ctx.now_ms, loaded.meta.m1_pending_since_ms);
+            }
+        }
+        PassPlan::Reject(_) => unreachable!("reject returned before composition"),
+    }
+    timings.compose_m0m1 = elapsed_ms(compose_started_at);
 
     let build_started_at = Instant::now();
+    let m0 = core
+        .frozen_units
+        .iter()
+        .find(|unit| unit.key == "m0")
+        .ok_or(TransformError::UnknownShape("compaction-off m0 missing"))?;
+    let m1 = core
+        .frozen_units
+        .iter()
+        .find(|unit| unit.key == "m1")
+        .ok_or(TransformError::UnknownShape("compaction-off m1 missing"))?;
+    let mural = core
+        .frozen_units
+        .iter()
+        .find(|unit| unit.key == M0_MURAL_KEY);
     let mut messages = Vec::with_capacity(req.messages.len() + 2);
     messages.push(ServedMessage::from_message(synthetic_m0_message(
-        composition.m0_bytes,
-        None,
+        m0.frozen_payload.clone(),
+        mural,
     )));
     messages.push(ServedMessage::from_message(
-        CkWireMessage::synthetic_user_text(M1_PLACEHOLDER.to_string()),
+        CkWireMessage::synthetic_user_text(m1.frozen_payload.clone()),
     ));
     messages.extend(
         req.messages
@@ -2541,14 +2812,80 @@ fn apply_additive_only(
     );
     timings.build_output = elapsed_ms(build_started_at);
     timings.tail_messages_emitted = req.messages.len();
+    timings.frozen_units = core.frozen_units.len();
+
+    let state_changed = core != loaded.core || meta != loaded.meta;
+    if state_changed {
+        meta.last_committed_pass_at_ms = ctx.now_ms;
+    }
+    let commit_required = core != loaded.core || meta != loaded.meta;
+    let store_commit_started_at = Instant::now();
+    let row_version = if commit_required {
+        #[cfg(test)]
+        run_transform_attempt_hook(&req.session_id);
+        store.commit_transform(
+            &req.session_id,
+            TransformCommit {
+                expected: loaded.row_version,
+                core: &core,
+                meta: &meta,
+                consumed_drop_ids: &[],
+                first_applied_command_ids: &[],
+                memory_revision: commit_memory_revision.as_ref(),
+                compartment_max_seq: commit_compartment_max_seq,
+                project_root: Some(ctx.project_directory),
+                first_divergence: None,
+                scheduler_observation: Some(&pass_scheduler_observation(
+                    scheduler_outcome.pass,
+                    scheduler_outcome.drain_latch.is_active(),
+                    ctx.now_ms,
+                )),
+                scheduler_request_observed_at_ms: req.request_observed_at_ms,
+                scheduler_full_array_fingerprint: req.full_array_fingerprint.as_deref(),
+                scheduler_eligible_supersession_count: None,
+                scheduler_withheld_by_tag_window: None,
+                scheduler_withheld_by_exempt_message: None,
+                scheduler_applied_supersession_count: None,
+                scheduler_applied_reductions: false,
+                overlays: TransformOverlayBatch::default(),
+            },
+        )?
+    } else {
+        loaded.row_version.unwrap_or(0)
+    };
+    timings.store_commit = elapsed_ms(store_commit_started_at);
+    timings.store_memories = m1_revision_read_timings.memories_ms;
+    timings.store_notes = m1_revision_read_timings.notes_ms;
     timings.total = elapsed_ms(total_started_at);
 
-    let action = if materialized { "HARD" } else { "SOFT+" };
+    let action = action_str(&plan, &core).to_string();
+    let materialize_reason = match plan {
+        PassPlan::Hard | PassPlan::MigrateHard => Some(
+            if !loaded.meta.initialized || loaded.meta.bootstrap_seed_fold_pending {
+                "first_render"
+            } else if is_legacy_baseline(&loaded.core) {
+                "legacy_migration"
+            } else if render_config_changed {
+                "epoch_change"
+            } else if scheduler_outcome.idle_ttl_fired {
+                "ttl_expiry"
+            } else if external_revision_changed || project_memory_epoch_hard_due {
+                "project_memory_epoch"
+            } else if cached_m1_missing(&loaded.core) {
+                "cached_m1_missing"
+            } else {
+                "hard_trigger"
+            }
+            .to_string(),
+        ),
+        PassPlan::Soft => Some("m1_delta".to_string()),
+        PassPlan::Defer | PassPlan::Reject(_) => None,
+    };
     Ok(TransformWithProjection {
         tag_numbers: BTreeMap::new(),
         projection,
-        scheduler_pass: scheduler::PassDecision::Defer,
-        scheduler_drain_latch_active: false,
+        scheduler_pass: scheduler_outcome.pass,
+        scheduler_drain_latch_active: scheduler_outcome.drain_latch.is_active(),
         boundary_state: BoundaryState::Absent,
         trim_mismatch: None,
         revert_epoch: meta.revert_epoch,
@@ -2562,9 +2899,9 @@ fn apply_additive_only(
             status: TransformStatus::Ok,
             served_from: ServedFrom::Transform,
             full_array_fingerprint: req.full_array_fingerprint.clone(),
-            action: action.to_string(),
-            decision: action.to_string(),
-            materialize_reason: materialized.then(|| "additive_only".to_string()),
+            action: action.clone(),
+            decision: action,
+            materialize_reason,
             first_divergence: None,
             timings: Some(timings),
             boundary_id: String::new(),
@@ -2572,9 +2909,9 @@ fn apply_additive_only(
             version: core.version,
             row_version,
             surface_state: SurfaceState::Inactive,
-            committed: materialized,
+            committed: commit_required,
             coverage_ordinal: None,
-            rendered_memory_ids: Some(composition.rendered_memory_ids),
+            rendered_memory_ids: Some(meta.rendered_memory_ids.clone()),
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             cache_ttl: None,
@@ -2584,7 +2921,7 @@ fn apply_additive_only(
             native_messages: None,
             host_directives: None,
             channel2_directive: None,
-            note_deliveries: None,
+            note_deliveries: (!note_deliveries.is_empty()).then_some(note_deliveries),
         },
     })
 }
@@ -2839,40 +3176,13 @@ fn apply_once(
     // tagger is active only after its non-zero epoch is present in the session's committed
     // render identity, so an established dormant session cannot acquire tags before the
     // coordinating cache-breaking HARD fold has committed.
-    let memory_render_epoch = if crate::MEMORY_RENDER_FORMAT_EPOCH != 0 {
-        format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH)
-    } else {
-        String::new()
-    };
-    let compartment_render_epoch = if crate::COMPARTMENT_RENDER_FORMAT_EPOCH != 0 {
-        format!("cre{}", crate::COMPARTMENT_RENDER_FORMAT_EPOCH)
-    } else {
-        String::new()
-    };
-    let profile_render_epoch = serializer_profile
-        .map(crate::profile_render_epoch)
-        .filter(|epoch| *epoch != 0)
-        .map(|epoch| format!("mpe{epoch}"))
-        .unwrap_or_default();
-    let tagger_feature_epoch = match crate::tagger_feature_epoch(tagging_surface_requested) {
-        0 => String::new(),
-        epoch => format!("tfe{epoch}"),
-    };
-    let prompt_surface_epoch = crate::prompt_surface::unified_content_epoch(
-        &req.system_prompt_hash,
-        &prompt_surface_selection(req),
-    );
-    let mut content_epoch = M0ContentEpoch {
-        workspace_fingerprint: store.workspace_fingerprint(ctx.project_path, ctx.now_ms)?,
-        upgrade_state: req.upgrade_state.clone(),
-        memory_content_epoch: String::new(),
-        memory_render_epoch,
-        compartment_render_epoch,
-        profile_render_epoch,
-        prompt_surface_epoch,
-        tagger_feature_epoch: tagger_feature_epoch.clone(),
-        transition_epoch: String::new(),
-    };
+    let mut content_epoch = m0_content_epoch_for_pass(
+        store,
+        req,
+        ctx,
+        serializer_profile,
+        tagging_surface_requested,
+    )?;
     let render_identity = render_identity_base(req, &content_epoch.prompt_surface_epoch);
     let persisted_mural_hash = frozen_mural_hash(&loaded.core).to_string();
     let stable_effective_render_config_base =
@@ -3442,29 +3752,8 @@ fn apply_once(
     };
     // A legacy/first-observation row has no stored identity. Adopt the current identity
     // without folding; only a change from a non-empty durable value is a HARD trigger.
-    let identity_observed = !loaded.meta.last_provider_id.is_empty()
-        || !loaded.meta.last_model_key.is_empty()
-        || !loaded.meta.last_system_prompt_hash.is_empty()
-        || !loaded.meta.last_upgrade_state.is_empty();
-    let coordinator_identity = req.render_config.contains("provider:")
-        || req.render_config.contains("model:")
-        || req.provider_id.is_some()
-        || req.model_key.is_some()
-        || !req.system_prompt_hash.is_empty()
-        || !req.upgrade_state.is_empty();
-    let render_config_changed = loaded.meta.initialized
-        && if transition_due || identity_observed || !coordinator_identity {
-            effective_render_config != loaded.meta.last_render_config
-        } else if loaded.meta.last_render_config.is_empty() {
-            false
-        } else if render_config_base(&loaded.meta.last_render_config).is_empty() {
-            // Older rows stored no provider identity in the base. Adopt the first provider
-            // identity without folding, while still honoring a real module render-epoch change.
-            render_epoch_suffix(&effective_render_config, true)
-                != render_epoch_suffix(&loaded.meta.last_render_config, true)
-        } else {
-            effective_render_config != loaded.meta.last_render_config
-        };
+    let (render_config_changed, identity_observed, coordinator_identity) =
+        render_config_change(&loaded.meta, req, &effective_render_config, transition_due);
     let reconcile_hard_due = loaded.core.reconcile_pending && !boundary_present;
     // If Claude-code coverage advances over system messages, force a HARD render so the
     // messages move into the m0 prefix before the byte-splice profile suppresses their
@@ -5300,6 +5589,79 @@ fn m0_mural_input(
     )
     .then_some(req.mural.as_ref())
     .flatten()
+}
+
+fn m0_content_epoch_for_pass(
+    store: &McStore,
+    req: &TransformRequest,
+    ctx: &ProducerContext<'_>,
+    serializer_profile: Option<SerializerProfile>,
+    tagging_surface_requested: bool,
+) -> Result<M0ContentEpoch, TransformError> {
+    let memory_render_epoch = if crate::MEMORY_RENDER_FORMAT_EPOCH != 0 {
+        format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH)
+    } else {
+        String::new()
+    };
+    let compartment_render_epoch = if crate::COMPARTMENT_RENDER_FORMAT_EPOCH != 0 {
+        format!("cre{}", crate::COMPARTMENT_RENDER_FORMAT_EPOCH)
+    } else {
+        String::new()
+    };
+    let profile_render_epoch = serializer_profile
+        .map(crate::profile_render_epoch)
+        .filter(|epoch| *epoch != 0)
+        .map(|epoch| format!("mpe{epoch}"))
+        .unwrap_or_default();
+    let tagger_feature_epoch = match crate::tagger_feature_epoch(tagging_surface_requested) {
+        0 => String::new(),
+        epoch => format!("tfe{epoch}"),
+    };
+    let prompt_surface_epoch = crate::prompt_surface::unified_content_epoch(
+        &req.system_prompt_hash,
+        &prompt_surface_selection(req),
+    );
+    Ok(M0ContentEpoch {
+        workspace_fingerprint: store.workspace_fingerprint(ctx.project_path, ctx.now_ms)?,
+        upgrade_state: req.upgrade_state.clone(),
+        memory_content_epoch: String::new(),
+        memory_render_epoch,
+        compartment_render_epoch,
+        profile_render_epoch,
+        prompt_surface_epoch,
+        tagger_feature_epoch,
+        transition_epoch: String::new(),
+    })
+}
+
+fn render_config_change(
+    meta: &ModuleMeta,
+    req: &TransformRequest,
+    effective_render_config: &str,
+    transition_due: bool,
+) -> (bool, bool, bool) {
+    let identity_observed = !meta.last_provider_id.is_empty()
+        || !meta.last_model_key.is_empty()
+        || !meta.last_system_prompt_hash.is_empty()
+        || !meta.last_upgrade_state.is_empty();
+    let coordinator_identity = req.render_config.contains("provider:")
+        || req.render_config.contains("model:")
+        || req.provider_id.is_some()
+        || req.model_key.is_some()
+        || !req.system_prompt_hash.is_empty()
+        || !req.upgrade_state.is_empty();
+    let changed = meta.initialized
+        && if transition_due || identity_observed || !coordinator_identity {
+            effective_render_config != meta.last_render_config
+        } else if meta.last_render_config.is_empty() {
+            false
+        } else if render_config_base(&meta.last_render_config).is_empty() {
+            render_epoch_suffix(effective_render_config, true)
+                != render_epoch_suffix(&meta.last_render_config, true)
+        } else {
+            effective_render_config != meta.last_render_config
+        };
+    (changed, identity_observed, coordinator_identity)
 }
 
 fn prompt_surface_selection(req: &TransformRequest) -> PromptSurfaceSelection {
@@ -14864,6 +15226,232 @@ pub(crate) mod tests {
         assert!(!defer.committed);
         assert_eq!(serde_json::to_vec(defer.messages()).unwrap(), first_bytes);
         assert_eq!(opencode_native_bytes(&defer, "off-additive"), first_native);
+    }
+
+    #[test]
+    fn compaction_off_additive_changes_defer_then_ride_m1_and_fold_on_hard() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("ARCHITECTURE.md"),
+            "# Architecture\n\nFrozen docs A\n",
+        )
+        .unwrap();
+        let s = store(dir.path());
+        s.insert_memory(memory_input(
+            "git:proj",
+            "ARCHITECTURE",
+            "Frozen memory A",
+            0,
+        ))
+        .unwrap();
+        let request = active_opencode_req(
+            "off-deltas",
+            "cfg0",
+            vec![item("tail", 1, "raw tail must remain unchanged")],
+        );
+        let project_directory = project_dir.to_str().unwrap();
+        let mut ctx = pctx("git:proj", project_directory, 0);
+        ctx.compaction_enabled = false;
+
+        let first = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(first.action, "HARD");
+        assert!(m0_bytes(&first).contains("Frozen memory A"));
+        assert!(m0_bytes(&first).contains("Frozen docs A"));
+        assert_eq!(m1_bytes(&first), M1_PLACEHOLDER);
+        let first_bytes = serde_json::to_vec(first.messages()).unwrap();
+        let first_m0 = m0_bytes(&first).to_string();
+
+        s.insert_memory(memory_input(
+            "git:proj",
+            "CONSTRAINTS",
+            "Deferred memory B",
+            1,
+        ))
+        .unwrap();
+        std::fs::write(
+            project_dir.join("ARCHITECTURE.md"),
+            "# Architecture\n\nDeferred docs B\n",
+        )
+        .unwrap();
+
+        let deferred = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(deferred.action, "SOFT+");
+        assert!(!deferred.committed);
+        assert_eq!(
+            serde_json::to_vec(deferred.messages()).unwrap(),
+            first_bytes,
+            "additive store and docs changes cannot rewrite the frozen prefix on defer",
+        );
+        assert!(!m0_bytes(&deferred).contains("Deferred memory B"));
+        assert!(!m0_bytes(&deferred).contains("Deferred docs B"));
+
+        let execute_request = with_usage(request.clone(), 70, 100);
+        let soft = transform(&s, &execute_request, &ctx).unwrap();
+        assert_eq!(soft.action, "SOFT");
+        assert_eq!(m0_bytes(&soft), first_m0);
+        assert!(m1_bytes(&soft).contains("<new-memories>"));
+        assert!(m1_bytes(&soft).contains("Deferred memory B"));
+        assert!(!m0_bytes(&soft).contains("Deferred docs B"));
+        assert_eq!(&*soft.messages()[2], &request.messages[0].ck);
+        let soft_bytes = serde_json::to_vec(soft.messages()).unwrap();
+
+        let replay = transform(&s, &execute_request, &ctx).unwrap();
+        assert_eq!(replay.action, "SOFT+");
+        assert!(!replay.committed);
+        assert_eq!(serde_json::to_vec(replay.messages()).unwrap(), soft_bytes);
+
+        let mut hard_request = execute_request;
+        hard_request.render_config = "cfg1".to_string();
+        let folded = transform(&s, &hard_request, &ctx).unwrap();
+        assert_eq!(folded.action, "HARD");
+        assert!(m0_bytes(&folded).contains("Deferred memory B"));
+        assert!(m0_bytes(&folded).contains("Deferred docs B"));
+        assert_eq!(m1_bytes(&folded), M1_PLACEHOLDER);
+        assert_eq!(&*folded.messages()[2], &request.messages[0].ck);
+    }
+
+    #[test]
+    fn compaction_off_uses_normal_model_system_and_ttl_hard_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.insert_memory(memory_input(
+            "git:proj",
+            "ARCHITECTURE",
+            "identity baseline",
+            0,
+        ))
+        .unwrap();
+        let mut request =
+            active_opencode_req("off-hard-authority", "cfg0", vec![item("tail", 1, "raw")]);
+        request.model_key = Some("provider/model-a".to_string());
+        request.system_prompt_hash = "system-a".to_string();
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.compaction_enabled = false;
+
+        let first = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(first.action, "HARD");
+
+        s.insert_memory(memory_input(
+            "git:proj",
+            "CONSTRAINTS",
+            "model-folded memory",
+            1,
+        ))
+        .unwrap();
+        request.model_key = Some("provider/model-b".to_string());
+        let model_fold = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(model_fold.action, "HARD");
+        assert!(m0_bytes(&model_fold).contains("model-folded memory"));
+
+        s.insert_memory(memory_input(
+            "git:proj",
+            "CONSTRAINTS",
+            "system-folded memory",
+            2,
+        ))
+        .unwrap();
+        request.system_prompt_hash = "system-b".to_string();
+        let system_fold = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(system_fold.action, "HARD");
+        assert!(m0_bytes(&system_fold).contains("system-folded memory"));
+
+        s.insert_memory(memory_input(
+            "git:proj",
+            "CONSTRAINTS",
+            "ttl-folded memory",
+            3,
+        ))
+        .unwrap();
+        ctx.observed_last_response_at_ms = Some(1);
+        ctx.now_ms = FIVE_MINUTE_CACHE_TTL_MS as i64 + 2;
+        let ttl_fold = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(ttl_fold.action, "HARD");
+        assert_eq!(ttl_fold.materialize_reason.as_deref(), Some("ttl_expiry"));
+        assert!(m0_bytes(&ttl_fold).contains("ttl-folded memory"));
+    }
+
+    #[test]
+    fn compaction_off_mural_is_frozen_and_replaced_only_on_authorized_hard() {
+        fn mural_request(
+            session_id: &str,
+            render_config: &str,
+            hash: &str,
+            data_url: &str,
+        ) -> TransformRequest {
+            let mut request =
+                active_opencode_req(session_id, render_config, vec![item("tail", 1, "raw tail")]);
+            request.mural = Some(crate::m0_compose::M0MuralInput {
+                enabled: true,
+                supports_vision: true,
+                data_url: Some(data_url.to_string()),
+                content_hash: Some(hash.to_string()),
+            });
+            request
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments(
+            "off-mural",
+            &[comp(1, 1, 1, "tail", "historian rows stay hidden")],
+        )
+        .unwrap();
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.compaction_enabled = false;
+        let mural_a = mural_request("off-mural", "cfg0", "mural-a", "data:image/png;base64,YQ==");
+
+        let first = transform(&s, &mural_a, &ctx).unwrap();
+        assert_eq!(first.action, "HARD");
+        assert!(m0_bytes(&first).contains("<memory-mural>"));
+        assert!(!m0_bytes(&first).contains("historian rows stay hidden"));
+        assert_eq!(first.messages()[0].content.len(), 2);
+        match &first.messages()[0].content[1].kind {
+            ck_wire::CkKind::Media(media) => {
+                assert_eq!(media.source["url"], json!("data:image/png;base64,YQ=="));
+            }
+            other => panic!("expected additive mural image, got {other:?}"),
+        }
+        assert_eq!(&*first.messages()[2], &mural_a.messages[0].ck);
+        assert_eq!(
+            frozen_mural_hash(&s.load("off-mural").unwrap().core),
+            "mural-a"
+        );
+        let first_bytes = serde_json::to_vec(first.messages()).unwrap();
+
+        let mural_b = mural_request("off-mural", "cfg0", "mural-b", "data:image/png;base64,Yg==");
+        let deferred = transform(&s, &mural_b, &ctx).unwrap();
+        assert_eq!(deferred.action, "SOFT+");
+        assert!(!deferred.committed);
+        assert_eq!(
+            serde_json::to_vec(deferred.messages()).unwrap(),
+            first_bytes
+        );
+        assert_eq!(
+            frozen_mural_hash(&s.load("off-mural").unwrap().core),
+            "mural-a"
+        );
+
+        let folded_request =
+            mural_request("off-mural", "cfg1", "mural-b", "data:image/png;base64,Yg==");
+        let folded = transform(&s, &folded_request, &ctx).unwrap();
+        assert_eq!(folded.action, "HARD");
+        match &folded.messages()[0].content[1].kind {
+            ck_wire::CkKind::Media(media) => {
+                assert_eq!(media.source["url"], json!("data:image/png;base64,Yg=="));
+            }
+            other => panic!("expected replacement mural image, got {other:?}"),
+        }
+        assert_eq!(
+            frozen_mural_hash(&s.load("off-mural").unwrap().core),
+            "mural-b"
+        );
+        let folded_bytes = serde_json::to_vec(folded.messages()).unwrap();
+
+        let replay = transform(&s, &folded_request, &ctx).unwrap();
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(serde_json::to_vec(replay.messages()).unwrap(), folded_bytes);
     }
 
     #[test]

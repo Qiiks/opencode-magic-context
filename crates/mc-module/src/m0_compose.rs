@@ -19,7 +19,7 @@ use crate::decay_render::{extract_m0_block, DecayRenderCompartment};
 use crate::memory_render::{render_m0, render_memory_line, workspace_source_names, M0Inputs};
 use crate::project_docs::read_project_docs_canonical;
 
-const MEMORY_MURAL_BLOCK: &str =
+pub(crate) const MEMORY_MURAL_BLOCK: &str =
     "<memory-mural>\nThe project memory mural image follows.\n</memory-mural>";
 
 /// Why composing the HARD m0 from the store failed.
@@ -135,7 +135,7 @@ pub struct M0ComposeInputs<'a> {
     pub mural: Option<&'a M0MuralInput>,
 }
 
-fn resolved_mural(input: Option<&M0MuralInput>) -> Option<M0MuralBlock> {
+pub(crate) fn resolved_mural(input: Option<&M0MuralInput>) -> Option<M0MuralBlock> {
     let input = input?;
     if !input.enabled || !input.supports_vision {
         return None;
