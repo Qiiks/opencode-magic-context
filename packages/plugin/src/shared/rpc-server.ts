@@ -185,6 +185,7 @@ export class MagicContextRpcServer {
                     port: this.port,
                     pid: process.pid,
                     started_at: this.startedAt,
+                    kind: "OpenCode server",
                     token: this.token,
                     instance_id: this.instanceId,
                 }),

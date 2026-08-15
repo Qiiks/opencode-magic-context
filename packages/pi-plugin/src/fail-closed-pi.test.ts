@@ -70,8 +70,8 @@ describe("registerPiFailClosedSurface", () => {
 				persistedVersion: 73,
 				supportedVersion: 74,
 				blockingProcesses: [
-					{ harness: "OpenCode server", pid: 5736 },
-					{ harness: "OpenCode server", pid: 5737 },
+					{ kind: "OpenCode server", pid: 5736 },
+					{ kind: "Pi", pid: 5737 },
 				],
 			},
 			tryReopen: async () => null,
@@ -87,7 +87,7 @@ describe("registerPiFailClosedSurface", () => {
 		expect(isFailClosedBlockingError(thrown)).toBe(true);
 		const message = thrown instanceof Error ? thrown.message : String(thrown);
 		expect(message).toContain("OpenCode server (PID 5736)");
-		expect(message).toContain("OpenCode server (PID 5737)");
+		expect(message).toContain("Pi (PID 5737)");
 		expect(message).toContain("an older Magic Context build");
 		expect(message).toContain(FAIL_CLOSED_DOCTOR_COMMAND);
 	});

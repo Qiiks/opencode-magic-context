@@ -25,9 +25,9 @@ const migrationReason: FailClosedReason = {
     persistedVersion: 73,
     supportedVersion: 74,
     blockingProcesses: [
-        { harness: "OpenCode server", pid: 5736 },
-        { harness: "OpenCode server", pid: 5736 },
-        { harness: "OpenCode server", pid: 5737 },
+        { kind: "OpenCode server", pid: 5736 },
+        { kind: "OpenCode server", pid: 5736 },
+        { kind: "OpenCode instance (TUI/CLI)", pid: 5737 },
     ],
 };
 
@@ -50,12 +50,13 @@ describe("formatFailClosedBlockingMessage", () => {
     it("names the blocking processes and gives ordered recovery actions", () => {
         const message = formatFailClosedBlockingMessage(migrationReason);
         expect(message).toContain("OpenCode server (PID 5736)");
-        expect(message).toContain("OpenCode server (PID 5737)");
+        expect(message).toContain("OpenCode instance (TUI/CLI) (PID 5737)");
         expect(message).toContain("an older Magic Context build");
         expect(message).toContain("would fail against the migrated database");
         expect(message).toContain(
             "Restart the blocking process (it will pick up the new build and migrate on start), or shut it down and retry.",
         );
+        expect(message).not.toContain("OpenCode server (PID 5737)");
         expect(message).not.toContain("fence");
         expect(message).toContain(FAIL_CLOSED_DOCTOR_COMMAND);
     });
@@ -73,6 +74,8 @@ describe("formatFailClosedBlockingMessage", () => {
         expect(message).toContain(file);
         expect(message).toContain("io arm");
         expect(message).toContain("safe to delete");
+        expect(message).toContain("If none of these processes are running");
+        expect(message).not.toContain("If no OpenCode server is running");
         expect(message).toContain(FAIL_CLOSED_DOCTOR_COMMAND);
     });
 
@@ -94,10 +97,10 @@ describe("formatFailClosedBlockingMessage", () => {
     it("deduplicates and bounds the process list", () => {
         const processes = [
             ...Array.from({ length: 10 }, (_, index) => ({
-                harness: "OpenCode server",
+                kind: "OpenCode server" as const,
                 pid: index + 1,
             })),
-            { harness: "OpenCode server", pid: 1 },
+            { kind: "OpenCode server" as const, pid: 1 },
         ];
         const message = formatFailClosedBlockingProcesses(processes);
         expect(message).toContain("OpenCode server (PID 1)");

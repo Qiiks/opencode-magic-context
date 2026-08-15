@@ -6,6 +6,7 @@ import type { readFileSync } from "node:fs";
 import {
     __resetRpcIdentityTestHooks,
     __setRpcIdentityTestHooks,
+    classifyProcessKind,
     discoverLivePiProcessIds,
     inspectLivePiProcesses,
     isPidAlive,
@@ -52,6 +53,30 @@ function tasklistOutput(entries: Array<[number, string]>): string {
 
 afterEach(() => {
     __resetRpcIdentityTestHooks();
+});
+
+describe("classifyProcessKind", () => {
+    test("classifies OpenCode server, OpenCode instance, Pi, and unknown commands", () => {
+        expect(classifyProcessKind("/usr/local/bin/opencode serve --hostname 127.0.0.1")).toBe(
+            "OpenCode server",
+        );
+        expect(classifyProcessKind("node /opt/opencode/bin/opencode --continue")).toBe(
+            "OpenCode instance (TUI/CLI)",
+        );
+        expect(
+            classifyProcessKind("bun /workspace/node_modules/@mariozechner/pi-coding-agent/dist/cli.js"),
+        ).toBe("Pi");
+        expect(classifyProcessKind("/usr/bin/other --flag")).toBe("process");
+        expect(classifyProcessKind(null)).toBe("process");
+    });
+
+    test("recognizes serve flags and Windows-style executable paths", () => {
+        expect(classifyProcessKind("opencode --serve=true")).toBe("OpenCode server");
+        expect(classifyProcessKind("C:\\Tools\\opencode.exe")).toBe(
+            "OpenCode instance (TUI/CLI)",
+        );
+        expect(classifyProcessKind("pi.cmd --model test")).toBe("Pi");
+    });
 });
 
 describe("discoverLivePiProcessIds", () => {

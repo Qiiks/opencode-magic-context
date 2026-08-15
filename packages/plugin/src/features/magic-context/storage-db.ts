@@ -19,17 +19,22 @@ import {
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
 import {
+    classifyProcessKind,
     discoverLivePiProcessIds,
     inspectLivePiProcesses,
     isPidAlive,
     isPidIdentityPlausible,
     parseRpcPortFile,
+    readProcessCommand,
 } from "../../shared/rpc-utils";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
 import { ensureContextStoreUuid } from "./context-authority";
-import type { FailClosedBlockingProcess } from "./fail-closed-block";
+import type {
+    FailClosedBlockingProcess,
+    FailClosedProcessKind,
+} from "./fail-closed-block";
 import { FORK_MIGRATION_VERSION_FLOOR, runMigrations, runMigrationsWithRetry } from "./migrations";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import {
@@ -66,6 +71,8 @@ export interface MigrationOnOpenRefusal {
     persistedVersion: number;
     supportedVersion: number;
     serverPids: number[];
+    /** Process kinds may be omitted when older test fixtures provide only serverPids. */
+    blockingProcesses?: FailClosedBlockingProcess[];
     unreadableFile?: string;
     unreadableArm?: "parse" | "io";
 }
@@ -317,6 +324,8 @@ export type RpcDiscoveryUnreadableArm = "parse" | "io";
 export interface RpcServerDiscovery {
     state: "absent" | "stale" | "live" | "unreadable" | "inconclusive";
     serverPids: number[];
+    /** Per-PID labels captured while the discovery record was validated. */
+    serverProcesses?: FailClosedBlockingProcess[];
     staleFiles: string[];
     /**
      * PIDs for which the process-existence or process-identity check could not
@@ -386,6 +395,48 @@ function invalidDiscoveryReason(raw: string): RpcDiscoveryJunkReason {
     return "parse-invalid";
 }
 
+function classifyDiscoveryRecordKind(record: {
+    kind?: string;
+    harness?: string;
+}): FailClosedProcessKind | null {
+    for (const value of [record.kind, record.harness]) {
+        const normalized = value?.trim().toLowerCase();
+        if (!normalized) continue;
+        if (normalized === "process") return "process";
+        if (normalized === "opencode server" || normalized === "server") {
+            return "OpenCode server";
+        }
+        if (
+            normalized === "opencode instance" ||
+            normalized === "opencode instance (tui/cli)" ||
+            normalized === "opencode" ||
+            normalized === "tui" ||
+            normalized === "cli"
+        ) {
+            return "OpenCode instance (TUI/CLI)";
+        }
+        if (
+            normalized === "pi" ||
+            normalized === "pi harness" ||
+            normalized === "omp" ||
+            normalized === "oh-my-pi"
+        ) {
+            return "Pi";
+        }
+    }
+    return null;
+}
+
+function classifyRpcProcess(record: {
+    pid: number;
+    kind?: string;
+    harness?: string;
+}): FailClosedProcessKind {
+    return (
+        classifyDiscoveryRecordKind(record) ?? classifyProcessKind(readProcessCommand(record.pid))
+    );
+}
+
 function classifyJunkDiscovery(
     portFile: string,
     raw: string,
@@ -452,6 +503,7 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
     }
 
     const pids = new Set<number>();
+    const processByPid = new Map<number, FailClosedBlockingProcess>();
     const staleFiles: string[] = [];
     const inconclusivePids = new Set<number>();
     for (const portFile of portFiles) {
@@ -475,6 +527,14 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
         const identity = liveness === "dead" ? "implausible" : isPidIdentityPlausible(record);
         if (liveness === "alive" && identity === "plausible") {
             pids.add(record.pid);
+            const detected = {
+                kind: classifyRpcProcess(record),
+                pid: record.pid,
+            } satisfies FailClosedBlockingProcess;
+            const previous = processByPid.get(record.pid);
+            if (!previous || (previous.kind === "process" && detected.kind !== "process")) {
+                processByPid.set(record.pid, detected);
+            }
         } else if (liveness === "dead" || identity === "implausible") {
             staleFiles.push(portFile);
         } else {
@@ -495,7 +555,14 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
 
     const serverPids = [...pids].sort((a, b) => a - b);
     if (serverPids.length > 0) {
-        return { state: "live", serverPids, staleFiles };
+        return {
+            state: "live",
+            serverPids,
+            serverProcesses: serverPids.map(
+                (pid) => processByPid.get(pid) ?? { kind: "process" as const, pid },
+            ),
+            staleFiles,
+        };
     }
     const uncertainPids = [...inconclusivePids].sort((a, b) => a - b);
     if (uncertainPids.length > 0) {
@@ -509,14 +576,11 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
     return { state: "stale", serverPids: [], staleFiles };
 }
 
-/** Return the live harnesses that would block an on-open migration. */
+/** Return the live processes that would block an on-open migration. */
 export function getLiveMigrationBlockingProcesses(storageDir: string): FailClosedBlockingProcess[] {
     const discovery = inspectRpcServerDiscovery(storageDir);
-    const openCode =
-        discovery.state === "live"
-            ? discovery.serverPids.map((pid) => ({ harness: "OpenCode server", pid }))
-            : [];
-    const pi = discoverLivePiProcessIds().map((pid) => ({ harness: "Pi harness", pid }));
+    const openCode = discovery.state === "live" ? (discovery.serverProcesses ?? []) : [];
+    const pi = discoverLivePiProcessIds().map((pid) => ({ kind: "Pi" as const, pid }));
     return [...openCode, ...pi];
 }
 
@@ -562,6 +626,15 @@ function enforceMigrationOnOpenGuard(
     const discovery = inspectRpcServerDiscovery(dbDir);
     const piDiscovery = inspectLivePiProcesses();
     const piPids = piDiscovery.processIds;
+    const serverProcesses =
+        discovery.serverProcesses ??
+        (discovery.state === "live"
+            ? discovery.serverPids.map((pid) => ({ kind: "process" as const, pid }))
+            : []);
+    const blockingProcesses = [
+        ...serverProcesses,
+        ...piPids.map((pid) => ({ kind: "Pi" as const, pid })),
+    ];
     if (
         (discovery.state === "absent" ||
             discovery.state === "stale" ||
@@ -579,6 +652,7 @@ function enforceMigrationOnOpenGuard(
         persistedVersion,
         supportedVersion: latestSupportedVersion,
         serverPids: blockingPids,
+        blockingProcesses,
         ...(discovery.unreadableFile ? { unreadableFile: discovery.unreadableFile } : {}),
         ...(discovery.unreadableArm ? { unreadableArm: discovery.unreadableArm } : {}),
     };
