@@ -1,8 +1,15 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import {
+    AUTHORITY_DOMAINS,
+    type AuthorityState,
+} from "@magic-context/core/features/magic-context/context-authority";
 import { Database } from "@magic-context/core/shared/sqlite";
+
 import {
     applyMigrateSession,
+    assertMigrateSessionIsSafeToRehome,
     type MigrateSessionDeps,
+    type MigrateSessionSafetyModule,
     planMigrateSession,
 } from "./migrate-session";
 
@@ -86,6 +93,11 @@ function makeContextDb(): Database {
             project_user_profile_version INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL
         );
+        CREATE TABLE authority_managed (
+            project_path TEXT PRIMARY KEY,
+            context_store_uuid TEXT NOT NULL,
+            marked_at INTEGER NOT NULL
+        );
     `);
     return db;
 }
@@ -156,6 +168,52 @@ function makeDeps(oc: Database, ctx: Database, targetIsGit = true): MigrateSessi
     };
 }
 
+function installAuthorityMarker(ctx: Database, projectPath: string): void {
+    ctx.prepare(
+        "INSERT INTO authority_managed (project_path, context_store_uuid, marked_at) VALUES (?, 'store-test', 0)",
+    ).run(projectPath);
+}
+
+function makeSafetyModule(
+    opts: {
+        authorityState?: Partial<Record<(typeof AUTHORITY_DOMAINS)[number], AuthorityState>>;
+        authorityError?: Error;
+        sessionStatus?: unknown | Error;
+    } = {},
+): {
+    module: MigrateSessionSafetyModule;
+    authorityCalls: Array<{ project: string; projectRoot?: string; domain: string }>;
+    sessionCalls: Array<{ sessionId: string; projectRoot: string }>;
+} {
+    const authorityCalls: Array<{ project: string; projectRoot?: string; domain: string }> = [];
+    const sessionCalls: Array<{ sessionId: string; projectRoot: string }> = [];
+    return {
+        module: {
+            async authorityStatus({ context_store_uuid, project, projectRoot, domain }) {
+                authorityCalls.push({ project, projectRoot, domain });
+                if (opts.authorityError) throw opts.authorityError;
+                const state = opts.authorityState?.[domain] ?? "TS";
+                return {
+                    authority: {
+                        context_store_uuid,
+                        project,
+                        domain,
+                        state,
+                        generation: 1,
+                    },
+                };
+            },
+            async sessionStatus(args) {
+                sessionCalls.push(args);
+                if (opts.sessionStatus instanceof Error) throw opts.sessionStatus;
+                return opts.sessionStatus ?? { row_version: null };
+            },
+        },
+        authorityCalls,
+        sessionCalls,
+    };
+}
+
 describe("planMigrateSession", () => {
     it("resolves a git target to its existing project row", () => {
         const oc = makeOpencodeDb();
@@ -205,6 +263,119 @@ describe("planMigrateSession", () => {
         const oc = makeOpencodeDb();
         const ctx = makeContextDb();
         expect(() => planMigrateSession("ses_nope", "/x", makeDeps(oc, ctx))).toThrow(/not found/);
+    });
+});
+
+describe("assertMigrateSessionIsSafeToRehome", () => {
+    function safetyPlan(ctx: Database): ReturnType<typeof planMigrateSession> {
+        const oc = makeOpencodeDb();
+        seedSession(oc, ctx);
+        return planMigrateSession(SID, "/home/u/benchmarks", makeDeps(oc, ctx));
+    }
+
+    for (const [role, projectPath] of [
+        ["source", FROM],
+        ["target", TO],
+    ] as const) {
+        for (const domain of AUTHORITY_DOMAINS) {
+            it(`refuses ${domain} module authority for the ${role} project`, async () => {
+                const ctx = makeContextDb();
+                installAuthorityMarker(ctx, projectPath);
+                const plan = safetyPlan(ctx);
+                const { module } = makeSafetyModule({ authorityState: { [domain]: "MODULE" } });
+
+                await expect(
+                    assertMigrateSessionIsSafeToRehome({ plan, contextDb: ctx, module }),
+                ).rejects.toThrow(new RegExp(`${domain} authority.*MODULE`));
+            });
+        }
+    }
+
+    it("checks a durable source marker even when the source is outside the current cwd", async () => {
+        const ctx = makeContextDb();
+        installAuthorityMarker(ctx, FROM);
+        const plan = safetyPlan(ctx);
+        const { module, authorityCalls } = makeSafetyModule({
+            authorityState: { memories: "DRAINING" },
+        });
+
+        await expect(
+            assertMigrateSessionIsSafeToRehome({ plan, contextDb: ctx, module }),
+        ).rejects.toThrow(/drain-authority \/old\/dir/);
+        expect(authorityCalls).toContainEqual(
+            expect.objectContaining({ project: FROM, projectRoot: "/old/dir" }),
+        );
+    });
+
+    it("refuses an unreachable module when a durable marker exists", async () => {
+        const ctx = makeContextDb();
+        installAuthorityMarker(ctx, TO);
+        const plan = safetyPlan(ctx);
+        const { module } = makeSafetyModule({ authorityError: new Error("subc offline") });
+
+        await expect(
+            assertMigrateSessionIsSafeToRehome({ plan, contextDb: ctx, module }),
+        ).rejects.toThrow(/module unreachable.*writes remain fenced.*drain-authority/i);
+    });
+
+    it("refuses an unreachable session.status probe when a marker exists", async () => {
+        const ctx = makeContextDb();
+        installAuthorityMarker(ctx, TO);
+        const plan = safetyPlan(ctx);
+        const { module } = makeSafetyModule({ sessionStatus: new Error("subc offline") });
+
+        await expect(
+            assertMigrateSessionIsSafeToRehome({ plan, contextDb: ctx, module }),
+        ).rejects.toThrow(
+            /session-cache state is unreachable.*writes remain fenced.*drain-authority/i,
+        );
+    });
+
+    it("warns but proceeds when session.status is unreachable and no markers exist", async () => {
+        const ctx = makeContextDb();
+        const plan = safetyPlan(ctx);
+        const { module } = makeSafetyModule({ sessionStatus: new Error("subc offline") });
+
+        const result = await assertMigrateSessionIsSafeToRehome({ plan, contextDb: ctx, module });
+        expect(result.warnings).toEqual([
+            expect.stringContaining("session-cache state was not checked"),
+        ]);
+    });
+
+    it("refuses a session with module transform cache state without deleting it", async () => {
+        const ctx = makeContextDb();
+        const plan = safetyPlan(ctx);
+        const { module, sessionCalls } = makeSafetyModule({ sessionStatus: { row_version: 7 } });
+
+        await expect(
+            assertMigrateSessionIsSafeToRehome({ plan, contextDb: ctx, module }),
+        ).rejects.toThrow(/transform cache state.*TypeScript transform mode.*ck session delete/i);
+        expect(sessionCalls).toEqual([{ sessionId: SID, projectRoot: "/old/dir" }]);
+    });
+
+    it("allows a TypeScript-authority migration to apply as before", async () => {
+        const ctx = makeContextDb();
+        const oc = makeOpencodeDb();
+        seedSession(oc, ctx);
+        installAuthorityMarker(ctx, FROM);
+        installAuthorityMarker(ctx, TO);
+        const plan = planMigrateSession(SID, "/home/u/benchmarks", makeDeps(oc, ctx));
+        const { module, authorityCalls } = makeSafetyModule();
+
+        await expect(
+            assertMigrateSessionIsSafeToRehome({ plan, contextDb: ctx, module }),
+        ).resolves.toEqual({
+            warnings: [],
+        });
+        applyMigrateSession(plan, "leave", makeDeps(oc, ctx));
+        expect(
+            (
+                ctx
+                    .prepare("SELECT project_path FROM session_projects WHERE session_id = ?")
+                    .get(SID) as { project_path: string }
+            ).project_path,
+        ).toBe(TO);
+        expect(authorityCalls).toHaveLength(AUTHORITY_DOMAINS.length * 2);
     });
 });
 

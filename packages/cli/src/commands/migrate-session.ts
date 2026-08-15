@@ -23,6 +23,7 @@
 import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path, { join } from "node:path";
+import type { AuthorityModuleClient } from "@magic-context/core/features/magic-context/context-authority";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
     copyMemoriesToProject,
@@ -30,8 +31,10 @@ import {
     selectRelocatableMemoryIds,
 } from "@magic-context/core/features/magic-context/memory/relocate-memory";
 import { bumpProjectMemoryEpoch } from "@magic-context/core/features/magic-context/storage-project-state";
+import { SubcModuleTransport } from "@magic-context/core/hooks/magic-context/module-transport";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
+
 import {
     backupDatabaseSnapshot,
     getPersistedSchemaVersion,
@@ -41,6 +44,11 @@ import {
 } from "../lib/database-access";
 import { getOpenCodeDatabasePath } from "../lib/migration-paths";
 import { promptIO } from "../lib/prompts";
+import {
+    type AuthorityProjectToVerify,
+    assertProjectsUseTsAuthority,
+    authorityDrainCommand,
+} from "./doctor-authority";
 
 type DatabaseLike = Pick<DatabaseType, "prepare" | "close" | "exec">;
 
@@ -108,9 +116,106 @@ export interface MigrateSessionResult {
     epochsBumped: string[];
 }
 
+export interface MigrateSessionSafetyModule {
+    authorityStatus: AuthorityModuleClient["authorityStatus"];
+    sessionStatus(args: { sessionId: string; projectRoot: string }): Promise<unknown>;
+}
+
+export interface MigrateSessionSafetyResult {
+    warnings: string[];
+}
+
 function existingSessionColumns(db: DatabaseLike): Set<string> {
     const rows = db.prepare("PRAGMA table_info(session)").all() as Array<{ name?: string }>;
     return new Set(rows.map((r) => r.name).filter((n): n is string => typeof n === "string"));
+}
+
+function isModuleCacheStatePresent(status: unknown): boolean {
+    if (!status || typeof status !== "object") return false;
+    // session.status is a read-only query. Its nullable row_version comes directly
+    // from mc_cache_state, so a number proves the module still owns this session's
+    // transform cache without asking the CLI to delete or rewrite module state.
+    const rowVersion = (status as { row_version?: unknown }).row_version;
+    return typeof rowVersion === "number";
+}
+
+function drainCommandsForMarkers(
+    markers: ReadonlyArray<{ project_path: string }>,
+    projects: readonly AuthorityProjectToVerify[],
+): string {
+    const byProject = new Map(projects.map((project) => [project.projectPath, project]));
+    return [
+        ...new Set(
+            markers.map((marker) =>
+                authorityDrainCommand(
+                    byProject.get(marker.project_path) ?? {
+                        role: "marked",
+                        projectPath: marker.project_path,
+                        projectRoot: null,
+                    },
+                ),
+            ),
+        ),
+    ].join("; ");
+}
+
+/** Check the durable authority fences before a session move writes either database. */
+export async function assertMigrateSessionIsSafeToRehome(args: {
+    plan: MigrateSessionPlan;
+    contextDb: DatabaseType;
+    module: MigrateSessionSafetyModule;
+}): Promise<MigrateSessionSafetyResult> {
+    const projects: AuthorityProjectToVerify[] = [
+        {
+            role: "source",
+            projectPath: args.plan.fromMcIdentity,
+            projectRoot: args.plan.currentDirectory,
+        },
+        {
+            role: "target",
+            projectPath: args.plan.toMcIdentity,
+            projectRoot: args.plan.targetDirectory,
+        },
+    ];
+    const authority = await assertProjectsUseTsAuthority({
+        db: args.contextDb,
+        projects,
+        module: args.module,
+    });
+
+    let sessionStatus: unknown;
+    try {
+        sessionStatus = await args.module.sessionStatus({
+            sessionId: args.plan.sessionId,
+            // A missing OpenCode directory cannot identify the old worktree, but
+            // session.status is read-only and scoped by session id, so the target
+            // root still lets us inspect the module's durable cache row.
+            projectRoot: args.plan.currentDirectory ?? args.plan.targetDirectory,
+        });
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (authority.markers.length === 0) {
+            return {
+                warnings: [
+                    `Module session-cache state was not checked because the module is unreachable: ${message}. No durable authority markers exist, so continuing for this pure-TypeScript installation.`,
+                ],
+            };
+        }
+        throw new Error(
+            "Migration refused: module session-cache state is unreachable while durable authority markers exist; writes remain fenced. " +
+                `Drain marked projects first: ${drainCommandsForMarkers(authority.markers, projects)}. ` +
+                `Module error: ${message}`,
+        );
+    }
+
+    if (isModuleCacheStatePresent(sessionStatus)) {
+        throw new Error(
+            `Migration refused: the module still holds transform cache state for session ${args.plan.sessionId}. ` +
+                "Use TypeScript transform mode for the session's project, or run `ck session delete` after preserving any needed state, then re-run this migration.",
+        );
+    }
+
+    return { warnings: [] };
 }
 
 /**
@@ -544,6 +649,28 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
         }
         const deps = realDeps(opencodeDb, contextDb);
         const plan = planMigrateSession(sessionId, expandedTo, deps);
+        const transport = new SubcModuleTransport();
+        const safety = await assertMigrateSessionIsSafeToRehome({
+            plan,
+            contextDb: contextDb as DatabaseType,
+            module: {
+                authorityStatus: (request) => transport.authorityStatus(request),
+                sessionStatus: ({ sessionId: statusSessionId, projectRoot }) =>
+                    transport.call({
+                        sessionId: statusSessionId,
+                        projectRoot,
+                        method: "session.status",
+                        body: {
+                            method: "session.status",
+                            v: 1,
+                            session_id: statusSessionId,
+                        },
+                    }),
+            },
+        });
+        for (const warning of safety.warnings) {
+            promptIO.log.warn(warning);
+        }
 
         promptIO.note(
             [
