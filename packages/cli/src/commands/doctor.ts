@@ -79,6 +79,41 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
         if (result.handled) return result.exitCode;
     }
 
+    // Reconcile interrupted cross-harness session migrations. The journal lives
+    // in the SHARED cortexkit DB (harness-agnostic), so this runs exactly once
+    // per doctor invocation — dispatching per adapter would reconcile the same
+    // physical database repeatedly. The sweep is phase-based and idempotent; a
+    // missing/out-of-range database simply has nothing to reconcile.
+    const { sweepPendingMigrations, formatMigrationSweepLines } = await import("./migrate");
+    const sweepDbPath = join(getMagicContextStorageDir(), "context.db");
+    let sweepDb: ReturnType<typeof openExistingContextDatabaseForMutation> = null;
+    try {
+        sweepDb = openExistingContextDatabaseForMutation(sweepDbPath);
+    } catch {
+        // Fence refusals (database newer or older than this CLI supports) and
+        // missing databases leave nothing to sweep; the per-harness doctors
+        // below report the underlying database condition.
+    }
+    if (sweepDb !== null) {
+        try {
+            const report = sweepPendingMigrations(sweepDb);
+            for (const line of formatMigrationSweepLines(report)) {
+                if (line.startsWith("LOST")) log.error(line);
+                else log.info(line);
+            }
+        } catch (error) {
+            // A genuine reconciliation failure (e.g. an unreadable stage file)
+            // should be visible, but must not abort the whole doctor run.
+            log.warn(
+                `Session-migration recovery sweep failed: ${
+                    error instanceof Error ? error.message : String(error)
+                }`,
+            );
+        } finally {
+            sweepDb.close();
+        }
+    }
+
     let anyFailure = false;
     for (const adapter of adapters) {
         log.step(`Running doctor for ${adapter.displayName}…`);
