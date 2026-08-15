@@ -493,6 +493,8 @@ pub struct AssembledHistorianFiring {
     pub prompt: String,
     pub model_chain: Vec<String>,
     pub chunk: HistorianBuiltChunk,
+    /// Original CK messages in the compacted interval, serialized for durable ctx_expand.
+    pub raw_chunk_messages: String,
     pub chunk_fingerprint: String,
     pub selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
     pub expected_revert_epoch: u64,
@@ -535,6 +537,7 @@ impl AssembledHistorianFiring {
             observed_chunk_fingerprint: &self.chunk_fingerprint,
             validation_chunk: &self.chunk.chunk,
             chunk_transcript: &self.chunk.text,
+            raw_chunk_messages: &self.raw_chunk_messages,
             boundary_dates: &self.boundary_dates,
             prior_compartments: &self.prior_compartments,
             validate_options: self.validate_options,
@@ -658,6 +661,17 @@ pub fn assemble_historian_firing(
         });
     }
 
+    let raw_chunk_messages = serde_json::to_string(
+        &messages
+            .iter()
+            .filter(|message| {
+                !message.ck.meta.synthetic
+                    && message.ordinal >= chunk.chunk.start_index
+                    && message.ordinal <= chunk.chunk.end_index
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| mc_store::McStoreError::Serde(error.to_string()))?;
     let boundary_dates = native_boundary_dates(messages);
     let reference_blocks = build_reference_blocks_from_stored(
         &config.session_id,
@@ -694,6 +708,7 @@ pub fn assemble_historian_firing(
             model_chain: config.model_chain,
             from_ordinal: chunk.chunk.start_index,
             to_ordinal: chunk.chunk.end_index,
+            raw_chunk_messages,
             chunk_fingerprint,
             selected_range_identities,
             expected_revert_epoch,

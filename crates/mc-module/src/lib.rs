@@ -4102,6 +4102,18 @@ impl McHandler {
                         .collect::<Vec<_>>(),
                     Err(_) => Vec::new(),
                 };
+                let raw_chunk_messages = serde_json::to_string(
+                    &parsed
+                        .messages
+                        .iter()
+                        .filter(|message| {
+                            !message.ck.meta.synthetic
+                                && message.ordinal >= chunk.chunk.start_index
+                                && message.ordinal <= chunk.chunk.end_index
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap_or_else(|_| "[]".to_string());
                 let boundary_dates = historian_chunk::native_boundary_dates(&parsed.messages);
                 let fingerprint_items: Vec<_> =
                     chunk.snapshot.iter().map(|item| item.as_item()).collect();
@@ -4135,6 +4147,7 @@ impl McHandler {
                                 observed_chunk_fingerprint: &observed,
                                 validation_chunk: &chunk.chunk,
                                 chunk_transcript: &chunk.text,
+                                raw_chunk_messages: &raw_chunk_messages,
                                 boundary_dates: &boundary_dates,
                                 prior_compartments: &prior_compartments,
                                 validate_options: historian_validate::ValidateOptions {
@@ -10116,7 +10129,7 @@ impl McHandler {
             None => return store_unavailable_error(),
         };
         let session_id = facade_scope.conversation_key.as_str();
-        if let Some(message) = i64_arg(args, "message").filter(|value| *value > 0) {
+        if let Some(message) = i64_arg(args, "message").filter(|value| *value >= 0) {
             if let Some(raw_message) =
                 self.cached_expand_messages(session_id)
                     .and_then(|messages| {
@@ -10128,7 +10141,16 @@ impl McHandler {
                 return mcp_text_result(render_cached_message_expand(&raw_message), false);
             }
             return match store.load_chunk_transcript_for_message(session_id, message) {
-                Ok(Some(row)) => mcp_text_result(render_message_expand(row, message), false),
+                Ok(Some(row)) => {
+                    if let Some(raw_message) = durable_expand_messages(std::slice::from_ref(&row))
+                        .into_iter()
+                        .find(|candidate| i64::try_from(candidate.ordinal).ok() == Some(message))
+                    {
+                        mcp_text_result(render_cached_message_expand(&raw_message), false)
+                    } else {
+                        mcp_text_result(render_message_expand(row, message), false)
+                    }
+                }
                 Ok(None) => mcp_text_result(
                     format!(
                         "Message {message} is no longer recoverable from persisted chunk transcripts. The span was evicted or was compacted before transcript capture."
@@ -10140,17 +10162,17 @@ impl McHandler {
         }
         let Some(start) = i64_arg(args, "start") else {
             return tool_error_result(
-                "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
+                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
             );
         };
         let Some(end) = i64_arg(args, "end") else {
             return tool_error_result(
-                "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
+                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
             );
         };
-        if start < 1 || end < start {
+        if start < 0 || end < start {
             return tool_error_result(
-                "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
+                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
             );
         }
         let last_compacted_ordinal = match store.last_compacted_ordinal(session_id) {
@@ -10187,14 +10209,13 @@ impl McHandler {
             Err(error) => return tool_error_result(format!("Error: {error}")),
         };
         if args.get("verbose").and_then(Value::as_bool) == Some(true) {
+            let durable_messages = durable_expand_messages(&transcripts);
             let rendered = self
                 .cached_expand_messages(session_id)
+                .or_else(|| (!durable_messages.is_empty()).then_some(durable_messages))
                 .map(|messages| render_verbose_range_expand(&messages, start, bounded_end))
                 .filter(|result| !result.text.is_empty())
                 .map(|result| render_verbose_expand_result(start, bounded_end, result))
-                // A process can restart or evict the bounded raw-request snapshot. Preserve
-                // the existing durable transcript fallback rather than claiming raw parts
-                // that no longer exist in the module process.
                 .unwrap_or_else(|| {
                     render_verbose_transcript_range_expand(start, bounded_end, &transcripts)
                 });
@@ -12516,6 +12537,11 @@ fn render_range_expand(
         );
     }
 
+    let durable_messages = durable_expand_messages(transcripts);
+    if !durable_messages.is_empty() {
+        return render_durable_range_expand(start, end, &durable_messages);
+    }
+
     let mut output = format!("Messages {start}-{end} from persisted historian chunk transcripts:");
     for compartment in matching {
         if !append_expand_piece(&mut output, "\n\n")
@@ -12533,14 +12559,146 @@ fn render_range_expand(
             .iter()
             .find(|row| row.compartment_seq == compartment.sequence)
             .and_then(|row| row.transcript.as_deref())
+            .map(|transcript| slice_expand_transcript(transcript, start, end))
+            .filter(|transcript| !transcript.is_empty())
             .unwrap_or(
-                "[no longer recoverable: this compartment transcript was evicted or was not recorded]",
+                "[no longer recoverable: this compartment transcript was evicted, was not recorded, or only covered ordinals outside the requested range]".to_string(),
             );
-        if !append_expand_piece(&mut output, transcript) {
+        if !append_expand_piece(&mut output, &transcript) {
             break;
         }
     }
     truncate_expand_output(output)
+}
+
+/// Decode original messages copied into every durable transcript row. A historian publish can
+/// produce several compartments, so ordinal de-duplication restores one chronological message
+/// sequence for range, verbose, and full-message recovery.
+fn durable_expand_messages(
+    transcripts: &[StoredChunkTranscript],
+) -> Vec<ck_wire::CkIngressMessage> {
+    let mut messages = BTreeMap::new();
+    for transcript in transcripts {
+        let Some(raw_messages) = transcript.raw_messages_json.as_deref() else {
+            continue;
+        };
+        let Ok(raw_messages) = serde_json::from_str::<Vec<ck_wire::CkIngressMessage>>(raw_messages)
+        else {
+            continue;
+        };
+        for message in raw_messages {
+            let Ok(ordinal) = i64::try_from(message.ordinal) else {
+                continue;
+            };
+            if ordinal >= transcript.start_ordinal && ordinal <= transcript.end_ordinal {
+                messages.entry(message.ordinal).or_insert(message);
+            }
+        }
+    }
+    messages.into_values().collect()
+}
+
+fn render_durable_range_expand(
+    start: i64,
+    end: i64,
+    messages: &[ck_wire::CkIngressMessage],
+) -> String {
+    let messages = messages
+        .iter()
+        .filter(|message| {
+            let ordinal = i64::try_from(message.ordinal).unwrap_or(i64::MAX);
+            ordinal >= start && ordinal <= end
+        })
+        .collect::<Vec<_>>();
+    let Some(first) = messages.first() else {
+        return format!(
+            "No messages found in range {start}-{end}. The range may be outside this session's persisted historian transcripts."
+        );
+    };
+    let last = messages.last().expect("nonempty checked above");
+    let mut output = format!(
+        "Messages {}-{} from persisted raw message history:",
+        first.ordinal, last.ordinal
+    );
+    for message in messages {
+        if !append_expand_piece(&mut output, "\n\n")
+            || !append_expand_piece(&mut output, &render_durable_range_message(message))
+        {
+            break;
+        }
+    }
+    truncate_expand_output(output)
+}
+
+fn render_durable_range_message(message: &ck_wire::CkIngressMessage) -> String {
+    let role = match message.ck.role.as_str() {
+        "assistant" => "A",
+        "user" => "U",
+        role => role,
+    };
+    let parts = message
+        .ck
+        .content
+        .iter()
+        .filter_map(render_durable_range_part)
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        format!("[{}] {role}:", message.ordinal)
+    } else {
+        format!("[{}] {role}: {}", message.ordinal, parts.join(" / "))
+    }
+}
+
+fn render_durable_range_part(part: &ck_wire::CkWireBlock) -> Option<String> {
+    match &part.kind {
+        ck_wire::CkKind::Text { text } => {
+            (!text.trim().is_empty()).then(|| text.trim().to_string())
+        }
+        ck_wire::CkKind::ToolCall { name, input, .. } => {
+            let argument = verbose_expand_key_argument(input);
+            Some(if argument.is_empty() {
+                format!("TC: {name}")
+            } else {
+                format!("TC: {name}({argument})")
+            })
+        }
+        ck_wire::CkKind::ToolResult {
+            tool_name, output, ..
+        } => Some(format!(
+            "TR: {tool_name} → output ~{} tok",
+            mc_tokenizer::estimate_tokens(&expand_tool_output_text(output))
+        )),
+        ck_wire::CkKind::Media(_) => Some("[media]".to_string()),
+        ck_wire::CkKind::Reasoning { .. }
+        | ck_wire::CkKind::RedactedReasoning { .. }
+        | ck_wire::CkKind::Opaque(_) => None,
+    }
+}
+
+fn slice_expand_transcript(transcript: &str, start: i64, end: i64) -> String {
+    transcript
+        .lines()
+        .filter_map(|line| {
+            let (span, _) = line.strip_prefix('[')?.split_once("] ")?;
+            let (span_start, span_end) = parse_expand_ordinal_span(span)?;
+            let clipped_start = span_start.max(start);
+            let clipped_end = span_end.min(end);
+            (clipped_start <= clipped_end).then(|| {
+                if clipped_start == span_start && clipped_end == span_end {
+                    line.to_string()
+                } else if clipped_start == clipped_end {
+                    format!(
+                        "[{clipped_start}] [historian transcript coalesced across ordinals {span_start}-{span_end}; exact raw payload unavailable]"
+                    )
+                } else {
+                    format!(
+                        "[{clipped_start}-{clipped_end}] [historian transcript coalesced across ordinals {span_start}-{span_end}; exact raw payload unavailable]"
+                    )
+                }
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 const CTX_EXPAND_VERBOSE_TOKEN_BUDGET: usize = 15_000;
@@ -12554,9 +12712,9 @@ struct VerboseRangeExpand {
     truncated: bool,
 }
 
-/// Render each raw CK message separately, retaining only bounded previews. The transform
-/// snapshot carries the same pre-reduction parts the model used, including tool outputs,
-/// while the default ctx_expand route intentionally remains on its byte-stable transcript.
+/// Render each raw CK message separately, retaining only bounded previews. The in-process
+/// snapshot and durable historian payload carry the same pre-reduction parts, including tool
+/// outputs; the default range view remains condensed while verbose exposes those previews.
 fn render_verbose_range_expand(
     messages: &[ck_wire::CkIngressMessage],
     start: i64,
@@ -12781,7 +12939,7 @@ fn parse_expand_ordinal_span(span: &str) -> Option<(i64, i64)> {
             (ordinal, ordinal)
         }
     };
-    (start > 0 && end >= start).then_some((start, end))
+    (start >= 0 && end >= start).then_some((start, end))
 }
 
 /// Mirrors TypeScript's `trim().slice(0, max)` preview rule in UTF-16 units.
@@ -13772,10 +13930,10 @@ fn ctx_expand_schema() -> Value {
         "type": "object",
         "additionalProperties": true,
         "properties": {
-            "start": { "type": "integer", "minimum": 1, "description": "First message ordinal to expand." },
-            "end": { "type": "integer", "minimum": 1, "description": "Last message ordinal to expand, inclusive." },
+            "start": { "type": "integer", "minimum": 0, "description": "First message ordinal to expand." },
+            "end": { "type": "integer", "minimum": 0, "description": "Last message ordinal to expand, inclusive." },
             "verbose": { "type": "boolean", "description": "With start/end: list each message separately with its ordinal [N] and per-part preview, including each tool call's output size, so one message can be recovered by ordinal." },
-            "message": { "type": "integer", "minimum": 1, "description": "Recover one message by ordinal in full from the cached raw request when available, otherwise its persisted historian chunk transcript." },
+            "message": { "type": "integer", "minimum": 0, "description": "Recover one message by ordinal in full from the cached raw request when available, otherwise its persisted historian chunk transcript." },
         }
     })
 }
@@ -19966,6 +20124,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 12,
                 chunk_transcript: Some("[10] U: exact prompt text\n[11] A: exact answer\n[12] A: TC: read(src/lib.rs) → output ~42 tok"),
+                raw_chunk_messages: None,
             })
             .unwrap();
 
@@ -26736,6 +26895,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap();
 
@@ -28714,5 +28874,163 @@ mod tests {
             composed.m0_bytes,
             "<user-profile>\n- prefers root cause\n- x &lt; y &amp; z\n</user-profile>\n\n<session-history>\n## 0-0 · c0\nfirst compartment-p1\n</session-history>"
         );
+    }
+    fn publish_ctx_expand_fixture(
+        store: &McStore,
+        session_id: &str,
+        project_path: &str,
+        messages: &[CkIngressMessage],
+    ) {
+        let start = i64::try_from(messages.first().expect("fixture messages").ordinal).unwrap();
+        let end = i64::try_from(messages.last().expect("fixture messages").ordinal).unwrap();
+        let selected_range_identities = messages
+            .iter()
+            .map(|message| mc_store::HistorianSelectedMessageIdentity {
+                mid: message.mid.clone(),
+                block_identities: vec![mc_store::BlockIdentity {
+                    kind_tag: "text".to_string(),
+                    byte_fingerprint: format!("{}-identity", message.mid),
+                }],
+            })
+            .collect::<Vec<_>>();
+        let meta = ModuleMeta {
+            block_identity_by_mid: selected_range_identities
+                .iter()
+                .map(|identity| (identity.mid.clone(), identity.block_identities.clone()))
+                .collect(),
+            historian: HistorianDurableState {
+                state: HistorianPhase::Publishing,
+                firing_seq: 1,
+                chunk_range: Some(HistorianChunkRange {
+                    from_ordinal: start as u64,
+                    to_ordinal: end as u64,
+                }),
+                chunk_fingerprint: "ctx-expand-fixture".to_string(),
+                selected_range_identities: selected_range_identities.clone(),
+                producer_session_id: Some("ctx-expand-producer".to_string()),
+                producer_run_id: Some("ctx-expand-run".to_string()),
+                fired_at_ms: Some(1),
+                expected_revert_epoch: 0,
+                compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        store
+            .commit(session_id, None, &CoreState::default(), &meta)
+            .unwrap();
+        let raw_messages = serde_json::to_string(messages).unwrap();
+        let predicate = mc_store::HistorianPublishPredicate {
+            firing_seq: 1,
+            producer_run_id: "ctx-expand-run".to_string(),
+            chunk_fingerprint: "ctx-expand-fixture".to_string(),
+            selected_range_identities,
+            compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
+        };
+        store
+            .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                session_id,
+                expected_row_version: store.load(session_id).unwrap().row_version,
+                expected_revert_epoch: 0,
+                predicate: &predicate,
+                project_path,
+                compartments: &[stored_comp(
+                    1,
+                    start,
+                    end,
+                    &format!("{}#0", messages.last().unwrap().mid),
+                    "condensed fixture",
+                )],
+                facts: &[],
+                promote_facts: false,
+                events: &[],
+                primer_candidates: &[],
+                user_memory_candidates: &[],
+                publication_floor_ordinal: end as u64,
+                chunk_transcript: Some(&format!("[{start}-{end}] U: condensed fixture")),
+                raw_chunk_messages: Some(&raw_messages),
+            })
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_expand_uses_durable_raw_messages_for_exact_ranges_and_snapshot_loss() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let full_tool_output = "durable full tool output\n".repeat(20_000);
+        let mut messages = (1..=100)
+            .map(|ordinal| {
+                ck_with_role(
+                    &format!("m{ordinal}"),
+                    ordinal,
+                    "user",
+                    &format!("ordinal-{ordinal}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        messages[51] = tool_result("m52", 52, &full_tool_output);
+        publish_ctx_expand_fixture(&store, "ses", project.to_str().unwrap(), &messages);
+
+        // R5-09: a persisted transcript covering 1-100 must expose only the requested ordinals.
+        let sliced =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"start": 50, "end": 55})).await);
+        assert!(sliced.contains("Messages 50-55"));
+        assert!(sliced.contains("[50] U: ordinal-50"));
+        assert!(sliced.contains("[55] U: ordinal-55"));
+        assert!(!sliced.contains("[1] U:"));
+        assert!(!sliced.contains("[100] U:"));
+
+        // R5-10: no transform snapshot is installed, so both routes must decode the durable
+        // original-message payload instead of falling back to the condensed historian line.
+        let full = tool_text(call_facade(&handler, "ctx_expand", json!({"message": 52})).await);
+        assert!(full.contains("[52] tool — full recovery:"), "{full}");
+        assert!(full.contains(&full_tool_output));
+        let verbose = tool_text(
+            call_facade(
+                &handler,
+                "ctx_expand",
+                json!({"start": 52, "end": 52, "verbose": true}),
+            )
+            .await,
+        );
+        assert!(verbose.contains("[52] tool"));
+        assert!(verbose.contains(&format!(
+            "output ~{} tok",
+            mc_tokenizer::estimate_tokens(&full_tool_output)
+        )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_expand_accepts_native_ordinal_zero_in_message_and_range_forms() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        publish_ctx_expand_fixture(
+            &store,
+            "ses",
+            project.to_str().unwrap(),
+            &[ck_with_role("m0", 0, "user", "ordinal zero")],
+        );
+
+        // R5-11: the shape published by a zero-based native history round-trips exactly.
+        let by_message =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"message": 0})).await);
+        assert!(by_message.contains("[0] U (user) — full recovery:"));
+        assert!(by_message.contains("ordinal zero"));
+        let by_range =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"start": 0, "end": 0})).await);
+        assert!(by_range.contains("Messages 0-0"));
+        assert!(by_range.contains("[0] U: ordinal zero"));
+        let schema = ctx_expand_schema();
+        assert_eq!(schema["properties"]["message"]["minimum"], json!(0));
+        assert_eq!(schema["properties"]["start"]["minimum"], json!(0));
+        assert_eq!(schema["properties"]["end"]["minimum"], json!(0));
     }
 }
