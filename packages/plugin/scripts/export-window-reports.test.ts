@@ -3,6 +3,12 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import packageJson from "../package.json";
+
+// The exporter stamps the LIVE plugin version into each report's reporter field.
+// Deriving the expectation from package.json keeps this test true across releases;
+// a pinned literal broke the v0.37.0 release pipeline at the version-bump commit.
+const REPORTER = `magic-context@${packageJson.version}`;
 
 describe("export-window-reports", () => {
     it("exports strict fusiform reports with the pinned units and routing field spelling", () => {
@@ -75,7 +81,7 @@ describe("export-window-reports", () => {
                         attempted_tokens_units: "estimate",
                         geometry: "unknown",
                         observed_at_ms: 1,
-                        reporter: "magic-context@0.36.1",
+                        reporter: REPORTER,
                     },
                     {
                         provider_id: "anthropic",
@@ -90,7 +96,7 @@ describe("export-window-reports", () => {
                         largest_success_units: "estimate",
                         geometry: "prompt_only",
                         observed_at_ms: 2,
-                        reporter: "magic-context@0.36.1",
+                        reporter: REPORTER,
                         largest_success: 199_500,
                     },
                     {
@@ -103,7 +109,7 @@ describe("export-window-reports", () => {
                         extracted_limit_units: "provider",
                         geometry: "combined",
                         observed_at_ms: 3,
-                        reporter: "magic-context@0.36.1",
+                        reporter: REPORTER,
                         path_may_forward: true,
                         served_by_hint: "anthropic",
                     },
