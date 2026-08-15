@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { convertMessages } from "@earendil-works/pi-ai/api/openai-completions";
 import { insertUserMemory } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
 import {
 	createPromptSurfaceGuidanceEpochCache,
@@ -12,6 +13,7 @@ import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
 	buildMagicContextBlock,
 	clearPiSystemPromptSession,
+	composeMagicContextSystemPrompt,
 	MAGIC_CONTEXT_GUIDANCE_MARKER,
 	processSystemPromptForCache,
 	SYSTEM_PROMPT_DATA_MARKERS,
@@ -21,6 +23,37 @@ import { createTestDb } from "./test-utils.test";
 function tempDir(prefix: string): string {
 	return mkdtempSync(join(tmpdir(), prefix));
 }
+
+describe("Pi single system-prompt serialization parity", () => {
+	it("keeps host identity and Magic Context guidance in one OpenAI-compatible wire message", () => {
+		const basePrompt = "You are a helpful coding assistant.";
+		const guidance = "## Magic Context\nUse ctx_search when needed.";
+		const composedPrompt = composeMagicContextSystemPrompt(
+			basePrompt,
+			guidance,
+		);
+
+		expect(composedPrompt).toBe(`${basePrompt}\n\n${guidance}`);
+		const wireMessages = convertMessages(
+			{
+				provider: "test",
+				reasoning: false,
+				input: ["text"],
+			} as unknown as Parameters<typeof convertMessages>[0],
+			{ systemPrompt: composedPrompt, messages: [] } as Parameters<
+				typeof convertMessages
+			>[1],
+			{ supportsDeveloperRole: false } as unknown as Parameters<
+				typeof convertMessages
+			>[2],
+		);
+		const systemMessages = wireMessages.filter(
+			(message) => message.role === "system",
+		);
+		expect(systemMessages).toHaveLength(1);
+		expect(systemMessages[0]?.content).toBe(composedPrompt);
+	});
+});
 
 describe("buildMagicContextBlock v2 system-prompt parity", () => {
 	it("keeps Magic Context guidance in the system prompt", () => {
