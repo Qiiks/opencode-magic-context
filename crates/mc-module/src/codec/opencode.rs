@@ -263,8 +263,8 @@ pub(crate) fn decode_opencode_sidecar_incremental(
     let mut sidecar = DecodeSidecar::new(HARNESS);
     sidecar.mid_pins = suffix.mid_pins;
     for mid in prior.order.iter().take(replace_from) {
+        sidecar.order.push(mid.clone());
         if let Some(meta) = prior.messages.get(mid) {
-            sidecar.order.push(mid.clone());
             sidecar.messages.insert(mid.clone(), Arc::clone(meta));
         }
     }
@@ -272,7 +272,7 @@ pub(crate) fn decode_opencode_sidecar_incremental(
         let Some(meta) = suffix.messages.get(&mid) else {
             continue;
         };
-        if !sidecar.messages.contains_key(&mid) {
+        if !sidecar.order.contains(&mid) {
             sidecar.order.push(mid.clone());
         }
         sidecar.messages.insert(mid, Arc::clone(meta));

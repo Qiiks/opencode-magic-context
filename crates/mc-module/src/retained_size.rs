@@ -68,7 +68,7 @@ fn serialized_value_retained_bytes(value: &impl Serialize) -> usize {
     value_retained_bytes(&value)
 }
 
-fn provider_extras_heap_bytes(extras: &ProviderExtras) -> usize {
+pub(crate) fn provider_extras_heap_bytes(extras: &ProviderExtras) -> usize {
     btree_map_allocation_bytes::<String, BTreeMap<String, Value>>(extras.len()).saturating_add(
         extras
             .iter()
@@ -93,7 +93,7 @@ fn optional_string_heap_bytes(value: Option<&String>) -> usize {
     value.map_or(0, String::capacity)
 }
 
-fn origin_heap_bytes(origin: Option<&MessageOrigin>) -> usize {
+pub(crate) fn origin_heap_bytes(origin: Option<&MessageOrigin>) -> usize {
     origin.map_or(0, |origin| {
         origin
             .provider
@@ -103,7 +103,7 @@ fn origin_heap_bytes(origin: Option<&MessageOrigin>) -> usize {
     })
 }
 
-fn harness_meta_heap_bytes(meta: &HarnessMeta) -> usize {
+pub(crate) fn harness_meta_heap_bytes(meta: &HarnessMeta) -> usize {
     optional_string_heap_bytes(meta.harness_id.as_ref())
         .saturating_add(optional_string_heap_bytes(meta.finish.as_ref()))
 }

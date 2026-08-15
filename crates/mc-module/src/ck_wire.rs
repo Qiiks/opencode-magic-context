@@ -90,9 +90,22 @@ pub(crate) struct ProjectionState {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+struct ProjectionMessageMeta {
+    mid: String,
+    ordinal: u64,
+    role: String,
+    origin: Option<MessageOrigin>,
+    provider_extras: ProviderExtras,
+    meta: HarnessMeta,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct FlatProjection {
     pub blocks: Vec<FlatBlock>,
     pub identity_by_mid: BTreeMap<String, Vec<BlockIdentity>>,
+    /// Message shells retain the identity and message-level metadata needed to rebuild an
+    /// acknowledged delta prefix. Block payloads remain single-owned by `blocks`.
+    message_meta: Vec<ProjectionMessageMeta>,
     /// Flat block end after each ingress message; maps the transport's message frontier without
     /// walking or serializing the cached payload.
     message_block_ends: Vec<usize>,
@@ -106,9 +119,53 @@ impl FlatProjection {
         self.message_block_ends.len()
     }
 
+    pub(crate) fn reattach_messages_prefix(
+        &self,
+        prefix_messages: usize,
+    ) -> Option<Vec<CkIngressMessage>> {
+        if prefix_messages > self.message_count() || self.message_meta.len() != self.message_count()
+        {
+            return None;
+        }
+
+        let mut block_start = 0;
+        let mut messages = Vec::with_capacity(prefix_messages);
+        for (message_index, message) in self.message_meta.iter().take(prefix_messages).enumerate() {
+            let block_end = *self.message_block_ends.get(message_index)?;
+            if block_end < block_start || block_end > self.blocks.len() {
+                return None;
+            }
+            let content = self.blocks[block_start..block_end]
+                .iter()
+                .enumerate()
+                .map(|(block_index, block)| {
+                    (block.mid == message.mid
+                        && block.ordinal == message.ordinal
+                        && block.role == message.role
+                        && block.block_index == block_index)
+                        .then(|| block.wire.as_ref().clone())
+                })
+                .collect::<Option<Vec<_>>>()?;
+            messages.push(CkIngressMessage {
+                mid: message.mid.clone(),
+                ordinal: message.ordinal,
+                ck: CkWireMessage::from_parts(
+                    message.role.clone(),
+                    content,
+                    message.origin.clone(),
+                    message.provider_extras.clone(),
+                    message.meta.clone(),
+                ),
+            });
+            block_start = block_end;
+        }
+        Some(messages)
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         use crate::retained_size::{
-            btree_map_allocation_bytes, ck_wire_block_retained_bytes, value_retained_bytes,
+            btree_map_allocation_bytes, ck_wire_block_retained_bytes, harness_meta_heap_bytes,
+            origin_heap_bytes, provider_extras_heap_bytes, value_retained_bytes,
             ARC_ALLOCATION_OVERHEAD_BYTES,
         };
         use std::mem::size_of;
@@ -170,6 +227,24 @@ impl FlatProjection {
                         })
                         .sum::<usize>(),
                 );
+        let message_meta_bytes = self
+            .message_meta
+            .capacity()
+            .saturating_mul(size_of::<ProjectionMessageMeta>())
+            .saturating_add(
+                self.message_meta
+                    .iter()
+                    .map(|message| {
+                        message
+                            .mid
+                            .capacity()
+                            .saturating_add(message.role.capacity())
+                            .saturating_add(origin_heap_bytes(message.origin.as_ref()))
+                            .saturating_add(provider_extras_heap_bytes(&message.provider_extras))
+                            .saturating_add(harness_meta_heap_bytes(&message.meta))
+                    })
+                    .sum::<usize>(),
+            );
         let frontier_bytes = self
             .states_after_messages
             .capacity()
@@ -219,6 +294,7 @@ impl FlatProjection {
         size_of::<Self>()
             .saturating_add(block_bytes)
             .saturating_add(identity_bytes)
+            .saturating_add(message_meta_bytes)
             .saturating_add(frontier_bytes)
             .saturating_add(
                 self.message_block_ends
@@ -313,6 +389,7 @@ pub(crate) fn project_messages_incremental(
     let builder = FlatProjectionBuilder {
         blocks: cached.blocks[..prefix_block_end].to_vec(),
         identity_by_mid,
+        message_meta: cached.message_meta[..prefix_messages].to_vec(),
         message_block_ends: cached.message_block_ends[..prefix_messages].to_vec(),
         states_after_messages: cached.states_after_messages[..prefix_messages].to_vec(),
         state: cached.states_after_messages[prefix_messages - 1]
@@ -326,6 +403,7 @@ pub(crate) fn project_messages_incremental(
 struct FlatProjectionBuilder {
     blocks: Vec<FlatBlock>,
     identity_by_mid: BTreeMap<String, Vec<BlockIdentity>>,
+    message_meta: Vec<ProjectionMessageMeta>,
     message_block_ends: Vec<usize>,
     states_after_messages: Vec<Arc<ProjectionState>>,
     state: ProjectionState,
@@ -402,6 +480,14 @@ fn project_messages_from_state(
         if !msg.ck.meta.synthetic {
             builder.identity_by_mid.insert(msg.mid.clone(), identities);
         }
+        builder.message_meta.push(ProjectionMessageMeta {
+            mid: msg.mid.clone(),
+            ordinal: msg.ordinal,
+            role: msg.ck.role.clone(),
+            origin: msg.ck.origin.clone(),
+            provider_extras: msg.ck.provider_extras.clone(),
+            meta: msg.ck.meta.clone(),
+        });
         builder.message_block_ends.push(builder.blocks.len());
         builder
             .states_after_messages
@@ -411,6 +497,7 @@ fn project_messages_from_state(
     Ok(FlatProjection {
         blocks: builder.blocks,
         identity_by_mid: builder.identity_by_mid,
+        message_meta: builder.message_meta,
         message_block_ends: builder.message_block_ends,
         states_after_messages: builder.states_after_messages,
     })
@@ -1153,6 +1240,10 @@ mod tests {
             },
         ];
         let cached = project_messages(&messages).expect("initial projection");
+        let reattached = cached
+            .reattach_messages_prefix(2)
+            .expect("cached projection rebuilds its acknowledged ingress prefix");
+        assert_eq!(reattached, messages[..2]);
         if let CkKind::ToolResult { output, .. } = &mut messages[2].ck.content[0].kind {
             output.kind = CkOutputKind::Text {
                 text: "changed result".into(),
