@@ -3,10 +3,20 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+export type ProcessKind =
+    | "OpenCode server"
+    | "OpenCode instance (TUI/CLI)"
+    | "Pi"
+    | "process";
+
 export interface RpcPortFileRecord {
     port: number;
     pid: number;
     started_at: number;
+    /** Optional producer-provided kind; older records omit it. */
+    kind?: string;
+    /** Compatibility with discovery records that used the harness name. */
+    harness?: string;
     /**
      * Per-process bearer token. The server requires it on all non-health RPC
      * calls so a random local process or browser-origin script that merely
@@ -224,6 +234,74 @@ function readPsProcessCommand(pid: number): string | null {
     }
 }
 
+/** Reuse the platform-gated command probes used by PID identity checks. */
+export function readProcessCommand(pid: number): string | null {
+    if (!Number.isInteger(pid) || pid <= 0) return null;
+    return rpcIdentityPlatform === "linux"
+        ? readLinuxProcessCommand(pid)
+        : rpcIdentityPlatform === "win32"
+          ? (readWindowsProcess(pid).command ?? null)
+          : readPsProcessCommand(pid);
+}
+
+function executableName(token: string | undefined): string {
+    return (token ?? "").replace(/^['\"]|['\"]$/g, "").split("/").at(-1) ?? "";
+}
+
+function commandTokens(command: string): string[] {
+    return command
+        .toLowerCase()
+        .replaceAll("\\", "/")
+        .replaceAll("\u0000", " ")
+        .split(/\s+/)
+        .map((token) => token.replace(/^['\"]|['\"]$/g, ""))
+        .filter(Boolean);
+}
+
+function commandHasOpenCodeExecutable(tokens: readonly string[]): number {
+    return tokens.findIndex((token) => {
+        const executable = executableName(token).replace(/\.(?:exe|cmd)$/, "");
+        return executable === "opencode" || executable.endsWith("/opencode");
+    });
+}
+
+function commandHasPiExecutable(tokens: readonly string[]): boolean {
+    for (let index = 0; index < tokens.length; index += 1) {
+        const executable = executableName(tokens[index]).replace(/\.(?:exe|cmd)$/, "");
+        if (["pi", "omp", "oh-my-pi"].includes(executable)) return true;
+        if (["node", "bun", "deno"].includes(executable)) {
+            const script = executableName(tokens[index + 1]).replace(/\.(?:exe|cmd)$/, "");
+            if (
+                ["pi", "pi.js", "pi.mjs", "pi.cjs"].includes(script) ||
+                tokens[index + 1]?.includes("pi-coding-agent")
+            ) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/** Classify a process command without changing the liveness decision. */
+export function classifyProcessKind(command: string | null | undefined): ProcessKind {
+    if (!command) return "process";
+    const tokens = commandTokens(command);
+    const openCodeIndex = commandHasOpenCodeExecutable(tokens);
+    if (openCodeIndex >= 0) {
+        const args = tokens.slice(openCodeIndex + 1);
+        if (
+            args.some(
+                (token) =>
+                    token === "serve" || token === "--serve" || token.startsWith("--serve="),
+            )
+        ) {
+            return "OpenCode server";
+        }
+        return "OpenCode instance (TUI/CLI)";
+    }
+    return commandHasPiExecutable(tokens) ? "Pi" : "process";
+}
+
 function commandLooksLikeOpenCode(command: string): boolean {
     const normalized = command.toLowerCase();
     return OPEN_CODE_COMMAND_MARKERS.some((marker) => normalized.includes(marker));
@@ -394,6 +472,8 @@ export function parseRpcPortFile(content: string, fallbackPid = 0): RpcPortFileR
                 port,
                 pid,
                 started_at: Number.isFinite(startedAt) ? startedAt : 0,
+                kind: typeof parsed.kind === "string" ? parsed.kind : undefined,
+                harness: typeof parsed.harness === "string" ? parsed.harness : undefined,
                 token: typeof parsed.token === "string" ? parsed.token : undefined,
                 instance_id:
                     typeof parsed.instance_id === "string" ? parsed.instance_id : undefined,

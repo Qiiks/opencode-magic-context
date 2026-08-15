@@ -525,9 +525,10 @@ describe("storage-db", () => {
                 persistedVersion: LATEST_SUPPORTED_VERSION - 1,
                 supportedVersion: LATEST_SUPPORTED_VERSION,
                 serverPids: [41001],
+                blockingProcesses: [{ kind: "Pi", pid: 41001 }],
             });
             expect(getLiveMigrationBlockingProcesses(dirname(dbPath))).toEqual([
-                { harness: "Pi harness", pid: 41001 },
+                { kind: "Pi", pid: 41001 },
             ]);
             expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
         });
@@ -579,6 +580,7 @@ describe("storage-db", () => {
                 persistedVersion: LATEST_SUPPORTED_VERSION - 1,
                 supportedVersion: LATEST_SUPPORTED_VERSION,
                 serverPids: [],
+                blockingProcesses: [],
                 unreadableFile: portFile,
                 unreadableArm: "parse",
             });
@@ -783,6 +785,37 @@ describe("storage-db", () => {
             expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION - 1);
         });
 
+        it("#when a discovery record provides a process kind #then it takes precedence over command probes", () => {
+            const dataHome = useTempDataHome("storage-db-record-kind-migration-");
+            const dbPath = resolveDbPath(dataHome);
+            mkdirSync(dirname(dbPath), { recursive: true });
+            const legacy = new Database(dbPath);
+            legacy.exec(`
+                CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_migrations(version) VALUES (${LATEST_SUPPORTED_VERSION - 1});
+                INSERT INTO schema_migrations(version) VALUES (${FORK_MIGRATION_VERSION_FLOOR});
+            `);
+            legacy.close();
+
+            const portDir = join(dirname(dbPath), "rpc", "test-project");
+            mkdirSync(portDir, { recursive: true });
+            writeFileSync(
+                join(portDir, `port-${process.pid}.json`),
+                JSON.stringify({
+                    port: 43123,
+                    pid: process.pid,
+                    started_at: 1_200_000,
+                    kind: "Pi",
+                }),
+            );
+            setLinuxIdentityProbe();
+
+            expect(openDatabase()).toBeNull();
+            expect(getMigrationOnOpenRefusal()?.blockingProcesses).toEqual([
+                { kind: "Pi", pid: process.pid },
+            ]);
+        });
+
         it("#when a live OpenCode server advertises a port #then refuses a pending migration", () => {
             const dataHome = useTempDataHome("storage-db-live-server-migration-");
             const dbPath = resolveDbPath(dataHome);
@@ -831,9 +864,10 @@ describe("storage-db", () => {
                 persistedVersion: LATEST_SUPPORTED_VERSION - 1,
                 supportedVersion: LATEST_SUPPORTED_VERSION,
                 serverPids: [process.pid],
+                blockingProcesses: [{ kind: "process", pid: process.pid }],
             });
             expect(getLiveMigrationBlockingProcesses(dirname(dbPath))).toEqual([
-                { harness: "OpenCode server", pid: process.pid },
+                { kind: "process", pid: process.pid },
             ]);
             const unchanged = new Database(dbPath);
             expect(getPersistedSchemaVersion(unchanged)).toBe(LATEST_SUPPORTED_VERSION - 1);

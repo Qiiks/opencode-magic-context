@@ -274,7 +274,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             notifyMagicContextDisabled(deps.client, reason);
             const migration = getMigrationOnOpenRefusal();
             const blockingProcesses =
-                migration?.serverPids.map((pid) => ({ harness: "OpenCode server", pid })) ?? [];
+                migration?.blockingProcesses ??
+                migration?.serverPids.map((pid) => ({ kind: "process" as const, pid })) ?? [];
             const fence = getSchemaFenceRejection();
             recordHookInitFailure({
                 type: "storage",

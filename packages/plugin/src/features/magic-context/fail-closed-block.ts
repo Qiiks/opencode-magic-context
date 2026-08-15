@@ -11,13 +11,20 @@
  * those stay fail-open pass-through in the outer transform wrappers.
  */
 
+import type { ProcessKind } from "../../shared/rpc-utils";
+
 export const FAIL_CLOSED_DOCTOR_COMMAND = "npx @cortexkit/magic-context@latest doctor";
 
 /** How often a blocked transform pass re-attempts storage open (1 = every pass). */
 export const FAIL_CLOSED_REPROBE_EVERY_N = 5;
 
+export type FailClosedProcessKind = ProcessKind;
+
 export interface FailClosedBlockingProcess {
-    harness: string;
+    /** The detected kind of process holding the shared database. */
+    kind?: FailClosedProcessKind;
+    /** Legacy callers may still provide the old display label. */
+    harness?: string;
     pid: number;
 }
 
@@ -74,23 +81,46 @@ function isMagicContextHiddenAgentName(agent: string): boolean {
 
 const MAX_FORMATTED_BLOCKING_PROCESSES = 8;
 
+function normalizeFailClosedProcessKind(
+    process: FailClosedBlockingProcess,
+): FailClosedProcessKind {
+    switch (process.kind) {
+        case "OpenCode server":
+        case "OpenCode instance (TUI/CLI)":
+        case "Pi":
+        case "process":
+            return process.kind;
+    }
+    switch (process.harness?.trim().toLowerCase()) {
+        case "opencode server":
+            return "OpenCode server";
+        case "opencode instance (tui/cli)":
+        case "opencode instance":
+            return "OpenCode instance (TUI/CLI)";
+        case "pi":
+        case "pi harness":
+        case "omp":
+            return "Pi";
+        default:
+            return "process";
+    }
+}
+
 export function formatFailClosedBlockingProcesses(
     processes: readonly FailClosedBlockingProcess[],
 ): string {
-    const uniqueProcesses = new Map<string, FailClosedBlockingProcess>();
+    const uniqueProcesses = new Map<string, { kind: FailClosedProcessKind; pid: number }>();
     for (const process of processes) {
-        if (!process.harness.trim() || !Number.isInteger(process.pid) || process.pid <= 0) continue;
-        uniqueProcesses.set(`${process.harness}\u0000${process.pid}`, {
-            harness: process.harness.trim(),
-            pid: process.pid,
-        });
+        if (!Number.isInteger(process.pid) || process.pid <= 0) continue;
+        const kind = normalizeFailClosedProcessKind(process);
+        uniqueProcesses.set(`${kind}\u0000${process.pid}`, { kind, pid: process.pid });
     }
     const entries = [...uniqueProcesses.values()];
     const visible = entries.slice(0, MAX_FORMATTED_BLOCKING_PROCESSES);
-    const rendered = visible.map(({ harness, pid }) => `${harness} (PID ${pid})`);
+    const rendered = visible.map(({ kind, pid }) => `${kind} (PID ${pid})`);
     const omitted = entries.length - visible.length;
     if (omitted > 0) rendered.push(`${omitted} more blocking process(es)`);
-    if (rendered.length === 0) return "a live harness process";
+    if (rendered.length === 0) return "a live process";
     if (rendered.length === 1) return rendered[0];
     const last = rendered.pop();
     return `${rendered.join(", ")}, and ${last}`;
@@ -102,10 +132,10 @@ export function formatFailClosedBlockingMessage(reason: FailClosedReason): strin
             const arm = reason.unreadableArm ?? "io";
             const recovery =
                 arm === "io"
-                    ? `If no OpenCode server is running, it is safe to delete ${reason.unreadableFile} and retry.`
-                    : `The file may be a recent incomplete write; retry after the file is older than the ten-minute grace window, or stop OpenCode before deleting it.`;
+                    ? `If none of these processes are running, it is safe to delete ${reason.unreadableFile} and retry.`
+                    : `The file may be a recent incomplete write; retry after the file is older than the ten-minute grace window, or stop the relevant process before deleting it.`;
             return [
-                `Magic Context cannot migrate the shared database because RPC discovery file ${reason.unreadableFile} is uncertain (${arm} arm), so the absence of a live OpenCode server cannot be proven.`,
+                `Magic Context cannot migrate the shared database because RPC discovery file ${reason.unreadableFile} is uncertain (${arm} arm), so the absence of a live process cannot be proven.`,
                 recovery,
                 `Recovery: ${FAIL_CLOSED_DOCTOR_COMMAND}`,
             ].join(" ");
