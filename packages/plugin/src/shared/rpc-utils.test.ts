@@ -43,6 +43,13 @@ function psOutput(output: string | Error): typeof execFileSync {
     }) as typeof execFileSync;
 }
 
+function tasklistOutput(entries: Array<[number, string]>): string {
+    return [
+        '"Image Name","PID","Session Name","Session#","Mem Usage"',
+        ...entries.map(([pid, command]) => `"${command}","${pid}","Console","1","10,000 K"`),
+    ].join("\r\n");
+}
+
 afterEach(() => {
     __resetRpcIdentityTestHooks();
 });
@@ -79,6 +86,27 @@ describe("discoverLivePiProcessIds", () => {
             error: "ps unavailable",
         });
     });
+
+    test("uses tasklist instead of ps on Windows", () => {
+        const calls: string[] = [];
+        __setRpcIdentityTestHooks({
+            platform: "win32",
+            processListExecFileSync: ((file: string | URL) => {
+                calls.push(String(file));
+                return tasklistOutput([
+                    [process.pid, "pi.exe"],
+                    [41001, "pi.exe"],
+                    [41002, "opencode.exe"],
+                ]);
+            }) as typeof execFileSync,
+        });
+
+        expect(inspectLivePiProcesses()).toEqual({
+            state: "known",
+            processIds: [41001],
+        });
+        expect(calls).toEqual(["tasklist"]);
+    });
 });
 
 describe("isPidAlive", () => {
@@ -107,6 +135,53 @@ describe("isPidAlive", () => {
             }) as typeof process.kill,
         });
         expect(isPidAlive(PID)).toBe("inconclusive");
+    });
+
+    test("uses tasklist for Windows liveness and captures probe stderr", () => {
+        const calls: Array<{ file: string; args: readonly string[]; stdio: unknown }> = [];
+        __setRpcIdentityTestHooks({
+            platform: "win32",
+            execFileSync: ((
+                file: string | URL,
+                args: readonly string[] = [],
+                options: { stdio?: unknown } = {},
+            ) => {
+                calls.push({ file: String(file), args, stdio: options.stdio });
+                if (String(file) === "ps") throw new Error("ps must not run on Windows");
+                return tasklistOutput([[PID, "OpenCode.exe"]]);
+            }) as typeof execFileSync,
+        });
+
+        expect(isPidAlive(PID)).toBe("alive");
+        expect(calls).toEqual([
+            {
+                file: "tasklist",
+                args: ["/FO", "CSV", "/FI", `PID eq ${PID}`],
+                stdio: ["ignore", "pipe", "pipe"],
+            },
+        ]);
+    });
+
+    test("treats a successful tasklist no-match response as dead", () => {
+        __setRpcIdentityTestHooks({
+            platform: "win32",
+            execFileSync: (() =>
+                "INFO: No tasks are running which match the specified criteria.") as typeof execFileSync,
+        });
+
+        expect(isPidAlive(PID)).toBe("dead");
+    });
+
+    test("returns inconclusive when the Windows tasklist probe cannot spawn", () => {
+        __setRpcIdentityTestHooks({
+            platform: "win32",
+            execFileSync: (() => {
+                throw new Error("tasklist unavailable");
+            }) as typeof execFileSync,
+        });
+
+        expect(isPidAlive(PID)).toBe("inconclusive");
+        expect(isPidIdentityPlausible(record(0))).toBe("inconclusive");
     });
 });
 
@@ -219,5 +294,24 @@ describe("isPidIdentityPlausible", () => {
             execFileSync: psOutput(new Error("ps unavailable")),
         });
         expect(isPidIdentityPlausible(record(0))).toBe("inconclusive");
+    });
+
+    test("uses tasklist for the Windows command fallback and skips unavailable start time", () => {
+        const calls: Array<{ file: string; args: readonly string[] }> = [];
+        __setRpcIdentityTestHooks({
+            platform: "win32",
+            execFileSync: ((file: string | URL, args: readonly string[] = []) => {
+                calls.push({ file: String(file), args });
+                if (String(file) === "ps") throw new Error("ps must not run on Windows");
+                return tasklistOutput([[PID, "OpenCode.exe"]]);
+            }) as typeof execFileSync,
+        });
+
+        expect(isPidIdentityPlausible(record(0))).toBe("plausible");
+        expect(calls).toEqual([{ file: "tasklist", args: ["/FO", "CSV", "/FI", `PID eq ${PID}`] }]);
+
+        calls.length = 0;
+        expect(isPidIdentityPlausible(record(NOW_MS))).toBe("inconclusive");
+        expect(calls).toEqual([]);
     });
 });

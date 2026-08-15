@@ -53,12 +53,14 @@ export function legacyRpcPortFilePath(storageDir: string, directory: string): st
 export type PidLiveness = "alive" | "dead" | "inconclusive";
 
 /**
- * Check whether the kernel confirms a PID is live without treating a denied
- * probe as confirmation. Sandboxes commonly reject `kill(pid, 0)` with EPERM
- * even when the PID does not exist outside their process view.
+ * Check whether the platform confirms a PID is live without treating a denied
+ * probe as confirmation. Windows uses tasklist because MSYS2/Cygwin ps does not
+ * support the options used by the Unix probe. Sandboxes commonly reject
+ * `kill(pid, 0)` with EPERM even when the PID does not exist outside their view.
  */
 export function isPidAlive(pid: number): PidLiveness {
     if (!Number.isInteger(pid) || pid <= 0) return "dead";
+    if (rpcIdentityPlatform === "win32") return readWindowsProcess(pid).state;
     try {
         rpcIdentityProcessKill(pid, 0);
         return "alive";
@@ -71,6 +73,8 @@ const RPC_IDENTITY_SKEW_TOLERANCE_MS = 120_000;
 const LINUX_CLOCK_TICKS_PER_SECOND = 100;
 const PS_PROBE_TIMEOUT_MS = 1_000;
 const OPEN_CODE_COMMAND_MARKERS = ["opencode", "node", "bun", "electron"];
+const TASKLIST_NO_TASKS_PATTERN =
+    /^INFO:\s+No tasks are running which match the specified criteria\.?$/im;
 
 let rpcIdentityReadFileSync: typeof readFileSync = readFileSync;
 let rpcIdentityExecFileSync: typeof execFileSync = execFileSync;
@@ -124,11 +128,78 @@ function readPsProcessStartTime(pid: number): number | null {
         const output = rpcIdentityExecFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
             encoding: "utf8",
             timeout: PS_PROBE_TIMEOUT_MS,
+            stdio: ["ignore", "pipe", "pipe"],
         });
         const processStartTime = Date.parse(String(output).trim());
         return Number.isFinite(processStartTime) ? processStartTime : null;
     } catch {
         return null;
+    }
+}
+
+interface ProcessListEntry {
+    pid: number;
+    command: string;
+}
+
+function parseCsvLine(line: string): string[] | null {
+    const fields: string[] = [];
+    let field = "";
+    let quoted = false;
+    for (let index = 0; index < line.length; index += 1) {
+        const character = line[index];
+        if (character === '"') {
+            if (quoted && line[index + 1] === '"') {
+                field += '"';
+                index += 1;
+            } else {
+                quoted = !quoted;
+            }
+        } else if (character === "," && !quoted) {
+            fields.push(field);
+            field = "";
+        } else {
+            field += character;
+        }
+    }
+    if (quoted) return null;
+    fields.push(field);
+    return fields;
+}
+
+function parseTasklistOutput(output: string): ProcessListEntry[] | null {
+    const entries: ProcessListEntry[] = [];
+    let sawHeader = false;
+    for (const rawLine of output.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        if (TASKLIST_NO_TASKS_PATTERN.test(line)) return [];
+        const fields = parseCsvLine(line);
+        if (!fields) continue;
+        if (fields[1]?.trim().toLowerCase() === "pid") {
+            sawHeader = true;
+            continue;
+        }
+        const pid = Number(fields[1]);
+        if (!Number.isInteger(pid) || pid <= 0 || !fields[0]) continue;
+        entries.push({ pid, command: fields[0] });
+    }
+    return entries.length > 0 || sawHeader ? entries : null;
+}
+
+function readWindowsProcess(pid: number): { state: PidLiveness; command?: string } {
+    try {
+        const output = rpcIdentityExecFileSync("tasklist", ["/FO", "CSV", "/FI", `PID eq ${pid}`], {
+            encoding: "utf8",
+            timeout: PS_PROBE_TIMEOUT_MS,
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+        const entries = parseTasklistOutput(String(output));
+        if (entries === null) return { state: "inconclusive" };
+        const process = entries.find((entry) => entry.pid === pid);
+        return process ? { state: "alive", command: process.command } : { state: "dead" };
+    } catch {
+        return { state: "inconclusive" };
     }
 }
 
@@ -145,6 +216,7 @@ function readPsProcessCommand(pid: number): string | null {
         const output = rpcIdentityExecFileSync("ps", ["-p", String(pid), "-o", "command="], {
             encoding: "utf8",
             timeout: PS_PROBE_TIMEOUT_MS,
+            stdio: ["ignore", "pipe", "pipe"],
         });
         return String(output);
     } catch {
@@ -161,10 +233,11 @@ function commandLooksLikeOpenCode(command: string): boolean {
  * Verify that a live PID still belongs to the process that wrote a port record.
  *
  * A PID can be reused after its original process exits. On Linux, procfs gives
- * us a process start time without spawning a helper; other platforms use `ps`
- * only on this cold database-open guard path. Legacy records without a start
- * time use a weaker command-name check. A failed filesystem or `ps` probe is
- * inconclusive, not proof that this port record still belongs to OpenCode.
+ * us a process start time without spawning a helper; macOS and other Unix-like
+ * platforms use `ps`, while Windows uses `tasklist`, only on this cold
+ * database-open guard path. Legacy records without a start time use a weaker
+ * command-name check. A failed filesystem or process probe is inconclusive,
+ * not proof that this port record still belongs to OpenCode.
  */
 export type PidIdentityPlausibility = "plausible" | "implausible" | "inconclusive";
 
@@ -175,7 +248,9 @@ export function isPidIdentityPlausible(record: RpcPortFileRecord): PidIdentityPl
         const processStartTime =
             rpcIdentityPlatform === "linux"
                 ? readLinuxProcessStartTime(record.pid)
-                : readPsProcessStartTime(record.pid);
+                : rpcIdentityPlatform === "win32"
+                  ? null
+                  : readPsProcessStartTime(record.pid);
         if (processStartTime === null) return "inconclusive";
         return processStartTime <= record.started_at + RPC_IDENTITY_SKEW_TOLERANCE_MS
             ? "plausible"
@@ -185,7 +260,9 @@ export function isPidIdentityPlausible(record: RpcPortFileRecord): PidIdentityPl
     const command =
         rpcIdentityPlatform === "linux"
             ? readLinuxProcessCommand(record.pid)
-            : readPsProcessCommand(record.pid);
+            : rpcIdentityPlatform === "win32"
+              ? (readWindowsProcess(record.pid).command ?? null)
+              : readPsProcessCommand(record.pid);
     if (command === null) return "inconclusive";
     return commandLooksLikeOpenCode(command) ? "plausible" : "implausible";
 }
@@ -252,19 +329,40 @@ export function inspectLivePiProcesses(): PiProcessDiscovery {
         return { state: "known", processIds: [] };
     }
     try {
+        const isWindows = rpcIdentityPlatform === "win32";
         const output = String(
-            rpcProcessListExecFileSync("ps", ["-axo", "pid=,command="], {
-                encoding: "utf8",
-                timeout: PS_PROBE_TIMEOUT_MS,
-            }),
+            rpcProcessListExecFileSync(
+                isWindows ? "tasklist" : "ps",
+                isWindows ? ["/FO", "CSV"] : ["-axo", "pid=,command="],
+                {
+                    encoding: "utf8",
+                    timeout: PS_PROBE_TIMEOUT_MS,
+                    stdio: ["ignore", "pipe", "pipe"],
+                },
+            ),
         );
         const pids = new Set<number>();
-        for (const line of output.split(/\r?\n/)) {
-            const match = /^\s*(\d+)\s+(.+)$/.exec(line);
-            if (!match) continue;
-            const pid = Number(match[1]);
-            if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
-            if (commandLooksLikePi(match[2])) pids.add(pid);
+        if (isWindows) {
+            const entries = parseTasklistOutput(output);
+            if (entries === null) {
+                return {
+                    state: "unreadable",
+                    processIds: [],
+                    error: "tasklist output unavailable",
+                };
+            }
+            for (const entry of entries) {
+                if (entry.pid === process.pid) continue;
+                if (commandLooksLikePi(entry.command)) pids.add(entry.pid);
+            }
+        } else {
+            for (const line of output.split(/\r?\n/)) {
+                const match = /^\s*(\d+)\s+(.+)$/.exec(line);
+                if (!match) continue;
+                const pid = Number(match[1]);
+                if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
+                if (commandLooksLikePi(match[2])) pids.add(pid);
+            }
         }
         return { state: "known", processIds: [...pids].sort((left, right) => left - right) };
     } catch (error) {
