@@ -21,6 +21,8 @@ mc-core = { workspace = true }
 mc-store = { workspace = true }
 mc-tokenizer = { path = "../mc-tokenizer" }
 cortexkit-store-types = { workspace = true }
+cortexkit-store = { workspace = true }
+cortexkit-lease = { workspace = true }
 subc-protocol = { workspace = true }
 subc-control = { workspace = true }
 subc-transport = { workspace = true }

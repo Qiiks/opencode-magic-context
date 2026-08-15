@@ -49,7 +49,7 @@ use std::future::Future;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -57,6 +57,8 @@ use mc_store::MEMORY_VISIBILITY_MUTATION_CATEGORY;
 use tokio::sync::Notify;
 
 use chrono::{Local, TimeZone};
+use cortexkit_lease::LeaseError;
+use cortexkit_store::StoreError;
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 #[cfg(test)]
 use mc_store::TagNumberRow;
@@ -222,6 +224,112 @@ pub const DEFAULT_MODULE_ID: &str = "magic-context";
 
 const TRANSFORM_HEALTH_LANE: &str = "transform";
 const TRANSFORM_WEDGE_THRESHOLD_MS: u64 = 120_000;
+const STORE_OPEN_IDLE: u8 = 0;
+const STORE_OPENING: u8 = 1;
+const STORE_OPEN_WAITING: u8 = 2;
+const STORE_OPENED: u8 = 3;
+const STORE_LEASE_WAIT_WINDOW: Duration = Duration::from_secs(60);
+const STORE_LEASE_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const STORE_LEASE_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy)]
+struct StoreOpenPolicy {
+    wait_window: Duration,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+}
+
+impl Default for StoreOpenPolicy {
+    fn default() -> Self {
+        Self {
+            wait_window: STORE_LEASE_WAIT_WINDOW,
+            initial_backoff: STORE_LEASE_INITIAL_BACKOFF,
+            max_backoff: STORE_LEASE_MAX_BACKOFF,
+        }
+    }
+}
+
+struct StoreOpenCoordinator {
+    phase: AtomicU8,
+    wait_started_at_ms: AtomicU64,
+    cancelled: AtomicBool,
+    cancel: Notify,
+    active_waiters: AtomicU64,
+    waiter_completed: Notify,
+    waiter_starts: AtomicU64,
+    policy: Mutex<StoreOpenPolicy>,
+}
+
+impl StoreOpenCoordinator {
+    fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(STORE_OPEN_IDLE),
+            wait_started_at_ms: AtomicU64::new(0),
+            cancelled: AtomicBool::new(false),
+            cancel: Notify::new(),
+            active_waiters: AtomicU64::new(0),
+            waiter_completed: Notify::new(),
+            waiter_starts: AtomicU64::new(0),
+            policy: Mutex::new(StoreOpenPolicy::default()),
+        }
+    }
+
+    fn waiting_report(&self, now_ms: u64) -> Option<HealthReport> {
+        if self.phase.load(Ordering::Acquire) != STORE_OPEN_WAITING {
+            return None;
+        }
+        let started_at_ms = self.wait_started_at_ms.load(Ordering::Relaxed);
+        let elapsed_ms = now_ms.saturating_sub(started_at_ms);
+        Some(HealthReport {
+            status: HealthStatus::Degraded,
+            detail: Some(format!(
+                "waiting on storage lease, held by prior incarnation, {:.2}s elapsed",
+                elapsed_ms as f64 / 1_000.0
+            )),
+            metrics: Some(json!({
+                "lane": TRANSFORM_HEALTH_LANE,
+                "storage_state": "waiting_for_lease",
+                "storage_lease_wait_elapsed_ms": elapsed_ms,
+            })),
+        })
+    }
+
+    fn finish_waiter(&self) {
+        self.active_waiters.fetch_sub(1, Ordering::AcqRel);
+        self.waiter_completed.notify_waiters();
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.cancel.notify_waiters();
+    }
+}
+
+struct StoreOpenWaiterGuard {
+    coordinator: Arc<StoreOpenCoordinator>,
+}
+
+impl Drop for StoreOpenWaiterGuard {
+    fn drop(&mut self) {
+        self.coordinator.finish_waiter();
+    }
+}
+
+fn jittered_store_open_delay(base: Duration, cap: Duration, attempt: usize) -> Duration {
+    const JITTER_PERCENT: [u128; 4] = [100, 108, 116, 104];
+    let nanos = base
+        .as_nanos()
+        .saturating_mul(JITTER_PERCENT[attempt % JITTER_PERCENT.len()])
+        / 100;
+    Duration::from_nanos(nanos.min(cap.as_nanos()).min(u64::MAX as u128) as u64)
+}
+
+fn store_open_error_is_live_lease(error: &McStoreError) -> bool {
+    matches!(
+        error,
+        McStoreError::Store(StoreError::Lease(LeaseError::Held { .. }))
+    )
+}
 
 /// The transform heartbeat is deliberately process-wide: the SDK health callback runs on
 /// the channel-0 control path and must be able to observe the data-plane lane without
@@ -2738,7 +2846,8 @@ impl ProjectionCache {
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (route channel → {project, session}).
 pub struct McHandler {
-    store: OnceLock<Arc<McStore>>,
+    store: Arc<OnceLock<Arc<McStore>>>,
+    store_open: Arc<StoreOpenCoordinator>,
     producer_factory: Arc<dyn HistorianProducerFactory>,
     session_resolver: Arc<dyn SessionResolver>,
     config: Mutex<ConfigCache>,
@@ -3170,7 +3279,8 @@ impl McHandler {
             None => Arc::new(MissingSessionResolver),
         };
         McHandler {
-            store: OnceLock::new(),
+            store: Arc::new(OnceLock::new()),
+            store_open: Arc::new(StoreOpenCoordinator::new()),
             producer_factory,
             session_resolver,
             config: Mutex::new(ConfigCache::default()),
@@ -3225,6 +3335,168 @@ impl McHandler {
         }
     }
 
+    fn begin_store_open(&self, descriptor: StorageDescriptor) {
+        if self.store.get().is_some()
+            || self
+                .store_open
+                .phase
+                .compare_exchange(
+                    STORE_OPEN_IDLE,
+                    STORE_OPENING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return;
+        }
+
+        self.store_open
+            .active_waiters
+            .fetch_add(1, Ordering::AcqRel);
+        self.store_open
+            .waiter_starts
+            .fetch_add(1, Ordering::Relaxed);
+        let store = Arc::clone(&self.store);
+        let coordinator = Arc::clone(&self.store_open);
+        tokio::spawn(async move {
+            let _guard = StoreOpenWaiterGuard {
+                coordinator: Arc::clone(&coordinator),
+            };
+            Self::run_store_open(store, coordinator, descriptor).await;
+        });
+    }
+
+    async fn run_store_open(
+        store_slot: Arc<OnceLock<Arc<McStore>>>,
+        coordinator: Arc<StoreOpenCoordinator>,
+        descriptor: StorageDescriptor,
+    ) {
+        let policy = *coordinator.policy.lock().expect("store open policy mutex");
+        let mut last_lease_error = match Self::open_store_once(&descriptor).await {
+            Ok(opened) => {
+                if coordinator.cancelled.load(Ordering::Acquire) {
+                    coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                    return;
+                }
+                let _ = store_slot.set(Arc::new(opened));
+                coordinator.phase.store(STORE_OPENED, Ordering::Release);
+                return;
+            }
+            Err(error) if store_open_error_is_live_lease(&error) => error,
+            Err(error) => {
+                eprintln!("mc-module: store open failed: {error}");
+                coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                return;
+            }
+        };
+
+        let started = Instant::now();
+        coordinator
+            .wait_started_at_ms
+            .store(now_ms().max(0) as u64, Ordering::Relaxed);
+        coordinator
+            .phase
+            .store(STORE_OPEN_WAITING, Ordering::Release);
+        eprintln!(
+            "mc-module: storage lease held; waiting up to {}s for predecessor exit",
+            STORE_LEASE_WAIT_WINDOW.as_secs()
+        );
+
+        let mut backoff = policy.initial_backoff;
+        let mut attempt = 0usize;
+        loop {
+            let elapsed = started.elapsed();
+            if coordinator.cancelled.load(Ordering::Acquire) {
+                eprintln!(
+                    "mc-module: storage lease wait cancelled during shutdown after {:.2}s",
+                    elapsed.as_secs_f64()
+                );
+                coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                return;
+            }
+            if elapsed >= policy.wait_window {
+                eprintln!(
+                    "mc-module: storage lease wait expired after {:.2}s; store open failed: {last_lease_error}",
+                    elapsed.as_secs_f64()
+                );
+                coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                return;
+            }
+
+            let delay = jittered_store_open_delay(backoff, policy.max_backoff, attempt)
+                .min(policy.wait_window.saturating_sub(elapsed));
+            tokio::select! {
+                _ = coordinator.cancel.notified() => {
+                    eprintln!(
+                        "mc-module: storage lease wait cancelled during shutdown after {:.2}s",
+                        started.elapsed().as_secs_f64()
+                    );
+                    coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                    return;
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
+            if coordinator.cancelled.load(Ordering::Acquire) {
+                eprintln!(
+                    "mc-module: storage lease wait cancelled during shutdown after {:.2}s",
+                    started.elapsed().as_secs_f64()
+                );
+                coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                return;
+            }
+            if started.elapsed() >= policy.wait_window {
+                continue;
+            }
+
+            match Self::open_store_once(&descriptor).await {
+                Ok(opened) => {
+                    if coordinator.cancelled.load(Ordering::Acquire) {
+                        coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                        return;
+                    }
+                    let _ = store_slot.set(Arc::new(opened));
+                    coordinator.phase.store(STORE_OPENED, Ordering::Release);
+                    eprintln!(
+                        "mc-module: storage lease released; store opened after {:.2}s",
+                        started.elapsed().as_secs_f64()
+                    );
+                    return;
+                }
+                Err(error) if store_open_error_is_live_lease(&error) => {
+                    last_lease_error = error;
+                    backoff = backoff.saturating_mul(2).min(policy.max_backoff);
+                    attempt = attempt.saturating_add(1);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "mc-module: storage lease wait ended after {:.2}s; store open failed: {error}",
+                        started.elapsed().as_secs_f64()
+                    );
+                    coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn open_store_once(descriptor: &StorageDescriptor) -> Result<McStore, McStoreError> {
+        let descriptor = descriptor.clone();
+        match tokio::task::spawn_blocking(move || McStore::open(&descriptor)).await {
+            Ok(result) => result,
+            Err(error) => panic!("store open worker failed: {error}"),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_store_open_policy_for_test(&self, policy: StoreOpenPolicy) {
+        *self
+            .store_open
+            .policy
+            .lock()
+            .expect("store open policy mutex") = policy;
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     fn with_producer_factory(factory: Arc<dyn HistorianProducerFactory>) -> Self {
@@ -3271,7 +3543,8 @@ impl McHandler {
         session_resolver: Arc<dyn SessionResolver>,
     ) -> Self {
         McHandler {
-            store: OnceLock::new(),
+            store: Arc::new(OnceLock::new()),
+            store_open: Arc::new(StoreOpenCoordinator::new()),
             producer_factory: factory,
             session_resolver,
             config: Mutex::new(ConfigCache::default()),
@@ -10704,6 +10977,12 @@ impl McHandler {
     }
 }
 
+impl Drop for McHandler {
+    fn drop(&mut self) {
+        self.store_open.cancel();
+    }
+}
+
 impl Default for McHandler {
     fn default() -> Self {
         Self::new()
@@ -10713,33 +10992,20 @@ impl Default for McHandler {
 #[async_trait]
 impl ModuleHandler for McHandler {
     /// The storage seam: HELLO_ACK carries the resolved descriptor (or none in
-    /// standalone dev). Open the store ONCE here — never at construction, because the
-    /// path isn't known until the ACK lands.
-    ///
-    /// Guard the OPEN itself, not just the `set`: `McStore::open` acquires the
-    /// single-writer lease, so on a reconnect ack (if serve re-fires this) an
-    /// unconditional open briefly takes a second lease on a process that already
-    /// holds one. `on_hello_ack` is called serially by serve, so the get/open/set
-    /// is race-free without a lock.
+    /// standalone dev). Start the store open ONCE here — never at construction, because
+    /// the path isn't known until the ACK lands. Opening runs off the request lane so a
+    /// predecessor's live single-writer lease cannot block transform dispatch.
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
-        if self.store.get().is_some() {
-            return;
-        }
-        let descriptor = resolve_descriptor(ack.storage.as_ref());
-        match McStore::open(&descriptor) {
-            Ok(store) => {
-                let _ = self.store.set(Arc::new(store));
-            }
-            Err(e) => {
-                eprintln!("mc-module: store open failed: {e}");
-            }
-        }
+        self.begin_store_open(resolve_descriptor(ack.storage.as_ref()));
     }
 
-    /// Return the transform lane's atomics-only liveness snapshot. The SDK invokes this on
-    /// its separate channel-0 health task; no store read or handler lock is allowed here.
+    /// Return an atomics-only liveness snapshot. The SDK invokes this on its separate
+    /// channel-0 health task, so neither the store nor a handler lock is touched here.
     async fn health(&self) -> HealthReport {
-        DISPATCH_HEALTH.report(now_ms().max(0) as u64)
+        let now = now_ms().max(0) as u64;
+        self.store_open
+            .waiting_report(now)
+            .unwrap_or_else(|| DISPATCH_HEALTH.report(now))
     }
 
     /// Record the route's {project_root, session} so the transform path can resolve the
@@ -14640,6 +14906,153 @@ mod tests {
             StorageBackend::Sqlite { path } => assert_eq!(path, "/managed/path/store.db"),
             other => panic!("expected sqlite backend, got {other:?}"),
         }
+    }
+
+    fn short_store_open_policy(wait_window: Duration) -> StoreOpenPolicy {
+        StoreOpenPolicy {
+            wait_window,
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(20),
+        }
+    }
+
+    async fn wait_for_store_open_phase(handler: &McHandler, phase: u8) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handler.store_open.phase.load(Ordering::Acquire) != phase {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("store open phase should advance");
+    }
+
+    async fn wait_for_store_open(handler: &McHandler) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handler.store.get().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("store should open after the predecessor releases its lease");
+    }
+
+    #[tokio::test]
+    async fn lease_held_then_freed_opens_store_and_discriminates_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let predecessor = McStore::open(&descriptor).unwrap();
+        let handler = McHandler::new();
+        handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
+
+        handler.begin_store_open(descriptor);
+        wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
+        let before = error_frame(call_transform_outcome(&handler, request(big_messages())).await);
+        assert_eq!(before.0, "store_unavailable");
+        assert_eq!(before.1, "store not opened (no HELLO_ACK storage seam)");
+
+        drop(predecessor);
+        wait_for_store_open(&handler).await;
+        let after = error_frame(call_transform_outcome(&handler, request(big_messages())).await);
+        assert_eq!(after.0, "route_unbound");
+    }
+
+    #[tokio::test]
+    async fn lease_held_past_window_preserves_terminal_store_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let _predecessor = McStore::open(&descriptor).unwrap();
+        let handler = McHandler::new();
+        handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(60)));
+
+        handler.begin_store_open(descriptor);
+        wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
+        let before = error_frame(call_transform_outcome(&handler, request(big_messages())).await);
+        wait_for_store_open_phase(&handler, STORE_OPEN_IDLE).await;
+        let after = error_frame(call_transform_outcome(&handler, request(big_messages())).await);
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn double_store_open_during_lease_wait_has_one_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let _predecessor = McStore::open(&descriptor).unwrap();
+        let handler = McHandler::new();
+        handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
+
+        handler.begin_store_open(descriptor.clone());
+        wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
+        handler.begin_store_open(descriptor);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        assert_eq!(handler.store_open.waiter_starts.load(Ordering::Relaxed), 1);
+        assert_eq!(handler.store_open.active_waiters.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_store_lease_wait_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let _predecessor = McStore::open(&descriptor).unwrap();
+        let handler = McHandler::new();
+        handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_secs(5)));
+        let coordinator = Arc::clone(&handler.store_open);
+
+        handler.begin_store_open(descriptor);
+        wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
+        drop(handler);
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while coordinator.active_waiters.load(Ordering::Acquire) != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("store lease waiter should stop on handler shutdown");
+    }
+
+    #[tokio::test]
+    async fn lease_wait_health_detail_advances_elapsed_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let _predecessor = McStore::open(&descriptor).unwrap();
+        let handler = McHandler::new();
+        handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
+
+        handler.begin_store_open(descriptor);
+        wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
+        let first = <McHandler as ModuleHandler>::health(&handler).await;
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        let second = <McHandler as ModuleHandler>::health(&handler).await;
+
+        assert_eq!(first.status, HealthStatus::Degraded);
+        assert_eq!(second.status, HealthStatus::Degraded);
+        let first_detail = first.detail.unwrap();
+        let second_detail = second.detail.unwrap();
+        assert!(first_detail.starts_with("waiting on storage lease, held by prior incarnation, "));
+        assert!(second_detail.ends_with("s elapsed"));
+        assert_ne!(first_detail, second_detail);
+        assert!(
+            second.metrics.unwrap()["storage_lease_wait_elapsed_ms"].as_u64()
+                > first.metrics.unwrap()["storage_lease_wait_elapsed_ms"].as_u64()
+        );
+    }
+
+    #[test]
+    fn store_lease_wait_defaults_to_sixty_seconds() {
+        assert_eq!(
+            StoreOpenPolicy::default().wait_window,
+            Duration::from_secs(60)
+        );
     }
 
     #[test]

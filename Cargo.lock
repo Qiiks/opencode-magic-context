@@ -514,6 +514,8 @@ name = "mc-module"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "cortexkit-lease",
+ "cortexkit-store",
  "cortexkit-store-types",
  "filetime",
  "mc-core",
