@@ -1,4 +1,6 @@
 import {
+    AUTHORITY_DOMAINS,
+    type AuthorityManagedMarker,
     type AuthorityModuleClient,
     checksumAuthoritySeedRows,
     drainAuthority,
@@ -13,7 +15,82 @@ import type { Database } from "@magic-context/core/shared/sqlite";
 
 import { openExistingContextDatabaseForMutation } from "../lib/database-access";
 
-const DOMAINS = ["memories", "notes"] as const;
+export interface AuthorityProjectToVerify {
+    /** Human-readable role in a cross-project operation, such as "source" or "target". */
+    role: string;
+    /** Durable Magic Context project identity stored by the authority marker. */
+    projectPath: string;
+    /** Filesystem root used to bind the module request to this project. */
+    projectRoot: string | null;
+}
+
+export interface AuthorityVerificationResult {
+    markers: AuthorityManagedMarker[];
+}
+
+export function authorityDrainCommand(project: AuthorityProjectToVerify): string {
+    return `magic-context doctor drain-authority ${
+        project.projectRoot ?? `<${project.role} project root>`
+    }`;
+}
+
+/**
+ * Prove that every requested project is writable by TypeScript before a command
+ * mutates shared context.db rows. A durable authority marker is the fence: no
+ * marker means TypeScript owns the project, while a marker requires the module
+ * to confirm TypeScript ownership for every authority domain.
+ */
+export async function assertProjectsUseTsAuthority(args: {
+    db: Database;
+    projects: readonly AuthorityProjectToVerify[];
+    module: Pick<AuthorityModuleClient, "authorityStatus">;
+}): Promise<AuthorityVerificationResult> {
+    const markers = listAuthorityManagedMarkers(args.db);
+    const markerByProject = new Map(markers.map((marker) => [marker.project_path, marker]));
+
+    for (const project of args.projects) {
+        const marker = markerByProject.get(project.projectPath);
+        if (!marker) continue;
+        const projectRoot = project.projectRoot;
+        if (!projectRoot) {
+            throw new Error(
+                `Migration refused: durable module authority for ${project.role} project ${project.projectPath} cannot be checked because its project directory is unavailable. ` +
+                    `Writes remain fenced. Drain it first: ${authorityDrainCommand(project)}`,
+            );
+        }
+
+        let statuses: Awaited<ReturnType<AuthorityModuleClient["authorityStatus"]>>[];
+        try {
+            statuses = await Promise.all(
+                AUTHORITY_DOMAINS.map((domain) =>
+                    args.module.authorityStatus({
+                        context_store_uuid: marker.context_store_uuid,
+                        project: project.projectPath,
+                        projectRoot,
+                        domain,
+                    }),
+                ),
+            );
+        } catch (error) {
+            throw new Error(
+                `Migration refused: module unreachable while checking ${project.role} project ${project.projectPath}; writes remain fenced. ` +
+                    `Drain it first: ${authorityDrainCommand(project)}. ` +
+                    `Module error: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        }
+
+        for (const [index, status] of statuses.entries()) {
+            const state = status.authority?.state ?? "TS";
+            if (state === "TS") continue;
+            throw new Error(
+                `Migration refused: ${project.role} project ${project.projectPath} has ${AUTHORITY_DOMAINS[index]} authority in ${state} mode; writes remain fenced. ` +
+                    `Drain it first: ${authorityDrainCommand(project)}`,
+            );
+        }
+    }
+
+    return { markers };
+}
 
 function authorityClient(
     transport: SubcModuleTransport,
@@ -27,7 +104,11 @@ function authorityClient(
     };
 }
 
-function checksumFor(db: Database, projectPath: string, domain: (typeof DOMAINS)[number]): string {
+function checksumFor(
+    db: Database,
+    projectPath: string,
+    domain: (typeof AUTHORITY_DOMAINS)[number],
+): string {
     const table = domain === "memories" ? "memories" : "notes";
     const rows = db
         .prepare(`SELECT * FROM ${table} WHERE project_path = ? ORDER BY id ASC`)
@@ -65,7 +146,7 @@ export async function reportAuthorityMarkers(args: {
         try {
             const module = authorityClient(transport, process.cwd());
             const statuses = await Promise.all(
-                DOMAINS.map((domain) =>
+                AUTHORITY_DOMAINS.map((domain) =>
                     module.authorityStatus({
                         context_store_uuid: ensureContextStoreUuid(args.db),
                         project: marker.project_path,
@@ -75,7 +156,10 @@ export async function reportAuthorityMarkers(args: {
             );
             args.info(
                 `  ${marker.project_path}: ${statuses
-                    .map((status, index) => `${DOMAINS[index]}=${status.authority?.state ?? "TS"}`)
+                    .map(
+                        (status, index) =>
+                            `${AUTHORITY_DOMAINS[index]}=${status.authority?.state ?? "TS"}`,
+                    )
                     .join(", ")}`,
             );
         } catch {
@@ -103,7 +187,7 @@ export async function runDoctorDrainAuthority(
         }
         const module = authorityClient(new SubcModuleTransport(), projectRoot);
         let drainedAny = false;
-        for (const domain of DOMAINS) {
+        for (const domain of AUTHORITY_DOMAINS) {
             const status = await module.authorityStatus({
                 context_store_uuid: ensureContextStoreUuid(db),
                 project: projectPath,
