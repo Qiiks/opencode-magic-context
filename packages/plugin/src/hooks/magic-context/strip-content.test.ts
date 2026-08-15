@@ -663,8 +663,9 @@ describe("strip-content", () => {
     describe("stripReasoningFromMergedAssistants (sentinel-based groupIntoBlocks workaround)", () => {
         describe("#given a leading whitespace-only text block before the reasoning", () => {
             it("#then keeps the reasoning — whitespace text is sentinel-invisible to the keep-rule", () => {
-                // Regression shape: the model emits [" ", thinking, tool_use, " "].
-                // Treating the leading " " as content made the keep-rule skip the
+                // Regression shape after OpenCode's Anthropic adapter normalizes
+                // structural sentinels: [" ", thinking, tool_use, " "]. Treating
+                // the leading " " as content made the keep-rule skip the
                 // thinking block, so the assistant kept reasoning while newest
                 // (exempt) and lost it on the first pass after — a byte change at
                 // a new position every turn, re-creating the provider cache from
