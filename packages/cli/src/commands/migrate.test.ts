@@ -1,14 +1,27 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+    existsSync,
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    renameSync,
+    rmSync,
+    unlinkSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { LATEST_SUPPORTED_VERSION } from "@magic-context/core/features/magic-context/storage-db";
 import { Database } from "@magic-context/core/shared/sqlite";
+import { convertEntriesToRawMessages } from "@magic-context/pi-core/read-session-pi";
 import {
+    type MigrationPendingRow,
     migrateOpenCodeSessionToPi,
+    migrationKeyFor,
     parseMigrateArgs,
     projectPathToPiDirSlug,
     runMigrateCli,
+    sweepPendingMigrations,
 } from "./migrate";
 
 const tempDirs: string[] = [];
@@ -179,8 +192,69 @@ function makeCortexkitDb() {
           updated_at INTEGER NOT NULL,
           harness TEXT NOT NULL DEFAULT 'opencode'
         );
+        CREATE TABLE migration_pending (
+          migration_key TEXT PRIMARY KEY,
+          source_session_id TEXT NOT NULL,
+          target_harness TEXT NOT NULL,
+          pi_session_id TEXT NOT NULL,
+          final_path TEXT NOT NULL,
+          stage_path TEXT NOT NULL,
+          content_sha256 TEXT NOT NULL,
+          phase TEXT NOT NULL CHECK (phase IN ('staged', 'db_committed')),
+          created_at INTEGER NOT NULL
+        );
     `);
     return ck;
+}
+
+type CortexkitTestDb = ReturnType<typeof makeCortexkitDb>;
+
+function readJournalRows(ck: CortexkitTestDb): MigrationPendingRow[] {
+    return ck.prepare("SELECT * FROM migration_pending ORDER BY created_at ASC").all() as never;
+}
+
+/**
+ * Resolve the runtime ordinal of the RawMessage a JSONL entry participates
+ * in, THROUGH THE RUNTIME READ PATH (convertEntriesToRawMessages — the same
+ * basis readSessionChunk consumes). User/assistant entries map by their own
+ * id; toolResult entries fold into the following user turn (or into a
+ * synthetic user turn ahead of the next assistant / at the tail), matching
+ * the reader's documented SYNTH_USER_ID_PREFIX contract.
+ */
+function runtimeOrdinalOfEntry(
+    entries: Array<Record<string, unknown>>,
+    entryId: string,
+): number | undefined {
+    const raw = convertEntriesToRawMessages(entries);
+    const byId = new Map(raw.map((message) => [message.id, message.ordinal]));
+    if (byId.has(entryId)) return byId.get(entryId);
+
+    const index = entries.findIndex((entry) => entry.id === entryId);
+    const entry = entries[index];
+    const message = entry?.message as { role?: string } | undefined;
+    if (entry?.type !== "message" || message?.role !== "toolResult") return undefined;
+
+    // First toolResult id of the folded run (the synth-user id suffix).
+    let firstRunId = entryId;
+    for (let i = index - 1; i >= 0; i--) {
+        const prior = entries[i];
+        const priorMessage = prior?.message as { role?: string } | undefined;
+        if (prior?.type === "message" && priorMessage?.role === "toolResult") {
+            firstRunId = prior.id as string;
+            continue;
+        }
+        break;
+    }
+
+    for (let i = index + 1; i < entries.length; i++) {
+        const next = entries[i];
+        const nextMessage = next?.message as { role?: string } | undefined;
+        if (next?.type !== "message") continue;
+        if (nextMessage?.role === "toolResult") continue;
+        if (nextMessage?.role === "user") return byId.get(next.id as string);
+        return byId.get(`synth-user-${firstRunId}`);
+    }
+    return byId.get(`synth-user-${firstRunId}`);
 }
 
 afterEach(() => {
@@ -357,7 +431,7 @@ describe("migrateOpenCodeSessionToPi", () => {
         expect(writes).toEqual([]);
     });
 
-    it("defaults to PI_CODING_AGENT_DIR/sessions and writes the JSONL atomically before DB commit", () => {
+    it("stages outside the sessions root, commits shared state, then renames into place", () => {
         const db = makeDb();
         const { sessionId, cwd } = insertSyntheticSession(db);
         const root = tempDir();
@@ -381,21 +455,38 @@ describe("migrateOpenCodeSessionToPi", () => {
             now: new Date("2026-04-30T11:46:47.422Z"),
             fs: {
                 writeFileAtomic: (path, data) => {
-                    order.push("write");
-                    expect(path.startsWith(join(agentDir, "sessions"))).toBe(true);
-                    expect(path).toContain(projectPathToPiDirSlug(cwd));
+                    order.push("stage-write");
+                    // The stage file lands OUTSIDE the sessions tree (no harness
+                    // scanner suffix rules apply there).
+                    expect(path.startsWith(join(agentDir, ".mc-migrations"))).toBe(true);
+                    expect(path).not.toContain(join(agentDir, "sessions"));
                     expect(data.endsWith("\n")).toBe(true);
+                    mkdirSync(dirname(path), { recursive: true });
+                    writeFileSync(path, data, "utf-8");
                 },
-                unlinkSync: () => {
+                unlinkSync: (path) => {
                     order.push("unlink");
+                    unlinkSync(path);
                 },
+                existsSync: (path) => existsSync(path),
+                renameSync: (from, to) => {
+                    order.push("rename");
+                    expect(from.startsWith(join(agentDir, ".mc-migrations"))).toBe(true);
+                    expect(to.startsWith(join(agentDir, "sessions"))).toBe(true);
+                    expect(to).toContain(projectPathToPiDirSlug(cwd));
+                    renameSync(from, to);
+                },
+                mkdirSync: (path, options) => mkdirSync(path, options),
             },
         });
 
         expect(result.outputPath.startsWith(join(agentDir, "sessions"))).toBe(true);
-        expect(order[0]).toBe("write");
+        expect(order[0]).toBe("stage-write");
         expect(order[1]).toBe("db-commit");
+        expect(order[2]).toBe("rename");
         expect(order).not.toContain("unlink");
+        // Success clears the journal row.
+        expect(readJournalRows(cortexkitDb)).toEqual([]);
     });
 
     it("skips a missing context DB without creating an empty file", () => {
@@ -438,6 +529,9 @@ describe("migrateOpenCodeSessionToPi", () => {
                 fs: {
                     writeFileAtomic: (path) => writes.push(path),
                     unlinkSync: () => {},
+                    existsSync: (path) => existsSync(path),
+                    renameSync: (from, to) => renameSync(from, to),
+                    mkdirSync: (path, options) => mkdirSync(path, options),
                 },
             }),
         ).toThrow(
@@ -555,7 +649,7 @@ describe("migrateOpenCodeSessionToPi — token & magic-context bridging", () => 
             db,
             cortexkitDb: ck,
             sessionId,
-            piSessionsRoot: tempDir(),
+            piSessionsRoot: join(tempDir(), "sessions"),
             now: new Date("2026-04-30T11:46:47.422Z"),
         });
 
@@ -662,7 +756,7 @@ describe("migrateOpenCodeSessionToPi — token & magic-context bridging", () => 
             db,
             cortexkitDb: ck,
             sessionId,
-            piSessionsRoot: tempDir(),
+            piSessionsRoot: join(tempDir(), "sessions"),
             now: new Date("2026-04-30T11:46:47.422Z"),
         });
 
@@ -702,7 +796,7 @@ describe("migrateOpenCodeSessionToPi — token & magic-context bridging", () => 
             db,
             cortexkitDb: makeCortexkitDb(),
             sessionId,
-            piSessionsRoot: tempDir(),
+            piSessionsRoot: join(tempDir(), "sessions"),
             now: new Date("2026-04-30T11:46:47.422Z"),
         });
 
@@ -761,6 +855,514 @@ describe("migrateOpenCodeSessionToPi — token & magic-context bridging", () => 
             }
         ).n;
         expect(piCount).toBe(0);
+    });
+});
+
+describe("migration journal — crash-safe lifecycle", () => {
+    function insertCompartment(ck: CortexkitTestDb, sessionId: string): void {
+        ck.prepare(
+            "INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, created_at, harness) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'opencode')",
+        ).run(sessionId, 0, 1, 1, "msg_1", "msg_1", "Comp 0", "summary 0", 5);
+    }
+
+    function countPiCompartments(ck: CortexkitTestDb, piSessionId: string): number {
+        return (
+            ck
+                .prepare(
+                    "SELECT COUNT(*) AS n FROM compartments WHERE session_id = ? AND harness = 'pi'",
+                )
+                .get(piSessionId) as { n: number }
+        ).n;
+    }
+
+    it("happy path: stage lands outside the sessions root, final in it, journal row cleared", () => {
+        const db = makeDb();
+        const { sessionId } = insertSyntheticSession(db);
+        const ck = makeCortexkitDb();
+        insertCompartment(ck, sessionId);
+        const root = tempDir();
+        const sessionsRoot = join(root, "sessions");
+
+        const result = migrateOpenCodeSessionToPi({
+            db,
+            cortexkitDb: ck,
+            sessionId,
+            piSessionsRoot: sessionsRoot,
+            now: new Date("2026-04-30T11:46:47.422Z"),
+        });
+
+        expect(result.migrationKey).toBe(migrationKeyFor(sessionId, "pi"));
+        expect(result.journalResumed).toBe(false);
+        expect(result.recovery).toEqual({
+            completed: 0,
+            rolledForward: 0,
+            rolledBack: 0,
+            lost: [],
+        });
+        expect(existsSync(result.outputPath)).toBe(true);
+        expect(result.outputPath.startsWith(sessionsRoot)).toBe(true);
+        // The staged file was renamed away, not copied.
+        expect(existsSync(join(root, ".mc-migrations", `${result.migrationKey}.jsonl`))).toBe(
+            false,
+        );
+        expect(readJournalRows(ck)).toEqual([]);
+        expect(countPiCompartments(ck, result.piSessionId)).toBe(1);
+    });
+
+    it("a crash while staging leaves a phase=staged row and provably no shared state", () => {
+        const db = makeDb();
+        const { sessionId } = insertSyntheticSession(db);
+        const ck = makeCortexkitDb();
+        insertCompartment(ck, sessionId);
+
+        expect(() =>
+            migrateOpenCodeSessionToPi({
+                db,
+                cortexkitDb: ck,
+                sessionId,
+                piSessionsRoot: join(tempDir(), "sessions"),
+                now: new Date("2026-04-30T11:46:47.422Z"),
+                fs: {
+                    writeFileAtomic: () => {
+                        throw new Error("disk full");
+                    },
+                    unlinkSync: () => {},
+                    existsSync: () => false,
+                    renameSync: () => {},
+                    mkdirSync: () => {},
+                },
+            }),
+        ).toThrow("disk full");
+
+        const rows = readJournalRows(ck);
+        expect(rows).toHaveLength(1);
+        expect(rows[0].phase).toBe("staged");
+        expect(rows[0].pi_session_id.length).toBeGreaterThan(0);
+        expect(rows[0].content_sha256.length).toBe(64);
+        // Ordering proof: the staged row committed BEFORE any shared state.
+        expect(countPiCompartments(ck, rows[0].pi_session_id)).toBe(0);
+    });
+
+    it("replay after a post-commit crash reuses the journal identity and upserts shared state", () => {
+        const db = makeDb();
+        const { sessionId } = insertSyntheticSession(db);
+        const ck = makeCortexkitDb();
+        insertCompartment(ck, sessionId);
+        const sessionsRoot = join(tempDir(), "sessions");
+
+        // Attempt 1 crashes AFTER the shared-state transaction committed but
+        // before the stage file reached its final path (rename failure).
+        expect(() =>
+            migrateOpenCodeSessionToPi({
+                db,
+                cortexkitDb: ck,
+                sessionId,
+                piSessionsRoot: sessionsRoot,
+                now: new Date("2026-04-30T11:46:47.422Z"),
+                fs: {
+                    writeFileAtomic: (path, data) => {
+                        mkdirSync(dirname(path), { recursive: true });
+                        writeFileSync(path, data, "utf-8");
+                    },
+                    unlinkSync: (path) => unlinkSync(path),
+                    existsSync: (path) => existsSync(path),
+                    renameSync: () => {
+                        throw new Error("rename failed");
+                    },
+                    mkdirSync: (path, options) => mkdirSync(path, options),
+                },
+            }),
+        ).toThrow("rename failed");
+
+        const crashed = readJournalRows(ck);
+        expect(crashed).toHaveLength(1);
+        expect(crashed[0].phase).toBe("db_committed");
+        const firstPiSessionId = crashed[0].pi_session_id;
+        expect(countPiCompartments(ck, firstPiSessionId)).toBe(1);
+
+        // The staged bytes are lost before the retry can roll forward.
+        unlinkSync(crashed[0].stage_path);
+
+        // Attempt 2 (real fs): the sweep reports the loss loudly, the journal
+        // identity is reused, and the upsert-shaped shared-state commit cannot
+        // UNIQUE-collide on the rows attempt 1 committed.
+        const result = migrateOpenCodeSessionToPi({
+            db,
+            cortexkitDb: ck,
+            sessionId,
+            piSessionsRoot: sessionsRoot,
+            now: new Date("2026-04-30T12:00:00.000Z"),
+        });
+
+        expect(result.journalResumed).toBe(true);
+        expect(result.piSessionId).toBe(firstPiSessionId);
+        expect(result.recovery?.lost).toHaveLength(1);
+        expect(result.recovery?.lost[0].migration_key).toBe(result.migrationKey);
+        expect(result.recovery?.lost[0].content_sha256).toBe(crashed[0].content_sha256);
+        // Exactly ONE set of shared rows — replaced, never duplicated.
+        expect(countPiCompartments(ck, firstPiSessionId)).toBe(1);
+        expect(readJournalRows(ck)).toEqual([]);
+        expect(existsSync(result.outputPath)).toBe(true);
+        expect(result.outputPath).toBe(crashed[0].final_path);
+    });
+
+    it("the next run rolls back a staged-only crash and migrates with a fresh identity", () => {
+        const db = makeDb();
+        const { sessionId } = insertSyntheticSession(db);
+        const ck = makeCortexkitDb();
+        insertCompartment(ck, sessionId);
+        const sessionsRoot = join(tempDir(), "sessions");
+
+        expect(() =>
+            migrateOpenCodeSessionToPi({
+                db,
+                cortexkitDb: ck,
+                sessionId,
+                piSessionsRoot: sessionsRoot,
+                now: new Date("2026-04-30T11:46:47.422Z"),
+                fs: {
+                    writeFileAtomic: () => {
+                        throw new Error("stage write failed");
+                    },
+                    unlinkSync: () => {},
+                    existsSync: () => false,
+                    renameSync: () => {},
+                    mkdirSync: () => {},
+                },
+            }),
+        ).toThrow("stage write failed");
+        const crashed = readJournalRows(ck);
+        expect(crashed).toHaveLength(1);
+        expect(crashed[0].phase).toBe("staged");
+
+        const result = migrateOpenCodeSessionToPi({
+            db,
+            cortexkitDb: ck,
+            sessionId,
+            piSessionsRoot: sessionsRoot,
+            now: new Date("2026-04-30T12:00:00.000Z"),
+        });
+
+        expect(result.recovery?.rolledBack).toBe(1);
+        expect(result.journalResumed).toBe(false);
+        expect(result.piSessionId).not.toBe(crashed[0].pi_session_id);
+        expect(readJournalRows(ck)).toEqual([]);
+        expect(existsSync(result.outputPath)).toBe(true);
+        expect(countPiCompartments(ck, result.piSessionId)).toBe(1);
+    });
+});
+
+describe("sweepPendingMigrations — phase reconciliation", () => {
+    function seedRow(
+        ck: CortexkitTestDb,
+        dir: string,
+        overrides: Partial<MigrationPendingRow> = {},
+    ): MigrationPendingRow {
+        const row: MigrationPendingRow = {
+            migration_key: `key_${Math.random().toString(36).slice(2)}`,
+            source_session_id: "ses_src",
+            target_harness: "pi",
+            pi_session_id: "pi_uuid",
+            final_path: join(dir, "sessions", "--tmp--", "final.jsonl"),
+            stage_path: join(dir, ".mc-migrations", "stage.jsonl"),
+            content_sha256: "abc123",
+            phase: "staged",
+            created_at: 1,
+            ...overrides,
+        };
+        ck.prepare(
+            "INSERT INTO migration_pending (migration_key, source_session_id, target_harness, pi_session_id, final_path, stage_path, content_sha256, phase, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ).run(
+            row.migration_key,
+            row.source_session_id,
+            row.target_harness,
+            row.pi_session_id,
+            row.final_path,
+            row.stage_path,
+            row.content_sha256,
+            row.phase,
+            row.created_at,
+        );
+        return row;
+    }
+
+    it("staged + stage file ⇒ rolls back (stage removed, row deleted)", () => {
+        const ck = makeCortexkitDb();
+        const dir = tempDir();
+        const row = seedRow(ck, dir);
+        mkdirSync(dirname(row.stage_path), { recursive: true });
+        writeFileSync(row.stage_path, "{}\n", "utf-8");
+
+        const report = sweepPendingMigrations(ck);
+
+        expect(report).toEqual({ completed: 0, rolledForward: 0, rolledBack: 1, lost: [] });
+        expect(existsSync(row.stage_path)).toBe(false);
+        expect(readJournalRows(ck)).toEqual([]);
+    });
+
+    it("staged without a stage file ⇒ row deleted anyway", () => {
+        const ck = makeCortexkitDb();
+        const row = seedRow(ck, tempDir());
+
+        const report = sweepPendingMigrations(ck);
+
+        expect(report.rolledBack).toBe(1);
+        expect(readJournalRows(ck)).toEqual([]);
+        expect(row.migration_key.length).toBeGreaterThan(0);
+    });
+
+    it("db_committed + stage file ⇒ rolls forward (rename completes, row deleted)", () => {
+        const ck = makeCortexkitDb();
+        const dir = tempDir();
+        const row = seedRow(ck, dir, { phase: "db_committed" });
+        mkdirSync(dirname(row.stage_path), { recursive: true });
+        writeFileSync(row.stage_path, '{"type":"session"}\n', "utf-8");
+        // The final path's parent directory never existed (the crash happened
+        // before anything created it) — the sweep must still complete the rename.
+        expect(existsSync(dirname(row.final_path))).toBe(false);
+
+        const report = sweepPendingMigrations(ck);
+
+        expect(report).toEqual({ completed: 0, rolledForward: 1, rolledBack: 0, lost: [] });
+        expect(existsSync(row.final_path)).toBe(true);
+        expect(existsSync(row.stage_path)).toBe(false);
+        expect(readFileSync(row.final_path, "utf-8")).toBe('{"type":"session"}\n');
+        expect(readJournalRows(ck)).toEqual([]);
+    });
+
+    it("final file present ⇒ row deleted regardless of phase (finished migration)", () => {
+        const ck = makeCortexkitDb();
+        const dir = tempDir();
+        const row = seedRow(ck, dir, { phase: "db_committed" });
+        mkdirSync(dirname(row.final_path), { recursive: true });
+        writeFileSync(row.final_path, "{}\n", "utf-8");
+
+        const report = sweepPendingMigrations(ck);
+
+        expect(report.completed).toBe(1);
+        expect(report.lost).toEqual([]);
+        expect(readJournalRows(ck)).toEqual([]);
+    });
+
+    it("db_committed without any file ⇒ reported lost and the row is kept", () => {
+        const ck = makeCortexkitDb();
+        const row = seedRow(ck, tempDir(), {
+            phase: "db_committed",
+            content_sha256: "deadbeef",
+        });
+
+        const report = sweepPendingMigrations(ck);
+
+        expect(report).toEqual({ completed: 0, rolledForward: 0, rolledBack: 0, lost: [row] });
+        // Never silently deleted: the checksum row survives to name the loss.
+        expect(readJournalRows(ck)).toEqual([row]);
+    });
+
+    it("is a no-op when the journal table does not exist", () => {
+        const db = new Database(":memory:");
+        databases.push(db);
+        const report = sweepPendingMigrations(db);
+        expect(report).toEqual({ completed: 0, rolledForward: 0, rolledBack: 0, lost: [] });
+    });
+});
+
+describe("compartment ordinals — Pi runtime reader basis", () => {
+    function insertExpandingSession(db: ReturnType<typeof makeDb>): string {
+        // user A (1 entry), assistant B (reasoning + text + tool ⇒ 4 entries),
+        // user C (1 entry). B's toolResult folds into C's runtime turn.
+        const sessionId = "ses_ord";
+        db.prepare(
+            "INSERT INTO session (id, title, directory, path, time_created) VALUES (?, ?, ?, ?, ?)",
+        ).run(sessionId, "Ord", "/tmp/ord", null, 1);
+        const insertMessage = db.prepare(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
+        );
+        const insertPart = db.prepare(
+            "INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?, ?, ?, ?, ?)",
+        );
+        insertMessage.run("msg_A", sessionId, 1000, JSON.stringify({ role: "user" }));
+        insertPart.run(
+            "prt_A1",
+            "msg_A",
+            sessionId,
+            1000,
+            JSON.stringify({ type: "text", text: "question A" }),
+        );
+        insertMessage.run("msg_B", sessionId, 2000, JSON.stringify({ role: "assistant" }));
+        insertPart.run(
+            "prt_B1",
+            "msg_B",
+            sessionId,
+            2000,
+            JSON.stringify({ type: "reasoning", text: "thinking B" }),
+        );
+        insertPart.run(
+            "prt_B2",
+            "msg_B",
+            sessionId,
+            2001,
+            JSON.stringify({ type: "text", text: "answer B" }),
+        );
+        insertPart.run(
+            "prt_B3",
+            "msg_B",
+            sessionId,
+            2002,
+            JSON.stringify({
+                type: "tool",
+                tool: "bash",
+                callID: "call_B",
+                state: { input: { command: "ls" }, output: "ok" },
+            }),
+        );
+        insertMessage.run("msg_C", sessionId, 3000, JSON.stringify({ role: "user" }));
+        insertPart.run(
+            "prt_C1",
+            "msg_C",
+            sessionId,
+            3000,
+            JSON.stringify({ type: "text", text: "next C" }),
+        );
+        return sessionId;
+    }
+
+    function readPiCompartment(ck: CortexkitTestDb, piSessionId: string, sequence: number) {
+        return ck
+            .prepare(
+                "SELECT start_message, end_message, start_message_id, end_message_id FROM compartments WHERE session_id = ? AND harness = 'pi' AND sequence = ?",
+            )
+            .get(piSessionId, sequence) as {
+            start_message: number;
+            end_message: number;
+            start_message_id: string;
+            end_message_id: string;
+        };
+    }
+
+    it("one message expanding to several entries spans all of its runtime ordinals", () => {
+        const db = makeDb();
+        const sessionId = insertExpandingSession(db);
+        const ck = makeCortexkitDb();
+        ck.prepare(
+            "INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, created_at, harness) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'opencode')",
+        ).run(sessionId, 0, 2, 2, "msg_B", "msg_B", "Mid", "summary", 5);
+
+        const result = migrateOpenCodeSessionToPi({
+            db,
+            cortexkitDb: ck,
+            sessionId,
+            piSessionsRoot: join(tempDir(), "sessions"),
+            now: new Date("2026-04-30T11:46:47.422Z"),
+        });
+
+        const entries = readJsonl(result.outputPath);
+        const row = readPiCompartment(ck, result.piSessionId, 0);
+
+        // B's derived entries, located by content.
+        const thinkingEntry = entries.find(
+            (entry) =>
+                (entry.message as { content?: Array<{ thinking?: string }> })?.content?.[0]
+                    ?.thinking === "thinking B",
+        );
+        const toolResultEntry = entries.find(
+            (entry) => (entry.message as { role?: string })?.role === "toolResult",
+        );
+        expect(thinkingEntry).toBeDefined();
+        expect(toolResultEntry).toBeDefined();
+
+        // Boundary ids: FIRST derived entry for the start, LAST for the end.
+        expect(row.start_message_id).toBe(thinkingEntry.id);
+        expect(row.end_message_id).toBe(toolResultEntry.id);
+
+        // Ordinals resolved THROUGH THE RUNTIME READ PATH.
+        expect(row.start_message).toBe(runtimeOrdinalOfEntry(entries, thinkingEntry.id));
+        expect(row.end_message).toBe(runtimeOrdinalOfEntry(entries, toolResultEntry.id));
+        // The mid-compartment spans the whole expansion: thinking, text,
+        // toolCall entries plus the folded toolResult turn ⇒ >= 4 ordinals.
+        expect(row.end_message - row.start_message).toBeGreaterThanOrEqual(3);
+    });
+
+    it("remaps an expanded start-boundary message to its FIRST Pi entry (no silent shrink)", () => {
+        const db = makeDb();
+        const sessionId = insertExpandingSession(db);
+        const ck = makeCortexkitDb();
+        ck.prepare(
+            "INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, created_at, harness) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'opencode')",
+        ).run(sessionId, 0, 2, 3, "msg_B", "msg_C", "StartExpand", "summary", 5);
+
+        const result = migrateOpenCodeSessionToPi({
+            db,
+            cortexkitDb: ck,
+            sessionId,
+            piSessionsRoot: join(tempDir(), "sessions"),
+            now: new Date("2026-04-30T11:46:47.422Z"),
+        });
+
+        const entries = readJsonl(result.outputPath);
+        const row = readPiCompartment(ck, result.piSessionId, 0);
+        const thinkingEntry = entries.find(
+            (entry) =>
+                (entry.message as { content?: Array<{ thinking?: string }> })?.content?.[0]
+                    ?.thinking === "thinking B",
+        );
+        const toolResultEntry = entries.find(
+            (entry) => (entry.message as { role?: string })?.role === "toolResult",
+        );
+        const userCEntry = entries.find(
+            (entry) =>
+                (entry.message as { content?: Array<{ text?: string }> })?.content?.[0]?.text ===
+                "next C",
+        );
+
+        // The start boundary is B's FIRST derived entry — the old last-entry
+        // remap would have picked the toolResult and shrunk the span.
+        expect(row.start_message_id).toBe(thinkingEntry.id);
+        expect(row.start_message_id).not.toBe(toolResultEntry.id);
+        expect(row.start_message).toBe(runtimeOrdinalOfEntry(entries, thinkingEntry.id));
+        // The end boundary keeps last-entry semantics.
+        expect(row.end_message_id).toBe(userCEntry.id);
+        expect(row.end_message).toBe(runtimeOrdinalOfEntry(entries, userCEntry.id));
+    });
+
+    it("compaction-marker insertion does not shift the ordinal basis", () => {
+        const db = makeDb();
+        const { sessionId } = insertSyntheticSession(db);
+        const ck = makeCortexkitDb();
+        ck.prepare(
+            "INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, created_at, harness) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'opencode')",
+        ).run(sessionId, 0, 1, 2, "msg_1", "msg_2", "Comp 0", "summary 0", 5);
+
+        const result = migrateOpenCodeSessionToPi({
+            db,
+            cortexkitDb: ck,
+            sessionId,
+            piSessionsRoot: join(tempDir(), "sessions"),
+            now: new Date("2026-04-30T11:46:47.422Z"),
+        });
+        expect(result.compactionMarkerWritten).toBe(true);
+
+        const entries = readJsonl(result.outputPath);
+        expect(entries.some((entry) => entry.type === "compaction")).toBe(true);
+        // The runtime reader skips structural entries: the RawMessage sequence
+        // is identical with or without the marker, so ordinals cannot drift.
+        expect(convertEntriesToRawMessages(entries).length).toBe(
+            convertEntriesToRawMessages(entries.filter((entry) => entry.type !== "compaction"))
+                .length,
+        );
+
+        const row = readPiCompartment(ck, result.piSessionId, 0);
+        const helloEntry = entries.find(
+            (entry) =>
+                (entry.message as { content?: Array<{ text?: string }> })?.content?.[0]?.text ===
+                "hello",
+        );
+        const toolResultEntry = entries.find(
+            (entry) => (entry.message as { role?: string })?.role === "toolResult",
+        );
+        expect(row.start_message_id).toBe(helloEntry.id);
+        expect(row.end_message_id).toBe(toolResultEntry.id);
+        expect(row.start_message).toBe(runtimeOrdinalOfEntry(entries, helloEntry.id));
+        expect(row.end_message).toBe(runtimeOrdinalOfEntry(entries, toolResultEntry.id));
     });
 });
 

@@ -2787,6 +2787,37 @@ export const MIGRATIONS: Migration[] = [
             }
         },
     },
+    {
+        version: 78,
+        description: "add migration_pending journal for crash-safe cross-harness session migration",
+        up(db: Database): void {
+            // Recovery journal for `doctor migrate` (OpenCode → Pi/OMP). Each row
+            // tracks one in-flight session migration through its phases so a crash
+            // between staging the JSONL, committing the shared-DB state, and
+            // renaming the file into the sessions root can be reconciled by phase
+            // on the next doctor/migrate run.
+            //
+            // Column naming is load-bearing: the Pi session column is named
+            // `pi_session_id` (and the source is `source_session_id`) — NEVER
+            // `session_id`. The structural clearSession contract test discovers
+            // every table with a `session_id` column and requires clearSession to
+            // empty it; dragging this journal into that set would make ordinary
+            // session deletion destroy crash-recovery records.
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS migration_pending (
+                    migration_key TEXT PRIMARY KEY,
+                    source_session_id TEXT NOT NULL,
+                    target_harness TEXT NOT NULL,
+                    pi_session_id TEXT NOT NULL,
+                    final_path TEXT NOT NULL,
+                    stage_path TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    phase TEXT NOT NULL CHECK (phase IN ('staged', 'db_committed')),
+                    created_at INTEGER NOT NULL
+                );
+            `);
+        },
+    },
 ];
 
 /**
