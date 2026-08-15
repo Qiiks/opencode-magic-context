@@ -19,6 +19,7 @@ import { resolveCtxReduceAvailability } from "./ctx-reduce-availability";
 import { estimateTokens } from "./read-session-formatting";
 
 const MAGIC_CONTEXT_MARKER = "## Magic Context";
+const SYSTEM_PROMPT_GUIDANCE_SEPARATOR = "\n\n";
 // Module-scope caches are per-plugin-instance (one plugin process per OpenCode
 // process) and accumulate session entries over the plugin's lifetime. Without
 // cleanup on `session.deleted`, these maps grow unbounded. Exported so hook.ts
@@ -364,7 +365,14 @@ export function createSystemPromptHashHandler(deps: {
                 promptSurface.preset,
                 promptSurface.primaryOverride,
             );
-            output.system.push(guidance);
+            // OpenAI-compatible serializers emit one wire message per array entry,
+            // and strict chat templates reject a second system message. Keep the host
+            // prompt and guidance in the original entry instead. Anthropic preserves
+            // separate entries as separate content blocks, so old and new wire bytes
+            // necessarily differ. The blank line keeps the two sections distinct and
+            // changes the persisted hash from the previous newline-joined format, causing
+            // the frozen cache prefix to rebuild once through its existing hash-change path.
+            output.system[0] = `${output.system[0]}${SYSTEM_PROMPT_GUIDANCE_SEPARATOR}${guidance}`;
             sessionLog(
                 sessionId,
                 `injected generic guidance into system prompt (ctxReduce=${effectiveCtxReduceEnabled}, subagent=${isSubagentSession}, subagentReduceMode=${subagentReduceMode})`,

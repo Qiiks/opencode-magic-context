@@ -167,6 +167,7 @@ import {
 import {
 	buildMagicContextBlock,
 	clearPiSystemPromptSession,
+	composeMagicContextSystemPrompt,
 	processSystemPromptForCache,
 } from "./system-prompt";
 import { withTimeout } from "./timeout";
@@ -1770,9 +1771,10 @@ async function startPiMagicContextRuntime(
 			// composed string so even sessions with no data block (e.g.
 			// memories disabled, no docs, no key files) still get
 			// sticky-date freezing and hash-change tracking.
-			const composedPrompt = block
-				? `${event.systemPrompt}\n\n${block}`
-				: event.systemPrompt;
+			const composedPrompt = composeMagicContextSystemPrompt(
+				event.systemPrompt,
+				block,
+			);
 
 			if (!sessionId) {
 				// No session id yet — return the composed prompt without

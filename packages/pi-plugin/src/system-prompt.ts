@@ -85,6 +85,13 @@ export function buildMagicContextBlock(
 	);
 }
 
+export function composeMagicContextSystemPrompt(
+	basePrompt: string,
+	block: string | null,
+): string {
+	return block ? `${basePrompt}\n\n${block}` : basePrompt;
+}
+
 export interface SystemPromptHashResult {
 	/** The system prompt to send to the LLM, possibly with date frozen. */
 	systemPrompt: string;

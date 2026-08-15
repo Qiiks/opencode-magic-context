@@ -919,6 +919,24 @@ read on every defer pass.
 
 ---
 
+## 31. System-prompt guidance uses one provider instruction envelope on both harnesses
+
+**OpenCode:** the host exposes `experimental.chat.system.transform` as a `string[]`,
+but OpenAI-compatible serializers turn every array entry into a separate wire
+message. Magic Context therefore appends its guidance inside `system[0]` with a
+blank-line separator instead of adding another array entry. This keeps strict Qwen
+and llama.cpp chat templates at one leading system message.
+
+**Pi:** `before_agent_start` exposes one `systemPrompt: string`, and Pi's direct-API
+serializers create one provider instruction from that string. Magic Context already
+composed the host prompt and guidance with the same blank-line separator, so Pi never
+had the second-system-entry defect and requires no provider-specific fix.
+
+Same effective behavior: host identity plus Magic Context guidance is one instruction
+envelope for direct OpenAI-compatible providers, including vLLM and llama.cpp.
+
+---
+
 ## Pending parity
 
 - Last-known-good transform capture and replay for OpenCode and rust-mode sessions is pending for Pi.
