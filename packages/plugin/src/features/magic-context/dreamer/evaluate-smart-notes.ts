@@ -23,6 +23,7 @@ import {
     storeCompiledSmartNoteCheck,
 } from "../smart-notes/storage";
 import type { SmartNoteCheckNote } from "../smart-notes/types";
+import { wakePlaneStatus } from "../smart-notes/wake-plane";
 import { getPendingSmartNotes, markNoteChecked, markNoteReady } from "../storage-notes";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { type LeaseAcquisition, peekLeaseHolderAndExpiry, startLeaseHeartbeat } from "./lease";
@@ -89,6 +90,12 @@ function createPromptAbortSignal(
 export async function evaluateSmartNotes(
     args: EvaluateSmartNotesArgs,
 ): Promise<EvaluateSmartNotesResult> {
+    if ((await wakePlaneStatus()) === "present") {
+        const pending = getPendingSmartNotes(args.db, args.projectIdentity).length;
+        log("[dreamer] evaluate-smart-notes: skipped (wake plane active)");
+        return { surfaced: 0, pending, ran: false };
+    }
+
     const projectRoot = args.sessionDirectory ?? args.projectIdentity;
     const moduleBridge = getModuleNoteEvaluationBridge(args.projectIdentity);
     await moduleBridge?.sync();

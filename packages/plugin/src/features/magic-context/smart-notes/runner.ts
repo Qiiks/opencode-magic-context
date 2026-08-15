@@ -13,6 +13,7 @@ import {
     markCompiledCheckNetworkFailure,
 } from "./storage";
 import { parseSmartNoteManifest } from "./types";
+import { wakePlaneStatus } from "./wake-plane";
 
 export interface RunDueCompiledSmartNoteChecksArgs {
     db: Database;
@@ -50,6 +51,10 @@ const MAX_FAILURES_BEFORE_REAUTHOR = 3;
 export async function runDueCompiledSmartNoteChecks(
     args: RunDueCompiledSmartNoteChecksArgs,
 ): Promise<RunDueCompiledSmartNoteChecksResult> {
+    if ((await wakePlaneStatus()) === "present") {
+        return { ran: 0, surfaced: 0, failed: 0, networkFailed: 0 };
+    }
+
     const startedAt = Date.now();
     const now = args.now ?? startedAt;
     const due = getDueCompiledSmartNoteChecks(

@@ -26,6 +26,7 @@ import {
 	conditionCompileReplySuffix,
 	conditionCompileStorageFields,
 } from "@magic-context/core/features/magic-context/smart-notes/condition-compiler";
+import { wakePlaneStatus } from "@magic-context/core/features/magic-context/smart-notes/wake-plane";
 import type {
 	ContextDatabase,
 	UpdateNoteOptions,
@@ -243,6 +244,16 @@ export function createCtxNoteTool(
 
 				const surfaceCondition = params.surface_condition?.trim();
 				if (surfaceCondition) {
+					if ((await wakePlaneStatus()) === "present") {
+						const note = addNote(deps.db, "session", {
+							sessionId,
+							content,
+							anchorOrdinal,
+						});
+						return ok(
+							`Saved session note #${note.id}.\nwake plane active — create a scheduled wake instead; stored as a plain note.`,
+						);
+					}
 					if (dreamerEnabled !== true) {
 						return err(
 							"Error: Smart notes require dreamer to be enabled. Enable dreamer in magic-context.jsonc to use surface_condition.",
