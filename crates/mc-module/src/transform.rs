@@ -5079,6 +5079,30 @@ fn apply_once(
             true,
         )?;
     }
+    let new_trailing_blank_units = new_trailing_blank_decision_units(
+        &core,
+        req,
+        &built_output.messages,
+        is_provider_prefix_mutation_pass,
+    );
+    if !new_trailing_blank_units.is_empty() {
+        core.frozen_units.extend(new_trailing_blank_units);
+        built_output = build_output_with_tags(
+            &core,
+            output_meta,
+            &projection,
+            req,
+            (tagging_active || auto_search_active).then_some(&tag_overlay),
+            tail_reclaim_enabled && !req.is_subagent,
+            mutation_exempt_mid,
+            &tag_numbers,
+            meta.reasoning_cleared_through_tag
+                .max(meta.reasoning_cleared_through_ordinal),
+            transition_committed,
+            output_cache_snapshot.as_ref(),
+            true,
+        )?;
+    }
     #[cfg(test)]
     if output_cache.is_some() {
         let fresh = build_output_with_tags(
@@ -9887,6 +9911,8 @@ fn surviving_strip_units(core: &CoreState, req: &TransformRequest) -> Vec<Frozen
             // full-array request.
             unit.key.starts_with("strip:merged_reasoning:")
                 || unit.key.starts_with("strip:reasoning_age:")
+                || unit.key.starts_with("strip:trailing_blank_keep:")
+                || unit.key.starts_with("strip:trailing_blank_strip:")
                 || unit
                     .key
                     .strip_prefix("strip:")
@@ -10407,6 +10433,7 @@ fn message_output_identity(
     full_drop_ids: &HashSet<String>,
     mutation_exempt: bool,
     reasoning_mutation_exempt: bool,
+    trailing_blank_mutation_exempt: bool,
     first_assistant_in_run: bool,
     frozen_unit_scan_ms: &mut f64,
 ) -> String {
@@ -10437,6 +10464,7 @@ fn message_output_identity(
     digest_field(&mut hasher, &[request_accepts_empty_content(req) as u8]);
     digest_field(&mut hasher, &[mutation_exempt as u8]);
     digest_field(&mut hasher, &[reasoning_mutation_exempt as u8]);
+    digest_field(&mut hasher, &[trailing_blank_mutation_exempt as u8]);
     digest_field(&mut hasher, &[first_assistant_in_run as u8]);
     let message_tag = message_tag_number(message, tag_numbers);
     digest_field(&mut hasher, &message_tag.to_le_bytes());
@@ -10733,35 +10761,125 @@ fn new_merged_reasoning_strip_units(
     units
 }
 
-fn strip_trailing_whitespace_from_historical_assistant(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrozenTrailingBlankDecision {
+    Keep,
+    Strip,
+}
+
+fn frozen_trailing_blank_decision(
+    core: &CoreState,
+    mid: &str,
+) -> Option<FrozenTrailingBlankDecision> {
+    if message_strip_unit(core, "trailing_blank_keep", mid).is_some() {
+        Some(FrozenTrailingBlankDecision::Keep)
+    } else if message_strip_unit(core, "trailing_blank_strip", mid).is_some() {
+        Some(FrozenTrailingBlankDecision::Strip)
+    } else {
+        None
+    }
+}
+
+fn canonical_blank_block() -> CkWireBlock {
+    CkWireBlock::bare(ck_wire::CkKind::Text {
+        text: String::new(),
+    })
+}
+
+fn apply_frozen_trailing_blank_decision(
+    core: &CoreState,
     profile: SerializerProfile,
     provider_id: Option<&str>,
-    mutation_exempt: bool,
+    newest_assistant_exempt: bool,
+    mid: &str,
     message: &mut CkWireMessage,
 ) -> usize {
     if profile != SerializerProfile::OpencodeAiSdk
         || provider_id != Some("anthropic")
         || message.role != "assistant"
-        || mutation_exempt
     {
         return 0;
     }
+    let Some(decision) = frozen_trailing_blank_decision(core, mid) else {
+        return 0;
+    };
 
+    let canonical_blank = canonical_blank_block();
     let Some(last_meaningful_index) = message
         .content
         .iter()
         .rposition(|block| !is_sentinel_invisible_text_block(block))
     else {
-        // Keep one block because the provider cannot serialize an assistant message with no content.
-        return 0;
+        if message.content.len() == 1 && message.content.first() == Some(&canonical_blank) {
+            return 0;
+        }
+        let mutations = message.content.len().max(1);
+        message.content = vec![canonical_blank];
+        message.mark_modified();
+        return mutations;
     };
-    let stripped = message.content.len() - last_meaningful_index - 1;
-    if stripped == 0 {
+
+    let trailing_count = message.content.len() - last_meaningful_index - 1;
+    let keep_blank = decision == FrozenTrailingBlankDecision::Keep
+        || (decision == FrozenTrailingBlankDecision::Strip
+            && !newest_assistant_exempt
+            && trailing_count > 0
+            && is_reasoning_block(&message.content[last_meaningful_index]));
+    if keep_blank {
+        let blank_index = last_meaningful_index + 1;
+        if trailing_count == 1 && message.content.get(blank_index) == Some(&canonical_blank) {
+            return 0;
+        }
+        let mutations = trailing_count.max(1);
+        message.content.truncate(blank_index);
+        message.content.push(canonical_blank);
+        message.mark_modified();
+        return mutations;
+    }
+
+    if newest_assistant_exempt || trailing_count == 0 {
         return 0;
     }
     message.content.truncate(last_meaningful_index + 1);
     message.mark_modified();
-    stripped
+    trailing_count
+}
+
+fn new_trailing_blank_decision_units(
+    core: &CoreState,
+    req: &TransformRequest,
+    rendered_messages: &[ServedMessage],
+    can_mutate_provider_prefix: bool,
+) -> Vec<FrozenUnit> {
+    if !can_mutate_provider_prefix
+        || SerializerProfile::parse(&req.serializer_profile)
+            != Some(SerializerProfile::OpencodeAiSdk)
+        || req.provider_id.as_deref() != Some("anthropic")
+    {
+        return Vec::new();
+    }
+
+    let mut units = Vec::new();
+    for rendered in rendered_messages {
+        let Some(mid) = rendered.meta.harness_id.as_deref() else {
+            continue;
+        };
+        if rendered.role != "assistant" || frozen_trailing_blank_decision(core, mid).is_some() {
+            continue;
+        }
+        let kind = if rendered.content.is_empty()
+            || rendered
+                .content
+                .last()
+                .is_some_and(is_sentinel_invisible_text_block)
+        {
+            "trailing_blank_keep"
+        } else {
+            "trailing_blank_strip"
+        };
+        units.push(strip_unit(kind, mid, ""));
+    }
+    units
 }
 
 fn apply_serializer_residual_to_message(
@@ -11082,6 +11200,8 @@ fn build_output_with_tags_inner(
             mutation_exempt_mid == Some(msg.mid.as_str()) || lineage_anchor_exempt;
         let reasoning_mutation_exempt =
             reasoning_mutation_exempt_mid == Some(msg.mid.as_str()) || lineage_anchor_exempt;
+        let trailing_blank_mutation_exempt =
+            reasoning_mutation_exempt_mid == Some(msg.mid.as_str());
         let first_assistant_in_run = msg.ck.role == "assistant" && !prev_assistant;
         let blocks = blocks_by_mid
             .get(msg.mid.as_str())
@@ -11101,6 +11221,7 @@ fn build_output_with_tags_inner(
             &full_drop_ids,
             mutation_exempt,
             reasoning_mutation_exempt,
+            trailing_blank_mutation_exempt,
             first_assistant_in_run,
             &mut build_timings.frozen_unit_scan,
         );
@@ -11257,10 +11378,12 @@ fn build_output_with_tags_inner(
                             &mut rendered,
                         );
                     }
-                    strip_trailing_whitespace_from_historical_assistant(
+                    apply_frozen_trailing_blank_decision(
+                        core,
                         profile,
                         req.provider_id.as_deref(),
-                        reasoning_mutation_exempt,
+                        trailing_blank_mutation_exempt,
+                        &msg.mid,
                         &mut rendered,
                     );
                 }
@@ -16830,28 +16953,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn late_trailing_whitespace_is_stable_after_the_assistant_stops_being_newest() {
-        fn assistant(include_trailing: bool) -> CkWireMessage {
-            let mut content = vec![
-                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
-                    text: " ".to_string(),
-                }),
-                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
-                    text: "signed thinking".to_string(),
-                    signature: Some("sig".to_string()),
-                }),
-                ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolCall {
-                    id: "call-1".to_string(),
-                    name: "bash".to_string(),
-                    input: serde_json::json!({}),
-                    provider_executed: false,
-                }),
-            ];
-            if include_trailing {
-                content.push(ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
-                    text: " \t\n".to_string(),
-                }));
-            }
+    fn frozen_trailing_blank_decisions_cover_both_races_and_provider_shapes() {
+        fn assistant(content: Vec<CkWireBlock>) -> CkWireMessage {
             CkWireMessage::from_parts(
                 "assistant",
                 content,
@@ -16861,45 +16964,347 @@ pub(crate) mod tests {
             )
         }
 
-        let mut first_serve = assistant(false);
+        fn stable_content(include_trailing: bool) -> Vec<CkWireBlock> {
+            let mut content = vec![
+                canonical_blank_block(),
+                CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: "signed thinking".to_string(),
+                    signature: Some("sig".to_string()),
+                }),
+                CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                    provider_executed: false,
+                }),
+            ];
+            if include_trailing {
+                content.push(CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: " \t\n".to_string(),
+                }));
+            }
+            content
+        }
+
+        let mut strip_core = CoreState::default();
+        strip_core
+            .frozen_units
+            .push(strip_unit("trailing_blank_strip", "target", ""));
+        let mut first_without_trailing = assistant(stable_content(false));
         assert_eq!(
-            strip_trailing_whitespace_from_historical_assistant(
+            apply_frozen_trailing_blank_decision(
+                &strip_core,
                 SerializerProfile::OpencodeAiSdk,
                 Some("anthropic"),
                 true,
-                &mut first_serve,
+                "target",
+                &mut first_without_trailing,
             ),
             0
         );
-        let first_bytes = serde_json::to_vec(&first_serve).unwrap();
-
-        let mut replay = assistant(true);
+        let first_without_trailing_bytes = serde_json::to_vec(&first_without_trailing).unwrap();
+        let mut late_trailing = assistant(stable_content(true));
         assert_eq!(
-            strip_trailing_whitespace_from_historical_assistant(
+            apply_frozen_trailing_blank_decision(
+                &strip_core,
                 SerializerProfile::OpencodeAiSdk,
                 Some("anthropic"),
                 false,
-                &mut replay,
+                "target",
+                &mut late_trailing,
             ),
             1
         );
-        assert_eq!(serde_json::to_vec(&replay).unwrap(), first_bytes);
+        assert_eq!(
+            serde_json::to_vec(&late_trailing).unwrap(),
+            first_without_trailing_bytes
+        );
+
+        let mut keep_core = CoreState::default();
+        keep_core
+            .frozen_units
+            .push(strip_unit("trailing_blank_keep", "target", ""));
+        let mut newest_with_trailing = assistant(stable_content(true));
+        apply_frozen_trailing_blank_decision(
+            &keep_core,
+            SerializerProfile::OpencodeAiSdk,
+            Some("anthropic"),
+            true,
+            "target",
+            &mut newest_with_trailing,
+        );
+        let newest_with_trailing_bytes = serde_json::to_vec(&newest_with_trailing).unwrap();
+        let mut historical_with_trailing = assistant(stable_content(true));
+        apply_frozen_trailing_blank_decision(
+            &keep_core,
+            SerializerProfile::OpencodeAiSdk,
+            Some("anthropic"),
+            false,
+            "target",
+            &mut historical_with_trailing,
+        );
+        assert_eq!(
+            serde_json::to_vec(&historical_with_trailing).unwrap(),
+            newest_with_trailing_bytes
+        );
         assert!(matches!(
-            &replay.content[0].kind,
-            ck_wire::CkKind::Text { text } if text == " "
+            &historical_with_trailing.content.last().unwrap().kind,
+            ck_wire::CkKind::Text { text } if text.is_empty()
         ));
 
-        let mut pi_replay = assistant(true);
+        for terminal in [
+            CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "signed".to_string(),
+                signature: Some("sig".to_string()),
+            }),
+            CkWireBlock::bare(ck_wire::CkKind::RedactedReasoning {
+                data: "redacted".to_string(),
+            }),
+        ] {
+            let mut reasoning_terminal = assistant(vec![terminal, canonical_blank_block()]);
+            apply_frozen_trailing_blank_decision(
+                &strip_core,
+                SerializerProfile::OpencodeAiSdk,
+                Some("anthropic"),
+                false,
+                "target",
+                &mut reasoning_terminal,
+            );
+            assert_eq!(reasoning_terminal.content.len(), 2);
+            assert_eq!(
+                reasoning_terminal.content.last(),
+                Some(&canonical_blank_block())
+            );
+        }
+
+        let mut adjacent_reasoning = assistant(vec![
+            CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "signed".to_string(),
+                signature: Some("sig".to_string()),
+            }),
+            CkWireBlock::bare(ck_wire::CkKind::RedactedReasoning {
+                data: "redacted".to_string(),
+            }),
+            CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: " ".to_string(),
+            }),
+            canonical_blank_block(),
+        ]);
+        apply_frozen_trailing_blank_decision(
+            &strip_core,
+            SerializerProfile::OpencodeAiSdk,
+            Some("anthropic"),
+            false,
+            "target",
+            &mut adjacent_reasoning,
+        );
+        assert_eq!(adjacent_reasoning.content.len(), 3);
         assert_eq!(
-            strip_trailing_whitespace_from_historical_assistant(
+            adjacent_reasoning.content.last(),
+            Some(&canonical_blank_block())
+        );
+
+        let mut wholly_blank = assistant(vec![
+            CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: " ".to_string(),
+            }),
+            canonical_blank_block(),
+        ]);
+        apply_frozen_trailing_blank_decision(
+            &keep_core,
+            SerializerProfile::OpencodeAiSdk,
+            Some("anthropic"),
+            true,
+            "target",
+            &mut wholly_blank,
+        );
+        assert_eq!(wholly_blank.content, vec![canonical_blank_block()]);
+
+        let mut newest_strip_exempt = assistant(stable_content(true));
+        assert_eq!(
+            apply_frozen_trailing_blank_decision(
+                &strip_core,
+                SerializerProfile::OpencodeAiSdk,
+                Some("anthropic"),
+                true,
+                "target",
+                &mut newest_strip_exempt,
+            ),
+            0,
+            "the Rust exemption matches TypeScript and contains only the newest assistant"
+        );
+        let mut pi_replay = assistant(stable_content(true));
+        assert_eq!(
+            apply_frozen_trailing_blank_decision(
+                &strip_core,
                 SerializerProfile::Pi,
                 Some("anthropic"),
                 false,
+                "target",
                 &mut pi_replay,
             ),
             0
         );
         assert_eq!(pi_replay.content.len(), 4);
+        let mut non_anthropic = assistant(stable_content(true));
+        assert_eq!(
+            apply_frozen_trailing_blank_decision(
+                &strip_core,
+                SerializerProfile::OpencodeAiSdk,
+                Some("openai"),
+                false,
+                "target",
+                &mut non_anthropic,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn trailing_blank_race_outcomes_freeze_on_bust_and_replay_after_restart() {
+        fn assistant(mid: &str, ordinal: u64, include_trailing: bool) -> CkIngressMessage {
+            let mut content = vec![
+                CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: format!("thinking-{mid}"),
+                    signature: Some(format!("sig-{mid}")),
+                }),
+                CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: format!("answer-{mid}"),
+                }),
+            ];
+            if include_trailing {
+                content.push(CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: " ".to_string(),
+                }));
+            }
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    content,
+                    None,
+                    ck_wire::ProviderExtras::new(),
+                    ck_wire::HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        fn blank_assistant(mid: &str, ordinal: u64, count: usize) -> CkIngressMessage {
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    (0..count)
+                        .map(|index| {
+                            CkWireBlock::bare(ck_wire::CkKind::Text {
+                                text: if index == 0 {
+                                    " ".to_string()
+                                } else {
+                                    String::new()
+                                },
+                            })
+                        })
+                        .collect(),
+                    None,
+                    ck_wire::ProviderExtras::new(),
+                    ck_wire::HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        fn request(session: &str, messages: Vec<CkIngressMessage>) -> TransformRequest {
+            let mut request =
+                profile_req(SerializerProfile::OpencodeAiSdk, session, "cfg", messages);
+            request.provider_id = Some("anthropic".to_string());
+            request
+        }
+
+        fn message_bytes(response: &TransformResponse, mid: &str) -> Vec<u8> {
+            response
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some(mid))
+                .expect("target assistant must be served")
+                .canonical_bytes()
+                .to_vec()
+        }
+
+        for (session, first_has_trailing, decision_kind) in [
+            ("trailing-keep-race", true, "trailing_blank_keep"),
+            ("trailing-strip-race", false, "trailing_blank_strip"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let first_bytes = {
+                let initial_store = store(dir.path());
+                let first = run(
+                    &initial_store,
+                    &request(session, vec![assistant("target", 1, first_has_trailing)]),
+                    &spine(),
+                );
+                assert_eq!(first.action, "HARD");
+                assert!(initial_store
+                    .load(session)
+                    .unwrap()
+                    .core
+                    .frozen_units
+                    .iter()
+                    .any(|unit| unit.key == format!("strip:{decision_kind}:target")));
+                message_bytes(&first, "target")
+            };
+
+            let restarted = store(dir.path());
+            let replay = run(
+                &restarted,
+                &request(
+                    session,
+                    vec![
+                        assistant("target", 1, first_has_trailing),
+                        assistant("newest", 2, false),
+                    ],
+                ),
+                &spine(),
+            );
+            assert_eq!(replay.action, "SOFT+");
+            assert_eq!(message_bytes(&replay, "target"), first_bytes);
+        }
+
+        let blank_dir = tempfile::tempdir().unwrap();
+        let blank_first_bytes = {
+            let initial_store = store(blank_dir.path());
+            let first = run(
+                &initial_store,
+                &request("trailing-blank-only", vec![blank_assistant("blank", 1, 2)]),
+                &spine(),
+            );
+            let blank = first
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some("blank"))
+                .unwrap();
+            assert_eq!(blank.content, vec![canonical_blank_block()]);
+            message_bytes(&first, "blank")
+        };
+        let restarted = store(blank_dir.path());
+        let replay = run(
+            &restarted,
+            &request(
+                "trailing-blank-only",
+                vec![
+                    blank_assistant("blank", 1, 2),
+                    assistant("newest", 2, false),
+                ],
+            ),
+            &spine(),
+        );
+        assert_eq!(message_bytes(&replay, "blank"), blank_first_bytes);
     }
 
     #[test]

@@ -81,6 +81,7 @@ export function healAllNullColumns(db: Database): void {
         ["stale_reduce_stripped_ids", ""],
         ["processed_image_stripped_ids", ""],
         ["merged_reasoning_stripped_ids", ""],
+        ["trailing_blank_decisions", ""],
         ["memory_block_cache", ""],
         ["memory_block_ids", ""],
         ["compaction_marker_state", ""],

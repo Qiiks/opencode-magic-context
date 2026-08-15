@@ -2149,6 +2149,80 @@ export function addMergedReasoningStrippedIds(
     return false;
 }
 
+// ── Trailing assistant blank decisions (frozen replay map) ──
+
+export type PersistedTrailingBlankDecision = "keep" | "strip";
+
+function parseTrailingBlankDecisions(
+    raw: string | null | undefined,
+): Map<string, PersistedTrailingBlankDecision> {
+    if (!raw) return new Map();
+    try {
+        const parsed: unknown = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return new Map();
+        const decisions = new Map<string, PersistedTrailingBlankDecision>();
+        for (const [id, decision] of Object.entries(parsed)) {
+            if (id.length > 0 && (decision === "keep" || decision === "strip")) {
+                decisions.set(id, decision);
+            }
+        }
+        return decisions;
+    } catch {
+        return new Map();
+    }
+}
+
+/**
+ * Record each assistant's trailing-blank choice when processing a pass that
+ * invalidates cached context. Keep the choice unchanged for the session so
+ * messages rebuilt later use the same shape.
+ */
+export function getTrailingBlankDecisions(
+    db: Database,
+    sessionId: string,
+): Map<string, PersistedTrailingBlankDecision> {
+    const row = db
+        .prepare("SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?")
+        .get(sessionId) as { trailing_blank_decisions?: string } | null;
+    return parseTrailingBlankDecisions(row?.trailing_blank_decisions);
+}
+
+/** Persist newly observed assistant decisions without overwriting an existing choice. */
+export function addTrailingBlankDecisions(
+    db: Database,
+    sessionId: string,
+    additions: Iterable<readonly [string, PersistedTrailingBlankDecision]>,
+): boolean {
+    const add = [...additions];
+    if (add.length === 0) return true;
+    ensureSessionMetaRow(db, sessionId);
+
+    for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt += 1) {
+        const row = db
+            .prepare("SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?")
+            .get(sessionId) as { trailing_blank_decisions?: string | null } | undefined;
+        const rawStored = row ? (row.trailing_blank_decisions ?? null) : null;
+        const current = parseTrailingBlankDecisions(rawStored);
+        let changed = false;
+        for (const [id, decision] of add) {
+            if (!current.has(id)) {
+                current.set(id, decision);
+                changed = true;
+            }
+        }
+        if (!changed) return true;
+        const nextBlob = JSON.stringify(Object.fromEntries(current));
+        const result = db
+            .prepare(
+                "UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ? AND trailing_blank_decisions IS ?",
+            )
+            .run(nextBlob, sessionId, rawStored);
+        if (result.changes > 0) return true;
+    }
+    sessionLog(sessionId, `trailing_blank_decisions CAS: ${CAS_RETRY_LIMIT} retries exhausted`);
+    return false;
+}
+
 // ── Stale ctx_reduce stripped message IDs (frozen replay watermark) ──
 
 /**
