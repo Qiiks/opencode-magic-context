@@ -6,7 +6,9 @@ import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 import {
     addMergedReasoningStrippedIds,
+    addTrailingBlankDecisions,
     getMergedReasoningStrippedIds,
+    getTrailingBlankDecisions,
 } from "./storage-meta-persisted";
 import { clearSession } from "./storage-meta-session";
 
@@ -47,5 +49,44 @@ describe("merged_reasoning_stripped_ids", () => {
         expect(
             db.prepare("SELECT 1 FROM session_meta WHERE session_id = ?").get(sessionId),
         ).toBeNull();
+    });
+});
+
+describe("trailing_blank_decisions", () => {
+    let db: Database;
+    const sessionId = "ses-trailing-blank";
+
+    beforeEach(() => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        runMigrations(db);
+    });
+
+    afterEach(() => {
+        db.close();
+    });
+
+    it("persists immutable keep and strip choices", () => {
+        expect(getTrailingBlankDecisions(db, sessionId)).toEqual(new Map());
+        expect(
+            addTrailingBlankDecisions(db, sessionId, [
+                ["assistant-keep", "keep"],
+                ["assistant-strip", "strip"],
+            ]),
+        ).toBe(true);
+        expect(addTrailingBlankDecisions(db, sessionId, [["assistant-keep", "strip"]])).toBe(true);
+
+        expect(getTrailingBlankDecisions(db, sessionId)).toEqual(
+            new Map([
+                ["assistant-keep", "keep"],
+                ["assistant-strip", "strip"],
+            ]),
+        );
+    });
+
+    it("removes decisions when the session is cleared", () => {
+        addTrailingBlankDecisions(db, sessionId, [["assistant-keep", "keep"]]);
+        clearSession(db, sessionId);
+        expect(getTrailingBlankDecisions(db, sessionId)).toEqual(new Map());
     });
 });

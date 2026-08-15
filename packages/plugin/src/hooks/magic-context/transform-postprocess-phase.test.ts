@@ -26,6 +26,7 @@ import {
     getPersistedCompactionMarkerState,
     getPersistedTodoPermissionDenied,
     getPersistedTodoSyntheticAnchor,
+    getTrailingBlankDecisions,
     setPersistedCompactionMarkerState,
     setPersistedTodoPermissionDenied,
     setPersistedTodoSyntheticAnchor,
@@ -2826,14 +2827,138 @@ describe("final message representation", () => {
             ],
         } as unknown as MessageLike;
 
-        finalizeMessageRepresentation([older, newest], "anthropic", {
+        const messages = [older, newest];
+        finalizeMessageRepresentation(messages, "anthropic", {
             reasoningMutationExemptMessage: newest,
+            trailingBlankDecisions: new Map([
+                ["assistant-older-whitespace", "strip"],
+                ["assistant-newest-whitespace", "keep"],
+            ]),
             skipMergedReasoningStrip: true,
         });
 
-        expect(older.parts.map((part) => part.type)).toEqual(["text", "reasoning", "tool"]);
-        expect(older.parts[0]).toEqual({ type: "text", text: " " });
-        expect(newest.parts.at(-1)).toEqual({ type: "text", text: " " });
+        expect(messages[0].parts.map((part) => part.type)).toEqual(["text", "reasoning", "tool"]);
+        expect(messages[0].parts[0]).toEqual({ type: "text", text: " " });
+        expect(messages[1].parts.at(-1)).toEqual({ type: "text", text: "" });
+        expect(older.parts).toHaveLength(4);
+    });
+
+    it("retains an Anthropic separator for lone and adjacent terminal reasoning", () => {
+        const lone = {
+            info: { id: "assistant-lone-reasoning", role: "assistant" },
+            parts: [
+                { type: "thinking", thinking: "signed", signature: "sig" },
+                { type: "text", text: "" },
+            ],
+        } as unknown as MessageLike;
+        const adjacent = {
+            info: { id: "assistant-adjacent-reasoning", role: "assistant" },
+            parts: [
+                { type: "thinking", thinking: "signed", signature: "sig" },
+                { type: "redacted_thinking", data: "redacted" },
+                { type: "text", text: "" },
+            ],
+        } as unknown as MessageLike;
+        const answered = {
+            info: { id: "assistant-answered", role: "assistant" },
+            parts: [
+                { type: "thinking", thinking: "signed", signature: "sig" },
+                { type: "text", text: "answer" },
+                { type: "text", text: "" },
+            ],
+        } as unknown as MessageLike;
+        const newest = {
+            info: { id: "assistant-newest", role: "assistant" },
+            parts: [{ type: "text", text: "newest" }],
+        } as unknown as MessageLike;
+        const messages = [lone, adjacent, answered, newest];
+
+        finalizeMessageRepresentation(messages, "anthropic", {
+            reasoningMutationExemptMessage: newest,
+            trailingBlankDecisions: new Map([
+                ["assistant-lone-reasoning", "strip"],
+                ["assistant-adjacent-reasoning", "strip"],
+                ["assistant-answered", "strip"],
+            ]),
+            skipMergedReasoningStrip: true,
+        });
+
+        const providerShape = (message: MessageLike) => {
+            const hasSignedReasoning = message.parts.some(
+                (part) =>
+                    part !== null &&
+                    typeof part === "object" &&
+                    (part.type === "thinking" || part.type === "redacted_thinking"),
+            );
+            return message.parts.map((part) => {
+                if (
+                    hasSignedReasoning &&
+                    part !== null &&
+                    typeof part === "object" &&
+                    part.type === "text" &&
+                    part.text === ""
+                ) {
+                    return "text:space";
+                }
+                return part !== null && typeof part === "object" ? part.type : typeof part;
+            });
+        };
+
+        expect(providerShape(messages[0])).toEqual(["thinking", "text:space"]);
+        expect(providerShape(messages[1])).toEqual(["thinking", "redacted_thinking", "text:space"]);
+        expect(providerShape(messages[2])).toEqual(["thinking", "text"]);
+    });
+
+    it("freezes both trailing-blank race outcomes and replays them on defer", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+
+        const buildTarget = (includeTrailing: boolean) =>
+            ({
+                info: { id: "assistant-target", role: "assistant" },
+                parts: [
+                    { type: "reasoning", text: "signed thinking" },
+                    { type: "tool", callID: "call-1", state: { status: "completed" } },
+                    ...(includeTrailing ? [{ type: "text", text: " \t" }] : []),
+                ],
+            }) as unknown as MessageLike;
+        const buildNewest = () =>
+            ({
+                info: { id: "assistant-newest", role: "assistant" },
+                parts: [{ type: "text", text: "next" }],
+            }) as unknown as MessageLike;
+
+        for (const scenario of [
+            {
+                sessionId: "ses-trailing-present-first",
+                first: true,
+                replay: true,
+                decision: "keep",
+            },
+            { sessionId: "ses-trailing-late", first: false, replay: true, decision: "strip" },
+        ] as const) {
+            const firstMessages = [buildTarget(scenario.first)];
+            await runPostTransformPhase(
+                basePostTransformArgs(db, scenario.sessionId, firstMessages, {
+                    schedulerDecision: "execute",
+                    resolvedProviderID: "anthropic",
+                }),
+            );
+            const firstBytes = JSON.stringify(firstMessages[0].parts);
+            expect(getTrailingBlankDecisions(db, scenario.sessionId)).toEqual(
+                new Map([["assistant-target", scenario.decision]]),
+            );
+
+            const replayTarget = buildTarget(scenario.replay);
+            const replayMessages = [replayTarget, buildNewest()];
+            await runPostTransformPhase(
+                basePostTransformArgs(db, scenario.sessionId, replayMessages, {
+                    schedulerDecision: "defer",
+                    resolvedProviderID: "anthropic",
+                }),
+            );
+            expect(JSON.stringify(replayMessages[0].parts)).toBe(firstBytes);
+        }
     });
 
     it("preserves the newest assistant reasoning through final representation", async () => {

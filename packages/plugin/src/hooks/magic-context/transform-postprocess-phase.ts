@@ -27,8 +27,10 @@ import {
 } from "../../features/magic-context/storage";
 import {
     addMergedReasoningStrippedIds,
+    addTrailingBlankDecisions,
     getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
+    getTrailingBlankDecisions,
     type PersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
 import {
@@ -74,14 +76,16 @@ import type { PassOutcome } from "./pass-outcome";
 import { estimateTokens } from "./read-session-formatting";
 import { modelAcceptsEmptyContent, replaySentinelByMessageIds } from "./sentinel";
 import {
+    applyFrozenTrailingBlankDecisions,
     clearOldReasoning,
     findMergedReasoningStripCandidateIds,
+    findTrailingBlankDecisionCandidates,
     stripClearedReasoning,
     stripDroppedPlaceholderMessages,
     stripInlineThinking,
     stripReasoningFromMergedAssistants,
     stripSystemInjectedMessages,
-    stripTrailingWhitespaceFromHistoricalAssistants,
+    type TrailingBlankDecision,
 } from "./strip-content";
 import { buildEditSupersessionReclaim, buildSupersessionReclaimOps } from "./supersession-reclaim";
 import { byteSize, prependTag } from "./tag-content-primitives";
@@ -745,6 +749,7 @@ export function finalizeMessageRepresentation(
         reasoningMutatedMessages?: Iterable<MessageLike>;
         reasoningMutationExemptMessage?: MessageLike;
         mergedReasoningStrippedIds?: ReadonlySet<string>;
+        trailingBlankDecisions?: ReadonlyMap<string, TrailingBlankDecision>;
         skipMergedReasoningStrip?: boolean;
         skipTrailingWhitespaceStrip?: boolean;
     },
@@ -784,11 +789,12 @@ export function finalizeMessageRepresentation(
               mutationExemptMessage: options?.reasoningMutationExemptMessage,
               frozenMessageIds: options?.mergedReasoningStrippedIds,
           });
-    if (
-        !options?.skipTrailingWhitespaceStrip &&
-        modelAcceptsEmptyContent(resolvedProviderID)
-    ) {
-        stripTrailingWhitespaceFromHistoricalAssistants(messages, newestAssistant);
+    if (!options?.skipTrailingWhitespaceStrip && modelAcceptsEmptyContent(resolvedProviderID)) {
+        applyFrozenTrailingBlankDecisions(
+            messages,
+            typeof newestAssistant?.info.id === "string" ? newestAssistant.info.id : undefined,
+            options?.trailingBlankDecisions ?? new Map(),
+        );
     }
     return { clearedParts, mergedReasoningParts };
 }
@@ -2014,6 +2020,18 @@ export async function runPostTransformPhase(
         }
     }
 
+    const trailingBlankDecisions = new Map<string, TrailingBlankDecision>();
+    if (canUseEmptySentinels && !compactionOff) {
+        try {
+            for (const [id, decision] of getTrailingBlankDecisions(args.db, args.sessionId)) {
+                trailingBlankDecisions.set(id, decision);
+            }
+        } catch (error) {
+            args.passOutcome?.record("trailing-blank-decision-load-exception");
+            sessionLog(args.sessionId, "transform failed loading trailing blank decisions:", error);
+        }
+    }
+
     const tFinalRepresentation = performance.now();
     const finalRepresentation = finalizeMessageRepresentation(
         args.messages,
@@ -2023,10 +2041,55 @@ export async function runPostTransformPhase(
             reasoningMutatedMessages,
             reasoningMutationExemptMessage,
             mergedReasoningStrippedIds,
+            trailingBlankDecisions,
             skipMergedReasoningStrip: compactionOff,
             skipTrailingWhitespaceStrip: compactionOff,
         },
     );
+
+    if (canUseEmptySentinels && !compactionOff && isCacheBustingPass) {
+        const candidates = findTrailingBlankDecisionCandidates(
+            args.messages,
+            trailingBlankDecisions,
+        );
+        if (candidates.length > 0) {
+            try {
+                const persisted = addTrailingBlankDecisions(args.db, args.sessionId, candidates);
+                if (persisted) {
+                    const committed = getTrailingBlankDecisions(args.db, args.sessionId);
+                    const newlyFrozen = new Map<string, TrailingBlankDecision>();
+                    for (const [id] of candidates) {
+                        const decision = committed.get(id);
+                        if (!decision) continue;
+                        trailingBlankDecisions.set(id, decision);
+                        newlyFrozen.set(id, decision);
+                    }
+                    applyFrozenTrailingBlankDecisions(
+                        args.messages,
+                        typeof reasoningMutationExemptMessage?.info.id === "string"
+                            ? reasoningMutationExemptMessage.info.id
+                            : undefined,
+                        newlyFrozen,
+                    );
+                    bustedThisPass = true;
+                } else {
+                    args.passOutcome?.record("trailing-blank-decision-persistence-failure");
+                    sessionLog(
+                        args.sessionId,
+                        "trailing blank decision: persistence failed; leaving newly observed assistants intact",
+                    );
+                }
+            } catch (error) {
+                args.passOutcome?.record("trailing-blank-decision-exception");
+                sessionLog(
+                    args.sessionId,
+                    "transform failed freezing trailing blank decision:",
+                    error,
+                );
+            }
+        }
+    }
+
     sessionLog(
         args.sessionId,
         `final representation: clearedParts=${finalRepresentation.clearedParts} mergedReasoningParts=${finalRepresentation.mergedReasoningParts}`,

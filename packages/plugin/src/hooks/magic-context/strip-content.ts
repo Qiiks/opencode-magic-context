@@ -542,45 +542,129 @@ function planMergedAssistantReasoningStrip(
     return plan;
 }
 
+export type TrailingBlankDecision = "keep" | "strip";
+
+const CANONICAL_BLANK_PART = { type: "text", text: "" } as const;
+
+function isSentinelInvisibleTextPart(part: unknown): boolean {
+    return (
+        isRecord(part) &&
+        part.type === "text" &&
+        typeof part.text === "string" &&
+        part.text.trim() === ""
+    );
+}
+
+function isCanonicalBlankPart(part: unknown): boolean {
+    return (
+        isRecord(part) && Object.keys(part).length === 2 && part.type === "text" && part.text === ""
+    );
+}
+
 /**
- * Remove trailing whitespace-only text blocks once an assistant is historical.
- * OpenCode can append a step-finish marker after the first continuation request
- * has already snapshotted the assistant. Structural cleanup turns that marker
- * into an empty sentinel, and the Anthropic adapter serializes the sentinel as
- * a single-space text block. Removing trailing blanks statelessly makes the
- * before-marker and after-marker requests identical. Leading whitespace remains:
- * the reasoning keep-rule treats it as sentinel-invisible without moving signed
- * thinking blocks that Anthropic has already accepted.
+ * Freeze the representation that was visible when an assistant first reached a
+ * cache-busting pass. A present blank keeps one stable separator; an absent blank
+ * makes later structural sentinels disappear on replay.
  */
-export function stripTrailingWhitespaceFromHistoricalAssistants(
+export function findTrailingBlankDecisionCandidates(
     messages: MessageLike[],
-    newestAssistant?: MessageLike,
-): number {
-    let stripped = 0;
+    frozenDecisions: ReadonlyMap<string, TrailingBlankDecision>,
+): Array<readonly [string, TrailingBlankDecision]> {
+    const decisions: Array<readonly [string, TrailingBlankDecision]> = [];
     for (const message of messages) {
-        if (message.info.role !== "assistant" || message === newestAssistant) continue;
+        const id = message.info.id;
+        if (
+            message.info.role !== "assistant" ||
+            typeof id !== "string" ||
+            id.length === 0 ||
+            frozenDecisions.has(id)
+        ) {
+            continue;
+        }
+        const last = message.parts.at(-1);
+        decisions.push([
+            id,
+            message.parts.length === 0 || isSentinelInvisibleTextPart(last) ? "keep" : "strip",
+        ]);
+    }
+    return decisions;
+}
+
+/**
+ * Replay persisted choices after all other message mutations. Keep decisions
+ * preserve one canonical blank block; strip decisions remove a later blank suffix
+ * unless that would expose terminal reasoning. Never delete the newest assistant's
+ * suffix, whether processing the TypeScript or Rust message representation.
+ */
+export function applyFrozenTrailingBlankDecisions(
+    messages: MessageLike[],
+    newestAssistantId: string | undefined,
+    frozenDecisions: ReadonlyMap<string, TrailingBlankDecision>,
+): number {
+    let mutations = 0;
+    for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+        let message = messages[messageIndex];
+        const id = message.info.id;
+        if (message.info.role !== "assistant" || typeof id !== "string") continue;
+        const decision = frozenDecisions.get(id);
+        if (!decision) continue;
 
         let lastMeaningfulIndex = message.parts.length - 1;
-        while (lastMeaningfulIndex >= 0) {
-            const part = message.parts[lastMeaningfulIndex];
-            if (
-                !isRecord(part) ||
-                part.type !== "text" ||
-                typeof part.text !== "string" ||
-                part.text.trim() !== ""
-            ) {
-                break;
-            }
+        while (
+            lastMeaningfulIndex >= 0 &&
+            isSentinelInvisibleTextPart(message.parts[lastMeaningfulIndex])
+        ) {
             lastMeaningfulIndex -= 1;
         }
 
-        // Keep wholly blank messages intact. Removing their only content would
-        // make the provider synthesize a replacement block and defeat normalization.
-        if (lastMeaningfulIndex < 0 || lastMeaningfulIndex === message.parts.length - 1) continue;
-        stripped += message.parts.length - lastMeaningfulIndex - 1;
-        message.parts.splice(lastMeaningfulIndex + 1);
+        const replaceParts = (start: number, deleteCount: number, insertBlank: boolean) => {
+            // OpenCode owns the hook's message objects. Copy the message and parts
+            // array before a length-changing splice so normalization cannot delete
+            // parts from another observer of the live request object graph.
+            message = { ...message, parts: [...message.parts] };
+            messages[messageIndex] = message;
+            message.parts.splice(
+                start,
+                deleteCount,
+                ...(insertBlank ? [{ ...CANONICAL_BLANK_PART }] : []),
+            );
+        };
+
+        if (lastMeaningfulIndex < 0) {
+            if (message.parts.length !== 1 || !isCanonicalBlankPart(message.parts[0])) {
+                mutations += Math.max(1, message.parts.length);
+                replaceParts(0, message.parts.length, true);
+            }
+            continue;
+        }
+
+        const trailingCount = message.parts.length - lastMeaningfulIndex - 1;
+        if (decision === "keep") {
+            const blankIndex = lastMeaningfulIndex + 1;
+            if (trailingCount !== 1 || !isCanonicalBlankPart(message.parts[blankIndex])) {
+                mutations += Math.max(1, trailingCount);
+                replaceParts(blankIndex, trailingCount, true);
+            }
+            continue;
+        }
+
+        if (id === newestAssistantId || trailingCount === 0) continue;
+        const lastMeaningfulPart = message.parts[lastMeaningfulIndex];
+        if (
+            isRecord(lastMeaningfulPart) &&
+            REASONING_PART_TYPES.has(lastMeaningfulPart.type as string)
+        ) {
+            const blankIndex = lastMeaningfulIndex + 1;
+            if (trailingCount !== 1 || !isCanonicalBlankPart(message.parts[blankIndex])) {
+                mutations += Math.max(1, trailingCount);
+                replaceParts(blankIndex, trailingCount, true);
+            }
+            continue;
+        }
+        mutations += trailingCount;
+        replaceParts(lastMeaningfulIndex + 1, trailingCount, false);
     }
-    return stripped;
+    return mutations;
 }
 
 /**
