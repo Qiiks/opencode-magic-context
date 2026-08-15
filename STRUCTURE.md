@@ -188,12 +188,13 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `crates/mc-module/src/session_resolver.rs`: Resolves incoming MCP facade requests to their backing project and session.
 - `crates/mc-module/src/lib.rs`: Route subc client requests, implement MCP tool facade routing (supporting `agent_drops.append` queue drops with server-side range parsing and command-id idempotency checks), serve prompt guidance, manage durable pass tracing for transform passes, orchestrate `session.status`, `session.wrapup`, and `session.delete` operations (utilizing structured status fields, machine-readable dispositions, and process-local per-session latches under a `MAX_WRAPUP_REQUEST_BUDGET` deadline, with `session.delete` atomically removing session-owned rows from SQLite tables), track transform dispatch health metrics and heartbeat reporting, manage LRU-bounded `InFlight` snapshot caching, and coordinate bootstrap state imports using `StateImportCoordinator`.
 - `crates/mc-module/src/historian_producer.rs`: Implement the Rust subc historian producer client using the wire v2 protocol with `OpenedRoute` targeting (channel and epoch routing).
-- `crates/mc-store/src/lib.rs`: Define durable session schemas and migrations (including the `mc_reduce_command_ledger` table in migration 16 for idempotency), handle metadata, and run CAS transitions.
+- `crates/mc-store/src/lib.rs`: Define durable session schemas and migrations (including the `mc_reduce_command_ledger` table in migration 16 for idempotency and `mc_project_mural_artifacts` in migration 49 for project mural artifacts), handle metadata, and run CAS transitions.
 - `crates/mc-module/src/codec/`: Decode harness-specific JSON messages (OpenCode, Pi) into canonical `CkIngressMessage` values and encode them back using harness model codecs.
 - `crates/mc-module/src/caveman.rs`: Age-tier caveman text compression ported to Rust.
 - `crates/mc-module/src/divergence.rs`: Per-pass transform output divergence tracking and attribution.
 - `crates/mc-module/src/healing.rs`: Define serializer healing profiles and gate tail mutations for verbatim-tail consumers to prevent phantom reclaims.
 - `crates/mc-module/src/selection.rs`: Implement tail-reduction selection to decide which tail items to reduce and produce their `ReductionDecision`s.
+- `crates/mc-module/src/retained_size.rs`: Calculate allocator-oriented retained-size estimates for memory-budgeted module holders.
 - `crates/mc-module/src/differential_goldens.rs`: Validate in-process Rust transform outputs against TS-generated wire fixtures (DG-1..3 goldens).
 
 **Tests:** Co-locate tests with source as `src/**/*.test.ts`, for example `src/hooks/magic-context/hook.test.ts`, `src/tools/ctx-memory/tools.test.ts`, and `src/features/magic-context/migrations-v11.test.ts`. End-to-end coverage lives in the separate `packages/e2e-tests/` workspace.
