@@ -158,6 +158,7 @@ import {
 	buildSyntheticToolReclaimOps,
 } from "@magic-context/core/hooks/magic-context/tool-reclaim";
 import { escalationBands } from "@magic-context/core/shared/escalation-bands";
+import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
@@ -2264,7 +2265,8 @@ export function registerPiContextHandler(
 			const modelChanged =
 				previousModelKey !== undefined &&
 				currentModelKey !== undefined &&
-				previousModelKey !== currentModelKey;
+				piModelRefToCanonical(previousModelKey) !==
+					piModelRefToCanonical(currentModelKey);
 			if (currentModelKey !== undefined) {
 				liveModelBySession.set(sessionId, currentModelKey);
 			}

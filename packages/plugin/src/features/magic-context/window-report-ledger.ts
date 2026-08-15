@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ContextLimitProvenance } from "../../shared/context-limit-provenance";
 import { getMagicContextStorageDir } from "../../shared/data-path";
+import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { log } from "../../shared/logger";
 import { getOrCreateSessionMeta } from "./storage-meta-session";
 
@@ -292,7 +293,8 @@ function readLargestSuccess(
 ): number | undefined {
     if (!sessionId || !providerID || !modelID) return undefined;
     const meta = getOrCreateSessionMeta(db, sessionId);
-    return meta.lastObservedModelKey === `${providerID}/${modelID}`
+    return piModelRefToCanonical(meta.lastObservedModelKey ?? "") ===
+        piModelRefToCanonical(`${providerID}/${modelID}`)
         ? positiveFiniteNumber(meta.observedSafeInputTokens)
         : undefined;
 }

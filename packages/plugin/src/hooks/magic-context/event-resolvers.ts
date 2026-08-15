@@ -4,7 +4,7 @@ import {
     loadPersistedUsage,
 } from "../../features/magic-context/storage-meta-persisted";
 import { escalationBands, MAX_EXECUTE_THRESHOLD } from "../../shared/escalation-bands";
-import { modelRefLookupOrder } from "../../shared/harness-provider-map";
+import { modelRefLookupOrder, piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { log, sessionLog } from "../../shared/logger";
 import {
     getSdkContextLimit,
@@ -143,7 +143,9 @@ export function resolveTrustedContextLimit(
         try {
             const persisted = loadPersistedUsage(ctx.db, ctx.sessionID);
             if (
-                persisted?.lastObservedModelKey === modelKey &&
+                persisted !== null &&
+                piModelRefToCanonical(persisted.lastObservedModelKey ?? "") ===
+                    piModelRefToCanonical(modelKey) &&
                 isSaneLimit(persisted.lastUsageContextLimit)
             ) {
                 return persisted.lastUsageContextLimit;
@@ -423,7 +425,7 @@ export function resolveModelKey(
         return undefined;
     }
 
-    return `${providerID}/${modelID}`;
+    return piModelRefToCanonical(`${providerID}/${modelID}`);
 }
 
 export function resolveSessionId(

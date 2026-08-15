@@ -1074,6 +1074,68 @@ describe("registerPiContextHandler", () => {
 		clearAutoSearchForPiSession("ses-sticky-context");
 	});
 
+	it("does not reset Pi model-specific state when canonical and native alias spellings flip", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-model-alias-switch";
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, { db });
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			const baseContext = {
+				...fakeContext(sessionId),
+				model: { provider: "openai", id: "gpt-5.6-sol" },
+			};
+
+			// Record the initial model before populating session metadata; only a
+			// genuine model change may clear this metadata.
+			recordPiLiveModel(sessionId, "openai/gpt-5.6-sol");
+			await handler(
+				{ messages: [userMessage("warm", 1)] as never[] },
+				baseContext as never,
+			);
+			updateSessionMeta(db, sessionId, {
+				lastContextPercentage: 61,
+				lastInputTokens: 61_000,
+				clearedReasoningThroughTag: 7,
+			});
+			incrementHistorianFailure(db, sessionId, "retain across alias flip");
+			recordOverflowDetected(db, sessionId, 64_000, "openai/gpt-5.6-sol");
+
+			await handler({ messages: [userMessage("native alias", 2)] as never[] }, {
+				...baseContext,
+				model: { provider: "openai-codex", id: "gpt-5.6-sol" },
+			} as never);
+			let meta = getOrCreateSessionMeta(db, sessionId);
+			expect(meta.clearedReasoningThroughTag).toBe(7);
+			expect(
+				getHistorianFailureState(db, sessionId).failureCount,
+			).toBeGreaterThan(0);
+			expect(getOverflowState(db, sessionId).detectedContextLimit).toBe(64_000);
+
+			updateSessionMeta(db, sessionId, {
+				lastContextPercentage: 62,
+				lastInputTokens: 62_000,
+				clearedReasoningThroughTag: 8,
+			});
+			await handler(
+				{ messages: [userMessage("canonical alias", 3)] as never[] },
+				baseContext as never,
+			);
+			meta = getOrCreateSessionMeta(db, sessionId);
+			expect(meta.clearedReasoningThroughTag).toBe(8);
+			expect(
+				getHistorianFailureState(db, sessionId).failureCount,
+			).toBeGreaterThan(0);
+			expect(getOverflowState(db, sessionId).detectedContextLimit).toBe(64_000);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
 	it("evicts the least-recently-tracked session's per-session caches past the cap", () => {
 		// Register a victim session with observable per-session state, then track
 		// >100 newer sessions so the victim is evicted via clearContextHandlerSession.

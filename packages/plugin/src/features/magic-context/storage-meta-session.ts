@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { getHarness } from "../../shared/harness";
+import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import type { Database } from "../../shared/sqlite";
 import { clearCompressionDepth } from "./compression-depth-storage";
 import { clearIndexedMessages } from "./message-index";
@@ -135,7 +136,11 @@ export function updateSessionMeta(
             values.push(value ? 1 : 0);
         } else if (typeof value === "string" || typeof value === "number") {
             setClauses.push(`${column} = ?`);
-            values.push(value);
+            values.push(
+                key === "lastObservedModelKey" && typeof value === "string"
+                    ? piModelRefToCanonical(value)
+                    : value,
+            );
         }
     }
 

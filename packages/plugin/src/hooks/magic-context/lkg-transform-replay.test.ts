@@ -401,6 +401,30 @@ describe("LKG transform replay", () => {
             ]);
     });
 
+    test("replays across Pi-native model aliases without treating them as a model switch", () => {
+        resetLkgSlotsForTest();
+        const input = [user("u0", 1)];
+        expect(
+            captureLkgSlot({
+                sessionId: "model-alias",
+                input,
+                output: structuredClone(input),
+                modelKey: "openai/gpt-5.6-sol",
+                providerKey: "openai",
+            }),
+        ).toBe(true);
+
+        const current = [...structuredClone(input), user("u1", 2)] as MessageLike[];
+        expect(
+            replayLkg({
+                sessionId: "model-alias",
+                messages: current,
+                modelKey: "openai-codex/gpt-5.6-sol",
+                providerKey: "openai-codex",
+            }),
+        ).toMatchObject({ ok: true });
+    });
+
     test("outermost handler rethrows emergency fail-closed errors", async () => {
         const handler = createMessagesTransformHandler({
             magicContext: {

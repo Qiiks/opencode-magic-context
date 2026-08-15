@@ -1964,6 +1964,103 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 			closeQuietly(db);
 		}
 	});
+	it("does not hard-fold when the current model switches from canonical to Pi alias spelling", () => {
+		const db = createTestDb();
+		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-model-alias-forward-"));
+		try {
+			const state = {
+				...piState("ses-pi-tax-model-alias-forward", cwd),
+				hardSignals: { ...baseHard, modelKey: "openai/gpt-5.6-sol" },
+			};
+			injectM0M1Pi(state, db, [userMessage("hi", 10)] as never, ["entry-0"]);
+
+			const aliasOnly = {
+				...state,
+				hardSignals: { ...baseHard, modelKey: "openai-codex/gpt-5.6-sol" },
+			};
+			expect(mustMaterializePi(aliasOnly, db)).toEqual({
+				value: false,
+				reason: null,
+			});
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+			closeQuietly(db);
+		}
+	});
+
+	it("persists a Pi-native baseline canonically, then accepts the reverse spelling flip", () => {
+		const db = createTestDb();
+		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-model-alias-reverse-"));
+		try {
+			const state = {
+				...piState("ses-pi-tax-model-alias-reverse", cwd),
+				hardSignals: { ...baseHard, modelKey: "openai-codex/gpt-5.6-sol" },
+			};
+			injectM0M1Pi(state, db, [userMessage("hi", 10)] as never, ["entry-0"]);
+			expect(getOrCreateSessionMeta(db, state.sessionId).cachedM0ModelKey).toBe(
+				"openai/gpt-5.6-sol",
+			);
+
+			const aliasOnly = {
+				...state,
+				hardSignals: { ...baseHard, modelKey: "openai/gpt-5.6-sol" },
+			};
+			expect(mustMaterializePi(aliasOnly, db)).toEqual({
+				value: false,
+				reason: null,
+			});
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+			closeQuietly(db);
+		}
+	});
+
+	it("does not hard-fold when an existing cached baseline stores a native alias", () => {
+		const db = createTestDb();
+		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-model-alias-upgrade-"));
+		try {
+			const state = {
+				...piState("ses-pi-tax-model-alias-upgrade", cwd),
+				hardSignals: { ...baseHard, modelKey: "openai/gpt-5.6-sol" },
+			};
+			injectM0M1Pi(state, db, [userMessage("hi", 10)] as never, ["entry-0"]);
+			db.prepare(
+				"UPDATE session_meta SET cached_m0_model_key = ? WHERE session_id = ?",
+			).run("openai-codex/gpt-5.6-sol", state.sessionId);
+
+			expect(mustMaterializePi(state, db)).toEqual({
+				value: false,
+				reason: null,
+			});
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+			closeQuietly(db);
+		}
+	});
+
+	it("still hard-folds for different models in the same alias family", () => {
+		const db = createTestDb();
+		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-model-alias-real-switch-"));
+		try {
+			const state = {
+				...piState("ses-pi-tax-model-alias-real-switch", cwd),
+				hardSignals: { ...baseHard, modelKey: "openai-codex/gpt-5.6-sol" },
+			};
+			injectM0M1Pi(state, db, [userMessage("hi", 10)] as never, ["entry-0"]);
+
+			const realSwitch = {
+				...state,
+				hardSignals: { ...baseHard, modelKey: "openai/gpt-5.6-codex" },
+			};
+			expect(mustMaterializePi(realSwitch, db)).toEqual({
+				value: true,
+				reason: "model_change",
+			});
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+			closeQuietly(db);
+		}
+	});
 });
 
 describe("injectM0M1Pi m[1]-rendered coverage watermark (marker-drain liveness)", () => {

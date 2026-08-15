@@ -1104,6 +1104,38 @@ describe("Rust mode authority adapter", () => {
         );
     });
 
+    it("sends canonical model identity to the Rust wire for a Pi-native alias", async () => {
+        const sessionId = `rust-model-alias-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installAvailabilityDb(sessionId, {});
+        installRawProvider(sessionId);
+        let transformRequest: Record<string, unknown> | undefined;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform") transformRequest = body as Record<string, unknown>;
+                return method === "transform"
+                    ? { native_messages: makeMessages(sessionId) }
+                    : { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const messages = makeMessages(sessionId);
+        messages[0].info.model = { providerID: "openai-codex", modelID: "gpt-5.6-sol" };
+
+        await transform.run(
+            sessionId,
+            messages,
+            { messages: messages as unknown[] },
+            makeMeta(db, sessionId),
+        );
+
+        expect(transformRequest?.model_key).toBe("openai/gpt-5.6-sol");
+        expect(transformRequest?.prompt_surface_model_key).toBe("openai/gpt-5.6-sol");
+        expect(transformRequest?.render_config).toContain("model:openai/gpt-5.6-sol");
+    });
+
     it("forwards the model-routed prompt preset and description overrides", async () => {
         const sessionId = `rust-prompt-surface-${Date.now()}`;
         sessions.push(sessionId);

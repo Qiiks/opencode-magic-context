@@ -55,6 +55,7 @@ import type { ContextUsage } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
+import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { log, sessionLog } from "../../shared/logger";
 import { getSdkContextLimit } from "../../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
@@ -983,7 +984,8 @@ export function createTransform(deps: TransformDeps) {
                 if (
                     lastUsageModelKey != null &&
                     outgoingModelKey != null &&
-                    lastUsageModelKey !== outgoingModelKey
+                    piModelRefToCanonical(lastUsageModelKey) !==
+                        piModelRefToCanonical(outgoingModelKey)
                 ) {
                     dropSlot(sessionId, "model-change");
                     sessionLog(
@@ -1126,7 +1128,8 @@ export function createTransform(deps: TransformDeps) {
                     // model other than the one we're about to send to.
                     lastMeasuredModelKey != null &&
                     armModelKey != null &&
-                    lastMeasuredModelKey !== armModelKey &&
+                    piModelRefToCanonical(lastMeasuredModelKey) !==
+                        piModelRefToCanonical(armModelKey) &&
                     !getOverflowState(db, sessionId).needsEmergencyRecovery
                 ) {
                     sessionLog(
@@ -1270,7 +1273,8 @@ export function createTransform(deps: TransformDeps) {
             Date.now() - persistedUsageBeforeResets.updatedAt <= 10 * 60 * 1000 &&
             (persistedUsageBeforeResets.lastObservedModelKey === null ||
                 currentModelKeyForBoundary === undefined ||
-                persistedUsageBeforeResets.lastObservedModelKey === currentModelKeyForBoundary) &&
+                piModelRefToCanonical(persistedUsageBeforeResets.lastObservedModelKey) ===
+                    piModelRefToCanonical(currentModelKeyForBoundary)) &&
             (resolvedContextLimit === undefined ||
                 persistedUsageBeforeResets.lastUsageContextLimit === 0 ||
                 persistedUsageBeforeResets.lastUsageContextLimit === resolvedContextLimit)
@@ -2265,8 +2269,9 @@ export function createTransform(deps: TransformDeps) {
                 typeof currentModelKeyForRecovery === "string" &&
                 currentModelKeyForRecovery.length > 0 &&
                 overflowStateForFinalWire.detectedContextLimit > 0 &&
-                overflowStateForFinalWire.detectedContextLimitModelKey ===
-                    currentModelKeyForRecovery
+                piModelRefToCanonical(
+                    overflowStateForFinalWire.detectedContextLimitModelKey ?? "",
+                ) === piModelRefToCanonical(currentModelKeyForRecovery)
                     ? overflowStateForFinalWire.detectedContextLimit
                     : undefined;
             const emergencyFailClosed = evaluateEmergencyFailClosed({

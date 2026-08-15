@@ -180,6 +180,33 @@ describe("event-resolvers", () => {
                 closeQuietly(db);
             }
         });
+        it("trusts a legacy native-spelling usage key for its canonical model", () => {
+            const db = new Database(":memory:");
+            initializeDatabase(db);
+            runMigrations(db);
+            const sessionId = "ses-usage-limit-native-alias";
+            try {
+                updateSessionMeta(db, sessionId, {
+                    lastContextPercentage: 10,
+                    lastInputTokens: 100_000,
+                    lastUsageContextLimit: 1_048_576,
+                    lastObservedModelKey: "openai/gpt-alias-test",
+                });
+                // Simulate a legacy session row whose model key uses the old provider prefix.
+                db.prepare(
+                    "UPDATE session_meta SET last_observed_model_key = ? WHERE session_id = ?",
+                ).run("openai-codex/gpt-alias-test", sessionId);
+
+                expect(
+                    resolveTrustedContextLimit("openai", "gpt-alias-test", {
+                        db,
+                        sessionID: sessionId,
+                    }),
+                ).toBe(1_048_576);
+            } finally {
+                closeQuietly(db);
+            }
+        });
     });
 
     describe("resolveCacheTtl", () => {
@@ -640,8 +667,9 @@ describe("event-resolvers", () => {
     });
 
     describe("resolveModelKey", () => {
-        it("returns provider/model when both parts exist", () => {
+        it("returns the canonical provider/model key when both parts exist", () => {
             expect(resolveModelKey("openai", "gpt-4o")).toBe("openai/gpt-4o");
+            expect(resolveModelKey("openai-codex", "gpt-5.6-sol")).toBe("openai/gpt-5.6-sol");
         });
 
         it("returns undefined when either part is missing", () => {

@@ -5,6 +5,7 @@ import {
     getOrCreateSessionMeta,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
+import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { sessionLog } from "../../shared/logger";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
@@ -341,7 +342,7 @@ export function createSystemPromptHashHandler(deps: {
                 : deps.resolveModel?.(sessionId);
         const modelKey =
             liveModel?.providerID && liveModel.modelID
-                ? `${liveModel.providerID}/${liveModel.modelID}`
+                ? piModelRefToCanonical(`${liveModel.providerID}/${liveModel.modelID}`)
                 : undefined;
         const promptSurface = guidanceEpochs.resolve(sessionId, deps.promptSurface, modelKey);
         const fullPrompt = output.system.join("\n");
