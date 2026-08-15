@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
+import { stripTrailingWhitespaceFromHistoricalAssistants } from "./strip-content";
 import { stripStructuralNoise } from "./strip-structural-noise";
 import type { MessageLike } from "./tag-messages";
 
@@ -86,6 +87,32 @@ describe("stripStructuralNoise", () => {
             text: "",
             cache_control: { type: "ephemeral" },
         });
+    });
+
+    it("keeps a late step-finish from changing the next defer representation", () => {
+        const buildTarget = (includeLateFinish: boolean) =>
+            message("m-target", "assistant", [
+                { type: "step-start", snapshot: "abc" },
+                { type: "reasoning", text: "signed thinking" },
+                { type: "tool", callID: "call-1", state: { status: "completed" } },
+                ...(includeLateFinish ? [{ type: "step-finish", reason: "tool-calls" }] : []),
+            ]);
+
+        const firstTarget = buildTarget(false);
+        stripStructuralNoise([firstTarget]);
+        stripTrailingWhitespaceFromHistoricalAssistants([firstTarget], firstTarget);
+        const firstBytes = JSON.stringify(firstTarget.parts);
+
+        const replayTarget = buildTarget(true);
+        const newest = message("m-newest", "assistant", [{ type: "text", text: "next step" }]);
+        stripStructuralNoise([replayTarget, newest]);
+        expect(
+            stripTrailingWhitespaceFromHistoricalAssistants([replayTarget, newest], newest),
+        ).toBe(1);
+
+        expect(JSON.stringify(replayTarget.parts)).toBe(firstBytes);
+        expect(replayTarget.parts[0]).toEqual({ type: "text", text: "" });
+        expect(replayTarget.parts.at(-1)).toMatchObject({ type: "tool", callID: "call-1" });
     });
 
     it("keeps messages that would otherwise become all-sentinel", () => {

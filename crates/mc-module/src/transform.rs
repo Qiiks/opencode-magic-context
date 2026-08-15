@@ -10371,6 +10371,37 @@ fn new_merged_reasoning_strip_units(
     units
 }
 
+fn strip_trailing_whitespace_from_historical_assistant(
+    profile: SerializerProfile,
+    provider_id: Option<&str>,
+    mutation_exempt: bool,
+    message: &mut CkWireMessage,
+) -> usize {
+    if profile != SerializerProfile::OpencodeAiSdk
+        || provider_id != Some("anthropic")
+        || message.role != "assistant"
+        || mutation_exempt
+    {
+        return 0;
+    }
+
+    let Some(last_meaningful_index) = message
+        .content
+        .iter()
+        .rposition(|block| !is_sentinel_invisible_text_block(block))
+    else {
+        // Keep one block because the provider cannot serialize an assistant message with no content.
+        return 0;
+    };
+    let stripped = message.content.len() - last_meaningful_index - 1;
+    if stripped == 0 {
+        return 0;
+    }
+    message.content.truncate(last_meaningful_index + 1);
+    message.mark_modified();
+    stripped
+}
+
 fn apply_serializer_residual_to_message(
     profile: SerializerProfile,
     provider_id: Option<&str>,
@@ -10854,14 +10885,20 @@ fn build_output_with_tags_inner(
                 || rendered.meta.synthetic
                 || !blocks_by_mid.contains_key(msg.mid.as_str());
             let output = if present {
-                if let Some(profile) = serializer_profile
-                    .filter(|_| message_strip_unit(core, "merged_reasoning", &msg.mid).is_some())
-                {
-                    apply_serializer_residual_to_message(
+                if let Some(profile) = serializer_profile {
+                    if message_strip_unit(core, "merged_reasoning", &msg.mid).is_some() {
+                        apply_serializer_residual_to_message(
+                            profile,
+                            req.provider_id.as_deref(),
+                            reasoning_mutation_exempt,
+                            first_assistant_in_run,
+                            &mut rendered,
+                        );
+                    }
+                    strip_trailing_whitespace_from_historical_assistant(
                         profile,
                         req.provider_id.as_deref(),
                         reasoning_mutation_exempt,
-                        first_assistant_in_run,
                         &mut rendered,
                     );
                 }
@@ -16202,6 +16239,79 @@ pub(crate) mod tests {
             &messages[0].content[1].kind,
             ck_wire::CkKind::Reasoning { text, .. } if text == "signed thinking"
         ));
+    }
+
+    #[test]
+    fn late_trailing_whitespace_is_stable_after_the_assistant_stops_being_newest() {
+        fn assistant(include_trailing: bool) -> CkWireMessage {
+            let mut content = vec![
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: " ".to_string(),
+                }),
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: "signed thinking".to_string(),
+                    signature: Some("sig".to_string()),
+                }),
+                ck_wire::CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                    provider_executed: false,
+                }),
+            ];
+            if include_trailing {
+                content.push(ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: " \t\n".to_string(),
+                }));
+            }
+            CkWireMessage::from_parts(
+                "assistant",
+                content,
+                None,
+                ck_wire::ProviderExtras::new(),
+                ck_wire::HarnessMeta::default(),
+            )
+        }
+
+        let mut first_serve = assistant(false);
+        assert_eq!(
+            strip_trailing_whitespace_from_historical_assistant(
+                SerializerProfile::OpencodeAiSdk,
+                Some("anthropic"),
+                true,
+                &mut first_serve,
+            ),
+            0
+        );
+        let first_bytes = serde_json::to_vec(&first_serve).unwrap();
+
+        let mut replay = assistant(true);
+        assert_eq!(
+            strip_trailing_whitespace_from_historical_assistant(
+                SerializerProfile::OpencodeAiSdk,
+                Some("anthropic"),
+                false,
+                &mut replay,
+            ),
+            1
+        );
+        assert_eq!(serde_json::to_vec(&replay).unwrap(), first_bytes);
+        assert!(matches!(
+            &replay.content[0].kind,
+            ck_wire::CkKind::Text { text } if text == " "
+        ));
+
+        let mut pi_replay = assistant(true);
+        assert_eq!(
+            strip_trailing_whitespace_from_historical_assistant(
+                SerializerProfile::Pi,
+                Some("anthropic"),
+                false,
+                &mut pi_replay,
+            ),
+            0
+        );
+        assert_eq!(pi_replay.content.len(), 4);
     }
 
     #[test]

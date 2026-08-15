@@ -81,6 +81,7 @@ import {
     stripInlineThinking,
     stripReasoningFromMergedAssistants,
     stripSystemInjectedMessages,
+    stripTrailingWhitespaceFromHistoricalAssistants,
 } from "./strip-content";
 import { buildEditSupersessionReclaim, buildSupersessionReclaimOps } from "./supersession-reclaim";
 import { byteSize, prependTag } from "./tag-content-primitives";
@@ -745,6 +746,7 @@ export function finalizeMessageRepresentation(
         reasoningMutationExemptMessage?: MessageLike;
         mergedReasoningStrippedIds?: ReadonlySet<string>;
         skipMergedReasoningStrip?: boolean;
+        skipTrailingWhitespaceStrip?: boolean;
     },
 ): { clearedParts: number; mergedReasoningParts: number } {
     let clearedParts = 0;
@@ -767,12 +769,27 @@ export function finalizeMessageRepresentation(
             clearedParts = stripClearedReasoning(targetedMessages);
         }
     }
+    let newestAssistant = options?.reasoningMutationExemptMessage;
+    if (!newestAssistant) {
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+            const message = messages[index];
+            if (message.info.role !== "assistant") continue;
+            newestAssistant = message;
+            break;
+        }
+    }
     const mergedReasoningParts = options?.skipMergedReasoningStrip
         ? 0
         : stripReasoningFromMergedAssistants(messages, resolvedProviderID, {
               mutationExemptMessage: options?.reasoningMutationExemptMessage,
               frozenMessageIds: options?.mergedReasoningStrippedIds,
           });
+    if (
+        !options?.skipTrailingWhitespaceStrip &&
+        modelAcceptsEmptyContent(resolvedProviderID)
+    ) {
+        stripTrailingWhitespaceFromHistoricalAssistants(messages, newestAssistant);
+    }
     return { clearedParts, mergedReasoningParts };
 }
 
@@ -2007,6 +2024,7 @@ export async function runPostTransformPhase(
             reasoningMutationExemptMessage,
             mergedReasoningStrippedIds,
             skipMergedReasoningStrip: compactionOff,
+            skipTrailingWhitespaceStrip: compactionOff,
         },
     );
     sessionLog(

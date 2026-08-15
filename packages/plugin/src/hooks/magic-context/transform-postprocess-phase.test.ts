@@ -2806,6 +2806,36 @@ describe("final message representation", () => {
         expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
     });
 
+    it("strips only historical trailing whitespace while preserving leading and newest blocks", () => {
+        const older = {
+            info: { id: "assistant-older-whitespace", role: "assistant" },
+            parts: [
+                { type: "text", text: " " },
+                { type: "reasoning", text: "signed thinking" },
+                { type: "tool", callID: "call-older", state: { status: "completed" } },
+                { type: "text", text: "\t\n" },
+            ],
+        } as unknown as MessageLike;
+        const newest = {
+            info: { id: "assistant-newest-whitespace", role: "assistant" },
+            parts: [
+                { type: "text", text: " " },
+                { type: "reasoning", text: "latest signed thinking" },
+                { type: "tool", callID: "call-newest", state: { status: "completed" } },
+                { type: "text", text: " " },
+            ],
+        } as unknown as MessageLike;
+
+        finalizeMessageRepresentation([older, newest], "anthropic", {
+            reasoningMutationExemptMessage: newest,
+            skipMergedReasoningStrip: true,
+        });
+
+        expect(older.parts.map((part) => part.type)).toEqual(["text", "reasoning", "tool"]);
+        expect(older.parts[0]).toEqual({ type: "text", text: " " });
+        expect(newest.parts.at(-1)).toEqual({ type: "text", text: " " });
+    });
+
     it("preserves the newest assistant reasoning through final representation", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);

@@ -543,6 +543,47 @@ function planMergedAssistantReasoningStrip(
 }
 
 /**
+ * Remove trailing whitespace-only text blocks once an assistant is historical.
+ * OpenCode can append a step-finish marker after the first continuation request
+ * has already snapshotted the assistant. Structural cleanup turns that marker
+ * into an empty sentinel, and the Anthropic adapter serializes the sentinel as
+ * a single-space text block. Removing trailing blanks statelessly makes the
+ * before-marker and after-marker requests identical. Leading whitespace remains:
+ * the reasoning keep-rule treats it as sentinel-invisible without moving signed
+ * thinking blocks that Anthropic has already accepted.
+ */
+export function stripTrailingWhitespaceFromHistoricalAssistants(
+    messages: MessageLike[],
+    newestAssistant?: MessageLike,
+): number {
+    let stripped = 0;
+    for (const message of messages) {
+        if (message.info.role !== "assistant" || message === newestAssistant) continue;
+
+        let lastMeaningfulIndex = message.parts.length - 1;
+        while (lastMeaningfulIndex >= 0) {
+            const part = message.parts[lastMeaningfulIndex];
+            if (
+                !isRecord(part) ||
+                part.type !== "text" ||
+                typeof part.text !== "string" ||
+                part.text.trim() !== ""
+            ) {
+                break;
+            }
+            lastMeaningfulIndex -= 1;
+        }
+
+        // Keep wholly blank messages intact. Removing their only content would
+        // make the provider synthesize a replacement block and defeat normalization.
+        if (lastMeaningfulIndex < 0 || lastMeaningfulIndex === message.parts.length - 1) continue;
+        stripped += message.parts.length - lastMeaningfulIndex - 1;
+        message.parts.splice(lastMeaningfulIndex + 1);
+    }
+    return stripped;
+}
+
+/**
  * Find the stable assistant message ids whose reasoning the current merge rule
  * would neutralize. The caller freezes these ids only on a cache-busting pass;
  * replay uses the persisted set instead of rerunning membership detection.
