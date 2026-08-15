@@ -223,6 +223,12 @@ function formatRustOperationMessage(
                 return `## Magic Wrapup\n\n${summary || "Nothing to compact."}`;
             case "already_in_progress":
                 return `## Magic Wrapup — Skipped\n\n/ctx-wrapup is already running for this session${rounds > 0 ? ` (${rounds} round${rounds === 1 ? "" : "s"} complete)` : ""}. Wait for it to finish, then run /ctx-wrapup again if more history remains.`;
+            case "retryable":
+                // The module's nonterminal disposition: progress was made but the
+                // drain stopped short of the keep watermark for a retryable reason.
+                // The TypeScript orchestrator presents the same shape as a Partial
+                // with the prescribed continuation, not a terminal failure.
+                return `## Magic Wrapup — Partial\n\n${summary || "Wrapup made progress but stopped before the keep watermark."} Run /ctx-wrapup again to continue.`;
             default:
                 return `## Magic Wrapup — Failed\n\n${summary || "Wrapup failed; try /ctx-wrapup again."}${rounds > 0 ? ` (${rounds} round${rounds === 1 ? "" : "s"})` : ""}`;
         }
@@ -813,7 +819,10 @@ export function createMagicContextCommandHandler(deps: {
                 } else if (!parsed.ok) {
                     result = `## Magic Wrapup — Invalid Arguments\n\n${parsed.message}`;
                 } else if (rustMode) {
-                    const keep = Math.min(100, Math.max(5, parsed.messagesToKeep));
+                    // The requested keep watermark is forwarded unchanged: it counts raw
+                    // messages and the module honors it as given (the TypeScript
+                    // orchestrator imposes no 5/100 clamp, only a floor of 1).
+                    const keep = parsed.messagesToKeep;
                     await deps.sendNotification(
                         sessionId,
                         "## Magic Wrapup\n\nStarting wrapup…",

@@ -552,10 +552,17 @@ fn resolve_protected_tail_boundary_with_index(
 /// The watermark counts messages of every role. Safety adjustments may move it earlier,
 /// retaining more than `keep`, but never later. This keeps tool invocations atomic and
 /// leaves the newest message, including its complete tool arc, in the verbatim tail.
+///
+/// `context_limit` and `execute_threshold_percentage` are the session's resolved
+/// geometry. They feed the same trigger-budget derivation the normal boundary uses, so
+/// the user-boundary snap window scales with the actual model window and effective
+/// threshold instead of a synthetic constant.
 pub fn resolve_wrapup_boundary(
     messages: &[BoundaryMsg],
     last_compartment_end_ordinal: Option<u64>,
     keep: usize,
+    context_limit: f64,
+    execute_threshold_percentage: f64,
 ) -> WrapupBoundaryResolution {
     let index = TokenIndex::new(messages);
     let raw_message_count = index.raw_message_count;
@@ -607,7 +614,7 @@ pub fn resolve_wrapup_boundary(
         }
         protected_tail_start = fenced;
 
-        let trigger_budget = derive_trigger_budget(128_000.0, 65.0);
+        let trigger_budget = derive_trigger_budget(context_limit, execute_threshold_percentage);
         let snapped = snap_wrapup_boundary_to_user(
             messages,
             &index,
@@ -2810,7 +2817,7 @@ mod tests {
             text_msg(5, Role::Assistant, "five"),
         ];
 
-        let plan = resolve_wrapup_boundary(&tail, None, 2);
+        let plan = resolve_wrapup_boundary(&tail, None, 2, 128_000.0, 65.0);
 
         assert_eq!(plan.raw_messages_above_last_compartment, 5);
         assert_eq!(plan.target_protected_start_ordinal, 4);
@@ -2827,7 +2834,7 @@ mod tests {
             text_msg(5, Role::Assistant, "newest"),
         ];
 
-        let plan = resolve_wrapup_boundary(&tail, None, 2);
+        let plan = resolve_wrapup_boundary(&tail, None, 2, 128_000.0, 65.0);
 
         assert_eq!(plan.target_protected_start_ordinal, 2);
         assert_eq!(plan.boundary.eligible_head, 1..2);
@@ -2844,7 +2851,7 @@ mod tests {
             tool_result_msg(5, "latest", "done"),
         ];
 
-        let plan = resolve_wrapup_boundary(&tail, None, 1);
+        let plan = resolve_wrapup_boundary(&tail, None, 1, 128_000.0, 65.0);
 
         assert_eq!(plan.target_protected_start_ordinal, 3);
         assert_eq!(plan.boundary.eligible_head, 1..3);
@@ -2858,7 +2865,7 @@ mod tests {
             text_msg(3, Role::Assistant, "three"),
         ];
 
-        let plan = resolve_wrapup_boundary(&tail, Some(10), 2);
+        let plan = resolve_wrapup_boundary(&tail, Some(10), 2, 128_000.0, 65.0);
 
         assert_eq!(plan.raw_messages_above_last_compartment, 0);
         assert_eq!(plan.target_protected_start_ordinal, 11);
@@ -2866,6 +2873,40 @@ mod tests {
         assert_eq!(plan.boundary.eligible_head, 11..11);
         assert_eq!(plan.boundary.boundary_reason, "manual-wrapup-empty");
         assert_eq!(plan.boundary.true_raw_eligible_tokens, 0.0);
+    }
+
+    #[test]
+    fn wrapup_user_snap_window_scales_with_session_geometry() {
+        // The keep-watermark candidate lands on ordinal 5; a meaningful user message
+        // sits about 10k tokens before it (ordinals 3..5). With a 1M x 65% geometry
+        // the derived trigger budget is about 32.5k, so the snap window reaches the
+        // user message and retains it. With a 128k x 65% geometry the budget floors
+        // at 5k, the snap cannot reach the user message, and the later candidate is
+        // kept — the same divergence the TypeScript resolver avoids by passing the
+        // session's real context limit and threshold.
+        let tail = vec![
+            text_msg(1, Role::User, "start the session"),
+            text_msg(2, Role::Assistant, &"preamble filler ".repeat(4_000)),
+            text_msg(3, Role::User, "now the real request"),
+            text_msg(4, Role::Assistant, &"followup filler ".repeat(2_500)),
+            text_msg(5, Role::Assistant, "interim note"),
+            text_msg(6, Role::User, "latest prompt"),
+        ];
+
+        let wide = resolve_wrapup_boundary(&tail, None, 2, 1_000_000.0, 65.0);
+        assert_eq!(
+            wide.target_protected_start_ordinal, 3,
+            "a 1M window's trigger budget must reach the user message: {wide:?}"
+        );
+        assert_eq!(wide.boundary.eligible_head, 1..3);
+        assert_eq!(wide.boundary.boundary_reason, "manual-wrapup-user-snap");
+
+        let narrow = resolve_wrapup_boundary(&tail, None, 2, 128_000.0, 65.0);
+        assert_eq!(
+            narrow.target_protected_start_ordinal, 5,
+            "a 128k window's floored budget must not reach the user message: {narrow:?}"
+        );
+        assert_eq!(narrow.boundary.eligible_head, 1..5);
     }
 
     #[test]

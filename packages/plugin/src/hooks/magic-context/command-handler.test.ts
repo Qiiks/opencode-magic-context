@@ -890,7 +890,9 @@ describe("createMagicContextCommandHandler", () => {
                 [{ method: string; body: Record<string, unknown>; timeoutMs?: number }]
             >;
             expect(calls[0]?.[0].method).toBe("session.wrapup");
-            expect(calls[0]?.[0].body.keep).toBe(100);
+            // The requested keep watermark is forwarded unchanged (no 5/100 clamp):
+            // the module honors it as given, matching the TypeScript orchestrator.
+            expect(calls[0]?.[0].body.keep).toBe(250);
             expect(calls[0]?.[0].body.command_id).toEqual(expect.any(String));
             expect(calls[0]?.[0].timeoutMs).toBe(MAX_WRAPUP_REQUEST_BUDGET_MS);
             expect(calls[1]?.[0].method).toBe("session.recomp");
@@ -900,6 +902,41 @@ describe("createMagicContextCommandHandler", () => {
                 expect.stringContaining("Wrapped up."),
                 {},
             );
+        });
+
+        it("presents a retryable Rust wrapup as Partial with a continuation, not Failed", async () => {
+            const sendNotification = mock(async () => {});
+            const moduleCall = mock(async () => ({
+                ok: false,
+                disposition: "retryable",
+                reason: "budget_exhausted",
+                summary:
+                    "compacted 3 messages into 1 compartments; wrapup request budget expired; takes effect on your next message",
+            }));
+            const handler = createMagicContextCommandHandler({
+                db,
+                protectedTags: 3,
+                transformMode: "rust",
+                rustModeModuleClient: { call: moduleCall },
+                sendNotification,
+            });
+
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command: "ctx-wrapup", sessionID: "ses-rust-wrapup-retry", arguments: "" },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-WRAPUP_HANDLED__",
+            );
+
+            const texts = (sendNotification.mock.calls as unknown as Array<[string, string]>)
+                .filter(([sessionId]) => sessionId === "ses-rust-wrapup-retry")
+                .map(([, text]) => text)
+                .join("\n");
+            expect(texts).toContain("## Magic Wrapup — Partial");
+            expect(texts).toContain("Run /ctx-wrapup again to continue.");
+            expect(texts).not.toContain("— Failed");
         });
 
         it("keeps /ctx-embed on the TypeScript subsystem in Rust mode", async () => {
@@ -968,7 +1005,7 @@ describe("createMagicContextCommandHandler", () => {
             );
         });
 
-        it("routes wrapup and recomp with bounded keep and command ids", async () => {
+        it("routes wrapup and recomp forwarding the requested keep and command ids", async () => {
             const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({
@@ -1007,7 +1044,9 @@ describe("createMagicContextCommandHandler", () => {
             );
 
             expect(calls.map((call) => call.method)).toEqual(["session.wrapup", "session.recomp"]);
-            expect(calls[0]?.body.keep).toBe(100);
+            // The requested keep watermark is forwarded unchanged; the module honors
+            // it as given (no 5/100 clamp), matching the TypeScript orchestrator.
+            expect(calls[0]?.body.keep).toBe(999);
             expect(typeof calls[0]?.body.command_id).toBe("string");
             expect(typeof calls[1]?.body.command_id).toBe("string");
             expect(sendNotification).toHaveBeenCalledWith(

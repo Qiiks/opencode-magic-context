@@ -950,15 +950,17 @@ pub fn completion_wait_budget() -> Duration {
     Duration::from_secs(660)
 }
 
-/// Maximum producer rounds driven by one explicit session wrapup.
-pub const MAX_WRAPUP_ROUNDS: usize = 5;
-
 /// The per-attempt deadline a consumer sets, VERBATIM, for `session.wrapup` calls —
 /// margin included, no consumer-side arithmetic on top (the module owns the margin,
-/// mirroring `MAX_EMERGENCY_REQUEST_BUDGET`). Derivation: one busy-join at entry
-/// (bounded by [`completion_wait_budget`], 660s) plus [`MAX_WRAPUP_ROUNDS`] producer
-/// rounds at [`wrapup_round_wait_budget`] (5 x 600s) = 3660s worst case, plus margin.
-/// Bump this in the same commit as any change to those inputs and notify consumers.
+/// mirroring `MAX_EMERGENCY_REQUEST_BUDGET`). The producer loop has NO round-count
+/// cap: it drains chunks until the keep watermark is reached or this budget expires,
+/// so the budget itself — not a chunk count — is the ceiling (the TypeScript wrapup
+/// drain has the same uncapped-until-target shape). Derivation: one busy-join at
+/// entry (bounded by [`completion_wait_budget`], 660s) plus producer rounds each
+/// bounded by [`wrapup_round_wait_budget`] (600s); the loop re-checks the remaining
+/// budget before every round, so the wall time is one join plus as many rounds as
+/// fit under the budget. Sized for a large multi-chunk drain with margin. Bump this
+/// in the same commit as any change to those inputs and notify consumers.
 pub const MAX_WRAPUP_REQUEST_BUDGET: Duration = Duration::from_secs(3_800);
 
 /// Per-round wrapup wait bound. A timed-out producer keeps running under the normal
