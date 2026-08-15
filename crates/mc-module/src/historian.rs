@@ -433,6 +433,8 @@ pub struct ValidatedPublishRequest<'a> {
     pub collect_user_memory_candidates: bool,
     pub publication_floor_ordinal: u64,
     pub chunk_transcript: &'a str,
+    /// Original CK messages for exact durable full-message and verbose recovery.
+    pub raw_chunk_messages: &'a str,
     /// Creation timestamp stamped on the appended compartment rows.
     pub created_at_ms: i64,
     /// YYYY-MM-DD dates keyed by native message id; missing entries remain date-less.
@@ -538,6 +540,7 @@ pub fn publish_validated_chunk(
         user_memory_candidates: &user_memory_candidates,
         publication_floor_ordinal: request.publication_floor_ordinal,
         chunk_transcript: Some(request.chunk_transcript),
+        raw_chunk_messages: Some(request.raw_chunk_messages),
     };
     let publish_result = match request.publication_fence {
         Some(fence) => fence.publish(store, publish_request),
@@ -909,6 +912,7 @@ pub struct HistorianFireRequest<'a> {
     pub observed_chunk_fingerprint: &'a str,
     pub validation_chunk: &'a HistorianChunk,
     pub chunk_transcript: &'a str,
+    pub raw_chunk_messages: &'a str,
     /// Message boundary dates captured with the native ingress messages.
     pub boundary_dates: &'a BTreeMap<String, String>,
     pub prior_compartments: &'a [StoredCompartmentRange],
@@ -926,6 +930,7 @@ pub struct HistorianReattachRequest<'a> {
     pub observed_chunk_fingerprint: &'a str,
     pub validation_chunk: &'a HistorianChunk,
     pub chunk_transcript: &'a str,
+    pub raw_chunk_messages: &'a str,
     /// Message boundary dates captured with the native ingress messages.
     pub boundary_dates: &'a BTreeMap<String, String>,
     pub prior_compartments: &'a [StoredCompartmentRange],
@@ -1354,6 +1359,7 @@ where
             observed_chunk_fingerprint: request.observed_chunk_fingerprint,
             validation_chunk: request.validation_chunk,
             chunk_transcript: request.chunk_transcript,
+            raw_chunk_messages: request.raw_chunk_messages,
             boundary_dates: request.boundary_dates,
             prior_compartments: request.prior_compartments,
             validate_options: request.validate_options,
@@ -1504,6 +1510,7 @@ where
         observed_chunk_fingerprint: request.observed_chunk_fingerprint,
         validation_chunk: request.validation_chunk,
         chunk_transcript: request.chunk_transcript,
+        raw_chunk_messages: request.raw_chunk_messages,
         boundary_dates: request.boundary_dates,
         prior_compartments: request.prior_compartments,
         validate_options: request.validate_options,
@@ -1532,6 +1539,7 @@ struct PublishOutputRequest<'a> {
     observed_chunk_fingerprint: &'a str,
     validation_chunk: &'a HistorianChunk,
     chunk_transcript: &'a str,
+    raw_chunk_messages: &'a str,
     boundary_dates: &'a BTreeMap<String, String>,
     prior_compartments: &'a [StoredCompartmentRange],
     validate_options: ValidateOptions,
@@ -1554,6 +1562,7 @@ fn publish_output_from_awaiting(
         observed_chunk_fingerprint,
         validation_chunk,
         chunk_transcript,
+        raw_chunk_messages,
         boundary_dates,
         prior_compartments,
         validate_options,
@@ -1628,6 +1637,7 @@ fn publish_output_from_awaiting(
             collect_user_memory_candidates: validate_options.user_memory_collection_enabled,
             publication_floor_ordinal: validated.unprocessed_from,
             chunk_transcript,
+            raw_chunk_messages,
             boundary_dates,
             created_at_ms,
             failure_backoff_at_ms,
@@ -2202,6 +2212,7 @@ mod tests {
             observed_chunk_fingerprint: "fp",
             validation_chunk: chunk,
             chunk_transcript: "U: transcript",
+            raw_chunk_messages: "[]",
             boundary_dates: empty_boundary_dates(),
             prior_compartments: prior,
             validate_options: validate_options(),
@@ -2224,6 +2235,7 @@ mod tests {
             observed_chunk_fingerprint: "fp",
             validation_chunk: chunk,
             chunk_transcript: "U: transcript",
+            raw_chunk_messages: "[]",
             boundary_dates: empty_boundary_dates(),
             prior_compartments: prior,
             validate_options: validate_options(),
@@ -2971,6 +2983,7 @@ mod tests {
             observed_chunk_fingerprint: "fp",
             validation_chunk: &chunk,
             chunk_transcript: "U: left transcript",
+            raw_chunk_messages: "[]",
             boundary_dates: empty_boundary_dates(),
             prior_compartments: &prior,
             validate_options: validate_options(),
@@ -2987,6 +3000,7 @@ mod tests {
             observed_chunk_fingerprint: "fp",
             validation_chunk: &chunk,
             chunk_transcript: "U: right transcript",
+            raw_chunk_messages: "[]",
             boundary_dates: empty_boundary_dates(),
             prior_compartments: &prior,
             validate_options: validate_options(),
@@ -3462,6 +3476,7 @@ mod tests {
             observed_chunk_fingerprint: "fp-changed",
             validation_chunk: &chunk,
             chunk_transcript: "U: transcript",
+            raw_chunk_messages: "[]",
             boundary_dates: empty_boundary_dates(),
             prior_compartments: &prior,
             validate_options: validate_options(),
@@ -3811,6 +3826,7 @@ mod tests {
                 collect_user_memory_candidates: true,
                 publication_floor_ordinal: 4,
                 chunk_transcript: "U: transcript",
+                raw_chunk_messages: "[]",
                 boundary_dates: empty_boundary_dates(),
                 created_at_ms: 123,
                 failure_backoff_at_ms: 0,
@@ -3891,6 +3907,7 @@ mod tests {
                     collect_user_memory_candidates: false,
                     publication_floor_ordinal: 1,
                     chunk_transcript: "U: transcript",
+                    raw_chunk_messages: "[]",
                     boundary_dates: empty_boundary_dates(),
                     created_at_ms: 123,
                     failure_backoff_at_ms: 0,
@@ -4042,6 +4059,7 @@ mod tests {
                 collect_user_memory_candidates: false,
                 publication_floor_ordinal: 5,
                 chunk_transcript: "U: transcript",
+                raw_chunk_messages: "[]",
                 boundary_dates: empty_boundary_dates(),
                 created_at_ms: 0,
                 failure_backoff_at_ms: 999,
@@ -4128,6 +4146,7 @@ mod tests {
                 collect_user_memory_candidates: false,
                 publication_floor_ordinal: 5,
                 chunk_transcript: "U: transcript",
+                raw_chunk_messages: "[]",
                 boundary_dates: empty_boundary_dates(),
                 created_at_ms: 0,
                 failure_backoff_at_ms: 999,
@@ -4209,6 +4228,7 @@ mod tests {
                 collect_user_memory_candidates: false,
                 publication_floor_ordinal: 5,
                 chunk_transcript: "U: transcript",
+                raw_chunk_messages: "[]",
                 boundary_dates: empty_boundary_dates(),
                 created_at_ms: 0,
                 failure_backoff_at_ms: 999,
@@ -4360,6 +4380,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 5,
                 chunk_transcript: Some("U: transcript"),
+                raw_chunk_messages: None,
             })
             .unwrap();
 
@@ -4440,6 +4461,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 3,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap();
 

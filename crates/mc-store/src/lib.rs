@@ -2392,6 +2392,15 @@ const MIGRATIONS: &[Migration] = &[
         );
         ",
     },
+    Migration {
+        version: 50,
+        // Historian transcripts are the durable recovery source once an in-process transform
+        // snapshot is gone. Keep the original CK message array beside its condensed transcript
+        // so full-message and verbose ctx_expand views do not degrade to summarized text.
+        statements: "
+        ALTER TABLE mc_chunk_transcripts ADD COLUMN raw_messages_deflate BLOB NULL;
+        ",
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -2957,6 +2966,9 @@ pub struct HistorianPublishRequest<'a> {
     pub user_memory_candidates: &'a [HistorianUserMemoryCandidate],
     pub publication_floor_ordinal: u64,
     pub chunk_transcript: Option<&'a str>,
+    /// JSON-encoded original CK messages for the compacted range. Unlike the condensed
+    /// transcript, this preserves full tool output for durable ctx_expand recovery.
+    pub raw_chunk_messages: Option<&'a str>,
 }
 
 /// Typed publish failures. CAS and state mismatches are deliberately separate so a
@@ -4088,6 +4100,9 @@ pub struct StoredChunkTranscript {
     pub start_ordinal: i64,
     pub end_ordinal: i64,
     pub transcript: Option<String>,
+    /// JSON-encoded original CK messages for this compacted range. Old transcript rows do not
+    /// have this migration-era payload, so callers retain the condensed transcript fallback.
+    pub raw_messages_json: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -9802,6 +9817,7 @@ impl McStore {
         &self,
         request: LineageDescentRequest<'_>,
     ) -> Result<LineageDescentOutcome, McStoreError> {
+        let note_caller_project = Arc::clone(&self.note_caller_project);
         let outcome = self.inner.with_conn_fenced(|tx| {
             let current_target = tx
                 .query_row(
@@ -10276,6 +10292,52 @@ impl McStore {
                     params![request.target_key],
                 )?;
             }
+            // Session notes follow the descended conversation key. Do not copy smart notes:
+            // their project-wide visibility is independent of one lineage's retained history.
+            let note_projects = {
+                let mut statement = tx.prepare(
+                    "SELECT DISTINCT project_path FROM mc_notes
+                      WHERE session_id = ?1 AND type = 'session'",
+                )?;
+                let projects = statement
+                    .query_map(params![source_key], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                projects
+            };
+            for note_project in note_projects {
+                let previous_project = note_caller_project
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .replace(note_project.clone());
+                let copy_result = (|| -> rusqlite::Result<()> {
+                    tx.execute(
+                        "DELETE FROM mc_notes
+                          WHERE session_id = ?1 AND project_path = ?2 AND type = 'session'",
+                        params![request.target_key, note_project],
+                    )?;
+                    tx.execute(
+                        &format!(
+                            "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS})
+                             SELECT type, project_path, ?1, content, status, surface_condition,
+                                    ready_at, ready_reason, manifest_json, compiled_check, check_hash,
+                                    check_cron, check_failure_count, check_network_failure_count,
+                                    check_quarantined_until, check_next_due_at, check_compiled_at,
+                                    check_false_since_at, check_last_liveness_at, last_checked_at,
+                                    check_status, check_version, policy_version, harness,
+                                    anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution,
+                                    status_version, created_at_ms, updated_at_ms, NULL, NULL
+                               FROM mc_notes
+                              WHERE session_id = ?2 AND project_path = ?3 AND type = 'session'"
+                        ),
+                        params![request.target_key, source_key, note_project],
+                    )?;
+                    Ok(())
+                })();
+                *note_caller_project
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = previous_project;
+                copy_result?;
+            }
             tx.execute(
                 "INSERT INTO mc_compartments (
                      session_id, sequence, start_message, end_message, start_message_id,
@@ -10291,10 +10353,10 @@ impl McStore {
             tx.execute(
                 "INSERT INTO mc_chunk_transcripts (
                      session_id, compartment_seq, start_ordinal, end_ordinal,
-                     transcript_deflate, created_at_ms
+                     transcript_deflate, raw_messages_deflate, created_at_ms
                  )
                  SELECT ?1, compartment_seq, start_ordinal, end_ordinal,
-                        transcript_deflate, created_at_ms
+                        transcript_deflate, raw_messages_deflate, created_at_ms
                    FROM mc_chunk_transcripts WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
@@ -11555,13 +11617,14 @@ impl McStore {
                     });
                 }
             }
-            if let Some(transcript) = request.chunk_transcript {
+            if request.chunk_transcript.is_some() || request.raw_chunk_messages.is_some() {
                 insert_chunk_transcripts_tx(
                     tx,
                     session_id,
                     first_appended_sequence,
                     request.compartments,
-                    transcript,
+                    request.chunk_transcript,
+                    request.raw_chunk_messages,
                 )?;
             }
             let promoted_refs = if request.promote_facts {
@@ -12547,23 +12610,28 @@ impl McStore {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT compartment_seq, start_ordinal, end_ordinal, transcript_deflate, created_at_ms
+                "SELECT compartment_seq, start_ordinal, end_ordinal, transcript_deflate,
+                        raw_messages_deflate, created_at_ms
                    FROM mc_chunk_transcripts
-                  WHERE session_id = ?1
-                    AND end_ordinal >= ?2
-                    AND start_ordinal <= ?3
-                  ORDER BY compartment_seq ASC
-                  LIMIT ?4",
+                   WHERE session_id = ?1
+                     AND end_ordinal >= ?2
+                     AND start_ordinal <= ?3
+                   ORDER BY compartment_seq ASC
+                   LIMIT ?4",
             )?;
             let mapped = stmt
                 .query_map(params![session_id, start, end, limit], |r| {
-                    let blob: Vec<u8> = r.get(3)?;
+                    let transcript_blob: Vec<u8> = r.get(3)?;
+                    let raw_messages_blob: Option<Vec<u8>> = r.get(4)?;
                     Ok(StoredChunkTranscript {
                         compartment_seq: r.get(0)?,
                         start_ordinal: r.get(1)?,
                         end_ordinal: r.get(2)?,
-                        transcript: decompress_transcript(&blob).ok(),
-                        created_at_ms: r.get(4)?,
+                        transcript: decompress_transcript(&transcript_blob).ok(),
+                        raw_messages_json: raw_messages_blob
+                            .as_deref()
+                            .and_then(|blob| decompress_raw_messages(blob).ok()),
+                        created_at_ms: r.get(5)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -15788,26 +15856,41 @@ fn insert_chunk_transcripts_tx(
     session_id: &str,
     first_sequence: i64,
     compartments: &[StoredCompartment],
-    transcript: &str,
+    transcript: Option<&str>,
+    raw_messages: Option<&str>,
 ) -> rusqlite::Result<()> {
     if compartments.is_empty() {
         return Ok(());
     }
-    let compressed = match compress_transcript(transcript) {
-        Ok(compressed) if compressed.len() <= MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES => compressed,
-        _ => return Ok(()),
-    };
+    let compressed = transcript.and_then(|transcript| {
+        compress_transcript(transcript)
+            .ok()
+            .filter(|compressed| compressed.len() <= MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES)
+    });
+    let raw_messages_compressed = raw_messages
+        .map(compress_raw_messages)
+        .transpose()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    if compressed.is_none() && raw_messages_compressed.is_none() {
+        return Ok(());
+    }
+    // The original schema keeps transcript_deflate NOT NULL. A raw-only row still needs a
+    // harmless condensed payload so durable raw recovery is not discarded with an oversized
+    // historian transcript.
+    let compressed = compressed.unwrap_or_else(|| compress_transcript("").unwrap_or_default());
     for (idx, compartment) in compartments.iter().enumerate() {
         tx.execute(
             "INSERT OR REPLACE INTO mc_chunk_transcripts
-               (session_id, compartment_seq, start_ordinal, end_ordinal, transcript_deflate, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+               (session_id, compartment_seq, start_ordinal, end_ordinal,
+                transcript_deflate, raw_messages_deflate, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 session_id,
                 first_sequence + idx as i64,
                 compartment.start_message,
                 compartment.end_message,
                 &compressed,
+                raw_messages_compressed.as_deref(),
                 compartment.created_at,
             ],
         )?;
@@ -15819,6 +15902,7 @@ fn evict_chunk_transcripts_tx(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
 ) -> rusqlite::Result<()> {
+    let empty_transcript = compress_transcript("").unwrap_or_default();
     loop {
         let total: i64 = tx.query_row(
             "SELECT COALESCE(SUM(LENGTH(transcript_deflate)), 0)
@@ -15829,24 +15913,36 @@ fn evict_chunk_transcripts_tx(
         if total <= MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES {
             return Ok(());
         }
-        let victim: Option<i64> = tx
+        let victim: Option<(i64, bool)> = tx
             .query_row(
-                "SELECT compartment_seq
+                "SELECT compartment_seq, raw_messages_deflate IS NOT NULL
                    FROM mc_chunk_transcripts
                   WHERE session_id = ?1
+                    AND (raw_messages_deflate IS NULL OR transcript_deflate <> ?2)
                   ORDER BY created_at_ms ASC, compartment_seq ASC
                   LIMIT 1",
-                params![session_id],
-                |r| r.get(0),
+                params![session_id, &empty_transcript],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some(victim) = victim else {
+        let Some((victim, retains_raw_messages)) = victim else {
             return Ok(());
         };
-        tx.execute(
-            "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1 AND compartment_seq = ?2",
-            params![session_id, victim],
-        )?;
+        if retains_raw_messages {
+            // Full message recovery is durable by contract. Retain its raw payload and reclaim
+            // only the optional condensed transcript when the legacy transcript budget fills.
+            tx.execute(
+                "UPDATE mc_chunk_transcripts
+                    SET transcript_deflate = ?3
+                  WHERE session_id = ?1 AND compartment_seq = ?2",
+                params![session_id, victim, &empty_transcript],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1 AND compartment_seq = ?2",
+                params![session_id, victim],
+            )?;
+        }
     }
 }
 
@@ -15854,6 +15950,19 @@ fn compress_transcript(transcript: &str) -> std::io::Result<Vec<u8>> {
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(transcript.as_bytes())?;
     encoder.finish()
+}
+
+fn compress_raw_messages(raw_messages: &str) -> std::io::Result<Vec<u8>> {
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(raw_messages.as_bytes())?;
+    encoder.finish()
+}
+
+fn decompress_raw_messages(blob: &[u8]) -> std::io::Result<String> {
+    let mut decoder = DeflateDecoder::new(blob);
+    let mut raw_messages = String::new();
+    decoder.read_to_string(&mut raw_messages)?;
+    Ok(raw_messages)
 }
 
 fn decompress_transcript(blob: &[u8]) -> std::io::Result<String> {
@@ -19645,7 +19754,7 @@ mod tests {
     fn fresh_and_migrated_stores_have_latest_schema() {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh = McStore::open(&descriptor(fresh_dir.path())).unwrap();
-        let expected_versions = (1_i64..=49).collect::<Vec<_>>();
+        let expected_versions = (1_i64..=LATEST_MIGRATION_VERSION as i64).collect::<Vec<_>>();
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
@@ -19702,6 +19811,18 @@ mod tests {
             })
             .unwrap();
         assert_eq!(fresh_has_table.as_deref(), Some("mc_pass_trace"));
+        let fresh_has_durable_raw_messages = fresh
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('mc_chunk_transcripts')
+                      WHERE name = 'raw_messages_deflate'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(fresh_has_durable_raw_messages, 1);
         let fresh_has_scheduler_histories = fresh
             .inner
             .with_conn(|conn| {
@@ -21687,6 +21808,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap();
         assert_eq!(first.row_version, 2);
@@ -21706,6 +21828,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap_err();
         assert!(
@@ -21756,6 +21879,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap_err();
         assert!(matches!(
@@ -21821,6 +21945,7 @@ mod tests {
                     user_memory_candidates: std::slice::from_ref(&observation),
                     publication_floor_ordinal: 21,
                     chunk_transcript: None,
+                    raw_chunk_messages: None,
                 })
                 .unwrap();
 
@@ -21900,6 +22025,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap();
         assert_eq!(
@@ -21949,6 +22075,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: Some("U: hello\nA: world"),
+                raw_chunk_messages: None,
             })
             .unwrap();
 
@@ -21987,6 +22114,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: Some("U: orphan"),
+                raw_chunk_messages: None,
             })
             .unwrap_err();
         assert!(matches!(err, HistorianPublishError::CasConflict { .. }));
@@ -22034,6 +22162,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: Some(&transcript),
+                raw_chunk_messages: None,
             })
             .unwrap();
         assert!(store
@@ -22075,6 +22204,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 25,
                 chunk_transcript: Some("U: bounded row"),
+                raw_chunk_messages: None,
             })
             .unwrap();
 
@@ -22134,6 +22264,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 101,
                 chunk_transcript: Some(&oversized),
+                raw_chunk_messages: None,
             })
             .unwrap();
         let transcript = store
@@ -22601,6 +22732,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: Some("stale transcript"),
+                raw_chunk_messages: None,
             })
             .unwrap_err();
 
@@ -22651,6 +22783,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap_err();
         assert!(matches!(err, HistorianPublishError::StateMismatch { .. }));
@@ -22686,6 +22819,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap_err();
         assert!(
@@ -22804,6 +22938,7 @@ mod tests {
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
                 chunk_transcript: None,
+                raw_chunk_messages: None,
             })
             .unwrap_err();
         assert!(matches!(
@@ -23093,7 +23228,10 @@ mod shadow_tests {
                 Ok(versions)
             })
             .unwrap();
-        assert_eq!(versions, (1_i64..=49).collect::<Vec<_>>());
+        assert_eq!(
+            versions,
+            (1_i64..=LATEST_MIGRATION_VERSION as i64).collect::<Vec<_>>()
+        );
         assert_eq!(
             store
                 .get_note_by_id("git:identity", "session", 1)
@@ -25567,17 +25705,28 @@ mod lineage_descent_tests {
     }
 
     #[test]
-    fn descent_copies_verbatim_ranges_writes_real_boundary_and_replay_does_not_rebump() {
+    fn descent_copies_verbatim_ranges_and_session_notes_without_replay_duplicates() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         seed_lineage(&store, "A", 10);
+        let source_note = store
+            .insert_note(NoteInput {
+                project_path: "git:project",
+                route_project_root: None,
+                session_id: "A",
+                content: "remember the inherited note",
+                surface_condition: None,
+                anchor_block_id: Some("m2#0"),
+                now_ms: 1,
+            })
+            .unwrap();
         store
             .inner
             .with_conn(|conn| {
                 conn.execute(
                     "INSERT INTO mc_tags
                          (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
-                     VALUES ('A', 1, 'm2#0', 'message', 7, 1, X'61')",
+                      VALUES ('A', 1, 'm2#0', 'message', 7, 1, X'61')",
                     [],
                 )?;
                 conn.execute(
@@ -25653,6 +25802,14 @@ mod lineage_descent_tests {
             })
             .unwrap();
         assert_eq!(copied_markers, (1, 1));
+        let inherited_notes = store.read_notes("git:project", "B", 10, 0).unwrap();
+        assert_eq!(inherited_notes.len(), 1);
+        assert_ne!(inherited_notes[0].id, source_note.id);
+        assert_eq!(inherited_notes[0].content, source_note.content);
+        assert_eq!(
+            inherited_notes[0].anchor_block_id.as_deref(),
+            source_note.anchor_block_id.as_deref()
+        );
         let transcript = store.load_chunk_transcripts_for_range("B", 1, 3).unwrap();
         assert_eq!(transcript.len(), 1);
         assert_eq!(
@@ -25683,6 +25840,11 @@ mod lineage_descent_tests {
             store.load("A").unwrap().meta.revert_epoch,
             before_epoch + 1,
             "write-free replay must not re-bump the prior publish fence"
+        );
+        assert_eq!(
+            store.read_notes("git:project", "B", 10, 0).unwrap().len(),
+            1,
+            "a replay must not duplicate inherited session notes"
         );
     }
 
