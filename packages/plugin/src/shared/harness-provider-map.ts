@@ -77,6 +77,25 @@ export function resolveModelRefForPi(ref: string): string {
     return remapProviderPrefix(piModelRefToCanonical(ref), CANONICAL_TO_PI_PROVIDER);
 }
 
+/**
+ * Return every known spelling of a model reference with the canonical shared
+ * form first. The raw input remains the first fallback, so a single config file
+ * works on every harness: canonical wins when both spellings are present, while
+ * Pi/OMP-native provider ids are still accepted at the read edge. Unknown
+ * providers pass through unchanged and therefore produce one candidate.
+ */
+export function modelRefLookupOrder(ref: string): string[] {
+    const canonical = piModelRefToCanonical(ompModelRefToCanonical(ref));
+    return [
+        ...new Set([
+            canonical,
+            ref,
+            resolveModelRefForPi(canonical),
+            resolveModelRefForOmp(canonical),
+        ]),
+    ];
+}
+
 /** OMP-native selector -> canonical shared-config model reference. */
 export function ompModelRefToCanonical(ref: string): string {
     return remapProviderPrefix(ref, OMP_TO_CANONICAL_PROVIDER);

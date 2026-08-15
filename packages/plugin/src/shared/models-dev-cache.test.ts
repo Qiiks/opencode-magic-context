@@ -78,6 +78,23 @@ describe("output-token reservation", () => {
         ).toBe(1_048_576);
     });
 
+    test("output_reserve accepts both harness provider spellings with canonical precedence", () => {
+        const limit = { context: 100_000, output: 20_000 };
+        expect(
+            resolveLimit(limit, "openai-codex", "gpt-5.6-sol", {
+                default: 0,
+                "openai-codex/gpt-5.6-sol": 8_000,
+            }),
+        ).toBe(92_000);
+        expect(
+            resolveLimit(limit, "openai-codex", "gpt-5.6-sol", {
+                default: 0,
+                "openai-codex/gpt-5.6-sol": 8_000,
+                "openai/gpt-5.6-sol": 4_000,
+            }),
+        ).toBe(96_000);
+    });
+
     test("output_reserve overrides shared and separate quota defaults", () => {
         expect(resolveLimit({ context: 100_000, output: 20_000 }, "anthropic", "claude", 0)).toBe(
             100_000,

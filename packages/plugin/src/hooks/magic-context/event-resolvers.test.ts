@@ -191,6 +191,15 @@ describe("event-resolvers", () => {
             expect(ttl).toBe("5m");
         });
 
+        it("accepts Pi-native keys when the runtime model key is canonical", () => {
+            expect(
+                resolveCacheTtl(
+                    { default: "5m", "openai-codex/gpt-5.6-sol": "60m" },
+                    "openai/gpt-5.6-sol",
+                ),
+            ).toBe("60m");
+        });
+
         it("resolves provider/model and bare-model overrides", () => {
             //#given
             const cacheTtl = {
@@ -220,6 +229,27 @@ describe("event-resolvers", () => {
             expect(
                 resolveExecuteThreshold({ default: 95, "openai/gpt-4o": 90 }, "openai/gpt-4o", 65),
             ).toBe(90);
+        });
+
+        it("accepts Pi-native threshold keys and keeps canonical precedence", () => {
+            expect(
+                resolveExecuteThreshold(
+                    { default: 65, "openai-codex/gpt-5.6-sol": 40 },
+                    "openai/gpt-5.6-sol",
+                    65,
+                ),
+            ).toBe(40);
+            expect(
+                resolveExecuteThreshold(
+                    {
+                        default: 65,
+                        "openai-codex/gpt-5.6-sol": 40,
+                        "openai/gpt-5.6-sol": 30,
+                    },
+                    "openai-codex/gpt-5.6-sol",
+                    65,
+                ),
+            ).toBe(30);
         });
 
         it("prefers exact provider/model key when present", () => {
