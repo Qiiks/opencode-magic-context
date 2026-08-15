@@ -325,4 +325,81 @@ describe("m[0]/m[1] materialization taxonomy", () => {
         const noFold = pass({ projectDirectory, isCacheBustingPass: true, hard: BASE_HARD });
         expect(noFold.rematerialized).toBe(false);
     });
+    it("does not hard-fold when the current model switches from canonical to Pi alias spelling", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        const canonical = { ...BASE_HARD, modelKey: "openai/gpt-5.6-sol" };
+        pass({ projectDirectory, isCacheBustingPass: true, hard: canonical });
+
+        const aliasOnly = pass({
+            projectDirectory,
+            isCacheBustingPass: true,
+            hard: { ...BASE_HARD, modelKey: "openai-codex/gpt-5.6-sol" },
+        });
+
+        expect(aliasOnly.rematerialized).toBe(false);
+        expect(aliasOnly.reason).toBeNull();
+    });
+
+    it("persists a Pi-native baseline canonically, then accepts the reverse spelling flip", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        pass({
+            projectDirectory,
+            isCacheBustingPass: true,
+            hard: { ...BASE_HARD, modelKey: "openai-codex/gpt-5.6-sol" },
+        });
+
+        expect(getOrCreateSessionMeta(db, SESSION_ID).cachedM0ModelKey).toBe("openai/gpt-5.6-sol");
+        const aliasOnly = pass({
+            projectDirectory,
+            isCacheBustingPass: true,
+            hard: { ...BASE_HARD, modelKey: "openai/gpt-5.6-sol" },
+        });
+
+        expect(aliasOnly.rematerialized).toBe(false);
+        expect(aliasOnly.reason).toBeNull();
+    });
+
+    it("does not hard-fold when an existing cached baseline stores a native alias", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        pass({
+            projectDirectory,
+            isCacheBustingPass: true,
+            hard: { ...BASE_HARD, modelKey: "openai/gpt-5.6-sol" },
+        });
+        db.prepare("UPDATE session_meta SET cached_m0_model_key = ? WHERE session_id = ?").run(
+            "openai-codex/gpt-5.6-sol",
+            SESSION_ID,
+        );
+
+        const upgraded = pass({
+            projectDirectory,
+            isCacheBustingPass: true,
+            hard: { ...BASE_HARD, modelKey: "openai/gpt-5.6-sol" },
+        });
+
+        expect(upgraded.rematerialized).toBe(false);
+        expect(upgraded.reason).toBeNull();
+    });
+
+    it("still hard-folds for different models in the same alias family", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        pass({
+            projectDirectory,
+            isCacheBustingPass: true,
+            hard: { ...BASE_HARD, modelKey: "openai-codex/gpt-5.6-sol" },
+        });
+
+        const realSwitch = pass({
+            projectDirectory,
+            isCacheBustingPass: true,
+            hard: { ...BASE_HARD, modelKey: "openai/gpt-5.6-codex" },
+        });
+
+        expect(realSwitch.rematerialized).toBe(true);
+        expect(realSwitch.reason).toBe("model_change");
+    });
 });

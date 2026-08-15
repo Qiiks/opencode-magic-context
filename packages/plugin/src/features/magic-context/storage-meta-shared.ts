@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { getHarness } from "../../shared/harness";
+import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import type { Database } from "../../shared/sqlite";
 import type { SessionMeta } from "./types";
 
@@ -546,7 +547,7 @@ export function persistCachedM0(
         payload.sessionFactsVersion,
         payload.upgradeState,
         payload.systemHash ?? "",
-        payload.modelKey ?? "",
+        payload.modelKey ? piModelRefToCanonical(payload.modelKey) : "",
         payload.projectIdentity ?? null,
         sessionId,
     );

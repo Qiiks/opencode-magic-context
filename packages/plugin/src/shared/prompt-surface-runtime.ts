@@ -13,6 +13,7 @@ import {
     CTX_REDUCE_LIGHT_DESCRIPTION,
     CTX_SEARCH_LIGHT_DESCRIPTION,
 } from "../tools/light-descriptions";
+import { piModelRefToCanonical } from "./harness-provider-map";
 import { detectConfigFile } from "./jsonc-parser";
 import {
     type PromptSurfaceConfig,
@@ -242,13 +243,14 @@ export function createPromptSurfaceGuidanceEpochCache(runtime: PromptSurfaceRunt
 
     return {
         resolve(sessionId, config, modelKey) {
+            const canonicalModelKey = modelKey ? piModelRefToCanonical(modelKey) : undefined;
             const cached = epochs.get(sessionId);
-            if (cached && cached.config === config && cached.modelKey === modelKey) {
+            if (cached && cached.config === config && cached.modelKey === canonicalModelKey) {
                 return cached.selection;
             }
 
-            const selection = runtime.resolveGuidance(config, modelKey);
-            epochs.set(sessionId, { config, modelKey, selection });
+            const selection = runtime.resolveGuidance(config, canonicalModelKey);
+            epochs.set(sessionId, { config, modelKey: canonicalModelKey, selection });
             return selection;
         },
         clear(sessionId) {

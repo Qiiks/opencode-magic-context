@@ -32,6 +32,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { writeRustTransformDecision } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
+import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { sessionLog } from "../../shared/logger";
 import { promptSurfaceConfigIdentity, resolvePromptSurface } from "../../shared/prompt-surface";
 import type { WindowGeometryResult } from "../../shared/window-geometry";
@@ -1566,7 +1567,9 @@ export function createRustModeTransform(
                 preflightError = error;
             }
         }
-        const modelKey = model ? resolveModelKey(model.providerID, model.modelID) : null;
+        const modelKey = model
+            ? piModelRefToCanonical(resolveModelKey(model.providerID, model.modelID) ?? "")
+            : null;
         let resolvedContextLimit: number | undefined;
         let resolvedWindowGeometry: WindowGeometryResult | undefined;
         if (model) {
@@ -1600,7 +1603,8 @@ export function createRustModeTransform(
         if (overflowState) {
             const detectedLimitMatchesModel =
                 overflowState.detectedContextLimitModelKey === null ||
-                overflowState.detectedContextLimitModelKey === modelKey;
+                piModelRefToCanonical(overflowState.detectedContextLimitModelKey) ===
+                    piModelRefToCanonical(modelKey ?? "");
             const hasProviderProof =
                 (overflowState.detectedContextLimit > 0 && detectedLimitMatchesModel) ||
                 // An unknown persisted arm alone is not proof. A second provider rejection

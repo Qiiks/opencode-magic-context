@@ -44,6 +44,7 @@ import {
     type WorkspaceIdentitySet,
 } from "../../features/magic-context/workspaces";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
+import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { sessionLog } from "../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { reconcileForkOrphanedCompactionMarkers } from "./compaction-marker-manager";
@@ -1368,7 +1369,7 @@ function readCurrentM0SnapshotMarkersUncached(args: M0SnapshotMarkerReadArgs): {
             upgradeState: getUpgradeState(args.db, args.sessionId),
             compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
             systemHash: hard.systemHash,
-            modelKey: hard.modelKey,
+            modelKey: piModelRefToCanonical(hard.modelKey),
             projectIdentity: args.projectPath ?? null,
             muralEnabled: args.muralEnabled === true,
             renderBudgetIdentity: renderBudgetIdentity(
@@ -1546,7 +1547,9 @@ export function mustMaterialize(args: {
     // baseline marker means a real change; an empty current signal means
     // "unknown this pass" and is never treated as a change (avoids spurious
     // folds before the signal is known).
-    if (hard.modelKey !== "" && hard.modelKey !== (args.state.cachedM0ModelKey ?? "")) {
+    const canonicalHardModelKey = piModelRefToCanonical(hard.modelKey);
+    const canonicalCachedModelKey = piModelRefToCanonical(args.state.cachedM0ModelKey ?? "");
+    if (canonicalHardModelKey !== "" && canonicalHardModelKey !== canonicalCachedModelKey) {
         return { value: true, reason: "model_change" };
     }
     if (hard.systemHash !== "" && hard.systemHash !== (args.state.cachedM0SystemHash ?? "")) {
@@ -2770,7 +2773,8 @@ function cachedRowMatchesState(row: CachedM0M1Row, state: M0M1State): boolean {
         row.cached_m0_session_facts_version === state.cachedM0SessionFactsVersion &&
         (row.cached_m0_upgrade_state ?? null) === (state.cachedM0UpgradeState ?? null) &&
         (row.cached_m0_system_hash ?? "") === (state.cachedM0SystemHash ?? "") &&
-        (row.cached_m0_model_key ?? "") === (state.cachedM0ModelKey ?? "") &&
+        piModelRefToCanonical(row.cached_m0_model_key ?? "") ===
+            piModelRefToCanonical(state.cachedM0ModelKey ?? "") &&
         (row.cached_m0_project_identity ?? null) === (state.cachedM0ProjectIdentity ?? null)
     );
 }

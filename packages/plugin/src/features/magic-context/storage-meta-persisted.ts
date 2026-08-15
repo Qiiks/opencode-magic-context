@@ -3,6 +3,7 @@ import {
     normalizeContextLimitProvenance,
 } from "../../shared/context-limit-provenance";
 import { escalationBands } from "../../shared/escalation-bands";
+import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { stableStringify } from "../../shared/stable-json";
@@ -1750,7 +1751,9 @@ export interface PersistedOverflowState {
 }
 
 function normalizeDetectedLimitModelKey(modelKey: string | null | undefined): string | null {
-    return typeof modelKey === "string" && modelKey.length > 0 ? modelKey : null;
+    return typeof modelKey === "string" && modelKey.length > 0
+        ? piModelRefToCanonical(modelKey)
+        : null;
 }
 
 function normalizeEmergencyRecoveryOrigin(value: unknown): EmergencyRecoveryOrigin | null {

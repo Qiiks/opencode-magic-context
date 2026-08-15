@@ -84,6 +84,7 @@ import {
 } from "@magic-context/core/hooks/magic-context/inject-compartments";
 
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
+import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import { sessionLog as logSession } from "@magic-context/core/shared/logger";
 import { resolvePiStableId, SYNTH_USER_ID_PREFIX } from "./read-session-pi";
 
@@ -928,7 +929,9 @@ function readCurrentMarkersFromCompartments(
 		compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
 		lastBaselineEndMessageId: lastBaselineEndMessageId(compartments),
 		systemHash: (state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).systemHash,
-		modelKey: (state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).modelKey,
+		modelKey: piModelRefToCanonical(
+			(state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).modelKey,
+		),
 		projectIdentity: state.projectIdentity,
 		muralEnabled: state.muralEnabled === true,
 		renderBudgetIdentity: renderBudgetIdentityPi(state),
@@ -987,7 +990,14 @@ export function mustMaterializePi(
 	// toolSetHash (no tool.definition hook), so that branch is effectively inert
 	// on Pi — kept for structural parity. See PARITY.md.
 	const hard = state.hardSignals ?? EMPTY_PI_HARD_SIGNALS;
-	if (hard.modelKey !== "" && hard.modelKey !== (meta.cachedM0ModelKey ?? "")) {
+	const canonicalHardModelKey = piModelRefToCanonical(hard.modelKey);
+	const canonicalCachedModelKey = piModelRefToCanonical(
+		meta.cachedM0ModelKey ?? "",
+	);
+	if (
+		canonicalHardModelKey !== "" &&
+		canonicalHardModelKey !== canonicalCachedModelKey
+	) {
 		return { value: true, reason: "model_change" };
 	}
 	if (
@@ -1337,7 +1347,9 @@ function readFrozenM0InputsPi(
 			compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
 			lastBaselineEndMessageId: lastBaselineEndMessageId(compartments),
 			systemHash: (state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).systemHash,
-			modelKey: (state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).modelKey,
+			modelKey: piModelRefToCanonical(
+				(state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).modelKey,
+			),
 			projectIdentity: state.projectIdentity,
 			muralEnabled: state.muralEnabled === true,
 			renderBudgetIdentity: renderBudgetIdentityPi(state),
@@ -2039,7 +2051,8 @@ function cachedPiRowMatchesSnapshot(args: {
 		// that re-materialized under a new system/tool/model identity must invalidate
 		// this process's cached row so the soft-refresh CAS adopts the sibling's m[0].
 		(rowMarkers.systemHash ?? "") === (args.markers.systemHash ?? "") &&
-		(rowMarkers.modelKey ?? "") === (args.markers.modelKey ?? "") &&
+		piModelRefToCanonical(rowMarkers.modelKey ?? "") ===
+			piModelRefToCanonical(args.markers.modelKey ?? "") &&
 		(rowMarkers.projectIdentity ?? null) ===
 			(args.markers.projectIdentity ?? null) &&
 		// Workspace fingerprint (parity with OpenCode cachedRowMatchesState):
