@@ -155,7 +155,7 @@ describe("maybeDeliverChannel2Pi", () => {
 		});
 	}
 
-	it("regression: keeps the model-visible ceiling nudge on sendMessage(display:false, followUp)", () => {
+	it("regression: queues the model-visible ceiling nudge for the next real turn", () => {
 		const db = createTestDb();
 		setChannel2NudgeState(db, SESSION, "pending");
 		armStrongBaseline(SESSION);
@@ -176,8 +176,8 @@ describe("maybeDeliverChannel2Pi", () => {
 			SESSION,
 		);
 		expect(delivered).toBe(true);
-		expect(capturedDeliverAs).toBe("followUp");
-		// Hidden from the Pi TUI (agent steer, not a user turn) but still model-visible.
+		expect(capturedDeliverAs).toBe("nextTurn");
+		// Hidden from the Pi TUI as synthetic context but still model-visible.
 		expect(capturedDisplay).toBe(false);
 		expect(capturedCustomType).toBe("magic-context:ceiling-nudge");
 		expect(capturedContent).toContain("<system-reminder>");

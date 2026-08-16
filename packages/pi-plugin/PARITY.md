@@ -813,12 +813,13 @@ turn. The drain loop, durable `wrapup_in_progress` marker, sequential historian
 runs, and deferred compaction semantics are shared in intent; only the progress
 surface differs.
 
-The supported and installed Pi floor is `@earendil-works/pi-coding-agent` 0.80.2.
-That version exposes `appendEntry` but not `registerEntryRenderer`, so status entries
-are persisted and session-logged but invisible in its TUI. Statuses never fall back
-to `sendMessage`, because that would leak progress text into model context. Newer
-runtimes render the same entries through the optional renderer. The intentionally
-model-visible Channel-2 ceiling nudge remains on `sendMessage`.
+The supported Pi floor is `@earendil-works/pi-coding-agent` 0.80.2, while the
+workspace test dependency is pinned to 0.83.0. The floor exposes `appendEntry` but
+not `registerEntryRenderer`, so status entries are persisted and session-logged but
+invisible in its TUI. Statuses never fall back to `sendMessage`, because that would
+leak progress text into model context. Newer runtimes render the same entries
+through the optional renderer. The intentionally model-visible Channel-2 ceiling
+nudge remains on `sendMessage` and uses the `nextTurn` queue supported at the floor.
 
 ---
 

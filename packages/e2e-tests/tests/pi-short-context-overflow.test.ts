@@ -26,6 +26,7 @@ import { buildMockHistorianPayload } from "../src/mock-historian";
  * What this test verifies:
  *   - Pi survives 30 back-to-back 20KB-reply turns with a slow historian
  *   - No turns error out (proves the pipeline stays responsive)
+ *   - Emergency handling keeps every provider request below the model window
  *
  * Pi tool-drop materialization is covered by `pi-drops.test.ts` (queue +
  * apply path), Pi historian compartment publication is covered by
@@ -154,11 +155,11 @@ describe("pi short context accumulating overflow", () => {
 
         expect(sessionId).toBeTruthy();
         expect(turnErrors).toEqual([]);
+        expect(peakObservedPct).toBeLessThan(100);
 
-        // Diagnostic visibility only — see header comment for why we don't
-        // assert specific drop/compartment counts in a pure-text Pi RPC
-        // session. The real survival contract is "no turn errors over 30
-        // back-to-back high-pressure turns", asserted above.
+        // Diagnostic visibility only: pure-text Pi RPC turns do not create
+        // deterministic drop or compartment counts. The test asserts the
+        // observable contracts instead: responsiveness and the model-window ceiling.
         const compartmentCount = h
             .contextDb()
             .prepare("SELECT COUNT(*) AS c FROM compartments WHERE session_id = ?")

@@ -1875,8 +1875,10 @@ async function startPiMagicContextRuntime(
 		// Channel 2 (ceiling) nudge delivery — the Pi analog of OpenCode's
 		// event-handler delivery on terminal message.updated. The pipeline
 		// records a `pending` intent near the threshold; deliver it here at the
-		// turn boundary via sendMessage(followUp). Internally CAS-gated to one
-		// delivery per tail-reset cycle, and no-ops unless `pending`.
+		// turn boundary via sendMessage(nextTurn). The synthetic message rides
+		// with the next real user turn instead of starting a competing turn.
+		// Internally CAS-gated to one delivery per tail-reset cycle and no-ops
+		// unless `pending`.
 		// Fire-and-forget; never block agent_end.
 		//
 		// Deliver ONLY on a clean final stop. Pi emits agent_end for error /
@@ -2011,10 +2013,10 @@ async function startPiMagicContextRuntime(
 		try {
 			const sessionId = ctx.sessionManager.getSessionId();
 			if (typeof sessionId !== "string" || sessionId.length === 0) return;
-			// Channel 2 mid-turn delivery: a pending ceiling intent steers a
-			// queued user message into the NEXT STEP of the in-flight turn so
-			// the agent is warned while the pile is still growing (agent_end
-			// stays as the idle fallback). No-ops unless pending + revalidated.
+			// Channel 2 mid-turn delivery: queue a pending ceiling intent for the
+			// next real user turn. It must not steer the active turn or spawn a
+			// follow-up that races an external prompt. No-ops unless pending and
+			// revalidated; agent_end stays as the fallback delivery site.
 			if (compactionOff) return;
 			const block = maybeChannel1ReminderForToolResult({
 				db,
@@ -2022,7 +2024,7 @@ async function startPiMagicContextRuntime(
 				toolName: event.toolName,
 				content: event.content,
 			});
-			if (db) maybeDeliverChannel2Pi(pi, db, sessionId, "steer");
+			if (db) maybeDeliverChannel2Pi(pi, db, sessionId);
 			if (!block) return;
 			return { content: [...event.content, block] };
 		} catch (err) {
