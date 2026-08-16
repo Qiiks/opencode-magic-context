@@ -308,6 +308,9 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 /** Broad verification closes its cycle before telemetry is recorded,
                  *  so pass the cycle-local backlog explicitly when needed. */
                 backlogAfter?: { pending: number; total: number };
+                /** Successful progress/detail; empty strings are omitted so absent
+                 *  and empty have the same persisted meaning. */
+                progress?: string | null;
             },
         ): void => {
             try {
@@ -321,7 +324,8 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                             name: config.task,
                             durationMs: Date.now() - startedAt,
                             resultChars: 0,
-                            ...(error ? { error } : {}),
+                            ...(status === "failed" && error ? { error } : {}),
+                            ...(extra?.progress ? { progress: extra.progress } : {}),
                             backlog: (() => {
                                 const end =
                                     extra?.backlogAfter ??
@@ -500,11 +504,12 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     // not drain the complete cycle. Only a zero-progress broad run
                     // is a failure that should raise the dashboard's red status.
                     if (broadProgress && processed > 0) {
-                        recordRun("completed", broadProgress, {
+                        recordRun("completed", null, {
+                            progress: broadProgress,
                             memoryChanges: computeMemoryDelta(memoryBefore),
                             backlogAfter,
                         });
-                        return { status: "completed", error: broadProgress };
+                        return { status: "completed" };
                     }
                     const error = incompleteMessage(result.remaining);
                     recordRun("failed", error, {
@@ -513,13 +518,12 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     });
                     return { status: "failed", transient: true, error };
                 }
-                recordRun("completed", broadProgress, {
+                recordRun("completed", null, {
+                    progress: broadProgress,
                     memoryChanges: computeMemoryDelta(memoryBefore),
                     backlogAfter,
                 });
-                return broadProgress
-                    ? { status: "completed", error: broadProgress }
-                    : { status: "completed" };
+                return { status: "completed" };
             }
 
             if (config.task === "classify-memories") {
