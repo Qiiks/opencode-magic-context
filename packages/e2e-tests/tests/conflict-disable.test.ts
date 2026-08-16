@@ -18,6 +18,7 @@ let h: TestHarness;
 
 beforeAll(async () => {
     h = await TestHarness.create({
+        expectMagicContext: false,
         // Override the usual safe compaction config. Setting auto: true should
         // trip conflict-detection inside the plugin.
         openCodeConfigExtra: {

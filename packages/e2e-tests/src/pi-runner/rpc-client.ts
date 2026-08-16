@@ -211,6 +211,7 @@ export class PiRpcClient {
   readonly protocol = new PiRpcProtocol();
 
   private readonly options: PiRpcClientOptions;
+  private readonly extensionErrors: PiRpcEvent[] = [];
   private process: ChildProcess | null = null;
   private stopReadingStdout: (() => void) | null = null;
   private stderr = "";
@@ -218,6 +219,13 @@ export class PiRpcClient {
   constructor(options: PiRpcClientOptions) {
     this.env = options.env ?? createPiIsolatedEnv();
     this.options = { ...options, env: this.env };
+    this.protocol.onEvent((event) => {
+      if (event.type === "extension_error") this.extensionErrors.push(event);
+    });
+  }
+
+  getExtensionErrors(): readonly PiRpcEvent[] {
+    return this.extensionErrors;
   }
 
   async start(): Promise<void> {

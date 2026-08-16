@@ -28,6 +28,8 @@ export interface TestHarnessOptions {
     openCodeConfigExtra?: Record<string, unknown>;
     /** Override the mock model's context token limit. Default 200000. */
     modelContextLimit?: number;
+    /** Set false only when the test intentionally verifies that Magic Context stays disabled. */
+    expectMagicContext?: boolean;
     /**
      * Default response used when the mock queue is empty. Lets tests send extra
      * prompts without worrying about scripting every one.
@@ -90,6 +92,7 @@ export class TestHarness {
             magicContextConfig: options.magicContextConfig,
             openCodeConfigExtra: options.openCodeConfigExtra,
             modelContextLimit: options.modelContextLimit,
+            prepareContextDatabase: options.expectMagicContext !== false,
         };
         const opencode = await spawnOpencode(spawnOpts);
 
