@@ -2,7 +2,7 @@ import { estimateTokens } from "./read-session-formatting";
 import { byteSize } from "./tag-content-primitives";
 import {
     stripChannel1ReminderSpans,
-    type TailHygieneDeltas,
+    type TailHygieneBaseline,
     type TailHygienePartMeasurement,
 } from "./tail-hygiene-walk";
 
@@ -135,19 +135,53 @@ export function decideChannel1(input: {
     };
 }
 
-export const CHANNEL2_USABLE_FRACTION = 1 / 3;
-export const CHANNEL2_MIN_RECLAIMABLE = 10_000;
+export const CHANNEL2_SEVERITY_THRESHOLD = 0.6;
+export const CHANNEL2_FLOOR_TOKENS = 50_000;
 
-export function shouldTriggerChannel2(input: {
-    baselineU: number;
-    baselineT: number;
-    deltas: TailHygieneDeltas;
-}): boolean {
-    const reclaimableTokens = Math.max(0, input.baselineU + input.deltas.u);
-    const tailTokens = Math.max(0, input.baselineT + input.deltas.t);
-    if (reclaimableTokens < CHANNEL2_MIN_RECLAIMABLE) return false;
-    if (tailTokens <= 0) return true;
-    return reclaimableTokens >= tailTokens * CHANNEL2_USABLE_FRACTION;
+export type Channel2PredicateBaseline = Pick<
+    TailHygieneBaseline,
+    "baselineU" | "baselineT" | "turnDeltaU" | "turnDeltaT" | "evaluable" | "generationInvalidated"
+>;
+
+export interface Channel2PredicateEvaluation {
+    evaluable: boolean;
+    shouldTrigger: boolean;
+    reclaimableTokens: number;
+    tailTokens: number;
+    severity: number;
+}
+
+export function evaluateChannel2(
+    input: Channel2PredicateBaseline | undefined,
+): Channel2PredicateEvaluation {
+    const values = input
+        ? [input.baselineU, input.baselineT, input.turnDeltaU, input.turnDeltaT]
+        : [];
+    if (
+        input?.evaluable !== true ||
+        input.generationInvalidated === true ||
+        values.some((value) => !Number.isFinite(value))
+    ) {
+        return {
+            evaluable: false,
+            shouldTrigger: false,
+            reclaimableTokens: 0,
+            tailTokens: 0,
+            severity: 0,
+        };
+    }
+
+    const tailTokens = Math.max(0, input.baselineT + input.turnDeltaT);
+    const reclaimableTokens = Math.min(tailTokens, Math.max(0, input.baselineU + input.turnDeltaU));
+    const severity = Math.min(1, Math.max(0, reclaimableTokens / Math.max(tailTokens, 1)));
+    return {
+        evaluable: true,
+        shouldTrigger:
+            reclaimableTokens >= CHANNEL2_FLOOR_TOKENS && severity >= CHANNEL2_SEVERITY_THRESHOLD,
+        reclaimableTokens,
+        tailTokens,
+        severity,
+    };
 }
 
 function approxThousands(tokens: number): string {

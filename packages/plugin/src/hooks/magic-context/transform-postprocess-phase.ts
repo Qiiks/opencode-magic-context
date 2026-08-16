@@ -47,6 +47,10 @@ import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import { runAutoSearchHint } from "./auto-search-runner";
+import {
+    rearmChannel2AfterCoverageAdvancingHardFold,
+    rearmChannel2AfterMeasuredCollapse,
+} from "./channel2-cycle";
 import { applyDeferredCompactionMarker, MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { getActiveCompartmentRun } from "./compartment-runner";
 import type {
@@ -889,6 +893,8 @@ export async function runPostTransformPhase(
             : { value: false, reason: null };
     let foldExecutedThisPass = false;
     let m0RematerializedThisPass = false;
+    const m0CoverageBeforeFold =
+        args.sessionMeta.cachedM0Bytes === null ? -1 : args.sessionMeta.cachedM0MaxCompartmentSeq;
     let m0MaterializeReason: string | null = null;
     if (foldDueDecision.value && args.m0M1) {
         try {
@@ -916,6 +922,18 @@ export async function runPostTransformPhase(
             );
             m0RematerializedThisPass = foldResult.m0RematerializedThisPass;
             m0MaterializeReason = foldResult.decision.reason;
+            try {
+                rearmChannel2AfterCoverageAdvancingHardFold({
+                    db: args.db,
+                    sessionId: args.sessionId,
+                    foldExecuted: foldExecutedThisPass,
+                    compactionOff,
+                    previousCoverage: m0CoverageBeforeFold,
+                    currentCoverage: args.sessionMeta.cachedM0MaxCompartmentSeq,
+                });
+            } catch (error) {
+                sessionLog(args.sessionId, "channel2 fold-cycle reset failed (ignored):", error);
+            }
         } catch (error) {
             args.passOutcome?.record("m0-m1-fold-preexecution-degradation");
             sessionLog(
@@ -2187,6 +2205,19 @@ export async function runPostTransformPhase(
                         args.protectedTags,
                     ),
                 });
+                try {
+                    rearmChannel2AfterMeasuredCollapse({
+                        db: args.db,
+                        sessionId: args.sessionId,
+                        baseline,
+                    });
+                } catch (error) {
+                    sessionLog(
+                        args.sessionId,
+                        "channel2 U-collapse reset failed (ignored):",
+                        error,
+                    );
+                }
                 assertedBaseline = {
                     tags,
                     protectedTags: args.protectedTags,

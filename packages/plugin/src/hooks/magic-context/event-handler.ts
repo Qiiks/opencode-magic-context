@@ -158,9 +158,7 @@ async function deliverChannel2IfPending(deps: EventHandlerDeps, sessionId: strin
             db: deps.db,
             client: deps.client,
             directiveText: deps.channel2DirectiveTextBySession?.get(sessionId),
-            baselineU: baseline?.baselineU,
-            baselineT: baseline?.baselineT,
-            deltas: baseline ? { u: baseline.turnDeltaU, t: baseline.turnDeltaT } : undefined,
+            baseline,
             oldestReclaimableToolTags: baseline?.oldestReclaimableToolTags,
         });
         if (delivered || getChannel2NudgeState(deps.db, sessionId) !== "pending") {

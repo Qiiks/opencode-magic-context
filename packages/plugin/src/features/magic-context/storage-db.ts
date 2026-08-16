@@ -31,10 +31,7 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
 import { ensureContextStoreUuid } from "./context-authority";
-import type {
-    FailClosedBlockingProcess,
-    FailClosedProcessKind,
-} from "./fail-closed-block";
+import type { FailClosedBlockingProcess, FailClosedProcessKind } from "./fail-closed-block";
 import { FORK_MIGRATION_VERSION_FLOOR, runMigrations, runMigrationsWithRetry } from "./migrations";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import {
@@ -2031,23 +2028,23 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // cannot go here because the table doesn't exist yet on a fresh DB.
 }
 
-const CHANNEL2_CLAIM_TTL_MS = 120_000;
+const CHANNEL2_CLAIM_TTL_MS = 10 * 60_000;
 
 /**
  * Boot heal for a wedged Channel-2 ceiling-nudge lease.
  *
  * The delivery path CAS-claims `pending → claimed` before sending the synthetic
- * user message. A crash can strand that claim and burn the one-shot cap, but a
+ * user message. A crash can strand that claim and consume the cycle, but a
  * sibling process can also be legitimately mid-send against the shared DB. The
  * claimed_at lease timestamp is the liveness boundary: only old/legacy claims are
- * rewound to `pending`; fresh claims are left alone so boot recovery never steals
- * an in-flight delivery.
+ * reaped to the empty, re-armable state; fresh claims are left alone so boot
+ * recovery never steals an in-flight delivery.
  */
 function healWedgedChannel2Claims(db: Database): void {
     try {
         const staleBefore = Date.now() - CHANNEL2_CLAIM_TTL_MS;
         db.prepare(
-            "UPDATE session_meta SET channel2_nudge_state = 'pending', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)",
+            "UPDATE session_meta SET channel2_nudge_state = '', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)",
         ).run(staleBefore);
     } catch {
         // Columns may be missing on a very fresh DB before ensureColumn/migration

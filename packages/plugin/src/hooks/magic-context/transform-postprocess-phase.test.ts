@@ -10,6 +10,7 @@ import {
     addStaleReduceStrippedIds,
     advanceToolReclaimWatermark,
     getActiveTagsBySession,
+    getChannel2NudgeState,
     getOrCreateSessionMeta,
     getPendingCompactionMarkerState,
     getProcessedImageStrippedIds,
@@ -17,6 +18,7 @@ import {
     insertTag,
     queueM0Mutation,
     queuePendingOp,
+    setChannel2NudgeState,
     setPendingCompactionMarkerState,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
@@ -36,6 +38,7 @@ import { Database } from "../../shared/sqlite";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { registerActiveCompartmentRun } from "./compartment-runner";
 import { clearToolPermissionDenied } from "./ctx-reduce-availability";
+import type { Channel1State } from "./ctx-reduce-nudge";
 import { estimateMessageTokens } from "./final-wire-token-estimate";
 import { injectM0M1, type M0HardSignals } from "./inject-compartments";
 import {
@@ -231,6 +234,44 @@ function basePostTransformArgs(
 function cloneMessages(messages: MessageLike[]): MessageLike[] {
     return structuredClone(messages);
 }
+
+describe("Channel-2 measured-collapse cycle reset", () => {
+    it("CAS-rearms delivered at the baseline-refresh site when measured U falls below 25k", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-channel2-u-collapse";
+        setChannel2NudgeState(db, sessionId, "delivered");
+        const channel1StateBySession = new Map<string, Channel1State>([
+            [
+                sessionId,
+                {
+                    baselineU: 60_000,
+                    baselineT: 100_000,
+                    turnDeltaU: 0,
+                    turnDeltaT: 0,
+                    baselineGeneration: 1,
+                    computedAt: 1,
+                    evaluable: true,
+                    generationInvalidated: false,
+                    baselineParts: [],
+                    contentSignature: "prior",
+                    reducedSinceRefresh: true,
+                    oldestReclaimableToolTags: [],
+                },
+            ],
+        ]);
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, [], {
+                channel1StateBySession,
+                didMutateFromFlushedStatuses: true,
+            }),
+        );
+
+        expect(channel1StateBySession.get(sessionId)?.baselineU).toBe(0);
+        expect(getChannel2NudgeState(db, sessionId)).toBe("");
+    });
+});
 
 function buildToolCallIndex(messages: MessageLike[]): ToolCallIndex {
     const index: ToolCallIndex = new Map();
@@ -1883,6 +1924,38 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         expect(JSON.stringify(postprocessMessages.map((message) => message.parts))).toBe(
             JSON.stringify(directMessages.map((message) => message.parts)),
         );
+    });
+
+    it("re-arms Channel 2 when a HARD fold advances m0 compartment coverage", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-hardfold-channel2-cycle";
+        materializeBaseline(sessionId);
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 10,
+                startMessageId: "start",
+                endMessageId: "end",
+                title: "new folded coverage",
+                content: "compartment content",
+            },
+        ]);
+        setChannel2NudgeState(db, sessionId, "delivered");
+
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, [], {
+                m0M1: {
+                    projectPath: FOLD_PROJECT,
+                    projectDirectory: FOLD_PROJECT,
+                    historyBudgetTokens: 98_000,
+                    hardSignals: { ...BASE_HARD, modelKey: "anthropic/sonnet" },
+                },
+            }),
+        );
+
+        expect(getChannel2NudgeState(db, sessionId)).toBe("");
     });
 
     it("drains queued pending ops on a DEFER scheduler pass when m[0] HARD-folds", async () => {

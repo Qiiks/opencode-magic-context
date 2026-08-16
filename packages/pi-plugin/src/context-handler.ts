@@ -122,8 +122,12 @@ import {
 	detectMidTurnBypassReason,
 } from "@magic-context/core/hooks/magic-context/boundary-execution";
 import { replayCavemanCompression } from "@magic-context/core/hooks/magic-context/caveman-cleanup";
+import {
+	rearmChannel2AfterCoverageAdvancingHardFold,
+	rearmChannel2AfterMeasuredCollapse,
+} from "@magic-context/core/hooks/magic-context/channel2-cycle";
 import { checkCompartmentTrigger } from "@magic-context/core/hooks/magic-context/compartment-trigger";
-import { shouldTriggerChannel2 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
+import { evaluateChannel2 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import {
 	DEFAULT_CONTEXT_LIMIT,
@@ -186,6 +190,7 @@ import {
 	recordPiTransformTiming,
 } from "./context-perf-hooks";
 import {
+	adaptPiChannel2Baseline,
 	clearPiChannel1State,
 	computeTailTokenEstimatePi,
 	setPiChannel1Baseline,
@@ -309,7 +314,7 @@ let mutationGateObserverForTests:
 			shouldApplyPendingOps: boolean;
 			shouldRunHeuristics: boolean;
 			shouldRunReasoningCleanup: boolean;
-		}) => void)
+	  }) => void)
 	| undefined;
 
 export const __test = {
@@ -3155,6 +3160,7 @@ export function registerPiContextHandler(
 					// fails. Mirrors OpenCode's transform path exactly.
 					let tailToolTokens: number;
 					let liveTailTokens: number;
+					let channel2HasUnknownFields = false;
 					try {
 						// reclaimable (toolOutput) excludes the protected top-N tags
 						// (parity with OpenCode) — the agent can't ctx_reduce those, so
@@ -3166,6 +3172,7 @@ export function registerPiContextHandler(
 						);
 						tailToolTokens = agg.toolOutput;
 						liveTailTokens = agg.conversation + agg.toolCall;
+						channel2HasUnknownFields = agg.nullCount > 0;
 					} catch {
 						const estimate = computeTailTokenEstimatePi(
 							outputMessages as unknown[],
@@ -3173,17 +3180,11 @@ export function registerPiContextHandler(
 						tailToolTokens = estimate.tailToolTokens;
 						liveTailTokens = estimate.liveTailTokens;
 					}
-					// usable = executeThresholdTokens − inputTokens + liveTail (the
-					// agent's working range). Computed BEFORE the baseline write so
-					// it persists with the same measurement — Channel-2 delivery
-					// revalidates the full trigger predicate from this snapshot.
-					const executeThresholdTokensPi = Math.round(
-						((usageContextLimit ?? 0) * resolvedExecuteThresholdPct) / 100,
-					);
-					const usableTokensPi = Math.max(
-						0,
-						executeThresholdTokensPi - usageInputTokens + liveTailTokens,
-					);
+					const channel2Baseline = adaptPiChannel2Baseline({
+						reclaimableTokens: tailToolTokens,
+						tailTokens: liveTailTokens,
+						hasUnknownFields: channel2HasUnknownFields,
+					});
 					// Same rationale as OpenCode: a historian publish, emergency drop,
 					// or pending-op replay can shrink the tail without a ctx_reduce
 					// tool call, so a regrowth must not inherit a stale persisted band.
@@ -3198,38 +3199,34 @@ export function registerPiContextHandler(
 						options.protectedTags ?? 20,
 					);
 					setPiChannel1Baseline(sessionId, {
+						...channel2Baseline,
 						tailToolTokens,
 						historyBudgetTokens: historyBudgetTokens ?? 0,
 						contextLimit: usageContextLimit ?? 0,
 						executeThresholdPercentage: resolvedExecuteThresholdPct,
 						lastInputTokens: usageInputTokens,
 						turnToolTokens: 0,
-						usableTokens: usableTokensPi,
 						reducedSinceRefresh: false,
 						oldestReclaimableToolTags,
 					});
 
-					// Channel 2 (ceiling) trigger — fire when reclaimable tool output
-					// is at least a third of the usable working range (the gap
-					// between fixed overhead and the execute-threshold ceiling).
-					// Delivery happens on `agent_end`/`tool_result` via a hidden
-					// pi.sendMessage custom message. Only escalate from '' so an
-					// in-flight claim/delivery is never reset.
-					if (
-						usageContextLimit &&
-						usageContextLimit > 0 &&
-						resolvedExecuteThresholdPct > 0
-					) {
-						const channel2ShouldTrigger = shouldTriggerChannel2({
-							baselineU: tailToolTokens,
-							baselineT: usableTokensPi,
-							deltas: { u: 0, t: 0 },
-						});
-						if (channel2ShouldTrigger) {
+					const channel2Evaluation = evaluateChannel2(channel2Baseline);
+					if (channel2Evaluation.evaluable) {
+						try {
+							rearmChannel2AfterMeasuredCollapse({
+								db: options.db,
+								sessionId,
+								baseline: channel2Baseline,
+							});
+						} catch (error) {
+							sessionLog(
+								sessionId,
+								`pi channel2 U-collapse reset failed: ${error instanceof Error ? error.message : String(error)}`,
+							);
+						}
+						if (channel2Evaluation.shouldTrigger) {
 							casChannel2NudgeState(options.db, sessionId, "", "pending");
 						} else {
-							// Cancel stale, undelivered intents when fresh metrics say the
-							// trigger no longer holds; claimed/delivered are never reset.
 							casChannel2NudgeState(options.db, sessionId, "pending", "");
 						}
 					}
@@ -4575,6 +4572,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		: { value: false, reason: null };
 	let foldExecutedThisPass = false;
 	let preFoldInjectionResult: PiInjectionResult | null = null;
+	const persistedM0BeforeFold = getOrCreateSessionMeta(args.db, args.sessionId);
+	const m0CoverageBeforeFold =
+		persistedM0BeforeFold.cachedM0Bytes === null
+			? -1
+			: persistedM0BeforeFold.cachedM0MaxCompartmentSeq;
 	if (foldDueDecision.value && piM0State) {
 		try {
 			// Persist the fold before opening mutation gates. The shadow array keeps
@@ -4591,6 +4593,25 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				foldDueDecision.value,
 				preFoldInjectionResult.m0Materialized === true,
 			);
+			const m0CoverageAfterFold = getOrCreateSessionMeta(
+				args.db,
+				args.sessionId,
+			).cachedM0MaxCompartmentSeq;
+			try {
+				rearmChannel2AfterCoverageAdvancingHardFold({
+					db: args.db,
+					sessionId: args.sessionId,
+					foldExecuted: foldExecutedThisPass,
+					compactionOff: false,
+					previousCoverage: m0CoverageBeforeFold,
+					currentCoverage: m0CoverageAfterFold,
+				});
+			} catch (error) {
+				sessionLog(
+					args.sessionId,
+					`pi channel2 fold-cycle reset failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
 		} catch (error) {
 			sessionLog(
 				args.sessionId,
@@ -5428,8 +5449,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 						...wireInjectionResult,
 						m0Materialized: true,
 						m0Reason:
-							preFoldInjectionResult.m0Reason ??
-							wireInjectionResult.m0Reason,
+							preFoldInjectionResult.m0Reason ?? wireInjectionResult.m0Reason,
 					}
 				: wireInjectionResult;
 			// Temporal markers are derived before history injection trims raw messages.

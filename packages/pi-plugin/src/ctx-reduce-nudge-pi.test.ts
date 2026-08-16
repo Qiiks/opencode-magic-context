@@ -8,9 +8,11 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import * as loggerModule from "@magic-context/core/shared/logger";
 import {
+	adaptPiChannel2Baseline,
 	clearPiChannel1State,
 	computeTailTokenEstimatePi,
 	computeTailToolTokensPi,
+	getPiChannel1Baseline,
 	maybeChannel1ReminderForToolResult,
 	maybeDeliverChannel2Pi,
 	setPiChannel1Baseline,
@@ -19,6 +21,17 @@ import { createTestDb } from "./test-utils.test";
 
 function toolResultMsg(text: string) {
 	return { role: "toolResult", content: [{ type: "text", text }] };
+}
+
+function channel2BaselineFields(baselineU: number, baselineT: number) {
+	return {
+		baselineU,
+		baselineT,
+		turnDeltaU: 0,
+		turnDeltaT: 0,
+		evaluable: true,
+		generationInvalidated: false,
+	};
 }
 
 afterEach(() => {
@@ -67,13 +80,13 @@ describe("maybeChannel1ReminderForToolResult", () => {
 
 	function seedBaseline(tailTokens: number): void {
 		setPiChannel1Baseline(SESSION, {
+			...channel2BaselineFields(tailTokens, 120_000),
 			tailToolTokens: tailTokens,
 			historyBudgetTokens: 100_000,
 			contextLimit: 200_000,
 			executeThresholdPercentage: 65,
 			lastInputTokens: 150_000, // pressure ≈ (75 / 65) ≈ 1.15
 			turnToolTokens: 0,
-			usableTokens: 60_000,
 			reducedSinceRefresh: false,
 			oldestReclaimableToolTags: [{ tagNumber: 9, toolName: "bash" }],
 		});
@@ -110,13 +123,13 @@ describe("maybeChannel1ReminderForToolResult", () => {
 	it("includes oldest reclaimable hints from the baseline", () => {
 		const db = createTestDb();
 		setPiChannel1Baseline(SESSION, {
+			...channel2BaselineFields(90_000, 120_000),
 			tailToolTokens: 90_000,
 			historyBudgetTokens: 100_000,
 			contextLimit: 200_000,
 			executeThresholdPercentage: 65,
 			lastInputTokens: 150_000,
 			turnToolTokens: 0,
-			usableTokens: 60_000,
 			reducedSinceRefresh: false,
 			oldestReclaimableToolTags: [{ tagNumber: 123, toolName: "read" }],
 		});
@@ -165,6 +178,35 @@ describe("maybeChannel1ReminderForToolResult", () => {
 	});
 });
 
+describe("Pi Channel-2 baseline adapter", () => {
+	it("maps known legacy measurements and rejects unknown fields conservatively", () => {
+		expect(
+			adaptPiChannel2Baseline({
+				reclaimableTokens: 60_000,
+				tailTokens: 100_000,
+			}),
+		).toMatchObject({
+			baselineU: 60_000,
+			baselineT: 100_000,
+			evaluable: true,
+			generationInvalidated: false,
+		});
+		expect(
+			adaptPiChannel2Baseline({
+				reclaimableTokens: 60_000,
+				tailTokens: 100_000,
+				hasUnknownFields: true,
+			}),
+		).toMatchObject({ evaluable: false, generationInvalidated: true });
+		expect(
+			adaptPiChannel2Baseline({
+				reclaimableTokens: 110_000,
+				tailTokens: 100_000,
+			}),
+		).toMatchObject({ evaluable: false, generationInvalidated: true });
+	});
+});
+
 describe("maybeDeliverChannel2Pi", () => {
 	const SESSION = "ses-ch2-pi";
 
@@ -187,13 +229,13 @@ describe("maybeDeliverChannel2Pi", () => {
 	/** A baseline whose measurement still satisfies the full Channel-2 trigger. */
 	function armStrongBaseline(sessionId: string): void {
 		setPiChannel1Baseline(sessionId, {
-			tailToolTokens: 30_000,
+			...channel2BaselineFields(60_000, 100_000),
+			tailToolTokens: 60_000,
 			historyBudgetTokens: 0,
 			contextLimit: 200_000,
 			executeThresholdPercentage: 65,
 			lastInputTokens: 120_000,
 			turnToolTokens: 0,
-			usableTokens: 60_000, // 30k >= 60k/3 -> trigger holds
 			reducedSinceRefresh: false,
 			oldestReclaimableToolTags: [{ tagNumber: 9, toolName: "bash" }],
 		});
@@ -245,27 +287,72 @@ describe("maybeDeliverChannel2Pi", () => {
 			db,
 			session,
 		);
-		// Unknown pressure must never burn the one-shot cap NOR cancel the
-		// intent — a later agent_end with a real measurement decides.
+		// An unknown U/T baseline must neither consume the cycle cap nor cancel
+		// the intent; a later agent_end with a real measurement decides.
 		expect(delivered).toBe(false);
 		expect(sent).toBe(0);
 		expect(getChannel2NudgeState(db, session)).toBe("pending");
+	});
+
+	it("holds pending when the baseline generation was invalidated", () => {
+		const db = createTestDb();
+		const session = "ses-ch2-pi-invalidated";
+		setChannel2NudgeState(db, session, "pending");
+		armStrongBaseline(session);
+		const baseline = getPiChannel1Baseline(session);
+		if (!baseline) throw new Error("missing test baseline");
+		baseline.evaluable = false;
+		baseline.generationInvalidated = true;
+		let sent = 0;
+
+		const delivered = maybeDeliverChannel2Pi(
+			{ sendMessage: () => sent++ },
+			db,
+			session,
+		);
+
+		expect(delivered).toBe(false);
+		expect(sent).toBe(0);
+		expect(getChannel2NudgeState(db, session)).toBe("pending");
+	});
+
+	it("cancels (re-armable) when typed T growth leaves the fourth band", () => {
+		const db = createTestDb();
+		const session = "ses-ch2-pi-typed-delta";
+		setChannel2NudgeState(db, session, "pending");
+		armStrongBaseline(session);
+		maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: session,
+			toolName: "bash",
+			content: [{ type: "text", text: "x".repeat(40_000) }],
+		});
+		let sent = 0;
+
+		const delivered = maybeDeliverChannel2Pi(
+			{ sendMessage: () => sent++ },
+			db,
+			session,
+		);
+
+		expect(delivered).toBe(false);
+		expect(sent).toBe(0);
+		expect(getChannel2NudgeState(db, session)).toBe("");
 	});
 
 	it("cancels (re-armable) when the full trigger predicate no longer holds", () => {
 		const db = createTestDb();
 		const session = "ses-ch2-pi-stale";
 		setChannel2NudgeState(db, session, "pending");
-		// 11k reclaimable >= 10k floor, but < usable/3 (44k/3 ~ 14.7k) — the
-		// audit repro: floor-only validation would deliver and burn the cap.
+		// The 50k floor holds, but severity is only 0.50, below the fourth band.
 		setPiChannel1Baseline(session, {
-			tailToolTokens: 11_000,
+			...channel2BaselineFields(50_000, 100_000),
+			tailToolTokens: 50_000,
 			historyBudgetTokens: 0,
 			contextLimit: 200_000,
 			executeThresholdPercentage: 65,
 			lastInputTokens: 100_000,
 			turnToolTokens: 0,
-			usableTokens: 44_000,
 			reducedSinceRefresh: false,
 			oldestReclaimableToolTags: [],
 		});
@@ -386,7 +473,7 @@ describe("maybeDeliverChannel2Pi", () => {
 		).toBe(true);
 	});
 
-	it("does not re-deliver after success (one nudge per lifetime)", () => {
+	it("does not re-deliver before a tail-cycle reset", () => {
 		const db = createTestDb();
 		setChannel2NudgeState(db, SESSION, "delivered");
 		let sent = 0;
