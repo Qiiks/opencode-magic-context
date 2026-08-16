@@ -6,7 +6,7 @@
  * that one counts tokens, this one shows the exact words.
  *
  * Usage: bun packages/plugin/scripts/export-agent-surface.ts [outPath]
- * Default out: .alfonso/agent-surface-export.md (repo root)
+ * Default out: .cortexkit/alfonso/agent-surface-export.md (repo root)
  */
 import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -139,7 +139,7 @@ out.push(
 );
 out.push("");
 
-const outPath = resolve(process.argv[2] ?? "../../.alfonso/agent-surface-export.md");
+const outPath = resolve(process.argv[2] ?? "../../.cortexkit/alfonso/agent-surface-export.md");
 mkdirSync(dirname(outPath), { recursive: true });
 writeFileSync(outPath, out.join("\n"));
 console.log(`written: ${outPath}`);
