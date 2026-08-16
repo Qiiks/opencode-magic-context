@@ -12,8 +12,8 @@
 //
 //   Channel 2 (ceiling nudge): OpenCode delivers via the in-process client's
 //   `promptAsync` (which joins the in-flight runner on OpenCode >= 1.17.7). Pi
-//   calls the native `pi.sendMessage(..., { deliverAs })` as a hidden custom
-//   message (`display:false`). The `channel2_nudge_state` lease is persisted and
+//   queues a hidden custom message through `pi.sendMessage` with
+//   `deliverAs: "nextTurn"`. The `channel2_nudge_state` lease is persisted and
 //   token-bound, so sibling processes sharing a session database cannot change a
 //   lease after another process has claimed it. It carries the intent from the
 //   pipeline point that records it to the later `tool_result` or `agent_end`
@@ -179,7 +179,10 @@ interface PiSendMessage {
 			display: boolean;
 			details?: unknown;
 		},
-		options?: { deliverAs?: "steer" | "followUp"; triggerTurn?: boolean },
+		options?: {
+			deliverAs?: "steer" | "followUp" | "nextTurn";
+			triggerTurn?: boolean;
+		},
 	) => void;
 }
 
@@ -191,12 +194,10 @@ const CHANNEL2_NUDGE_CUSTOM_TYPE = "magic-context:ceiling-nudge";
  * Delivered as a hidden custom message (`sendMessage` + `display:false`) so it
  * reaches the model but is not presented as a literal user turn.
  *
- * Delivery sites + mode:
- * - `tool_result` (mid-turn, the primary site): deliverAs "steer" — Pi queues
- *   the message and the agent loop pulls it at the next step boundary, so the
- *   agent is warned while the pile is still growing and can act this turn.
- * - `agent_end` (idle fallback): catches the intent when the turn ended before
- *   a tool boundary could deliver it; deliverAs "followUp" starts a fresh turn.
+ * Both delivery sites queue the message with deliverAs "nextTurn". Pi adds it
+ * to the next real user turn instead of steering the active turn or starting an
+ * autonomous follow-up. This avoids a busy-session race where an external user
+ * prompt can be refused while Pi drains the synthetic continuation.
  *
  * Lease: pending → claimed(token) → delivered. A token is issued while claiming,
  * re-checked immediately before send, and required to confirm or revert. This
@@ -207,7 +208,6 @@ export function maybeDeliverChannel2Pi(
 	pi: PiSendMessage,
 	db: Database,
 	sessionId: string,
-	deliverAs: "steer" | "followUp" = "followUp",
 ): boolean {
 	let state: string;
 	try {
@@ -256,10 +256,9 @@ export function maybeDeliverChannel2Pi(
 			);
 			return false;
 		}
-		// display: false → hidden from the Pi TUI (agent steer, not a user turn),
-		// but still model-visible via convertToLlm. deliverAs preserves the
-		// existing scheduling (steer mid-turn / followUp at agent_end).
-		pi.sendMessage(message, { deliverAs });
+		// display:false keeps the synthetic entry out of the Pi TUI while
+		// convertToLlm still presents it to the model on the next real user turn.
+		pi.sendMessage(message, { deliverAs: "nextTurn" });
 	} catch (error) {
 		try {
 			const restored = casChannel2NudgeClaim(
