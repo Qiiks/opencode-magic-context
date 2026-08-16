@@ -26,7 +26,7 @@ describe("decideChannel1 — agent-tail hygiene ratio", () => {
     it("uses the four owner-set bands without wall-pressure input", () => {
         expect(decideChannel1({ ...base, baselineU: 20_000 }).level).toBe("gentle");
         expect(decideChannel1({ ...base, baselineU: 40_000 }).level).toBe("firm");
-        expect(decideChannel1({ ...base, baselineU: 55_000 }).level).toBe("urgent");
+        expect(decideChannel1({ ...base, baselineU: 55_000 }).level).toBe("firm");
         expect(decideChannel1({ ...base, baselineU: 60_000 }).level).toBe("urgent");
     });
 
@@ -35,7 +35,7 @@ describe("decideChannel1 — agent-tail hygiene ratio", () => {
         const fable = decideChannel1({ ...base, baselineU: 119_900, baselineT: 218_000 });
         expect(sol.fire).toBe(true);
         expect(fable.fire).toBe(true);
-        expect(sol.level).toBe("urgent");
+        expect(sol.level).toBe("firm");
         expect(fable.level).toBe(sol.level);
     });
 
@@ -134,7 +134,7 @@ describe("decideChannel1 — agent-tail hygiene ratio", () => {
     it("fires an escalation before cadence is reached", () => {
         const decision = decideChannel1({
             ...base,
-            baselineU: 55_000,
+            baselineU: 60_000,
             baselineT: 100_000,
             lastNudgeUndropped: 50_000,
             lastNudgeLevel: "firm",
@@ -205,13 +205,13 @@ describe("evaluateChannel2 — fourth hygiene band", () => {
         generationInvalidated: false,
     };
 
-    it("arms only at severity >= 0.60 with at least 50k reclaimable tokens", () => {
+    it("arms only at severity >= 0.75 with at least 50k reclaimable tokens", () => {
         expect(CHANNEL2_FLOOR_TOKENS).toBe(50_000);
-        expect(CHANNEL2_SEVERITY_THRESHOLD).toBe(0.6);
+        expect(CHANNEL2_SEVERITY_THRESHOLD).toBe(0.75);
         expect(
             evaluateChannel2({
                 ...baseline,
-                baselineU: 50_000,
+                baselineU: 65_000,
                 turnDeltaU: 10_000,
             }).shouldTrigger,
         ).toBe(true);
@@ -237,19 +237,30 @@ describe("evaluateChannel2 — fourth hygiene band", () => {
         ).toBe(false);
     });
 
-    it("arms the 162k/249k flagship incident", () => {
+    it("keeps the 162k/249k flagship incident in the urgent band", () => {
         const evaluation = evaluateChannel2({
             ...baseline,
             baselineU: 162_000,
             baselineT: 249_000,
         });
-        expect(evaluation.shouldTrigger).toBe(true);
+        expect(evaluation.shouldTrigger).toBe(false);
         expect(evaluation.severity).toBeCloseTo(0.651, 3);
+
+        const decision = decideChannel1({
+            ...baseline,
+            baselineU: 162_000,
+            baselineT: 249_000,
+            lastNudgeUndropped: 0,
+            lastNudgeLevel: "",
+            hasRecentReduce: false,
+        });
+        expect(decision.fire).toBe(true);
+        expect(decision.level).toBe("urgent");
     });
 
     it("cannot arm below the Channel-1 urgent band", () => {
         for (let tailTokens = 60_000; tailTokens <= 500_000; tailTokens += 10_000) {
-            const belowUrgent = Math.floor(tailTokens * 0.54999);
+            const belowUrgent = Math.floor(tailTokens * 0.59999);
             expect(
                 evaluateChannel2({
                     ...baseline,

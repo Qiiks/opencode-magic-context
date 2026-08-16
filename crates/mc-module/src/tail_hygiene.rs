@@ -15,7 +15,7 @@ use crate::ck_wire::{FlatBlock, FlatProjection};
 pub(crate) const CHANNEL1_MIN_TOKENS: i64 = 60_000;
 pub(crate) const CHANNEL1_FLOOR_TOKENS: i64 = 25_000;
 pub(crate) const CHANNEL2_FLOOR_TOKENS: i64 = 50_000;
-pub(crate) const CHANNEL2_SEVERITY_THRESHOLD: f64 = 0.60;
+pub(crate) const CHANNEL2_SEVERITY_THRESHOLD: f64 = 0.75;
 
 const RED_KEY_PREFIX: &str = "red:";
 const CAV_KEY_PREFIX: &str = "cav:";
@@ -710,7 +710,7 @@ pub(crate) fn hygiene_band(u: i64, t: i64) -> HygieneBand {
     let severity = u as f64 / t.max(1) as f64;
     if u >= CHANNEL2_FLOOR_TOKENS && severity >= CHANNEL2_SEVERITY_THRESHOLD {
         HygieneBand::Channel2
-    } else if severity >= 0.55 {
+    } else if severity >= 0.60 {
         HygieneBand::Urgent
     } else if severity >= 0.40 {
         HygieneBand::Firm
