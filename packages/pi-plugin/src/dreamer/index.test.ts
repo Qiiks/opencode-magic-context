@@ -90,6 +90,12 @@ async function flushMicrotasks(): Promise<void> {
 	await Promise.resolve();
 }
 
+const CURATE_PSEUDO_TOOL_CALL = `归档与全局用户画像完全重复且无项目特化信息的记忆条目。[historical tool call]
+id: call_2080315
+name: ctx_memory
+arguments:
+{"action":"archive","reason":"与全局用户画像重复","ids":[6]}`;
+
 afterEach(() => {
 	__test.reset();
 	if (db) {
@@ -202,6 +208,58 @@ describe("Pi dreamer wiring", () => {
 		expect(capturedSystem).toContain(
 			"Write human-readable prose you author in: Spanish (Español).",
 		);
+	});
+
+	test("shared curate validation retries Pi pseudo-tool-call text with the fallback model", async () => {
+		db = createDb();
+		const attemptedModels: Array<string | undefined> = [];
+		__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: mock(async (args: { model?: string }) => {
+						attemptedModels.push(args.model);
+						return {
+							ok: true,
+							assistantText:
+								attemptedModels.length === 1
+									? CURATE_PSEUDO_TOOL_CALL
+									: "curation complete",
+						};
+					}),
+				}) as never,
+		);
+		insertMemory(db, {
+			projectPath: "git:pi-curate-pseudo-tool-call",
+			category: "PROJECT_RULES",
+			content: "Use the shared release checklist before publishing.",
+		});
+
+		registerPiDreamerProject(
+			dreamerOptions({
+				database: db,
+				projectDir: process.cwd(),
+				projectIdentity: "git:pi-curate-pseudo-tool-call",
+				config: DreamerConfigSchema.parse({
+					model: "primary/curator",
+					tasks: {
+						curate: {
+							schedule: "0 4 * * *",
+							fallback_models: ["fallback/curator"],
+						},
+					},
+				}),
+			}),
+		);
+
+		const result = await runPiDreamForProject(
+			"git:pi-curate-pseudo-tool-call",
+			"curate",
+		);
+
+		expect(attemptedModels).toEqual(["primary/curator", "fallback/curator"]);
+		expect(result.failed).toEqual([]);
+		expect(result.ran).toEqual(["curate"]);
 	});
 
 	test("re-registering the SAME dir is a no-op (keeps the first timer)", async () => {
