@@ -140,7 +140,7 @@ describe("Pi status dialog", () => {
 							undefined,
 							() => undefined,
 						);
-						rendered.push(component.render(100));
+						rendered.push(component.render(78));
 						component.dispose?.();
 						return undefined;
 					},
@@ -155,6 +155,8 @@ describe("Pi status dialog", () => {
 
 			const text = rendered.flat().join("\n");
 			expect(text).toContain("Work tokens 1.2K new · 9.8K total input");
+			expect(text).toContain("Window ");
+			expect(text).not.toContain("Context:");
 		} finally {
 			closeQuietly(db);
 		}

@@ -1,4 +1,7 @@
-import type { OutputReserveConfig } from "@magic-context/core/shared/models-dev-cache";
+import {
+	type OutputReserveConfig,
+	resolveOutputReserve,
+} from "@magic-context/core/shared/models-dev-cache";
 import {
 	deriveWindowGeometry,
 	getWindowOverlay,
@@ -60,6 +63,11 @@ export function resolvePiWindowGeometry(
 	if (!isSaneLimit(context)) return undefined;
 	const providerID = args.model?.provider ?? "unknown";
 	const modelID = args.model?.id ?? "unknown";
+	const outputReserveOverride = resolveOutputReserve(
+		providerID,
+		modelID,
+		args.reserveConfig,
+	);
 	const result = deriveWindowGeometry(
 		providerID,
 		modelID,
@@ -76,11 +84,16 @@ export function resolvePiWindowGeometry(
 			contextCap: isSaneLimit(args.detectedContextLimit)
 				? args.detectedContextLimit
 				: undefined,
-			reserveConfig: args.reserveConfig,
+			outputReserveOverride,
 			harness: "pi",
 		},
 	);
-	if (!result || !isSaneLimit(persistedUsable)) return result;
+	if (
+		!result ||
+		outputReserveOverride !== undefined ||
+		!isSaneLimit(persistedUsable)
+	)
+		return result;
 	const usableSoft = Math.round(persistedUsable);
 	return {
 		...result,

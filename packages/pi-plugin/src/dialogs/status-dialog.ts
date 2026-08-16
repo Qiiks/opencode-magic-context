@@ -274,7 +274,12 @@ function renderInner(
 		)} · ${fmt(s.inputTokens)} / ${s.contextLimit > 0 ? fmt(s.contextLimit) : "?"} tokens`,
 	);
 	if (s.windowGeometry) {
-		lines.push(formatWindowDerivationLine(s.inputTokens, s.windowGeometry));
+		lines.push(
+			formatWindowDerivationLine(s.inputTokens, s.windowGeometry).replace(
+				/^Context:.* — window /,
+				"Window ",
+			),
+		);
 	}
 	lines.push(
 		`Work tokens ${fmt(s.newWorkTokens)} new · ${fmt(s.totalInputTokens)} total input`,

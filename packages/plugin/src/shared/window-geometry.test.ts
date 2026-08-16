@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveLimit } from "./models-dev-cache";
+import { resolveLimit, resolveOutputReserve } from "./models-dev-cache";
 import {
     deriveWindowGeometry,
     formatWindowDerivationLine,
@@ -238,6 +238,39 @@ describe("window geometry", () => {
         );
         expect(result?.derivation.reserve).toBe(32_000);
         expect(result?.usableSoft).toBe(1_016_576);
+    });
+
+    test("output_reserve forms override a pre-carved input and overlay output facts", () => {
+        const data = overlay("openai-codex", "gpt-5.6-sol", {
+            "output.enforced": fact({ kind: "stated", value: 68_000 }),
+        });
+        const cases = [
+            16_384,
+            { default: 16_384 },
+            { default: 32_000, "openai-codex/gpt-5.6-sol": 16_384 },
+        ] as const;
+
+        for (const reserveConfig of cases) {
+            const result = deriveWindowGeometry(
+                "openai-codex",
+                "gpt-5.6-sol",
+                { context: 400_000, input: 272_000, output: 128_000 },
+                {
+                    overlay: resolveWindowOverlayFacts("openai-codex", "gpt-5.6-sol", data),
+                    outputReserveOverride: resolveOutputReserve(
+                        "openai-codex",
+                        "gpt-5.6-sol",
+                        reserveConfig,
+                    ),
+                },
+            );
+            expect(result?.usableSoft).toBe(272_000 - 16_384);
+            expect(result?.derivation).toMatchObject({
+                window: 272_000,
+                reserve: 16_384,
+                reserveSource: "output_config",
+            });
+        }
     });
 
     test("provider hook wins over overlay, while overlay beats catalog", () => {

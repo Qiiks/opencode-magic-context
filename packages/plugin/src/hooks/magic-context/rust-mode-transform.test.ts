@@ -32,6 +32,7 @@ import * as logger from "../../shared/logger";
 import { promptSurfaceConfigIdentity } from "../../shared/prompt-surface";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { deriveWindowGeometry } from "../../shared/window-geometry";
 import { createCtxSearchTools } from "../../tools/ctx-search/tools";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import { getVisibleMemoryIds } from "./inject-compartments";
@@ -348,6 +349,23 @@ describe("Rust mode authority adapter", () => {
 
         expect(authorityRoots.length).toBeGreaterThan(0);
         expect(authorityRoots.every((root) => root === "/session/root-b")).toBe(true);
+    });
+
+    it("transports the host-resolved output_reserve as Rust usable_soft", () => {
+        const resolved = deriveWindowGeometry(
+            "openai-codex",
+            "gpt-5.6-sol",
+            { context: 400_000, input: 272_000, output: 128_000 },
+            { outputReserveOverride: 16_384, harness: "opencode" },
+        );
+        const geometry = __rustModeTransformTest.transformGeometryForWire(resolved);
+
+        expect(geometry).toEqual({
+            usable_soft: 255_616,
+            usable_hard: 368_000,
+            derivation:
+                "s1-shared/context-output/context=272000/output=16384/mode=shared_upfront/usable-hard=368000",
+        });
     });
 
     it("transports S1 geometry and bases host preflight on the hard wall", () => {

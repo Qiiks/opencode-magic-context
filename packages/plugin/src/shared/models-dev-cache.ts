@@ -211,10 +211,11 @@ function modelKeyLookupOrder(providerID: string, modelID: string): string[] {
     return [...new Set(candidates)];
 }
 
-function configuredOutputReserve(
-    config: OutputReserveConfig | undefined,
+/** Resolve the user-tier output reservation for one runtime model. */
+export function resolveOutputReserve(
     providerID: string,
     modelID: string,
+    config: OutputReserveConfig | undefined = outputReserveConfig,
 ): number | undefined {
     if (typeof config === "number")
         return Number.isFinite(config) && config >= 0 ? config : undefined;
@@ -259,7 +260,7 @@ export function resolveLimit(
     if (input !== undefined && (context === undefined || input < context)) return input;
     if (context === undefined) return undefined;
 
-    const configuredReserve = configuredOutputReserve(reserveConfig, providerID, modelID);
+    const configuredReserve = resolveOutputReserve(providerID, modelID, reserveConfig);
     let reserve: number;
     if (configuredReserve !== undefined) {
         reserve = configuredReserve;
@@ -523,7 +524,7 @@ export function getSdkWindowGeometry(
         },
         {
             overlay: resolveWindowOverlayFacts(providerID, modelID, getWindowOverlay()),
-            reserveConfig: outputReserveConfig,
+            outputReserveOverride: resolveOutputReserve(providerID, modelID),
             harness: options?.harness ?? "opencode",
             contextCap:
                 promptOnlyDetected === undefined && isFinitePositive(detectedContextLimit)
