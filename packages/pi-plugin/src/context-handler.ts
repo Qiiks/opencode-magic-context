@@ -66,7 +66,6 @@ import {
 	findAdoptableFallbackTags,
 	findPiFallbackToolOwnerTags,
 	getActiveTagsBySession,
-	getActiveTagTokenAggregate,
 	getDroppedTagsByNumbers,
 	getHistorianFailureState,
 	getMaxDroppedTagNumber,
@@ -75,6 +74,7 @@ import {
 	getPendingPiCompactionMarkerState,
 	getPersistedToolTagAccounting,
 	getTagsByNumbers,
+	getTagsBySession,
 	getTagsForPendingOperations,
 	hasPiFallbackMessageTags,
 	hasPiFallbackToolOwnerTags,
@@ -190,9 +190,8 @@ import {
 	recordPiTransformTiming,
 } from "./context-perf-hooks";
 import {
-	adaptPiChannel2Baseline,
 	clearPiChannel1State,
-	computeTailTokenEstimatePi,
+	getPiChannel1Baseline,
 	setPiChannel1Baseline,
 } from "./ctx-reduce-nudge-pi";
 import { detectRecentCommit } from "./detect-recent-commit";
@@ -233,6 +232,11 @@ import {
 import { stripPiDroppedPlaceholderMessages } from "./strip-placeholders-pi";
 import { stripPiProcessedImages } from "./strip-processed-images-pi";
 import { clearPiSystemPromptSession } from "./system-prompt";
+import {
+	assertPiTailHygieneContentUnchanged,
+	effectivePiTailHygiene,
+	refreshPiTailHygieneBaseline,
+} from "./tail-hygiene-walk-pi";
 import {
 	injectPiTemporalMarkers,
 	stripPiLeadingTemporalMarker,
@@ -2998,6 +3002,7 @@ export function registerPiContextHandler(
 			// already-mutated messages unchanged.
 			const tPostTransform = performance.now();
 			let outputMessages = result.messages as PiAgentMessage[];
+			let assertTailHygieneLastWriter: (() => void) | undefined;
 
 			const tNoteNudges = performance.now();
 			try {
@@ -3113,110 +3118,49 @@ export function registerPiContextHandler(
 			}
 			logTransformTiming(sessionId, "todoCapture", tTodoCapture);
 
-			// Channel 1 baseline snapshot + Channel 2 ceiling trigger. Mirrors
-			// OpenCode's transform.ts end-of-pass block. Computed from the final
-			// `outputMessages` (already trimmed to the live tail), refreshing here
-			// (a proven transform boundary) zeroes the per-turn accumulator. The
-			// `tool_result` handler in index.ts reads this baseline. Primary-only:
-			// a missing baseline is how Channel 1 stays off for subagents.
+			// Walk Pi's final rendered entry stream once to calculate both nudge-channel
+			// totals. A cache-busting pass replaces the saved baseline; a deferred pass
+			// keeps it and adds only newly appended content and protection-boundary moves.
 			const tChannelAccounting = performance.now();
 			try {
 				const sessionMetaForCh1 = getOrCreateSessionMeta(options.db, sessionId);
-				// Gate on ctx_reduce being callable. Primary Pi sessions register the
-				// tool; subagents do not, so a baseline/nudge there would point at a
-				// missing session-scoped tool. A missing baseline is also how Channel 1
-				// stays off.
 				if (!options.compactionOff && !sessionMetaForCh1.isSubagent) {
-					// Resolve through the SCHEDULER config (the real execute
-					// threshold), not options.historian — when historian is disabled
-					// the historian threshold falls back to 65 and ignores the user's
-					// execute_threshold_percentage / _tokens.
-					const resolvedExecuteThresholdPct = resolveExecuteThreshold(
-						schedulerConfig.executeThresholdPercentage ?? 65,
-						liveModelBySession.get(sessionId),
-						65,
-						{
-							tokensConfig: schedulerConfig.executeThresholdTokens,
-							contextLimit: usageContextLimit ?? 0,
-						},
-					);
-					const historyBudgetTokens = resolveHistoryBudgetTokensForPi({
-						historyBudgetPercentage: options.historian?.historyBudgetPercentage,
-						usagePercentage,
-						usageInputTokens,
-						usageContextLimit,
-						// Execute threshold from the SCHEDULER config (its real
-						// home), so the budget denominator matches the threshold
-						// used for Channel severity even when historian is disabled.
-						executeThresholdPercentage:
-							schedulerConfig.executeThresholdPercentage,
-						executeThresholdTokens: schedulerConfig.executeThresholdTokens,
-						modelKey: liveModelBySession.get(sessionId),
+					const tags = getTagsBySession(options.db, sessionId);
+					const protectedTags = options.protectedTags ?? 20;
+					const stableId = (message: unknown): string | undefined =>
+						message && typeof message === "object"
+							? result.postCommitEntryIdByRef.get(message)
+							: undefined;
+					const baseline = refreshPiTailHygieneBaseline({
+						messages: outputMessages,
+						tags,
+						protectedTags,
+						stableId,
+						syntheticLeadingCount: result.syntheticLeadingCount,
+						cacheBusting: result.bustedThisPass,
+						previous: getPiChannel1Baseline(sessionId),
 					});
-					// Real-tokenizer counts from the durable tag store (injected
-					// m[0]/m[1] blocks are never tagged → injected-free live tail).
-					// reclaimable = non-dropped tool OUTPUT; liveTail = conv + tool
-					// I/O. Falls back to a byte-approx live-tail walk only if the store read
-					// fails. Mirrors OpenCode's transform path exactly.
-					let tailToolTokens: number;
-					let liveTailTokens: number;
-					let channel2HasUnknownFields = false;
-					try {
-						// reclaimable (toolOutput) excludes the protected top-N tags
-						// (parity with OpenCode) — the agent can't ctx_reduce those, so
-						// counting them would nag forever about undroppable tail output.
-						const agg = getActiveTagTokenAggregate(
-							options.db,
-							sessionId,
-							options.protectedTags ?? 20,
-						);
-						tailToolTokens = agg.toolOutput;
-						liveTailTokens = agg.conversation + agg.toolCall;
-						channel2HasUnknownFields = agg.nullCount > 0;
-					} catch {
-						const estimate = computeTailTokenEstimatePi(
-							outputMessages as unknown[],
-						);
-						tailToolTokens = estimate.tailToolTokens;
-						liveTailTokens = estimate.liveTailTokens;
-					}
-					const channel2Baseline = adaptPiChannel2Baseline({
-						reclaimableTokens: tailToolTokens,
-						tailTokens: liveTailTokens,
-						hasUnknownFields: channel2HasUnknownFields,
-					});
-					// Same rationale as OpenCode: a historian publish, emergency drop,
-					// or pending-op replay can shrink the tail without a ctx_reduce
-					// tool call, so a regrowth must not inherit a stale persisted band.
-					resetLastNudgeCycleIfTailShrank(
-						options.db,
-						sessionId,
-						tailToolTokens,
-					);
+					const effective = effectivePiTailHygiene(baseline);
+					resetLastNudgeCycleIfTailShrank(options.db, sessionId, effective.u);
 					const oldestReclaimableToolTags = getOldestActiveUnprotectedToolTags(
 						options.db,
 						sessionId,
-						options.protectedTags ?? 20,
+						protectedTags,
 					);
-					setPiChannel1Baseline(sessionId, {
-						...channel2Baseline,
-						tailToolTokens,
-						historyBudgetTokens: historyBudgetTokens ?? 0,
-						contextLimit: usageContextLimit ?? 0,
-						executeThresholdPercentage: resolvedExecuteThresholdPct,
-						lastInputTokens: usageInputTokens,
-						turnToolTokens: 0,
+					const channelState = {
+						...baseline,
 						reducedSinceRefresh: false,
 						oldestReclaimableToolTags,
-					});
+					};
+					setPiChannel1Baseline(sessionId, channelState);
 
-					const channel2Evaluation = evaluateChannel2(channel2Baseline);
+					const channel2Evaluation = evaluateChannel2(channelState);
 					if (channel2Evaluation.evaluable) {
 						try {
 							rearmChannel2AfterMeasuredCollapse({
 								db: options.db,
 								sessionId,
-								baseline: channel2Baseline,
+								baseline: channelState,
 							});
 						} catch (error) {
 							sessionLog(
@@ -3230,10 +3174,25 @@ export function registerPiContextHandler(
 							casChannel2NudgeState(options.db, sessionId, "pending", "");
 						}
 					}
+
+					assertTailHygieneLastWriter = () =>
+						assertPiTailHygieneContentUnchanged({
+							messages: outputMessages,
+							tags,
+							protectedTags,
+							stableId,
+							syntheticLeadingCount: result.syntheticLeadingCount,
+							expectedSignature: baseline.contentSignature,
+						});
 				} else {
 					clearPiChannel1State(sessionId);
 				}
 			} catch (err) {
+				const stale = getPiChannel1Baseline(sessionId);
+				if (stale) {
+					stale.evaluable = false;
+					stale.generationInvalidated = true;
+				}
 				sessionLog(
 					sessionId,
 					`channel1 baseline / channel2 trigger failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -3316,6 +3275,12 @@ export function registerPiContextHandler(
 				sessionId,
 				`transform completed in ${transformElapsedMs.toFixed(1)}ms (${outputMessages.length} messages, ${result.targetCount} targets, watermark: ${result.reasoningWatermark})`,
 			);
+			if (
+				assertTailHygieneLastWriter &&
+				process.env.NODE_ENV !== "production"
+			) {
+				assertTailHygieneLastWriter();
+			}
 			return { messages: outputMessages } as {
 				messages: typeof event.messages;
 			};

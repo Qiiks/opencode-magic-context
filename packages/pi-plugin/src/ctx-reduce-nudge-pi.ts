@@ -1,7 +1,8 @@
 // Pi parity for the ctx_reduce nudge redesign (Channels 1 & 2).
 //
-// The metric math is fully shared from `@magic-context/core` — only the
-// harness-specific I/O differs:
+// Band/guard math is shared from `@magic-context/core`; Pi's rendered-entry
+// classifier is a shape-specific twin because Pi keeps thinking, signatures,
+// tool calls, and tool results in different envelopes:
 //
 //   Channel 1 (in-turn tool-output nudge): OpenCode appends to a tool's
 //   `output.output` string in `tool.execute.after`; Pi appends a TextContent
@@ -31,113 +32,15 @@ import {
 	buildChannel1Reminder,
 	buildChannel2Reminder,
 	CHANNEL1_SENTINEL,
-	type Channel1Level,
-	type Channel2PredicateBaseline,
+	decideChannel1,
 	evaluateChannel2,
-	isDroppedToolOutput,
-	type TailTokenEstimate,
-	tailToolTokensFromStrings,
+	type Channel1State as SharedChannel1State,
 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import { measurePiToolResultDelta } from "./tail-hygiene-walk-pi";
 
-export interface Channel1State extends Channel2PredicateBaseline {
-	tailToolTokens: number;
-	historyBudgetTokens: number;
-	contextLimit: number;
-	executeThresholdPercentage: number;
-	lastInputTokens: number;
-	turnToolTokens: number;
-	reducedSinceRefresh: boolean;
-	oldestReclaimableToolTags: Array<{
-		tagNumber: number;
-		toolName: string | null;
-	}>;
-}
-
-export function adaptPiChannel2Baseline(input: {
-	reclaimableTokens?: number;
-	tailTokens?: number;
-	hasUnknownFields?: boolean;
-}): Channel2PredicateBaseline {
-	const reclaimableTokens = input.reclaimableTokens;
-	const tailTokens = input.tailTokens;
-	// TODO-S5: walk Pi's final message array so dropped sentinels and protected
-	// parts are classified directly instead of trusting these temporary scalars.
-	const evaluable =
-		input.hasUnknownFields !== true &&
-		typeof reclaimableTokens === "number" &&
-		Number.isFinite(reclaimableTokens) &&
-		reclaimableTokens >= 0 &&
-		typeof tailTokens === "number" &&
-		Number.isFinite(tailTokens) &&
-		tailTokens >= 0 &&
-		reclaimableTokens <= tailTokens;
-	return {
-		baselineU: evaluable ? reclaimableTokens : 0,
-		baselineT: evaluable ? tailTokens : 0,
-		turnDeltaU: 0,
-		turnDeltaT: 0,
-		evaluable,
-		generationInvalidated: !evaluable,
-	};
-}
-
-function legacyPiTokens(value: string): number {
-	return Math.round(Buffer.byteLength(value, "utf8") * 0.25);
-}
-
-interface LegacyPiChannel1Decision {
-	fire: boolean;
-	level: Channel1Level;
-	undroppedTokens: number;
-	nextLastNudge: number;
-	nextLastNudgeLevel: Channel1Level | "";
-}
-
-// Pi still calculates its window-relative metric. Keep that calculation local
-// so the shared rendered-tail accounting cannot change Pi accidentally. Remove
-// it when Pi measures reclaimable tagged mass (U) against total tail mass (T).
-function decideLegacyPiChannel1(input: {
-	undroppedTokens: number;
-	pressure: number;
-	estimatedInputTokens: number;
-	workingWindowTokens: number;
-	lastNudgeUndropped: number;
-	lastNudgeLevel: Channel1Level | "";
-}): LegacyPiChannel1Decision {
-	const resetCycle = input.undroppedTokens < input.lastNudgeUndropped;
-	const lastNudge = resetCycle ? 0 : input.lastNudgeUndropped;
-	const lastLevel = resetCycle ? "" : input.lastNudgeLevel;
-	const quiet = (): LegacyPiChannel1Decision => ({
-		fire: false,
-		level: "gentle",
-		undroppedTokens: input.undroppedTokens,
-		nextLastNudge: lastNudge,
-		nextLastNudgeLevel: lastLevel,
-	});
-	if (input.undroppedTokens < 10_000) return quiet();
-	if (Math.min(1, Math.max(0, input.pressure)) < 0.8) return quiet();
-	const severity = Math.min(
-		1,
-		input.undroppedTokens / Math.max(input.estimatedInputTokens, 1),
-	);
-	if (severity < 0.2) return quiet();
-	const level: Channel1Level =
-		severity >= 0.65 ? "urgent" : severity >= 0.4 ? "firm" : "gentle";
-	const rank: Record<Channel1Level, number> = { gentle: 1, firm: 2, urgent: 3 };
-	const refire = Math.max(10_000, Math.round(0.05 * input.workingWindowTokens));
-	if (lastLevel === "" && input.undroppedTokens < lastNudge + refire)
-		return quiet();
-	if (lastLevel !== "" && rank[level] <= rank[lastLevel]) return quiet();
-	return {
-		fire: true,
-		level,
-		undroppedTokens: input.undroppedTokens,
-		nextLastNudge: input.undroppedTokens,
-		nextLastNudgeLevel: level,
-	};
-}
+export type Channel1State = SharedChannel1State;
 
 function sealDeliveredAfterUnconfirmedSend(
 	db: Database,
@@ -218,93 +121,6 @@ function toolResultText(content: readonly unknown[]): string {
 }
 
 /**
- * Sum approximate tokens of non-dropped tool output across Pi messages. Pi tool
- * output lives in `toolResult.content[].text` (not OpenCode's
- * `parts[].state.output`); the math is the shared `tailToolTokensFromStrings`.
- * `messages` is the post-injection wire array, already trimmed to the live tail.
- */
-export function computeTailToolTokensPi(messages: readonly unknown[]): number {
-	const outputs: string[] = [];
-	for (const m of messages) {
-		if (
-			m !== null &&
-			typeof m === "object" &&
-			(m as { role?: unknown }).role === "toolResult"
-		) {
-			const content = (m as { content?: unknown }).content;
-			if (Array.isArray(content)) outputs.push(toolResultText(content));
-		}
-	}
-	return tailToolTokensFromStrings(outputs);
-}
-
-function jsonTokens(value: unknown): number {
-	if (value === undefined || value === null) return 0;
-	try {
-		return legacyPiTokens(JSON.stringify(value));
-	} catch {
-		return 0;
-	}
-}
-
-function textTokens(content: unknown): number {
-	if (typeof content === "string") return legacyPiTokens(content);
-	if (!Array.isArray(content)) return 0;
-	let tokens = 0;
-	for (const part of content) {
-		if (!part || typeof part !== "object") continue;
-		const p = part as { type?: unknown; text?: unknown; thinking?: unknown };
-		if (typeof p.text === "string") tokens += legacyPiTokens(p.text);
-		else if (typeof p.thinking === "string")
-			tokens += legacyPiTokens(p.thinking);
-		else if (p.type === "image") tokens += 1200;
-	}
-	return tokens;
-}
-
-export function computeTailTokenEstimatePi(
-	messages: readonly unknown[],
-): TailTokenEstimate {
-	let tailToolTokens = 0;
-	let liveTailTokens = 0;
-	for (const raw of messages) {
-		if (!raw || typeof raw !== "object") continue;
-		const msg = raw as { role?: unknown; content?: unknown };
-		if (msg.role === "toolResult") {
-			const outputText = Array.isArray(msg.content)
-				? toolResultText(msg.content)
-				: typeof msg.content === "string"
-					? msg.content
-					: "";
-			const outputTokens =
-				outputText && !isDroppedToolOutput(outputText)
-					? legacyPiTokens(outputText)
-					: 0;
-			tailToolTokens += outputTokens;
-			liveTailTokens += outputTokens;
-			continue;
-		}
-		if (msg.role === "assistant" && Array.isArray(msg.content)) {
-			for (const part of msg.content) {
-				if (!part || typeof part !== "object") continue;
-				const p = part as {
-					type?: unknown;
-					name?: unknown;
-					arguments?: unknown;
-				};
-				if (p.type === "toolCall") {
-					if (typeof p.name === "string")
-						liveTailTokens += legacyPiTokens(p.name);
-					liveTailTokens += jsonTokens(p.arguments);
-				}
-			}
-		}
-		liveTailTokens += textTokens(msg.content);
-	}
-	return { tailToolTokens, liveTailTokens };
-}
-
-/**
  * Channel 1 decision for a just-finished tool result. Returns the reminder
  * TextContent block to append (so the caller's `tool_result` handler can return
  * `{ content: [...event.content, block] }`), or null when no nudge should fire.
@@ -330,35 +146,21 @@ export function maybeChannel1ReminderForToolResult(args: {
 	}
 
 	const text = toolResultText(args.content);
-	if (text.length === 0) return null;
 	// Content-based idempotency (bare `<system-reminder>` opener is the marker).
 	if (text.includes(CHANNEL1_SENTINEL)) return null;
 
-	// Accumulate this tool's tokens into the per-turn accumulator (prospective:
-	// not yet reflected in the baseline tail snapshot).
-	const deltaTokens = legacyPiTokens(text);
-	state.turnToolTokens += deltaTokens;
+	// The result enters the rendered tail on the next context pass. Until then,
+	// the recency reserve protects this newest tool output: it increases total
+	// tail tokens (T), while reclaimable tokens (U) remain unchanged.
+	const deltaTokens = measurePiToolResultDelta(args.content);
+	if (deltaTokens === 0) return null;
 	state.turnDeltaT += deltaTokens;
 
-	if (state.reducedSinceRefresh) return null;
-
-	const undroppedTokens = state.tailToolTokens + state.turnToolTokens;
-	const estimatedInputTokens = state.lastInputTokens + state.turnToolTokens;
-	const pressure =
-		state.contextLimit > 0 && state.executeThresholdPercentage > 0
-			? ((estimatedInputTokens / state.contextLimit) * 100) /
-				state.executeThresholdPercentage
-			: 0;
-	const workingWindowTokens = Math.round(
-		(state.contextLimit * state.executeThresholdPercentage) / 100,
-	);
-	const decision = decideLegacyPiChannel1({
-		undroppedTokens,
-		pressure,
-		estimatedInputTokens: state.lastInputTokens + state.turnToolTokens,
-		workingWindowTokens,
+	const decision = decideChannel1({
+		...state,
 		lastNudgeUndropped: getLastNudgeUndropped(db, sessionId),
 		lastNudgeLevel: getLastNudgeLevel(db, sessionId),
+		hasRecentReduce: state.reducedSinceRefresh,
 	});
 
 	setLastNudgeUndropped(db, sessionId, decision.nextLastNudge);
