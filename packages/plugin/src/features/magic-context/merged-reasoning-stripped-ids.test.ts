@@ -84,6 +84,31 @@ describe("trailing_blank_decisions", () => {
         );
     });
 
+    it("refreshes only the explicitly live newest assistant", () => {
+        addTrailingBlankDecisions(db, sessionId, [
+            ["assistant-historical", "strip"],
+            ["assistant-newest", "strip"],
+        ]);
+
+        expect(
+            addTrailingBlankDecisions(
+                db,
+                sessionId,
+                [
+                    ["assistant-historical", "keep"],
+                    ["assistant-newest", "keep"],
+                ],
+                { overwriteMessageId: "assistant-newest" },
+            ),
+        ).toBe(true);
+        expect(getTrailingBlankDecisions(db, sessionId)).toEqual(
+            new Map([
+                ["assistant-historical", "strip"],
+                ["assistant-newest", "keep"],
+            ]),
+        );
+    });
+
     it("removes decisions when the session is cleared", () => {
         addTrailingBlankDecisions(db, sessionId, [["assistant-keep", "keep"]]);
         clearSession(db, sessionId);

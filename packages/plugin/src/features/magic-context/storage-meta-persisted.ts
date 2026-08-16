@@ -2151,7 +2151,16 @@ export function addMergedReasoningStrippedIds(
 
 // ── Trailing assistant blank decisions (frozen replay map) ──
 
-export type PersistedTrailingBlankDecision = "keep" | "strip";
+export type PersistedTrailingBlankDecision = "keep" | `keep:${number}` | "strip";
+
+function isPersistedTrailingBlankDecision(value: unknown): value is PersistedTrailingBlankDecision {
+    if (value === "keep" || value === "strip") return true;
+    if (typeof value !== "string" || !value.startsWith("keep:")) return false;
+    const countText = value.slice("keep:".length);
+    if (!/^[1-9]\d*$/.test(countText)) return false;
+    const count = Number(countText);
+    return Number.isSafeInteger(count) && count > 1 && count <= 10_000;
+}
 
 function parseTrailingBlankDecisions(
     raw: string | null | undefined,
@@ -2162,7 +2171,7 @@ function parseTrailingBlankDecisions(
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return new Map();
         const decisions = new Map<string, PersistedTrailingBlankDecision>();
         for (const [id, decision] of Object.entries(parsed)) {
-            if (id.length > 0 && (decision === "keep" || decision === "strip")) {
+            if (id.length > 0 && isPersistedTrailingBlankDecision(decision)) {
                 decisions.set(id, decision);
             }
         }
@@ -2173,9 +2182,8 @@ function parseTrailingBlankDecisions(
 }
 
 /**
- * Record each assistant's trailing-blank choice when processing a pass that
- * invalidates cached context. Keep the choice unchanged for the session so
- * messages rebuilt later use the same shape.
+ * Read each assistant's replay choice. A historical choice is immutable; the live
+ * newest assistant may replace its choice until a later assistant freezes it.
  */
 export function getTrailingBlankDecisions(
     db: Database,
@@ -2187,11 +2195,12 @@ export function getTrailingBlankDecisions(
     return parseTrailingBlankDecisions(row?.trailing_blank_decisions);
 }
 
-/** Persist newly observed assistant decisions without overwriting an existing choice. */
+/** Persist new decisions, optionally refreshing the still-live newest assistant. */
 export function addTrailingBlankDecisions(
     db: Database,
     sessionId: string,
     additions: Iterable<readonly [string, PersistedTrailingBlankDecision]>,
+    options?: { overwriteMessageId?: string },
 ): boolean {
     const add = [...additions];
     if (add.length === 0) return true;
@@ -2205,7 +2214,11 @@ export function addTrailingBlankDecisions(
         const current = parseTrailingBlankDecisions(rawStored);
         let changed = false;
         for (const [id, decision] of add) {
-            if (!current.has(id)) {
+            const currentDecision = current.get(id);
+            if (
+                currentDecision === undefined ||
+                (id === options?.overwriteMessageId && currentDecision !== decision)
+            ) {
                 current.set(id, decision);
                 changed = true;
             }

@@ -3003,6 +3003,235 @@ describe("final message representation", () => {
         }
     });
 
+    it("freezes defer-served trailing shapes before late provider blanks arrive", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+
+        const fixtures = [
+            {
+                name: "tool-use-terminal",
+                firstParts: [
+                    {
+                        type: "reasoning",
+                        text: "signed thinking from the evidence turn",
+                        metadata: { anthropic: { signature: "sig-tool-use" } },
+                    },
+                    {
+                        type: "tool",
+                        callID: "call-terminal",
+                        tool: "TERMINAL",
+                        state: { status: "completed", input: { command: "pwd" }, output: "" },
+                    },
+                ],
+                decision: "strip",
+            },
+            {
+                name: "reasoning-terminal",
+                firstParts: [
+                    {
+                        type: "reasoning",
+                        text: "signed terminal thinking",
+                        metadata: { anthropic: { signature: "sig-reasoning" } },
+                    },
+                    { type: "text", text: "" },
+                ],
+                decision: "keep",
+            },
+            {
+                name: "text-terminal",
+                firstParts: [{ type: "text", text: "visible answer" }],
+                decision: "strip",
+            },
+            {
+                name: "structural-suffix",
+                firstParts: [
+                    { type: "text", text: "visible answer" },
+                    { type: "text", text: "" },
+                    { type: "text", text: "" },
+                ],
+                decision: "keep:2",
+            },
+            {
+                name: "wholly-blank",
+                firstParts: [{ type: "text", text: "" }],
+                decision: "keep",
+            },
+        ] as const;
+
+        for (const fixture of fixtures) {
+            const sessionId = `ses-defer-trailing-${fixture.name}`;
+            const targetId = `assistant-${fixture.name}`;
+            const firstMessages = [
+                {
+                    info: { id: targetId, role: "assistant" },
+                    parts: structuredClone(fixture.firstParts),
+                },
+            ] as unknown as MessageLike[];
+            const first = await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, firstMessages, {
+                    schedulerDecision: "defer",
+                    resolvedProviderID: "anthropic",
+                }),
+            );
+            const firstBytes = JSON.stringify(firstMessages[0].parts);
+
+            expect(first.bustedThisPass).toBe(false);
+            expect(getTrailingBlankDecisions(db, sessionId)).toEqual(
+                new Map([[targetId, fixture.decision]]),
+            );
+
+            const replayMessages = [
+                {
+                    info: { id: targetId, role: "assistant" },
+                    parts: [...structuredClone(fixture.firstParts), { type: "text", text: " " }],
+                },
+                {
+                    info: { id: `${targetId}-newest`, role: "assistant" },
+                    parts: [{ type: "text", text: "next turn" }],
+                },
+            ] as unknown as MessageLike[];
+            const replay = await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, replayMessages, {
+                    schedulerDecision: "defer",
+                    resolvedProviderID: "anthropic",
+                }),
+            );
+
+            expect(replay.bustedThisPass).toBe(false);
+            expect(JSON.stringify(replayMessages[0].parts)).toBe(firstBytes);
+        }
+    });
+
+    it("uses the last blank shape served while an assistant is still newest", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-trailing-live-newest";
+        const buildTarget = (includeTrailing: boolean) =>
+            ({
+                info: { id: "assistant-target", role: "assistant" },
+                parts: [
+                    {
+                        type: "reasoning",
+                        text: "signed thinking",
+                        metadata: { anthropic: { signature: "sig-live-newest" } },
+                    },
+                    { type: "tool", callID: "call-live", state: { status: "completed" } },
+                    ...(includeTrailing ? [{ type: "text", text: "" }] : []),
+                ],
+            }) as unknown as MessageLike;
+
+        const firstMessages = [buildTarget(false)];
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, firstMessages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+        expect(getTrailingBlankDecisions(db, sessionId)).toEqual(
+            new Map([["assistant-target", "strip"]]),
+        );
+
+        const stillNewestMessages = [buildTarget(true)];
+        const stillNewest = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, stillNewestMessages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+        const lastNewestBytes = JSON.stringify(stillNewestMessages[0].parts);
+        expect(stillNewest.bustedThisPass).toBe(false);
+        expect(stillNewestMessages[0].parts.at(-1)).toEqual({ type: "text", text: "" });
+        expect(getTrailingBlankDecisions(db, sessionId)).toEqual(
+            new Map([["assistant-target", "keep"]]),
+        );
+
+        const historicalMessages = [
+            buildTarget(true),
+            {
+                info: { id: "assistant-newest", role: "assistant" },
+                parts: [{ type: "text", text: "next turn" }],
+            },
+        ] as unknown as MessageLike[];
+        const historical = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, historicalMessages, {
+                schedulerDecision: "defer",
+                resolvedProviderID: "anthropic",
+            }),
+        );
+
+        expect(historical.bustedThisPass).toBe(false);
+        expect(JSON.stringify(historicalMessages[0].parts)).toBe(lastNewestBytes);
+    });
+
+    it("prevents a three-turn late-blank storm without opening the defer gate", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-three-turn-late-blank-storm";
+        const firstServedBytes = new Map<string, string>();
+        const buildAssistant = (turn: number, includeTrailing: boolean): MessageLike =>
+            ({
+                info: { id: `assistant-turn-${turn}`, role: "assistant" },
+                parts: [
+                    {
+                        type: "reasoning",
+                        text: `signed thinking ${turn}`,
+                        metadata: { anthropic: { signature: `sig-${turn}` } },
+                    },
+                    {
+                        type: "tool",
+                        callID: `call-${turn}`,
+                        tool: "TERMINAL",
+                        state: { status: "completed", input: {}, output: "" },
+                    },
+                    ...(includeTrailing ? [{ type: "text", text: " " }] : []),
+                ],
+            }) as unknown as MessageLike;
+
+        for (let currentTurn = 0; currentTurn <= 3; currentTurn += 1) {
+            const messages: MessageLike[] = [];
+            for (let turn = 0; turn <= currentTurn; turn += 1) {
+                messages.push(buildAssistant(turn, turn < currentTurn));
+                if (turn < currentTurn) {
+                    messages.push({
+                        info: { id: `user-turn-${turn + 1}`, role: "user" },
+                        parts: [{ type: "text", text: `continue ${turn + 1}` }],
+                    } as unknown as MessageLike);
+                }
+            }
+
+            const result = await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    schedulerDecision: "defer",
+                    resolvedProviderID: "anthropic",
+                }),
+            );
+            expect(result.bustedThisPass).toBe(false);
+
+            for (let turn = 0; turn <= currentTurn; turn += 1) {
+                const assistant = messages.find(
+                    (candidate) => candidate.info.id === `assistant-turn-${turn}`,
+                );
+                expect(assistant).toBeDefined();
+                const bytes = JSON.stringify(assistant?.parts);
+                const firstBytes = firstServedBytes.get(`assistant-turn-${turn}`);
+                if (firstBytes === undefined) {
+                    firstServedBytes.set(`assistant-turn-${turn}`, bytes);
+                } else {
+                    expect(bytes).toBe(firstBytes);
+                }
+            }
+        }
+
+        expect(getTrailingBlankDecisions(db, sessionId)).toEqual(
+            new Map([
+                ["assistant-turn-0", "strip"],
+                ["assistant-turn-1", "strip"],
+                ["assistant-turn-2", "strip"],
+                ["assistant-turn-3", "strip"],
+            ]),
+        );
+    });
+
     it("preserves the newest assistant reasoning through final representation", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);

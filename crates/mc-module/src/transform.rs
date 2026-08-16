@@ -5220,14 +5220,19 @@ fn apply_once(
             true,
         )?;
     }
-    let new_trailing_blank_units = new_trailing_blank_decision_units(
-        &core,
+    // Recheck trailing blanks on every pass, including deferred passes. The build
+    // above already applied stored decisions, so removing a provider-added blank
+    // from an older message restores its previously served bytes. On a deferred
+    // pass, record only the newest assistant because no cached message follows it.
+    let (trailing_blank_decisions_updated, newest_keep_updated) = refresh_trailing_blank_decisions(
+        &mut core,
         req,
         &built_output.messages,
         is_provider_prefix_mutation_pass,
     );
-    if !new_trailing_blank_units.is_empty() {
-        core.frozen_units.extend(new_trailing_blank_units);
+    if trailing_blank_decisions_updated > 0
+        && (is_provider_prefix_mutation_pass || newest_keep_updated)
+    {
         built_output = build_output_with_tags(
             &core,
             output_meta,
@@ -5508,6 +5513,36 @@ struct TailIdentityReAdoption {
     new_hash_prefix: String,
 }
 
+fn trailing_blank_identity_replays_stored(
+    req: &TransformRequest,
+    core: &CoreState,
+    mid: &str,
+    stored: &[BlockIdentity],
+) -> bool {
+    let Some(profile) = SerializerProfile::parse(&req.serializer_profile) else {
+        return false;
+    };
+    let Some(message) = req.messages.iter().find(|message| message.mid == mid) else {
+        return false;
+    };
+    let mut normalized = message.clone();
+    if apply_frozen_trailing_blank_decision(
+        core,
+        profile,
+        req.provider_id.as_deref(),
+        false,
+        mid,
+        &mut normalized.ck,
+    ) == 0
+    {
+        return false;
+    }
+    project_messages(std::slice::from_ref(&normalized))
+        .ok()
+        .and_then(|projection| projection.identity_by_mid.get(mid).cloned())
+        .is_some_and(|normalized_identity| normalized_identity == stored)
+}
+
 fn enforce_block_identity(
     meta: &ModuleMeta,
     req: &TransformRequest,
@@ -5525,6 +5560,25 @@ fn enforce_block_identity(
             continue;
         };
         if stored == vector {
+            continue;
+        }
+        // A provider may append an invisible suffix after a message was stored.
+        // Accept it only when the stored strip/keep decision reconstructs the full
+        // message identity that was previously served.
+        if trailing_blank_identity_replays_stored(req, core, mid, stored) {
+            if latest_assistant_reasoning_mutation_exempt_mid(&req.messages) == Some(mid.as_str())
+                && frozen_trailing_blank_decision(core, mid)
+                    == Some(FrozenTrailingBlankDecision::Strip)
+            {
+                // Keep a trailing blank visible while the newest assistant may still
+                // change, and update its stored identity as the decision becomes keep.
+                // Older assistants replay strip and retain their prior identity.
+                re_adoptions.push(TailIdentityReAdoption {
+                    mid: mid.clone(),
+                    old_hash_prefix: block_identity_hash_prefix(stored),
+                    new_hash_prefix: block_identity_hash_prefix(vector),
+                });
+            }
             continue;
         }
         if identity_drift_requires_reject(meta, req, core, mid) {
@@ -10981,11 +11035,22 @@ enum FrozenTrailingBlankDecision {
     Strip,
 }
 
+fn frozen_trailing_blank_keep_count(core: &CoreState, mid: &str) -> Option<usize> {
+    let unit = message_strip_unit(core, "trailing_blank_keep", mid)?;
+    if unit.frozen_payload.is_empty() {
+        return Some(1);
+    }
+    unit.frozen_payload
+        .parse::<usize>()
+        .ok()
+        .filter(|count| (2..=10_000).contains(count))
+}
+
 fn frozen_trailing_blank_decision(
     core: &CoreState,
     mid: &str,
 ) -> Option<FrozenTrailingBlankDecision> {
-    if message_strip_unit(core, "trailing_blank_keep", mid).is_some() {
+    if frozen_trailing_blank_keep_count(core, mid).is_some() {
         Some(FrozenTrailingBlankDecision::Keep)
     } else if message_strip_unit(core, "trailing_blank_strip", mid).is_some() {
         Some(FrozenTrailingBlankDecision::Strip)
@@ -11034,19 +11099,30 @@ fn apply_frozen_trailing_blank_decision(
     };
 
     let trailing_count = message.content.len() - last_meaningful_index - 1;
-    let keep_blank = decision == FrozenTrailingBlankDecision::Keep
-        || (decision == FrozenTrailingBlankDecision::Strip
-            && !newest_assistant_exempt
-            && trailing_count > 0
-            && is_reasoning_block(&message.content[last_meaningful_index]));
-    if keep_blank {
+    let keep_count = if decision == FrozenTrailingBlankDecision::Keep {
+        frozen_trailing_blank_keep_count(core, mid).unwrap_or(1)
+    } else if !newest_assistant_exempt
+        && trailing_count > 0
+        && is_reasoning_block(&message.content[last_meaningful_index])
+    {
+        1
+    } else {
+        0
+    };
+    if keep_count > 0 {
         let blank_index = last_meaningful_index + 1;
-        if trailing_count == 1 && message.content.get(blank_index) == Some(&canonical_blank) {
+        let suffix_is_canonical = trailing_count == keep_count
+            && message.content[blank_index..]
+                .iter()
+                .all(|block| block == &canonical_blank);
+        if suffix_is_canonical {
             return 0;
         }
-        let mutations = trailing_count.max(1);
+        let mutations = trailing_count.max(keep_count).max(1);
         message.content.truncate(blank_index);
-        message.content.push(canonical_blank);
+        message
+            .content
+            .extend((0..keep_count).map(|_| canonical_blank.clone()));
         message.mark_modified();
         return mutations;
     }
@@ -11059,41 +11135,81 @@ fn apply_frozen_trailing_blank_decision(
     trailing_count
 }
 
-fn new_trailing_blank_decision_units(
-    core: &CoreState,
+fn refresh_trailing_blank_decisions(
+    core: &mut CoreState,
     req: &TransformRequest,
     rendered_messages: &[ServedMessage],
-    can_mutate_provider_prefix: bool,
-) -> Vec<FrozenUnit> {
-    if !can_mutate_provider_prefix
-        || SerializerProfile::parse(&req.serializer_profile)
-            != Some(SerializerProfile::OpencodeAiSdk)
+    record_historical: bool,
+) -> (usize, bool) {
+    if SerializerProfile::parse(&req.serializer_profile) != Some(SerializerProfile::OpencodeAiSdk)
         || req.provider_id.as_deref() != Some("anthropic")
     {
-        return Vec::new();
+        return (0, false);
     }
 
-    let mut units = Vec::new();
+    let newest_assistant_mid = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
+    let mut updates = Vec::new();
     for rendered in rendered_messages {
         let Some(mid) = rendered.meta.harness_id.as_deref() else {
             continue;
         };
-        if rendered.role != "assistant" || frozen_trailing_blank_decision(core, mid).is_some() {
+        if rendered.role != "assistant" {
             continue;
         }
-        let kind = if rendered.content.is_empty()
-            || rendered
-                .content
-                .last()
-                .is_some_and(is_sentinel_invisible_text_block)
-        {
-            "trailing_blank_keep"
-        } else {
-            "trailing_blank_strip"
-        };
-        units.push(strip_unit(kind, mid, ""));
+        let trailing_count = rendered
+            .content
+            .iter()
+            .rev()
+            .take_while(|block| is_sentinel_invisible_text_block(block))
+            .count();
+        let (decision, keep_count) =
+            if rendered.content.is_empty() || trailing_count == rendered.content.len() {
+                (FrozenTrailingBlankDecision::Keep, 1)
+            } else if trailing_count == 0 {
+                (FrozenTrailingBlankDecision::Strip, 0)
+            } else if trailing_count <= 10_000 {
+                (FrozenTrailingBlankDecision::Keep, trailing_count)
+            } else {
+                continue;
+            };
+        let frozen = frozen_trailing_blank_decision(core, mid);
+        let frozen_matches = frozen == Some(decision)
+            && (decision == FrozenTrailingBlankDecision::Strip
+                || frozen_trailing_blank_keep_count(core, mid) == Some(keep_count));
+        if frozen.is_some() && (newest_assistant_mid != Some(mid) || frozen_matches) {
+            continue;
+        }
+        if frozen.is_none() && !record_historical && newest_assistant_mid != Some(mid) {
+            continue;
+        }
+        updates.push((mid.to_string(), decision, keep_count));
     }
-    units
+
+    let newest_keep_updated = updates.iter().any(|(mid, decision, _)| {
+        newest_assistant_mid == Some(mid.as_str()) && *decision == FrozenTrailingBlankDecision::Keep
+    });
+    let replaced_keys = updates
+        .iter()
+        .flat_map(|(mid, _, _)| {
+            [
+                format!("strip:trailing_blank_keep:{mid}"),
+                format!("strip:trailing_blank_strip:{mid}"),
+            ]
+        })
+        .collect::<HashSet<_>>();
+    core.frozen_units
+        .retain(|unit| !replaced_keys.contains(&unit.key));
+    for (mid, decision, keep_count) in &updates {
+        let (kind, payload) = match decision {
+            FrozenTrailingBlankDecision::Keep if *keep_count > 1 => {
+                ("trailing_blank_keep", keep_count.to_string())
+            }
+            FrozenTrailingBlankDecision::Keep => ("trailing_blank_keep", String::new()),
+            FrozenTrailingBlankDecision::Strip => ("trailing_blank_strip", String::new()),
+        };
+        core.frozen_units.push(strip_unit(kind, mid, &payload));
+    }
+    (updates.len(), newest_keep_updated)
 }
 
 fn apply_serializer_residual_to_message(
@@ -17571,6 +17687,230 @@ pub(crate) mod tests {
             &spine(),
         );
         assert_eq!(message_bytes(&replay, "blank"), blank_first_bytes);
+    }
+
+    #[test]
+    fn trailing_blank_decisions_freeze_and_replay_on_defer_passes() {
+        fn assistant(mid: &str, ordinal: u64, include_trailing: bool) -> CkIngressMessage {
+            let mut content = vec![
+                CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: format!("thinking-{mid}"),
+                    signature: Some(format!("sig-{mid}")),
+                }),
+                CkWireBlock::bare(ck_wire::CkKind::ToolCall {
+                    id: format!("call-{mid}"),
+                    name: "TERMINAL".to_string(),
+                    input: json!({ "command": "pwd" }),
+                    provider_executed: false,
+                }),
+            ];
+            if include_trailing {
+                content.push(canonical_blank_block());
+            }
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    content,
+                    None,
+                    ck_wire::ProviderExtras::new(),
+                    ck_wire::HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        fn result(mid: &str, ordinal: u64) -> CkIngressMessage {
+            tool_result(
+                &format!("result-{mid}"),
+                ordinal,
+                &format!("call-{mid}"),
+                "terminal output",
+            )
+        }
+
+        fn request(session: &str, messages: Vec<CkIngressMessage>) -> TransformRequest {
+            let mut request =
+                profile_req(SerializerProfile::OpencodeAiSdk, session, "cfg", messages);
+            request.provider_id = Some("anthropic".to_string());
+            request
+        }
+
+        fn message_bytes(response: &TransformResponse, mid: &str) -> Vec<u8> {
+            response
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some(mid))
+                .expect("target assistant must be served")
+                .canonical_bytes()
+                .to_vec()
+        }
+
+        fn bootstrap(store: &McStore, session: &str) {
+            let first = run(
+                store,
+                &request(session, vec![item("user-0", 1, "start")]),
+                &spine(),
+            );
+            assert_eq!(first.action, "HARD");
+        }
+
+        let storm_dir = tempfile::tempdir().unwrap();
+        let storm_store = store(storm_dir.path());
+        let storm_session = "trailing-blank-defer-storm";
+        bootstrap(&storm_store, storm_session);
+        let mut first_served = HashMap::<String, Vec<u8>>::new();
+
+        for current_turn in 0..=3u64 {
+            let mut messages = vec![item("user-0", 1, "start")];
+            for turn in 0..=current_turn {
+                let mid = format!("assistant-{turn}");
+                messages.push(assistant(&mid, turn * 2 + 2, turn < current_turn));
+                messages.push(result(&mid, turn * 2 + 3));
+            }
+
+            let response = run(&storm_store, &request(storm_session, messages), &spine());
+            assert_eq!(response.action, "SOFT+");
+            assert!(response.first_divergence.is_none());
+            for turn in 0..=current_turn {
+                let mid = format!("assistant-{turn}");
+                let bytes = message_bytes(&response, &mid);
+                if let Some(first_bytes) = first_served.get(&mid) {
+                    assert_eq!(
+                        &bytes, first_bytes,
+                        "a late blank changed {mid} during the defer storm"
+                    );
+                } else {
+                    first_served.insert(mid, bytes);
+                }
+            }
+        }
+
+        let storm_core = storm_store.load(storm_session).unwrap().core;
+        for turn in 0..=3u64 {
+            assert_eq!(
+                frozen_trailing_blank_decision(&storm_core, &format!("assistant-{turn}")),
+                Some(FrozenTrailingBlankDecision::Strip)
+            );
+        }
+
+        let newest_dir = tempfile::tempdir().unwrap();
+        let newest_store = store(newest_dir.path());
+        let newest_session = "trailing-blank-last-newest-shape";
+        bootstrap(&newest_store, newest_session);
+        let first = run(
+            &newest_store,
+            &request(
+                newest_session,
+                vec![
+                    item("user-0", 1, "start"),
+                    assistant("target", 2, false),
+                    result("target", 3),
+                ],
+            ),
+            &spine(),
+        );
+        assert_eq!(first.action, "SOFT+");
+        assert_eq!(
+            frozen_trailing_blank_decision(
+                &newest_store.load(newest_session).unwrap().core,
+                "target"
+            ),
+            Some(FrozenTrailingBlankDecision::Strip)
+        );
+
+        let still_newest = run(
+            &newest_store,
+            &request(
+                newest_session,
+                vec![
+                    item("user-0", 1, "start"),
+                    assistant("target", 2, true),
+                    result("target", 3),
+                ],
+            ),
+            &spine(),
+        );
+        assert_eq!(still_newest.action, "SOFT+");
+        let last_newest_bytes = message_bytes(&still_newest, "target");
+        assert_eq!(
+            frozen_trailing_blank_decision(
+                &newest_store.load(newest_session).unwrap().core,
+                "target"
+            ),
+            Some(FrozenTrailingBlankDecision::Keep)
+        );
+
+        let historical = run(
+            &newest_store,
+            &request(
+                newest_session,
+                vec![
+                    item("user-0", 1, "start"),
+                    assistant("target", 2, true),
+                    result("target", 3),
+                    assistant("newest", 4, false),
+                    result("newest", 5),
+                ],
+            ),
+            &spine(),
+        );
+        assert_eq!(historical.action, "SOFT+");
+        assert_eq!(message_bytes(&historical, "target"), last_newest_bytes);
+
+        let structural_dir = tempfile::tempdir().unwrap();
+        let structural_store = store(structural_dir.path());
+        let structural_session = "trailing-blank-structural-suffix";
+        bootstrap(&structural_store, structural_session);
+        let mut structural_target = assistant("structural", 2, false);
+        structural_target
+            .ck
+            .content
+            .extend([canonical_blank_block(), canonical_blank_block()]);
+        let first_structural = run(
+            &structural_store,
+            &request(
+                structural_session,
+                vec![
+                    item("user-0", 1, "start"),
+                    structural_target.clone(),
+                    result("structural", 3),
+                ],
+            ),
+            &spine(),
+        );
+        let structural_bytes = message_bytes(&first_structural, "structural");
+        assert_eq!(
+            frozen_trailing_blank_keep_count(
+                &structural_store.load(structural_session).unwrap().core,
+                "structural"
+            ),
+            Some(2)
+        );
+
+        structural_target.ck.content.push(canonical_blank_block());
+        let structural_replay = run(
+            &structural_store,
+            &request(
+                structural_session,
+                vec![
+                    item("user-0", 1, "start"),
+                    structural_target,
+                    result("structural", 3),
+                    assistant("newest", 4, false),
+                    result("newest", 5),
+                ],
+            ),
+            &spine(),
+        );
+        assert_eq!(structural_replay.action, "SOFT+");
+        assert_eq!(
+            message_bytes(&structural_replay, "structural"),
+            structural_bytes
+        );
     }
 
     #[test]
