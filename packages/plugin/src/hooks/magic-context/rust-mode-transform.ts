@@ -1122,6 +1122,14 @@ function mirrorRustSyntheticTodoAnchor(args: {
 }
 
 /** Single response-field seam for the parallel module encode-back contract. */
+function hasNativeResponseContent(response: Record<string, unknown>): boolean {
+    if (typeof response.native_messages === "string" || Array.isArray(response.native_messages)) {
+        return true;
+    }
+    const delta = response.native_messages_delta;
+    return isRecord(delta) && Array.isArray(delta.messages);
+}
+
 export function applyNativeMessagesVerbatim(
     output: { messages: unknown[] },
     response: Record<string, unknown>,
@@ -2333,17 +2341,22 @@ export function createRustModeTransform(
                 | ReturnType<typeof estimateFinalWireInputTokens>
                 | undefined;
             captureResponseTelemetry(response);
-            if (isNeedFullSync(response)) {
-                // A module restart can retain durable state while changing the accepted
-                // state-sync shape, so the next sync must re-probe its capabilities.
-                options.moduleClient.invalidateStateSyncCapabilities?.();
-                // need_full_sync is a WIRE-layer miss: the module (often freshly
-                // restarted, with its process-local Ready snapshot gone) cannot
-                // reconstruct the array from a tail delta. It says nothing about
-                // context.db state — the module's durable store survives restarts —
-                // so this arm must NOT re-seed state. A full state re-seed here
-                // cost 19-74s per pass on a live session (the SUBC loop) and
-                // hammered the module hard enough to crash-loop it.
+            const needFullSync = isNeedFullSync(response);
+            const nativeContentOmitted = !hasNativeResponseContent(response);
+            if (needFullSync || nativeContentOmitted) {
+                if (needFullSync) {
+                    // A module restart can retain durable state while changing the accepted
+                    // state-sync shape, so the next sync must re-probe its capabilities.
+                    options.moduleClient.invalidateStateSyncCapabilities?.();
+                } else {
+                    sessionLog(
+                        sessionId,
+                        "native_delta_fallback_reason=adapter_response_omitted_native_content retry=full",
+                    );
+                }
+                // A wire-cache miss or an invalid successful response says nothing about
+                // context.db state. Retry the transform with complete arrays, but do not
+                // re-seed durable state; that costs tens of seconds on giant sessions.
                 state.forceFullWire = true;
                 if (wireDelta) {
                     const retryOrdinalStartedAt = performance.now();
@@ -2455,6 +2468,11 @@ export function createRustModeTransform(
                     // failure ladder (LKG replay now, park after three) instead of
                     // letting an empty-output response masquerade as a served pass.
                     throw new Error("rust module still requires full sync after a full-array send");
+                }
+                if (!hasNativeResponseContent(response)) {
+                    throw new Error(
+                        "rust module omitted native content after a full-array retry",
+                    );
                 }
             }
             const deliveryPassIds = noteDeliveryPassIds(response);

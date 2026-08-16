@@ -3334,11 +3334,7 @@ mod tests {
         let models = vec!["prov/model-a".to_string()];
         let mut producer =
             ScriptedProducer::default().with_start(Err(HistorianProducerError::Subc(
-                subc_protocol::ErrorBody {
-                    code: "route_rejected".to_string(),
-                    message: "no such module".to_string(),
-                }
-                .into(),
+                subc_protocol::ErrorBody::new("route_rejected", "no such module").into(),
             )));
 
         let err = run_historian_firing(

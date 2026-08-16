@@ -2423,6 +2423,18 @@ impl BoundaryTokenCache {
 // cause unbounded cache growth.
 const NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const NATIVE_ATTACHMENT_CACHE_ENTRY_BUDGET_BYTES: usize = 192 * 1024 * 1024;
+// These three caches are independent by design: a serialized-output miss re-encodes canonical
+// CortexKit (CK) messages, while a projection or native-prefix miss either reconstructs from the
+// ready snapshot or asks
+// the adapter for a full request. No cache may interpret another cache's presence as authority.
+// Keep their aggregate process-retained ceiling explicit when any individual budget changes.
+const TRANSFORM_SERVE_CACHE_COMBINED_BUDGET_BYTES: usize = 768 * 1024 * 1024;
+const _: () = assert!(
+    transform::SERIALIZED_OUTPUT_CACHE_BUDGET_BYTES
+        + NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES
+        + PROJECTION_CACHE_BUDGET_BYTES
+        <= TRANSFORM_SERVE_CACHE_COMBINED_BUDGET_BYTES
+);
 
 #[derive(Debug, Clone)]
 struct NativeDeltaFrontier {
@@ -2450,6 +2462,29 @@ struct NativeEncodedChunk {
     retained_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeDeltaFallbackReason {
+    MissingCacheState,
+    FingerprintMismatch,
+    CacheContextMismatch,
+    InvalidFrontier,
+    NoReusableOutput,
+    MissingNativeContent,
+}
+
+impl NativeDeltaFallbackReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingCacheState => "missing_cache_state",
+            Self::FingerprintMismatch => "fingerprint_mismatch",
+            Self::CacheContextMismatch => "cache_context_mismatch",
+            Self::InvalidFrontier => "invalid_frontier",
+            Self::NoReusableOutput => "no_reusable_output",
+            Self::MissingNativeContent => "missing_native_content",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct NativeAttachmentCacheStats {
     reused_messages: usize,
@@ -2458,6 +2493,7 @@ struct NativeAttachmentCacheStats {
     refused_store: usize,
     degraded_store: usize,
     evicted: usize,
+    delta_fallback_reason: Option<NativeDeltaFallbackReason>,
 }
 
 #[derive(Debug, Clone)]
@@ -8255,23 +8291,17 @@ impl McHandler {
         } else {
             NativeAttachmentCacheStats::default()
         };
-        if let Some(frontier) = native_delta_frontier.as_ref() {
-            if native_cache_stats.reused_messages > 0 {
-                if let Some(mut native_messages) = response.native_messages.take() {
-                    let replace_from = native_cache_stats.reused_messages;
-                    if replace_from <= native_messages.len() {
-                        let messages = native_messages.split_off(replace_from);
-                        response.native_messages_delta = Some(transform::NativeMessagesDelta {
-                            after: frontier.after.clone(),
-                            replace_from,
-                            messages,
-                        });
-                    } else {
-                        response.native_messages = Some(native_messages);
-                    }
-                }
-            }
-        }
+        finalize_native_messages_response(
+            &mut response,
+            &parsed,
+            reasoning_watermark,
+            &tag_numbers,
+            mutation_exempt_mid.as_deref(),
+            lineage_anchor_mid.as_deref(),
+            transition_consumed,
+            native_delta_frontier.as_ref(),
+            native_cache_stats,
+        );
         let native_attach_ms = native_attach_started_at.elapsed().as_secs_f64() * 1_000.0;
         let trace_complete_started_at = Instant::now();
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
@@ -8810,7 +8840,9 @@ impl McHandler {
                 let outcome = self.apply_state_sync_wire(&binding, &store, assembled);
                 let completed_result = match &outcome {
                     HandlerOutcome::Response(bytes) => Some(bytes.clone()),
-                    HandlerOutcome::Error { .. } | HandlerOutcome::Streamed => None,
+                    HandlerOutcome::Error { .. }
+                    | HandlerOutcome::ErrorWithDetail { .. }
+                    | HandlerOutcome::Streamed => None,
                 };
                 let mut seeds = self.state_sync_seeds.lock().expect("state sync seed mutex");
                 let phase = {
@@ -9301,7 +9333,9 @@ impl McHandler {
                     .await;
                 let completed_result = match &outcome {
                     HandlerOutcome::Response(bytes) => Some(bytes.clone()),
-                    HandlerOutcome::Error { .. } | HandlerOutcome::Streamed => None,
+                    HandlerOutcome::Error { .. }
+                    | HandlerOutcome::ErrorWithDetail { .. }
+                    | HandlerOutcome::Streamed => None,
                 };
                 let mut transforms = self.transform_pages.lock().expect("transform page mutex");
                 let phase = {
@@ -11805,6 +11839,25 @@ fn attach_native_messages_incremental(
         .map(|(index, mid)| (mid.as_str(), index))
         .collect::<HashMap<_, _>>();
     let context = native_attachment_context(request, transition_consumed);
+    let delta_fallback_reason = native_delta_frontier.and_then(|frontier| {
+        let Some(snapshot) = cached.as_ref() else {
+            return Some(NativeDeltaFallbackReason::MissingCacheState);
+        };
+        if snapshot.full_array_fingerprint.as_deref() != Some(frontier.after.as_str()) {
+            return Some(NativeDeltaFallbackReason::FingerprintMismatch);
+        }
+        if snapshot.context != context {
+            return Some(NativeDeltaFallbackReason::CacheContextMismatch);
+        }
+        let native_len = request.native_messages.as_deref().map_or(0, <[Value]>::len);
+        if frontier.native_replace_from > native_len
+            || frontier.native_prefix.len() != frontier.native_replace_from
+            || frontier.native_prefix_retained_bytes.len() != frontier.native_replace_from
+        {
+            return Some(NativeDeltaFallbackReason::InvalidFrontier);
+        }
+        None
+    });
     let mutation_exempt_mids = [mutation_exempt_mid, lineage_anchor_mid]
         .into_iter()
         .flatten()
@@ -12015,6 +12068,10 @@ fn attach_native_messages_incremental(
         reused_messages: suffix_start,
         encoded_messages: message_keys.len().saturating_sub(suffix_start),
         request_native_retained_bytes,
+        delta_fallback_reason: delta_fallback_reason.or_else(|| {
+            (native_delta_frontier.is_some() && suffix_start == 0)
+                .then_some(NativeDeltaFallbackReason::NoReusableOutput)
+        }),
         ..Default::default()
     };
     let served_bytes = response
@@ -12044,6 +12101,82 @@ fn attach_native_messages_incremental(
         );
     response.native_messages = Some(native_messages);
     stats
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_native_messages_response(
+    response: &mut transform::TransformResponse,
+    request: &TransformRequest,
+    reasoning_watermark: u64,
+    tag_numbers: &BTreeMap<String, u64>,
+    mutation_exempt_mid: Option<&str>,
+    lineage_anchor_mid: Option<&str>,
+    transition_consumed: bool,
+    native_delta_frontier: Option<&NativeDeltaFrontier>,
+    native_cache_stats: NativeAttachmentCacheStats,
+) {
+    if !request.serve_native {
+        return;
+    }
+
+    let mut fallback_reason = native_cache_stats.delta_fallback_reason;
+    if let Some(frontier) = native_delta_frontier {
+        if fallback_reason.is_none() && native_cache_stats.reused_messages > 0 {
+            match response.native_messages.take() {
+                Some(mut native_messages)
+                    if native_cache_stats.reused_messages <= native_messages.len() =>
+                {
+                    let messages = native_messages.split_off(native_cache_stats.reused_messages);
+                    response.native_messages_delta = Some(transform::NativeMessagesDelta {
+                        after: frontier.after.clone(),
+                        replace_from: native_cache_stats.reused_messages,
+                        messages,
+                    });
+                }
+                Some(native_messages) => {
+                    response.native_messages = Some(native_messages);
+                    fallback_reason = Some(NativeDeltaFallbackReason::InvalidFrontier);
+                }
+                None => {
+                    fallback_reason = Some(NativeDeltaFallbackReason::MissingNativeContent);
+                }
+            }
+        }
+    } else {
+        // Callers without a frontier cannot reconstruct a suffix, even if an unexpected
+        // pre-existing delta reached this seam. Preserve backward compatibility with a full serve.
+        response.native_messages_delta = None;
+    }
+
+    if response.native_messages.is_none() && response.native_messages_delta.is_none() {
+        fallback_reason.get_or_insert(NativeDeltaFallbackReason::MissingNativeContent);
+        response.native_messages = Some(
+            encode_full_native_messages(
+                response.messages(),
+                request,
+                reasoning_watermark,
+                tag_numbers,
+                mutation_exempt_mid,
+                lineage_anchor_mid,
+                transition_consumed,
+            )
+            .into_iter()
+            .map(Arc::new)
+            .collect(),
+        );
+    }
+
+    if let Some(reason) = fallback_reason {
+        eprintln!(
+            "native-delta fallback session={} native_delta_fallback_reason={}",
+            request.session_id,
+            reason.as_str(),
+        );
+    }
+    debug_assert!(
+        response.native_messages.is_some() || response.native_messages_delta.is_some(),
+        "successful serve_native response must carry full or delta native content"
+    );
 }
 
 fn state_import_validation_error(error: StateImportValidationError) -> HandlerOutcome {
@@ -17263,6 +17396,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_response_release_guard_full_serializes_without_frontier() {
+        let request = native_cache_request(
+            "native-release-guard",
+            vec![ck("guard-message", 1, "hello")],
+            vec![native_text_message("guard-message", "user", "hello")],
+            "guard-fingerprint",
+        );
+        let mut response = transform::TransformResponse::passthrough(
+            request
+                .messages
+                .iter()
+                .map(|message| message.ck.clone())
+                .collect(),
+            request.full_array_fingerprint.clone(),
+        );
+
+        finalize_native_messages_response(
+            &mut response,
+            &request,
+            1,
+            &BTreeMap::new(),
+            None,
+            None,
+            false,
+            None,
+            NativeAttachmentCacheStats::default(),
+        );
+
+        assert!(response.native_messages.is_some());
+        assert!(response.native_messages_delta.is_none());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn cold_soft_plus_full_sync_primes_the_next_tail_delta() {
         let producer = Arc::new(ProducerState::default());
@@ -18736,6 +18902,185 @@ mod tests {
         assert_ne!(
             native_charge, projection_charge,
             "projection bytes must not be double-charged onto the native LRU"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_mismatched_native_delta_cache_serves_full_output() {
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let session = "native-delta-fingerprint-mismatch";
+        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+
+        let initial = native_cache_request(
+            session,
+            vec![
+                ck("mismatch-prefix", 1, "prefix"),
+                ck("mismatch-tail", 2, "before"),
+            ],
+            vec![
+                native_text_message("mismatch-prefix", "user", "prefix"),
+                native_text_message("mismatch-tail", "user", "before"),
+            ],
+            "mismatch-fp-1",
+        );
+        let first =
+            call_transform_request_on_channel(&handler, 7, serde_json::to_value(initial).unwrap())
+                .await;
+        assert_eq!(first["status"], "ok", "{first}");
+        assert!(first["native_messages"].is_array(), "{first}");
+
+        handler
+            .native_attachments
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(session)
+            .expect("initial native attachment snapshot")
+            .snapshot
+            .full_array_fingerprint = Some("stale-native-cache-fingerprint".to_string());
+
+        let mut delta = native_cache_request(
+            session,
+            vec![ck("mismatch-tail", 2, "after")],
+            vec![native_text_message("mismatch-tail", "user", "after")],
+            "mismatch-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "mismatch-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 1,
+        }));
+        let response =
+            call_transform_request_on_channel(&handler, 7, serde_json::to_value(delta).unwrap())
+                .await;
+
+        assert_eq!(response["status"], "ok", "{response}");
+        assert!(
+            response["native_messages"].is_array(),
+            "a mismatched attachment snapshot must fall back to a full native serve: {response}"
+        );
+        assert!(
+            response.get("native_messages_delta").is_none(),
+            "{response}"
+        );
+        assert_eq!(
+            handler
+                .native_attachments
+                .lock()
+                .unwrap()
+                .stats(session)
+                .delta_fallback_reason
+                .map(NativeDeltaFallbackReason::as_str),
+            Some("fingerprint_mismatch")
+        );
+
+        let mut healed_delta = native_cache_request(
+            session,
+            vec![ck("mismatch-tail", 2, "after-heal")],
+            vec![native_text_message("mismatch-tail", "user", "after-heal")],
+            "mismatch-fp-3",
+        );
+        healed_delta.tail_delta = Some(json!({
+            "after": "mismatch-fp-2",
+            "replace_from": 1,
+            "native_replace_from": 1,
+        }));
+        let healed = call_transform_request_on_channel(
+            &handler,
+            7,
+            serde_json::to_value(healed_delta).unwrap(),
+        )
+        .await;
+        assert_eq!(healed["status"], "ok", "{healed}");
+        assert!(healed["native_messages_delta"].is_object(), "{healed}");
+        assert!(healed.get("native_messages").is_none(), "{healed}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_native_delta_cache_eviction_self_heals_full_then_delta() {
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let session = "native-delta-eviction-heal";
+        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+
+        let initial = native_cache_request(
+            session,
+            vec![ck("evict-prefix", 1, "prefix"), ck("evict-tail", 2, "zero")],
+            vec![
+                native_text_message("evict-prefix", "user", "prefix"),
+                native_text_message("evict-tail", "user", "zero"),
+            ],
+            "evict-fp-0",
+        );
+        let cold =
+            call_transform_request_on_channel(&handler, 7, serde_json::to_value(initial).unwrap())
+                .await;
+        assert!(cold["native_messages"].is_array(), "{cold}");
+
+        let delta_request = |after: &str, fingerprint: &str, text: &str| {
+            let mut delta = native_cache_request(
+                session,
+                vec![ck("evict-tail", 2, text)],
+                vec![native_text_message("evict-tail", "user", text)],
+                fingerprint,
+            );
+            delta.tail_delta = Some(json!({
+                "after": after,
+                "replace_from": 1,
+                "native_replace_from": 1,
+            }));
+            serde_json::to_value(delta).unwrap()
+        };
+
+        let pass_n = call_transform_request_on_channel(
+            &handler,
+            7,
+            delta_request("evict-fp-0", "evict-fp-1", "one"),
+        )
+        .await;
+        assert!(pass_n["native_messages_delta"].is_object(), "{pass_n}");
+        assert!(pass_n.get("native_messages").is_none(), "{pass_n}");
+
+        handler.native_attachments.lock().unwrap().remove(session);
+        let pass_n_plus_1 = call_transform_request_on_channel(
+            &handler,
+            7,
+            delta_request("evict-fp-1", "evict-fp-2", "two"),
+        )
+        .await;
+        assert!(
+            pass_n_plus_1["native_messages"].is_array(),
+            "{pass_n_plus_1}"
+        );
+        assert!(
+            pass_n_plus_1.get("native_messages_delta").is_none(),
+            "{pass_n_plus_1}"
+        );
+        assert_eq!(
+            handler
+                .native_attachments
+                .lock()
+                .unwrap()
+                .stats(session)
+                .delta_fallback_reason
+                .map(NativeDeltaFallbackReason::as_str),
+            Some("missing_cache_state")
+        );
+
+        let pass_n_plus_2 = call_transform_request_on_channel(
+            &handler,
+            7,
+            delta_request("evict-fp-2", "evict-fp-3", "three"),
+        )
+        .await;
+        assert!(
+            pass_n_plus_2["native_messages_delta"].is_object(),
+            "{pass_n_plus_2}"
+        );
+        assert!(
+            pass_n_plus_2.get("native_messages").is_none(),
+            "{pass_n_plus_2}"
         );
     }
 
@@ -28575,7 +28920,8 @@ mod tests {
         let errors = outcomes
             .into_iter()
             .filter_map(|outcome| match outcome {
-                HandlerOutcome::Error { code, .. } => Some(code),
+                HandlerOutcome::Error { code, .. }
+                | HandlerOutcome::ErrorWithDetail { code, .. } => Some(code),
                 HandlerOutcome::Response(_) | HandlerOutcome::Streamed => None,
             })
             .collect::<Vec<_>>();
@@ -28649,7 +28995,9 @@ mod tests {
         assert!(matches!(absent, HandlerOutcome::Response(_)), "{absent:?}");
         let absent_response = match &absent {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(bytes).unwrap(),
-            HandlerOutcome::Error { .. } | HandlerOutcome::Streamed => Value::Null,
+            HandlerOutcome::Error { .. }
+            | HandlerOutcome::ErrorWithDetail { .. }
+            | HandlerOutcome::Streamed => Value::Null,
         };
         assert_eq!(absent_response["memories_skipped"], json!(true));
         assert!(store
@@ -28704,7 +29052,9 @@ mod tests {
         assert!(matches!(workspace, HandlerOutcome::Response(_)));
         let workspace_response = match &workspace {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(bytes).unwrap(),
-            HandlerOutcome::Error { .. } | HandlerOutcome::Streamed => Value::Null,
+            HandlerOutcome::Error { .. }
+            | HandlerOutcome::ErrorWithDetail { .. }
+            | HandlerOutcome::Streamed => Value::Null,
         };
         assert_eq!(workspace_response["memories_skipped"], json!(true));
         assert!(store
