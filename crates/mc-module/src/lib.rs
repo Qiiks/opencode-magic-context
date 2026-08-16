@@ -7806,26 +7806,22 @@ impl McHandler {
             // The established historian namespace remains accepted for compatibility with
             // existing producer sessions. Dreamer IDs instead require registration and route
             // validation before they may bypass the transform.
+            if parsed.tail_delta.is_some() {
+                return need_full_sync_response(&parsed);
+            }
             ticket.accept();
-            let mut response = transform::TransformResponse::passthrough(
-                parsed.messages.iter().map(|m| m.ck.clone()).collect(),
-                parsed.full_array_fingerprint.clone(),
-            );
-            attach_native_messages(&mut response, &parsed, 0, None);
-            return respond(serde_json::to_value(response).unwrap_or(Value::Null));
+            return passthrough_transform_response(&parsed);
         }
         if self.dreamer_run_registered(&parsed.session_id) {
             // Registration is the authority for a dreamer exemption. Validate the route
             // before trusting it so a stale or cross-project channel cannot bypass transform.
             match self.resolve_binding(channel, &parsed.session_id) {
                 Ok(_) => {
+                    if parsed.tail_delta.is_some() {
+                        return need_full_sync_response(&parsed);
+                    }
                     ticket.accept();
-                    let mut response = transform::TransformResponse::passthrough(
-                        parsed.messages.iter().map(|m| m.ck.clone()).collect(),
-                        parsed.full_array_fingerprint.clone(),
-                    );
-                    attach_native_messages(&mut response, &parsed, 0, None);
-                    return respond(serde_json::to_value(response).unwrap_or(Value::Null));
+                    return passthrough_transform_response(&parsed);
                 }
                 Err(BindingError::Unbound) => {
                     return HandlerOutcome::Error {
@@ -7919,7 +7915,7 @@ impl McHandler {
             let expanded = self.expand_transform_tail_delta(&mut parsed);
             delta_expand_ms = delta_expand_started_at.elapsed().as_secs_f64() * 1_000.0;
             let Some(frontier) = expanded else {
-                return need_full_sync_response(parsed.full_array_fingerprint.clone());
+                return need_full_sync_response(&parsed);
             };
             Some(frontier)
         } else {
@@ -8372,7 +8368,7 @@ impl McHandler {
             timings.native_cache_evicted = native_cache_stats.evicted;
             timings.post_attach = post_attach_started_at.elapsed().as_secs_f64() * 1_000.0;
         }
-        respond_transform(&parsed.session_id, response)
+        respond_transform(&parsed, response)
     }
 
     fn state_sync_seed_now(&self) -> Instant {
@@ -12200,12 +12196,23 @@ fn state_import_validation_error(error: StateImportValidationError) -> HandlerOu
     }
 }
 
-fn need_full_sync_response(full_array_fingerprint: Option<String>) -> HandlerOutcome {
-    respond(
-        serde_json::to_value(transform::TransformResponse::need_full_sync(
-            full_array_fingerprint,
-        ))
-        .unwrap_or(Value::Null),
+fn passthrough_transform_response(request: &TransformRequest) -> HandlerOutcome {
+    let mut response = transform::TransformResponse::passthrough(
+        request
+            .messages
+            .iter()
+            .map(|message| message.ck.clone())
+            .collect(),
+        request.full_array_fingerprint.clone(),
+    );
+    attach_native_messages(&mut response, request, 0, None);
+    respond_transform(request, response)
+}
+
+fn need_full_sync_response(request: &TransformRequest) -> HandlerOutcome {
+    respond_transform(
+        request,
+        transform::TransformResponse::need_full_sync(request.full_array_fingerprint.clone()),
     )
 }
 
@@ -12369,7 +12376,7 @@ fn apply_drive_fault(response: &mut transform::TransformResponse, fault: DriveFa
 }
 
 fn respond_transform(
-    session_id: &str,
+    request: &TransformRequest,
     mut response: transform::TransformResponse,
 ) -> HandlerOutcome {
     // drive-fault: corrupt the response before it is serialized (see the SAFETY note
@@ -12395,6 +12402,23 @@ fn respond_transform(
             _ => {} // exhausted — response passes through cleanly
         }
     }
+    if response.status == transform::TransformStatus::Ok && request.tail_delta.is_some() {
+        return HandlerOutcome::Error {
+            code: "transform_delta_unexpanded".to_string(),
+            message: "successful transform response retained an unexpanded tail_delta".to_string(),
+        };
+    }
+    if response.status == transform::TransformStatus::Ok
+        && request.serve_native
+        && response.native_messages.is_none()
+        && response.native_messages_delta.is_none()
+    {
+        return HandlerOutcome::Error {
+            code: "transform_native_response_omitted".to_string(),
+            message: "successful serve_native response omitted native content".to_string(),
+        };
+    }
+    let session_id = &request.session_id;
     let response_encode_started_at = Instant::now();
     let pass_timings = response.timings.clone();
     let messages = response.ck_messages.take();
@@ -16871,9 +16895,8 @@ mod tests {
         );
         let expected =
             serde_json::to_vec(&serde_json::to_value(response.clone()).unwrap()).unwrap();
-        let HandlerOutcome::Response(actual) =
-            respond_transform("serialized-output-cache", response)
-        else {
+        let request = transform_request(vec![ck("wire-byte-cache", 1, "hello")], 1, 100);
+        let HandlerOutcome::Response(actual) = respond_transform(&request, response) else {
             panic!("cached transform response failed to encode");
         };
         assert_eq!(actual, expected);
@@ -17441,6 +17464,28 @@ mod tests {
 
         assert!(response.native_messages.is_some());
         assert!(response.native_messages_delta.is_none());
+    }
+
+    #[test]
+    fn transform_response_seam_turns_native_omission_into_a_typed_refusal() {
+        let request = native_cache_request(
+            "native-response-seam",
+            vec![ck("seam-message", 1, "hello")],
+            vec![native_text_message("seam-message", "user", "hello")],
+            "seam-fingerprint",
+        );
+        let response = transform::TransformResponse::passthrough(
+            request
+                .messages
+                .iter()
+                .map(|message| message.ck.clone())
+                .collect(),
+            request.full_array_fingerprint.clone(),
+        );
+
+        let outcome = respond_transform(&request, response);
+
+        assert_eq!(error_code(outcome), "transform_native_response_omitted");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -20187,6 +20232,92 @@ mod tests {
         assert_eq!(child["action"], "PASSTHROUGH");
         assert_eq!(child["ck_messages"].as_array().unwrap().len(), 1);
         assert_eq!(child["ck_messages"][0]["role"], "user");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_passthrough_refuses_an_unexpanded_native_tail_delta() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let session = format!("{}native-child", historian::MC_CHILD_SESSION_PREFIX);
+
+        let first = native_cache_request(
+            &session,
+            vec![
+                ck("child-prefix", 1, "prefix"),
+                ck("child-tail", 2, "before"),
+            ],
+            vec![
+                native_text_message("child-prefix", "user", "prefix"),
+                native_text_message("child-tail", "user", "before"),
+            ],
+            "child-fp-1",
+        );
+        let first = call_transform_request(&handler, serde_json::to_value(first).unwrap()).await;
+        assert_eq!(first["status"], "ok", "{first}");
+        assert_eq!(first["native_messages"].as_array().map(Vec::len), Some(2));
+
+        let mut delta = native_cache_request(
+            &session,
+            vec![ck("child-tail", 2, "after")],
+            vec![native_text_message("child-tail", "user", "after")],
+            "child-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "child-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 1,
+        }));
+        let refused = call_transform_request(&handler, serde_json::to_value(delta).unwrap()).await;
+
+        assert_eq!(refused["status"], "need_full_sync", "{refused}");
+        assert!(refused.get("native_messages").is_none(), "{refused}");
+        assert!(refused.get("native_messages_delta").is_none(), "{refused}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn registered_dreamer_passthrough_refuses_an_unexpanded_native_tail_delta() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(producer, default_test_config());
+        let session = "native-dreamer";
+        handler.bind_route(7, binding(project.to_str().unwrap(), session));
+        let _registration = handler.register_dreamer_run(session);
+
+        let first = native_cache_request(
+            session,
+            vec![
+                ck("dreamer-prefix", 1, "prefix"),
+                ck("dreamer-tail", 2, "before"),
+            ],
+            vec![
+                native_text_message("dreamer-prefix", "user", "prefix"),
+                native_text_message("dreamer-tail", "user", "before"),
+            ],
+            "dreamer-fp-1",
+        );
+        let first =
+            call_transform_request_on_channel(&handler, 7, serde_json::to_value(first).unwrap())
+                .await;
+        assert_eq!(first["status"], "ok", "{first}");
+        assert_eq!(first["native_messages"].as_array().map(Vec::len), Some(2));
+
+        let mut delta = native_cache_request(
+            session,
+            vec![ck("dreamer-tail", 2, "after")],
+            vec![native_text_message("dreamer-tail", "user", "after")],
+            "dreamer-fp-2",
+        );
+        delta.tail_delta = Some(json!({
+            "after": "dreamer-fp-1",
+            "replace_from": 1,
+            "native_replace_from": 1,
+        }));
+        let refused =
+            call_transform_request_on_channel(&handler, 7, serde_json::to_value(delta).unwrap())
+                .await;
+
+        assert_eq!(refused["status"], "need_full_sync", "{refused}");
+        assert!(refused.get("native_messages").is_none(), "{refused}");
+        assert!(refused.get("native_messages_delta").is_none(), "{refused}");
     }
 
     #[tokio::test(flavor = "current_thread")]
