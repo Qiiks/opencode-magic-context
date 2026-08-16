@@ -249,6 +249,18 @@ export interface PreparedConfigUpdate {
     configPaths: [string, string];
 }
 
+export function hasExplicitNonExactPluginVersion(spec: string): boolean {
+    if (!spec.startsWith(`${PACKAGE_NAME}@`)) return false;
+    return !isValidSemver(spec.slice(PACKAGE_NAME.length + 1));
+}
+
+function isExactOrBarePluginSpec(spec: string): boolean {
+    return (
+        spec === PACKAGE_NAME ||
+        (spec.startsWith(`${PACKAGE_NAME}@`) && !hasExplicitNonExactPluginVersion(spec))
+    );
+}
+
 function configUpdateContent(content: string, version: string): string | null {
     const parsed = parseJsonConfig(content);
     if (!parsed) return null;
@@ -256,7 +268,7 @@ function configUpdateContent(content: string, version: string): string | null {
     const current = entries.find(
         (entry) => entry === PACKAGE_NAME || entry.startsWith(`${PACKAGE_NAME}@`),
     );
-    if (!current) return null;
+    if (!current || !isExactOrBarePluginSpec(current)) return null;
 
     const escaped = current.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const entryRegex = new RegExp(`(["'])${escaped}\\1`);
