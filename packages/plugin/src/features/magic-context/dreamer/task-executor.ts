@@ -189,6 +189,23 @@ function loadActiveMemoryPromptMemories(
     return memories.map((memory) => toCuratePromptMemory(memory, verificationById));
 }
 
+const TEXTUAL_CURATE_TOOL_CALL_PATTERNS = [
+    /\[\s*historical tool call\s*\][\s\S]*?(?:^|\n)\s*name\s*:\s*ctx_memory\b[\s\S]*?(?:^|\n)\s*arguments\s*:/im,
+    /(?:^|\n)\s*name\s*:\s*ctx_memory\b[\s\S]*?(?:^|\n)\s*arguments\s*:/im,
+    /(?:^|\n)\s*(?:```[^\n]*\n\s*)?ctx_memory\s*\(\s*action\s*=/im,
+    /["']name["']\s*:\s*["']ctx_memory["'][\s\S]*?["']arguments["']\s*:/i,
+] as const;
+
+/** Reject serialized or hand-written ctx_memory invocations. They are assistant
+ * text, not executable tool parts, so accepting one would leave its mutation
+ * unapplied while recording the whole curate run as complete. */
+function validateCurateAssistantText(text: string): string {
+    if (TEXTUAL_CURATE_TOOL_CALL_PATTERNS.some((pattern) => pattern.test(text))) {
+        throw new Error("Curate returned an unresolved textual ctx_memory tool call.");
+    }
+    return text;
+}
+
 /**
  * Build the TaskExecutor the v2 scheduler drives. The scheduler owns the keyed
  * domain lease + holderId and hands them in; this executor runs one task's actual
@@ -1223,7 +1240,7 @@ async function runAgenticTask(
                 validateOutput: (messages) => {
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("Dreamer returned no assistant output.");
-                    return text;
+                    return task === "curate" ? validateCurateAssistantText(text) : text;
                 },
             },
         );
