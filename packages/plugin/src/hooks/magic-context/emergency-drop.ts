@@ -17,6 +17,7 @@
 //   - All accounting is in TOKENS. Tags store BYTES, so we convert with the one
 //     canonical estimator (`TOKENS_PER_BYTE`, shared with the Phase 1 nudge).
 
+import { newestCtxReduceTagNumbers } from "../../features/magic-context/reclaim-protection";
 import { TOKENS_PER_BYTE } from "./ctx-reduce-nudge";
 
 /** Reclaim target = fixedFloor + TARGET_FRACTION × (ceiling − fixedFloor). */
@@ -225,6 +226,14 @@ export function planEmergencyDrop(input: {
         }
     }
 
+    // Protect the same newest ctx_reduce exemplars even though resolveToolTier
+    // classifies them as T3. This is safe without changing the target math:
+    // fixedFloor above derives from every active floor tag, so removing candidates
+    // changes neither the floor nor the target (panel-verified emergency interaction).
+    const protectedCtxReduceTags = newestCtxReduceTagNumbers(
+        floorTags.filter((tag) => tag.status === "active" && tag.type === "tool"),
+    );
+
     // Build evictable candidates per tier. Only active tags are eligible, so a
     // tag dropped on a prior pass (now status!=='active') is never re-selected —
     // that, plus the input-sample latch above, is the full idempotence story.
@@ -232,6 +241,7 @@ export function planEmergencyDrop(input: {
     for (const tag of tags) {
         if (tag.status !== "active" || tag.type !== "tool") continue;
         if (tag.tagNumber > protectedCutoff) continue; // global protected tail
+        if (protectedCtxReduceTags.has(tag.tagNumber)) continue;
         const tier = resolveToolTier(tag.toolName);
         if ((tier === 1 || tier === 2) && reserved.has(tag.tagNumber)) continue;
         byTier[tier].push(tag);

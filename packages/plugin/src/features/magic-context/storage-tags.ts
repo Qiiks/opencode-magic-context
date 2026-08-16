@@ -1,5 +1,6 @@
 import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import { newestCtxReduceTagNumbers } from "./reclaim-protection";
 import type { TagEntry } from "./types";
 
 const insertTagStatements = new WeakMap<Database, PreparedStatement>();
@@ -286,7 +287,8 @@ export function getOldestActiveUnprotectedToolTags(
 const getActiveToolTagsForAgeReclaimStatements = new WeakMap<Database, PreparedStatement>();
 
 /**
- * Return active tool tags with the same persisted token estimate used by reclaim hints.
+ * Return age-reclaim candidates with the same persisted token estimate used by reclaim hints.
+ * The newest ctx_reduce exemplars are omitted before the watermark/value checks in the caller.
  * Legacy rows with neither token column populated remain eligible for fail-safe reclaim.
  */
 export function getActiveToolTagsForAgeReclaim(
@@ -309,7 +311,7 @@ export function getActiveToolTagsForAgeReclaim(
         token_count?: unknown;
         input_token_count?: unknown;
     }>;
-    return rows
+    const tags = rows
         .filter((row) => typeof row.tag_number === "number")
         .map((row) => {
             const outputTokens = typeof row.token_count === "number" ? row.token_count : null;
@@ -324,6 +326,8 @@ export function getActiveToolTagsForAgeReclaim(
                         : (outputTokens ?? 0) + (inputTokens ?? 0),
             };
         });
+    const protectedCtxReduceTags = newestCtxReduceTagNumbers(tags);
+    return tags.filter((tag) => !protectedCtxReduceTags.has(tag.tagNumber));
 }
 
 /**

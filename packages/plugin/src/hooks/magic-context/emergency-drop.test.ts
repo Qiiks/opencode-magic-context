@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
+import { CTX_REDUCE_KEEP } from "../../features/magic-context/reclaim-protection";
 import {
     type EmergencyDropTag,
     planEmergencyDrop,
@@ -274,6 +275,25 @@ describe("planEmergencyDrop — target math", () => {
 });
 
 describe("planEmergencyDrop — tier ordering", () => {
+    it("protects newest ctx_reduce exemplars in the emergency band instead of evicting them as T3", () => {
+        const tags = Array.from({ length: 5 }, (_, index) =>
+            tag(index + 1, "ctx_reduce", 4_000),
+        );
+        const plan = planWithFloor({
+            tags,
+            maxTag: 5,
+            protectedTags: 0,
+            hasPriorDrop: false,
+            priorInputSample: 0,
+            currentTotalInputTokens: 6_000,
+            ceilingTokens: 1_000,
+        });
+
+        expect(plan.shouldDrop).toBe(true);
+        expect(plan.tagNumbers).toEqual([1, 2]);
+        expect(CTX_REDUCE_KEEP).toBe(3);
+    });
+
     it("drops T3 before T2 before T1", () => {
         // Mix of tiers, all same size. reclaim forces dropping several.
         const tags = [

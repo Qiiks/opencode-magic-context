@@ -326,6 +326,7 @@ function buildCtx(spec: CaseSpec): Record<string, unknown> {
         protected_cutoff_ordinal: em ? Math.max(maxN - em.protectedTags, 0) : 0,
         last_execute_ordinal: spec.lastExecuteOrdinal ?? 0,
         scheduler_pressure_execute: spec.passClass === "Execute",
+        pass_already_busting: spec.selector === "two_pass",
         prior_input_sample: em?.priorInputSample ?? 0,
         has_prior_drop: em?.hasPriorDrop ?? false,
         agent_drop_ids: [],
@@ -347,11 +348,11 @@ const cases: CaseSpec[] = [
         ],
     },
     {
-        label: "supersession: ctx_reduce keep-5",
+        label: "supersession: ctx_reduce keep-3 exemplars",
         selector: "supersession",
         smartDrops: true,
         passClass: "Execute",
-        tags: Array.from({ length: 7 }, (_, i) => ({
+        tags: Array.from({ length: 5 }, (_, i) => ({
             id: `c${i + 1}`,
             toolName: "ctx_reduce",
             n: i + 1,
@@ -416,6 +417,20 @@ const cases: CaseSpec[] = [
         ],
     },
     {
+        label: "two_pass: ctx_reduce keep-3 exemplars",
+        selector: "two_pass",
+        smartDrops: false,
+        passClass: "Execute",
+        lastExecuteOrdinal: 5,
+        tags: Array.from({ length: 5 }, (_, i) => ({
+            id: `c${i + 1}`,
+            toolName: "ctx_reduce",
+            n: i + 1,
+            byteSize: 4_000,
+            tokenCount: 1_000,
+        })),
+    },
+    {
         label: "two_pass: skip sub-floor arcs",
         selector: "two_pass",
         smartDrops: false,
@@ -449,6 +464,19 @@ const cases: CaseSpec[] = [
             { id: "c3", toolName: "bash", n: 3, byteSize: 40000 },   // T3
             { id: "c4", toolName: "web", n: 4, byteSize: 40000 },    // T3
         ],
+    },
+    {
+        label: "emergency: ctx_reduce keep-3 exemplars",
+        selector: "emergency",
+        smartDrops: false,
+        passClass: "EmergencyForce",
+        emergency: { currentTotalInputTokens: 6000, ceilingTokens: 1000, protectedTags: 0 },
+        tags: Array.from({ length: 5 }, (_, i) => ({
+            id: `c${i + 1}`,
+            toolName: "ctx_reduce",
+            n: i + 1,
+            byteSize: 4_000,
+        })),
     },
     {
         label: "emergency: protected tail excluded",

@@ -1,3 +1,4 @@
+import { CTX_REDUCE_KEEP } from "../../features/magic-context/reclaim-protection";
 import { type ContextDatabase, getActiveTagsBySession } from "../../features/magic-context/storage";
 import type { PendingOp } from "../../features/magic-context/types";
 import { isEditTool } from "./edit-marker";
@@ -12,10 +13,9 @@ import type { TagTarget } from "./tag-messages";
 // Keep-counts are fixed constants (no config sub-knobs):
 //   - todowrite: keep newest 1 (the live plan is the synthetic todowrite we
 //     inject + protect every pass; real ones are older snapshots).
-//   - ctx_reduce: keep newest 5 (preserves the visible reduce rhythm).
+//   - ctx_reduce: keep the shared newest-K housekeeping exemplars.
 //   - zero-value meta: keep 0 (worthless once executed).
 const TODOWRITE_KEEP = 1;
-const CTX_REDUCE_KEEP = 5;
 
 // Tools whose output is worthless once the call ran. ctx_note is handled
 // separately because only its read/dismiss actions are zero-value.
