@@ -8,10 +8,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import * as loggerModule from "@magic-context/core/shared/logger";
 import {
-	adaptPiChannel2Baseline,
 	clearPiChannel1State,
-	computeTailTokenEstimatePi,
-	computeTailToolTokensPi,
 	getPiChannel1Baseline,
 	maybeChannel1ReminderForToolResult,
 	maybeDeliverChannel2Pi,
@@ -19,60 +16,23 @@ import {
 } from "./ctx-reduce-nudge-pi";
 import { createTestDb } from "./test-utils.test";
 
-function toolResultMsg(text: string) {
-	return { role: "toolResult", content: [{ type: "text", text }] };
-}
-
 function channel2BaselineFields(baselineU: number, baselineT: number) {
 	return {
 		baselineU,
 		baselineT,
 		turnDeltaU: 0,
 		turnDeltaT: 0,
+		baselineGeneration: 1,
+		computedAt: 1,
 		evaluable: true,
 		generationInvalidated: false,
+		baselineParts: [],
+		contentSignature: "fixture",
 	};
 }
 
 afterEach(() => {
 	mock.restore();
-});
-
-describe("computeTailToolTokensPi", () => {
-	it("sums non-dropped toolResult text, excludes sentinels", () => {
-		const big = "x".repeat(40_000); // ~10k tokens
-		const msgs = [
-			toolResultMsg(big),
-			toolResultMsg("[dropped §5§]"),
-			toolResultMsg("[truncated]"),
-			{
-				role: "assistant",
-				content: [{ type: "text", text: "x".repeat(40_000) }],
-			},
-		];
-		const tokens = computeTailToolTokensPi(msgs);
-		expect(tokens).toBeGreaterThan(9_000);
-		expect(tokens).toBeLessThan(11_000);
-	});
-
-	it("estimates the full live tail separately from reclaimable tool output", () => {
-		const estimate = computeTailTokenEstimatePi([
-			{
-				role: "user",
-				content: [{ type: "text", text: "conversation ".repeat(1000) }],
-			},
-			{
-				role: "assistant",
-				content: [
-					{ type: "toolCall", name: "bash", arguments: { cmd: "echo hi" } },
-				],
-			},
-			toolResultMsg("tool output ".repeat(1000)),
-		]);
-
-		expect(estimate.tailToolTokens).toBeGreaterThan(0);
-		expect(estimate.liveTailTokens).toBeGreaterThan(estimate.tailToolTokens);
-	});
 });
 
 describe("maybeChannel1ReminderForToolResult", () => {
@@ -81,12 +41,6 @@ describe("maybeChannel1ReminderForToolResult", () => {
 	function seedBaseline(tailTokens: number): void {
 		setPiChannel1Baseline(SESSION, {
 			...channel2BaselineFields(tailTokens, 120_000),
-			tailToolTokens: tailTokens,
-			historyBudgetTokens: 100_000,
-			contextLimit: 200_000,
-			executeThresholdPercentage: 65,
-			lastInputTokens: 150_000, // pressure ≈ (75 / 65) ≈ 1.15
-			turnToolTokens: 0,
 			reducedSinceRefresh: false,
 			oldestReclaimableToolTags: [{ tagNumber: 9, toolName: "bash" }],
 		});
@@ -104,7 +58,7 @@ describe("maybeChannel1ReminderForToolResult", () => {
 		expect(block).toBeNull();
 	});
 
-	it("fires a system-reminder block when pressure + undropped warrant it", () => {
+	it("fires a system-reminder block when the rendered-tail ratio warrants it", () => {
 		const db = createTestDb();
 		seedBaseline(90_000);
 		const block = maybeChannel1ReminderForToolResult({
@@ -124,12 +78,6 @@ describe("maybeChannel1ReminderForToolResult", () => {
 		const db = createTestDb();
 		setPiChannel1Baseline(SESSION, {
 			...channel2BaselineFields(90_000, 120_000),
-			tailToolTokens: 90_000,
-			historyBudgetTokens: 100_000,
-			contextLimit: 200_000,
-			executeThresholdPercentage: 65,
-			lastInputTokens: 150_000,
-			turnToolTokens: 0,
 			reducedSinceRefresh: false,
 			oldestReclaimableToolTags: [{ tagNumber: 123, toolName: "read" }],
 		});
@@ -178,35 +126,6 @@ describe("maybeChannel1ReminderForToolResult", () => {
 	});
 });
 
-describe("Pi Channel-2 baseline adapter", () => {
-	it("maps known legacy measurements and rejects unknown fields conservatively", () => {
-		expect(
-			adaptPiChannel2Baseline({
-				reclaimableTokens: 60_000,
-				tailTokens: 100_000,
-			}),
-		).toMatchObject({
-			baselineU: 60_000,
-			baselineT: 100_000,
-			evaluable: true,
-			generationInvalidated: false,
-		});
-		expect(
-			adaptPiChannel2Baseline({
-				reclaimableTokens: 60_000,
-				tailTokens: 100_000,
-				hasUnknownFields: true,
-			}),
-		).toMatchObject({ evaluable: false, generationInvalidated: true });
-		expect(
-			adaptPiChannel2Baseline({
-				reclaimableTokens: 110_000,
-				tailTokens: 100_000,
-			}),
-		).toMatchObject({ evaluable: false, generationInvalidated: true });
-	});
-});
-
 describe("maybeDeliverChannel2Pi", () => {
 	const SESSION = "ses-ch2-pi";
 
@@ -230,12 +149,6 @@ describe("maybeDeliverChannel2Pi", () => {
 	function armStrongBaseline(sessionId: string): void {
 		setPiChannel1Baseline(sessionId, {
 			...channel2BaselineFields(60_000, 100_000),
-			tailToolTokens: 60_000,
-			historyBudgetTokens: 0,
-			contextLimit: 200_000,
-			executeThresholdPercentage: 65,
-			lastInputTokens: 120_000,
-			turnToolTokens: 0,
 			reducedSinceRefresh: false,
 			oldestReclaimableToolTags: [{ tagNumber: 9, toolName: "bash" }],
 		});
@@ -347,12 +260,6 @@ describe("maybeDeliverChannel2Pi", () => {
 		// The 50k floor holds, but severity is only 0.50, below the fourth band.
 		setPiChannel1Baseline(session, {
 			...channel2BaselineFields(50_000, 100_000),
-			tailToolTokens: 50_000,
-			historyBudgetTokens: 0,
-			contextLimit: 200_000,
-			executeThresholdPercentage: 65,
-			lastInputTokens: 100_000,
-			turnToolTokens: 0,
 			reducedSinceRefresh: false,
 			oldestReclaimableToolTags: [],
 		});
