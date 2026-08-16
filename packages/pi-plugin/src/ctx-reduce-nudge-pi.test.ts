@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+	getChannel2NudgeClaim,
 	getChannel2NudgeClaimedAt,
 	getChannel2NudgeState,
 	setChannel2NudgeState,
@@ -296,6 +297,34 @@ describe("maybeDeliverChannel2Pi", () => {
 		expect(getChannel2NudgeState(db, SESSION)).toBe("pending");
 	});
 
+	it("refuses a foreign revert attempt against a live claim", () => {
+		const db = createTestDb();
+		const session = "ses-ch2-pi-foreign-revert";
+		setChannel2NudgeState(db, session, "pending");
+		armStrongBaseline(session);
+
+		const delivered = maybeDeliverChannel2Pi(
+			{
+				sendMessage: () => {
+					// A sibling acquired a fresh lease after this delivery attempt lost
+					// its own claim. Its claim must not be returned to pending here.
+					db.prepare(
+						"UPDATE session_meta SET channel2_nudge_state = 'claimed', channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = ? WHERE session_id = ?",
+					).run(Date.now(), "foreign-claim-token", session);
+					throw new Error("transient");
+				},
+			},
+			db,
+			session,
+		);
+
+		expect(delivered).toBe(false);
+		expect(getChannel2NudgeClaim(db, session)).toMatchObject({
+			state: "claimed",
+			claimToken: "foreign-claim-token",
+		});
+	});
+
 	it("returns false and leaves the claim healable when claimed→pending CAS throws", async () => {
 		const db = createTestDb();
 		const session = "ses-ch2-pi-revert-throw";
@@ -309,7 +338,7 @@ describe("maybeDeliverChannel2Pi", () => {
 			const statement = originalPrepare(sql);
 			if (
 				sql ===
-				"UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = '' WHERE session_id = ? AND channel2_nudge_state = ?"
+				"UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = ? WHERE session_id = ? AND channel2_nudge_state = 'claimed' AND channel2_nudge_claim_token = ?"
 			) {
 				return {
 					...statement,
@@ -317,13 +346,13 @@ describe("maybeDeliverChannel2Pi", () => {
 						if (
 							args[0] === "pending" &&
 							args[1] === 0 &&
-							args[2] === session &&
-							args[3] === "claimed"
+							args[2] === "" &&
+							args[3] === session
 						) {
 							throw new Error("SQLITE_BUSY: database is locked");
 						}
 						return statement.run(
-							...(args as [unknown, unknown, unknown, unknown]),
+							...(args as [unknown, unknown, unknown, unknown, unknown]),
 						);
 					},
 				} as typeof statement;
@@ -346,7 +375,7 @@ describe("maybeDeliverChannel2Pi", () => {
 		expect(getChannel2NudgeClaimedAt(db, session)).toBeGreaterThan(0);
 	});
 
-	it("preserves a sibling's delivered claim and logs the duplicate window distinctly", async () => {
+	it("preserves a sibling's delivered lease when token confirmation is lost", async () => {
 		const db = createTestDb();
 		const session = "ses-ch2-pi-duplicate";
 		setChannel2NudgeState(db, session, "pending");
@@ -375,7 +404,7 @@ describe("maybeDeliverChannel2Pi", () => {
 				(call) =>
 					call[0] === session &&
 					typeof call[1] === "string" &&
-					call[1].includes("duplicate window"),
+					call[1].includes("claim confirmation was not ours"),
 			),
 		).toBe(true);
 	});

@@ -12,19 +12,23 @@
 //
 //   Channel 2 (ceiling nudge): OpenCode delivers via the in-process client's
 //   `promptAsync` (which joins the in-flight runner on OpenCode >= 1.17.7). Pi
-//   is single-process, so it just calls the native `pi.sendMessage(..., {
-//   deliverAs })` as a hidden custom message (`display:false`). The
-//   `channel2_nudge_state` lease enforces one delivery per tail-reset cycle and
-//   carries the intent from the pipeline point that records it to the later
-//   `tool_result` or `agent_end` event that delivers it.
+//   calls the native `pi.sendMessage(..., { deliverAs })` as a hidden custom
+//   message (`display:false`). The `channel2_nudge_state` lease is persisted and
+//   token-bound, so sibling processes sharing a session database cannot change a
+//   lease after another process has claimed it. It carries the intent from the
+//   pipeline point that records it to the later `tool_result` or `agent_end`
+//   event that delivers it.
 
+import { randomUUID } from "node:crypto";
 import {
+	casChannel2NudgeClaim,
 	casChannel2NudgeState,
+	claimChannel2NudgeState,
+	getChannel2NudgeClaim,
 	getChannel2NudgeState,
 	getLastNudgeLevel,
 	getLastNudgeUndropped,
 	resetLastNudgeCycle,
-	setChannel2NudgeState,
 	setLastNudgeLevel,
 	setLastNudgeUndropped,
 } from "@magic-context/core/features/magic-context/storage";
@@ -41,27 +45,6 @@ import type { Database } from "@magic-context/core/shared/sqlite";
 import { measurePiToolResultDelta } from "./tail-hygiene-walk-pi";
 
 export type Channel1State = SharedChannel1State;
-
-function sealDeliveredAfterUnconfirmedSend(
-	db: Database,
-	sessionId: string,
-): "already-delivered" | "sealed" | "stuck-claimed" {
-	try {
-		if (getChannel2NudgeState(db, sessionId) === "delivered") {
-			return "already-delivered";
-		}
-	} catch {
-		// Best-effort probe only — if the read fails, still try to seal the cap.
-	}
-
-	try {
-		setChannel2NudgeState(db, sessionId, "delivered");
-		return "sealed";
-	} catch {
-		// Preserve the stale claim so the shared TTL heal can recover it later.
-		return "stuck-claimed";
-	}
-}
 
 // Per-session Channel 1 metric baseline. Written at the end of each pipeline
 // pass (post-drop), read in the `tool_result` handler. Primary-only: subagents
@@ -204,21 +187,21 @@ const CHANNEL2_NUDGE_CUSTOM_TYPE = "magic-context:ceiling-nudge";
 
 /**
  * Deliver a pending Channel 2 ceiling nudge for `sessionId`, if any. Safe to
- * call from BOTH delivery sites; no-ops unless a `pending` intent exists. Pi
- * is single-process so delivery coalesces natively — no #28202 workaround.
+ * call from both delivery sites; no-ops unless a `pending` intent exists.
  * Delivered as a hidden custom message (`sendMessage` + `display:false`) so it
- * reaches the model but isn't presented as a literal user turn.
+ * reaches the model but is not presented as a literal user turn.
  *
  * Delivery sites + mode:
  * - `tool_result` (mid-turn, the primary site): deliverAs "steer" — Pi queues
- *   the message and the agent loop pulls it at the NEXT STEP boundary, so the
- *   agent is warned while the pile is still growing and can act THIS turn.
- *   Waiting for idle would deliver the warning after all the growth happened.
+ *   the message and the agent loop pulls it at the next step boundary, so the
+ *   agent is warned while the pile is still growing and can act this turn.
  * - `agent_end` (idle fallback): catches the intent when the turn ended before
  *   a tool boundary could deliver it; deliverAs "followUp" starts a fresh turn.
  *
- * Lease: pending → claimed → delivered (revert to pending on failure so a
- * transient error doesn't consume the current cycle). Returns true on delivery.
+ * Lease: pending → claimed(token) → delivered. A token is issued while claiming,
+ * re-checked immediately before send, and required to confirm or revert. This
+ * prevents a sibling process from changing a newer claimant's lease. Returns
+ * true only when delivery is confirmed.
  */
 export function maybeDeliverChannel2Pi(
 	pi: PiSendMessage,
@@ -245,101 +228,94 @@ export function maybeDeliverChannel2Pi(
 		try {
 			casChannel2NudgeState(db, sessionId, "pending", "");
 		} catch {
-			// best-effort; next pass re-evaluates.
+			// If resetting the intent fails, a later evaluation pass retries the
+			// reset and re-checks whether the nudge is still needed.
 		}
 		return false;
 	}
 	const undropped = evaluation.reclaimableTokens;
 
-	if (!casChannel2NudgeState(db, sessionId, "pending", "claimed")) return false;
+	const claimToken = randomUUID();
+	if (!claimChannel2NudgeState(db, sessionId, claimToken)) return false;
 
 	try {
-		// display: false → hidden from the Pi TUI (agent steer, not a user turn),
-		// but still model-visible via convertToLlm. deliverAs preserves the
-		// existing scheduling (steer mid-turn / followUp at agent_end).
-		pi.sendMessage(
-			{
-				customType: CHANNEL2_NUDGE_CUSTOM_TYPE,
-				content: buildChannel2Reminder(
-					undropped,
-					baseline.oldestReclaimableToolTags,
-				),
-				display: false,
-				details: { kind: "channel-2-ceiling-nudge" },
-			},
-			{ deliverAs },
-		);
-	} catch (error) {
-		try {
-			casChannel2NudgeState(db, sessionId, "claimed", "pending");
-		} catch (revertError) {
+		const message = {
+			customType: CHANNEL2_NUDGE_CUSTOM_TYPE,
+			content: buildChannel2Reminder(
+				undropped,
+				baseline.oldestReclaimableToolTags,
+			),
+			display: false,
+			details: { kind: "channel-2-ceiling-nudge" },
+		};
+		const claim = getChannel2NudgeClaim(db, sessionId);
+		if (claim.state !== "claimed" || claim.claimToken !== claimToken) {
 			sessionLog(
 				sessionId,
-				"channel2 ceiling nudge delivery failed; pending restore was busy so the stale claim will heal later:",
-				{ deliveryError: error, revertError },
+				`channel2 ceiling nudge delivery skipped: claim no longer owned before send (state=${claim.state || "empty"})`,
 			);
 			return false;
 		}
-		sessionLog(
-			sessionId,
-			"channel2 ceiling nudge delivery failed (will retry):",
-			error,
-		);
+		// display: false → hidden from the Pi TUI (agent steer, not a user turn),
+		// but still model-visible via convertToLlm. deliverAs preserves the
+		// existing scheduling (steer mid-turn / followUp at agent_end).
+		pi.sendMessage(message, { deliverAs });
+	} catch (error) {
+		try {
+			const restored = casChannel2NudgeClaim(
+				db,
+				sessionId,
+				"pending",
+				claimToken,
+			);
+			if (restored) {
+				sessionLog(
+					sessionId,
+					"channel2 ceiling nudge delivery failed (will retry):",
+					error,
+				);
+			} else {
+				sessionLog(
+					sessionId,
+					"channel2 ceiling nudge delivery failed after its claim was no longer owned; lease state left unchanged:",
+					error,
+				);
+			}
+		} catch (revertError) {
+			sessionLog(
+				sessionId,
+				"channel2 ceiling nudge delivery failed; token-bound pending restore was busy so the stale claim will heal later:",
+				{ deliveryError: error, revertError },
+			);
+		}
 		return false;
 	}
 
 	try {
-		const confirmed = casChannel2NudgeState(
+		const confirmed = casChannel2NudgeClaim(
 			db,
 			sessionId,
-			"claimed",
 			"delivered",
+			claimToken,
 		);
 		if (confirmed) {
 			sessionLog(sessionId, "channel2 ceiling nudge delivered");
 			return true;
 		}
-
-		const outcome = sealDeliveredAfterUnconfirmedSend(db, sessionId);
-		if (outcome === "already-delivered") {
-			sessionLog(
-				sessionId,
-				"channel2 ceiling nudge duplicate window: our send returned after a sibling reclaimed the stale lease and already delivered",
-			);
-		} else if (outcome === "sealed") {
-			sessionLog(
-				sessionId,
-				"channel2 ceiling nudge sent but claim confirmation was lost; sealed delivered without an authoritative confirm",
-			);
-		} else {
-			sessionLog(
-				sessionId,
-				"channel2 ceiling nudge sent but claim confirmation was lost; lease stayed claimed and will heal later",
-			);
-		}
+		const claim = getChannel2NudgeClaim(db, sessionId);
+		sessionLog(
+			sessionId,
+			`channel2 ceiling nudge sent but claim confirmation was not ours (state=${claim.state || "empty"}); leaving existing lease state unchanged`,
+		);
 		return false;
 	} catch (error) {
 		// The nudge has already been handed to Pi; never re-arm on a post-send
 		// confirm failure, or a transient DB error can duplicate a cycle delivery.
-		const outcome = sealDeliveredAfterUnconfirmedSend(db, sessionId);
-		if (outcome === "already-delivered") {
-			sessionLog(
-				sessionId,
-				"channel2 ceiling nudge duplicate window: our send returned after a sibling reclaimed the stale lease and already delivered",
-			);
-		} else if (outcome === "sealed") {
-			sessionLog(
-				sessionId,
-				"channel2 ceiling nudge sent but confirm failed:",
-				error,
-			);
-		} else {
-			sessionLog(
-				sessionId,
-				"channel2 ceiling nudge sent but confirm failed; lease stayed claimed and will heal later:",
-				error,
-			);
-		}
+		sessionLog(
+			sessionId,
+			"channel2 ceiling nudge sent but token-confirm failed; lease state left unchanged:",
+			error,
+		);
 		return false;
 	}
 }
