@@ -135,7 +135,7 @@ fn reset_emergency_reasoning_exclusion_count() {
 
 // Real 5k-message sessions retain 24-55 MiB of canonical output plus typed CK trees. A 64 MiB
 // ceiling refused those single-session snapshots, turning every warm pass into a full re-encode.
-const SERIALIZED_OUTPUT_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const SERIALIZED_OUTPUT_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const TAG_BASELINE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const TAG_MINT_FRONTIER_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 

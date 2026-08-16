@@ -3164,6 +3164,52 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
 });
 
 describe("native output delta", () => {
+    it("retries with full arrays when a delta response omits native content", async () => {
+        const sessionId = `rust-native-omission-retry-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const transformBodies: Array<Record<string, unknown>> = [];
+        let healedNative: unknown[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                const request = body as Record<string, unknown>;
+                transformBodies.push(request);
+                if (transformBodies.length === 1) {
+                    return { native_messages: structuredClone(request.native_messages) };
+                }
+                if (request.tail_delta) return { status: "ok", served_from: "transform" };
+                return { native_messages: structuredClone(healedNative) };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const initial = makeMessages(sessionId);
+        await transform.run(
+            sessionId,
+            initial,
+            { messages: [...initial] },
+            makeMeta(db, sessionId),
+        );
+
+        const changed = structuredClone(initial);
+        changed[0]!.parts = [{ type: "text", text: "changed after warm prime" }];
+        healedNative = structuredClone(changed);
+        const output = { messages: [...changed] as unknown[] };
+        await transform.run(sessionId, changed, output, makeMeta(db, sessionId));
+
+        expect(transformBodies).toHaveLength(3);
+        expect(transformBodies[1]?.tail_delta).toEqual({
+            after: transformBodies[0]?.full_array_fingerprint,
+            replace_from: 0,
+            native_replace_from: 0,
+        });
+        expect(transformBodies[2]?.tail_delta).toBeUndefined();
+        expect(transformBodies[2]?.native_messages).toEqual(changed);
+        expect(output.messages).toEqual(healedNative);
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(0);
+    });
+
     it("reconstructs the exact acknowledged prefix plus replacement suffix", () => {
         const previous = [
             { info: { id: "m0" }, parts: [{ type: "text", text: "stable" }] },
