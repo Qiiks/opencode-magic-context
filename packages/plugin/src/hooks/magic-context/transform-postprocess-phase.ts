@@ -34,7 +34,9 @@ import {
     type PersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
 import {
+    getOldestActiveUnprotectedToolTags,
     getTagNumberByMessageId,
+    getTailHygieneTags,
     updateTagStatus,
 } from "../../features/magic-context/storage-tags";
 import type { Tagger } from "../../features/magic-context/tagger";
@@ -58,6 +60,7 @@ import {
     resolveToolPermissionDenied,
     todowritePermissionDenied,
 } from "./ctx-reduce-availability";
+import type { Channel1State } from "./ctx-reduce-nudge";
 import { dropStaleReduceCalls } from "./drop-stale-reduce-calls";
 import { foldExecutesThisPass } from "./fold-execution-gate";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
@@ -90,6 +93,7 @@ import {
 } from "./strip-content";
 import { buildEditSupersessionReclaim, buildSupersessionReclaimOps } from "./supersession-reclaim";
 import { byteSize, prependTag } from "./tag-content-primitives";
+import { assertTailHygieneContentUnchanged, refreshTailHygieneBaseline } from "./tail-hygiene-walk";
 import { buildSyntheticTodoPart, isSyntheticTodoPart, type SyntheticTodoPart } from "./todo-view";
 import {
     advanceToolReclaimWatermarkToCurrentMax,
@@ -543,6 +547,8 @@ interface RunPostTransformPhaseArgs {
     messageTagNumbers: Map<MessageLike, number>;
     tagger: Tagger;
     ctxReduceAvailability: CtxReduceAvailabilityVerdict;
+    /** Final-array counts of reclaimable tagged mass (U) and total eligible mass (T). */
+    channel1StateBySession?: Map<string, Channel1State>;
     /** Frozen-per-session verdict for the native `todowrite` tool. Gates the
      *  synthetic todo-pair injection below: a session whose tools map filters
      *  todowrite out must not get a synthetic pair for a tool it cannot call. */
@@ -2153,6 +2159,59 @@ export async function runPostTransformPhase(
         tFinalRepresentation,
         `clearedParts=${finalRepresentation.clearedParts} mergedReasoningParts=${finalRepresentation.mergedReasoningParts}`,
     );
+
+    let assertedBaseline:
+        | { tags: TagEntry[]; protectedTags: number; contentSignature: string }
+        | undefined;
+    if (args.channel1StateBySession) {
+        if (args.ctxReduceAvailability.callable && !compactionOff) {
+            try {
+                const tags = getTailHygieneTags(args.db, args.sessionId);
+                const previous = args.channel1StateBySession.get(args.sessionId);
+                const baseline = refreshTailHygieneBaseline({
+                    messages: args.messages,
+                    tags,
+                    protectedTags: args.protectedTags,
+                    cacheBusting: bustedThisPass,
+                    previous,
+                });
+                args.channel1StateBySession.set(args.sessionId, {
+                    ...baseline,
+                    reducedSinceRefresh:
+                        baseline.baselineGeneration !== previous?.baselineGeneration
+                            ? false
+                            : (previous?.reducedSinceRefresh ?? false),
+                    oldestReclaimableToolTags: getOldestActiveUnprotectedToolTags(
+                        args.db,
+                        args.sessionId,
+                        args.protectedTags,
+                    ),
+                });
+                assertedBaseline = {
+                    tags,
+                    protectedTags: args.protectedTags,
+                    contentSignature: baseline.contentSignature,
+                };
+            } catch (error) {
+                const stale = args.channel1StateBySession.get(args.sessionId);
+                if (stale) {
+                    stale.evaluable = false;
+                    stale.generationInvalidated = true;
+                }
+                sessionLog(args.sessionId, "tail hygiene baseline refresh failed (held):", error);
+            }
+        } else {
+            args.channel1StateBySession.delete(args.sessionId);
+        }
+    }
+    if (assertedBaseline && process.env.NODE_ENV !== "production") {
+        assertTailHygieneContentUnchanged({
+            messages: args.messages,
+            tags: assertedBaseline.tags,
+            protectedTags: assertedBaseline.protectedTags,
+            expectedSignature: assertedBaseline.contentSignature,
+        });
+    }
 
     return {
         explicitMaterializedSuccessfully,

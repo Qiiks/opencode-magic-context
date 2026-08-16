@@ -3221,8 +3221,9 @@ export function registerPiContextHandler(
 						resolvedExecuteThresholdPct > 0
 					) {
 						const channel2ShouldTrigger = shouldTriggerChannel2({
-							reclaimableTokens: tailToolTokens,
-							usableTokens: usableTokensPi,
+							baselineU: tailToolTokens,
+							baselineT: usableTokensPi,
+							deltas: { u: 0, t: 0 },
 						});
 						if (channel2ShouldTrigger) {
 							casChannel2NudgeState(options.db, sessionId, "", "pending");

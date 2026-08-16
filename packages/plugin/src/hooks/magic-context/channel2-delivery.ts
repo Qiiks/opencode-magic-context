@@ -1,8 +1,8 @@
 // Channel 2 delivery: the synthetic-user-message ceiling nudge.
 //
 // The transform records a one-shot `pending` intent in `session_meta`
-// (`channel2_nudge_state`) when pressure is near the execute threshold and a
-// large pile of reclaimable tool output remains. This module DELIVERS that
+// (`channel2_nudge_state`) when its persisted rendered-tail predicate holds.
+// This module DELIVERS that
 // intent from the event handler (`message.updated`, both mid-turn
 // "tool-calls" and final "stop" events), because `promptAsync` must run on an
 // event boundary, not mid-transform. Primary sessions keep both delivery
@@ -62,14 +62,11 @@ export interface Channel2DeliveryDeps {
      * No-op when absent (e.g. a context with no client wired).
      */
     client?: unknown;
-    /** Reclaimable tool-output tokens for the wording + stale-intent revalidation. */
-    reclaimableTokens?: number;
-    /**
-     * The usable working range measured at the same Channel-1 baseline refresh
-     * (see Channel1State.usableTokens). Required to re-run the FULL trigger
-     * predicate at delivery time.
-     */
-    usableTokens?: number;
+    /** Saved rendered-tail counts: reclaimable tagged mass U and total eligible mass T. */
+    baselineU?: number;
+    baselineT?: number;
+    /** U/T token counts added since that final-array measurement. */
+    deltas?: { u: number; t: number };
     oldestReclaimableToolTags?: readonly ToolReclaimHint[];
     /** Module-owned directives are already predicate-validated; preserve their text verbatim. */
     directiveText?: string;
@@ -157,13 +154,10 @@ export async function maybeDeliverChannel2(
         return false;
     }
 
-    // Revalidate before delivering. The `pending` intent was recorded at high
-    // pressure during a transform pass; between then and this terminal
-    // message.updated the agent may have run ctx_reduce (or a later turn shrank
-    // the reclaimable tail), so the ceiling condition may no longer hold. A
-    // module directive has already been validated against the module's durable
-    // pressure state, so its lease still uses this function but skips a second
-    // predicate evaluation that could discard the authoritative text.
+    // Revalidate before delivering. Between arming and this step boundary the
+    // agent may have reduced or appended enough typed mass to change the saved
+    // predicate. A module directive is already validated by the module, so its
+    // lease skips this TypeScript baseline check and preserves its text.
     // Firing the synthetic nudge anyway would inject a stale "you have N tokens
     // to drop" message AND consume the one-per-session cap for nothing.
     //
@@ -172,27 +166,29 @@ export async function maybeDeliverChannel2(
     //   and do NOT touch the lease: leave `pending` for a later final-stop that
     //   has a real measurement. Never substitute a default and burn the cap on
     //   an unvalidated condition.
-    // - KNOWN baseline → re-run the FULL trigger predicate (floor AND the
-    //   reclaimable ≥ usable/3 ratio — the same one that armed the intent),
-    //   not just the floor. Predicate false → cancel to '' (re-armable).
+    // - KNOWN baseline → add the U/T deltas and rerun the existing U ≥ T/3
+    //   threshold. If it fails, clear `pending` so later growth can re-arm it.
     if (
         deps.directiveText === undefined &&
-        (deps.reclaimableTokens === undefined || deps.usableTokens === undefined)
+        (deps.baselineU === undefined || deps.baselineT === undefined)
     ) {
         return false;
     }
+    const deltas = deps.deltas ?? { u: 0, t: 0 };
+    const effectiveU = Math.max(0, (deps.baselineU ?? 0) + deltas.u);
     if (
         deps.directiveText === undefined &&
         !shouldTriggerChannel2({
-            reclaimableTokens: deps.reclaimableTokens as number,
-            usableTokens: deps.usableTokens as number,
+            baselineU: deps.baselineU as number,
+            baselineT: deps.baselineT as number,
+            deltas,
         })
     ) {
         try {
             casChannel2NudgeState(deps.db, sessionId, "pending", "");
             sessionLog(
                 sessionId,
-                `channel2 intent cleared pre-delivery (reclaimable ${deps.reclaimableTokens}, usable ${deps.usableTokens} — trigger no longer holds; re-armable)`,
+                `channel2 intent cleared pre-delivery (U ${effectiveU}, T ${Math.max(0, (deps.baselineT ?? 0) + deltas.t)} — trigger no longer holds; re-armable)`,
             );
         } catch {
             // best-effort; if the CAS fails the next pass re-evaluates.
@@ -223,8 +219,7 @@ export async function maybeDeliverChannel2(
         // Module directives carry their own validated wording; host-triggered
         // reminders use the measured reclaimable tail after the predicate above.
         const reminder =
-            deps.directiveText ??
-            buildChannel2Reminder(deps.reclaimableTokens as number, deps.oldestReclaimableToolTags);
+            deps.directiveText ?? buildChannel2Reminder(effectiveU, deps.oldestReclaimableToolTags);
 
         const body: Record<string, unknown> = {
             noReply: false,
