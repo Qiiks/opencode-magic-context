@@ -42,6 +42,7 @@ import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
 import {
     __rustModeTransformTest,
+    applyNativeMessagesVerbatim,
     createRustModeTransform as createRustModeTransformImpl,
     RUST_EMERGENCY_WALL_PCT,
     RUST_FAILURE_PARK_THRESHOLD,
@@ -1306,6 +1307,46 @@ describe("Rust mode authority adapter", () => {
         expect(
             db.prepare("SELECT title FROM compartments WHERE session_id = ?").get(sessionId),
         ).toEqual({ title: "receiver-bound compartment" });
+    });
+
+    it("does not block transform completion on a compartment mirror backlog", async () => {
+        const sessionId = `rust-compartment-backlog-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let releaseMirror!: () => void;
+        const mirrorBacklog = new Promise<void>((resolve) => {
+            releaseMirror = resolve;
+        });
+        let mirrorCompleted = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform" ? { native_messages: [] } : { ok: true },
+            getCompartmentsAfter: async () => {
+                await mirrorBacklog;
+                mirrorCompleted = true;
+                return { max_sequence: 0, compartments: [] };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const messages = makeMessages(sessionId);
+        const run = transform.run(
+            sessionId,
+            messages,
+            { messages: [...messages] },
+            makeMeta(db, sessionId),
+        );
+
+        const disposition = await Promise.race([
+            run.then(() => "served" as const),
+            Bun.sleep(500).then(() => "blocked" as const),
+        ]);
+        expect(disposition).toBe("served");
+        expect(mirrorCompleted).toBe(false);
+        releaseMirror();
+        await run;
+        await Bun.sleep(0);
+        expect(mirrorCompleted).toBe(true);
     });
 
     it("sends fail-closed tool verdicts while availability remains provisional", async () => {
@@ -3119,6 +3160,52 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
                 )
                 .run(projectPath),
         ).toThrow("managed by the Rust module");
+    });
+});
+
+describe("native output delta", () => {
+    it("reconstructs the exact acknowledged prefix plus replacement suffix", () => {
+        const previous = [
+            { info: { id: "m0" }, parts: [{ type: "text", text: "stable" }] },
+            { info: { id: "m1" }, parts: [{ type: "text", text: "old" }] },
+        ];
+        const suffix = [
+            { info: { id: "m1" }, parts: [{ type: "text", text: "new" }] },
+            { info: { id: "m2" }, parts: [{ type: "text", text: "tail" }] },
+        ];
+        const output = { messages: [] as unknown[] };
+
+        const applied = applyNativeMessagesVerbatim(
+            output,
+            {
+                native_messages_delta: {
+                    after: "fp-before",
+                    replace_from: 1,
+                    messages: suffix,
+                },
+            },
+            { messages: previous, fingerprint: "fp-before" },
+        );
+
+        expect(applied).toEqual([previous[0], ...suffix]);
+        expect(output.messages).toEqual(applied);
+        expect(applied[0]).toBe(previous[0]);
+    });
+
+    it("rejects a delta whose prefix fingerprint is not acknowledged", () => {
+        expect(() =>
+            applyNativeMessagesVerbatim(
+                { messages: [] },
+                {
+                    native_messages_delta: {
+                        after: "stale",
+                        replace_from: 1,
+                        messages: [],
+                    },
+                },
+                { messages: [{ info: { id: "m0" } }], fingerprint: "current" },
+            ),
+        ).toThrow("did not match the acknowledged output");
     });
 });
 

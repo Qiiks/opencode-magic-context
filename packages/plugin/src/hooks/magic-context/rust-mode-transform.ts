@@ -226,6 +226,9 @@ interface RustWireCache {
     nativeFingerprint: string;
     nativePrefixFingerprintBeforeLast: string;
     fingerprint: string;
+    /** Previous acknowledged module output. The array is reused by reference and supplies the
+     * prefix for a validated native-output delta; eviction falls back to a full response. */
+    nativeOutput?: unknown[];
 }
 
 interface RustSessionState extends ModuleStateSyncState {
@@ -1122,6 +1125,7 @@ function mirrorRustSyntheticTodoAnchor(args: {
 export function applyNativeMessagesVerbatim(
     output: { messages: unknown[] },
     response: Record<string, unknown>,
+    previous?: { messages: readonly unknown[]; fingerprint: string },
 ): unknown[] {
     const nativeMessages = response.native_messages;
     if (typeof nativeMessages === "string") {
@@ -1130,12 +1134,32 @@ export function applyNativeMessagesVerbatim(
             throw new Error("rust transform native_messages string was not an array");
         return replaceMessagesInPlace(output, parsed);
     }
-    if (!Array.isArray(nativeMessages)) {
+    if (Array.isArray(nativeMessages)) {
+        // The module owns healing, ordering, and codec fidelity. Do not clone,
+        // normalize, or otherwise inspect the returned native message array.
+        return replaceMessagesInPlace(output, nativeMessages);
+    }
+    const delta = response.native_messages_delta;
+    if (!isRecord(delta) || !Array.isArray(delta.messages)) {
         throw new Error("rust transform response omitted native_messages");
     }
-    // The module owns healing, ordering, and codec fidelity. Do not clone,
-    // normalize, or otherwise inspect the returned native message array.
-    return replaceMessagesInPlace(output, nativeMessages);
+    const replaceFrom = delta.replace_from;
+    if (
+        !previous ||
+        delta.after !== previous.fingerprint ||
+        typeof replaceFrom !== "number" ||
+        !Number.isSafeInteger(replaceFrom) ||
+        replaceFrom < 0 ||
+        replaceFrom > previous.messages.length
+    ) {
+        throw new Error(
+            "rust transform native_messages_delta did not match the acknowledged output",
+        );
+    }
+    return replaceMessagesInPlace(output, [
+        ...previous.messages.slice(0, replaceFrom),
+        ...delta.messages,
+    ]);
 }
 
 function muralInputForWire(
@@ -1446,7 +1470,7 @@ export function createRustModeTransform(
         sessionId: string,
         input: MessageLike[],
         inputSnapshots: readonly MessageContentSnapshot[],
-        response: Record<string, unknown>,
+        nativeMessages: readonly unknown[],
         responseRowVersion: number,
     ): RustLkgCapturePlan | null => {
         state.lkgCaptureSequence += 1;
@@ -1459,8 +1483,7 @@ export function createRustModeTransform(
         ) {
             return null;
         }
-        const native = response.native_messages;
-        const jsonPrefix = typeof native === "string" ? native : JSON.stringify(native);
+        const jsonPrefix = JSON.stringify(nativeMessages);
         if (typeof jsonPrefix !== "string") return null;
         const keys = resolveLkgModelKeys(input);
         return {
@@ -1728,10 +1751,15 @@ export function createRustModeTransform(
                 sessionLog(
                     sessionId,
                     `rust module stages: handler=${stage("handler_total")} apply_once=${stage("total")} ` +
-                        `request_to_handler=${stage("request_observed_to_handler")} ` +
-                        `projection=${stage("projection")} selection=${stage("selection")} ` +
-                        `build_output=${stage("build_output")} store_commit=${stage("store_commit")} ` +
+                        `request_to_handler=${stage("request_observed_to_handler")} delta_expand=${stage("delta_expand")} ` +
+                        `projection_cache_lookup=${stage("projection_cache_lookup")} projection=${stage("projection")} ` +
+                        `selection=${stage("selection")} build_output=${stage("build_output")} ` +
+                        `store_commit=${stage("store_commit")} trigger=${stage("trigger_ms")} ` +
+                        `trigger_boundary=${stage("trigger_boundary_build")} trigger_eval=${stage("trigger_eval")} ` +
+                        `projection_cache_store=${stage("projection_cache_store")} native_attach=${stage("native_attach")} ` +
+                        `retained_size=${stage("retained_size")} snapshot_store=${stage("snapshot_store")} ` +
                         `post_attach=${stage("post_attach")} response_encode=${stage("response_encode")} ` +
+                        `response_meta_encode=${stage("response_meta_encode")} response_splice=${stage("response_splice")} ` +
                         `native_cache_reused=${stage("native_cache_reused_messages")} ` +
                         `native_cache_encoded=${stage("native_cache_encoded_messages")}`,
                 );
@@ -2467,7 +2495,17 @@ export function createRustModeTransform(
                 // Validate and postprocess the module result before touching the caller-owned
                 // array. This keeps failure recovery O(1) on the steady path: no defensive
                 // full-array clone is needed just in case boundary validation rejects it.
-                appliedMessages = applyNativeMessagesVerbatim({ messages: [] }, response);
+                appliedMessages = applyNativeMessagesVerbatim(
+                    { messages: [] },
+                    response,
+                    previousWireCache?.nativeOutput
+                        ? {
+                              messages: previousWireCache.nativeOutput,
+                              fingerprint: previousWireCache.fingerprint,
+                          }
+                        : undefined,
+                );
+                pendingWireCache.nativeOutput = appliedMessages;
                 runRustModePostprocess({
                     db: deps.db,
                     sessionId,
@@ -2514,7 +2552,7 @@ export function createRustModeTransform(
                     sessionId,
                     messages,
                     pendingWireCache.rawContentSnapshots,
-                    response,
+                    appliedMessages,
                     rowVersion,
                 );
                 let captureMode = "async";
@@ -2677,46 +2715,60 @@ export function createRustModeTransform(
             }
             wireCaches.set(sessionId, pendingWireCache);
             appliedAt = performance.now();
-            // Memory and compartment mirrors reconcile the host SQLite copy with the
-            // module. They are not on the serve path: the caller already has applied
-            // bytes, so appliedAt is recorded first and they stay out of pass elapsed.
-            // Neither result is read again in this pass. Keep the previous order
-            // (memories, then compartments) so a failure in one cannot affect the other;
-            // both errors are already ignored.
-            if (options.moduleClient.mirrorPull) {
-                const mirrorPullStartedAt = performance.now();
-                try {
-                    await pullMemoryMirrorOnce({
-                        db: deps.db,
-                        module: options.moduleClient as AuthorityModuleClient,
-                    });
-                } catch (error) {
-                    sessionLog(sessionId, "rust memory mirror-back failed (ignored):", error);
-                } finally {
-                    logStage(sessionId, "mirrorPull", mirrorPullStartedAt, timings);
-                }
-            }
+            // Mirrors feed later RPC reads and tolerate seconds of staleness. Run the two pulls in
+            // their established order, but do not keep the transform hook pending while a backlog
+            // page or SQLite apply is slow. pullMemoryMirrorOnce still coalesces overlapping passes.
             const getCompartmentsAfter = options.moduleClient.getCompartmentsAfter;
-            if (getCompartmentsAfter) {
-                const compartmentMirrorStartedAt = performance.now();
-                try {
-                    await mirrorModuleCompartments({
-                        db: deps.db,
-                        sessionId,
-                        reader: {
-                            getCompartmentsAfter: (mirroredSessionId, afterSequence) =>
-                                getCompartmentsAfter.call(
-                                    options.moduleClient,
-                                    mirroredSessionId,
-                                    afterSequence,
-                                ),
-                        } satisfies ModuleCompartmentReader,
-                    });
-                } catch (error) {
-                    sessionLog(sessionId, "rust compartment mirror-back failed (ignored):", error);
-                } finally {
-                    logStage(sessionId, "compartmentMirror", compartmentMirrorStartedAt, timings);
-                }
+            if (options.moduleClient.mirrorPull || getCompartmentsAfter) {
+                void (async () => {
+                    if (options.moduleClient.mirrorPull) {
+                        const mirrorPullStartedAt = performance.now();
+                        try {
+                            await pullMemoryMirrorOnce({
+                                db: deps.db,
+                                module: options.moduleClient as AuthorityModuleClient,
+                            });
+                        } catch (error) {
+                            sessionLog(
+                                sessionId,
+                                "rust memory mirror-back failed (ignored):",
+                                error,
+                            );
+                        } finally {
+                            logStage(sessionId, "mirrorPull", mirrorPullStartedAt, timings);
+                        }
+                    }
+                    if (getCompartmentsAfter) {
+                        const compartmentMirrorStartedAt = performance.now();
+                        try {
+                            await mirrorModuleCompartments({
+                                db: deps.db,
+                                sessionId,
+                                reader: {
+                                    getCompartmentsAfter: (mirroredSessionId, afterSequence) =>
+                                        getCompartmentsAfter.call(
+                                            options.moduleClient,
+                                            mirroredSessionId,
+                                            afterSequence,
+                                        ),
+                                } satisfies ModuleCompartmentReader,
+                            });
+                        } catch (error) {
+                            sessionLog(
+                                sessionId,
+                                "rust compartment mirror-back failed (ignored):",
+                                error,
+                            );
+                        } finally {
+                            logStage(
+                                sessionId,
+                                "compartmentMirror",
+                                compartmentMirrorStartedAt,
+                                timings,
+                            );
+                        }
+                    }
+                })();
             }
             finishPass(true);
         } catch (error) {
