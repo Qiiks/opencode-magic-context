@@ -1045,11 +1045,18 @@ body {
   font-size: 11px;
 }
 
-.dream-run-flat-err {
-  color: var(--red);
+.dream-run-task-detail {
   max-width: 360px;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.dream-run-task-detail.neutral {
+  color: var(--text-secondary);
+}
+
+.dream-run-task-detail.error {
+  color: var(--red);
 }
 
 .dream-run-flat-detail-row td {

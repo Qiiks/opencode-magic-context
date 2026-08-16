@@ -12,6 +12,7 @@ import {
   saveProjectConfig,
 } from "../../lib/api";
 import { describeCron } from "../../lib/cron";
+import { getDreamRunTaskDetail } from "../../lib/dream-run-detail";
 import { jsoncErrorMessage, parseJsonc, patchDreamerTasksJsonc } from "../../lib/jsonc";
 import type {
   DreamerProject,
@@ -658,13 +659,19 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
                     <th>Tokens</th>
                     <th>Backlog</th>
                     <th>Memory</th>
-                    <th>Error</th>
+                    <th>Detail</th>
                   </tr>
                 </thead>
                 <tbody>
                   <For each={flatRuns()}>
                     {(run) => {
                       const task = () => run.tasks_json[0];
+                      const taskDetail = () => {
+                        const current = task();
+                        return current
+                          ? getDreamRunTaskDetail(current, run.tasks_failed)
+                          : { text: undefined, tone: "neutral" as const };
+                      };
                       const memChanged = () => hasMemoryChanges(run.memory_changes_json);
                       const memSummary = () => {
                         const c = run.memory_changes_json;
@@ -713,8 +720,11 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
                                 </span>
                               </Show>
                             </td>
-                            <td class="dream-run-flat-err" title={task()?.error ?? ""}>
-                              {task()?.error ?? "—"}
+                            <td
+                              class={`dream-run-task-detail ${taskDetail().tone}`}
+                              title={taskDetail().text ?? ""}
+                            >
+                              {taskDetail().text ?? "—"}
                             </td>
                           </tr>
                           <Show when={expandedRun() === run.id && memChanged()}>
@@ -861,35 +871,50 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
                                         <th>Tokens</th>
                                         <th>Backlog</th>
                                         <th>Status</th>
+                                        <th>Detail</th>
                                       </tr>
                                     </thead>
                                     <tbody>
                                       <For each={run.tasks_json}>
-                                        {(task) => (
-                                          <tr>
-                                            <td>{formatTaskLabel(task.name)}</td>
-                                            <td class="mono">{formatDuration(task.durationMs)}</td>
-                                            <td class="mono">{formatTaskOutput(task, run)}</td>
-                                            <td
-                                              class="mono"
-                                              title={
-                                                task.tokens
-                                                  ? `input ${task.tokens.input.toLocaleString()} · output ${task.tokens.output.toLocaleString()} · cache ${task.tokens.cache_read.toLocaleString()}/${task.tokens.cache_write.toLocaleString()}`
-                                                  : undefined
-                                              }
-                                            >
-                                              {formatTaskTokens(task)}
-                                            </td>
-                                            <td>{formatTaskBacklog(task)}</td>
-                                            <td>
-                                              <span
-                                                class={`dream-run-status ${task.error ? "error" : "success"}`}
+                                        {(task) => {
+                                          const detail = getDreamRunTaskDetail(
+                                            task,
+                                            run.tasks_failed,
+                                          );
+                                          return (
+                                            <tr>
+                                              <td>{formatTaskLabel(task.name)}</td>
+                                              <td class="mono">
+                                                {formatDuration(task.durationMs)}
+                                              </td>
+                                              <td class="mono">{formatTaskOutput(task, run)}</td>
+                                              <td
+                                                class="mono"
+                                                title={
+                                                  task.tokens
+                                                    ? `input ${task.tokens.input.toLocaleString()} · output ${task.tokens.output.toLocaleString()} · cache ${task.tokens.cache_read.toLocaleString()}/${task.tokens.cache_write.toLocaleString()}`
+                                                    : undefined
+                                                }
                                               >
-                                                {task.error ? "✕" : "✓"}
-                                              </span>
-                                            </td>
-                                          </tr>
-                                        )}
+                                                {formatTaskTokens(task)}
+                                              </td>
+                                              <td>{formatTaskBacklog(task)}</td>
+                                              <td>
+                                                <span
+                                                  class={`dream-run-status ${detail.tone === "error" ? "error" : "success"}`}
+                                                >
+                                                  {detail.tone === "error" ? "✕" : "✓"}
+                                                </span>
+                                              </td>
+                                              <td
+                                                class={`dream-run-task-detail ${detail.tone}`}
+                                                title={detail.text ?? ""}
+                                              >
+                                                {detail.text ?? "—"}
+                                              </td>
+                                            </tr>
+                                          );
+                                        }}
                                       </For>
                                     </tbody>
                                   </table>

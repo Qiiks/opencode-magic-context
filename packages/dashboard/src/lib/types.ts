@@ -354,7 +354,12 @@ export interface DreamRunTask {
   name: string;
   durationMs: number;
   resultChars: number;
+  /** Failure detail only. Missing means no failure was recorded; an empty
+   * string is treated as absent by the dashboard. */
   error?: string;
+  /** Successful progress/detail. Missing means no progress was reported; an
+   * empty string is treated as absent by the dashboard. */
+  progress?: string;
   backlog?: {
     pendingAtStart: number;
     totalAtStart: number;

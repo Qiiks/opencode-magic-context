@@ -239,17 +239,19 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         );
 
         expect(result.status).toBe("completed");
-        expect(result.error).toContain("verify-broad cycle");
-        expect(result.error).toContain("remain");
+        expect(result.error).toBeUndefined();
         const state = getTaskScheduleState(db, project, "verify-broad");
         expect(state?.lastBroadRunAt).toBeGreaterThan(0);
         const run = getDreamRuns(db, project)[0];
         expect(run?.tasks_failed).toBe(0);
         const task = JSON.parse(run?.tasks_json ?? "[]")[0] as {
             error?: string;
+            progress?: string;
             backlog?: { pendingAtStart: number; pendingAtEnd: number; processed: number };
         };
-        expect(task.error).toContain("verify-broad cycle");
+        expect(task.error).toBeUndefined();
+        expect(task.progress).toContain("verify-broad cycle");
+        expect(task.progress).toContain("remain");
         expect(task.backlog).toMatchObject({ pendingAtStart: 51, pendingAtEnd: 1, processed: 50 });
     });
 
