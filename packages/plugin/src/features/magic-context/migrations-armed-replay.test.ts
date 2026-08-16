@@ -70,6 +70,40 @@ function applyExactlyOneMigration(
     }).immediate();
 }
 
+// Tables the populate arms CLAIM to fill by the end of the walk. Static on
+// purpose: the per-step assertions compare against expectation sets maintained
+// by the same arms that write, so an arm refactored into a no-op empties both
+// sides together and stays green — the fence itself becomes the stale claim.
+// This list is the independent side of that claim: it only changes when a
+// human edits it, so a populate arm going quiet reddens the walk with the
+// table's name instead of silently narrowing coverage.
+// Both arms write the same two tables, so a per-table count would let one arm
+// go quiet behind the other's rows (proved by a survived early-return mutant
+// during construction). The claim is therefore per ARM: each arm's rows carry
+// a distinctive content prefix, and each prefix must be present at walk end.
+const CLAIMED_ARM_SIGNATURES = [
+    { arm: "populateTsOwnedRows", table: "memories", like: "memory populated after v%" },
+    { arm: "populateTsOwnedRows", table: "notes", like: "note populated after v%" },
+    { arm: "populateModuleOwnedRows", table: "memories", like: "module memory populated after v%" },
+    { arm: "populateModuleOwnedRows", table: "notes", like: "module note populated after v%" },
+] as const;
+
+function assertClaimedTablesNonEmpty(db: DatabaseType): void {
+    for (const claim of CLAIMED_ARM_SIGNATURES) {
+        const row = db
+            .prepare(`SELECT COUNT(*) AS n FROM ${claim.table} WHERE content LIKE ?`)
+            .get(claim.like) as { n: number };
+        if (row.n === 0) {
+            throw new Error(
+                `${claim.table} carries no rows matching "${claim.like}" at end of the ` +
+                    `step-through walk: no migration was tested against ${claim.arm}'s data — ` +
+                    `that populate arm has stopped writing. Fix the arm (or, if the claim ` +
+                    `itself changed, update CLAIMED_ARM_SIGNATURES deliberately).`,
+            );
+        }
+    }
+}
+
 function assertPopulatedRowsLanded(db: DatabaseType, state: ReplayState): void {
     // Before v1 the unified notes table does not exist and there are no populated rows yet.
     if (state.expectedMemoryContents.size === 0 && state.expectedNoteContents.size === 0) return;
@@ -393,6 +427,7 @@ test("every migration lands on populated rows and v72+ stores stay armed", () =>
         }
 
         assertPopulatedRowsLanded(db, state);
+        assertClaimedTablesNonEmpty(db);
         assertPrivilegeClosed(db);
         assertDurableAuthorityTriggers(db);
         expect(state.armed).toBe(true);
