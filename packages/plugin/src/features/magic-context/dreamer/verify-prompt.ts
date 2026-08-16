@@ -13,7 +13,13 @@
  * prompt and the host apply both bias hard toward keeping memories.
  */
 
-import { assertNoDuplicateManifestIds, extractCompleteManifestBody } from "./manifest-parser";
+import {
+    assertManifestCoversExactly,
+    assertNoDuplicateManifestIds,
+    assertParsedManifestNonEmpty,
+    describeUnrecognizedManifestShape,
+    extractCompleteManifestBody,
+} from "./manifest-parser";
 
 export const VERIFY_SYSTEM_PROMPT = `You are a memory verifier for the magic-context system. You verify project memories against the CURRENT code.
 
@@ -83,11 +89,26 @@ function filesOf(s: string): string[] {
         .filter(Boolean);
 }
 
+function verifyIds(parsed: ParsedVerifyManifest): number[] {
+    return [...parsed.verified, ...parsed.updated, ...parsed.archived].map((entry) => entry.id);
+}
+
+function verifyBody(text: string): string {
+    try {
+        return extractCompleteManifestBody(text, "verify");
+    } catch (error) {
+        const described = describeUnrecognizedManifestShape(text, "verify", "verified");
+        if (!described.startsWith("parsed zero entries")) throw new Error(described);
+        throw error;
+    }
+}
+
 /** Parse the agent's complete `<verify>` manifest. The root close tag is
- *  mandatory so truncated output cannot apply a partial set of verdicts. */
+ *  mandatory so truncated output cannot apply a partial set of verdicts.
+ *  A well-formed root with no recognized entries is a format miss, not success. */
 export function parseVerifyManifest(text: string): ParsedVerifyManifest {
     const out: ParsedVerifyManifest = { verified: [], updated: [], archived: [] };
-    const body = extractCompleteManifestBody(text, "verify");
+    const body = verifyBody(text);
 
     for (const m of body.matchAll(/<verified\b([^>]*)\/?>/g)) {
         const id = Number.parseInt(attrOf(m[1], "id") ?? "", 10);
@@ -104,9 +125,22 @@ export function parseVerifyManifest(text: string): ParsedVerifyManifest {
         if (!Number.isInteger(id)) throw new Error("verify manifest entry missing numeric id");
         out.archived.push({ id, reason: attrOf(m[1], "reason") ?? "" });
     }
-    assertNoDuplicateManifestIds(
-        [...out.verified, ...out.updated, ...out.archived].map((entry) => entry.id),
-        "verify",
-    );
+    if (verifyIds(out).length === 0 && body.trim().length > 0) {
+        throw new Error(describeUnrecognizedManifestShape(text, "verify", "verified"));
+    }
+    assertNoDuplicateManifestIds(verifyIds(out), "verify");
     return out;
+}
+
+/** Retry-time contract: non-empty parse + exact id coverage. Apply still
+ *  re-asserts coverage as the final belt. */
+export function validateVerifyManifest(
+    text: string,
+    expectedIds: ReadonlySet<number>,
+): ParsedVerifyManifest {
+    const parsed = parseVerifyManifest(text);
+    const ids = verifyIds(parsed);
+    assertParsedManifestNonEmpty(ids.length, expectedIds.size, text, "verify", "verified");
+    assertManifestCoversExactly(ids, expectedIds, "verify");
+    return parsed;
 }

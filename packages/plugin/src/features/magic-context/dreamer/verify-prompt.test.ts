@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { buildVerifyPrompt, parseVerifyManifest } from "./verify-prompt";
+import { buildVerifyPrompt, parseVerifyManifest, validateVerifyManifest } from "./verify-prompt";
 
 describe("parseVerifyManifest", () => {
     it("parses verified / update / archive with attribute-order tolerance", () => {
@@ -31,6 +31,23 @@ describe("parseVerifyManifest", () => {
         );
     });
 
+    it("still accepts an empty verify body (no unrecognized children)", () => {
+        expect(parseVerifyManifest(`<verify></verify>`)).toEqual({
+            verified: [],
+            updated: [],
+            archived: [],
+        });
+    });
+
+    it("rejects a well-formed root with no recognized entries", () => {
+        expect(() => parseVerifyManifest(`<verify><item id="1"/></verify>`)).toThrow(
+            /root <item> unrecognized; expected <verify> with <verified> entries/,
+        );
+        expect(() =>
+            parseVerifyManifest(`<verify>[{ "id": 1, "status": "verified" }]</verify>`),
+        ).toThrow(/JSON array unrecognized; expected <verify> with <verified> entries/);
+    });
+
     it("rejects duplicate ids and invalid entries", () => {
         expect(() =>
             parseVerifyManifest(
@@ -40,6 +57,29 @@ describe("parseVerifyManifest", () => {
         expect(() =>
             parseVerifyManifest(`<verify><verified id="x" files="a.ts"/></verify>`),
         ).toThrow(/numeric id/);
+    });
+});
+
+describe("validateVerifyManifest", () => {
+    it("rejects an empty parse against a non-empty batch", () => {
+        expect(() => validateVerifyManifest(`<verify></verify>`, new Set([1]))).toThrow(
+            /parsed zero entries; expected <verify> with <verified> entries/,
+        );
+    });
+
+    it("rejects missing and extra ids at retry time", () => {
+        expect(() =>
+            validateVerifyManifest(
+                `<verify><verified id="1" files="a.ts"/></verify>`,
+                new Set([1, 2]),
+            ),
+        ).toThrow(/missing id 2/);
+        expect(() =>
+            validateVerifyManifest(
+                `<verify><verified id="1" files="a.ts"/><verified id="9" files="b.ts"/></verify>`,
+                new Set([1]),
+            ),
+        ).toThrow(/unknown id 9/);
     });
 });
 

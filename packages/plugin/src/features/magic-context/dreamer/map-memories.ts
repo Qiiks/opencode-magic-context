@@ -15,6 +15,7 @@ import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import {
     getMemoriesByProject,
+    getMemoryVerifications,
     getUnmappedMemoryIds,
     normalizeVerificationFiles,
     recordMemoryMapping,
@@ -28,6 +29,7 @@ import {
     MAP_MEMORIES_SYSTEM_PROMPT,
     type MapMemoryInput,
     parseMapMemoriesManifest,
+    validateMapMemoriesManifest,
 } from "./map-memories-prompt";
 import {
     DreamerModuleFailureError,
@@ -58,6 +60,12 @@ import {
 // and peak context well under a 128K window. A 200+ pool → ~3 batches.
 const MAP_BATCH_SIZE = 80;
 
+/** Cap on already-mapped file-independent rows re-queued per run. A silent
+ *  parse miss used to persist `independent=true` for memories that name real
+ *  files; those rows never enter verify. Heal at most one extra batch so new
+ *  unmapped memories stay first in line. */
+export const MAX_INDEPENDENT_REQUEUE_PER_RUN = MAP_BATCH_SIZE;
+
 export interface MapMemoriesArgs {
     db: Database;
     client: PluginContext["client"];
@@ -82,27 +90,60 @@ export interface MapMemoriesResult {
     complete: boolean;
 }
 
-/** Resolve the unmapped active memories into prompt inputs (with path seeds). */
-function loadUnmappedInputs(
+/** Re-queue predicate: a file-independent mapping (sentinel, no real files)
+ *  whose memory text names existing repo paths — the same seed heuristic the
+ *  mapper already uses. That is the silent-corruption shape: a memory WITH
+ *  backing files was persisted as independent. A legitimately-independent
+ *  memory that names no existing path is a bystander and is left alone. */
+export function shouldRequeueIndependentMapping(
+    state: { hasSentinel: boolean; files: readonly string[] },
+    content: string,
+    repoDir: string,
+): boolean {
+    if (!state.hasSentinel || state.files.length > 0) return false;
+    return extractMemoryCandidatePaths(content, repoDir).length > 0;
+}
+
+function toMapInput(
+    memory: { id: number; category: string; content: string },
+    repoDir: string,
+): MapMemoryInput {
+    return {
+        id: memory.id,
+        category: memory.category,
+        content: memory.content,
+        candidates: extractMemoryCandidatePaths(memory.content, repoDir),
+    };
+}
+
+/** Unmapped active memories first, then a bounded heal of corrupted
+ *  independent rows. Exported so tests can assert the re-queue predicate
+ *  without standing up a child session. */
+export function selectMapMemoryInputs(
     db: Database,
     projectIdentity: string,
     repoDir: string,
 ): MapMemoryInput[] {
     const active = getMemoriesByProject(db, projectIdentity);
-    const unmapped = new Set(
-        getUnmappedMemoryIds(
-            db,
-            active.map((m) => m.id),
-        ),
-    );
-    return active
+    const activeIds = active.map((m) => m.id);
+    const unmapped = new Set(getUnmappedMemoryIds(db, activeIds));
+    const verifications = getMemoryVerifications(db, activeIds);
+
+    const unmappedInputs = active
         .filter((m) => unmapped.has(m.id))
-        .map((m) => ({
-            id: m.id,
-            category: m.category,
-            content: m.content,
-            candidates: extractMemoryCandidatePaths(m.content, repoDir),
-        }));
+        .map((m) => toMapInput(m, repoDir));
+
+    const requeue: MapMemoryInput[] = [];
+    for (const memory of active) {
+        if (unmapped.has(memory.id)) continue;
+        const state = verifications.get(memory.id);
+        if (!state) continue;
+        if (!shouldRequeueIndependentMapping(state, memory.content, repoDir)) continue;
+        requeue.push(toMapInput(memory, repoDir));
+        if (requeue.length >= MAX_INDEPENDENT_REQUEUE_PER_RUN) break;
+    }
+
+    return [...unmappedInputs, ...requeue];
 }
 
 export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesResult> {
@@ -113,7 +154,7 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
         remaining: 0,
         complete: true,
     };
-    const inputs = loadUnmappedInputs(args.db, args.projectIdentity, args.sessionDirectory);
+    const inputs = selectMapMemoryInputs(args.db, args.projectIdentity, args.sessionDirectory);
     if (inputs.length === 0) return result;
 
     const batches: MapMemoryInput[][] = [];
@@ -221,7 +262,7 @@ async function mapOneBatch(
                     }
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("map-memories returned no output");
-                    parseMapMemoriesManifest(text);
+                    validateMapMemoriesManifest(text, new Set(batch.map((memory) => memory.id)));
                     return text;
                 },
             },
