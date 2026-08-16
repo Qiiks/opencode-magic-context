@@ -25,8 +25,9 @@ import { buildMockHistorianPayload } from "../src/mock-historian";
  *
  * What this test verifies:
  *   - Pi survives 30 back-to-back 20KB-reply turns with a slow historian
- *   - No turns error out (proves the pipeline stays responsive)
- *   - Emergency handling keeps every provider request below the model window
+ *   - Pi telemetry reaches the derived 85% force band while the historian is busy
+ *   - The emergency drain latch arms, the scheduler queues drops, and usage falls
+ *   - No turns error out and every provider request remains below the model window
  *
  * Pi tool-drop materialization is covered by `pi-drops.test.ts` (queue +
  * apply path), Pi historian compartment publication is covered by
@@ -60,6 +61,7 @@ beforeAll(async () => {
         modelContextLimit: 128_000,
         magicContextConfig: {
             execute_threshold_percentage: 40,
+            historian: { model: "anthropic/claude-haiku-4-5" },
         },
     });
 });
@@ -117,6 +119,9 @@ describe("pi short context accumulating overflow", () => {
 
         let sessionId: string | null = null;
         const turnUsage: number[] = [];
+        const schedulerUsage: number[] = [];
+        const emergencyLatch: number[] = [];
+        const historianInProgress: number[] = [];
         const turnErrors: Array<{ turn: number; error: string }> = [];
         const turns = 30;
 
@@ -140,12 +145,43 @@ describe("pi short context accumulating overflow", () => {
             const mainReq = reqs.find((r) => !isHistorian(r.body));
             const observed = mainReq ? Math.floor(JSON.stringify(mainReq.body).length / 4) : 0;
             turnUsage.push(Math.round((observed / 128_000) * 1000) / 10);
+            if (sessionId) {
+                const meta = h
+                    .contextDb()
+                    .prepare(
+                        "SELECT last_context_percentage, emergency_drain_active, compartment_in_progress FROM session_meta WHERE session_id = ?",
+                    )
+                    .get(sessionId) as
+                    | {
+                          last_context_percentage: number;
+                          emergency_drain_active: number;
+                          compartment_in_progress: number;
+                      }
+                    | undefined;
+                if (!meta) throw new Error(`missing Pi session metadata for ${sessionId}`);
+                schedulerUsage.push(Math.round(meta.last_context_percentage * 10) / 10);
+                emergencyLatch.push(meta.emergency_drain_active);
+                historianInProgress.push(meta.compartment_in_progress);
+            }
         }
 
+        const historianRequests = h.mock.requests().filter((r) => isHistorian(r.body));
         const peakObservedPct = turnUsage.reduce((m, p) => Math.max(m, p), 0);
         const finalPct = turnUsage[turnUsage.length - 1] ?? 0;
-        console.log(`[PI-OVERFLOW-GUARD] peak: ${peakObservedPct}% final: ${finalPct}% of 128K`);
-        console.log(`[PI-OVERFLOW-GUARD] per-turn %: ${turnUsage.join(", ")}`);
+        const forceBandSeen = schedulerUsage.some((usage) => usage >= 85);
+        const historianBusyAtForceBand = schedulerUsage.some(
+            (usage, index) => usage >= 85 && historianInProgress[index] === 1,
+        );
+        const latchArmed = emergencyLatch.some((latchedAt) => latchedAt > 0);
+        const forceDropDecision = h
+            .contextDb()
+            .prepare(
+                "SELECT 1 FROM transform_decisions WHERE session_id = ? AND input_tokens >= ? AND decision = 'execute' AND dropped_count > 0 LIMIT 1",
+            )
+            .get(sessionId!, 128_000 * 0.85);
+        console.log(
+            `[PI-OVERFLOW-GUARD] historians=${historianRequests.length} peak=${peakObservedPct}% final=${finalPct}% scheduler_peak=${Math.max(...schedulerUsage)}% force_band=${forceBandSeen} historian_busy=${historianBusyAtForceBand} latch=${latchArmed} force_drop=${Boolean(forceDropDecision)}`,
+        );
         if (turnErrors.length > 0) {
             console.log(
                 `[PI-OVERFLOW-GUARD] prompt failures (${turnErrors.length}):`,
@@ -155,11 +191,16 @@ describe("pi short context accumulating overflow", () => {
 
         expect(sessionId).toBeTruthy();
         expect(turnErrors).toEqual([]);
+        expect(historianRequests.length).toBeGreaterThan(0);
+        expect(forceBandSeen).toBe(true);
+        expect(historianBusyAtForceBand).toBe(true);
+        expect(latchArmed).toBe(true);
+        expect(forceDropDecision).toBeTruthy();
         expect(peakObservedPct).toBeLessThan(100);
+        expect(finalPct).toBeLessThan(peakObservedPct);
 
-        // Diagnostic visibility only: pure-text Pi RPC turns do not create
-        // deterministic drop or compartment counts. The test asserts the
-        // observable contracts instead: responsiveness and the model-window ceiling.
+        // A published compartment proves that the delayed historian response was
+        // valid; the force-band sample above proves cleanup did not wait for it.
         const compartmentCount = h
             .contextDb()
             .prepare("SELECT COUNT(*) AS c FROM compartments WHERE session_id = ?")
@@ -168,9 +209,8 @@ describe("pi short context accumulating overflow", () => {
             .contextDb()
             .prepare("SELECT last_context_percentage, last_input_tokens FROM session_meta WHERE session_id = ?")
             .get(sessionId!) as { last_context_percentage: number; last_input_tokens: number } | undefined;
-        const droppedCount = h.countDroppedTags(sessionId!);
-        console.log(
-            `[PI-OVERFLOW-GUARD] compartments=${compartmentCount.c} dropped_tags=${droppedCount} last_context_percentage=${meta?.last_context_percentage} last_input_tokens=${meta?.last_input_tokens}`,
-        );
+        expect(compartmentCount.c).toBeGreaterThan(0);
+        expect(meta?.last_context_percentage).toBeLessThan(100);
+        expect(meta?.last_input_tokens).toBeGreaterThan(0);
     }, 240_000);
 });

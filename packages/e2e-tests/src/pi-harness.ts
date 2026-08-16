@@ -4,6 +4,7 @@ import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
+import { prepareContextDatabase } from "./prepare-context-db";
 import { createPiIsolatedEnv, type PiIsolatedEnv, type PiRunResult } from "./pi-runner/spawn";
 import {
   PiRpcClient,
@@ -40,13 +41,15 @@ export class PiTestHarness {
   readonly env: PiIsolatedEnv;
 
   private readonly rpc: PiRpcClient;
+  private readonly expectMagicContext: boolean;
   private contextDbCached: Database | null = null;
   private turns: PiRunResult[] = [];
 
-  private constructor(mock: MockProvider, rpc: PiRpcClient) {
+  private constructor(mock: MockProvider, rpc: PiRpcClient, expectMagicContext: boolean) {
     this.mock = mock;
     this.rpc = rpc;
     this.env = rpc.env;
+    this.expectMagicContext = expectMagicContext;
   }
 
   static async create(options: PiTestHarnessOptions = {}): Promise<PiTestHarness> {
@@ -55,6 +58,14 @@ export class PiTestHarness {
     mock.setDefault(options.mockDefault ?? DEFAULT_MOCK_RESPONSE);
     const env = createPiIsolatedEnv(options.sharedDataDir);
     if (options.workdir) env.workdir = options.workdir;
+    if (options.magicContextConfig?.enabled !== false) {
+      try {
+        prepareContextDatabase(env.dataDir);
+      } catch (error) {
+        await mock.stop();
+        throw error;
+      }
+    }
     const rpc = new PiRpcClient({
       env,
       mockProviderURL: PiTestHarness.mockBaseURL(mock),
@@ -70,7 +81,7 @@ export class PiTestHarness {
       throw error;
     }
 
-    return new PiTestHarness(mock, rpc);
+    return new PiTestHarness(mock, rpc, options.magicContextConfig?.enabled !== false);
   }
 
   /**
@@ -129,9 +140,24 @@ export class PiTestHarness {
       );
       requireSuccessfulResponse(promptResponse);
       await agentEnd;
+      const extensionErrors = this.rpc.getExtensionErrors();
+      if (extensionErrors.length > 0) {
+        throw new Error(`Pi extension error: ${JSON.stringify(extensionErrors)}`);
+      }
       const state = await this.getState();
+      const sessionId = typeof state.sessionId === "string" ? state.sessionId : null;
+      // Extension diagnostics may arrive before this turn's event listener, so
+      // require the durable session row rather than trusting a successful model reply.
+      if (this.expectMagicContext) {
+        if (!sessionId) throw new Error("Pi did not report a session id for Magic Context verification");
+        const processed = this
+          .contextDb()
+          .prepare("SELECT 1 FROM session_meta WHERE session_id = ?")
+          .get(sessionId);
+        if (!processed) throw new Error(`Pi Magic Context did not process session ${sessionId}`);
+      }
       const result: PiRunResult = {
-        sessionId: typeof state.sessionId === "string" ? state.sessionId : null,
+        sessionId,
         events: events as Array<Record<string, unknown>>,
         stdout: events.map((event) => JSON.stringify(event)).join("\n"),
         stderr: this.rpc.getStderr(),

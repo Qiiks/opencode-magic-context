@@ -11,6 +11,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { prepareContextDatabase } from "../prepare-context-db";
 import {
     buildHermeticBinaries,
     detectRustModePrereqs,
@@ -59,6 +60,8 @@ export interface SpawnOptions {
     openCodeConfigExtra?: Record<string, unknown>;
     /** Override the mock model's context token limit. Default 200000. */
     modelContextLimit?: number;
+    /** Pre-create the isolated Magic Context DB unless the test expects the plugin to stay disabled. */
+    prepareContextDatabase?: boolean;
     /**
      * Reuse a pre-created isolated env instead of allocating a fresh one. The
      * Rust-mode harness creates the env first so a hermetic subc daemon can
@@ -342,6 +345,7 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
     const env = resolvedOpts.existingEnv ?? createIsolatedEnv();
     const port = resolvedOpts.port ?? (await pickFreePort());
 
+    if (resolvedOpts.prepareContextDatabase !== false) prepareContextDatabase(env.dataDir);
     writeConfigs(env, resolvedOpts.mockProviderURL, resolvedOpts);
 
     // Explicitly strip any inherited OPENCODE_SERVER_PASSWORD from the parent shell —
