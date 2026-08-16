@@ -2205,17 +2205,11 @@ fn served_output_fingerprints(messages: &[ServedMessage]) -> Vec<ServedBlockFing
                 .unwrap_or_else(|| format!("served_message:{message_index}"))
         };
 
-        let single_block = message.block_fingerprints.len() == 1;
         for (block_index, (content_hash, serialized_len)) in
             message.block_fingerprints.iter().enumerate()
         {
-            let block_id = if single_block {
-                message_id.clone()
-            } else {
-                format!("{message_id}#{block_index}")
-            };
             fingerprints.push(ServedBlockFingerprint {
-                block_id,
+                block_id: ck_wire::block_id(&message_id, block_index),
                 content_hash: content_hash.clone(),
                 serialized_len: *serialized_len,
             });
@@ -14158,6 +14152,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn served_fingerprint_block_ids_pin_flat_mid_index_format() {
+        let single = ServedMessage::from_message(text_message("single", "one"));
+        let multiple = ServedMessage::from_message(CkWireMessage::from_parts(
+            "user",
+            vec![
+                CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: "first".to_string(),
+                }),
+                CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: "second".to_string(),
+                }),
+            ],
+            None,
+            ck_wire::ProviderExtras::new(),
+            ck_wire::HarnessMeta {
+                harness_id: Some("multiple".to_string()),
+                ..Default::default()
+            },
+        ));
+        let synthetic = ServedMessage::from_message(CkWireMessage::synthetic_user_text(
+            "synthetic".to_string(),
+        ));
+
+        let block_ids = served_output_fingerprints(&[single, multiple, synthetic])
+            .into_iter()
+            .map(|fingerprint| fingerprint.block_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            block_ids,
+            ["single#0", "multiple#0", "multiple#1", "mc_m0#0"]
+        );
+    }
+
+    #[test]
     fn served_fingerprint_records_cold_start_and_attributes_middle_changes() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -14195,10 +14223,10 @@ pub(crate) mod tests {
             inserted_divergence.kind,
             divergence::DivergenceKind::Inserted
         );
-        assert_eq!(inserted_divergence.block_id_old.as_deref(), Some("b"));
+        assert_eq!(inserted_divergence.block_id_old.as_deref(), Some("b#0"));
         assert_eq!(
             inserted_divergence.block_id_new.as_deref(),
-            Some("inserted")
+            Some("inserted#0")
         );
         let trace = store.load_pass_trace(session).unwrap().unwrap();
         let inserted_json = serde_json::to_string(inserted_divergence).unwrap();
@@ -14211,8 +14239,11 @@ pub(crate) mod tests {
         let removed = run(&store, &removed_request, &spine());
         let removed_divergence = removed.first_divergence.as_ref().unwrap();
         assert_eq!(removed_divergence.kind, divergence::DivergenceKind::Removed);
-        assert_eq!(removed_divergence.block_id_old.as_deref(), Some("inserted"));
-        assert_eq!(removed_divergence.block_id_new.as_deref(), Some("c"));
+        assert_eq!(
+            removed_divergence.block_id_old.as_deref(),
+            Some("inserted#0")
+        );
+        assert_eq!(removed_divergence.block_id_new.as_deref(), Some("c#0"));
 
         let stable_after_divergence = run(&store, &removed_request, &spine());
         assert!(stable_after_divergence.first_divergence.is_none());
@@ -14390,8 +14421,8 @@ pub(crate) mod tests {
             .as_ref()
             .expect("middle content change must attribute");
         assert_eq!(row.kind, divergence::DivergenceKind::ContentChanged);
-        assert_eq!(row.block_id_old.as_deref(), Some("m1"));
-        assert_eq!(row.block_id_new.as_deref(), Some("m1"));
+        assert_eq!(row.block_id_old.as_deref(), Some("m1#0"));
+        assert_eq!(row.block_id_new.as_deref(), Some("m1#0"));
 
         // Fingerprints stored for the diverged pass match a forced-rehash rebuild of
         // the same served messages (proves attribution rows stay on the same basis).
@@ -15022,8 +15053,8 @@ pub(crate) mod tests {
         assert_eq!(after.meta.tail_identity_re_adopt_count, 1);
         let divergence = adopted.first_divergence.as_ref().unwrap();
         assert_eq!(divergence.kind, divergence::DivergenceKind::ContentChanged);
-        assert_eq!(divergence.block_id_old.as_deref(), Some("tail"));
-        assert_eq!(divergence.block_id_new.as_deref(), Some("tail"));
+        assert_eq!(divergence.block_id_old.as_deref(), Some("tail#0"));
+        assert_eq!(divergence.block_id_new.as_deref(), Some("tail#0"));
 
         let replay = transform(
             &s,
