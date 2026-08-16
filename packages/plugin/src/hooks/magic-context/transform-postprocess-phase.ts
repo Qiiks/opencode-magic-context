@@ -2066,6 +2066,10 @@ export async function runPostTransformPhase(
         }
     }
 
+    const newestAssistantId =
+        typeof reasoningMutationExemptMessage?.info.id === "string"
+            ? reasoningMutationExemptMessage.info.id
+            : undefined;
     const tFinalRepresentation = performance.now();
     const finalRepresentation = finalizeMessageRepresentation(
         args.messages,
@@ -2081,14 +2085,28 @@ export async function runPostTransformPhase(
         },
     );
 
-    if (canUseEmptySentinels && !compactionOff && isCacheBustingPass) {
-        const candidates = findTrailingBlankDecisionCandidates(
+    if (canUseEmptySentinels && !compactionOff) {
+        // Observe every served pass, including defers. A newly completed assistant is
+        // recorded while it is newest, before a provider can append a blank to the
+        // rebuilt historical message. If a late blank arrives while it is still newest,
+        // refresh its choice; the newest exemption leaves those live bytes untouched.
+        const detectedCandidates = findTrailingBlankDecisionCandidates(
             args.messages,
             trailingBlankDecisions,
+            { refreshMessageId: newestAssistantId },
         );
+        // A defer pass can safely establish only the newest assistant's shape: it
+        // has no cached continuation after it. Historical messages without a prior
+        // decision wait for an independent cache-busting pass rather than guessing
+        // from bytes that the provider may already have changed.
+        const candidates = isCacheBustingPass
+            ? detectedCandidates
+            : detectedCandidates.filter(([id]) => id === newestAssistantId);
         if (candidates.length > 0) {
             try {
-                const persisted = addTrailingBlankDecisions(args.db, args.sessionId, candidates);
+                const persisted = addTrailingBlankDecisions(args.db, args.sessionId, candidates, {
+                    overwriteMessageId: newestAssistantId,
+                });
                 if (persisted) {
                     const committed = getTrailingBlankDecisions(args.db, args.sessionId);
                     const newlyFrozen = new Map<string, TrailingBlankDecision>();
@@ -2098,14 +2116,15 @@ export async function runPostTransformPhase(
                         trailingBlankDecisions.set(id, decision);
                         newlyFrozen.set(id, decision);
                     }
+                    // Apply a new keep decision while the assistant is still newest
+                    // so whitespace becomes canonical without changing the recorded
+                    // suffix length. A strip decision remains exempt while it is live.
                     applyFrozenTrailingBlankDecisions(
                         args.messages,
-                        typeof reasoningMutationExemptMessage?.info.id === "string"
-                            ? reasoningMutationExemptMessage.info.id
-                            : undefined,
+                        newestAssistantId,
                         newlyFrozen,
                     );
-                    bustedThisPass = true;
+                    if (isCacheBustingPass) bustedThisPass = true;
                 } else {
                     args.passOutcome?.record("trailing-blank-decision-persistence-failure");
                     sessionLog(

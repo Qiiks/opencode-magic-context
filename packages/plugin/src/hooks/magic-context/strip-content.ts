@@ -542,8 +542,9 @@ function planMergedAssistantReasoningStrip(
     return plan;
 }
 
-export type TrailingBlankDecision = "keep" | "strip";
+export type TrailingBlankDecision = "keep" | `keep:${number}` | "strip";
 
+const MAX_FROZEN_TRAILING_BLANKS = 10_000;
 const CANONICAL_BLANK_PART = { type: "text", text: "" } as const;
 
 function isSentinelInvisibleTextPart(part: unknown): boolean {
@@ -561,40 +562,65 @@ function isCanonicalBlankPart(part: unknown): boolean {
     );
 }
 
+function trailingBlankKeepCount(decision: TrailingBlankDecision): number | undefined {
+    if (decision === "keep") return 1;
+    if (!decision.startsWith("keep:")) return undefined;
+    const countText = decision.slice("keep:".length);
+    if (!/^[1-9]\d*$/.test(countText)) return undefined;
+    const count = Number(countText);
+    return Number.isSafeInteger(count) && count > 0 && count <= MAX_FROZEN_TRAILING_BLANKS
+        ? count
+        : undefined;
+}
+
 /**
- * Freeze the representation that was visible when an assistant first reached a
- * cache-busting pass. A present blank keeps one stable separator; an absent blank
- * makes later structural sentinels disappear on replay.
+ * Capture the representation served for each assistant before a provider can append
+ * a late blank. The newest assistant may be refreshed while it remains live; once a
+ * later assistant appears, its last served choice becomes an immutable replay rule.
  */
 export function findTrailingBlankDecisionCandidates(
     messages: MessageLike[],
     frozenDecisions: ReadonlyMap<string, TrailingBlankDecision>,
+    options?: { refreshMessageId?: string },
 ): Array<readonly [string, TrailingBlankDecision]> {
     const decisions: Array<readonly [string, TrailingBlankDecision]> = [];
     for (const message of messages) {
         const id = message.info.id;
-        if (
-            message.info.role !== "assistant" ||
-            typeof id !== "string" ||
-            id.length === 0 ||
-            frozenDecisions.has(id)
-        ) {
+        if (message.info.role !== "assistant" || typeof id !== "string" || id.length === 0) {
             continue;
         }
-        const last = message.parts.at(-1);
-        decisions.push([
-            id,
-            message.parts.length === 0 || isSentinelInvisibleTextPart(last) ? "keep" : "strip",
-        ]);
+        let trailingCount = 0;
+        while (
+            trailingCount < message.parts.length &&
+            isSentinelInvisibleTextPart(message.parts[message.parts.length - trailingCount - 1])
+        ) {
+            trailingCount += 1;
+        }
+        if (trailingCount > MAX_FROZEN_TRAILING_BLANKS && trailingCount < message.parts.length) {
+            continue;
+        }
+        const decision: TrailingBlankDecision =
+            message.parts.length === 0 || trailingCount === message.parts.length
+                ? "keep"
+                : trailingCount === 0
+                  ? "strip"
+                  : trailingCount === 1
+                    ? "keep"
+                    : `keep:${trailingCount}`;
+        const frozen = frozenDecisions.get(id);
+        if (frozen !== undefined && (id !== options?.refreshMessageId || frozen === decision)) {
+            continue;
+        }
+        decisions.push([id, decision]);
     }
     return decisions;
 }
 
 /**
  * Replay persisted choices after all other message mutations. Keep decisions
- * preserve one canonical blank block; strip decisions remove a later blank suffix
- * unless that would expose terminal reasoning. Never delete the newest assistant's
- * suffix, whether processing the TypeScript or Rust message representation.
+ * preserve the canonical blank suffix first served for that message; strip decisions
+ * remove a later blank suffix unless that would expose terminal reasoning. Never
+ * delete the newest assistant's suffix in either message representation.
  */
 export function applyFrozenTrailingBlankDecisions(
     messages: MessageLike[],
@@ -617,7 +643,7 @@ export function applyFrozenTrailingBlankDecisions(
             lastMeaningfulIndex -= 1;
         }
 
-        const replaceParts = (start: number, deleteCount: number, insertBlank: boolean) => {
+        const replaceParts = (start: number, deleteCount: number, insertBlankCount: number) => {
             // OpenCode owns the hook's message objects. Copy the message and parts
             // array before a length-changing splice so normalization cannot delete
             // parts from another observer of the live request object graph.
@@ -626,24 +652,28 @@ export function applyFrozenTrailingBlankDecisions(
             message.parts.splice(
                 start,
                 deleteCount,
-                ...(insertBlank ? [{ ...CANONICAL_BLANK_PART }] : []),
+                ...Array.from({ length: insertBlankCount }, () => ({ ...CANONICAL_BLANK_PART })),
             );
         };
 
         if (lastMeaningfulIndex < 0) {
             if (message.parts.length !== 1 || !isCanonicalBlankPart(message.parts[0])) {
                 mutations += Math.max(1, message.parts.length);
-                replaceParts(0, message.parts.length, true);
+                replaceParts(0, message.parts.length, 1);
             }
             continue;
         }
 
         const trailingCount = message.parts.length - lastMeaningfulIndex - 1;
-        if (decision === "keep") {
+        const keepCount = trailingBlankKeepCount(decision);
+        if (keepCount !== undefined) {
             const blankIndex = lastMeaningfulIndex + 1;
-            if (trailingCount !== 1 || !isCanonicalBlankPart(message.parts[blankIndex])) {
-                mutations += Math.max(1, trailingCount);
-                replaceParts(blankIndex, trailingCount, true);
+            const suffixIsCanonical =
+                trailingCount === keepCount &&
+                message.parts.slice(blankIndex).every(isCanonicalBlankPart);
+            if (!suffixIsCanonical) {
+                mutations += Math.max(1, trailingCount, keepCount);
+                replaceParts(blankIndex, trailingCount, keepCount);
             }
             continue;
         }
@@ -657,12 +687,12 @@ export function applyFrozenTrailingBlankDecisions(
             const blankIndex = lastMeaningfulIndex + 1;
             if (trailingCount !== 1 || !isCanonicalBlankPart(message.parts[blankIndex])) {
                 mutations += Math.max(1, trailingCount);
-                replaceParts(blankIndex, trailingCount, true);
+                replaceParts(blankIndex, trailingCount, 1);
             }
             continue;
         }
         mutations += trailingCount;
-        replaceParts(lastMeaningfulIndex + 1, trailingCount, false);
+        replaceParts(lastMeaningfulIndex + 1, trailingCount, 0);
     }
     return mutations;
 }
