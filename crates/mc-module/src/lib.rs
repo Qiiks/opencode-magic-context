@@ -42,6 +42,7 @@ mod retained_size;
 pub mod scheduler;
 pub mod selection;
 pub mod session_resolver;
+mod tail_hygiene;
 pub mod transform;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -20265,11 +20266,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn claude_code_channel2_lease_is_frozen_idempotent_and_pressure_rearmable() {
+    async fn claude_code_channel2_lease_is_frozen_idempotent_and_pressure_changes_do_not_rearm() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
         let messages_for = |pair_count: u64| {
-            let output = "tool output ".repeat(1_500);
+            let output = "tool output ".repeat(5_000);
             let mut messages = Vec::new();
             for index in 0..pair_count {
                 messages.push(assistant_tool_call(
@@ -20353,19 +20354,12 @@ mod tests {
         )
         .await;
         assert!(low_pressure.get("channel2_directive").is_none());
-        let after_reclaim = store.load("ses").unwrap();
-        assert!(!after_reclaim.meta.channel2_pressure_latched);
-        assert_eq!(after_reclaim.meta.channel2_arming_watermark, 1);
-
-        let rearmed =
-            call_transform_request(&handler, request_for(grown_messages, 79_000, 100_000)).await;
-        let second_id = rearmed["channel2_directive"]["directive_id"]
-            .as_str()
-            .expect("a fresh pressure crossing after reclaim must re-arm");
-        assert_ne!(second_id, first_id);
-        let after_rearm = store.load("ses").unwrap();
-        assert_eq!(after_rearm.meta.channel2_arming_watermark, 2);
-        assert!(after_rearm.meta.pending_channel2_directive.is_some());
+        let after_pressure_change = store.load("ses").unwrap();
+        assert!(
+            after_pressure_change.meta.channel2_pressure_latched,
+            "whole-input pressure is no longer a cap transition; only fold, measured U collapse, or reap re-arm"
+        );
+        assert_eq!(after_pressure_change.meta.channel2_arming_watermark, 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

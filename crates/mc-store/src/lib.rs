@@ -3371,6 +3371,48 @@ pub struct PendingChannel2Directive {
     pub arming_watermark: u64,
 }
 
+/// Content class recorded by the rendered-tail hygiene walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TailHygienePartKind {
+    Text,
+    ToolInput,
+    ToolOutput,
+    File,
+    Excluded,
+}
+
+/// One typed part from the rendered-tail hygiene walk. Persisting its measurements lets later
+/// passes record newly appended content and update which content is considered recent without
+/// tokenizing the historical prefix again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TailHygienePartMeasurement {
+    pub key: String,
+    pub content_hash: String,
+    pub kind: TailHygienePartKind,
+    pub tokens: i64,
+    pub u_tokens: i64,
+    pub tag_number: Option<i64>,
+    pub tag_status: Option<String>,
+    pub protected: bool,
+}
+
+/// Durable hygiene metrics used by both reminder channels, measured relative to the currently
+/// live tail rather than the full history.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TailHygieneBaseline {
+    pub baseline_u: i64,
+    pub baseline_t: i64,
+    pub turn_delta_u: i64,
+    pub turn_delta_t: i64,
+    pub baseline_generation: u64,
+    pub computed_at_ms: i64,
+    pub evaluable: bool,
+    pub generation_invalidated: bool,
+    pub baseline_parts: Vec<TailHygienePartMeasurement>,
+    pub content_signature: String,
+}
+
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
@@ -3604,6 +3646,9 @@ pub struct ModuleMeta {
     /// Last Channel-1 severity band that appended a reminder. Empty means no active band.
     #[serde(default)]
     pub channel1_last_nudge_level: String,
+    /// Baseline calculated by one shared tail walk so both nudge channels use the same measurements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_hygiene_baseline: Option<TailHygieneBaseline>,
     /// Auto-search decisions targeting a previously served block remain hidden until an
     /// independent cache-busting pass. A genuinely new physical tail renders immediately and
     /// never enters this set.
