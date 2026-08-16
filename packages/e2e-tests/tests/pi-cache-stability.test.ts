@@ -2,14 +2,20 @@
 
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
+import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
+import { Database as CoreDatabase } from "@magic-context/core/shared/sqlite";
+import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { PiTestHarness } from "../src/pi-harness";
 import { openTestDb } from "../src/test-db";
 
 interface HarnessOptions {
     magicContextConfig?: Record<string, unknown>;
     modelContextLimit?: number;
+    sharedDataDir?: string;
 }
 
 async function withPiHarness<T>(
@@ -22,6 +28,24 @@ async function withPiHarness<T>(
     } finally {
         await h.dispose();
     }
+}
+
+function createCurrentSchemaDataDir(): { dataDir: string; rootDir: string } {
+    // This test covers request transforms rather than startup migration.
+    // Initialize a current-schema data directory so the migration safety check
+    // does not disable the extension when another local Pi process is running.
+    const rootDir = mkdtempSync(join(tmpdir(), "pi-cache-stability-schema-"));
+    const dataDir = join(rootDir, "data");
+    const dbDir = join(dataDir, "cortexkit", "magic-context");
+    mkdirSync(dbDir, { recursive: true });
+    const db = new CoreDatabase(join(dbDir, "context.db"));
+    try {
+        initializeDatabase(db);
+        runMigrations(db);
+    } finally {
+        closeQuietly(db);
+    }
+    return { dataDir, rootDir };
 }
 
 function openWritableDb(h: PiTestHarness): Database {
@@ -55,8 +79,25 @@ function mainRequests(h: PiTestHarness) {
     });
 }
 
+function stripCacheControl(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(stripCacheControl);
+    if (value && typeof value === "object") {
+        const output: Record<string, unknown> = {};
+        for (const [key, child] of Object.entries(value)) {
+            if (key === "cache_control") continue;
+            output[key] = stripCacheControl(child);
+        }
+        return output;
+    }
+    return value;
+}
+
 function serialize(value: unknown): string {
     return JSON.stringify(value);
+}
+
+function serializeDurablePrefix(value: unknown): string {
+    return JSON.stringify(stripCacheControl(value));
 }
 
 function requestMessages(request: { body: { messages?: unknown } }): unknown[] {
@@ -111,6 +152,15 @@ function maxTagNumber(h: PiTestHarness, sessionId: string): number {
     });
 }
 
+function minTagNumber(h: PiTestHarness, sessionId: string): number {
+    return readDb(h, (db) => {
+        const row = db
+            .prepare("SELECT COALESCE(MIN(tag_number), 0) AS n FROM tags WHERE session_id = ?")
+            .get(sessionId) as { n: number } | null;
+        return row?.n ?? 0;
+    });
+}
+
 function queueDrop(h: PiTestHarness, sessionId: string, tagNumber: number): void {
     writeDb(h, (db) => {
         db.prepare(
@@ -119,7 +169,102 @@ function queueDrop(h: PiTestHarness, sessionId: string, tagNumber: number): void
     });
 }
 
+function piBustCount(h: PiTestHarness, sessionId: string, sinceMs = 0): number {
+    return readDb(h, (db) => {
+        const row = db
+            .prepare(
+                "SELECT COUNT(*) AS n FROM transform_decisions WHERE session_id = ? AND harness = 'pi' AND ts_ms >= ?",
+            )
+            .get(sessionId, sinceMs) as { n: number } | null;
+        return row?.n ?? 0;
+    });
+}
+
 describe("pi cache stability", () => {
+    it("keeps three quiet mural-enabled passes byte-stable with zero cache busts", async () => {
+        const isolated = createCurrentSchemaDataDir();
+        try {
+            await withPiHarness(
+                {
+                    sharedDataDir: isolated.dataDir,
+                    magicContextConfig: {
+                        protected_tags: 0,
+                        execute_threshold_percentage: 90,
+                        mural: { enabled: true },
+                        memory: {
+                            auto_search: { enabled: false },
+                            git_commit_indexing: { enabled: false },
+                        },
+                    },
+                },
+                async (h) => {
+                    h.mock.setDefault({
+                        text: "ok",
+                        usage: {
+                            input_tokens: 100,
+                            output_tokens: 10,
+                            cache_creation_input_tokens: 100,
+                        },
+                    });
+
+                    const warm = await h.sendPrompt("warm the Pi session", {
+                        timeoutMs: 60_000,
+                    });
+                    expect(warm.sessionId).toBeTruthy();
+                    await h.sendPrompt("establish the stable mural-enabled baseline", {
+                        timeoutMs: 60_000,
+                        continueSession: true,
+                    });
+                    await h.waitFor(() => h.countTags(warm.sessionId!) > 0, {
+                        label: "quiet-pass baseline tag",
+                    });
+                    const cachedUpgradeState = readDb(h, (db) => {
+                        const row = db
+                            .prepare(
+                                "SELECT cached_m0_upgrade_state AS value FROM session_meta WHERE session_id = ?",
+                            )
+                            .get(warm.sessionId!) as { value: string | null } | null;
+                        return row?.value ?? "";
+                    });
+                    expect(cachedUpgradeState).toContain("mural-enabled:1");
+                    const queuedTag = minTagNumber(h, warm.sessionId!);
+                    queueDrop(h, warm.sessionId!, queuedTag);
+
+                    const quietStartedAt = Date.now();
+                    const requestStart = h.requests().length - 1;
+                    const quietPasses = 3;
+                    for (let index = 0; index < quietPasses; index += 1) {
+                        await h.sendPrompt(`quiet pass ${index + 1}`, {
+                            timeoutMs: 60_000,
+                            continueSession: true,
+                        });
+                    }
+
+                    expect(h.countPendingOps(warm.sessionId!)).toBe(1);
+                    expect(piBustCount(h, warm.sessionId!, quietStartedAt)).toBe(0);
+                    const requests = h.requests().slice(requestStart);
+                    expect(requests).toHaveLength(quietPasses + 1);
+                    for (let index = 0; index < requests.length - 1; index += 1) {
+                        const earlier = requestMessages(requests[index]!);
+                        const later = requestMessages(requests[index + 1]!);
+                        expect(earlier.length).toBeLessThanOrEqual(later.length);
+                        for (
+                            let messageIndex = 0;
+                            messageIndex < earlier.length;
+                            messageIndex += 1
+                        ) {
+                            expect(serializeDurablePrefix(later[messageIndex])).toBe(
+                                serializeDurablePrefix(earlier[messageIndex]),
+                            );
+                        }
+                    }
+                },
+            );
+        } finally {
+            rmSync(isolated.rootDir, { recursive: true, force: true });
+        }
+    }, 180_000);
+
     it("persists tag source_contents once with harness='pi' and keeps original unprefixed text", async () => {
         await withPiHarness({}, async (h) => {
             const original = "pi source persistence: keep this exact unprefixed user text";

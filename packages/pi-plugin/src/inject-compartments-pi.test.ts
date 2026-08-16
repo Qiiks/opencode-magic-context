@@ -572,7 +572,7 @@ describe("injectM0M1Pi", () => {
 				state.sessionId,
 			);
 
-			expect(mustMaterializePi(state, db)).toEqual({
+			expect(mustMaterializePi(state, db)).toMatchObject({
 				value: true,
 				reason: "compartment_render_epoch",
 			});
@@ -1679,7 +1679,7 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 				...state,
 				hardSignals: { ...baseHard, modelKey: "anthropic/sonnet" },
 			};
-			expect(mustMaterializePi(switched, db)).toEqual({
+			expect(mustMaterializePi(switched, db)).toMatchObject({
 				value: true,
 				reason: "model_change",
 			});
@@ -1703,7 +1703,7 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 				...state,
 				hardSignals: { ...baseHard, systemHash: "sys-v2" },
 			};
-			expect(mustMaterializePi(changed, db)).toEqual({
+			expect(mustMaterializePi(changed, db)).toMatchObject({
 				value: true,
 				reason: "system_hash",
 			});
@@ -1755,7 +1755,7 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 				...piState(state.sessionId, cwdB),
 				hardSignals: baseHard,
 			};
-			expect(mustMaterializePi(switched, db)).toEqual({
+			expect(mustMaterializePi(switched, db)).toMatchObject({
 				value: true,
 				reason: "project_change",
 			});
@@ -1964,6 +1964,87 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 			closeQuietly(db);
 		}
 	});
+	it("reproduces the copied live marker tuple and keeps three canonical-alias replays byte-identical", () => {
+		const db = createTestDb();
+		const cwd = mkdtempSync(join(tmpdir(), "pi-live-marker-repro-"));
+		try {
+			const state = {
+				...piState("019de471-4fdc-762d-9286-624dfad0b5fe", cwd),
+				projectIdentity: "git:f78f6db52b23c81d58dae3879c9383f550ec180e",
+				injectionBudgetTokens: 15_000,
+				historyBudgetTokens: 27_540,
+				muralEnabled: true,
+				hardSignals: {
+					...baseHard,
+					systemHash: "38b2cc92af20c9236054057c7da1a3df",
+					modelKey: "openai-codex/gpt-5.6-sol",
+				},
+			};
+			appendCompartments(db, state.sessionId, [
+				{
+					sequence: 417,
+					startMessage: 417,
+					endMessage: 417,
+					startMessageId: "entry-417",
+					endMessageId: "entry-417",
+					title: "Cached production boundary",
+					content: "cached production compartment",
+					p1: "cached production compartment",
+				},
+			]);
+			db.prepare(
+				"INSERT INTO m0_mutation_log (id, session_id, mutation_type, target_id, queued_at) VALUES (15, ?, 'compartment_upgrade', NULL, 1)",
+			).run(state.sessionId);
+			const firstMessages = [userMessage("same quiet tail", 10)];
+			injectM0M1Pi(state, db, firstMessages as never, ["entry-0"]);
+			appendCompartments(db, state.sessionId, [
+				{
+					sequence: 425,
+					startMessage: 425,
+					endMessage: 425,
+					startMessageId: "entry-425",
+					endMessageId: "entry-425",
+					title: "Live additive compartment",
+					content: "new m1-only content after the cached boundary",
+					p1: "new m1-only content after the cached boundary",
+				},
+			]);
+			const firstM0 = textOf(firstMessages[0] as never);
+			const firstM1 = textOf(firstMessages[1] as never);
+			const meta = getOrCreateSessionMeta(db, state.sessionId);
+			expect(meta.cachedM0ModelKey).toBe("openai/gpt-5.6-sol");
+			expect(meta.cachedM0MaxCompartmentSeq).toBe(417);
+			expect(meta.cachedM0MaxMutationId).toBe(15);
+			expect(meta.cachedM0UpgradeState).toContain("mural-enabled:1");
+			expect(meta.cachedM0UpgradeState).toContain("render-budgets:m15000-h27540");
+
+			for (let pass = 0; pass < 3; pass += 1) {
+				const messages = [userMessage("same quiet tail", 10)];
+				const result = injectM0M1Pi(
+					state,
+					db,
+					messages as never,
+					["entry-0"],
+					false,
+				);
+				expect(result.m0Materialized).toBe(false);
+				expect(result.m0Reason).toBeNull();
+				expect(textOf(messages[0] as never)).toBe(firstM0);
+				expect(textOf(messages[1] as never)).toBe(firstM1);
+			}
+
+			expect(mustMaterializePi(state, db)).toEqual({ value: false, reason: null });
+			expect(mustMaterializePi({ ...state, muralEnabled: undefined }, db)).toEqual({
+				value: true,
+				reason: "render_config",
+				mismatch: { signal: "muralEnabled", cached: true, current: false },
+			});
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+			closeQuietly(db);
+		}
+	});
+
 	it("does not hard-fold when the current model switches from canonical to Pi alias spelling", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-model-alias-forward-"));
@@ -2038,7 +2119,7 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 		}
 	});
 
-	it("still hard-folds for different models in the same alias family", () => {
+	it("folds exactly once for a genuinely different model in the same alias family", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-model-alias-real-switch-"));
 		try {
@@ -2052,10 +2133,31 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 				...state,
 				hardSignals: { ...baseHard, modelKey: "openai/gpt-5.6-codex" },
 			};
-			expect(mustMaterializePi(realSwitch, db)).toEqual({
+			expect(mustMaterializePi(realSwitch, db)).toMatchObject({
 				value: true,
 				reason: "model_change",
+				mismatch: {
+					signal: "modelKey",
+					cached: "openai/gpt-5.6-sol",
+					current: "openai/gpt-5.6-codex",
+				},
 			});
+			const folded = injectM0M1Pi(
+				realSwitch,
+				db,
+				[userMessage("switch", 11)] as never,
+				["entry-1"],
+			);
+			const replay = injectM0M1Pi(
+				realSwitch,
+				db,
+				[userMessage("switch", 11)] as never,
+				["entry-1"],
+			);
+			expect(folded.m0Materialized).toBe(true);
+			expect(folded.m0Reason).toBe("model_change");
+			expect(replay.m0Materialized).toBe(false);
+			expect(replay.m0Reason).toBeNull();
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
 			closeQuietly(db);

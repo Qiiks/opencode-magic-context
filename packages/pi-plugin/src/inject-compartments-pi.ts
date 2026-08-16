@@ -534,9 +534,26 @@ function renderBudgetIdentityPi(state: PiM0M1State): string {
 	return `m${state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS}-h${state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS}`;
 }
 
+export interface PiMaterializeMismatch {
+	signal: string;
+	cached: string | number | boolean | null;
+	current: string | number | boolean | null;
+}
+
 export interface PiMaterializeDecision {
 	value: boolean;
 	reason: string | null;
+	/** The exact compared values for the signal that fired. */
+	mismatch?: PiMaterializeMismatch;
+}
+
+function piMaterializeMismatch(
+	reason: string,
+	signal: string,
+	cached: PiMaterializeMismatch["cached"],
+	current: PiMaterializeMismatch["current"],
+): PiMaterializeDecision {
+	return { value: true, reason, mismatch: { signal, cached, current } };
 }
 
 interface PiInjectionTokenCountCache {
@@ -976,13 +993,28 @@ export function mustMaterializePi(
 	// A renderer-format change must fold cached m[0] exactly once. The fold
 	// persists this component with the rendered bytes, consuming the trigger.
 	if (cached.compartmentRenderEpoch !== current.compartmentRenderEpoch) {
-		return { value: true, reason: "compartment_render_epoch" };
+		return piMaterializeMismatch(
+			"compartment_render_epoch",
+			"compartmentRenderEpoch",
+			cached.compartmentRenderEpoch,
+			current.compartmentRenderEpoch,
+		);
 	}
-	if (
-		cached.muralEnabled !== current.muralEnabled ||
-		cached.renderBudgetIdentity !== current.renderBudgetIdentity
-	) {
-		return { value: true, reason: "render_config" };
+	if (cached.muralEnabled !== current.muralEnabled) {
+		return piMaterializeMismatch(
+			"render_config",
+			"muralEnabled",
+			cached.muralEnabled,
+			current.muralEnabled,
+		);
+	}
+	if (cached.renderBudgetIdentity !== current.renderBudgetIdentity) {
+		return piMaterializeMismatch(
+			"render_config",
+			"renderBudgetIdentity",
+			cached.renderBudgetIdentity,
+			current.renderBudgetIdentity,
+		);
 	}
 	// ── HARD: provider-side cache eviction (the cache was already dead) ──
 	// Parity with OpenCode mustMaterialize. An empty current signal means
@@ -998,13 +1030,23 @@ export function mustMaterializePi(
 		canonicalHardModelKey !== "" &&
 		canonicalHardModelKey !== canonicalCachedModelKey
 	) {
-		return { value: true, reason: "model_change" };
+		return piMaterializeMismatch(
+			"model_change",
+			"modelKey",
+			canonicalCachedModelKey,
+			canonicalHardModelKey,
+		);
 	}
 	if (
 		hard.systemHash !== "" &&
 		hard.systemHash !== (meta.cachedM0SystemHash ?? "")
 	) {
-		return { value: true, reason: "system_hash" };
+		return piMaterializeMismatch(
+			"system_hash",
+			"systemHash",
+			meta.cachedM0SystemHash ?? "",
+			hard.systemHash,
+		);
 	}
 	// Pi can switch projects within the same session (`/cd`). Legacy cached rows
 	// have a NULL marker: treat that as unknown/MATCH for lazy adoption so the
@@ -1013,7 +1055,12 @@ export function mustMaterializePi(
 		meta.cachedM0ProjectIdentity !== null &&
 		meta.cachedM0ProjectIdentity !== state.projectIdentity
 	) {
-		return { value: true, reason: "project_change" };
+		return piMaterializeMismatch(
+			"project_change",
+			"projectIdentity",
+			meta.cachedM0ProjectIdentity,
+			state.projectIdentity,
+		);
 	}
 	// Idle > TTL: self-consuming guard via cachedM0MaterializedAt (parity with
 	// OpenCode). cacheExpired stays true every pass until lastResponseTime
@@ -1025,12 +1072,22 @@ export function mustMaterializePi(
 		hard.lastResponseTime > 0 &&
 		hard.lastResponseTime > (meta.cachedM0MaterializedAt ?? 0)
 	) {
-		return { value: true, reason: "ttl_idle" };
+		return piMaterializeMismatch(
+			"ttl_idle",
+			"lastResponseTimeAfterMaterialization",
+			meta.cachedM0MaterializedAt ?? 0,
+			hard.lastResponseTime,
+		);
 	}
 
 	// ── HARD: genuine m[0] CONTENT change ──
 	if (cached.upgradeState !== current.upgradeState) {
-		return { value: true, reason: "renderer_upgrade" };
+		return piMaterializeMismatch(
+			"renderer_upgrade",
+			"upgradeState",
+			cached.upgradeState,
+			current.upgradeState,
+		);
 	}
 	if (
 		current.workspaceFingerprint !== null ||
@@ -1040,19 +1097,34 @@ export function mustMaterializePi(
 			current.workspaceFingerprint !==
 			(meta.cachedM0WorkspaceFingerprint ?? null)
 		) {
-			return { value: true, reason: "project_memory_change" };
+			return piMaterializeMismatch(
+				"project_memory_change",
+				"workspaceFingerprint",
+				meta.cachedM0WorkspaceFingerprint ?? null,
+				current.workspaceFingerprint,
+			);
 		}
 	} else if (
 		current.projectMemoryEpoch !== (meta.cachedM0ProjectMemoryEpoch ?? 0)
 	) {
-		return { value: true, reason: "project_memory_change" };
+		return piMaterializeMismatch(
+			"project_memory_change",
+			"projectMemoryEpoch",
+			meta.cachedM0ProjectMemoryEpoch ?? 0,
+			current.projectMemoryEpoch,
+		);
 	}
 	// Use !== (not >), matching OpenCode mustMaterialize: a max-id that DECREASES
 	// (revert / message.removed shrinking the compartment or mutation set) must
 	// still invalidate m[0]. A '>' comparison would miss a decrease and serve a
 	// stale cached baseline.
 	if (current.maxMutationId !== (meta.cachedM0MaxMutationId ?? 0)) {
-		return { value: true, reason: "pending_mutations" };
+		return piMaterializeMismatch(
+			"pending_mutations",
+			"maxMutationId",
+			meta.cachedM0MaxMutationId ?? 0,
+			current.maxMutationId,
+		);
 	}
 	// new_compartment is NOT a trigger (parity with OpenCode — Bug 1 fix): new
 	// compartments are an m[1] delta (renderM1Pi readNewCompartments WHERE
@@ -2300,6 +2372,15 @@ export function injectM0M1Pi(
 	// the guarded fallback (TOCTOU).
 	const currentCompartments = getRenderableCompartmentsPi(db, state);
 	let decision = mustMaterializePi(state, db, currentCompartments);
+	if (decision.value) {
+		const mismatch = decision.mismatch
+			? ` mismatch=${JSON.stringify(decision.mismatch)}`
+			: "";
+		logSession(
+			state.sessionId,
+			`pi m[0] HARD fold firing: reason=${decision.reason ?? "unknown"}${mismatch}`,
+		);
+	}
 	let m0 = "";
 	let m1 = PI_M1_PLACEHOLDER;
 	let markers: PiM0SnapshotMarkers | null = null;

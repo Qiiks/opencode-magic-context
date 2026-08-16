@@ -940,3 +940,26 @@ envelope for direct OpenAI-compatible providers, including vLLM and llama.cpp.
 ## Pending parity
 
 - Last-known-good transform capture and replay for OpenCode and rust-mode sessions is pending for Pi.
+
+## 32. HARD-fold preflight uses the exact wire state and executed-fold gates
+
+Pi builds one `piM0State` for both the early HARD-fold preflight and the later wire injection. The preflight used to omit `muralEnabled`, so every session with an existing `mural-enabled:1` baseline reported an advisory `render_config` fold while the real injection (which did receive `muralEnabled: true`) replayed the cache. On defer passes that false advisory opened pending-operation, heuristic, and reasoning-cleanup gates even though no fold materialized. The affected population was **Pi sessions with the opt-in mural enabled and an already-materialized m[0] baseline**; it was not every v0.37.0 Pi session and was not caused by window-geometry budget derivation.
+
+The copied production row for session `019de471-4fdc-762d-9286-624dfad0b5fe` reproduced the discrepancy offline: the exact state (`openai-codex/gpt-5.6-sol`, mural enabled, `m15000-h27540`) returned `cache_hit`, while the old preflight shape returned `render_config` with `muralEnabled: true -> false`. `renderBudgetIdentityPi` was equal on both sides. Its compare and fold-write paths both call the same helper with the same state, so the `m15000-h27540` marker is self-consistent and cannot alternate between passes. No data migration is needed: the existing cached marker is already correct, and the next natural pass uses the exact state and exits the loop.
+
+Both harness twins now pre-execute a due fold off-wire and feed the shared `foldExecutesThisPass(foldDue, materialized)` predicate into the BUST clause. A due-but-suppressed fold cannot authorize first-application mutations. OpenCode still drains into genuine HARD folds because its off-wire pre-execution materializes in-process; a byte-differential test compares its final injected parts with the prior one-shot fold shape. The Pi end-to-end test also checks three consecutive low-pressure requests at the serialized-prefix boundary with zero transform-decision bust rows; OpenCode's existing `cache-stability.test.ts` runs the equivalent five-turn serialized system/prefix invariant.
+
+### Model-key and model-indexed lookup audit
+
+| Site | Comparison / lookup discipline |
+|---|---|
+| Pi `readCurrentMarkersFromCompartments` and `readFrozenM0InputsPi` | Canonicalize the live Pi-native model before marker persistence. |
+| Pi `mustMaterializePi` | Canonicalizes both live `hard.modelKey` and stored `cachedM0ModelKey`; aliases match, genuinely different models fold once. |
+| Pi `cachedPiRowMatchesSnapshot` | Canonicalizes both cached-row and in-process snapshot keys before the soft-refresh CAS comparison. |
+| OpenCode `readCurrentM0SnapshotMarkersUncached` | Canonicalizes the marker written with m[0]. |
+| OpenCode `mustMaterialize` | Canonicalizes both the live hard signal and cached m[0] key. |
+| OpenCode `cachedRowMatchesState` | Canonicalizes both cached-row and in-process keys. |
+| `cache_ttl`, execute-threshold, prompt-surface model maps | Resolve through `modelRefLookupOrder`, whose first candidate is canonical and whose fallbacks include native aliases. Pi canonicalizes the message-end key before persisting the resolved scalar `cacheTtl`; per-pass TTL checks parse that scalar and perform no model-key comparison. |
+| `last_observed_model_key` | Write paths canonicalize it and OpenCode readers canonicalize both sides. Pi's pressure writer does not populate this OpenCode usage-attribution field, so an empty value on the incident session is expected; Pi HARD-fold identity comes from `liveModelBySession`, not this column. |
+
+Workspace fingerprints preserve the distinction between SQL `NULL` (not workspaced) and a non-empty hash. The compare normalizes only nullish values to `null`; it does not coerce `NULL` to `""`. A legacy zero-length fingerprint would therefore trigger one self-healing fold whose write stores the current `null`, not a per-pass loop.
