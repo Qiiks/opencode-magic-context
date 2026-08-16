@@ -154,10 +154,13 @@ describe("source contract: peek-then-drain in runPipeline (history)", () => {
 		//  1. Inside the try block (so it only runs on success)
 		//  2. After the injectM0M1Pi seam returns
 		//  3. Guarded by isCacheBusting
-		const idx = code.indexOf("injectM0M1PiForRun(");
+		// Anchor on the LAST call site: the wire-injection seam. The pre-fold
+		// probe (fold-execution gate) also calls injectM0M1PiForRun earlier in
+		// runPipeline, and the drain contract applies to the wire injection only.
+		const idx = code.lastIndexOf("injectM0M1PiForRun(");
 		expect(idx).toBeGreaterThan(0);
 		// Look at the next ~600 chars after the injection call
-		const segment = code.slice(idx, idx + 1200);
+		const segment = code.slice(idx, idx + 2400);
 		// The drain must mention historyRefreshSessions.delete and isCacheBusting
 		expect(segment).toContain("historyRefreshSessions.delete(args.sessionId)");
 		expect(segment).toMatch(/if\s*\(\s*args\.isCacheBusting\s*\)/);
