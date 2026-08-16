@@ -14252,7 +14252,6 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
         consumes: vec![ConsumerRole::ServiceClient {
             of: vec!["thalamus".to_string()],
         }],
-        scheduled_tasks: Vec::new(),
         bindings: Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
