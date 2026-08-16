@@ -285,9 +285,11 @@ to compensate for Pi's estimate-token undercount. It does **not** mutate the rea
 context limit, and it passes the raw forward token count onward so emergency drop
 planning still sees the current assembled size. The floor is monotonic: it never
 lowers the persisted pressure, and missing/null forward usage preserves the old
-behavior. Earlier Channel 1/2 ctx_reduce nudges can result because their
-usable/reclaimable math consumes the same corrected input-token reading; those
-nudges are persisted/replayed like the rest of Pi's sticky context hints.
+behavior. This forward-pressure floor affects scheduler and historian decisions only.
+Channel 1/2 `ctx_reduce` nudges instead consume the persisted final-tail `{U,T}`
+hygiene baseline, excluding reasoning from both terms, so live pressure cannot
+silently escalate their severity. Those nudges remain persisted/replayed like
+the rest of Pi's sticky context hints.
 
 Emergency drops remain cache-stable: repeated force passes on the same provider
 usage sample are latched by `last_emergency_input_sample`, fresh same-turn

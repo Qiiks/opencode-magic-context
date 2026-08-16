@@ -5,6 +5,7 @@ import packageJson from "../../../package.json"
 import { badgeTextColor } from '../badge-contrast';
 import { loadSidebarSnapshot, type SidebarSnapshot } from "../data/context-db"
 import { formatThresholdPercent } from "../../shared/format-threshold"
+import { formatTailHygiene } from "../../shared/tail-hygiene-status"
 import { compactionOffSidebarRows, nativeCompactionContextLabel } from "../compaction-off"
 import {
     computeEffectiveOrder,
@@ -239,7 +240,7 @@ const TokenBreakdown = (props: {
             key: "conv",
             tokens: s.conversationTokens,
             color: COLORS.conversation,
-            label: "Conversation",
+            label: "Conversation*",
         })
 
         // Tool Calls = tool_use/tool_result/tool/tool-invocation parts in messages
@@ -320,6 +321,7 @@ const TokenBreakdown = (props: {
                             </box>
                         )
                     })}
+                    <text fg={props.theme.textMuted}>* includes Reasoning; hygiene excludes it</text>
                 </box>
             )}
         </box>
@@ -787,16 +789,26 @@ const SidebarContent = (props: {
                                     <b>{s()!.usagePercentage.toFixed(1)}%</b> / {formatThresholdPercent(s()!.executeThreshold)}%{s()!.executeThresholdClamped ? "*" : ""}
                                 </text>
                             )}
-                            {/* Right: absolute token usage vs the model's
-                                full context window (separate from the
-                                execute threshold so users still know how
-                                much headroom remains beyond compaction). */}
+                            {/* Right: absolute token usage against the usable
+                                scheduler window — the same denominator as the
+                                percentage and nudge/trigger scheduling. */}
                             <text fg={contextSummaryColor()}>
                                 {compactTokens(s()!.inputTokens)} / {compactTokens(s()!.contextLimit)}
                             </text>
                         </box>
                     )}
                     <TokenBreakdown theme={props.theme} snapshot={s()!} collapsed={collapsed()} />
+                    {!collapsed() && (
+                        <text fg={props.theme.textMuted}>Conversation includes reasoning estimates; hygiene excludes reasoning.</text>
+                    )}
+                    {s()!.tailHygiene !== undefined && (
+                        <StatRow
+                            theme={props.theme}
+                            label="Hygiene"
+                            value={formatTailHygiene(s()!.tailHygiene!)}
+                            warning={!s()!.tailHygiene!.evaluable}
+                        />
+                    )}
                 </box>
             )}
 

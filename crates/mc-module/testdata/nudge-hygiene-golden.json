@@ -2,8 +2,8 @@
   "schema": 1,
   "provenance": {
     "generator": "crates/mc-module/gen/gen-nudge-hygiene-golden.ts",
-    "generator_version": "nudge-hygiene-ts-v1",
-    "input_sha256": "dff3ab1beae39ece8401f0bfd2a38dd0c8413caad2a4464aa30e8115a7a276fb"
+    "generator_version": "nudge-hygiene-ts-v2",
+    "input_sha256": "1ecce6c3143396936d12cc3054af8816fc3bd7d5fb377db085bfba2d86ad32c1"
   },
   "cases": [
     {
@@ -18,7 +18,7 @@
             {
               "type": "text",
               "unit": "prose ",
-              "repeat": 58000
+              "repeat": 87000
             }
           ]
         },
@@ -47,7 +47,7 @@
               "id": "call-live",
               "name": "read",
               "unit": "result ",
-              "repeat": 81000
+              "repeat": 162000
             }
           ]
         }
@@ -55,18 +55,13 @@
       "tags": [
         {
           "tag_number": 1,
-          "block_id": "conversation#0",
-          "kind": "message"
-        },
-        {
-          "tag_number": 2,
           "block_id": "tool-result#0",
           "kind": "tool"
         }
       ],
       "expected": {
-        "u": 139008,
-        "t": 139008,
+        "u": 162006,
+        "t": 249008,
         "band": "channel2"
       }
     },
@@ -280,6 +275,168 @@
       "expected": {
         "u": 4001,
         "t": 4001,
+        "band": "quiet"
+      }
+    },
+    {
+      "id": "caveman-rendered-not-original-weight",
+      "protected_tags": 0,
+      "messages": [
+        {
+          "mid": "caveman",
+          "ordinal": 1,
+          "role": "assistant",
+          "blocks": [
+            {
+              "type": "text",
+              "unit": "[caveman depth=2] compacted sentence. ",
+              "repeat": 4000
+            }
+          ]
+        },
+        {
+          "mid": "untagged-context",
+          "ordinal": 2,
+          "role": "user",
+          "blocks": [
+            {
+              "type": "text",
+              "unit": "visible context ",
+              "repeat": 2000
+            }
+          ]
+        }
+      ],
+      "tags": [
+        {
+          "tag_number": 1,
+          "block_id": "caveman#0",
+          "kind": "message"
+        }
+      ],
+      "expected": {
+        "u": 44001,
+        "t": 48002,
+        "band": "quiet"
+      }
+    },
+    {
+      "id": "channel1-reminder-span-excluded",
+      "protected_tags": 0,
+      "messages": [
+        {
+          "mid": "reminder-owner",
+          "ordinal": 1,
+          "role": "assistant",
+          "blocks": [
+            {
+              "type": "tool_call",
+              "id": "call-reminder",
+              "name": "read",
+              "input": {
+                "path": "reminder"
+              }
+            }
+          ]
+        },
+        {
+          "mid": "reminder-result",
+          "ordinal": 2,
+          "role": "user",
+          "blocks": [
+            {
+              "type": "tool_result",
+              "id": "call-reminder",
+              "name": "read",
+              "unit": "kept output\n\n<system-reminder>\nreasoning-sized reminder bytes must not count\n</system-reminder>",
+              "repeat": 1
+            }
+          ]
+        }
+      ],
+      "tags": [
+        {
+          "tag_number": 1,
+          "block_id": "reminder-result#0",
+          "kind": "tool"
+        }
+      ],
+      "expected": {
+        "u": 7,
+        "t": 7,
+        "band": "quiet"
+      }
+    },
+    {
+      "id": "post-fold-fresh-tail",
+      "protected_tags": 0,
+      "messages": [
+        {
+          "mid": "fold-summary",
+          "ordinal": 1,
+          "role": "user",
+          "synthetic": true,
+          "blocks": [
+            {
+              "type": "text",
+              "unit": "compacted history ",
+              "repeat": 100000
+            }
+          ]
+        },
+        {
+          "mid": "fresh-tail",
+          "ordinal": 2,
+          "role": "user",
+          "blocks": [
+            {
+              "type": "text",
+              "unit": "fresh visible tail ",
+              "repeat": 10000
+            }
+          ]
+        }
+      ],
+      "tags": [
+        {
+          "tag_number": 1,
+          "block_id": "fresh-tail#0",
+          "kind": "message"
+        }
+      ],
+      "expected": {
+        "u": 30001,
+        "t": 30001,
+        "band": "quiet"
+      }
+    },
+    {
+      "id": "tiny-t-minimum-guard",
+      "protected_tags": 0,
+      "messages": [
+        {
+          "mid": "tiny",
+          "ordinal": 1,
+          "role": "user",
+          "blocks": [
+            {
+              "type": "text",
+              "unit": "x ",
+              "repeat": 59000
+            }
+          ]
+        }
+      ],
+      "tags": [
+        {
+          "tag_number": 1,
+          "block_id": "tiny#0",
+          "kind": "message"
+        }
+      ],
+      "expected": {
+        "u": 59001,
+        "t": 59001,
         "band": "quiet"
       }
     },

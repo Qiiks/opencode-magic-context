@@ -17,6 +17,10 @@ import { sessionLog } from "../../shared";
 import { isTuiConnected, pushNotification } from "../../shared/rpc-notifications";
 import type { Database } from "../../shared/sqlite";
 import {
+    resolveTailHygieneStatus,
+    type WireTailHygieneBaseline,
+} from "../../shared/tail-hygiene-status";
+import {
     type PartialRecompRange,
     snapRangeToCompartments,
 } from "./compartment-runner-partial-recomp";
@@ -525,6 +529,8 @@ export function createMagicContextCommandHandler(deps: {
     getDreamerProgress?: () =>
         | import("../../features/magic-context/dreamer/task-registry").DreamTaskProgress
         | null;
+    /** Cached U/T token measurement of the final rendered conversation tail, shared by both nudge mechanisms. */
+    getTailHygiene?: (sessionId: string) => import("./ctx-reduce-nudge").Channel1State | undefined;
     onFlush?: (sessionId: string) => void;
     /** Runs /ctx-recomp. When `range` is provided, runs partial recomp over
      *  that range (snapped to enclosing compartment boundaries). When omitted,
@@ -781,6 +787,13 @@ export function createMagicContextCommandHandler(deps: {
                               { db: deps.db, sessionID: sessionId },
                           )
                         : undefined;
+                const rustTailHygiene = rustStatus?.tail_hygiene;
+                const tailHygiene = resolveTailHygieneStatus(
+                    deps.getTailHygiene?.(sessionId),
+                    rustTailHygiene && typeof rustTailHygiene === "object"
+                        ? (rustTailHygiene as WireTailHygieneBaseline)
+                        : undefined,
+                );
                 const statusOutput = executeStatus(
                     deps.db,
                     sessionId,
@@ -802,6 +815,7 @@ export function createMagicContextCommandHandler(deps: {
                           }
                         : undefined,
                     windowGeometry,
+                    tailHygiene,
                 );
                 const moduleStatus = rustStatus ? `\n\n${formatRustStatusText(rustStatus)}` : "";
                 const modeStatus = deps.compactionOff

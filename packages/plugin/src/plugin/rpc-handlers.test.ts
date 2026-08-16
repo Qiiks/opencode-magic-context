@@ -105,6 +105,81 @@ describe("buildSidebarSnapshot — stale build error state", () => {
     });
 });
 
+describe("buildSidebarSnapshot — persisted tail hygiene", () => {
+    test("preserves zero-valued TypeScript baseline fields in the RPC payload", () => {
+        const db = createTestDb();
+        try {
+            const sessionId = "ses-hygiene-zero";
+            const live = createLiveSessionState();
+            live.channel1StateBySession.set(sessionId, {
+                baselineU: 0,
+                baselineT: 0,
+                turnDeltaU: 0,
+                turnDeltaT: 0,
+                baselineGeneration: 0,
+                computedAt: 0,
+                evaluable: true,
+                generationInvalidated: false,
+                baselineParts: [],
+                contentSignature: "empty",
+                reducedSinceRefresh: false,
+                oldestReclaimableToolTags: [],
+            });
+
+            const snapshot = buildSidebarSnapshot(db, sessionId, process.cwd(), live);
+
+            expect(snapshot.tailHygiene).toEqual({
+                u: 0,
+                t: 0,
+                severity: 0,
+                evaluable: true,
+                generationInvalidated: false,
+                baselineGeneration: 0,
+                computedAt: 0,
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("prefers the durable Rust baseline when module authority is active", () => {
+        const db = createTestDb();
+        try {
+            const snapshot = buildSidebarSnapshot(
+                db,
+                "ses-hygiene-rust",
+                process.cwd(),
+                createLiveSessionState(),
+                undefined,
+                undefined,
+                {
+                    tail_hygiene: {
+                        u: 65_100,
+                        t: 100_000,
+                        severity: 0.651,
+                        evaluable: true,
+                        generation_invalidated: false,
+                        baseline_generation: 7,
+                        computed_at_ms: 123,
+                    },
+                },
+            );
+
+            expect(snapshot.tailHygiene).toEqual({
+                u: 65_100,
+                t: 100_000,
+                severity: 0.651,
+                evaluable: true,
+                generationInvalidated: false,
+                baselineGeneration: 7,
+                computedAt: 123,
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
 describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
     test("computes memoryTokens on-demand when memory_block_cache is empty but memory_block_count > 0", () => {
         const db = createTestDb();

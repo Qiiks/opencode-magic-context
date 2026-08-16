@@ -33,12 +33,18 @@ import {
 	formatThresholdClampNote,
 	formatThresholdPercent,
 } from "@magic-context/core/shared/format-threshold";
+import type { TailHygieneStatus } from "@magic-context/core/shared/rpc-types";
+import {
+	formatTailHygiene,
+	resolveTailHygieneStatus,
+} from "@magic-context/core/shared/tail-hygiene-status";
 import {
 	formatWindowDerivationLine,
 	type WindowGeometryResult,
 } from "@magic-context/core/shared/window-geometry";
 import packageJson from "../../package.json";
 import { resolveSessionId } from "../commands/pi-command-utils";
+import { getPiChannel1Baseline } from "../ctx-reduce-nudge-pi";
 import { resolvePiWindowGeometry } from "../pi-context-limit";
 import { isPiRecompInFlight } from "../pi-recomp-runner";
 
@@ -121,6 +127,7 @@ interface StatusDialogDetail {
 	conversationTokens: number;
 	toolCallTokens: number;
 	toolDefinitionTokens: number;
+	tailHygiene?: TailHygieneStatus;
 	newWorkTokens: number;
 	totalInputTokens: number;
 	/** Compartments still needing a v2 upgrade (legacy or tierless). */
@@ -284,6 +291,9 @@ function renderInner(
 	lines.push(
 		`Work tokens ${fmt(s.newWorkTokens)} new · ${fmt(s.totalInputTokens)} total input`,
 	);
+	if (s.tailHygiene !== undefined) {
+		lines.push(`Hygiene ${formatTailHygiene(s.tailHygiene)}`);
+	}
 
 	// Segmented bar (fills the full inner content width)
 	lines.push(renderBar(s, innerWidth));
@@ -298,6 +308,7 @@ function renderInner(
 		const right = theme.fg("muted", `${fmt(seg.tokens)} (${pct}%)`);
 		lines.push(`${left}   ${right}`);
 	}
+	lines.push("* Conversation includes model Reasoning; hygiene excludes it.");
 	lines.push("");
 
 	// Quick counts + historian. v2: facts retired (promoted to memories), so the
@@ -537,6 +548,9 @@ export function buildPiStatusDetail(
 			toolDefinitionTokens,
 	);
 	const workMetrics = getSessionWorkMetrics(deps.db, sessionId);
+	const tailHygiene = resolveTailHygieneStatus(
+		getPiChannel1Baseline(sessionId),
+	);
 
 	const modelKey = ctx.model
 		? `${ctx.model.provider}/${ctx.model.id}`
@@ -648,6 +662,7 @@ export function buildPiStatusDetail(
 		conversationTokens,
 		toolCallTokens,
 		toolDefinitionTokens,
+		...(tailHygiene === undefined ? {} : { tailHygiene }),
 		newWorkTokens: workMetrics.newWorkTokens,
 		totalInputTokens: workMetrics.totalInputTokens,
 		upgradeNeededCount: safeRead(
@@ -713,7 +728,7 @@ function breakdownSegments(s: StatusDialogDetail): Array<{
 		});
 	if (s.conversationTokens > 0)
 		segs.push({
-			label: "Conversation",
+			label: "Conversation*",
 			tokens: s.conversationTokens,
 			color: COLORS.conversation,
 		});

@@ -177,7 +177,9 @@ export function evaluateChannel2(
     return {
         evaluable: true,
         shouldTrigger:
-            reclaimableTokens >= CHANNEL2_FLOOR_TOKENS && severity >= CHANNEL2_SEVERITY_THRESHOLD,
+            tailTokens >= CHANNEL1_MIN_TOKENS &&
+            reclaimableTokens >= CHANNEL2_FLOOR_TOKENS &&
+            severity >= CHANNEL2_SEVERITY_THRESHOLD,
         reclaimableTokens,
         tailTokens,
         severity,

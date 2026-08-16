@@ -1026,18 +1026,18 @@ mod tests {
     }
 
     #[test]
-    fn parity_golden_matches_ts_reference_across_starter_corpus() {
+    fn parity_golden_matches_ts_reference_across_full_corpus() {
         let golden: HygieneGolden =
             serde_json::from_str(include_str!("../testdata/nudge-hygiene-golden.json"))
                 .expect("parse nudge hygiene golden");
         assert_eq!(golden.schema, 1);
-        assert_eq!(golden.provenance.generator_version, "nudge-hygiene-ts-v1");
+        assert_eq!(golden.provenance.generator_version, "nudge-hygiene-ts-v2");
         assert_eq!(
             hygiene_fixture_hash(&golden.cases),
             golden.provenance.input_sha256,
             "committed fixture inputs must match the TypeScript generator provenance"
         );
-        assert!(golden.cases.len() >= 6);
+        assert!(golden.cases.len() >= 12);
 
         for case in &golden.cases {
             let messages = case
@@ -1064,6 +1064,25 @@ mod tests {
                     (rust - ts).abs() <= tolerance,
                     "{} {label} drifted outside tokenizer tolerance: Rust={rust}, TS={ts}, tolerance={tolerance}",
                     case.id
+                );
+            }
+            if case.id == "reasoning-excluded-both-terms" {
+                let reasoning_tokens = case
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.blocks)
+                    .filter_map(|block| match block {
+                        HygieneFixtureBlock::Reasoning { unit, repeat } => {
+                            Some(estimated_tokens(&unit.repeat(*repeat)))
+                        }
+                        _ => None,
+                    })
+                    .sum::<i64>();
+                let tolerance =
+                    12.max((case.expected.t.unsigned_abs() as f64 * 0.03).ceil() as i64);
+                assert!(
+                    (measured.t + reasoning_tokens - case.expected.t).abs() > tolerance,
+                    "Rust reasoning-arm counting mutant must redden its parity leg"
                 );
             }
             assert_eq!(

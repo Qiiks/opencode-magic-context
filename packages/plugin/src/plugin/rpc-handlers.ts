@@ -60,6 +60,10 @@ import {
 import { getLoggerDiagnostics, log } from "../shared/logger";
 import type { MagicContextRpcServer } from "../shared/rpc-server";
 import type { EmbedDetail, SidebarSnapshot, StatusDetail } from "../shared/rpc-types";
+import {
+    resolveTailHygieneStatus,
+    type WireTailHygieneBaseline,
+} from "../shared/tail-hygiene-status";
 import { applyStickySnapshotCache } from "./sidebar-snapshot-cache";
 
 // Per-process incremental work-metrics state, keyed by session. The RPC server
@@ -71,6 +75,7 @@ const workMetricsCarryBySession = new Map<string, WorkMetricsCarry>();
 const RUST_STATUS_CACHE_TTL_MS = 2_000;
 export interface RustSessionStatus {
     usage?: { current_total_input_tokens?: number; context_limit_tokens?: number };
+    tail_hygiene?: WireTailHygieneBaseline | null;
     boundary_present?: boolean;
     coverage_ordinal?: number | null;
     compartment_count?: number;
@@ -476,6 +481,11 @@ export function buildSidebarSnapshot(
             nativeContextLimit > 0 ? (effectiveInputTokens / nativeContextLimit) * 100 : undefined;
 
         const calibration = resolveModelCalibration(activeProviderID, activeModelID);
+        const tailHygiene = resolveTailHygieneStatus(
+            liveSessionState?.channel1StateBySession.get(sessionId),
+            moduleStatus?.tail_hygiene,
+        );
+
         const calibrated = calibrateBuckets({
             inputTokens: effectiveInputTokens,
             systemLocal: systemPromptTokens,
@@ -523,6 +533,7 @@ export function buildSidebarSnapshot(
             conversationTokens: calibrated.conversationTokens,
             toolCallTokens: calibrated.toolCallTokens,
             toolDefinitionTokens: calibrated.toolDefinitionTokens,
+            ...(tailHygiene === undefined ? {} : { tailHygiene }),
             executeThreshold,
             executeThresholdClamped,
             boundaryPresent: moduleStatus?.boundary_present,

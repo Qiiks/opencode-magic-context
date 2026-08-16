@@ -11,6 +11,7 @@ import packageJson from "../../package.json"
 import { closeRpc, dismissUpgradeReminder, getAnnouncement, getCompartmentCount, getRpcGeneration, initRpcClient, loadEmbedDetail, loadStatusDetail, loadToastDurationMs, markAnnounced, requestRecomp, requestUpgrade, type EmbedDetail, type StatusDetail } from "./data/context-db"
 import { startNotificationSocket, stopNotificationSocket, type SocketNotification } from "./data/notification-socket"
 import { formatThresholdPercent } from "../shared/format-threshold"
+import { formatTailHygiene } from "../shared/tail-hygiene-status"
 import { formatWindowDerivationLine } from "../shared/window-geometry"
 import { compactionOffSidebarRows, nativeCompactionContextLabel } from "./compaction-off"
 import { isCompactionEnabled } from "../config/agent-disable"
@@ -202,7 +203,7 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
             segs.push({ label: "User Profile", tokens: d.profileTokens, color: COLORS.profile })
 
         if (d.conversationTokens > 0)
-            segs.push({ label: "Conversation", tokens: d.conversationTokens, color: COLORS.conversation })
+            segs.push({ label: "Conversation*", tokens: d.conversationTokens, color: COLORS.conversation })
         if (d.toolCallTokens > 0)
             segs.push({ label: "Tool Calls", tokens: d.toolCallTokens, color: COLORS.toolCalls })
         if (d.toolDefinitionTokens > 0)
@@ -271,6 +272,15 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                         </box>
                     )
                 })}
+                <text fg={t().textMuted}>* Conversation includes Reasoning; hygiene excludes it</text>
+                {s().tailHygiene !== undefined && (
+                    <R
+                        t={t()}
+                        l="Hygiene"
+                        v={formatTailHygiene(s().tailHygiene!)}
+                        fg={s().tailHygiene!.evaluable ? t().accent : t().warning}
+                    />
+                )}
             </box>
 
             {/* Recomp / session-upgrade live progress (full width, only while
