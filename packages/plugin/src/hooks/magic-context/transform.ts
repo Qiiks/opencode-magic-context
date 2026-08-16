@@ -70,7 +70,7 @@ import {
     resolveTodowriteAvailabilityFromMessages,
     type ToolAvailabilityVerdict,
 } from "./ctx-reduce-availability";
-import { shouldTriggerChannel2 } from "./ctx-reduce-nudge";
+import { evaluateChannel2 } from "./ctx-reduce-nudge";
 import { deriveTriggerBudget } from "./derive-budgets";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
@@ -2496,16 +2496,9 @@ export function createTransform(deps: TransformDeps) {
                 !channelBaseline.generationInvalidated &&
                 !channelBaseline.reducedSinceRefresh
             ) {
-                const channel2ShouldTrigger = shouldTriggerChannel2({
-                    baselineU: channelBaseline.baselineU,
-                    baselineT: channelBaseline.baselineT,
-                    deltas: {
-                        u: channelBaseline.turnDeltaU,
-                        t: channelBaseline.turnDeltaT,
-                    },
-                });
+                const channel2Evaluation = evaluateChannel2(channelBaseline);
                 try {
-                    if (channel2ShouldTrigger) {
+                    if (channel2Evaluation.shouldTrigger) {
                         casChannel2NudgeState(db, sessionId, "", "pending");
                     } else {
                         casChannel2NudgeState(db, sessionId, "pending", "");

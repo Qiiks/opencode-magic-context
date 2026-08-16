@@ -4,11 +4,11 @@ import {
     buildChannel2Reminder,
     CHANNEL1_FLOOR_TOKENS,
     CHANNEL1_MIN_TOKENS,
-    CHANNEL2_MIN_RECLAIMABLE,
-    CHANNEL2_USABLE_FRACTION,
+    CHANNEL2_FLOOR_TOKENS,
+    CHANNEL2_SEVERITY_THRESHOLD,
     channel1RefireTokens,
     decideChannel1,
-    shouldTriggerChannel2,
+    evaluateChannel2,
 } from "./ctx-reduce-nudge";
 
 describe("decideChannel1 — agent-tail hygiene ratio", () => {
@@ -195,33 +195,72 @@ describe("reminder rendering", () => {
     });
 });
 
-describe("shouldTriggerChannel2 — new baseline seam with legacy predicate", () => {
-    it("uses effective baseline plus typed deltas through the new input shape", () => {
+describe("evaluateChannel2 — fourth hygiene band", () => {
+    const baseline = {
+        baselineU: 0,
+        baselineT: 100_000,
+        turnDeltaU: 0,
+        turnDeltaT: 0,
+        evaluable: true,
+        generationInvalidated: false,
+    };
+
+    it("arms only at severity >= 0.60 with at least 50k reclaimable tokens", () => {
+        expect(CHANNEL2_FLOOR_TOKENS).toBe(50_000);
+        expect(CHANNEL2_SEVERITY_THRESHOLD).toBe(0.6);
         expect(
-            shouldTriggerChannel2({
-                baselineU: 20_000,
-                baselineT: 90_000,
-                deltas: { u: 10_000, t: 0 },
-            }),
+            evaluateChannel2({
+                ...baseline,
+                baselineU: 50_000,
+                turnDeltaU: 10_000,
+            }).shouldTrigger,
         ).toBe(true);
         expect(
-            shouldTriggerChannel2({
-                baselineU: 20_000,
-                baselineT: 300_000,
-                deltas: { u: 34_000, t: 0 },
-            }),
+            evaluateChannel2({
+                ...baseline,
+                baselineU: 49_999,
+                baselineT: 80_000,
+            }).shouldTrigger,
+        ).toBe(false);
+        expect(
+            evaluateChannel2({
+                ...baseline,
+                baselineU: 59_999,
+            }).shouldTrigger,
         ).toBe(false);
     });
 
-    it("retains the existing floor and fraction", () => {
-        expect(CHANNEL2_MIN_RECLAIMABLE).toBe(10_000);
-        expect(CHANNEL2_USABLE_FRACTION).toBeCloseTo(1 / 3, 5);
-        expect(
-            shouldTriggerChannel2({
-                baselineU: CHANNEL2_MIN_RECLAIMABLE - 1,
-                baselineT: 1_000,
-                deltas: { u: 0, t: 0 },
-            }),
-        ).toBe(false);
+    it("arms the 162k/249k flagship incident", () => {
+        const evaluation = evaluateChannel2({
+            ...baseline,
+            baselineU: 162_000,
+            baselineT: 249_000,
+        });
+        expect(evaluation.shouldTrigger).toBe(true);
+        expect(evaluation.severity).toBeCloseTo(0.651, 3);
+    });
+
+    it("cannot arm below the Channel-1 urgent band", () => {
+        for (let tailTokens = 60_000; tailTokens <= 500_000; tailTokens += 10_000) {
+            const belowUrgent = Math.floor(tailTokens * 0.54999);
+            expect(
+                evaluateChannel2({
+                    ...baseline,
+                    baselineU: belowUrgent,
+                    baselineT: tailTokens,
+                }).shouldTrigger,
+            ).toBe(false);
+        }
+    });
+
+    it("holds generation-invalidated and unknown baselines", () => {
+        expect(evaluateChannel2(undefined).evaluable).toBe(false);
+        const invalidated = evaluateChannel2({
+            ...baseline,
+            baselineU: 70_000,
+            generationInvalidated: true,
+        });
+        expect(invalidated.evaluable).toBe(false);
+        expect(invalidated.shouldTrigger).toBe(false);
     });
 });

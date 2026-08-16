@@ -787,7 +787,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		const migration = getMigrationOnOpenRefusal();
 		const blockingProcesses =
 			migration?.blockingProcesses ??
-			migration?.serverPids.map((pid) => ({ kind: "process" as const, pid })) ?? [];
+			migration?.serverPids.map((pid) => ({ kind: "process" as const, pid })) ??
+			[];
 		const fence = getSchemaFenceRejection();
 		const reason: FailClosedReason =
 			migration && blockingProcesses.length > 0
@@ -1874,13 +1875,13 @@ async function startPiMagicContextRuntime(
 		// Channel 2 (ceiling) nudge delivery — the Pi analog of OpenCode's
 		// event-handler delivery on terminal message.updated. The pipeline
 		// records a `pending` intent near the threshold; deliver it here at the
-		// turn boundary via sendUserMessage(followUp). Internally CAS-gated to
-		// one delivery per session lifetime, and no-ops unless `pending`.
+		// turn boundary via sendMessage(followUp). Internally CAS-gated to one
+		// delivery per tail-reset cycle, and no-ops unless `pending`.
 		// Fire-and-forget; never block agent_end.
 		//
 		// Deliver ONLY on a clean final stop. Pi emits agent_end for error /
 		// aborted responses and for retry attempts too (agent-loop); delivering
-		// on those would inject the follow-up mid-retry and burn the one-shot cap
+		// on those would inject the follow-up mid-retry and consume the cycle
 		// before the turn actually completed. OpenCode's equivalent gates on
 		// finish === "stop". Mirror that with the final assistant's stopReason.
 		try {
@@ -2015,13 +2016,13 @@ async function startPiMagicContextRuntime(
 			// the agent is warned while the pile is still growing (agent_end
 			// stays as the idle fallback). No-ops unless pending + revalidated.
 			if (compactionOff) return;
-			if (db) maybeDeliverChannel2Pi(pi, db, sessionId, "steer");
 			const block = maybeChannel1ReminderForToolResult({
 				db,
 				sessionId,
 				toolName: event.toolName,
 				content: event.content,
 			});
+			if (db) maybeDeliverChannel2Pi(pi, db, sessionId, "steer");
 			if (!block) return;
 			return { content: [...event.content, block] };
 		} catch (err) {

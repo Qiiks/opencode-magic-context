@@ -1141,13 +1141,18 @@ describe("registerPiContextHandler", () => {
 		// >100 newer sessions so the victim is evicted via clearContextHandlerSession.
 		const victim = "ses-evict-victim";
 		setPiChannel1Baseline(victim, {
+			baselineU: 0,
+			baselineT: 0,
+			turnDeltaU: 0,
+			turnDeltaT: 0,
+			evaluable: true,
+			generationInvalidated: false,
 			tailToolTokens: 1,
 			historyBudgetTokens: 0,
 			contextLimit: 0,
 			executeThresholdPercentage: 65,
 			lastInputTokens: 0,
 			turnToolTokens: 0,
-			usableTokens: 0,
 			reducedSinceRefresh: false,
 			oldestReclaimableToolTags: [],
 		});

@@ -35,7 +35,7 @@ describe("channel 2 fires for subagents", () => {
         expect(idx).toBeGreaterThan(-1);
         const triggerBlock = src.slice(idx, src.indexOf("const elapsed", idx));
         expect(triggerBlock).not.toContain("fullFeatureMode");
-        expect(triggerBlock).toContain("shouldTriggerChannel2");
+        expect(triggerBlock).toContain("evaluateChannel2");
         expect(triggerBlock).toContain("channelBaseline.evaluable");
     });
 

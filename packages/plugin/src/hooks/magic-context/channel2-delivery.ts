@@ -1,6 +1,6 @@
 // Channel 2 delivery: the synthetic-user-message ceiling nudge.
 //
-// The transform records a one-shot `pending` intent in `session_meta`
+// The transform records a cycle-capped `pending` intent in `session_meta`
 // (`channel2_nudge_state`) when its persisted rendered-tail predicate holds.
 // This module DELIVERS that
 // intent from the event handler (`message.updated`, both mid-turn
@@ -15,8 +15,8 @@
 // Lease state machine (cross-process CAS): pending -> claimed(token) -> delivered.
 //   - claim `pending -> claimed` with a per-claim token before send (so two
 //     processes can't both send from the same pending row)
-//   - on confirmed success: token-CAS `claimed -> delivered` (cap consumed,
-//     terminal)
+//   - on confirmed success: token-CAS `claimed -> delivered` (current tail-reset
+//     cycle consumed)
 //   - on send failure: revert `claimed -> pending` (don't burn the one ceiling
 //     nudge on a transient transport error)
 //   - after a successful send: never revert to pending, even if confirmation
@@ -49,7 +49,8 @@ import { resolvePromptContext } from "../../shared/prompt-context";
 import type { Database } from "../../shared/sqlite";
 import {
     buildChannel2Reminder,
-    shouldTriggerChannel2,
+    type Channel2PredicateBaseline,
+    evaluateChannel2,
     type ToolReclaimHint,
 } from "./ctx-reduce-nudge";
 import { isMidTurn } from "./read-session-db";
@@ -62,11 +63,8 @@ export interface Channel2DeliveryDeps {
      * No-op when absent (e.g. a context with no client wired).
      */
     client?: unknown;
-    /** Saved rendered-tail counts: reclaimable tagged mass U and total eligible mass T. */
-    baselineU?: number;
-    baselineT?: number;
-    /** U/T token counts added since that final-array measurement. */
-    deltas?: { u: number; t: number };
+    /** Persisted reclaimable/total tail tokens, typed deltas, and generation validity. */
+    baseline?: Channel2PredicateBaseline;
     oldestReclaimableToolTags?: readonly ToolReclaimHint[];
     /** Module-owned directives are already predicate-validated; preserve their text verbatim. */
     directiveText?: string;
@@ -158,43 +156,26 @@ export async function maybeDeliverChannel2(
     // agent may have reduced or appended enough typed mass to change the saved
     // predicate. A module directive is already validated by the module, so its
     // lease skips this TypeScript baseline check and preserves its text.
-    // Firing the synthetic nudge anyway would inject a stale "you have N tokens
-    // to drop" message AND consume the one-per-session cap for nothing.
     //
-    // Two rules, both cap-preserving:
-    // - UNKNOWN baseline (no fresh measurement at this event) → do NOT deliver
-    //   and do NOT touch the lease: leave `pending` for a later final-stop that
-    //   has a real measurement. Never substitute a default and burn the cap on
-    //   an unvalidated condition.
-    // - KNOWN baseline → add the U/T deltas and rerun the existing U ≥ T/3
-    //   threshold. If it fails, clear `pending` so later growth can re-arm it.
-    if (
-        deps.directiveText === undefined &&
-        (deps.baselineU === undefined || deps.baselineT === undefined)
-    ) {
+    // An unavailable or generation-invalidated baseline holds `pending`; a known
+    // false predicate cancels it to the re-armable empty state.
+    const evaluation = evaluateChannel2(deps.baseline);
+    if (deps.directiveText === undefined && !evaluation.evaluable) {
         return false;
     }
-    const deltas = deps.deltas ?? { u: 0, t: 0 };
-    const effectiveU = Math.max(0, (deps.baselineU ?? 0) + deltas.u);
-    if (
-        deps.directiveText === undefined &&
-        !shouldTriggerChannel2({
-            baselineU: deps.baselineU as number,
-            baselineT: deps.baselineT as number,
-            deltas,
-        })
-    ) {
+    if (deps.directiveText === undefined && !evaluation.shouldTrigger) {
         try {
             casChannel2NudgeState(deps.db, sessionId, "pending", "");
             sessionLog(
                 sessionId,
-                `channel2 intent cleared pre-delivery (U ${effectiveU}, T ${Math.max(0, (deps.baselineT ?? 0) + deltas.t)} — trigger no longer holds; re-armable)`,
+                `channel2 intent cleared pre-delivery (U ${evaluation.reclaimableTokens}, T ${evaluation.tailTokens} — trigger no longer holds; re-armable)`,
             );
         } catch {
             // best-effort; if the CAS fails the next pass re-evaluates.
         }
         return false;
     }
+    const effectiveU = evaluation.reclaimableTokens;
 
     const client = deps.client;
     if (!client) return false;
@@ -293,7 +274,7 @@ export async function maybeDeliverChannel2(
     }
 
     try {
-        // Confirmed: consume the one-shot cap (terminal). The CAS result is
+        // Confirmed: consume the current tail-reset cycle. The CAS result is
         // authoritative; a stolen/expired claim must not be treated as delivered.
         const confirmed = casChannel2NudgeClaim(deps.db, sessionId, "delivered", claimToken);
         if (confirmed) {

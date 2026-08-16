@@ -13,9 +13,9 @@
 //   `promptAsync` (which joins the in-flight runner on OpenCode >= 1.17.7). Pi
 //   is single-process, so it just calls the native `pi.sendMessage(..., {
 //   deliverAs })` as a hidden custom message (`display:false`). The
-//   `channel2_nudge_state` lease is kept both to enforce the one-nudge-per-
-//   session cap and because the intent is recorded at one point in the pipeline
-//   but delivered later, when a `tool_result` or `agent_end` event arrives.
+//   `channel2_nudge_state` lease enforces one delivery per tail-reset cycle and
+//   carries the intent from the pipeline point that records it to the later
+//   `tool_result` or `agent_end` event that delivers it.
 
 import {
 	casChannel2NudgeState,
@@ -32,27 +32,55 @@ import {
 	buildChannel2Reminder,
 	CHANNEL1_SENTINEL,
 	type Channel1Level,
+	type Channel2PredicateBaseline,
+	evaluateChannel2,
 	isDroppedToolOutput,
-	shouldTriggerChannel2,
 	type TailTokenEstimate,
 	tailToolTokensFromStrings,
 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 
-export interface Channel1State {
+export interface Channel1State extends Channel2PredicateBaseline {
 	tailToolTokens: number;
 	historyBudgetTokens: number;
 	contextLimit: number;
 	executeThresholdPercentage: number;
 	lastInputTokens: number;
 	turnToolTokens: number;
-	usableTokens: number;
 	reducedSinceRefresh: boolean;
 	oldestReclaimableToolTags: Array<{
 		tagNumber: number;
 		toolName: string | null;
 	}>;
+}
+
+export function adaptPiChannel2Baseline(input: {
+	reclaimableTokens?: number;
+	tailTokens?: number;
+	hasUnknownFields?: boolean;
+}): Channel2PredicateBaseline {
+	const reclaimableTokens = input.reclaimableTokens;
+	const tailTokens = input.tailTokens;
+	// TODO-S5: walk Pi's final message array so dropped sentinels and protected
+	// parts are classified directly instead of trusting these temporary scalars.
+	const evaluable =
+		input.hasUnknownFields !== true &&
+		typeof reclaimableTokens === "number" &&
+		Number.isFinite(reclaimableTokens) &&
+		reclaimableTokens >= 0 &&
+		typeof tailTokens === "number" &&
+		Number.isFinite(tailTokens) &&
+		tailTokens >= 0 &&
+		reclaimableTokens <= tailTokens;
+	return {
+		baselineU: evaluable ? reclaimableTokens : 0,
+		baselineT: evaluable ? tailTokens : 0,
+		turnDeltaU: 0,
+		turnDeltaT: 0,
+		evaluable,
+		generationInvalidated: !evaluable,
+	};
 }
 
 function legacyPiTokens(value: string): number {
@@ -158,7 +186,11 @@ export function clearPiChannel1State(sessionId: string): void {
 /** Mark that the agent ran ctx_reduce since the last baseline refresh (suppress self-nag). */
 export function markPiChannel1Reduced(sessionId: string, db?: Database): void {
 	const state = channel1StateBySession.get(sessionId);
-	if (state) state.reducedSinceRefresh = true;
+	if (state) {
+		state.reducedSinceRefresh = true;
+		state.evaluable = false;
+		state.generationInvalidated = true;
+	}
 	if (db) resetLastNudgeCycle(db, sessionId);
 }
 
@@ -291,6 +323,8 @@ export function maybeChannel1ReminderForToolResult(args: {
 
 	if (toolName === "ctx_reduce") {
 		state.reducedSinceRefresh = true;
+		state.evaluable = false;
+		state.generationInvalidated = true;
 		resetLastNudgeCycle(db, sessionId);
 		return null;
 	}
@@ -302,7 +336,9 @@ export function maybeChannel1ReminderForToolResult(args: {
 
 	// Accumulate this tool's tokens into the per-turn accumulator (prospective:
 	// not yet reflected in the baseline tail snapshot).
-	state.turnToolTokens += legacyPiTokens(text);
+	const deltaTokens = legacyPiTokens(text);
+	state.turnToolTokens += deltaTokens;
+	state.turnDeltaT += deltaTokens;
 
 	if (state.reducedSinceRefresh) return null;
 
@@ -380,7 +416,7 @@ const CHANNEL2_NUDGE_CUSTOM_TYPE = "magic-context:ceiling-nudge";
  *   a tool boundary could deliver it; deliverAs "followUp" starts a fresh turn.
  *
  * Lease: pending → claimed → delivered (revert to pending on failure so a
- * transient error doesn't burn the one-shot cap). Returns true on delivery.
+ * transient error doesn't consume the current cycle). Returns true on delivery.
  */
 export function maybeDeliverChannel2Pi(
 	pi: PiSendMessage,
@@ -396,31 +432,14 @@ export function maybeDeliverChannel2Pi(
 	}
 	if (state !== "pending") return false;
 
-	// Revalidate before delivering (parity with OpenCode channel2-delivery).
-	// The `pending` intent was recorded at high pressure during a context pass;
-	// by this agent_end the agent may have run ctx_reduce (markPiChannel1Reduced
-	// + the next pass refreshes the baseline), so the ceiling condition may no
-	// longer hold. Firing anyway injects a stale follow-up AND burns the
-	// one-per-session cap.
-	//
-	// Two rules, both cap-preserving (mirrors OpenCode):
-	// - UNKNOWN baseline → do NOT deliver, do NOT touch the lease: leave
-	//   `pending` for a later agent_end with a real measurement. Never
-	//   substitute a default and burn the cap on an unvalidated condition.
-	// - KNOWN baseline → re-run the FULL trigger predicate (floor AND the
-	//   reclaimable ≥ usable/3 ratio that armed the intent), not just the
-	//   floor. Predicate false → cancel to '' (re-armable).
+	// Revalidate from the same U/T baseline shape used when the pipeline armed
+	// the intent. Unknown or generation-invalidated measurements hold `pending`;
+	// a known false fourth-band predicate cancels it to the re-armable state.
 	const baseline = channel1StateBySession.get(sessionId);
 	if (!baseline) return false;
-	if (baseline.reducedSinceRefresh) return false;
-	const undropped = baseline.tailToolTokens + baseline.turnToolTokens;
-	if (
-		!shouldTriggerChannel2({
-			baselineU: undropped,
-			baselineT: baseline.usableTokens,
-			deltas: { u: 0, t: 0 },
-		})
-	) {
+	const evaluation = evaluateChannel2(baseline);
+	if (!evaluation.evaluable) return false;
+	if (!evaluation.shouldTrigger) {
 		try {
 			casChannel2NudgeState(db, sessionId, "pending", "");
 		} catch {
@@ -428,6 +447,7 @@ export function maybeDeliverChannel2Pi(
 		}
 		return false;
 	}
+	const undropped = evaluation.reclaimableTokens;
 
 	if (!casChannel2NudgeState(db, sessionId, "pending", "claimed")) return false;
 
@@ -498,7 +518,7 @@ export function maybeDeliverChannel2Pi(
 		return false;
 	} catch (error) {
 		// The nudge has already been handed to Pi; never re-arm on a post-send
-		// confirm failure, or a transient DB error can duplicate the one-shot cap.
+		// confirm failure, or a transient DB error can duplicate a cycle delivery.
 		const outcome = sealDeliveredAfterUnconfirmedSend(db, sessionId);
 		if (outcome === "already-delivered") {
 			sessionLog(

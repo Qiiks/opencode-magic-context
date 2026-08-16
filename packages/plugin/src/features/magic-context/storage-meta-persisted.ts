@@ -1085,7 +1085,7 @@ export function resetLastNudgeCycleIfTailShrank(
     return changed;
 }
 
-// ---- Channel 2 (synthetic-user-message ceiling) one-shot lease/outbox ----
+// ---- Channel 2 (synthetic-user-message ceiling) cycle lease/outbox ----
 // State machine stored as a single string in `channel2_nudge_state`:
 //   ''         — no intent (initial)
 //   'pending'  — transform recorded the ceiling condition; deliver on next event
@@ -1095,9 +1095,9 @@ export function resetLastNudgeCycleIfTailShrank(
 //                OpenCode also writes `channel2_nudge_claim_token` so a slow
 //                sender cannot confirm a lease after another process heals and
 //                re-delivers it.
-//   'delivered'— confirmed sent; the one ceiling nudge is consumed (terminal)
+//   'delivered'— confirmed sent; the current tail-reset cycle is consumed
 // On send failure the caller reverts 'claimed' -> 'pending' so a transient error
-// does not permanently burn the single ceiling nudge. After send succeeds, a
+// does not consume the cycle. After send succeeds, a
 // confirm failure must NOT re-arm; callers leave the lease non-pending.
 export type Channel2NudgeState = "" | "pending" | "claimed" | "delivered";
 
