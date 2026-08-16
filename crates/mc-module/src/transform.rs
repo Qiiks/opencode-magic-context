@@ -43,14 +43,19 @@ use crate::selection::{
     filter_reasoning_ineligible_decisions, select_reductions_with_outcome, PassClass, SelItem,
     SelKind, SelMessageRole, SelectionConfig, SelectionContext, SelectionOutcome,
 };
+use crate::tail_hygiene::{
+    effective_tail_hygiene, hygiene_band, measure_tail_hygiene, refresh_tail_hygiene_baseline,
+    HygieneBand, CHANNEL1_FLOOR_TOKENS, CHANNEL1_MIN_TOKENS, CHANNEL2_FLOOR_TOKENS,
+    CHANNEL2_SEVERITY_THRESHOLD,
+};
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
     BlockIdentity, Channel1AppendRow, DeferredExecuteState, LineageAnchor, LineageConstituent,
     LineageDescentDisposition, LineageDescentRequest, McStore, McStoreError, McTagRow,
     MemoryRevision, ModuleMeta, ModuleUsage, NoteDelivery, PassSchedulerObservation,
     PendingAgentDrop, PendingChannel2Directive, PendingRewriteState, ServedBlockFingerprint,
-    StoredCompartment, TagCacheSummary, TagMintInput, TemporalMarkInput, TemporalMarkRow,
-    TransformCommit, TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
+    StoredCompartment, TagCacheSummary, TagMintInput, TailHygieneBaseline, TemporalMarkInput,
+    TemporalMarkRow, TransformCommit, TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -98,12 +103,9 @@ const CAV_KEY_PREFIX: &str = "cav:";
 /// separated upstream session keys. Five edges corresponds to three arm/clear cycles
 /// when the initial arm is not counted as evidence of multiplexing by itself.
 const PENDING_REWRITE_AMBIGUOUS_EDGE_THRESHOLD: u32 = 5;
-const CHANNEL1_FLOOR_TOKENS: i64 = 10_000;
-const CHANNEL1_REFIRE_FLOOR_TOKENS: i64 = 10_000;
-const CHANNEL1_PRESSURE_FLOOR: f64 = 0.8;
-const CHANNEL1_GENTLE_FRACTION: f64 = 0.2;
-const CHANNEL2_MIN_RECLAIMABLE: i64 = 10_000;
-const CHANNEL2_USABLE_FRACTION: f64 = 1.0 / 3.0;
+const CHANNEL1_REFIRE_FLOOR_TOKENS: i64 = 25_000;
+const CHANNEL1_GENTLE_FRACTION: f64 = 0.20;
+const CHANNEL2_DIRECTIVE_LEASE_TTL_MS: i64 = 10 * 60 * 1_000;
 const TEMPORAL_AWARENESS_THRESHOLD_MS: i64 = 5 * 60 * 1_000;
 const USER_HINT_FRAGMENT_CHAR_CAP: usize = 80;
 const USER_HINT_TOTAL_CHAR_CAP: usize = 800;
@@ -1706,10 +1708,6 @@ struct ActiveTagForNudge {
     tag_number: i64,
     kind: String,
     token_count: i64,
-    /// The three token columns used by the TypeScript tag aggregate. Legacy module rows
-    /// store their combined weight in token_count and leave the split lanes at zero.
-    input_token_count: i64,
-    reasoning_token_count: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1765,10 +1763,9 @@ struct Channel1NudgeInputs<'a, 'ctx> {
     core: &'a CoreState,
     projection: &'a FlatProjection,
     tag_rows: &'a [McTagRow],
+    baseline: Option<&'a TailHygieneBaseline>,
     channel1_appends: &'a [Channel1AppendRow],
     mutation_exempt_mid: Option<&'a str>,
-    context_limit_tokens: f64,
-    input_tokens: f64,
     protected_tags: usize,
 }
 
@@ -5131,17 +5128,50 @@ fn apply_once(
     } else {
         TagOverlayState::default()
     };
+
+    let hygiene_tag_rows =
+        tag_rows_for_hygiene(&projection, &tag_rows, &tag_overlay, !tagging_active);
+    let hygiene_measurement = measure_tail_hygiene(
+        &projection,
+        &core,
+        meta.coverage_ordinal,
+        &hygiene_tag_rows,
+        req.protected_tags,
+        &protected_block_ids,
+    );
+    let current_hygiene_baseline = if is_bust_pass {
+        let refreshed = refresh_tail_hygiene_baseline(
+            hygiene_measurement,
+            true,
+            loaded.meta.tail_hygiene_baseline.as_ref(),
+            ctx.now_ms,
+        );
+        meta.tail_hygiene_baseline = Some(refreshed.clone());
+        Some(refreshed)
+    } else {
+        loaded.meta.tail_hygiene_baseline.as_ref().map(|previous| {
+            refresh_tail_hygiene_baseline(hygiene_measurement, false, Some(previous), ctx.now_ms)
+        })
+    };
+    let refreshed_coverage = meta.coverage_ordinal;
+    rearm_channel2_after_hard_fold(
+        &mut meta,
+        matches!(plan, PassPlan::Hard | PassPlan::MigrateHard),
+        loaded.meta.coverage_ordinal,
+        refreshed_coverage,
+    );
+    rearm_channel2_after_measured_collapse(&mut meta, is_bust_pass);
+
     if tagging_active {
         if let Some(row) = maybe_append_channel1_nudge(
             Channel1NudgeInputs {
                 ctx,
                 core: &core,
                 projection: &projection,
-                tag_rows: &tag_rows,
+                tag_rows: &hygiene_tag_rows,
+                baseline: current_hygiene_baseline.as_ref(),
                 channel1_appends: &channel1_appends,
                 mutation_exempt_mid,
-                context_limit_tokens,
-                input_tokens: usage_input_tokens,
                 protected_tags: req.protected_tags,
             },
             &mut meta,
@@ -5329,11 +5359,9 @@ fn apply_once(
         Channel2DirectiveInput {
             core: &core,
             projection: &projection,
-            tag_rows: &tag_rows,
+            tag_rows: &hygiene_tag_rows,
+            baseline: current_hygiene_baseline.as_ref(),
             mutation_exempt_mid,
-            context_limit_tokens,
-            input_tokens: usage_input_tokens,
-            execute_threshold_percentage: ctx.execute_threshold_percentage,
             protected_tags: req.protected_tags,
         },
         &mut meta,
@@ -8989,29 +9017,7 @@ fn maybe_append_channel1_nudge(
         input.tag_rows,
         input.mutation_exempt_mid,
     );
-    let live_tail_tokens = active_tags
-        .iter()
-        .map(|tag| tag.token_count.max(0))
-        .sum::<i64>();
-    let working_window_tokens = (input.context_limit_tokens
-        * input.ctx.execute_threshold_percentage.clamp(1.0, 100.0)
-        / 100.0)
-        .round()
-        .max(0.0) as i64;
-    let undropped_tokens = active_tags
-        .iter()
-        .filter(|tag| tag.kind == "tool_result")
-        .map(|tag| tag.token_count.max(0))
-        .sum::<i64>();
-    let decision = decide_channel1(
-        undropped_tokens,
-        live_tail_tokens,
-        working_window_tokens,
-        input.context_limit_tokens,
-        input.input_tokens,
-        input.ctx.execute_threshold_percentage,
-        meta,
-    );
+    let decision = decide_channel1(input.baseline, meta);
     meta.channel1_last_nudge_undropped = decision.next_last_nudge;
     meta.channel1_last_nudge_level = decision.next_last_level;
     let was_suppressed = meta.channel1_reduce_suppressed;
@@ -9031,13 +9037,79 @@ fn maybe_append_channel1_nudge(
         &existing_blocks,
         input.mutation_exempt_mid,
     )?;
-    let hint = oldest_reclaimable_hint(&active_tags, working_window_tokens, input.protected_tags);
+    let hint = oldest_reclaimable_hint(&active_tags, input.protected_tags);
     let reminder = build_channel1_reminder(decision.level, decision.reclaimable_tokens, &hint);
     Some(Channel1AppendRow {
         block_id,
         reminder_text: reminder,
         fired_at_ms: input.ctx.now_ms,
     })
+}
+
+fn tag_rows_for_hygiene(
+    projection: &FlatProjection,
+    stored_rows: &[McTagRow],
+    overlay: &TagOverlayState,
+    derive_when_empty: bool,
+) -> Vec<McTagRow> {
+    let projected_ids = projection
+        .blocks
+        .iter()
+        .map(|block| block.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut rows = stored_rows
+        .iter()
+        .filter(|row| {
+            !projected_ids.contains(row.block_id.as_str())
+                || overlay.tag_by_block_id.get(&row.block_id) == Some(&row.tag_number)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let existing_ids = rows
+        .iter()
+        .map(|row| row.block_id.clone())
+        .collect::<HashSet<_>>();
+    for (block_id, tag_number) in &overlay.tag_by_block_id {
+        if existing_ids.contains(block_id) {
+            continue;
+        }
+        let Some(block) = projection.blocks.iter().find(|block| block.id == *block_id) else {
+            continue;
+        };
+        let Some(kind) = taggable_kind(block) else {
+            continue;
+        };
+        rows.push(McTagRow {
+            tag_number: *tag_number,
+            block_id: block_id.clone(),
+            kind: kind.as_store_kind().to_string(),
+            token_count: 0,
+            created_at_ms: 0,
+            source_bytes: Vec::new(),
+        });
+    }
+    if rows.is_empty() && derive_when_empty {
+        for (index, block) in projection
+            .blocks
+            .iter()
+            .filter(|block| taggable_kind(block).is_some())
+            .enumerate()
+        {
+            rows.push(McTagRow {
+                tag_number: index.saturating_add(1) as i64,
+                block_id: block.id.clone(),
+                kind: taggable_kind(block)
+                    .expect("filtered taggable block")
+                    .as_store_kind()
+                    .to_string(),
+                token_count: 0,
+                created_at_ms: 0,
+                source_bytes: Vec::new(),
+            });
+        }
+    }
+    rows.sort_by_key(|row| row.tag_number);
+    rows
 }
 
 fn active_tags_for_nudge(
@@ -9052,7 +9124,6 @@ fn active_tags_for_nudge(
         .map(|row| (row.block_id.as_str(), row))
         .collect::<BTreeMap<_, _>>();
     let frozen_targets = frozen_red_targets(core);
-    let extra_tokens_by_arc = channel2_extra_token_lanes_by_arc(projection);
     let mut out = Vec::new();
     for block in projection.blocks.iter().filter(|block| {
         taggable_kind(block).is_some()
@@ -9061,14 +9132,10 @@ fn active_tags_for_nudge(
             && mutation_exempt_mid != Some(block.mid.as_str())
     }) {
         if let Some(row) = tag_by_block.get(block.id.as_str()) {
-            let (input_token_count, reasoning_token_count) =
-                channel2_extra_token_lanes(block, &extra_tokens_by_arc);
             out.push(ActiveTagForNudge {
                 tag_number: row.tag_number,
                 kind: row.kind.clone(),
                 token_count: row.token_count.max(0),
-                input_token_count,
-                reasoning_token_count,
             });
         }
     }
@@ -9091,7 +9158,6 @@ fn active_tags_for_channel2(
         return stored;
     }
     let frozen_targets = frozen_red_targets(core);
-    let extra_tokens_by_arc = channel2_extra_token_lanes_by_arc(projection);
     let mut next_tag = 1i64;
     let mut derived = Vec::new();
     for block in projection.blocks.iter().filter(|block| {
@@ -9103,55 +9169,22 @@ fn active_tags_for_channel2(
         let Some((kind, source)) = taggable_source(block) else {
             continue;
         };
-        let (input_token_count, reasoning_token_count) =
-            channel2_extra_token_lanes(block, &extra_tokens_by_arc);
         derived.push(ActiveTagForNudge {
             tag_number: next_tag,
             kind: kind.as_store_kind().to_string(),
             token_count: mc_tokenizer::estimate_tokens(source) as i64,
-            input_token_count,
-            reasoning_token_count,
         });
         next_tag = next_tag.saturating_add(1);
     }
     derived
 }
 
-fn channel2_extra_token_lanes_by_arc(projection: &FlatProjection) -> HashMap<&str, (i64, i64)> {
-    let mut tokens_by_arc = HashMap::new();
-    for block in &projection.blocks {
-        let Some(arc_id) = block.arc_id.as_deref() else {
-            continue;
-        };
-        let tokens = tokens_by_arc.entry(arc_id).or_insert((0i64, 0i64));
-        tokens.0 = tokens.0.saturating_add(block.channel2_input_tokens);
-        tokens.1 = tokens.1.saturating_add(block.channel2_reasoning_tokens);
-    }
-    tokens_by_arc
-}
-
-fn channel2_extra_token_lanes(
-    block: &crate::ck_wire::FlatBlock,
-    tokens_by_arc: &HashMap<&str, (i64, i64)>,
-) -> (i64, i64) {
-    if block.kind_tag != "tool_result" {
-        return (0, 0);
-    }
-    block
-        .arc_id
-        .as_deref()
-        .and_then(|arc_id| tokens_by_arc.get(arc_id).copied())
-        .unwrap_or((0, 0))
-}
-
 struct Channel2DirectiveInput<'a> {
     core: &'a CoreState,
     projection: &'a FlatProjection,
     tag_rows: &'a [McTagRow],
+    baseline: Option<&'a TailHygieneBaseline>,
     mutation_exempt_mid: Option<&'a str>,
-    context_limit_tokens: f64,
-    input_tokens: f64,
-    execute_threshold_percentage: f64,
     protected_tags: usize,
 }
 
@@ -9215,28 +9248,18 @@ fn channel2_pressure(
     input: Channel2DirectiveInput<'_>,
     meta: &ModuleMeta,
 ) -> Option<Channel2Pressure> {
-    if input.context_limit_tokens <= 0.0 || input.execute_threshold_percentage <= 0.0 {
-        return None;
-    }
-    let working_window_tokens =
-        (input.context_limit_tokens * input.execute_threshold_percentage.clamp(1.0, 100.0) / 100.0)
-            .round()
-            .max(0.0) as i64;
-    let active_tags = active_tags_for_channel2(
-        input.core,
-        meta,
-        input.projection,
-        input.tag_rows,
-        input.mutation_exempt_mid,
-    );
-    let (reclaimable_tokens, live_tail_tokens) =
-        channel2_token_aggregate(&active_tags, input.protected_tags);
-    let usable_tokens =
-        (working_window_tokens as f64 - input.input_tokens + live_tail_tokens as f64).max(0.0);
-    let due = reclaimable_tokens >= CHANNEL2_MIN_RECLAIMABLE
-        && (usable_tokens == 0.0
-            || reclaimable_tokens as f64 >= usable_tokens * CHANNEL2_USABLE_FRACTION);
+    let (reclaimable_tokens, live_tail_tokens) = channel2_token_aggregate(input.baseline)?;
+    let severity = reclaimable_tokens as f64 / live_tail_tokens.max(1) as f64;
+    let due =
+        reclaimable_tokens >= CHANNEL2_FLOOR_TOKENS && severity >= CHANNEL2_SEVERITY_THRESHOLD;
     let hint = if due {
+        let active_tags = active_tags_for_channel2(
+            input.core,
+            meta,
+            input.projection,
+            input.tag_rows,
+            input.mutation_exempt_mid,
+        );
         oldest_channel2_hint(&active_tags, input.protected_tags)
     } else {
         Vec::new()
@@ -9246,6 +9269,34 @@ fn channel2_pressure(
         reclaimable_tokens,
         hint,
     })
+}
+
+fn rearm_channel2_cycle(meta: &mut ModuleMeta) {
+    meta.pending_channel2_directive = None;
+    meta.channel2_pressure_latched = false;
+}
+
+fn rearm_channel2_after_hard_fold(
+    meta: &mut ModuleMeta,
+    hard_fold_executed: bool,
+    previous_coverage: Option<u64>,
+    current_coverage: Option<u64>,
+) {
+    if hard_fold_executed && coverage_advanced(previous_coverage, current_coverage) {
+        rearm_channel2_cycle(meta);
+    }
+}
+
+fn rearm_channel2_after_measured_collapse(meta: &mut ModuleMeta, baseline_refreshed: bool) {
+    if baseline_refreshed
+        && meta.tail_hygiene_baseline.as_ref().is_some_and(|baseline| {
+            baseline.evaluable
+                && !baseline.generation_invalidated
+                && effective_tail_hygiene(baseline).0 < CHANNEL1_FLOOR_TOKENS
+        })
+    {
+        rearm_channel2_cycle(meta);
+    }
 }
 
 fn claude_code_channel2_directive(
@@ -9263,20 +9314,41 @@ fn claude_code_channel2_directive(
         meta.pending_channel2_directive = None;
     }
 
+    if meta
+        .pending_channel2_directive
+        .as_ref()
+        .is_some_and(|pending| {
+            now_ms.saturating_sub(pending.armed_at_ms) >= CHANNEL2_DIRECTIVE_LEASE_TTL_MS
+        })
+    {
+        rearm_channel2_cycle(meta);
+    }
+
     if let Some(pending) = meta.pending_channel2_directive.as_ref() {
-        return Some(Channel2Directive {
-            text: pending.text.clone(),
-            directive_id: pending.directive_id.clone(),
-            armed_at_ms: pending.armed_at_ms,
-        });
+        match channel2_token_aggregate(input.baseline) {
+            None => {
+                return Some(Channel2Directive {
+                    text: pending.text.clone(),
+                    directive_id: pending.directive_id.clone(),
+                    armed_at_ms: pending.armed_at_ms,
+                });
+            }
+            Some((u, t))
+                if u >= CHANNEL2_FLOOR_TOKENS
+                    && u as f64 / t.max(1) as f64 >= CHANNEL2_SEVERITY_THRESHOLD =>
+            {
+                return Some(Channel2Directive {
+                    text: pending.text.clone(),
+                    directive_id: pending.directive_id.clone(),
+                    armed_at_ms: pending.armed_at_ms,
+                });
+            }
+            Some(_) => rearm_channel2_cycle(meta),
+        }
     }
 
     let pressure = channel2_pressure(input, meta)?;
-    if !pressure.due {
-        meta.channel2_pressure_latched = false;
-        return None;
-    }
-    if meta.channel2_pressure_latched {
+    if !pressure.due || meta.channel2_pressure_latched {
         return None;
     }
 
@@ -9316,29 +9388,14 @@ fn protected_tag_cutoff(active_tags: &[ActiveTagForNudge], protected_tags: usize
         .or(Some(i64::MIN))
 }
 
-fn channel2_token_aggregate(
-    active_tags: &[ActiveTagForNudge],
-    protected_tags: usize,
-) -> (i64, i64) {
-    let protected_cutoff = protected_tag_cutoff(active_tags, protected_tags);
-    let reclaimable = active_tags
-        .iter()
-        .filter(|tag| tag.kind == "tool_result")
-        .filter(|tag| protected_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff))
-        .map(|tag| {
-            tag.token_count.max(0) + tag.input_token_count.max(0) + tag.reasoning_token_count.max(0)
-        })
-        .sum();
-    // The usable range includes the full live tail, including tool results. Only
-    // tool-result bytes are reclaimable; excluding them here would make the ceiling
-    // predicate fire early compared with the host aggregate (conversation + tool I/O).
-    let live_tail = active_tags
-        .iter()
-        .map(|tag| {
-            tag.token_count.max(0) + tag.input_token_count.max(0) + tag.reasoning_token_count.max(0)
-        })
-        .sum();
-    (reclaimable, live_tail)
+fn channel2_token_aggregate(baseline: Option<&TailHygieneBaseline>) -> Option<(i64, i64)> {
+    let baseline = baseline?;
+    if !baseline.evaluable || baseline.generation_invalidated {
+        return None;
+    }
+    // Reclaimable mass is the active, unprotected subset of every tagged text, tool, and file
+    // included in the measured tail. Reasoning is excluded from both reclaimable and total mass.
+    Some(effective_tail_hygiene(baseline))
 }
 
 fn oldest_channel2_hint(
@@ -9369,15 +9426,9 @@ fn build_channel2_host_reminder(reclaimable_tokens: i64, hint: &[(i64, String)])
     format!("<system-reminder>\n{text}\n</system-reminder>")
 }
 
-fn decide_channel1(
-    reclaimable_tokens: i64,
-    _live_tail_tokens: i64,
-    working_window_tokens: i64,
-    context_limit_tokens: f64,
-    input_tokens: f64,
-    execute_threshold_percentage: f64,
-    meta: &ModuleMeta,
-) -> Channel1Decision {
+fn decide_channel1(baseline: Option<&TailHygieneBaseline>, meta: &ModuleMeta) -> Channel1Decision {
+    let (reclaimable_tokens, tail_tokens) = baseline.map_or((0, 0), effective_tail_hygiene);
+    let severity = reclaimable_tokens as f64 / tail_tokens.max(1) as f64;
     let reset_cycle = meta.channel1_reduce_suppressed
         || reclaimable_tokens < meta.channel1_last_nudge_undropped.max(0);
     let last_nudge = if reset_cycle {
@@ -9402,38 +9453,30 @@ fn decide_channel1(
         next_last_nudge,
         next_last_level,
     };
+
+    if baseline.is_none_or(|baseline| !baseline.evaluable || baseline.generation_invalidated) {
+        return quiet(last_nudge, last_level_string(last_level));
+    }
     if meta.channel1_reduce_suppressed {
         return quiet(0, String::new());
     }
-    if reclaimable_tokens < CHANNEL1_FLOOR_TOKENS {
+    if tail_tokens < CHANNEL1_MIN_TOKENS || reclaimable_tokens < CHANNEL1_FLOOR_TOKENS {
         return quiet(last_nudge, last_level_string(last_level));
     }
-    let pressure = if context_limit_tokens > 0.0 && execute_threshold_percentage > 0.0 {
-        (input_tokens / context_limit_tokens * 100.0 / execute_threshold_percentage).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    if pressure < CHANNEL1_PRESSURE_FLOOR {
-        return quiet(last_nudge, last_level_string(last_level));
-    }
-    let estimated_input_tokens = input_tokens.max(1.0);
-    let severity = (reclaimable_tokens as f64 / estimated_input_tokens).clamp(0.0, 1.0);
     if severity < CHANNEL1_GENTLE_FRACTION {
         return quiet(last_nudge, last_level_string(last_level));
     }
-    let level = if severity >= 0.65 {
-        Channel1Level::Urgent
-    } else if severity >= 0.4 {
-        Channel1Level::Firm
-    } else {
-        Channel1Level::Gentle
+    let level = match hygiene_band(reclaimable_tokens, tail_tokens) {
+        HygieneBand::Urgent | HygieneBand::Channel2 => Channel1Level::Urgent,
+        HygieneBand::Firm => Channel1Level::Firm,
+        HygieneBand::Gentle => Channel1Level::Gentle,
+        HygieneBand::Quiet => return quiet(last_nudge, last_level_string(last_level)),
     };
-    if let Some(last) = last_level {
-        if level.rank() <= last.rank() {
-            return quiet(last_nudge, last.as_str().to_string());
-        }
-    } else if reclaimable_tokens < last_nudge + channel1_refire_tokens(working_window_tokens) {
-        return quiet(last_nudge, String::new());
+    let escalated = last_level.is_none_or(|last| level.rank() > last.rank());
+    let cadence_reached = last_level.is_some()
+        && reclaimable_tokens.saturating_sub(last_nudge) >= channel1_refire_tokens(tail_tokens);
+    if !escalated && !cadence_reached {
+        return quiet(last_nudge, last_level_string(last_level));
     }
     Channel1Decision {
         fire: true,
@@ -9444,9 +9487,165 @@ fn decide_channel1(
     }
 }
 
-fn channel1_refire_tokens(working_window_tokens: i64) -> i64 {
-    let scaled = (0.05 * working_window_tokens.max(0) as f64).round() as i64;
+fn channel1_refire_tokens(tail_tokens: i64) -> i64 {
+    let scaled = (0.08 * tail_tokens.max(0) as f64).round() as i64;
     CHANNEL1_REFIRE_FLOOR_TOKENS.max(scaled)
+}
+
+#[cfg(test)]
+mod nudge_formula_tests {
+    use super::*;
+
+    fn baseline(u: i64, t: i64) -> TailHygieneBaseline {
+        TailHygieneBaseline {
+            baseline_u: u,
+            baseline_t: t,
+            evaluable: true,
+            ..TailHygieneBaseline::default()
+        }
+    }
+
+    fn nudge_meta(u: i64, t: i64) -> ModuleMeta {
+        ModuleMeta {
+            tail_hygiene_baseline: Some(baseline(u, t)),
+            ..ModuleMeta::default()
+        }
+    }
+
+    fn decision(meta: &ModuleMeta) -> Channel1Decision {
+        decide_channel1(meta.tail_hygiene_baseline.as_ref(), meta)
+    }
+
+    fn pending(id: &str, armed_at_ms: i64, watermark: u64) -> PendingChannel2Directive {
+        PendingChannel2Directive {
+            text: "directive".to_string(),
+            directive_id: id.to_string(),
+            armed_at_ms,
+            arming_watermark: watermark,
+        }
+    }
+
+    #[test]
+    fn channel1_uses_tail_ratio_without_pressure_or_whole_input() {
+        let decision = decision(&nudge_meta(140_000, 200_000));
+        assert!(
+            decision.fire,
+            "hygiene ratio should fire without a wall-pressure gate"
+        );
+        assert_eq!(decision.level, Channel1Level::Urgent);
+    }
+
+    #[test]
+    fn channel1_minimum_tail_floor_bands_and_cadence_match_reference() {
+        assert!(!decision(&nudge_meta(53_100, 59_000)).fire);
+        assert!(decision(&nudge_meta(26_000, 61_000)).fire);
+        assert_eq!(hygiene_band(25_000, 100_000), HygieneBand::Gentle);
+        assert_eq!(hygiene_band(40_000, 100_000), HygieneBand::Firm);
+        assert_eq!(hygiene_band(55_000, 100_000), HygieneBand::Urgent);
+        assert_eq!(hygiene_band(60_000, 100_000), HygieneBand::Channel2);
+
+        let mut before_cadence = nudge_meta(49_000, 200_000);
+        before_cadence.channel1_last_nudge_undropped = 25_000;
+        before_cadence.channel1_last_nudge_level = "gentle".to_string();
+        assert!(!decision(&before_cadence).fire);
+        before_cadence.tail_hygiene_baseline = Some(baseline(50_000, 200_000));
+        assert!(decision(&before_cadence).fire);
+        assert_eq!(channel1_refire_tokens(200_000), 25_000);
+        assert_eq!(channel1_refire_tokens(400_000), 32_000);
+    }
+
+    #[test]
+    fn channel2_aggregate_uses_persisted_all_class_walk_and_holds_invalid_baselines() {
+        let measured = baseline(60_000, 90_000);
+        assert_eq!(
+            channel2_token_aggregate(Some(&measured)),
+            Some((60_000, 90_000))
+        );
+        let mut invalid = measured;
+        invalid.generation_invalidated = true;
+        assert_eq!(channel2_token_aggregate(Some(&invalid)), None);
+    }
+
+    #[test]
+    fn channel2_rearms_only_on_hard_coverage_fold_or_measured_u_collapse() {
+        let mut meta = nudge_meta(60_000, 90_000);
+        meta.channel2_pressure_latched = true;
+        rearm_channel2_after_hard_fold(&mut meta, false, Some(10), Some(20));
+        assert!(
+            meta.channel2_pressure_latched,
+            "a SOFT coverage advance must not rearm"
+        );
+        rearm_channel2_after_hard_fold(&mut meta, true, Some(10), Some(10));
+        assert!(
+            meta.channel2_pressure_latched,
+            "a marker-only HARD must not rearm"
+        );
+        rearm_channel2_after_hard_fold(&mut meta, true, Some(10), Some(20));
+        assert!(!meta.channel2_pressure_latched);
+
+        meta.channel2_pressure_latched = true;
+        rearm_channel2_after_measured_collapse(&mut meta, true);
+        assert!(meta.channel2_pressure_latched);
+        meta.tail_hygiene_baseline = Some(baseline(24_999, 90_000));
+        rearm_channel2_after_measured_collapse(&mut meta, false);
+        assert!(
+            meta.channel2_pressure_latched,
+            "defer reuse cannot perform U-collapse rearm"
+        );
+        rearm_channel2_after_measured_collapse(&mut meta, true);
+        assert!(!meta.channel2_pressure_latched);
+    }
+
+    #[test]
+    fn channel2_claimed_lease_reaps_and_delivered_echo_keeps_cycle_consumed() {
+        let projection = project_messages(&[]).unwrap();
+        let core = CoreState::default();
+        let tags = Vec::new();
+        let due_baseline = baseline(60_000, 90_000);
+        let mut stale = nudge_meta(60_000, 90_000);
+        stale.channel2_pressure_latched = true;
+        stale.channel2_arming_watermark = 1;
+        stale.pending_channel2_directive = Some(pending("old", 10, 1));
+        let replacement = claude_code_channel2_directive(
+            "session",
+            None,
+            10 + CHANNEL2_DIRECTIVE_LEASE_TTL_MS,
+            Channel2DirectiveInput {
+                core: &core,
+                projection: &projection,
+                tag_rows: &tags,
+                baseline: Some(&due_baseline),
+                mutation_exempt_mid: None,
+                protected_tags: 0,
+            },
+            &mut stale,
+        )
+        .expect("stale claimed directive should re-arm while the predicate remains true");
+        assert_ne!(replacement.directive_id, "old");
+        assert_eq!(stale.channel2_arming_watermark, 2);
+
+        let delivered_id = replacement.directive_id.clone();
+        let echoed = claude_code_channel2_directive(
+            "session",
+            Some(&delivered_id),
+            20,
+            Channel2DirectiveInput {
+                core: &core,
+                projection: &projection,
+                tag_rows: &tags,
+                baseline: Some(&due_baseline),
+                mutation_exempt_mid: None,
+                protected_tags: 0,
+            },
+            &mut stale,
+        );
+        assert!(echoed.is_none());
+        assert!(stale.pending_channel2_directive.is_none());
+        assert!(
+            stale.channel2_pressure_latched,
+            "delivered echo consumes the cycle"
+        );
+    }
 }
 
 fn newest_tool_result_for_channel1(
@@ -9491,24 +9690,13 @@ fn tool_result_can_carry_channel1(block: &CkWireBlock) -> bool {
 
 fn oldest_reclaimable_hint(
     active_tags: &[ActiveTagForNudge],
-    working_window_tokens: i64,
     protected_tags: usize,
 ) -> Vec<(i64, String)> {
-    let mut protected = HashSet::new();
-    let mut sum = 0i64;
-    for tag in active_tags.iter().rev() {
-        if sum >= working_window_tokens.max(0) {
-            break;
-        }
-        protected.insert(tag.tag_number);
-        sum += tag.token_count.max(0);
-    }
     let configured_cutoff = protected_tag_cutoff(active_tags, protected_tags);
     active_tags
         .iter()
         .filter(|tag| {
             tag.kind == "tool_result"
-                && !protected.contains(&tag.tag_number)
                 && configured_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff)
         })
         .take(4)
@@ -18079,10 +18267,10 @@ pub(crate) mod tests {
                 .iter()
                 .find(|message| message.meta.harness_id.as_deref() == Some("older"))
                 .expect("older assistant must be served");
-            matches!(
-                &target.content[1].kind,
-                ck_wire::CkKind::Text { text } if text.is_empty()
-            )
+            !target
+                .content
+                .iter()
+                .any(|block| matches!(block.kind, ck_wire::CkKind::Reasoning { .. }))
         }
 
         let older = assistant(
@@ -24877,18 +25065,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn channel1_nudge_replays_and_suppresses_refire() {
+    fn channel1_hygiene_ratio_nudge_replays_and_suppresses_refire() {
         run_active_surface_test(|| {
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
-            let huge = "word ".repeat(20_000);
+            let huge = "word ".repeat(40_000);
             let messages = vec![
                 assistant_tool_call("call1", 1, "c1"),
                 tool_result("result1", 2, "c1", &huge),
                 assistant_tool_call("call2", 3, "c2"),
                 tool_result("result2", 4, "c2", &huge),
             ];
-            let request = with_usage(active_cc_req("nudge", "cfg0", messages.clone()), 900, 1024);
+            let mut request = active_cc_req("nudge", "cfg0", messages.clone());
+            request.protected_tags = 0;
+            let request = with_usage(request, 900, 1024);
             run(&s, &request, &spine());
             let first = run(&s, &request, &spine());
             let first_result = tail_bytes(&first, "result2").to_string();
@@ -24906,11 +25096,9 @@ pub(crate) mod tests {
             let mut extended_messages = messages;
             extended_messages.push(assistant_tool_call("call3", 5, "c3"));
             extended_messages.push(tool_result("result3", 6, "c3", &huge));
-            let suppressed = run(
-                &s,
-                &with_usage(active_cc_req("nudge", "cfg0", extended_messages), 900, 1024),
-                &spine(),
-            );
+            let mut extended_request = active_cc_req("nudge", "cfg0", extended_messages);
+            extended_request.protected_tags = 0;
+            let suppressed = run(&s, &with_usage(extended_request, 900, 1024), &spine());
             assert!(tail_bytes(&suppressed, "result2").contains("<system-reminder>"));
             assert!(!tail_bytes(&suppressed, "result3").contains("<system-reminder>"));
             assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);

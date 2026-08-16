@@ -54,12 +54,6 @@ pub struct FlatBlock {
     /// SHA-256 of the serialized block bytes, retained so consumers can verify that the block content has not changed.
     #[serde(skip_serializing)]
     pub content_hash: [u8; 32],
-    /// Token lanes consumed by host directives. Computing them during projection lets a validated
-    /// delta retain the prefix values instead of re-tokenizing every historical tool arc.
-    #[serde(skip_serializing)]
-    pub channel2_input_tokens: i64,
-    #[serde(skip_serializing)]
-    pub channel2_reasoning_tokens: i64,
     pub synthetic: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -594,14 +588,6 @@ fn flatten_block(
         kind: block.kind.tag().to_string(),
     })?;
     let content_hash: [u8; 32] = Sha256::digest(bytes.as_bytes()).into();
-    let channel2_input_tokens = match &block.kind {
-        CkKind::ToolCall { input, .. } => mc_tokenizer::estimate_tokens(&input.to_string()) as i64,
-        _ => 0,
-    };
-    let channel2_reasoning_tokens = match &block.kind {
-        CkKind::Reasoning { .. } => mc_tokenizer::estimate_tokens(&bytes) as i64,
-        _ => 0,
-    };
     let (name, file_path, tool_input, provider_executed, tool_call_id, output_kind) =
         match &block.kind {
             CkKind::ToolCall {
@@ -647,8 +633,6 @@ fn flatten_block(
         arc_id,
         bytes: Arc::from(bytes),
         content_hash,
-        channel2_input_tokens,
-        channel2_reasoning_tokens,
         synthetic: msg.ck.meta.synthetic,
         tool_call_id,
         output_kind,
