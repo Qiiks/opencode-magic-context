@@ -78,8 +78,8 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2("ses-noclient", {
             db,
             // No client (e.g. a context with no client available).
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baselineU: 30_000,
+            baselineT: 60_000,
         });
         expect(delivered).toBe(false);
         // Intent stays pending: delivery is simply unavailable, not consumed.
@@ -93,9 +93,9 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2("ses-unknown", {
             db,
             client: fakeClient(async () => ({})),
-            // No reclaimable/usable measurement at this event.
+            // No rendered-tail U/T measurement at this event.
         });
-        // Unknown pressure must never burn the one-shot cap NOR cancel the
+        // An unknown baseline must never burn the one-shot cap NOR cancel the
         // intent — a later final-stop with a real measurement decides.
         expect(delivered).toBe(false);
         expect(getChannel2NudgeState(db, "ses-unknown")).toBe("pending");
@@ -105,14 +105,14 @@ describe("maybeDeliverChannel2", () => {
         useTempDataHome("ch2-stale-");
         const db = openDatabase()!;
         setChannel2NudgeState(db, "ses-stale", "pending");
-        // 11k reclaimable >= 10k floor but < usable/3 (44k/3 ≈ 14.7k): the
+        // 11k reclaimable >= 10k floor but < T/3 (44k/3 ≈ 14.7k): the
         // audit repro — floor-only validation delivered this stale nudge and
         // permanently burned the one-per-session cap.
         const delivered = await maybeDeliverChannel2("ses-stale", {
             db,
             client: fakeClient(async () => ({})),
-            reclaimableTokens: 11_000,
-            usableTokens: 44_000,
+            baselineU: 11_000,
+            baselineT: 44_000,
         });
         expect(delivered).toBe(false);
         // Cancelled to '' (re-armable), NOT 'delivered' — cap preserved.
@@ -164,8 +164,8 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2(sessionId, {
             db,
             client: fakeClient(promptAsync),
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baselineU: 30_000,
+            baselineT: 60_000,
         });
 
         expect(delivered).toBe(true);
@@ -188,8 +188,8 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2(sessionId, {
             db,
             client: fakeClient(promptAsync),
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baselineU: 30_000,
+            baselineT: 60_000,
         });
 
         expect(delivered).toBe(false);
@@ -219,8 +219,8 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2(sessionId, {
             db,
             client,
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baselineU: 30_000,
+            baselineT: 60_000,
         });
 
         expect(delivered).toBe(false);
@@ -237,8 +237,8 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2("ses-go", {
             db,
             client: fakeClient(promptAsync),
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baselineU: 30_000,
+            baselineT: 60_000,
         });
 
         expect(delivered).toBe(true);
@@ -273,8 +273,8 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2("ses-confirm-lost", {
             db,
             client: fakeClient(promptAsync),
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baselineU: 30_000,
+            baselineT: 60_000,
         });
 
         expect(promptAsync).toHaveBeenCalledTimes(1);
@@ -300,8 +300,8 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await deliver(sessionId, {
             db,
             client: fakeClient(promptAsync),
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baselineU: 30_000,
+            baselineT: 60_000,
         });
 
         expect(promptAsync).toHaveBeenCalledTimes(1);
@@ -333,8 +333,8 @@ describe("maybeDeliverChannel2", () => {
             const secondDelivered = await maybeDeliverChannel2(sessionId, {
                 db,
                 client: fakeClient(secondPromptAsync),
-                reclaimableTokens: 30_000,
-                usableTokens: 60_000,
+                baselineU: 30_000,
+                baselineT: 60_000,
             });
             expect(secondDelivered).toBe(true);
         });
@@ -342,8 +342,8 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2(sessionId, {
             db,
             client: fakeClient(firstPromptAsync),
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baselineU: 30_000,
+            baselineT: 60_000,
         });
 
         expect(firstPromptAsync).toHaveBeenCalledTimes(1);
@@ -392,8 +392,8 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await deliver(sessionId, {
             db,
             client: fakeClient(promptAsync),
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baselineU: 30_000,
+            baselineT: 60_000,
         });
 
         expect(delivered).toBe(false);
@@ -421,8 +421,8 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2("ses-fail", {
             db,
             client: fakeClient(promptAsync),
-            reclaimableTokens: 30_000,
-            usableTokens: 60_000,
+            baselineU: 30_000,
+            baselineT: 60_000,
         });
 
         expect(delivered).toBe(false);

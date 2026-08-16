@@ -150,21 +150,17 @@ async function deliverChannel2IfPending(deps: EventHandlerDeps, sessionId: strin
         // `pending` intent exists, a client is wired, and a subagent run is still
         // active.
         const baseline = deps.channel1StateBySession?.get(sessionId);
-        // If the agent already called ctx_reduce since the last transform refreshed
-        // the baseline, the tailToolTokens/turnToolTokens here are STALE-HIGH (they
-        // predate the reduction) — delivering now would nudge the agent to drop
-        // output it just dropped. Skip until the next transform recomputes a fresh
-        // baseline. Parity with Pi's maybeDeliverChannel2Pi (reducedSinceRefresh
-        // guard). The pending intent stays armed for that fresh re-evaluation.
+        // A reduce after the persisted generation invalidates its U/T values.
+        // Hold the pending intent until a cache-busting pass rewalks the final
+        // rendered tail; delivery must never burn the cap from stale mass.
         if (baseline?.reducedSinceRefresh) return;
         const delivered = await maybeDeliverChannel2(sessionId, {
             db: deps.db,
             client: deps.client,
             directiveText: deps.channel2DirectiveTextBySession?.get(sessionId),
-            reclaimableTokens: baseline
-                ? baseline.tailToolTokens + baseline.turnToolTokens
-                : undefined,
-            usableTokens: baseline?.usableTokens,
+            baselineU: baseline?.baselineU,
+            baselineT: baseline?.baselineT,
+            deltas: baseline ? { u: baseline.turnDeltaU, t: baseline.turnDeltaT } : undefined,
             oldestReclaimableToolTags: baseline?.oldestReclaimableToolTags,
         });
         if (delivered || getChannel2NudgeState(deps.db, sessionId) !== "pending") {

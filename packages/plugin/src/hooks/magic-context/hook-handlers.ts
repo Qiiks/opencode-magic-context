@@ -32,7 +32,6 @@ import {
     buildChannel1Reminder,
     CHANNEL1_SENTINEL,
     type Channel1State,
-    computePressure,
     decideChannel1,
     toolOutputTokens,
 } from "./ctx-reduce-nudge";
@@ -474,32 +473,22 @@ function maybeInjectChannel1Nudge(
     // Content-based idempotency (robust to callID reuse on retries).
     if (out.output.includes(CHANNEL1_SENTINEL)) return;
 
-    // Accumulate this tool's tokens into the per-turn accumulator (prospective:
-    // this output is not yet tagged/counted in the baseline).
-    const thisTurnTokens = toolOutputTokens(out.output);
-    state.turnToolTokens += thisTurnTokens;
+    // The just-completed output is prospective input for the next pass and is
+    // inside the recency reserve, so it grows T but not U.
+    state.turnDeltaT += toolOutputTokens(out.output);
 
-    if (state.reducedSinceRefresh) return; // suppress nagging right after a reduce
+    if (state.reducedSinceRefresh) return;
 
-    const undroppedTokens = state.tailToolTokens + state.turnToolTokens;
-    const pressure = computePressure({
-        lastInputTokens: state.lastInputTokens,
-        turnToolTokens: state.turnToolTokens,
-        contextLimit: state.contextLimit,
-        executeThresholdPercentage: state.executeThresholdPercentage,
-    });
-
-    const workingWindowTokens = Math.round(
-        (state.contextLimit * state.executeThresholdPercentage) / 100,
-    );
     const decision = decideChannel1({
-        undroppedTokens,
-        pressure,
-        estimatedInputTokens: state.lastInputTokens + state.turnToolTokens,
-        workingWindowTokens,
+        baselineU: state.baselineU,
+        baselineT: state.baselineT,
+        turnDeltaU: state.turnDeltaU,
+        turnDeltaT: state.turnDeltaT,
         lastNudgeUndropped: getLastNudgeUndropped(args.db, sessionId),
         lastNudgeLevel: getLastNudgeLevel(args.db, sessionId),
-        hasRecentReduce: false, // handled by reducedSinceRefresh above
+        hasRecentReduce: false,
+        evaluable: state.evaluable,
+        generationInvalidated: state.generationInvalidated,
     });
 
     // Always persist the cadence + band state so a reduce-driven drop re-arms it.
@@ -549,15 +538,19 @@ export function createToolExecuteAfterHook(args: {
             // Mark the Channel 1 baseline dirty so the next nudge re-measures the
             // (now smaller) reclaimable tail instead of replaying a stale band.
             const state = args.channel1StateBySession.get(typedInput.sessionID);
-            if (state) state.reducedSinceRefresh = true;
+            if (state) {
+                state.reducedSinceRefresh = true;
+                state.evaluable = false;
+                state.generationInvalidated = true;
+            }
             try {
                 resetLastNudgeCycle(args.db, typedInput.sessionID);
             } catch (error) {
                 sessionLog(typedInput.sessionID, "channel1 reduce reset failed (ignored):", error);
             }
         } else {
-            // Channel 1: append an in-turn ctx_reduce nudge to this tool's output
-            // when reclaimable space + pressure warrant it. Auto-sticky via
+            // Channel 1: append an in-turn ctx_reduce nudge when the rendered-tail
+            // hygiene ratio and minimum-mass guards warrant it. Auto-sticky via
             // OpenCode's DB (the mutated output.output persists + replays). Fully
             // guarded so an injection failure can never block the tool result.
             try {

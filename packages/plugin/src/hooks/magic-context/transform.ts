@@ -20,11 +20,9 @@ import {
     type ContextDatabase,
     deriveTagLoadFloor,
     getActiveTagsBySession,
-    getActiveTagTokenAggregate,
     getActiveTagTokenTotalsByMessage,
     getHistorianFailureState,
     getMaxDroppedTagNumber,
-    getOldestActiveUnprotectedToolTags,
     getOrCreateSessionMeta,
     getTagsByNumbers,
     loadPersistedUsage,
@@ -72,7 +70,7 @@ import {
     resolveTodowriteAvailabilityFromMessages,
     type ToolAvailabilityVerdict,
 } from "./ctx-reduce-availability";
-import { computeTailTokenEstimate, shouldTriggerChannel2 } from "./ctx-reduce-nudge";
+import { shouldTriggerChannel2 } from "./ctx-reduce-nudge";
 import { deriveTriggerBudget } from "./derive-budgets";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
@@ -2153,6 +2151,7 @@ export function createTransform(deps: TransformDeps) {
             messageTagNumbers,
             tagger: deps.tagger,
             ctxReduceAvailability,
+            channel1StateBySession: deps.channel1StateBySession,
             todowriteAvailability,
             client: deps.client,
             activeAgent,
@@ -2482,138 +2481,39 @@ export function createTransform(deps: TransformDeps) {
             }
         }
 
-        // Channel 1 baseline snapshot (post-drop, post-injection). Computed from
-        // the final `messages` array, which the compartment-injection step has
-        // already trimmed to the live tail — so summing non-dropped tool output
-        // gives the post-boundary undropped tokens directly. Refreshing here (a
-        // proven transform boundary) zeroes the per-turn accumulator without the
-        // chat.message mid-turn race.
-        //
-        // Gated on ctx_reduce being effective (NOT fullFeatureMode): Channel 1
-        // nudges the agent to call ctx_reduce, so it's meaningful exactly when
-        // the agent has the §N§ prefix + the tool — i.e. any session with
-        // ctx_reduce enabled, INCLUDING subagents (which self-manage tool
-        // bloat). It must NOT fire when the session's tool allow-list denies
-        // ctx_reduce. Channel 2 (the synthetic-user ceiling) rides the same gate
-        // — it fires for any ctx_reduce-effective session, subagents included.
-        if (ctxReduceCallable && !compactionOff && deps.channel1StateBySession) {
-            try {
-                // Always resolve through resolveExecuteThreshold — even when the
-                // percentage config is a bare number — so an execute_threshold_tokens
-                // override is honored (a per-model absolute cap converts to an
-                // effective %). Skipping it for the numeric case made the Channel
-                // pressure math use the wrong threshold on token-configured models.
-                const resolvedExecuteThresholdPct = resolveExecuteThreshold(
-                    deps.executeThresholdPercentage ?? 65,
-                    deps.getModelKey?.(sessionId),
-                    65,
-                    {
-                        tokensConfig: deps.executeThresholdTokens,
-                        contextLimit: resolvedContextLimit ?? 0,
+        // The final-array walk runs inside runPostTransformPhase after its last
+        // byte mutation. This site only uses the persisted baseline to reset
+        // cadence and run the existing Channel-2 lease logic.
+        const channelBaseline = deps.channel1StateBySession?.get(sessionId);
+        if (ctxReduceCallable && !compactionOff && channelBaseline) {
+            const measuredU = Math.min(
+                Math.max(0, channelBaseline.baselineT + channelBaseline.turnDeltaT),
+                Math.max(0, channelBaseline.baselineU + channelBaseline.turnDeltaU),
+            );
+            resetLastNudgeCycleIfTailShrank(db, sessionId, measuredU);
+            if (
+                channelBaseline.evaluable &&
+                !channelBaseline.generationInvalidated &&
+                !channelBaseline.reducedSinceRefresh
+            ) {
+                const channel2ShouldTrigger = shouldTriggerChannel2({
+                    baselineU: channelBaseline.baselineU,
+                    baselineT: channelBaseline.baselineT,
+                    deltas: {
+                        u: channelBaseline.turnDeltaU,
+                        t: channelBaseline.turnDeltaT,
                     },
-                );
-                // Real-tokenizer counts from the durable tag store (injected
-                // m[0]/m[1] blocks are never tagged, so this is the injected-free
-                // live tail). reclaimable = non-dropped tool OUTPUT; liveTail =
-                // conversation + tool I/O. Falls back to a byte-approx live-tail walk
-                // only if the store read fails. Replaces the old output-only path.
-                let tailToolTokens: number;
-                let liveTailTokens: number;
-                try {
-                    // reclaimable (toolOutput) excludes the protected top-N tags —
-                    // the agent can't ctx_reduce those, so they must not count
-                    // toward the nudge's "reclaimable" figure (else it nags forever
-                    // about protected-tail output it cannot drop).
-                    const agg = getActiveTagTokenAggregate(db, sessionId, deps.protectedTags);
-                    tailToolTokens = agg.toolOutput;
-                    liveTailTokens = agg.conversation + agg.toolCall;
-                } catch {
-                    const estimate = computeTailTokenEstimate(messages);
-                    tailToolTokens = estimate.tailToolTokens;
-                    liveTailTokens = estimate.liveTailTokens;
-                }
-                const executeThresholdTokens = Math.round(
-                    ((resolvedContextLimit ?? 0) * resolvedExecuteThresholdPct) / 100,
-                );
-                const usableTokens = Math.max(
-                    0,
-                    executeThresholdTokens - contextUsage.inputTokens + liveTailTokens,
-                );
-                // If the measured tail already shrank below the last persisted
-                // watermark before this tool turn (historian publish, emergency
-                // drop, pending-op replay), the old band referred to a pile that
-                // no longer exists. Clear it now so regrowth starts a fresh cycle.
-                resetLastNudgeCycleIfTailShrank(db, sessionId, tailToolTokens);
-                const oldestReclaimableToolTags = getOldestActiveUnprotectedToolTags(
-                    db,
-                    sessionId,
-                    deps.protectedTags,
-                );
-                deps.channel1StateBySession.set(sessionId, {
-                    tailToolTokens,
-                    historyBudgetTokens: historyBudgetTokens ?? 0,
-                    contextLimit: resolvedContextLimit ?? 0,
-                    executeThresholdPercentage: resolvedExecuteThresholdPct,
-                    lastInputTokens: contextUsage.inputTokens,
-                    turnToolTokens: 0,
-                    usableTokens,
-                    reducedSinceRefresh: false,
-                    oldestReclaimableToolTags,
                 });
-
-                // Channel 2 (ceiling) trigger — record a one-shot pending intent
-                // when pressure is near the execute threshold AND a large pile of
-                // reclaimable tool output remains. Delivery happens later from the
-                // event handler (`message.updated`) via the in-process client.
-                // Uses the real post-transform pressure (current usage% / threshold)
-                // and the just-computed tail tokens. Only escalate from the empty
-                // ('') state so we never reset an in-flight claim/delivery; the cap
-                // is one delivery per session lifetime.
-                //
-                // Subagents included: Channel 2 injects a synthetic user message
-                // via promptAsync, which a subagent's run loop picks up at its next
-                // step boundary and addresses like any queued message — verified
-                // safe (a subagent runs under the same in-process client as a
-                // primary). The only gate is ctx_reduce being effectively enabled
-                // (this whole block), so we never nudge toward an uncallable tool.
-                // resolvedContextLimit/threshold known is all that's required.
-                // usable = the agent's working range = the gap between the fixed
-                // overhead floor (everything that ISN'T live tail: system + tool
-                // defs + m[0] + m[1]) and the execute-threshold ceiling. Derived
-                // by identity: executeThresholdTokens − inputTokens + liveTail
-                // (inputTokens − liveTail IS the fixed overhead on the wire). As
-                // pressure rises, usable shrinks toward 0, so the single
-                // reclaimable ≥ usable/3 ratio encodes both "near comparting" and
-                // "big reclaimable pile" without a separate pressure gate.
-                // (executeThresholdTokens/usableTokens computed above, alongside
-                // the Channel-1 baseline they're persisted with.)
-                const channel2MetricsKnown =
-                    resolvedContextLimit !== undefined &&
-                    resolvedContextLimit > 0 &&
-                    resolvedExecuteThresholdPct > 0;
-                if (channel2MetricsKnown) {
-                    const channel2ShouldTrigger = shouldTriggerChannel2({
-                        reclaimableTokens: tailToolTokens,
-                        usableTokens,
-                    });
-                    try {
-                        if (channel2ShouldTrigger) {
-                            casChannel2NudgeState(db, sessionId, "", "pending");
-                        } else {
-                            // Cancel stale, undelivered intents when the same
-                            // trigger predicate no longer holds; never touch an
-                            // in-flight claim or the delivered terminal cap.
-                            casChannel2NudgeState(db, sessionId, "pending", "");
-                        }
-                    } catch (error) {
-                        sessionLog(sessionId, "channel2 trigger CAS failed (ignored):", error);
+                try {
+                    if (channel2ShouldTrigger) {
+                        casChannel2NudgeState(db, sessionId, "", "pending");
+                    } else {
+                        casChannel2NudgeState(db, sessionId, "pending", "");
                     }
+                } catch (error) {
+                    sessionLog(sessionId, "channel2 trigger CAS failed (ignored):", error);
                 }
-            } catch (error) {
-                sessionLog(sessionId, "channel1 baseline snapshot failed (ignored):", error);
             }
-        } else {
-            deps.channel1StateBySession?.delete(sessionId);
         }
 
         const elapsed = (performance.now() - startTime).toFixed(1);

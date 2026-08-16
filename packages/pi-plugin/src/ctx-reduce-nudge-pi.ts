@@ -31,19 +31,85 @@ import {
 	buildChannel1Reminder,
 	buildChannel2Reminder,
 	CHANNEL1_SENTINEL,
-	type Channel1State,
-	computePressure,
-	decideChannel1,
+	type Channel1Level,
 	isDroppedToolOutput,
 	shouldTriggerChannel2,
 	type TailTokenEstimate,
 	tailToolTokensFromStrings,
-	toolOutputTokens,
 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 
-export type { Channel1State };
+export interface Channel1State {
+	tailToolTokens: number;
+	historyBudgetTokens: number;
+	contextLimit: number;
+	executeThresholdPercentage: number;
+	lastInputTokens: number;
+	turnToolTokens: number;
+	usableTokens: number;
+	reducedSinceRefresh: boolean;
+	oldestReclaimableToolTags: Array<{
+		tagNumber: number;
+		toolName: string | null;
+	}>;
+}
+
+function legacyPiTokens(value: string): number {
+	return Math.round(Buffer.byteLength(value, "utf8") * 0.25);
+}
+
+interface LegacyPiChannel1Decision {
+	fire: boolean;
+	level: Channel1Level;
+	undroppedTokens: number;
+	nextLastNudge: number;
+	nextLastNudgeLevel: Channel1Level | "";
+}
+
+// Pi still calculates its window-relative metric. Keep that calculation local
+// so the shared rendered-tail accounting cannot change Pi accidentally. Remove
+// it when Pi measures reclaimable tagged mass (U) against total tail mass (T).
+function decideLegacyPiChannel1(input: {
+	undroppedTokens: number;
+	pressure: number;
+	estimatedInputTokens: number;
+	workingWindowTokens: number;
+	lastNudgeUndropped: number;
+	lastNudgeLevel: Channel1Level | "";
+}): LegacyPiChannel1Decision {
+	const resetCycle = input.undroppedTokens < input.lastNudgeUndropped;
+	const lastNudge = resetCycle ? 0 : input.lastNudgeUndropped;
+	const lastLevel = resetCycle ? "" : input.lastNudgeLevel;
+	const quiet = (): LegacyPiChannel1Decision => ({
+		fire: false,
+		level: "gentle",
+		undroppedTokens: input.undroppedTokens,
+		nextLastNudge: lastNudge,
+		nextLastNudgeLevel: lastLevel,
+	});
+	if (input.undroppedTokens < 10_000) return quiet();
+	if (Math.min(1, Math.max(0, input.pressure)) < 0.8) return quiet();
+	const severity = Math.min(
+		1,
+		input.undroppedTokens / Math.max(input.estimatedInputTokens, 1),
+	);
+	if (severity < 0.2) return quiet();
+	const level: Channel1Level =
+		severity >= 0.65 ? "urgent" : severity >= 0.4 ? "firm" : "gentle";
+	const rank: Record<Channel1Level, number> = { gentle: 1, firm: 2, urgent: 3 };
+	const refire = Math.max(10_000, Math.round(0.05 * input.workingWindowTokens));
+	if (lastLevel === "" && input.undroppedTokens < lastNudge + refire)
+		return quiet();
+	if (lastLevel !== "" && rank[level] <= rank[lastLevel]) return quiet();
+	return {
+		fire: true,
+		level,
+		undroppedTokens: input.undroppedTokens,
+		nextLastNudge: input.undroppedTokens,
+		nextLastNudgeLevel: level,
+	};
+}
 
 function sealDeliveredAfterUnconfirmedSend(
 	db: Database,
@@ -143,22 +209,22 @@ export function computeTailToolTokensPi(messages: readonly unknown[]): number {
 function jsonTokens(value: unknown): number {
 	if (value === undefined || value === null) return 0;
 	try {
-		return toolOutputTokens(JSON.stringify(value));
+		return legacyPiTokens(JSON.stringify(value));
 	} catch {
 		return 0;
 	}
 }
 
 function textTokens(content: unknown): number {
-	if (typeof content === "string") return toolOutputTokens(content);
+	if (typeof content === "string") return legacyPiTokens(content);
 	if (!Array.isArray(content)) return 0;
 	let tokens = 0;
 	for (const part of content) {
 		if (!part || typeof part !== "object") continue;
 		const p = part as { type?: unknown; text?: unknown; thinking?: unknown };
-		if (typeof p.text === "string") tokens += toolOutputTokens(p.text);
+		if (typeof p.text === "string") tokens += legacyPiTokens(p.text);
 		else if (typeof p.thinking === "string")
-			tokens += toolOutputTokens(p.thinking);
+			tokens += legacyPiTokens(p.thinking);
 		else if (p.type === "image") tokens += 1200;
 	}
 	return tokens;
@@ -180,7 +246,7 @@ export function computeTailTokenEstimatePi(
 					: "";
 			const outputTokens =
 				outputText && !isDroppedToolOutput(outputText)
-					? toolOutputTokens(outputText)
+					? legacyPiTokens(outputText)
 					: 0;
 			tailToolTokens += outputTokens;
 			liveTailTokens += outputTokens;
@@ -196,7 +262,7 @@ export function computeTailTokenEstimatePi(
 				};
 				if (p.type === "toolCall") {
 					if (typeof p.name === "string")
-						liveTailTokens += toolOutputTokens(p.name);
+						liveTailTokens += legacyPiTokens(p.name);
 					liveTailTokens += jsonTokens(p.arguments);
 				}
 			}
@@ -236,29 +302,27 @@ export function maybeChannel1ReminderForToolResult(args: {
 
 	// Accumulate this tool's tokens into the per-turn accumulator (prospective:
 	// not yet reflected in the baseline tail snapshot).
-	state.turnToolTokens += toolOutputTokens(text);
+	state.turnToolTokens += legacyPiTokens(text);
 
 	if (state.reducedSinceRefresh) return null;
 
 	const undroppedTokens = state.tailToolTokens + state.turnToolTokens;
-	const pressure = computePressure({
-		lastInputTokens: state.lastInputTokens,
-		turnToolTokens: state.turnToolTokens,
-		contextLimit: state.contextLimit,
-		executeThresholdPercentage: state.executeThresholdPercentage,
-	});
-
+	const estimatedInputTokens = state.lastInputTokens + state.turnToolTokens;
+	const pressure =
+		state.contextLimit > 0 && state.executeThresholdPercentage > 0
+			? ((estimatedInputTokens / state.contextLimit) * 100) /
+				state.executeThresholdPercentage
+			: 0;
 	const workingWindowTokens = Math.round(
 		(state.contextLimit * state.executeThresholdPercentage) / 100,
 	);
-	const decision = decideChannel1({
+	const decision = decideLegacyPiChannel1({
 		undroppedTokens,
 		pressure,
 		estimatedInputTokens: state.lastInputTokens + state.turnToolTokens,
 		workingWindowTokens,
 		lastNudgeUndropped: getLastNudgeUndropped(db, sessionId),
 		lastNudgeLevel: getLastNudgeLevel(db, sessionId),
-		hasRecentReduce: false, // handled by reducedSinceRefresh above
 	});
 
 	setLastNudgeUndropped(db, sessionId, decision.nextLastNudge);
@@ -352,8 +416,9 @@ export function maybeDeliverChannel2Pi(
 	const undropped = baseline.tailToolTokens + baseline.turnToolTokens;
 	if (
 		!shouldTriggerChannel2({
-			reclaimableTokens: undropped,
-			usableTokens: baseline.usableTokens,
+			baselineU: undropped,
+			baselineT: baseline.usableTokens,
+			deltas: { u: 0, t: 0 },
 		})
 	) {
 		try {

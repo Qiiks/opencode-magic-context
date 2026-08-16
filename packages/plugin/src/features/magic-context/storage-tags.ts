@@ -1607,6 +1607,7 @@ export function getTagsBySession(db: Database, sessionId: string): TagEntry[] {
 // apply-operations, heuristic-cleanup, nudger) should switch to these.
 
 const getActiveTagsBySessionStatements = new WeakMap<Database, PreparedStatement>();
+const getNullOwnerToolTagsBySessionStatements = new WeakMap<Database, PreparedStatement>();
 const getDroppedTagsBySessionStatements = new WeakMap<Database, PreparedStatement>();
 const getMaxDroppedTagNumberStatements = new WeakMap<Database, PreparedStatement>();
 
@@ -1659,6 +1660,32 @@ function getMaxDroppedTagNumberStatement(db: Database): PreparedStatement {
 export function getActiveTagsBySession(db: Database, sessionId: string): TagEntry[] {
     const rows = getActiveTagsBySessionStatement(db).all(sessionId).filter(isTagRow);
     return rows.map(toTagEntry);
+}
+
+/**
+ * Attribution rows for final rendered-tail accounting. Active, non-protected
+ * rows identify reclaimable token mass (U). Legacy tool rows with no owner are
+ * included regardless of status so duplicate call IDs remain visible and the
+ * orphan resolver can reject ambiguous matches.
+ */
+export function getTailHygieneTags(db: Database, sessionId: string): TagEntry[] {
+    const active = getActiveTagsBySession(db, sessionId);
+    let orphanStatement = getNullOwnerToolTagsBySessionStatements.get(db);
+    if (!orphanStatement) {
+        orphanStatement = db.prepare(
+            `SELECT ${TAG_SELECT_COLUMNS} FROM tags
+             WHERE session_id = ? AND type = 'tool' AND tool_owner_message_id IS NULL
+             ORDER BY tag_number ASC, id ASC`,
+        );
+        getNullOwnerToolTagsBySessionStatements.set(db, orphanStatement);
+    }
+    const seen = new Set(active.map((tag) => `${tag.tagNumber}\0${tag.messageId}\0${tag.type}`));
+    for (const row of orphanStatement.all(sessionId).filter(isTagRow)) {
+        const orphan = toTagEntry(row);
+        const key = `${orphan.tagNumber}\0${orphan.messageId}\0${orphan.type}`;
+        if (!seen.has(key)) active.push(orphan);
+    }
+    return active;
 }
 
 /**
