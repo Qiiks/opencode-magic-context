@@ -9535,8 +9535,9 @@ mod nudge_formula_tests {
         assert!(decision(&nudge_meta(26_000, 61_000)).fire);
         assert_eq!(hygiene_band(25_000, 100_000), HygieneBand::Gentle);
         assert_eq!(hygiene_band(40_000, 100_000), HygieneBand::Firm);
-        assert_eq!(hygiene_band(55_000, 100_000), HygieneBand::Urgent);
-        assert_eq!(hygiene_band(60_000, 100_000), HygieneBand::Channel2);
+        assert_eq!(hygiene_band(55_000, 100_000), HygieneBand::Firm);
+        assert_eq!(hygiene_band(60_000, 100_000), HygieneBand::Urgent);
+        assert_eq!(hygiene_band(75_000, 100_000), HygieneBand::Channel2);
 
         let mut before_cadence = nudge_meta(49_000, 200_000);
         before_cadence.channel1_last_nudge_undropped = 25_000;
@@ -9562,7 +9563,7 @@ mod nudge_formula_tests {
 
     #[test]
     fn channel2_rearms_only_on_hard_coverage_fold_or_measured_u_collapse() {
-        let mut meta = nudge_meta(60_000, 90_000);
+        let mut meta = nudge_meta(75_000, 100_000);
         meta.channel2_pressure_latched = true;
         rearm_channel2_after_hard_fold(&mut meta, false, Some(10), Some(20));
         assert!(
@@ -9595,8 +9596,8 @@ mod nudge_formula_tests {
         let projection = project_messages(&[]).unwrap();
         let core = CoreState::default();
         let tags = Vec::new();
-        let due_baseline = baseline(60_000, 90_000);
-        let mut stale = nudge_meta(60_000, 90_000);
+        let due_baseline = baseline(75_000, 100_000);
+        let mut stale = nudge_meta(75_000, 100_000);
         stale.channel2_pressure_latched = true;
         stale.channel2_arming_watermark = 1;
         stale.pending_channel2_directive = Some(pending("old", 10, 1));

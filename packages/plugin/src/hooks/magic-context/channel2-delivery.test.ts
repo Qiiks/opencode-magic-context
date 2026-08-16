@@ -104,7 +104,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2("ses-noclient", {
             db,
             // No client (e.g. a context with no client available).
-            baseline: channel2Baseline(60_000, 100_000),
+            baseline: channel2Baseline(75_000, 100_000),
         });
         expect(delivered).toBe(false);
         // Intent stays pending: delivery is simply unavailable, not consumed.
@@ -210,7 +210,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2(sessionId, {
             db,
             client: fakeClient(promptAsync),
-            baseline: channel2Baseline(60_000, 100_000),
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(delivered).toBe(true);
@@ -233,7 +233,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2(sessionId, {
             db,
             client: fakeClient(promptAsync),
-            baseline: channel2Baseline(60_000, 100_000),
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(delivered).toBe(false);
@@ -263,7 +263,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2(sessionId, {
             db,
             client,
-            baseline: channel2Baseline(60_000, 100_000),
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(delivered).toBe(false);
@@ -280,7 +280,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2("ses-go", {
             db,
             client: fakeClient(promptAsync),
-            baseline: channel2Baseline(60_000, 100_000),
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(delivered).toBe(true);
@@ -315,7 +315,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2("ses-confirm-lost", {
             db,
             client: fakeClient(promptAsync),
-            baseline: channel2Baseline(60_000, 100_000),
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(promptAsync).toHaveBeenCalledTimes(1);
@@ -341,7 +341,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await deliver(sessionId, {
             db,
             client: fakeClient(promptAsync),
-            baseline: channel2Baseline(60_000, 100_000),
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(promptAsync).toHaveBeenCalledTimes(1);
@@ -373,7 +373,7 @@ describe("maybeDeliverChannel2", () => {
             const secondDelivered = await maybeDeliverChannel2(sessionId, {
                 db,
                 client: fakeClient(secondPromptAsync),
-                baseline: channel2Baseline(60_000, 100_000),
+                baseline: channel2Baseline(75_000, 100_000),
             });
             expect(secondDelivered).toBe(true);
         });
@@ -381,7 +381,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2(sessionId, {
             db,
             client: fakeClient(firstPromptAsync),
-            baseline: channel2Baseline(60_000, 100_000),
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(firstPromptAsync).toHaveBeenCalledTimes(1);
@@ -430,7 +430,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await deliver(sessionId, {
             db,
             client: fakeClient(promptAsync),
-            baseline: channel2Baseline(60_000, 100_000),
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(delivered).toBe(false);
@@ -458,7 +458,7 @@ describe("maybeDeliverChannel2", () => {
         const delivered = await maybeDeliverChannel2("ses-fail", {
             db,
             client: fakeClient(promptAsync),
-            baseline: channel2Baseline(60_000, 100_000),
+            baseline: channel2Baseline(75_000, 100_000),
         });
 
         expect(delivered).toBe(false);
@@ -551,7 +551,7 @@ describe("maybeDeliverChannel2", () => {
         const deps = {
             db,
             client: fakeClient(promptAsync),
-            baseline: channel2Baseline(60_000, 100_000),
+            baseline: channel2Baseline(75_000, 100_000),
         };
 
         expect(await maybeDeliverChannel2(sessionId, deps)).toBe(true);
@@ -570,7 +570,7 @@ describe("maybeDeliverChannel2", () => {
         const deps = {
             db,
             client: fakeClient(promptAsync),
-            baseline: channel2Baseline(60_000, 100_000),
+            baseline: channel2Baseline(75_000, 100_000),
         };
 
         expect(await maybeDeliverChannel2(sessionId, deps)).toBe(true);
@@ -598,7 +598,7 @@ describe("maybeDeliverChannel2", () => {
         const deps = {
             db,
             client: fakeClient(promptAsync),
-            baseline: channel2Baseline(60_000, 100_000),
+            baseline: channel2Baseline(75_000, 100_000),
         };
 
         expect(await maybeDeliverChannel2(sessionId, deps)).toBe(true);

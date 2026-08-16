@@ -62,7 +62,7 @@
       "expected": {
         "u": 162006,
         "t": 249008,
-        "band": "channel2"
+        "band": "urgent"
       }
     },
     {
@@ -109,7 +109,7 @@
       "expected": {
         "u": 96001,
         "t": 144002,
-        "band": "channel2"
+        "band": "urgent"
       }
     },
     {

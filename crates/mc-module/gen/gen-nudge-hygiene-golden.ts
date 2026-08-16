@@ -277,7 +277,7 @@ if (cases.length < 12) throw new Error(`nudge hygiene parity corpus has only ${c
 const flagship = cases.find((fixture) => fixture.id === "live-incident-mixed-tail");
 if (!flagship) throw new Error("missing flagship live-incident fixture");
 const flagshipSeverity = flagship.expected.u / Math.max(flagship.expected.t, 1);
-if (flagship.expected.band !== "channel2" || Math.abs(flagshipSeverity - 0.651) > 0.002) {
+if (flagship.expected.band !== "urgent" || Math.abs(flagshipSeverity - 0.651) > 0.002) {
     throw new Error(
         `flagship positive control drifted: severity=${flagshipSeverity.toFixed(3)} band=${flagship.expected.band}`,
     );

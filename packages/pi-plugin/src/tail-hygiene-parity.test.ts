@@ -334,12 +334,12 @@ describe("nudge hygiene three-leg differential corpus", () => {
 		}
 	});
 
-	it("keeps the 0.651 flagship fixture in channel2", () => {
+	it("keeps the 0.651 flagship fixture in the urgent band", () => {
 		const flagship = golden.cases.find(
 			(fixture) => fixture.id === "live-incident-mixed-tail",
 		);
 		if (!flagship) throw new Error("missing flagship parity fixture");
 		expect(flagship.expected.u / flagship.expected.t).toBeCloseTo(0.651, 3);
-		expect(flagship.expected.band).toBe("channel2");
+		expect(flagship.expected.band).toBe("urgent");
 	});
 });

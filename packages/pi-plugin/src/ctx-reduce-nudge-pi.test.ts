@@ -148,7 +148,7 @@ describe("maybeDeliverChannel2Pi", () => {
 	/** A baseline whose measurement still satisfies the full Channel-2 trigger. */
 	function armStrongBaseline(sessionId: string): void {
 		setPiChannel1Baseline(sessionId, {
-			...channel2BaselineFields(60_000, 100_000),
+			...channel2BaselineFields(75_000, 100_000),
 			reducedSinceRefresh: false,
 			oldestReclaimableToolTags: [{ tagNumber: 9, toolName: "bash" }],
 		});

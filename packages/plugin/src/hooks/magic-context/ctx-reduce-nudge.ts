@@ -35,7 +35,7 @@ export const CHANNEL1_FLOOR_TOKENS = 25_000;
 export const CHANNEL1_REFIRE_FLOOR_TOKENS = 25_000;
 const S_GENTLE = 0.2;
 const S_FIRM = 0.4;
-const S_URGENT = 0.55;
+const S_URGENT = 0.60;
 const LEVEL_RANK: Record<Channel1Level, number> = { gentle: 1, firm: 2, urgent: 3 };
 const DROP_SENTINELS = ["[dropped", "[truncated"];
 
@@ -135,7 +135,7 @@ export function decideChannel1(input: {
     };
 }
 
-export const CHANNEL2_SEVERITY_THRESHOLD = 0.6;
+export const CHANNEL2_SEVERITY_THRESHOLD = 0.75;
 export const CHANNEL2_FLOOR_TOKENS = 50_000;
 
 export type Channel2PredicateBaseline = Pick<
