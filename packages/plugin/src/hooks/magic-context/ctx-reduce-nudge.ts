@@ -35,7 +35,7 @@ export const CHANNEL1_FLOOR_TOKENS = 25_000;
 export const CHANNEL1_REFIRE_FLOOR_TOKENS = 25_000;
 const S_GENTLE = 0.2;
 const S_FIRM = 0.4;
-const S_URGENT = 0.60;
+const S_URGENT = 0.6;
 const LEVEL_RANK: Record<Channel1Level, number> = { gentle: 1, firm: 2, urgent: 3 };
 const DROP_SENTINELS = ["[dropped", "[truncated"];
 

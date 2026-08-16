@@ -2016,7 +2016,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 			expect(meta.cachedM0MaxCompartmentSeq).toBe(417);
 			expect(meta.cachedM0MaxMutationId).toBe(15);
 			expect(meta.cachedM0UpgradeState).toContain("mural-enabled:1");
-			expect(meta.cachedM0UpgradeState).toContain("render-budgets:m15000-h27540");
+			expect(meta.cachedM0UpgradeState).toContain(
+				"render-budgets:m15000-h27540",
+			);
 
 			for (let pass = 0; pass < 3; pass += 1) {
 				const messages = [userMessage("same quiet tail", 10)];
@@ -2033,8 +2035,13 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 				expect(textOf(messages[1] as never)).toBe(firstM1);
 			}
 
-			expect(mustMaterializePi(state, db)).toEqual({ value: false, reason: null });
-			expect(mustMaterializePi({ ...state, muralEnabled: undefined }, db)).toEqual({
+			expect(mustMaterializePi(state, db)).toEqual({
+				value: false,
+				reason: null,
+			});
+			expect(
+				mustMaterializePi({ ...state, muralEnabled: undefined }, db),
+			).toEqual({
 				value: true,
 				reason: "render_config",
 				mismatch: { signal: "muralEnabled", cached: true, current: false },

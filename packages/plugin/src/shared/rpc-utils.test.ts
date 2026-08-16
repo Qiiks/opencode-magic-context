@@ -64,7 +64,9 @@ describe("classifyProcessKind", () => {
             "OpenCode instance (TUI/CLI)",
         );
         expect(
-            classifyProcessKind("bun /workspace/node_modules/@mariozechner/pi-coding-agent/dist/cli.js"),
+            classifyProcessKind(
+                "bun /workspace/node_modules/@mariozechner/pi-coding-agent/dist/cli.js",
+            ),
         ).toBe("Pi");
         expect(classifyProcessKind("/usr/bin/other --flag")).toBe("process");
         expect(classifyProcessKind(null)).toBe("process");
@@ -72,9 +74,7 @@ describe("classifyProcessKind", () => {
 
     test("recognizes serve flags and Windows-style executable paths", () => {
         expect(classifyProcessKind("opencode --serve=true")).toBe("OpenCode server");
-        expect(classifyProcessKind("C:\\Tools\\opencode.exe")).toBe(
-            "OpenCode instance (TUI/CLI)",
-        );
+        expect(classifyProcessKind("C:\\Tools\\opencode.exe")).toBe("OpenCode instance (TUI/CLI)");
         expect(classifyProcessKind("pi.cmd --model test")).toBe("Pi");
     });
 });

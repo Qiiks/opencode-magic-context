@@ -276,9 +276,7 @@ describe("planEmergencyDrop — target math", () => {
 
 describe("planEmergencyDrop — tier ordering", () => {
     it("protects newest ctx_reduce exemplars in the emergency band instead of evicting them as T3", () => {
-        const tags = Array.from({ length: 5 }, (_, index) =>
-            tag(index + 1, "ctx_reduce", 4_000),
-        );
+        const tags = Array.from({ length: 5 }, (_, index) => tag(index + 1, "ctx_reduce", 4_000));
         const plan = planWithFloor({
             tags,
             maxTag: 5,

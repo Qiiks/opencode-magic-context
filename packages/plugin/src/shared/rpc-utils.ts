@@ -3,11 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-export type ProcessKind =
-    | "OpenCode server"
-    | "OpenCode instance (TUI/CLI)"
-    | "Pi"
-    | "process";
+export type ProcessKind = "OpenCode server" | "OpenCode instance (TUI/CLI)" | "Pi" | "process";
 
 export interface RpcPortFileRecord {
     port: number;
@@ -245,7 +241,12 @@ export function readProcessCommand(pid: number): string | null {
 }
 
 function executableName(token: string | undefined): string {
-    return (token ?? "").replace(/^['\"]|['\"]$/g, "").split("/").at(-1) ?? "";
+    return (
+        (token ?? "")
+            .replace(/^['"]|['"]$/g, "")
+            .split("/")
+            .at(-1) ?? ""
+    );
 }
 
 function commandTokens(command: string): string[] {
@@ -254,7 +255,7 @@ function commandTokens(command: string): string[] {
         .replaceAll("\\", "/")
         .replaceAll("\u0000", " ")
         .split(/\s+/)
-        .map((token) => token.replace(/^['\"]|['\"]$/g, ""))
+        .map((token) => token.replace(/^['"]|['"]$/g, ""))
         .filter(Boolean);
 }
 
@@ -291,8 +292,7 @@ export function classifyProcessKind(command: string | null | undefined): Process
         const args = tokens.slice(openCodeIndex + 1);
         if (
             args.some(
-                (token) =>
-                    token === "serve" || token === "--serve" || token.startsWith("--serve="),
+                (token) => token === "serve" || token === "--serve" || token.startsWith("--serve="),
             )
         ) {
             return "OpenCode server";

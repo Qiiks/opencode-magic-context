@@ -44,11 +44,24 @@ describe("buildSyntheticToolReclaimOps", () => {
         const sessionId = "ses-ctx-reduce-age";
         const targets = new Map<number, TagTarget>();
         for (let n = 1; n <= 5; n += 1) {
-            insertTag(db, sessionId, `reduce-${n}`, "tool", 4_000, n, 0, "ctx_reduce", 0, null, null, {
-                tokenCount: 1_000,
-                inputTokenCount: 0,
-                reasoningTokenCount: 0,
-            });
+            insertTag(
+                db,
+                sessionId,
+                `reduce-${n}`,
+                "tool",
+                4_000,
+                n,
+                0,
+                "ctx_reduce",
+                0,
+                null,
+                null,
+                {
+                    tokenCount: 1_000,
+                    inputTokenCount: 0,
+                    reasoningTokenCount: 0,
+                },
+            );
             targets.set(n, target());
         }
 

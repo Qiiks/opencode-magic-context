@@ -2470,9 +2470,7 @@ export function createRustModeTransform(
                     throw new Error("rust module still requires full sync after a full-array send");
                 }
                 if (!hasNativeResponseContent(response)) {
-                    throw new Error(
-                        "rust module omitted native content after a full-array retry",
-                    );
+                    throw new Error("rust module omitted native content after a full-array retry");
                 }
             }
             const deliveryPassIds = noteDeliveryPassIds(response);

@@ -81,9 +81,7 @@ function isMagicContextHiddenAgentName(agent: string): boolean {
 
 const MAX_FORMATTED_BLOCKING_PROCESSES = 8;
 
-function normalizeFailClosedProcessKind(
-    process: FailClosedBlockingProcess,
-): FailClosedProcessKind {
+function normalizeFailClosedProcessKind(process: FailClosedBlockingProcess): FailClosedProcessKind {
     switch (process.kind) {
         case "OpenCode server":
         case "OpenCode instance (TUI/CLI)":
