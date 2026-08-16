@@ -3630,7 +3630,7 @@ describe("registerPiContextHandler", () => {
 			closeQuietly(db);
 		}
 	});
-	describe("known m[0] hard-fold folds the execute pass in", () => {
+	describe("executed m[0] hard-fold folds the execute pass in", () => {
 		const BASE_MODEL = "anthropic/opus";
 		const HARD_MODEL = "anthropic/sonnet";
 		const BASE_SYSTEM_HASH = "sys-v1";
@@ -3671,7 +3671,10 @@ describe("registerPiContextHandler", () => {
 				db,
 				protectedTags: 0,
 				heuristics: {},
-				injection: { injectionBudgetTokens: 10_000 },
+				injection: {
+					injectionBudgetTokens: 10_000,
+					muralEnabled: true,
+				},
 				scheduler: { executeThresholdPercentage: 80 },
 			});
 			const handler = fake.handlers.get("context") as (
@@ -3703,8 +3706,20 @@ describe("registerPiContextHandler", () => {
 		it("drains queued pending ops on a DEFER scheduler pass when m[0] HARD-folds", async () => {
 			const db = createTestDb();
 			const sessionId = "ses-pi-hardfold-drain";
+			const gateSnapshots: Array<{
+				foldDue: boolean;
+				foldExecuted: boolean;
+				shouldApplyPendingOps: boolean;
+				shouldRunHeuristics: boolean;
+				shouldRunReasoningCleanup: boolean;
+			}> = [];
+			const restoreObserver =
+				contextHandlerInternals.setMutationGateObserverForTests((snapshot) => {
+					gateSnapshots.push(snapshot);
+				});
 			try {
 				const { handler, toolTagNumber } = await primeBaseline(db, sessionId);
+				gateSnapshots.length = 0;
 				recordPiLiveModel(sessionId, HARD_MODEL);
 
 				const secondMessages = buildMessages();
@@ -3713,6 +3728,15 @@ describe("registerPiContextHandler", () => {
 					contextFor(sessionId, secondMessages),
 				);
 
+				expect(gateSnapshots).toEqual([
+					{
+						foldDue: true,
+						foldExecuted: true,
+						shouldApplyPendingOps: true,
+						shouldRunHeuristics: true,
+						shouldRunReasoningCleanup: true,
+					},
+				]);
 				expect(
 					getTagsBySession(db, sessionId).find(
 						(tag) => tag.tagNumber === toolTagNumber,
@@ -3720,12 +3744,79 @@ describe("registerPiContextHandler", () => {
 				).toBe("dropped");
 				expect(getPendingOps(db, sessionId)).toHaveLength(0);
 			} finally {
+				restoreObserver();
 				clearContextHandlerSession(sessionId);
 				closeQuietly(db);
 			}
 		});
 
-		it("leaves queued drops untouched on a plain DEFER pass with unchanged markers", async () => {
+		it("keeps every mutation gate closed when a due fold is suppressed", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-hardfold-suppressed";
+			const gateSnapshots: Array<{
+				foldDue: boolean;
+				foldExecuted: boolean;
+				shouldApplyPendingOps: boolean;
+				shouldRunHeuristics: boolean;
+				shouldRunReasoningCleanup: boolean;
+			}> = [];
+			let restoreInjection = () => {};
+			const restoreObserver =
+				contextHandlerInternals.setMutationGateObserverForTests((snapshot) => {
+					gateSnapshots.push(snapshot);
+				});
+			try {
+				const { handler, toolTagNumber } = await primeBaseline(db, sessionId);
+				gateSnapshots.length = 0;
+				recordPiLiveModel(sessionId, HARD_MODEL);
+				restoreInjection = contextHandlerInternals.setInjectM0M1PiForTests(
+					() => ({
+						injected: true,
+						compartmentCount: 0,
+						factCount: 0,
+						memoryCount: 0,
+						skippedVisibleMessages: 0,
+						m0Materialized: false,
+						m0Reason: "model_change",
+						m0Bytes: 1,
+						m1Bytes: 1,
+						contentionExhausted: false,
+						renderedBoundary: { endMessageId: null, ordinal: null },
+						m1RenderedCoverage: null,
+						syntheticLeadingCount: 0,
+					}),
+				);
+
+				const secondMessages = buildMessages();
+				await handler(
+					{ messages: secondMessages },
+					contextFor(sessionId, secondMessages),
+				);
+
+				expect(gateSnapshots).toEqual([
+					{
+						foldDue: true,
+						foldExecuted: false,
+						shouldApplyPendingOps: false,
+						shouldRunHeuristics: false,
+						shouldRunReasoningCleanup: false,
+					},
+				]);
+				expect(
+					getTagsBySession(db, sessionId).find(
+						(tag) => tag.tagNumber === toolTagNumber,
+					)?.status,
+				).toBe("active");
+				expect(getPendingOps(db, sessionId)).toHaveLength(1);
+			} finally {
+				restoreInjection();
+				restoreObserver();
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+
+		it("keeps queued drops gated when a mural-enabled HARD fold is only advisory", async () => {
 			const db = createTestDb();
 			const sessionId = "ses-pi-hardfold-nodrain";
 			try {

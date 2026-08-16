@@ -59,6 +59,7 @@ import {
     todowritePermissionDenied,
 } from "./ctx-reduce-availability";
 import { dropStaleReduceCalls } from "./drop-stale-reduce-calls";
+import { foldExecutesThisPass } from "./fold-execution-gate";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
 import {
     clearInjectionCache,
@@ -850,19 +851,12 @@ export async function runPostTransformPhase(
         activeCompartmentRun !== undefined;
     const deferredMaterialize = args.canConsumeDeferredLate && deferredMaterializationWasPending;
     const materializationRequested = isExplicitFlush || deferredMaterialize;
-    // Known-bust fold: if m[0] is going to HARD-fold this pass (epoch / model /
-    // system-hash / ttl-idle / mutation-id / upgrade — whatever mustMaterialize
-    // decides), the Anthropic prefix is being re-cached regardless. Drain the
-    // queued tool-drops + run heuristics into THAT bust instead of busting a
-    // second time on a later execute pass. ADVISORY-ONLY: early-true widens the
-    // gates below; early-false changes nothing — injectM0M1 keeps its own
-    // independent late mustMaterialize recheck, so a cross-process epoch/mutation
-    // bump arriving after this point still folds (and its drops drain on a later
-    // pass, exactly as today). Correctness is never worse than today; the cost is
-    // one extra mustMaterialize (indexed DB reads + a cached docs stat).
-    // Kept a SEPARATE boolean — NEVER folded into materializationRequested, which
-    // drives the lastResponseTime TTL reset and pendingMaterialization cleanup;
-    // folding in would suppress those and oscillate.
+    // A HARD decision alone is not a cache bust. Execute it off-wire first, then
+    // let pending drops and heuristics ride the bust only when persistence reports
+    // that m[0] actually materialized. A contention fallback or failed attempt
+    // leaves the mutation gates closed, preserving byte-identical defer replay.
+    // injectM0M1 still rechecks later, so a cross-process marker bump after this
+    // pre-execution can fold safely without retroactively authorizing mutations.
     // Re-gated for compaction-off mode (issue #266): injection runs when the
     // memory/docs identity is present AND (fullFeatureMode || compactionOff),
     // so the mode cannot swallow m[0]/m[1] delivery — and a compaction-off
@@ -872,7 +866,7 @@ export async function runPostTransformPhase(
         args.m0M1 !== undefined &&
         (!!args.m0M1.projectPath || !!args.m0M1.projectDirectory) &&
         (args.fullFeatureMode || compactionOff);
-    const m0HardFoldThisPass =
+    const foldDueDecision =
         m0M1EnabledForFold && args.m0M1
             ? mustMaterialize({
                   db: args.db,
@@ -885,13 +879,55 @@ export async function runPostTransformPhase(
                   memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
                   historyBudgetTokens: args.m0M1.historyBudgetTokens,
                   hardSignals: args.m0M1.hardSignals,
-              }).value
-            : false;
+              })
+            : { value: false, reason: null };
+    let foldExecutedThisPass = false;
+    let m0RematerializedThisPass = false;
+    let m0MaterializeReason: string | null = null;
+    if (foldDueDecision.value && args.m0M1) {
+        try {
+            // Persist the fold before opening mutation gates. Omitting messages
+            // keeps this pre-execution off the outgoing wire; the injection phase
+            // below replays the persisted pair into the real message array.
+            const foldResult = injectM0M1({
+                db: args.db,
+                sessionId: args.sessionId,
+                state: args.sessionMeta as M0M1State,
+                projectPath: args.m0M1.projectPath,
+                projectDirectory: args.m0M1.projectDirectory,
+                injectDocs: args.m0M1.injectDocs,
+                memoryInjectionBudgetTokens: args.m0M1.memoryInjectionBudgetTokens,
+                historyBudgetTokens: args.m0M1.historyBudgetTokens,
+                temporalAwareness: args.m0M1.temporalAwareness,
+                isCacheBustingPass: true,
+                hardSignals: args.m0M1.hardSignals,
+                muralEnabled: args.m0M1.muralEnabled,
+                compactionOff,
+            });
+            foldExecutedThisPass = foldExecutesThisPass(
+                foldDueDecision.value,
+                foldResult.m0RematerializedThisPass,
+            );
+            m0RematerializedThisPass = foldResult.m0RematerializedThisPass;
+            m0MaterializeReason = foldResult.decision.reason;
+        } catch (error) {
+            args.passOutcome?.record("m0-m1-fold-preexecution-degradation");
+            sessionLog(
+                args.sessionId,
+                "transform: m[0] HARD fold pre-execution failed:",
+                getErrorMessage(error),
+            );
+        }
+        sessionLog(
+            args.sessionId,
+            `m[0] HARD fold decision: reason=${foldDueDecision.reason ?? "unknown"} executed=${foldExecutedThisPass}`,
+        );
+    }
     // Bypass the compartment-running veto when this pass is busting the Anthropic
     // prefix REGARDLESS — so the pending-op drain + heuristics ride that one bust
     // instead of being deferred into a SECOND bust ~a turn later. Two cases:
     //   - forceMaterialization (the derived force band): overflow prevention trumps cache stability.
-    //   - m0HardFoldThisPass: a HARD m[0] fold (model/system-hash/epoch/etc.) is
+    //   - foldExecutedThisPass: a HARD m[0] fold (model/system-hash/epoch/etc.) is
     //     re-caching m[0] this pass; the prefix is already gone, so draining into
     //     it is free. Without this, a hard fold landing while the historian runs
     //     leaves the drop vetoed -> it spills to a later soft bust (observed: a
@@ -905,13 +941,13 @@ export async function runPostTransformPhase(
     //   - The historian's post-publish queueDropsForCompartmentalizedMessages is
     //     idempotent against already-dropped tags (status !== "active"), so any
     //     drain/publish ordering is benign.
-    const bypassCompartmentGate = forceMaterialization || m0HardFoldThisPass;
+    const bypassCompartmentGate = forceMaterialization || foldExecutedThisPass;
     const shouldReadPendingOps =
         !compactionOff &&
         (materializationRequested ||
             args.schedulerDecision === "execute" ||
             forceMaterialization ||
-            m0HardFoldThisPass ||
+            foldExecutedThisPass ||
             compartmentRunning);
     const pendingOps = shouldReadPendingOps ? getPendingOps(args.db, args.sessionId) : [];
     const hasPendingUserOps = pendingOps.length > 0;
@@ -923,7 +959,7 @@ export async function runPostTransformPhase(
         (args.schedulerDecision === "execute" ||
             materializationRequested ||
             forceMaterialization ||
-            m0HardFoldThisPass) &&
+            foldExecutedThisPass) &&
         (!compartmentRunning || bypassCompartmentGate);
     // Heuristic cleanup runs for ALL sessions — primary and subagent. Subagents
     // previously skipped heuristics entirely (via fullFeatureMode gate), which
@@ -954,12 +990,10 @@ export async function runPostTransformPhase(
         (!compartmentRunning || bypassCompartmentGate) &&
         (materializationRequested ||
             forceMaterialization ||
-            // Known m[0] hard-fold this pass: the prefix busts regardless, so
-            // running heuristics here folds the drops into the one bust. Bypasses
-            // the once-per-turn guard deliberately (the guard exists to avoid
-            // mid-turn cache busts; this pass busts anyway), so a hard fold that
-            // lands mid-turn still drains.
-            m0HardFoldThisPass ||
+            // The off-wire fold landed, so the prefix already busted. Heuristics
+            // may ride it and bypass the once-per-turn guard without creating an
+            // independent mid-turn rewrite.
+            foldExecutedThisPass ||
             // the derived force band emergency floor for BOTH primary and subagent. For a primary
             // this coincides with forceMaterialization (fullFeatureMode && the derived force band);
             // for a subagent (no forceMaterialization) it's the only path that
@@ -1028,8 +1062,8 @@ export async function runPostTransformPhase(
               ? "deferred_materialization"
               : forceMaterialization
                 ? `force_materialization (${args.contextUsage.percentage.toFixed(1)}% >= ${args.forceMaterializationPercentage}%)`
-                : m0HardFoldThisPass && args.schedulerDecision !== "execute"
-                  ? `m0_hard_fold (drain folded into known m[0] bust, scheduler=${args.schedulerDecision})`
+                : foldExecutedThisPass && args.schedulerDecision !== "execute"
+                  ? `m0_hard_fold (drain folded into executed m[0] bust, scheduler=${args.schedulerDecision})`
                   : subagentRerun
                     ? `scheduler_execute_subagent_rerun (pendingOps=${pendingOps.length}, scheduler=${args.schedulerDecision})`
                     : `scheduler_execute (pendingOps=${pendingOps.length}, scheduler=${args.schedulerDecision})`;
@@ -1077,8 +1111,6 @@ export async function runPostTransformPhase(
     const droppedTokens = 0;
     let emergencyReclaimedTokens = 0;
     let emergency = false;
-    let m0RematerializedThisPass = false;
-    let m0MaterializeReason: string | null = null;
     let m0M1InjectedThisPass = false;
     let prependedMessageCount = 0;
     const reasoningMutatedMessages = new Set<MessageLike>();
@@ -1096,7 +1128,9 @@ export async function runPostTransformPhase(
                 ? "explicit_flush"
                 : deferredMaterialize
                   ? "deferred_materialization"
-                  : `scheduler_execute (scheduler=${args.schedulerDecision})`;
+                  : foldExecutedThisPass && args.schedulerDecision !== "execute"
+                    ? `m0_hard_fold (drain folded into executed m[0] bust, scheduler=${args.schedulerDecision})`
+                    : `scheduler_execute (scheduler=${args.schedulerDecision})`;
             sessionLog(
                 args.sessionId,
                 `pending ops WILL APPLY — reason=${applyReason}, pendingOps=${pendingOps.length}, context=${args.contextUsage.percentage.toFixed(1)}%`,

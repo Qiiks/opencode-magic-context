@@ -1819,7 +1819,7 @@ describe("smart-drops supersession reclaim (flag-gated)", () => {
     });
 });
 
-describe("known m[0] hard-fold folds the execute pass in", () => {
+describe("executed m[0] hard-fold folds the execute pass in", () => {
     const FOLD_PROJECT = "/tmp/test-hardfold-project";
     const BASE_HARD: M0HardSignals = {
         systemHash: "sys-v1",
@@ -1842,6 +1842,48 @@ describe("known m[0] hard-fold folds the execute pass in", () => {
             hardSignals: BASE_HARD,
         });
     }
+
+    it("keeps OpenCode final bytes identical to a one-shot executed fold", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const directSession = "ses-hardfold-byte-direct";
+        const postprocessSession = "ses-hardfold-byte-postprocess";
+        materializeBaseline(directSession);
+        materializeBaseline(postprocessSession);
+        const hardSignals = { ...BASE_HARD, modelKey: "anthropic/sonnet" };
+
+        const directMessages: MessageLike[] = [];
+        const direct = injectM0M1({
+            db,
+            sessionId: directSession,
+            messages: directMessages,
+            state: getOrCreateSessionMeta(db, directSession),
+            projectPath: FOLD_PROJECT,
+            projectDirectory: FOLD_PROJECT,
+            historyBudgetTokens: 98_000,
+            isCacheBustingPass: true,
+            hardSignals,
+        });
+        const postprocessMessages: MessageLike[] = [];
+        const postprocess = await runPostTransformPhase(
+            basePostTransformArgs(db, postprocessSession, postprocessMessages, {
+                schedulerDecision: "defer",
+                contextUsage: { percentage: 40, inputTokens: 4000 },
+                m0M1: {
+                    projectPath: FOLD_PROJECT,
+                    projectDirectory: FOLD_PROJECT,
+                    historyBudgetTokens: 98_000,
+                    hardSignals,
+                },
+            }),
+        );
+
+        expect(direct.m0RematerializedThisPass).toBe(true);
+        expect(postprocess.materialized).toBe(true);
+        expect(JSON.stringify(postprocessMessages.map((message) => message.parts))).toBe(
+            JSON.stringify(directMessages.map((message) => message.parts)),
+        );
+    });
 
     it("drains queued pending ops on a DEFER scheduler pass when m[0] HARD-folds", async () => {
         db = new Database(":memory:");

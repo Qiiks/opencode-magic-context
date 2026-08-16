@@ -53,12 +53,12 @@ This is the heart of the system and the part most easily gotten wrong. A "transf
 Pending-op drain and heuristic cleanup are each gated by the same shape in `transform-postprocess-phase.ts`:
 ```
 shouldApplyPendingOps / shouldRunHeuristics =
-  (execute || materializationRequested || forceMaterialization || m0HardFoldThisPass)  // BUST clause: is this pass busting anyway?
+  (execute || materializationRequested || forceMaterialization || foldExecutedThisPass) // BUST clause: did a HARD fold land this pass?
   && (!compartmentRunning || emergencyBypassCompartmentGate)                            // VETO clause: is the historian mid-run?
 ```
-- **BUST clause** — only mutate (drop tools, run heuristics) on a pass that is *already* busting the prefix, so the mutation rides that one bust instead of causing its own. `m0HardFoldThisPass` is the fold-exec signal (an advisory `mustMaterialize` call earlier in postprocess).
+- **BUST clause** — only mutate (drop tools, run heuristics) on a pass that is *already* busting the prefix, so the mutation rides that one bust instead of causing its own. `foldExecutedThisPass` is true only after off-wire fold pre-execution reports that m[0] actually materialized; a `mustMaterialize` advisory by itself never opens mutation gates.
 - **VETO clause — `compartmentRunning`** — block mutation while the historian is summarizing the tail, so we don't change the bytes it's reading mid-run. Bypassed by `emergencyBypassCompartmentGate`.
-- **`emergencyBypassCompartmentGate`** bypasses the veto when `forceMaterialization` (≥85%) **OR `m0HardFoldThisPass`** — i.e. a hard fold drains pending ops + runs heuristics even while the historian runs, because the prefix is busting regardless (see "drain into the known bust" invariant). This is safe per the disjoint-DB model below; Pi already does this (`context-handler.ts`).
+- **`emergencyBypassCompartmentGate`** bypasses the veto when `forceMaterialization` (≥85%) **OR `foldExecutedThisPass`** — i.e. a hard fold drains pending ops + runs heuristics even while the historian runs, because the prefix is busting regardless (see "drain into the known bust" invariant). This is safe per the disjoint-DB model below; both harness twins use the shared executed-fold predicate.
 
 ### Load-bearing invariants (memorize these)
 1. **A HARD bust means the prefix is already gone → drain EVERYTHING into it. Never "defer" a hard bust.** This pass IS the fold; there is no later fold to wait for. Deferring the drain only produces a second, avoidable bust ~one turn later. (The `compartmentRunning` veto must therefore yield to a hard fold — the fold-exec bypass.)
