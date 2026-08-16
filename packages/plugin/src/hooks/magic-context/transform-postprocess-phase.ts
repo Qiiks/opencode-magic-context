@@ -97,7 +97,13 @@ import {
 } from "./strip-content";
 import { buildEditSupersessionReclaim, buildSupersessionReclaimOps } from "./supersession-reclaim";
 import { byteSize, prependTag } from "./tag-content-primitives";
-import { assertTailHygieneContentUnchanged, refreshTailHygieneBaseline } from "./tail-hygiene-walk";
+import {
+    assertTailHygieneContentUnchanged,
+    refreshTailHygieneBaseline,
+    sameTailHygieneStructuralSignature,
+    type TailHygieneStructuralSignature,
+    tailHygieneStructuralSignature,
+} from "./tail-hygiene-walk";
 import { buildSyntheticTodoPart, isSyntheticTodoPart, type SyntheticTodoPart } from "./todo-view";
 import {
     advanceToolReclaimWatermarkToCurrentMax,
@@ -2179,7 +2185,12 @@ export async function runPostTransformPhase(
     );
 
     let assertedBaseline:
-        | { tags: TagEntry[]; protectedTags: number; contentSignature: string }
+        | {
+              tags: TagEntry[];
+              protectedTags: number;
+              contentSignature: string;
+              structuralSignature: TailHygieneStructuralSignature;
+          }
         | undefined;
     if (args.channel1StateBySession) {
         if (args.ctxReduceAvailability.callable && !compactionOff) {
@@ -2193,6 +2204,7 @@ export async function runPostTransformPhase(
                     cacheBusting: bustedThisPass,
                     previous,
                 });
+                const structuralSignature = tailHygieneStructuralSignature(args.messages);
                 args.channel1StateBySession.set(args.sessionId, {
                     ...baseline,
                     reducedSinceRefresh:
@@ -2222,6 +2234,7 @@ export async function runPostTransformPhase(
                     tags,
                     protectedTags: args.protectedTags,
                     contentSignature: baseline.contentSignature,
+                    structuralSignature,
                 };
             } catch (error) {
                 const stale = args.channel1StateBySession.get(args.sessionId);
@@ -2235,13 +2248,37 @@ export async function runPostTransformPhase(
             args.channel1StateBySession.delete(args.sessionId);
         }
     }
-    if (assertedBaseline && process.env.NODE_ENV !== "production") {
-        assertTailHygieneContentUnchanged({
-            messages: args.messages,
-            tags: assertedBaseline.tags,
-            protectedTags: assertedBaseline.protectedTags,
-            expectedSignature: assertedBaseline.contentSignature,
-        });
+    if (assertedBaseline) {
+        try {
+            const servedSignature = tailHygieneStructuralSignature(args.messages);
+            if (
+                !sameTailHygieneStructuralSignature(
+                    assertedBaseline.structuralSignature,
+                    servedSignature,
+                )
+            ) {
+                sessionLog(
+                    args.sessionId,
+                    `ERROR [tail-hygiene-last-writer-mismatch]: served messages changed after tail-hygiene baseline refresh (expected messages=${assertedBaseline.structuralSignature.messageCount}, parts=[${assertedBaseline.structuralSignature.partCounts.join(",")}], bytes=${assertedBaseline.structuralSignature.totalBytes}; actual messages=${servedSignature.messageCount}, parts=[${servedSignature.partCounts.join(",")}], bytes=${servedSignature.totalBytes})`,
+                );
+            }
+        } catch (error) {
+            // This diagnostic must never interrupt a turn. The tail baseline still
+            // guides the nudge, and the next served pass can refresh it.
+            sessionLog(
+                args.sessionId,
+                "ERROR [tail-hygiene-last-writer-check-failed]: structural production guard failed open:",
+                error,
+            );
+        }
+        if (process.env.NODE_ENV !== "production") {
+            assertTailHygieneContentUnchanged({
+                messages: args.messages,
+                tags: assertedBaseline.tags,
+                protectedTags: assertedBaseline.protectedTags,
+                expectedSignature: assertedBaseline.contentSignature,
+            });
+        }
     }
 
     return {

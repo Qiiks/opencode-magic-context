@@ -4,6 +4,7 @@ import { isRecord } from "../../shared/record-type-guard";
 import { stableStringify } from "../../shared/stable-json";
 import { estimateImageTokensFromDataUrl } from "./image-token-estimate";
 import { estimateTokens } from "./read-session-formatting";
+import { byteSize } from "./tag-content-primitives";
 import type { MessageLike } from "./tag-messages";
 import { isSyntheticTodoPart } from "./todo-view";
 
@@ -30,6 +31,16 @@ export interface TailHygieneMeasurement {
     t: number;
     contentSignature: string;
     parts: TailHygienePartMeasurement[];
+}
+
+/**
+ * Cheap served-array shape used in production to catch a write after the tail
+ * walk without repeating its content hashing and token accounting.
+ */
+export interface TailHygieneStructuralSignature {
+    messageCount: number;
+    partCounts: number[];
+    totalBytes: number;
 }
 
 export interface TailHygieneBaseline {
@@ -433,6 +444,37 @@ function fileContentAndTokens(part: Record<string, unknown>): { content: string;
 
 function contentSignature(parts: readonly TailHygienePartMeasurement[]): string {
     return fnv1a32(parts.map((part) => `${part.key}:${part.contentHash}`).join("\0"));
+}
+
+/**
+ * Capture a low-cost structural signature of the exact messages about to be
+ * served. It intentionally does not hash content: production needs a cheap
+ * last-writer alarm, while the full content-hash assertion remains a dev check.
+ */
+export function tailHygieneStructuralSignature(
+    messages: readonly MessageLike[],
+): TailHygieneStructuralSignature {
+    const partCounts: number[] = [];
+    let totalBytes = 0;
+    for (const message of messages) {
+        partCounts.push(message.parts.length);
+        totalBytes += byteSize(JSON.stringify(message) ?? "");
+    }
+    return { messageCount: messages.length, partCounts, totalBytes };
+}
+
+export function sameTailHygieneStructuralSignature(
+    expected: TailHygieneStructuralSignature,
+    actual: TailHygieneStructuralSignature,
+): boolean {
+    if (
+        expected.messageCount !== actual.messageCount ||
+        expected.totalBytes !== actual.totalBytes ||
+        expected.partCounts.length !== actual.partCounts.length
+    ) {
+        return false;
+    }
+    return expected.partCounts.every((count, index) => count === actual.partCounts[index]);
 }
 
 export function measureTailHygiene(input: {

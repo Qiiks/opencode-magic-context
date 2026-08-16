@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,6 +34,7 @@ import {
     setPersistedTodoSyntheticAnchor,
 } from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
+import * as loggerModule from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { registerActiveCompartmentRun } from "./compartment-runner";
@@ -234,6 +235,54 @@ function basePostTransformArgs(
 function cloneMessages(messages: MessageLike[]): MessageLike[] {
     return structuredClone(messages);
 }
+
+describe("tail hygiene last-writer guard", () => {
+    it("logs a production structural mismatch after a post-walk mutation without throwing", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-tail-hygiene-last-writer";
+        const messages = [
+            {
+                info: { id: "tail-user", role: "user" },
+                parts: [{ type: "text", text: "baseline tail" }],
+            },
+        ] as unknown as MessageLike[];
+        const channel1StateBySession = new Map<string, Channel1State>();
+        const originalSet = channel1StateBySession.set;
+        channel1StateBySession.set = function (key, state) {
+            const result = originalSet.call(this, key, state);
+            if (key === sessionId) {
+                messages[0].parts.push({
+                    type: "text",
+                    text: "deliberate post-walk mutation",
+                } as MessageLike["parts"][number]);
+            }
+            return result;
+        };
+        const originalNodeEnv = process.env.NODE_ENV;
+        process.env.NODE_ENV = "production";
+        const sessionLog = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+
+        try {
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, { channel1StateBySession }),
+            );
+
+            expect(
+                sessionLog.mock.calls.some(
+                    (call) =>
+                        call[0] === sessionId &&
+                        typeof call[1] === "string" &&
+                        call[1].includes("ERROR [tail-hygiene-last-writer-mismatch]"),
+                ),
+            ).toBe(true);
+        } finally {
+            sessionLog.mockRestore();
+            if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+            else process.env.NODE_ENV = originalNodeEnv;
+        }
+    });
+});
 
 describe("Channel-2 measured-collapse cycle reset", () => {
     it("CAS-rearms delivered at the baseline-refresh site when measured U falls below 25k", async () => {
