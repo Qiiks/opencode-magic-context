@@ -2339,6 +2339,21 @@ describe("registerPiContextHandler", () => {
 				userMessage("next request", 4),
 				assistantMessage("newer answer", 5),
 				userMessage("latest request", 6),
+				assistantToolCall("reduce-2", "ctx_reduce", {}, 7),
+				{
+					...toolResultMessage("reduce-2", "reduced two", 8),
+					toolName: "ctx_reduce",
+				},
+				assistantToolCall("reduce-3", "ctx_reduce", {}, 9),
+				{
+					...toolResultMessage("reduce-3", "reduced three", 10),
+					toolName: "ctx_reduce",
+				},
+				assistantToolCall("reduce-4", "ctx_reduce", {}, 11),
+				{
+					...toolResultMessage("reduce-4", "reduced four", 12),
+					toolName: "ctx_reduce",
+				},
 			] as never[];
 		const entryIds = [
 			"entry-1",
@@ -2347,6 +2362,12 @@ describe("registerPiContextHandler", () => {
 			"entry-4",
 			"entry-5",
 			"entry-6",
+			"entry-reduce-2-owner",
+			"entry-reduce-2-result",
+			"entry-reduce-3-owner",
+			"entry-reduce-3-result",
+			"entry-reduce-4-owner",
+			"entry-reduce-4-result",
 		];
 
 		async function runProviderScenario(

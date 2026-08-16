@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { CTX_REDUCE_KEEP } from "../../features/magic-context/reclaim-protection";
 import type { TagEntry } from "../../features/magic-context/types";
 import { buildChannel1Reminder } from "./ctx-reduce-nudge";
 import type { MessageLike } from "./tag-messages";
@@ -180,6 +181,37 @@ describe("tail hygiene single-walk instrument", () => {
         expect(
             measureTailHygiene({ messages: syntheticMessages, tags: [], protectedTags: 0 }),
         ).toMatchObject({ u: 0, t: 0 });
+    });
+
+    it("excludes protected ctx_reduce exemplar arcs from U while retaining them in T", () => {
+        const messages = Array.from({ length: 4 }, (_, index) =>
+            nativeTool(
+                `reduce-owner-${index + 1}`,
+                `reduce-${index + 1}`,
+                { drop: index + 1 },
+                `reduced ${index + 1}`,
+            ),
+        );
+        const tags = Array.from({ length: 4 }, (_, index) =>
+            tag(index + 1, `reduce-${index + 1}`, "tool", {
+                toolName: "ctx_reduce",
+                toolOwnerMessageId: `reduce-owner-${index + 1}`,
+            }),
+        );
+
+        const measured = measureTailHygiene({ messages, tags, protectedTags: 0 });
+        const protectedTagNumbers = new Set(
+            measured.parts.filter((part) => part.protected).map((part) => part.tagNumber),
+        );
+        const oldestArcParts = measured.parts.filter((part) => part.tagNumber === 1);
+        const exemplarParts = measured.parts.filter((part) => (part.tagNumber ?? 0) >= 2);
+
+        expect(protectedTagNumbers).toEqual(new Set([2, 3, 4]));
+        expect(oldestArcParts.every((part) => part.uTokens > 0)).toBe(true);
+        expect(exemplarParts.every((part) => part.uTokens === 0)).toBe(true);
+        expect(measured.u).toBeGreaterThan(0);
+        expect(measured.t).toBeGreaterThan(measured.u);
+        expect(CTX_REDUCE_KEEP).toBe(3);
     });
 
     it("keeps U as a constructed subset of T, including image/file parts", () => {

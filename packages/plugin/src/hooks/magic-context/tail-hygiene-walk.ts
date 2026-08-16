@@ -1,3 +1,4 @@
+import { newestCtxReduceTagNumbers } from "../../features/magic-context/reclaim-protection";
 import type { TagEntry } from "../../features/magic-context/types";
 import { isRecord } from "../../shared/record-type-guard";
 import { stableStringify } from "../../shared/stable-json";
@@ -261,13 +262,17 @@ function messageIdForTag(tag: TagEntry): string | null {
 }
 
 function protectedTagNumbers(tags: readonly TagEntry[], protectedTags: number): Set<number> {
-    if (protectedTags <= 0) return new Set();
     const active = Array.from(
         new Set(tags.filter((tag) => tag.status === "active").map((tag) => tag.tagNumber)),
     )
         .sort((left, right) => right - left)
-        .slice(0, protectedTags);
-    return new Set(active);
+        .slice(0, Math.max(0, protectedTags));
+    const protectedNumbers = new Set(active);
+    const protectedCtxReduceTags = newestCtxReduceTagNumbers(
+        tags.filter((tag) => tag.status === "active" && tag.type === "tool"),
+    );
+    for (const tagNumber of protectedCtxReduceTags) protectedNumbers.add(tagNumber);
+    return protectedNumbers;
 }
 
 function neighborhoodConsistent(args: {

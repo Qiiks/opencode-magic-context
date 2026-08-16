@@ -34,8 +34,8 @@ use crate::transform::{utf16_len, utf16_prefix, ReductionDecision};
 
 /// `todowrite`: keep the newest 1 (the live plan is the newest todo state).
 const TODOWRITE_KEEP: usize = 1;
-/// `ctx_reduce`: keep the newest 5 (preserves the visible reduce rhythm).
-const CTX_REDUCE_KEEP: usize = 5;
+/// Recent `ctx_reduce` arcs retained as visible housekeeping exemplars.
+const CTX_REDUCE_KEEP: usize = 3;
 /// Zero-value meta tools whose every occurrence is droppable.
 const ZERO_VALUE_META_TOOLS: &[&str] = &["bash_status", "bash_kill"];
 /// `ctx_note` actions that carry no lasting value (droppable when positively read).
@@ -732,8 +732,27 @@ fn expand_arc(
 
 // --- the five selectors: each returns the ARC-IDs (or block-ids) it targets ---
 
+fn newest_ctx_reduce_arc_ids(arcs: &[&ToolArc]) -> HashSet<String> {
+    let mut newest_first: Vec<&ToolArc> = arcs
+        .iter()
+        .copied()
+        .filter(|arc| arc.name == "ctx_reduce")
+        .collect();
+    newest_first.sort_by(|left, right| {
+        right
+            .ordinal
+            .cmp(&left.ordinal)
+            .then_with(|| right.arc_id.cmp(&left.arc_id))
+    });
+    newest_first
+        .into_iter()
+        .take(CTX_REDUCE_KEEP)
+        .map(|arc| arc.arc_id.clone())
+        .collect()
+}
+
 /// 1.1 Control-plane supersession + 1.2 edit supersession (the smart_drops selectors).
-/// Newest-arc-first, per tool name: todowrite keep-1, ctx_reduce keep-5, zero-value
+/// Newest-arc-first, per tool name: todowrite keep-1, ctx_reduce keep-K, zero-value
 /// meta drop-all, ctx_note drop-on-zero-value-action; edit/write older-per-file →
 /// edit_marker. Returns per-arc intents so the caller expands + shapes them. Active
 /// (non-reduced, client-executed) arcs only.
@@ -748,7 +767,7 @@ fn select_supersession(arcs: &[&ToolArc]) -> HashMap<String, ArcIntent> {
     });
 
     let mut todowrite_seen = 0usize;
-    let mut ctx_reduce_seen = 0usize;
+    let protected_ctx_reduce_arcs = newest_ctx_reduce_arc_ids(arcs);
     let mut seen_file: HashSet<String> = HashSet::new();
 
     for arc in newest_first {
@@ -771,8 +790,7 @@ fn select_supersession(arcs: &[&ToolArc]) -> HashMap<String, ArcIntent> {
             todowrite_seen += 1;
             todowrite_seen > TODOWRITE_KEEP
         } else if name == "ctx_reduce" {
-            ctx_reduce_seen += 1;
-            ctx_reduce_seen > CTX_REDUCE_KEEP
+            !protected_ctx_reduce_arcs.contains(&arc.arc_id)
         } else if ZERO_VALUE_META_TOOLS.contains(&name) {
             true
         } else if name == "ctx_note" {
@@ -862,6 +880,7 @@ fn select_two_pass(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<String>
     if !two_pass_batch_can_apply(ctx) || ctx.last_execute_ordinal == 0 {
         return HashSet::new();
     }
+    let protected_ctx_reduce_arcs = newest_ctx_reduce_arc_ids(arcs);
     let newest_todowrite = arcs
         .iter()
         .filter(|arc| arc.name == "todowrite")
@@ -878,6 +897,7 @@ fn select_two_pass(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<String>
                 .is_none_or(|tokens| tokens >= AGE_RECLAIM_MIN_TOKENS)
         })
         .filter(|arc| Some(arc.arc_id.as_str()) != newest_todowrite)
+        .filter(|arc| !protected_ctx_reduce_arcs.contains(&arc.arc_id))
         .map(|arc| arc.arc_id.clone())
         .collect()
 }
@@ -1022,11 +1042,19 @@ fn select_emergency(
         }
     }
 
+    // Protect ctx_reduce exemplars without changing the target math. The fixed floor
+    // above already derives from every active floor tag, so removing candidates changes
+    // neither the floor nor target (panel-verified emergency interaction).
+    let protected_ctx_reduce_arcs = newest_ctx_reduce_arc_ids(arcs);
+
     // Build candidates per tier (protected tail + reserve excluded).
     let mut by_tier: HashMap<u8, Vec<&&ToolArc>> = HashMap::new();
     for arc in arcs {
         if arc.ordinal > ctx.protected_cutoff_ordinal && ctx.protected_cutoff_ordinal > 0 {
             continue; // global protected tail
+        }
+        if protected_ctx_reduce_arcs.contains(&arc.arc_id) {
+            continue;
         }
         let tier = resolve_tool_tier(&arc.name);
         if (tier == 1 || tier == 2) && reserved.contains(&arc.arc_id) {

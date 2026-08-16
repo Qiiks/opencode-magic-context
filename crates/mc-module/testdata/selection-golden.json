@@ -91,6 +91,7 @@
       "protected_cutoff_ordinal": 0,
       "last_execute_ordinal": 0,
       "scheduler_pressure_execute": true,
+      "pass_already_busting": false,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -103,7 +104,7 @@
     }
   },
   {
-    "label": "supersession: ctx_reduce keep-5",
+    "label": "supersession: ctx_reduce keep-3 exemplars",
     "items": [
       {
         "id": "c1#0",
@@ -239,60 +240,6 @@
         "byte_size": 40,
         "token_count": null,
         "arc_id": "c5#0"
-      },
-      {
-        "id": "c6#0",
-        "ordinal": 6,
-        "kind": {
-          "ToolCall": {
-            "name": "ctx_reduce",
-            "input": {}
-          }
-        },
-        "provider_executed": false,
-        "byte_size": 0,
-        "token_count": null,
-        "arc_id": "c6#0"
-      },
-      {
-        "id": "c6#1",
-        "ordinal": 6,
-        "kind": {
-          "ToolResult": {
-            "tool_name": "ctx_reduce"
-          }
-        },
-        "provider_executed": false,
-        "byte_size": 40,
-        "token_count": null,
-        "arc_id": "c6#0"
-      },
-      {
-        "id": "c7#0",
-        "ordinal": 7,
-        "kind": {
-          "ToolCall": {
-            "name": "ctx_reduce",
-            "input": {}
-          }
-        },
-        "provider_executed": false,
-        "byte_size": 0,
-        "token_count": null,
-        "arc_id": "c7#0"
-      },
-      {
-        "id": "c7#1",
-        "ordinal": 7,
-        "kind": {
-          "ToolResult": {
-            "tool_name": "ctx_reduce"
-          }
-        },
-        "provider_executed": false,
-        "byte_size": 40,
-        "token_count": null,
-        "arc_id": "c7#0"
       }
     ],
     "ctx": {
@@ -302,6 +249,7 @@
       "protected_cutoff_ordinal": 0,
       "last_execute_ordinal": 0,
       "scheduler_pressure_execute": true,
+      "pass_already_busting": false,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -405,6 +353,7 @@
       "protected_cutoff_ordinal": 0,
       "last_execute_ordinal": 0,
       "scheduler_pressure_execute": true,
+      "pass_already_busting": false,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -515,6 +464,7 @@
       "protected_cutoff_ordinal": 0,
       "last_execute_ordinal": 0,
       "scheduler_pressure_execute": true,
+      "pass_already_busting": false,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -629,6 +579,7 @@
       "protected_cutoff_ordinal": 0,
       "last_execute_ordinal": 0,
       "scheduler_pressure_execute": true,
+      "pass_already_busting": false,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -710,6 +661,7 @@
       "protected_cutoff_ordinal": 0,
       "last_execute_ordinal": 0,
       "scheduler_pressure_execute": true,
+      "pass_already_busting": false,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -875,6 +827,164 @@
       "c1#0": "drop",
       "c2#0": "drop",
       "c3#0": "drop"
+    }
+  },
+  {
+    "label": "two_pass: ctx_reduce keep-3 exemplars",
+    "items": [
+      {
+        "id": "c1#0",
+        "ordinal": 1,
+        "kind": {
+          "ToolCall": {
+            "name": "ctx_reduce",
+            "input": {}
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 0,
+        "token_count": null,
+        "arc_id": "c1#0"
+      },
+      {
+        "id": "c1#1",
+        "ordinal": 1,
+        "kind": {
+          "ToolResult": {
+            "tool_name": "ctx_reduce"
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 4000,
+        "token_count": 1000,
+        "arc_id": "c1#0"
+      },
+      {
+        "id": "c2#0",
+        "ordinal": 2,
+        "kind": {
+          "ToolCall": {
+            "name": "ctx_reduce",
+            "input": {}
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 0,
+        "token_count": null,
+        "arc_id": "c2#0"
+      },
+      {
+        "id": "c2#1",
+        "ordinal": 2,
+        "kind": {
+          "ToolResult": {
+            "tool_name": "ctx_reduce"
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 4000,
+        "token_count": 1000,
+        "arc_id": "c2#0"
+      },
+      {
+        "id": "c3#0",
+        "ordinal": 3,
+        "kind": {
+          "ToolCall": {
+            "name": "ctx_reduce",
+            "input": {}
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 0,
+        "token_count": null,
+        "arc_id": "c3#0"
+      },
+      {
+        "id": "c3#1",
+        "ordinal": 3,
+        "kind": {
+          "ToolResult": {
+            "tool_name": "ctx_reduce"
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 4000,
+        "token_count": 1000,
+        "arc_id": "c3#0"
+      },
+      {
+        "id": "c4#0",
+        "ordinal": 4,
+        "kind": {
+          "ToolCall": {
+            "name": "ctx_reduce",
+            "input": {}
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 0,
+        "token_count": null,
+        "arc_id": "c4#0"
+      },
+      {
+        "id": "c4#1",
+        "ordinal": 4,
+        "kind": {
+          "ToolResult": {
+            "tool_name": "ctx_reduce"
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 4000,
+        "token_count": 1000,
+        "arc_id": "c4#0"
+      },
+      {
+        "id": "c5#0",
+        "ordinal": 5,
+        "kind": {
+          "ToolCall": {
+            "name": "ctx_reduce",
+            "input": {}
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 0,
+        "token_count": null,
+        "arc_id": "c5#0"
+      },
+      {
+        "id": "c5#1",
+        "ordinal": 5,
+        "kind": {
+          "ToolResult": {
+            "tool_name": "ctx_reduce"
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 4000,
+        "token_count": 1000,
+        "arc_id": "c5#0"
+      }
+    ],
+    "ctx": {
+      "pass_class": "Execute",
+      "current_total_input_tokens": 0,
+      "ceiling_tokens": 0,
+      "protected_cutoff_ordinal": 0,
+      "last_execute_ordinal": 5,
+      "scheduler_pressure_execute": true,
+      "pass_already_busting": true,
+      "prior_input_sample": 0,
+      "has_prior_drop": false,
+      "agent_drop_ids": []
+    },
+    "smart_drops": false,
+    "frozen": [],
+    "expected": {
+      "c1#0": "drop",
+      "c2#0": "drop"
     }
   },
   {
@@ -1148,6 +1258,7 @@
       "protected_cutoff_ordinal": 4,
       "last_execute_ordinal": 0,
       "scheduler_pressure_execute": false,
+      "pass_already_busting": false,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -1157,6 +1268,164 @@
     "expected": {
       "c3#0": "drop",
       "c4#0": "drop"
+    }
+  },
+  {
+    "label": "emergency: ctx_reduce keep-3 exemplars",
+    "items": [
+      {
+        "id": "c1#0",
+        "ordinal": 1,
+        "kind": {
+          "ToolCall": {
+            "name": "ctx_reduce",
+            "input": {}
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 0,
+        "token_count": null,
+        "arc_id": "c1#0"
+      },
+      {
+        "id": "c1#1",
+        "ordinal": 1,
+        "kind": {
+          "ToolResult": {
+            "tool_name": "ctx_reduce"
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 4000,
+        "token_count": null,
+        "arc_id": "c1#0"
+      },
+      {
+        "id": "c2#0",
+        "ordinal": 2,
+        "kind": {
+          "ToolCall": {
+            "name": "ctx_reduce",
+            "input": {}
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 0,
+        "token_count": null,
+        "arc_id": "c2#0"
+      },
+      {
+        "id": "c2#1",
+        "ordinal": 2,
+        "kind": {
+          "ToolResult": {
+            "tool_name": "ctx_reduce"
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 4000,
+        "token_count": null,
+        "arc_id": "c2#0"
+      },
+      {
+        "id": "c3#0",
+        "ordinal": 3,
+        "kind": {
+          "ToolCall": {
+            "name": "ctx_reduce",
+            "input": {}
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 0,
+        "token_count": null,
+        "arc_id": "c3#0"
+      },
+      {
+        "id": "c3#1",
+        "ordinal": 3,
+        "kind": {
+          "ToolResult": {
+            "tool_name": "ctx_reduce"
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 4000,
+        "token_count": null,
+        "arc_id": "c3#0"
+      },
+      {
+        "id": "c4#0",
+        "ordinal": 4,
+        "kind": {
+          "ToolCall": {
+            "name": "ctx_reduce",
+            "input": {}
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 0,
+        "token_count": null,
+        "arc_id": "c4#0"
+      },
+      {
+        "id": "c4#1",
+        "ordinal": 4,
+        "kind": {
+          "ToolResult": {
+            "tool_name": "ctx_reduce"
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 4000,
+        "token_count": null,
+        "arc_id": "c4#0"
+      },
+      {
+        "id": "c5#0",
+        "ordinal": 5,
+        "kind": {
+          "ToolCall": {
+            "name": "ctx_reduce",
+            "input": {}
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 0,
+        "token_count": null,
+        "arc_id": "c5#0"
+      },
+      {
+        "id": "c5#1",
+        "ordinal": 5,
+        "kind": {
+          "ToolResult": {
+            "tool_name": "ctx_reduce"
+          }
+        },
+        "provider_executed": false,
+        "byte_size": 4000,
+        "token_count": null,
+        "arc_id": "c5#0"
+      }
+    ],
+    "ctx": {
+      "pass_class": "EmergencyForce",
+      "current_total_input_tokens": 6000,
+      "ceiling_tokens": 1000,
+      "protected_cutoff_ordinal": 5,
+      "last_execute_ordinal": 0,
+      "scheduler_pressure_execute": false,
+      "pass_already_busting": false,
+      "prior_input_sample": 0,
+      "has_prior_drop": false,
+      "agent_drop_ids": []
+    },
+    "smart_drops": false,
+    "frozen": [],
+    "expected": {
+      "c1#0": "drop",
+      "c2#0": "drop"
     }
   },
   {
@@ -1278,6 +1547,7 @@
       "protected_cutoff_ordinal": 2,
       "last_execute_ordinal": 0,
       "scheduler_pressure_execute": false,
+      "pass_already_busting": false,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []
@@ -1327,6 +1597,7 @@
       "protected_cutoff_ordinal": 1,
       "last_execute_ordinal": 0,
       "scheduler_pressure_execute": false,
+      "pass_already_busting": false,
       "prior_input_sample": 200000,
       "has_prior_drop": true,
       "agent_drop_ids": []
@@ -1373,6 +1644,7 @@
       "protected_cutoff_ordinal": 1,
       "last_execute_ordinal": 0,
       "scheduler_pressure_execute": false,
+      "pass_already_busting": false,
       "prior_input_sample": 0,
       "has_prior_drop": false,
       "agent_drop_ids": []

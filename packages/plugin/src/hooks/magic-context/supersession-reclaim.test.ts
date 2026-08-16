@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CTX_REDUCE_KEEP } from "../../features/magic-context/reclaim-protection";
 import {
     closeDatabase,
     insertTag,
@@ -78,16 +79,17 @@ describe("buildSupersessionReclaimOps", () => {
         expect(ids(ops)).toEqual([1, 2]);
     });
 
-    it("keeps newest 5 ctx_reduce, drops older ones", () => {
+    it("keeps the newest three ctx_reduce exemplars and drops older ones", () => {
         const db = freshDb();
         const targets = new Map<number, TagTarget>();
-        for (let n = 1; n <= 7; n += 1) {
-            insertTag(db, SES, `c${n}`, "tool", 40, n, 0, "ctx_reduce");
+        for (let n = 1; n <= 5; n += 1) {
+            insertTag(db, SES, `reduce-${n}`, "tool", 40, n, 0, "ctx_reduce");
             targets.set(n, target());
         }
         const ops = buildSupersessionReclaimOps({ db, sessionId: SES, targets });
-        // newest 5 (3..7) kept; 1 and 2 dropped.
+
         expect(ids(ops)).toEqual([1, 2]);
+        expect(CTX_REDUCE_KEEP).toBe(3);
     });
 
     it("drops all zero-value meta (bash_status / bash_kill)", () => {
