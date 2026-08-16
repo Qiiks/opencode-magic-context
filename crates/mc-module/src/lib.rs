@@ -586,8 +586,7 @@ const SESSION_STATUS_COMPARTMENT_PAGE_LIMIT: usize = 50;
 /// After a historian abandon, suppress refires for this long so a persistently
 /// failing model does not burn a full summarization pass on every transform.
 const HISTORIAN_FAILURE_BACKOFF_MS: i64 = historian::HISTORIAN_FAILURE_BACKOFF_MS;
-const SESSION_UNRESOLVED_MESSAGE: &str =
-    "session unresolved; launch Claude Code through the CortexKit wrapper so ctx_* can bind to this conversation";
+const SESSION_UNRESOLVED_MESSAGE: &str = "session unresolved; launch Claude Code through the CortexKit wrapper so ctx_* can bind to this conversation";
 /// OpenCode's Rust-mode tool route binds the real harness session, unlike the Claude Code
 /// wrapper route whose binding is an instance-token namespace.
 const OPENCODE_HARNESS: &str = "opencode";
@@ -1836,7 +1835,16 @@ impl TransformRequest {
     }
 
     /// Estimated bytes retained by one ready snapshot, including its cache keys and `Arc`.
+    #[cfg(test)]
     pub(crate) fn retained_bytes(&self) -> usize {
+        self.retained_bytes_with_charges(None, None)
+    }
+
+    fn retained_bytes_with_charges(
+        &self,
+        native_charge: Option<usize>,
+        message_charge: Option<usize>,
+    ) -> usize {
         use crate::retained_size::{
             btree_map_allocation_bytes, ck_wire_message_retained_bytes,
             cloned_string_retained_bytes, value_heap_bytes, ARC_ALLOCATION_OVERHEAD_BYTES,
@@ -1899,27 +1907,30 @@ impl TransformRequest {
                 .map(|(key, value)| key.capacity().saturating_add(value.capacity()))
                 .sum::<usize>(),
         );
-        let native_messages = self.native_messages.as_ref().map_or(0, |messages| {
-            messages
-                .capacity()
-                .saturating_mul(size_of::<Value>())
-                .saturating_add(messages.iter().map(value_heap_bytes).sum::<usize>())
+        let native_messages = native_charge.unwrap_or_else(|| {
+            self.native_messages.as_ref().map_or(0, |messages| {
+                messages
+                    .capacity()
+                    .saturating_mul(size_of::<Value>())
+                    .saturating_add(messages.iter().map(value_heap_bytes).sum::<usize>())
+            })
         });
-        let messages = self
-            .messages
-            .capacity()
-            .saturating_mul(size_of::<ck_wire::CkIngressMessage>())
-            .saturating_add(
-                self.messages
-                    .iter()
-                    .map(|message| {
-                        message.mid.capacity().saturating_add(
-                            ck_wire_message_retained_bytes(&message.ck)
-                                .saturating_sub(size_of::<ck_wire::CkWireMessage>()),
-                        )
-                    })
-                    .sum::<usize>(),
-            );
+        let messages = message_charge.unwrap_or_else(|| {
+            self.messages
+                .capacity()
+                .saturating_mul(size_of::<ck_wire::CkIngressMessage>())
+                .saturating_add(
+                    self.messages
+                        .iter()
+                        .map(|message| {
+                            message.mid.capacity().saturating_add(
+                                ck_wire_message_retained_bytes(&message.ck)
+                                    .saturating_sub(size_of::<ck_wire::CkWireMessage>()),
+                            )
+                        })
+                        .sum::<usize>(),
+                )
+        });
         let tail_delta = self.tail_delta.as_ref().map_or(0, value_heap_bytes);
         let declared_trim = self.declared_trim.as_ref().map_or(0, |trim| {
             trim.flat_boundary_id
@@ -2199,8 +2210,11 @@ struct BoundaryTokenCacheEntry {
 
 #[derive(Debug, Clone, Default)]
 struct BoundaryTokenCacheSnapshot {
-    entries: HashMap<String, BoundaryTokenCacheEntry>,
-    formatted_tokens: HashMap<[u8; 32], usize>,
+    entries: Arc<HashMap<String, BoundaryTokenCacheEntry>>,
+    entry_updates: HashMap<String, BoundaryTokenCacheEntry>,
+    formatted_tokens: Arc<HashMap<[u8; 32], usize>>,
+    formatted_token_updates: HashMap<[u8; 32], usize>,
+    active_ids: Option<HashSet<String>>,
     hits: usize,
     misses: usize,
 }
@@ -2211,7 +2225,11 @@ impl BoundaryTokenCacheSnapshot {
         // so length alone cannot prove that a cached token count still describes these bytes.
         // The projection computes this digest once and retains it on the block, avoiding a second
         // full payload hash when the token cache entry is still valid.
-        if let Some(entry) = self.entries.get(block_id) {
+        if let Some(entry) = self
+            .entry_updates
+            .get(block_id)
+            .or_else(|| self.entries.get(block_id))
+        {
             if entry.byte_size == bytes.len() && entry.content_hash == *content_hash {
                 self.hits = self.hits.saturating_add(1);
                 return entry.token_count;
@@ -2219,7 +2237,7 @@ impl BoundaryTokenCacheSnapshot {
         }
         let token_count = mc_tokenizer::estimate_tokens(bytes);
         self.misses = self.misses.saturating_add(1);
-        self.entries.insert(
+        self.entry_updates.insert(
             block_id.to_string(),
             BoundaryTokenCacheEntry {
                 byte_size: bytes.len(),
@@ -2232,43 +2250,88 @@ impl BoundaryTokenCacheSnapshot {
 
     fn formatted_token_count(&mut self, bytes: &str) -> usize {
         let content_hash: [u8; 32] = Sha256::digest(bytes.as_bytes()).into();
-        if let Some(token_count) = self.formatted_tokens.get(&content_hash) {
+        if let Some(token_count) = self
+            .formatted_token_updates
+            .get(&content_hash)
+            .or_else(|| self.formatted_tokens.get(&content_hash))
+        {
             return *token_count;
         }
         let token_count = mc_tokenizer::estimate_tokens(bytes);
-        self.formatted_tokens.insert(content_hash, token_count);
+        self.formatted_token_updates
+            .insert(content_hash, token_count);
         token_count
     }
 
     fn retain_projection(&mut self, projection: &crate::ck_wire::FlatProjection) {
-        let active_ids = projection
+        let active_count = projection
             .blocks
             .iter()
             .filter(|block| !block.synthetic)
-            .map(|block| block.id.as_str())
-            .collect::<HashSet<_>>();
-        self.entries
-            .retain(|block_id, _| active_ids.contains(block_id.as_str()));
+            .count();
+        let added_ids = self
+            .entry_updates
+            .keys()
+            .filter(|block_id| !self.entries.contains_key(block_id.as_str()))
+            .count();
+        if self.entries.len().saturating_add(added_ids) <= active_count {
+            return;
+        }
+        self.active_ids = Some(
+            projection
+                .blocks
+                .iter()
+                .filter(|block| !block.synthetic)
+                .map(|block| block.id.clone())
+                .collect(),
+        );
     }
 
+    #[cfg(test)]
     fn retained_bytes(&self) -> usize {
-        let source_bytes = self
-            .entries
-            .keys()
-            // Include a conservative per-entry allowance for the HashMap bucket and owned key.
-            .map(|block_id| block_id.len() + std::mem::size_of::<BoundaryTokenCacheEntry>() + 64)
-            .sum::<usize>();
-        source_bytes
-            + self.formatted_tokens.len()
-                * (std::mem::size_of::<[u8; 32]>() + std::mem::size_of::<usize>() + 64)
+        boundary_token_maps_retained_bytes(
+            self.entries.iter().chain(self.entry_updates.iter()),
+            self.formatted_tokens.len() + self.formatted_token_updates.len(),
+        )
     }
+
+    fn materialize(
+        self,
+    ) -> (
+        HashMap<String, BoundaryTokenCacheEntry>,
+        HashMap<[u8; 32], usize>,
+    ) {
+        let mut entries =
+            Arc::try_unwrap(self.entries).unwrap_or_else(|entries| (*entries).clone());
+        entries.extend(self.entry_updates);
+        if let Some(active_ids) = self.active_ids {
+            entries.retain(|block_id, _| active_ids.contains(block_id));
+        }
+        let mut formatted_tokens = Arc::try_unwrap(self.formatted_tokens)
+            .unwrap_or_else(|formatted_tokens| (*formatted_tokens).clone());
+        formatted_tokens.extend(self.formatted_token_updates);
+        (entries, formatted_tokens)
+    }
+}
+
+fn boundary_token_maps_retained_bytes<'a>(
+    entries: impl Iterator<Item = (&'a String, &'a BoundaryTokenCacheEntry)>,
+    formatted_token_count: usize,
+) -> usize {
+    let source_bytes = entries
+        // Include a conservative per-entry allowance for the HashMap bucket and owned key.
+        .map(|(block_id, _)| block_id.len() + std::mem::size_of::<BoundaryTokenCacheEntry>() + 64)
+        .sum::<usize>();
+    source_bytes
+        + formatted_token_count
+            * (std::mem::size_of::<[u8; 32]>() + std::mem::size_of::<usize>() + 64)
 }
 
 #[derive(Debug)]
 struct BoundaryTokenCacheSession {
     retained_bytes: usize,
-    entries: HashMap<String, BoundaryTokenCacheEntry>,
-    formatted_tokens: HashMap<[u8; 32], usize>,
+    entries: Arc<HashMap<String, BoundaryTokenCacheEntry>>,
+    formatted_tokens: Arc<HashMap<[u8; 32], usize>>,
 }
 
 #[derive(Debug)]
@@ -2300,7 +2363,12 @@ impl BoundaryTokenCache {
         let (entries, formatted_tokens) = self
             .sessions
             .get(session_id)
-            .map(|session| (session.entries.clone(), session.formatted_tokens.clone()))
+            .map(|session| {
+                (
+                    Arc::clone(&session.entries),
+                    Arc::clone(&session.formatted_tokens),
+                )
+            })
             .unwrap_or_default();
         if !entries.is_empty() || !formatted_tokens.is_empty() {
             self.lru.retain(|candidate| candidate != session_id);
@@ -2314,9 +2382,13 @@ impl BoundaryTokenCache {
     }
 
     fn replace(&mut self, session_id: &str, snapshot: BoundaryTokenCacheSnapshot) {
+        // Drop the session's Arc owners before materializing. On the ordinary single-flight path,
+        // Arc::try_unwrap then applies only the suffix updates instead of cloning every cached key.
         self.remove(session_id);
-        let retained_bytes = snapshot.retained_bytes();
-        if (snapshot.entries.is_empty() && snapshot.formatted_tokens.is_empty())
+        let (entries, formatted_tokens) = snapshot.materialize();
+        let retained_bytes =
+            boundary_token_maps_retained_bytes(entries.iter(), formatted_tokens.len());
+        if (entries.is_empty() && formatted_tokens.is_empty())
             || retained_bytes > self.max_retained_bytes
         {
             return;
@@ -2326,8 +2398,8 @@ impl BoundaryTokenCache {
             session_id.to_string(),
             BoundaryTokenCacheSession {
                 retained_bytes,
-                entries: snapshot.entries,
-                formatted_tokens: snapshot.formatted_tokens,
+                entries: Arc::new(entries),
+                formatted_tokens: Arc::new(formatted_tokens),
             },
         );
         self.lru.push_back(session_id.to_string());
@@ -2357,6 +2429,7 @@ struct NativeDeltaFrontier {
     after: String,
     native_replace_from: usize,
     native_prefix: Vec<Arc<Value>>,
+    native_prefix_retained_bytes: Vec<usize>,
     projection_cache: Option<ProjectionCacheInput>,
 }
 
@@ -2381,6 +2454,7 @@ struct NativeEncodedChunk {
 struct NativeAttachmentCacheStats {
     reused_messages: usize,
     encoded_messages: usize,
+    request_native_retained_bytes: usize,
     refused_store: usize,
     degraded_store: usize,
     evicted: usize,
@@ -2402,6 +2476,9 @@ struct NativeAttachmentCacheSnapshot {
     // Transform-generated m0/m1 messages can shift every served-output position away from raw
     // ingress. Preserve the acknowledged ingress because `native_replace_from` indexes that input.
     ingress_chunks: Vec<Arc<Value>>,
+    // Pay each deep retained-size walk when a suffix first enters the cache. Warm passes reuse the
+    // prefix charges instead of traversing every retained provider tree again.
+    ingress_chunk_retained_bytes: Vec<usize>,
 }
 
 impl NativeAttachmentCacheSnapshot {
@@ -2427,17 +2504,26 @@ impl NativeAttachmentCacheSnapshot {
             .iter()
             .map(|chunk| Arc::as_ptr(&chunk.value))
             .collect::<HashSet<_>>();
+        debug_assert_eq!(
+            self.ingress_chunks.len(),
+            self.ingress_chunk_retained_bytes.len()
+        );
         let ingress_bytes = self
             .ingress_chunks
             .capacity()
             .saturating_mul(size_of::<Arc<Value>>())
             .saturating_add(
+                self.ingress_chunk_retained_bytes
+                    .capacity()
+                    .saturating_mul(size_of::<usize>()),
+            )
+            .saturating_add(
                 self.ingress_chunks
                     .iter()
-                    .filter(|value| charged_values.insert(Arc::as_ptr(value)))
-                    .map(|value| {
-                        ARC_ALLOCATION_OVERHEAD_BYTES
-                            .saturating_add(native_value_retained_bytes(value))
+                    .zip(&self.ingress_chunk_retained_bytes)
+                    .filter(|(value, _)| charged_values.insert(Arc::as_ptr(value)))
+                    .map(|(_, retained_bytes)| {
+                        ARC_ALLOCATION_OVERHEAD_BYTES.saturating_add(*retained_bytes)
                     })
                     .sum::<usize>(),
             );
@@ -2585,15 +2671,10 @@ impl NativeAttachmentCache {
         {
             self.remove(session_id);
         }
-        let snapshot = self
-            .sessions
-            .get(session_id)
-            .map(|session| session.snapshot.clone());
-        if snapshot.is_some() {
-            self.lru.retain(|candidate| candidate != session_id);
-            self.lru.push_back(session_id.to_string());
-        }
-        snapshot
+        let session = self.sessions.remove(session_id)?;
+        self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+        self.lru.retain(|candidate| candidate != session_id);
+        Some(session.snapshot)
     }
 
     fn delta_native_prefix(
@@ -2602,7 +2683,7 @@ impl NativeAttachmentCache {
         revert_epoch: u64,
         after: &str,
         prefix_messages: usize,
-    ) -> Option<Vec<Arc<Value>>> {
+    ) -> Option<(Vec<Arc<Value>>, Vec<usize>)> {
         if self
             .sessions
             .get(session_id)
@@ -2613,8 +2694,14 @@ impl NativeAttachmentCache {
         let prefix = self.sessions.get(session_id).and_then(|session| {
             let snapshot = &session.snapshot;
             (snapshot.full_array_fingerprint.as_deref() == Some(after)
-                && prefix_messages <= snapshot.ingress_chunks.len())
-            .then(|| snapshot.ingress_chunks[..prefix_messages].to_vec())
+                && prefix_messages <= snapshot.ingress_chunks.len()
+                && prefix_messages <= snapshot.ingress_chunk_retained_bytes.len())
+            .then(|| {
+                (
+                    snapshot.ingress_chunks[..prefix_messages].to_vec(),
+                    snapshot.ingress_chunk_retained_bytes[..prefix_messages].to_vec(),
+                )
+            })
         })?;
         self.lru.retain(|candidate| candidate != session_id);
         self.lru.push_back(session_id.to_string());
@@ -2643,8 +2730,7 @@ impl NativeAttachmentCache {
             stats.refused_store = stats.refused_store.saturating_add(1);
             eprintln!(
                 "native-attachment-cache refused_store session={session_id} byte_charge={retained_bytes} requested_byte_charge={requested_bytes} entry_cap={} total_budget={}",
-                self.max_entry_retained_bytes,
-                self.max_retained_bytes,
+                self.max_entry_retained_bytes, self.max_retained_bytes,
             );
             return;
         }
@@ -2676,9 +2762,7 @@ impl NativeAttachmentCache {
                 stats.evicted = stats.evicted.saturating_add(1);
                 eprintln!(
                     "native-attachment-cache evicted session={oldest} byte_charge={} retained_bytes={} total_budget={}",
-                    session.retained_bytes,
-                    self.retained_bytes,
-                    self.max_retained_bytes,
+                    session.retained_bytes, self.retained_bytes, self.max_retained_bytes,
                 );
             }
         }
@@ -2713,6 +2797,7 @@ struct ProjectionCacheSnapshot {
     context: ProjectionCacheContext,
     full_array_fingerprint: Option<String>,
     projection: Arc<crate::ck_wire::FlatProjection>,
+    message_retained_bytes: Arc<Vec<usize>>,
 }
 
 impl ProjectionCacheSnapshot {
@@ -2722,6 +2807,12 @@ impl ProjectionCacheSnapshot {
 
         self.projection
             .retained_bytes()
+            .saturating_add(ARC_ALLOCATION_OVERHEAD_BYTES)
+            .saturating_add(
+                self.message_retained_bytes
+                    .capacity()
+                    .saturating_mul(size_of::<usize>()),
+            )
             .saturating_add(ARC_ALLOCATION_OVERHEAD_BYTES)
             .saturating_add(self.context.session_id.capacity())
             .saturating_add(self.context.serializer_profile.capacity())
@@ -3037,6 +3128,10 @@ struct HistorianPrepareContext<'a> {
 #[derive(Default)]
 struct HistorianTriggerTimings {
     elapsed_ms: f64,
+    boundary_build_ms: f64,
+    trigger_eval_ms: f64,
+    cache_store_ms: f64,
+    token_cache_hits: usize,
     tokenized_blocks: usize,
 }
 
@@ -3788,8 +3883,8 @@ impl McHandler {
         let mut current_messages = std::mem::take(&mut parsed.messages);
         messages.append(&mut current_messages);
 
-        let native_prefix = if native_replace_from == 0 {
-            Vec::new()
+        let (native_prefix, native_prefix_retained_bytes) = if native_replace_from == 0 {
+            (Vec::new(), Vec::new())
         } else {
             self.native_attachments
                 .lock()
@@ -3804,11 +3899,16 @@ impl McHandler {
                     let request = fallback_request.as_ref()?;
                     let previous_native = request.native_messages.as_ref()?;
                     (native_replace_from <= previous_native.len()).then(|| {
-                        previous_native[..native_replace_from]
+                        let prefix = previous_native[..native_replace_from]
                             .iter()
                             .cloned()
                             .map(Arc::new)
-                            .collect()
+                            .collect::<Vec<_>>();
+                        let retained_bytes = previous_native[..native_replace_from]
+                            .iter()
+                            .map(native_value_retained_bytes)
+                            .collect();
+                        (prefix, retained_bytes)
                     })
                 })?
         };
@@ -3826,6 +3926,7 @@ impl McHandler {
             after,
             native_replace_from,
             native_prefix,
+            native_prefix_retained_bytes,
             projection_cache,
         })
     }
@@ -3884,7 +3985,30 @@ impl McHandler {
         request: &TransformRequest,
         revert_epoch: u64,
         projection: Arc<crate::ck_wire::FlatProjection>,
-    ) {
+        prior: Option<&ProjectionCacheInput>,
+    ) -> usize {
+        let reusable_prefix = prior
+            .filter(|cache| {
+                cache.replace_from <= request.messages.len()
+                    && cache.replace_from <= cache.message_retained_bytes.len()
+            })
+            .map_or(0, |cache| cache.replace_from);
+        let mut message_retained_bytes = prior
+            .filter(|_| reusable_prefix > 0)
+            .map(|cache| cache.message_retained_bytes[..reusable_prefix].to_vec())
+            .unwrap_or_default();
+        message_retained_bytes.reserve(request.messages.len().saturating_sub(reusable_prefix));
+        message_retained_bytes.extend(request.messages[reusable_prefix..].iter().map(|message| {
+            message.mid.capacity().saturating_add(
+                crate::retained_size::ck_wire_message_retained_bytes(&message.ck)
+                    .saturating_sub(std::mem::size_of::<ck_wire::CkWireMessage>()),
+            )
+        }));
+        let request_message_charge = request
+            .messages
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ck_wire::CkIngressMessage>())
+            .saturating_add(message_retained_bytes.iter().copied().sum::<usize>());
         self.projections
             .lock()
             .expect("projection cache mutex")
@@ -3895,8 +4019,10 @@ impl McHandler {
                     context: projection_cache_context(request),
                     full_array_fingerprint: request.full_array_fingerprint.clone(),
                     projection,
+                    message_retained_bytes: Arc::new(message_retained_bytes),
                 },
             );
+        request_message_charge
     }
 
     fn transform_page_in_progress(&self, session_id: &str) -> bool {
@@ -4396,12 +4522,12 @@ impl McHandler {
                         )?;
                         match action {
                             historian::RestartAction::Done => {
-                                return Ok(historian::HistorianReattachOutcome::Done)
+                                return Ok(historian::HistorianReattachOutcome::Done);
                             }
                             historian::RestartAction::AbandonedAndRefireEligible { firing_seq } => {
                                 return Ok(historian::HistorianReattachOutcome::RefireEligible {
                                     firing_seq,
-                                })
+                                });
                             }
                             historian::RestartAction::ReattachProducer { .. } => {}
                         }
@@ -4490,7 +4616,7 @@ impl McHandler {
                     state: "unknown".to_string(),
                     progress: None,
                     last_failure: None,
-                })
+                });
             }
         };
         let state = loaded.meta.historian.state.as_str().to_string();
@@ -4539,11 +4665,19 @@ impl McHandler {
                 last_failure,
             });
         }
+        let boundary_build_started_at = Instant::now();
         let CachedBoundaryMessages {
             messages: boundary_messages,
+            token_cache_hits,
             tokenized_blocks,
             mut token_cache_snapshot,
         } = boundary_messages(parsed, projection, &self.boundary_tokens);
+        trigger_timer.timings.boundary_build_ms +=
+            boundary_build_started_at.elapsed().as_secs_f64() * 1_000.0;
+        trigger_timer.timings.token_cache_hits = trigger_timer
+            .timings
+            .token_cache_hits
+            .saturating_add(token_cache_hits);
         trigger_timer.timings.tokenized_blocks = trigger_timer
             .timings
             .tokenized_blocks
@@ -4584,6 +4718,7 @@ impl McHandler {
             input_tokens,
             context_limit,
         );
+        let trigger_eval_started_at = Instant::now();
         let trigger = {
             let mut formatted_token_estimator =
                 |bytes: &str| token_cache_snapshot.formatted_token_count(bytes);
@@ -4613,10 +4748,15 @@ impl McHandler {
                 &mut formatted_token_estimator,
             )
         };
+        trigger_timer.timings.trigger_eval_ms +=
+            trigger_eval_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let cache_store_started_at = Instant::now();
         self.boundary_tokens
             .lock()
             .expect("boundary token cache mutex")
             .replace(&parsed.session_id, token_cache_snapshot);
+        trigger_timer.timings.cache_store_ms +=
+            cache_store_started_at.elapsed().as_secs_f64() * 1_000.0;
         let progress = trigger
             .progress
             .as_ref()
@@ -4836,7 +4976,7 @@ impl McHandler {
         let loaded = match store.load(&parsed.session_id) {
             Ok(loaded) => loaded,
             Err(error) => {
-                return PreparedWrapupAction::Failed(format!("state load failed: {error}"))
+                return PreparedWrapupAction::Failed(format!("state load failed: {error}"));
             }
         };
         if loaded.meta.pending_rewrite.is_some() {
@@ -4908,14 +5048,14 @@ impl McHandler {
                 firing
             }
             Ok(AssembleHistorianFiringOutcome::NoFire(reason)) => {
-                return PreparedWrapupAction::Nothing(format!("{reason:?}"))
+                return PreparedWrapupAction::Nothing(format!("{reason:?}"));
             }
             Err(error) => return PreparedWrapupAction::Failed(format!("assembly failed: {error}")),
         };
         let live_guard = match self.try_claim_live_historian_session(&parsed.session_id) {
             LiveHistorianSessionClaim::Acquired(guard) => guard,
             LiveHistorianSessionClaim::Busy(completion) => {
-                return PreparedWrapupAction::Busy(completion)
+                return PreparedWrapupAction::Busy(completion);
             }
         };
         PreparedWrapupAction::FireReady(Box::new(HistorianFiringTask {
@@ -5392,7 +5532,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "bad_request".to_string(),
                     message,
-                }
+                };
             }
         };
         let Some(raw_drop) = request.get("drop").and_then(Value::as_str) else {
@@ -5413,7 +5553,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "bad_request".to_string(),
                     message: format!("invalid drop range syntax: {error}"),
-                }
+                };
             }
         };
         let _binding = match self.resolve_binding(channel, session_id) {
@@ -5422,14 +5562,14 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "route_unbound".to_string(),
                     message: "agent_drops.append on a channel with no session binding".to_string(),
-                }
+                };
             }
             Err(BindingError::SessionMismatch) => {
                 return HandlerOutcome::Error {
                     code: "session_mismatch".to_string(),
                     message: "request session_id does not match the channel's bound session"
                         .to_string(),
-                }
+                };
             }
         };
         let store = match self.store.get() {
@@ -5442,7 +5582,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_write_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let by_number = tags
@@ -5525,14 +5665,14 @@ impl McHandler {
                 return Err(HandlerOutcome::Error {
                     code: "route_unbound".to_string(),
                     message: format!("{operation} on a channel with no session binding"),
-                })
+                });
             }
             Err(BindingError::SessionMismatch) => {
                 return Err(HandlerOutcome::Error {
                     code: "session_mismatch".to_string(),
                     message: "request session_id does not match the channel's bound session"
                         .to_string(),
-                })
+                });
             }
         };
         Ok((session_id.to_string(), binding))
@@ -5615,14 +5755,14 @@ impl McHandler {
                 return respond(json!({
                     "ok": true,
                     "disposition": row.disposition,
-                }))
+                }));
             }
             Ok(None) => {}
             Err(error) => {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         }
         let _guard = match self.try_claim_recomp_session(&session_id) {
@@ -5631,7 +5771,7 @@ impl McHandler {
                 return respond(json!({
                     "ok": true,
                     "disposition": "already_in_progress",
-                }))
+                }));
             }
         };
 
@@ -5641,7 +5781,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let has_compartments = match store.has_compartments(&session_id) {
@@ -5650,7 +5790,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let never_minted = !has_compartments && loaded.core.boundary_id.trim().is_empty();
@@ -5687,7 +5827,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_write_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         self.serialized_outputs
@@ -5790,7 +5930,7 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             };
         #[cfg(test)]
@@ -5814,7 +5954,7 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             };
             wrapup_latch = sample_wrapup_latch();
@@ -5894,7 +6034,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let pending_m1_delta = loaded.meta.initialized
@@ -6076,13 +6216,13 @@ impl McHandler {
                     return Self::retryable_wrapup_response(
                         RetryableWrapupReason::SnapshotStale,
                         "wrapup state changed before terminal result recording",
-                    )
+                    );
                 }
                 Err(error) => {
                     return HandlerOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             };
             let ledger_summary = if disposition == "failed" {
@@ -6115,13 +6255,13 @@ impl McHandler {
                     return Self::retryable_wrapup_response(
                         RetryableWrapupReason::SnapshotStale,
                         "wrapup state changed before terminal result recording",
-                    )
+                    );
                 }
                 Err(error) => {
                     return HandlerOutcome::Error {
                         code: "store_commit_failed".to_string(),
                         message: format!("could not record terminal wrapup result: {error}"),
-                    }
+                    };
                 }
             }
         } else {
@@ -6205,7 +6345,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "authority_project_resolution_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         if let Some(command_id) = command_id {
@@ -6221,7 +6361,7 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             }
         }
@@ -6239,7 +6379,7 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "bad_request".to_string(),
                         message: "session.wrapup keep must be an integer".to_string(),
-                    }
+                    };
                 }
             },
         };
@@ -6255,7 +6395,7 @@ impl McHandler {
                     "disposition": "already_in_progress",
                     "rounds": rounds,
                     "summary": format!("wrapup already in progress, {rounds} rounds done"),
-                }))
+                }));
             }
         };
 
@@ -6265,7 +6405,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let entry_now = now_ms();
@@ -6292,13 +6432,13 @@ impl McHandler {
                 return Self::retryable_wrapup_response(
                     RetryableWrapupReason::SnapshotUnavailable,
                     "too many concurrent wrapups",
-                )
+                );
             }
             TransformSnapshotLookup::Missing | TransformSnapshotLookup::InFlight => {
                 return Self::retryable_wrapup_response(
                     RetryableWrapupReason::SnapshotUnavailable,
                     "wrapup unavailable until a full session transform has been observed",
-                )
+                );
             }
         };
         let parsed = Arc::clone(&ready.request);
@@ -6308,7 +6448,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         if ready.revert_epoch != initial_snapshot.revert_epoch {
@@ -6323,7 +6463,7 @@ impl McHandler {
                 return Self::retryable_wrapup_response(
                     RetryableWrapupReason::SnapshotUnavailable,
                     format!("wrapup boundary assembly failed: {error}"),
-                )
+                );
             }
         };
         let boundary_messages =
@@ -6365,13 +6505,13 @@ impl McHandler {
                 return Self::retryable_wrapup_response(
                     RetryableWrapupReason::SnapshotStale,
                     "wrapup unavailable until a full session transform has been observed",
-                )
+                );
             }
             Err(error) => {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         }
         if plan.raw_messages_above_last_compartment <= keep
@@ -6613,7 +6753,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let final_end = final_compartments
@@ -6765,7 +6905,7 @@ impl McHandler {
                             return HandlerOutcome::Error {
                                 code: "authority_checksum_failed".to_string(),
                                 message: error.to_string(),
-                            }
+                            };
                         }
                     };
                 store.authority_verify_prepare(
@@ -6804,7 +6944,7 @@ impl McHandler {
             _ => {
                 return invalid_params_error(
                     "authority.prepare phase must be begin, complete, ack, or abort",
-                )
+                );
             }
         };
         match result {
@@ -7055,7 +7195,7 @@ impl McHandler {
             _ => {
                 return Err(invalid_params_error(
                     "prompt_surface preset must be \"full\" or \"light\"",
-                ))
+                ));
             }
         };
         let model_key = request
@@ -7074,7 +7214,7 @@ impl McHandler {
             _ => {
                 return Err(invalid_params_error(
                     "prompt_surface config identity must be a string",
-                ))
+                ));
             }
         };
         let descriptions = request
@@ -7115,7 +7255,7 @@ impl McHandler {
             _ => {
                 return Err(invalid_params_error(
                     "prompt_surface guidance_override must be a string",
-                ))
+                ));
             }
         };
         Ok(PromptSurfaceSelection {
@@ -7148,7 +7288,7 @@ impl McHandler {
                         message: "request session_id does not match the channel's bound session"
                             .to_string(),
                     },
-                }
+                };
             }
         };
         let mut requested = match self.prompt_surface_selection_from_value(request) {
@@ -7200,7 +7340,7 @@ impl McHandler {
                         message: "request session_id does not match the channel's bound session"
                             .to_string(),
                     },
-                }
+                };
             }
         };
 
@@ -7212,7 +7352,7 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "bad_request".to_string(),
                         message: "guidance.get tool_present must be a boolean".to_string(),
-                    }
+                    };
                 }
             },
         };
@@ -7249,7 +7389,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_write_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let variant = if active {
@@ -7489,7 +7629,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: e.to_string(),
-                }
+                };
             }
         };
         let pass_trace = match store.load_pass_trace(session_id) {
@@ -7498,7 +7638,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: e.to_string(),
-                }
+                };
             }
         };
         let side_channel_status = match store.historian_side_channel_status(session_id) {
@@ -7507,7 +7647,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
                     message: e.to_string(),
-                }
+                };
             }
         };
         let mut historian = json!(&loaded.meta.historian);
@@ -7581,6 +7721,7 @@ impl McHandler {
         ticket: &TransformDispatchTicket<'_>,
     ) -> HandlerOutcome {
         let handler_started_at = Instant::now();
+        let mut delta_expand_ms = 0.0;
         const REQUEST_OBSERVED_KEY: &str = "request_observed_at_ms";
         let request_observed_to_handler = request
             .get(REQUEST_OBSERVED_KEY)
@@ -7594,7 +7735,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "bad_request".to_string(),
                     message: e.to_string(),
-                }
+                };
             }
         };
         let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile);
@@ -7640,14 +7781,14 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "route_unbound".to_string(),
                         message: "registered dreamer session has no bound route".to_string(),
-                    }
+                    };
                 }
                 Err(BindingError::SessionMismatch) => {
                     return HandlerOutcome::Error {
                         code: "session_mismatch".to_string(),
                         message: "registered dreamer session does not match the bound route"
                             .to_string(),
-                    }
+                    };
                 }
             }
         }
@@ -7657,7 +7798,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "store_unavailable".to_string(),
                     message: "store not opened (no HELLO_ACK storage seam)".to_string(),
-                }
+                };
             }
         };
         let binding = match self.resolve_binding(channel, &parsed.session_id) {
@@ -7666,14 +7807,14 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "route_unbound".to_string(),
                     message: "transform on a channel with no session binding".to_string(),
-                }
+                };
             }
             Err(BindingError::SessionMismatch) => {
                 return HandlerOutcome::Error {
                     code: "session_mismatch".to_string(),
                     message: "request session_id does not match the channel's bound session"
                         .to_string(),
-                }
+                };
             }
         };
         apply_claude_code_config_controls(&mut parsed, &binding.config, serializer_profile);
@@ -7724,7 +7865,10 @@ impl McHandler {
             .or_default()
             .insert(lineage_root);
         let native_delta_frontier = if parsed.tail_delta.is_some() {
-            let Some(frontier) = self.expand_transform_tail_delta(&mut parsed) else {
+            let delta_expand_started_at = Instant::now();
+            let expanded = self.expand_transform_tail_delta(&mut parsed);
+            delta_expand_ms = delta_expand_started_at.elapsed().as_secs_f64() * 1_000.0;
+            let Some(frontier) = expanded else {
                 return need_full_sync_response(parsed.full_array_fingerprint.clone());
             };
             Some(frontier)
@@ -7757,7 +7901,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "authority_project_resolution_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let note_project_path =
@@ -7768,7 +7912,7 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "authority_project_resolution_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             };
         let pass_now = now_ms();
@@ -7807,21 +7951,28 @@ impl McHandler {
             _ => {}
         }
         let parsed = Arc::new(parsed);
+        let projection_cache_lookup_started_at = Instant::now();
         let projection_cache_input = native_delta_frontier
             .as_ref()
             .and_then(|frontier| frontier.projection_cache.clone())
             .or_else(|| self.lookup_full_projection_cache(&parsed));
+        let projection_cache_lookup_ms =
+            projection_cache_lookup_started_at.elapsed().as_secs_f64() * 1_000.0;
         // A previous publish may have committed while one independent side channel failed.
         // Retry on normal traffic rather than creating another background timer.
+        let side_channel_drain_started_at = Instant::now();
         let _ = store.drain_historian_side_channels(
             &parsed.session_id,
             pass_now,
             HISTORIAN_SIDE_CHANNEL_DRAIN_PER_KIND,
         );
+        let side_channel_drain_ms = side_channel_drain_started_at.elapsed().as_secs_f64() * 1_000.0;
         // This trace is intentionally outside the fenced cache-state commit: a rejected
         // pass must still leave a durable breadcrumb, and a trace failure must never
         // change the transform result.
+        let trace_received_started_at = Instant::now();
         let _ = store.trace_pass_received(&parsed.session_id, pass_now);
+        let trace_received_ms = trace_received_started_at.elapsed().as_secs_f64() * 1_000.0;
         let run_transform = || {
             let resolved_cache_ttl = parsed.cache_ttl.clone().map_or_else(
                 || {
@@ -8067,7 +8218,17 @@ impl McHandler {
         let lineage_anchor_mid = result.lineage_anchor_mid;
         let tag_numbers = result.tag_numbers;
         let projection = Arc::new(result.projection);
-        self.store_projection_cache(&parsed, revert_epoch, Arc::clone(&projection));
+        let projection_cache_store_started_at = Instant::now();
+        let request_message_charge = self.store_projection_cache(
+            &parsed,
+            revert_epoch,
+            Arc::clone(&projection),
+            native_delta_frontier
+                .as_ref()
+                .and_then(|frontier| frontier.projection_cache.as_ref()),
+        );
+        let projection_cache_store_ms =
+            projection_cache_store_started_at.elapsed().as_secs_f64() * 1_000.0;
         let mut response = result.response;
         if response.committed {
             self.guidance_dates
@@ -8076,6 +8237,7 @@ impl McHandler {
                 .remove(&parsed.session_id);
         }
         response.historian = Some(diagnostics);
+        let native_attach_started_at = Instant::now();
         let native_cache_stats = if parsed.serve_native {
             attach_native_messages_incremental(
                 &mut response,
@@ -8093,12 +8255,42 @@ impl McHandler {
         } else {
             NativeAttachmentCacheStats::default()
         };
+        if let Some(frontier) = native_delta_frontier.as_ref() {
+            if native_cache_stats.reused_messages > 0 {
+                if let Some(mut native_messages) = response.native_messages.take() {
+                    let replace_from = native_cache_stats.reused_messages;
+                    if replace_from <= native_messages.len() {
+                        let messages = native_messages.split_off(replace_from);
+                        response.native_messages_delta = Some(transform::NativeMessagesDelta {
+                            after: frontier.after.clone(),
+                            replace_from,
+                            messages,
+                        });
+                    } else {
+                        response.native_messages = Some(native_messages);
+                    }
+                }
+            }
+        }
+        let native_attach_ms = native_attach_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let trace_complete_started_at = Instant::now();
         let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
+        let trace_complete_ms = trace_complete_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let response_observation_started_at = Instant::now();
         self.record_response_observation(&parsed.session_id, now_ms());
+        let response_observation_ms =
+            response_observation_started_at.elapsed().as_secs_f64() * 1_000.0;
         // Tail deltas have already been expanded at this point. Charge the retained request tree,
         // not the much smaller inbound suffix, so the ready LRU and active-lease budget describe
         // the same object their `Arc`s keep alive.
-        let retained_bytes = parsed.retained_bytes();
+        let retained_size_started_at = Instant::now();
+        let retained_bytes = parsed.retained_bytes_with_charges(
+            (native_cache_stats.request_native_retained_bytes > 0)
+                .then_some(native_cache_stats.request_native_retained_bytes),
+            Some(request_message_charge),
+        );
+        let retained_size_ms = retained_size_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let snapshot_store_started_at = Instant::now();
         self.transform_snapshots
             .lock()
             .expect("transform snapshots mutex")
@@ -8109,10 +8301,25 @@ impl McHandler {
                 revert_epoch,
                 retained_bytes,
             );
+        let snapshot_store_ms = snapshot_store_started_at.elapsed().as_secs_f64() * 1_000.0;
         if let Some(timings) = response.timings.as_mut() {
             timings.handler_total = handler_started_at.elapsed().as_secs_f64() * 1_000.0;
             timings.request_observed_to_handler = request_observed_to_handler;
+            timings.delta_expand = delta_expand_ms;
+            timings.side_channel_drain = side_channel_drain_ms;
+            timings.trace_received = trace_received_ms;
+            timings.projection_cache_lookup = projection_cache_lookup_ms;
+            timings.projection_cache_store = projection_cache_store_ms;
+            timings.native_attach = native_attach_ms;
+            timings.trace_complete = trace_complete_ms;
+            timings.response_observation = response_observation_ms;
+            timings.retained_size = retained_size_ms;
+            timings.snapshot_store = snapshot_store_ms;
             timings.trigger_ms = trigger_timings.elapsed_ms;
+            timings.trigger_boundary_build = trigger_timings.boundary_build_ms;
+            timings.trigger_eval = trigger_timings.trigger_eval_ms;
+            timings.trigger_cache_store = trigger_timings.cache_store_ms;
+            timings.trigger_token_cache_hits = trigger_timings.token_cache_hits;
             timings.trigger_tokenized_blocks = trigger_timings.tokenized_blocks;
             timings.native_cache_reused_messages = native_cache_stats.reused_messages;
             timings.native_cache_encoded_messages = native_cache_stats.encoded_messages;
@@ -8715,7 +8922,7 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "store_load_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             };
             if historian_phase != HistorianPhase::Idle {
@@ -8733,7 +8940,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "authority_project_resolution_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         };
         let store_project_path = authority_project.as_deref().unwrap_or(&root_path);
@@ -9195,7 +9402,7 @@ impl McHandler {
                 return HandlerOutcome::Error {
                     code: "authority_lookup_failed".to_string(),
                     message: error.to_string(),
-                }
+                };
             }
         }) else {
             return HandlerOutcome::Error {
@@ -9210,7 +9417,7 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "authority_lookup_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             })
         else {
@@ -9226,13 +9433,13 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "authority_not_module".to_string(),
                         message: "memories authority row is missing".to_string(),
-                    }
+                    };
                 }
                 Err(error) => {
                     return HandlerOutcome::Error {
                         code: "authority_lookup_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             };
         if authority.state != "MODULE" {
@@ -9403,13 +9610,13 @@ impl McHandler {
                     return HandlerOutcome::Error {
                         code: "authority_not_module".to_string(),
                         message: "classification requires MODULE memories authority".to_string(),
-                    }
+                    };
                 }
                 Err(error) => {
                     return HandlerOutcome::Error {
                         code: "authority_lookup_failed".to_string(),
                         message: error.to_string(),
-                    }
+                    };
                 }
             };
         if authority_project != memory_project {
@@ -9561,7 +9768,7 @@ impl McHandler {
                 Some(Value::Null) | None => None,
                 Some(Value::String(cue)) => Some(cue.to_string()),
                 Some(_) => {
-                    return invalid_params_error("mural cue row cue must be a string or null")
+                    return invalid_params_error("mural cue row cue must be a string or null");
                 }
             };
             updates.push(mc_store::MuralCueUpdate {
@@ -9919,13 +10126,13 @@ impl McHandler {
                     return Err(HandlerOutcome::Error {
                         code: "session_resolve_timeout".to_string(),
                         message: "session.resolve timed out after 2s".to_string(),
-                    })
+                    });
                 }
                 Err(error) => {
                     return Err(HandlerOutcome::Error {
                         code: "session_resolve_failed".to_string(),
                         message: error.to_string(),
-                    })
+                    });
                 }
             }
         };
@@ -9966,7 +10173,7 @@ impl McHandler {
                     return Err(HandlerOutcome::Error {
                         code: "authority_project_resolution_failed".to_string(),
                         message: error.to_string(),
-                    })
+                    });
                 }
             },
             None => route_project_root.clone(),
@@ -9991,7 +10198,7 @@ impl McHandler {
             // The parser is the delivery-side canonicalizer. Surface its exact rejection so
             // acknowledgement and asynchronous delivery cannot disagree about range syntax.
             Err(error) => {
-                return tool_error_result(format!("Error: Invalid range syntax. {error}"))
+                return tool_error_result(format!("Error: Invalid range syntax. {error}"));
             }
         };
         let facade_scope = match self
@@ -11350,6 +11557,8 @@ fn validated_projection_cache_input(
     (prefix <= projection.message_count()).then_some(ProjectionCacheInput {
         projection,
         replace_from: prefix,
+        prior_fingerprint: after.to_string(),
+        message_retained_bytes: Arc::clone(&snapshot.message_retained_bytes),
     })
 }
 
@@ -11511,11 +11720,12 @@ fn native_ingress_chunks(
     request: &TransformRequest,
     encoded_chunks: &[NativeEncodedChunk],
     frontier: Option<&NativeDeltaFrontier>,
-) -> Vec<Arc<Value>> {
+) -> (Vec<Arc<Value>>, Vec<usize>) {
     let native_messages = request.native_messages.as_deref().unwrap_or_default();
     let reusable_prefix = frontier
         .filter(|frontier| {
             frontier.native_prefix.len() == frontier.native_replace_from
+                && frontier.native_prefix_retained_bytes.len() == frontier.native_replace_from
                 && frontier.native_replace_from <= native_messages.len()
         })
         .map_or(0, |frontier| frontier.native_replace_from);
@@ -11523,7 +11733,12 @@ fn native_ingress_chunks(
         .filter(|_| reusable_prefix > 0)
         .map(|frontier| frontier.native_prefix.clone())
         .unwrap_or_default();
+    let mut ingress_chunk_retained_bytes = frontier
+        .filter(|_| reusable_prefix > 0)
+        .map(|frontier| frontier.native_prefix_retained_bytes.clone())
+        .unwrap_or_default();
     ingress_chunks.reserve(native_messages.len().saturating_sub(reusable_prefix));
+    ingress_chunk_retained_bytes.reserve(native_messages.len().saturating_sub(reusable_prefix));
     let output_chunks_by_start = encoded_chunks
         .iter()
         .filter(|chunk| chunk.end_index == chunk.start_index.saturating_add(1))
@@ -11533,13 +11748,18 @@ fn native_ingress_chunks(
         let shared_output = output_chunks_by_start
             .get(&index)
             .filter(|chunk| chunk.value.as_ref() == message);
-        ingress_chunks.push(
-            shared_output
-                .map(|chunk| Arc::clone(&chunk.value))
-                .unwrap_or_else(|| Arc::new(message.clone())),
+        let (value, retained_bytes) = shared_output.map_or_else(
+            || {
+                let value = Arc::new(message.clone());
+                let retained_bytes = native_value_retained_bytes(&value);
+                (value, retained_bytes)
+            },
+            |chunk| (Arc::clone(&chunk.value), chunk.retained_bytes),
         );
+        ingress_chunks.push(value);
+        ingress_chunk_retained_bytes.push(retained_bytes);
     }
-    ingress_chunks
+    (ingress_chunks, ingress_chunk_retained_bytes)
 }
 
 static NATIVE_ATTACHMENT_DIFFERENTIAL: OnceLock<bool> = OnceLock::new();
@@ -11569,7 +11789,7 @@ fn attach_native_messages_incremental(
         return NativeAttachmentCacheStats::default();
     }
 
-    let cached = cache
+    let mut cached = cache
         .lock()
         .expect("native attachment cache mutex")
         .snapshot(&request.session_id, revert_epoch);
@@ -11596,8 +11816,14 @@ fn attach_native_messages_incremental(
         .max_by_key(|message| message.ordinal)
         .map(|message| message.mid.as_str());
 
-    let mut sidecar_hashes = HashMap::new();
-    let mut sidecar_sizes = HashMap::new();
+    let mut sidecar_hashes = cached
+        .as_mut()
+        .map(|snapshot| std::mem::take(&mut snapshot.sidecar_hashes))
+        .unwrap_or_default();
+    let mut sidecar_sizes = cached
+        .as_mut()
+        .map(|snapshot| std::mem::take(&mut snapshot.sidecar_sizes))
+        .unwrap_or_default();
     let mut message_keys = Vec::with_capacity(response.messages().len());
     for (position, served) in response.messages().iter().enumerate() {
         let meta = codec::sidecar::meta_for_ck(&sidecar, served, position);
@@ -11617,30 +11843,20 @@ fn attach_native_messages_incremental(
             let trusted = sidecar_positions
                 .get(slot)
                 .is_some_and(|index| *index < trusted_prefix);
-            let cached_hash = if trusted {
-                cached
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.sidecar_hashes.get(slot).copied())
-            } else {
-                None
-            };
-            let cached_size = if trusted {
-                cached
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.sidecar_sizes.get(slot).copied())
-            } else {
-                None
-            };
+            let cached_hash = trusted.then(|| sidecar_hashes.get(slot).copied()).flatten();
+            let cached_size = trusted.then(|| sidecar_sizes.get(slot).copied()).flatten();
             let computed = (cached_hash.is_none() || cached_size.is_none())
                 .then(|| meta.map(native_sidecar_hash_and_size))
                 .flatten();
             let hash = cached_hash.or_else(|| computed.map(|(hash, _)| hash))?;
-            if let Some(retained_bytes) =
-                cached_size.or_else(|| computed.map(|(_, retained_bytes)| retained_bytes))
-            {
-                sidecar_sizes.insert(slot.to_string(), retained_bytes);
+            if cached_size.is_none() {
+                if let Some(retained_bytes) = computed.map(|(_, retained_bytes)| retained_bytes) {
+                    sidecar_sizes.insert(slot.to_string(), retained_bytes);
+                }
             }
-            sidecar_hashes.insert(slot.to_string(), hash);
+            if cached_hash.is_none() {
+                sidecar_hashes.insert(slot.to_string(), hash);
+            }
             Some(hash)
         });
         let mutation_exempt = slot.is_some_and(|mid| mutation_exempt_mids.contains(&mid));
@@ -11669,6 +11885,8 @@ fn attach_native_messages_incremental(
         sidecar_hashes.insert(slot.clone(), hash);
         sidecar_sizes.insert(slot.clone(), retained_bytes);
     }
+    sidecar_hashes.retain(|slot, _| sidecar_positions.contains_key(slot.as_str()));
+    sidecar_sizes.retain(|slot, _| sidecar_positions.contains_key(slot.as_str()));
 
     let cache_compatible = cached
         .as_ref()
@@ -11765,7 +11983,8 @@ fn attach_native_messages_incremental(
         .iter()
         .map(|chunk| Arc::clone(&chunk.value))
         .collect::<Vec<_>>();
-    let ingress_chunks = native_ingress_chunks(request, &chunks, native_delta_frontier);
+    let (ingress_chunks, ingress_chunk_retained_bytes) =
+        native_ingress_chunks(request, &chunks, native_delta_frontier);
 
     if native_attachment_differential_enabled() {
         let full = encode_full_native_messages(
@@ -11786,9 +12005,16 @@ fn attach_native_messages_incremental(
         );
     }
 
+    let request_native_retained_bytes = request.native_messages.as_ref().map_or(0, |messages| {
+        messages
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Value>())
+            .saturating_add(ingress_chunk_retained_bytes.iter().copied().sum::<usize>())
+    });
     let mut stats = NativeAttachmentCacheStats {
         reused_messages: suffix_start,
         encoded_messages: message_keys.len().saturating_sub(suffix_start),
+        request_native_retained_bytes,
         ..Default::default()
     };
     let served_bytes = response
@@ -11811,6 +12037,7 @@ fn attach_native_messages_incremental(
                 sidecar_sizes,
                 chunks,
                 ingress_chunks,
+                ingress_chunk_retained_bytes,
             },
             &mut stats,
             served_bytes,
@@ -12030,7 +12257,7 @@ fn respond_transform(
             return HandlerOutcome::Error {
                 code: "encode_failed".to_string(),
                 message: error.to_string(),
-            }
+            };
         }
     };
     if messages.is_some() {
@@ -12045,15 +12272,19 @@ fn respond_transform(
             return HandlerOutcome::Error {
                 code: "encode_failed".to_string(),
                 message: error.to_string(),
-            }
+            };
         }
     };
+    let response_meta_encode_ms = response_encode_started_at.elapsed().as_secs_f64() * 1_000.0;
     let Some(messages) = messages else {
         let outcome = HandlerOutcome::Response(encoded);
         emit_pass_timing(
             session_id,
             pass_timings.as_ref(),
             response_encode_started_at,
+            response_meta_encode_ms,
+            0.0,
+            0.0,
         );
         return outcome;
     };
@@ -12069,10 +12300,14 @@ fn respond_transform(
         };
     };
     let null_start = start + PLACEHOLDER.len() - 4;
+    let response_size_account_started_at = Instant::now();
     let retained_bytes = messages
         .iter()
         .map(|message| message.canonical_bytes().len())
         .sum::<usize>();
+    let response_size_account_ms =
+        response_size_account_started_at.elapsed().as_secs_f64() * 1_000.0;
+    let response_splice_started_at = Instant::now();
     let mut output =
         Vec::with_capacity(encoded.len() + retained_bytes + messages.len().saturating_sub(1) + 2);
     output.extend_from_slice(&encoded[..null_start]);
@@ -12085,11 +12320,15 @@ fn respond_transform(
     }
     output.push(b']');
     output.extend_from_slice(&encoded[null_start + 4..]);
+    let response_splice_ms = response_splice_started_at.elapsed().as_secs_f64() * 1_000.0;
     let outcome = HandlerOutcome::Response(output);
     emit_pass_timing(
         session_id,
         pass_timings.as_ref(),
         response_encode_started_at,
+        response_meta_encode_ms,
+        response_size_account_ms,
+        response_splice_ms,
     );
     outcome
 }
@@ -12098,13 +12337,20 @@ fn emit_pass_timing(
     session_id: &str,
     timings: Option<&transform::TransformTimings>,
     response_encode_started_at: Instant,
+    response_meta_encode_ms: f64,
+    response_size_account_ms: f64,
+    response_splice_ms: f64,
 ) {
     if let Some(timings) = timings {
+        let mut timings = timings.clone();
+        timings.response_meta_encode = response_meta_encode_ms;
+        timings.response_size_account = response_size_account_ms;
+        timings.response_splice = response_splice_ms;
         eprintln!(
             "{}",
             transform::format_pass_timing_line(
                 session_id,
-                timings,
+                &timings,
                 response_encode_started_at.elapsed().as_secs_f64() * 1_000.0,
             )
         );
@@ -13852,6 +14098,7 @@ fn boundary_messages(
 
 struct CachedBoundaryMessages {
     messages: Vec<BoundaryMsg>,
+    token_cache_hits: usize,
     tokenized_blocks: usize,
     token_cache_snapshot: BoundaryTokenCacheSnapshot,
 }
@@ -13910,9 +14157,11 @@ fn cached_boundary_messages(
         })
         .collect();
     cache_snapshot.retain_projection(projection);
+    let token_cache_hits = cache_snapshot.hits;
     let tokenized_blocks = cache_snapshot.misses;
     CachedBoundaryMessages {
         messages,
+        token_cache_hits,
         tokenized_blocks,
         token_cache_snapshot: cache_snapshot,
     }
@@ -14516,7 +14765,10 @@ mod tests {
         let formatted_tokens = warm.formatted_token_count(formatted);
         assert_eq!(formatted_tokens, mc_tokenizer::estimate_tokens(formatted));
         assert_eq!(warm.formatted_token_count(formatted), formatted_tokens);
-        assert_eq!(warm.formatted_tokens.len(), 1);
+        assert_eq!(
+            warm.formatted_tokens.len() + warm.formatted_token_updates.len(),
+            1
+        );
 
         let mut bounded = BoundaryTokenCache::new(one_session_bytes);
         let mut first = bounded.snapshot("first");
@@ -17225,6 +17477,7 @@ mod tests {
                     )
                     .ok()?,
                     native_prefix: Vec::new(),
+                    native_prefix_retained_bytes: Vec::new(),
                     projection_cache: None,
                 })
             });
@@ -17270,6 +17523,7 @@ mod tests {
                 crate::ck_wire::project_messages(&request.messages)
                     .expect("seeded projection must succeed"),
             ),
+            None,
         );
         let retained_bytes = serde_json::to_vec(request).unwrap().len();
         let mut snapshots = handler
@@ -17414,10 +17668,11 @@ mod tests {
                 .len(),
             3
         );
-        let prefix = cache
+        let (prefix, retained_bytes) = cache
             .delta_native_prefix("native-prefix-core", 0, "native-prefix-core-fp", 3)
             .expect("the raw ingress prefix remains attachable");
         assert_eq!(prefix.len(), 3);
+        assert_eq!(retained_bytes.len(), 3);
         assert_eq!(
             prefix[2].as_ref(),
             &request.native_messages.as_ref().unwrap()[2]
@@ -17448,6 +17703,7 @@ mod tests {
         let projection_charge = ProjectionCacheSnapshot {
             context: projection_cache_context(&request),
             full_array_fingerprint: request.full_array_fingerprint.clone(),
+            message_retained_bytes: Arc::new(vec![0; request.messages.len()]),
             projection: Arc::clone(&projection),
         }
         .retained_bytes(SESSION_ID);
@@ -17455,7 +17711,7 @@ mod tests {
             projection_charge <= PROJECTION_CACHE_ENTRY_BUDGET_BYTES,
             "required projection core must fit: charge={projection_charge} cap={PROJECTION_CACHE_ENTRY_BUDGET_BYTES}"
         );
-        handler.store_projection_cache(&request, 0, Arc::clone(&projection));
+        handler.store_projection_cache(&request, 0, Arc::clone(&projection), None);
 
         let (first, first_stats) = run_native_cache_pass(
             &handler.native_attachments,
@@ -17617,6 +17873,7 @@ mod tests {
             ProjectionCacheSnapshot {
                 context: projection_cache_context(&request),
                 full_array_fingerprint: request.full_array_fingerprint.clone(),
+                message_retained_bytes: Arc::new(vec![0; request.messages.len()]),
                 projection: Arc::clone(&projection),
             },
         );
@@ -17663,6 +17920,7 @@ mod tests {
         let snapshot = ProjectionCacheSnapshot {
             context: projection_cache_context(&baseline),
             full_array_fingerprint: baseline.full_array_fingerprint.clone(),
+            message_retained_bytes: Arc::new(vec![0; baseline.messages.len()]),
             projection: Arc::new(
                 crate::ck_wire::project_messages(&baseline.messages).expect("baseline projection"),
             ),
@@ -18464,6 +18722,7 @@ mod tests {
         let snapshot = ProjectionCacheSnapshot {
             context: projection_cache_context(&request),
             full_array_fingerprint: request.full_array_fingerprint.clone(),
+            message_retained_bytes: Arc::new(vec![0; request.messages.len()]),
             projection: Arc::clone(&projection),
         };
         let projection_charge = snapshot.retained_bytes(&request.session_id);
@@ -18638,6 +18897,7 @@ mod tests {
         let snapshot = ProjectionCacheSnapshot {
             context: projection_cache_context(&request),
             full_array_fingerprint: request.full_array_fingerprint.clone(),
+            message_retained_bytes: Arc::new(vec![0; request.messages.len()]),
             projection: Arc::new(
                 crate::ck_wire::project_messages(&request.messages)
                     .expect("projection cache snapshot"),
@@ -18720,7 +18980,8 @@ mod tests {
             assistant_tool_call("call-project", 2),
             tool_result("result-project", 3, "first result"),
         ];
-        for handler in [&cached_handler, &control_handler] {
+        let mut cached_native_before = Vec::new();
+        for (index, handler) in [&cached_handler, &control_handler].into_iter().enumerate() {
             let initial = native_cache_request(
                 "ses",
                 initial_messages.clone(),
@@ -18730,6 +18991,12 @@ mod tests {
             let response =
                 call_transform_request(handler, serde_json::to_value(initial).unwrap()).await;
             assert_eq!(response["status"], "ok", "{response}");
+            if index == 0 {
+                cached_native_before = response["native_messages"]
+                    .as_array()
+                    .expect("initial native response array")
+                    .clone();
+            }
         }
 
         let changed_messages = vec![
@@ -18748,7 +19015,7 @@ mod tests {
             "replace_from": 2,
             "native_replace_from": 0,
         }));
-        let cached =
+        let mut cached =
             call_transform_request(&cached_handler, serde_json::to_value(delta).unwrap()).await;
         let full = call_transform_request(
             &control_handler,
@@ -18765,6 +19032,23 @@ mod tests {
         assert_eq!(full["status"], "ok", "{full}");
         assert_eq!(cached["timings"]["projection_reused_messages"], 2);
         assert_eq!(cached["timings"]["projection_projected_messages"], 1);
+        let native_delta = cached["native_messages_delta"]
+            .as_object()
+            .expect("cached response uses a native suffix");
+        assert_eq!(native_delta["after"], "projection-handler-fp-1");
+        let replace_from = native_delta["replace_from"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .expect("native suffix frontier");
+        let mut expanded_native = cached_native_before[..replace_from].to_vec();
+        expanded_native.extend(
+            native_delta["messages"]
+                .as_array()
+                .expect("native suffix messages")
+                .iter()
+                .cloned(),
+        );
+        cached["native_messages"] = Value::Array(expanded_native);
         assert_eq!(full["timings"]["projection_reused_messages"], 0);
         assert_eq!(full["timings"]["projection_projected_messages"], 3);
 
