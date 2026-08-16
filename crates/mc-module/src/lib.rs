@@ -6080,6 +6080,18 @@ impl McHandler {
                 .is_some_and(|signal| signal.revision != loaded.meta.m1_revision);
         let pending_m1_age_ms = pending_m1_delta
             .then(|| now_ms().saturating_sub(loaded.meta.m1_pending_since_ms.unwrap_or(now_ms())));
+        let tail_hygiene = loaded.meta.tail_hygiene_baseline.as_ref().map(|baseline| {
+            let (u, t) = crate::tail_hygiene::effective_tail_hygiene(baseline);
+            json!({
+                "u": u,
+                "t": t,
+                "severity": (u as f64 / t.max(1) as f64).clamp(0.0, 1.0),
+                "evaluable": baseline.evaluable && !baseline.generation_invalidated,
+                "generation_invalidated": baseline.generation_invalidated,
+                "baseline_generation": baseline.baseline_generation,
+                "computed_at_ms": baseline.computed_at_ms,
+            })
+        });
         let summary = sanitize_status_text(
             &format!(
                 "session {short_session} (last active {age}): {} {}, coverage ordinal {coverage}, boundary {boundary}, {} pending {}, {} {}, pending m1 delta {}, last historian: {historian}, {publish_health}, surface {surface}",
@@ -6148,6 +6160,7 @@ impl McHandler {
                 "current_total_input_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.current_total_input_tokens),
                 "context_limit_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.context_limit_tokens),
             },
+            "tail_hygiene": tail_hygiene,
         });
         if let Some(page) = compartment_page {
             let compartments = page
@@ -24195,12 +24208,56 @@ mod tests {
         ));
         assert!(session_status["pass_trace"]["first_divergence"].is_null());
         assert!(session_status["pass_trace"]["last_divergence"].is_string());
+        assert!(session_status["tail_hygiene"]["u"].is_number());
+        assert!(session_status["tail_hygiene"]["t"].is_number());
+        assert!(session_status["tail_hygiene"]["severity"].is_number());
+        assert!(session_status["tail_hygiene"]["evaluable"].is_boolean());
         assert_eq!(session_status["epochs"]["state_sync_deltas"], json!(true));
         assert_eq!(
             session_status["fake_compaction"]["descent_pending"],
             json!({ "build_skew": 0, "no_responses": 0 })
         );
         assert!(session_status["fake_compaction"]["dispositions"]["descended"].is_number());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_status_preserves_zero_valued_tail_hygiene_fields() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        call_transform_request(&handler, request(vec![ck("m1", 1, "hello")])).await;
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta;
+        meta.tail_hygiene_baseline = Some(mc_store::TailHygieneBaseline {
+            baseline_u: 0,
+            baseline_t: 0,
+            turn_delta_u: 0,
+            turn_delta_t: 0,
+            baseline_generation: 0,
+            computed_at_ms: 0,
+            evaluable: true,
+            generation_invalidated: false,
+            baseline_parts: Vec::new(),
+            content_signature: String::new(),
+        });
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+
+        let status = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({
+                "method": "session.status",
+                "v": 1,
+                "session_id": "ses",
+            }),
+        ));
+
+        assert_eq!(status["tail_hygiene"]["u"], json!(0));
+        assert_eq!(status["tail_hygiene"]["t"], json!(0));
+        assert_eq!(status["tail_hygiene"]["severity"], json!(0.0));
+        assert_eq!(status["tail_hygiene"]["evaluable"], json!(true));
+        assert_eq!(status["tail_hygiene"]["baseline_generation"], json!(0));
+        assert_eq!(status["tail_hygiene"]["computed_at_ms"], json!(0));
     }
 
     #[tokio::test(flavor = "current_thread")]

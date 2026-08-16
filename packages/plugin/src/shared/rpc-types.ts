@@ -9,6 +9,20 @@ import type {
 } from "../features/magic-context/dreamer/task-registry";
 import type { LoggerDiagnostics } from "./logger";
 
+export interface TailHygieneStatus {
+    /** Tokens in active, non-protected tail content that the agent can reclaim. */
+    u: number;
+    /** Tokens in rendered-tail content eligible for hygiene accounting in the same scan. */
+    t: number;
+    /** Reclaimable-to-eligible token ratio, clamped to 0–1 and shared by both nudge mechanisms. */
+    severity: number;
+    /** False until a fresh scan runs after existing tail content changes, preventing stale measurements. */
+    evaluable: boolean;
+    generationInvalidated: boolean;
+    baselineGeneration: number;
+    computedAt: number;
+}
+
 export interface SidebarSnapshot {
     sessionId: string;
     usagePercentage: number;
@@ -78,6 +92,8 @@ export interface SidebarSnapshot {
      * shows this as "Tool Definitions".
      */
     toolDefinitionTokens: number;
+    /** Persisted reclaimable (U) and eligible (T) token counts used by both nudge mechanisms. */
+    tailHygiene?: TailHygieneStatus;
     /**
      * Effective execute-threshold percentage for this session's active model,
      * after per-model resolution and the tokens→percentage conversion (when

@@ -228,6 +228,13 @@ describe("evaluateChannel2 — fourth hygiene band", () => {
                 baselineU: 59_999,
             }).shouldTrigger,
         ).toBe(false);
+        expect(
+            evaluateChannel2({
+                ...baseline,
+                baselineU: 59_000,
+                baselineT: 59_000,
+            }).shouldTrigger,
+        ).toBe(false);
     });
 
     it("arms the 162k/249k flagship incident", () => {

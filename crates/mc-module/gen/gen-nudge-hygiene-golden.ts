@@ -49,14 +49,11 @@ const fixtures: Fixture[] = [
         id: "live-incident-mixed-tail",
         protected_tags: 0,
         messages: [
-            { mid: "conversation", ordinal: 1, role: "user", blocks: [{ type: "text", unit: "prose ", repeat: 58_000 }] },
+            { mid: "conversation", ordinal: 1, role: "user", blocks: [{ type: "text", unit: "prose ", repeat: 87_000 }] },
             { mid: "tool-owner", ordinal: 2, role: "assistant", blocks: [{ type: "tool_call", id: "call-live", name: "read", input: { path: "fixture" } }] },
-            { mid: "tool-result", ordinal: 3, role: "user", blocks: [{ type: "tool_result", id: "call-live", name: "read", unit: "result ", repeat: 81_000 }] },
+            { mid: "tool-result", ordinal: 3, role: "user", blocks: [{ type: "tool_result", id: "call-live", name: "read", unit: "result ", repeat: 162_000 }] },
         ],
-        tags: [
-            { tag_number: 1, block_id: "conversation#0", kind: "message" },
-            { tag_number: 2, block_id: "tool-result#0", kind: "tool" },
-        ],
+        tags: [{ tag_number: 1, block_id: "tool-result#0", kind: "tool" }],
     },
     {
         id: "protected-recency-reserve",
@@ -104,6 +101,41 @@ const fixtures: Fixture[] = [
             { tag_number: 1, block_id: "result#0", kind: "tool" },
             { tag_number: 2, block_id: "kept#0", kind: "message" },
         ],
+    },
+    {
+        id: "caveman-rendered-not-original-weight",
+        protected_tags: 0,
+        messages: [
+            { mid: "caveman", ordinal: 1, role: "assistant", blocks: [{ type: "text", unit: "[caveman depth=2] compacted sentence. ", repeat: 4_000 }] },
+            { mid: "untagged-context", ordinal: 2, role: "user", blocks: [{ type: "text", unit: "visible context ", repeat: 2_000 }] },
+        ],
+        tags: [{ tag_number: 1, block_id: "caveman#0", kind: "message" }],
+    },
+    {
+        id: "channel1-reminder-span-excluded",
+        protected_tags: 0,
+        messages: [
+            { mid: "reminder-owner", ordinal: 1, role: "assistant", blocks: [{ type: "tool_call", id: "call-reminder", name: "read", input: { path: "reminder" } }] },
+            { mid: "reminder-result", ordinal: 2, role: "user", blocks: [{ type: "tool_result", id: "call-reminder", name: "read", unit: "kept output\n\n<system-reminder>\nreasoning-sized reminder bytes must not count\n</system-reminder>", repeat: 1 }] },
+        ],
+        tags: [{ tag_number: 1, block_id: "reminder-result#0", kind: "tool" }],
+    },
+    {
+        id: "post-fold-fresh-tail",
+        protected_tags: 0,
+        messages: [
+            { mid: "fold-summary", ordinal: 1, role: "user", synthetic: true, blocks: [{ type: "text", unit: "compacted history ", repeat: 100_000 }] },
+            { mid: "fresh-tail", ordinal: 2, role: "user", blocks: [{ type: "text", unit: "fresh visible tail ", repeat: 10_000 }] },
+        ],
+        tags: [{ tag_number: 1, block_id: "fresh-tail#0", kind: "message" }],
+    },
+    {
+        id: "tiny-t-minimum-guard",
+        protected_tags: 0,
+        messages: [
+            { mid: "tiny", ordinal: 1, role: "user", blocks: [{ type: "text", unit: "x ", repeat: 59_000 }] },
+        ],
+        tags: [{ tag_number: 1, block_id: "tiny#0", kind: "message" }],
     },
     {
         id: "image-and-file-total",
@@ -241,13 +273,23 @@ const cases = fixtures.map((fixture) => {
         expected: { u: measured.u, t: measured.t, band: band(measured.u, measured.t) },
     };
 });
+if (cases.length < 12) throw new Error(`nudge hygiene parity corpus has only ${cases.length} fixtures`);
+const flagship = cases.find((fixture) => fixture.id === "live-incident-mixed-tail");
+if (!flagship) throw new Error("missing flagship live-incident fixture");
+const flagshipSeverity = flagship.expected.u / Math.max(flagship.expected.t, 1);
+if (flagship.expected.band !== "channel2" || Math.abs(flagshipSeverity - 0.651) > 0.002) {
+    throw new Error(
+        `flagship positive control drifted: severity=${flagshipSeverity.toFixed(3)} band=${flagship.expected.band}`,
+    );
+}
+
 const canonical = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
 const inputSha256 = createHash("sha256").update(canonical(fixtures)).digest("hex");
 const golden = {
     schema: 1,
     provenance: {
         generator: "crates/mc-module/gen/gen-nudge-hygiene-golden.ts",
-        generator_version: "nudge-hygiene-ts-v1",
+        generator_version: "nudge-hygiene-ts-v2",
         input_sha256: inputSha256,
     },
     cases,

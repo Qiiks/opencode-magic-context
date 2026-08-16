@@ -12,7 +12,9 @@ import { getTagsBySession } from "../../features/magic-context/storage-tags";
 import { getErrorMessage } from "../../shared/error-message";
 import { formatThresholdClampNote } from "../../shared/format-threshold";
 import { sessionLog } from "../../shared/logger";
+import type { TailHygieneStatus } from "../../shared/rpc-types";
 import type { Database } from "../../shared/sqlite";
+import { formatTailHygiene } from "../../shared/tail-hygiene-status";
 import {
     formatWindowDerivationLine,
     type WindowGeometryResult,
@@ -66,6 +68,7 @@ export function executeStatus(
     contextLimit?: number,
     dreamer?: { backlog?: DreamTaskBacklogMap; progress?: DreamTaskProgress | null },
     windowGeometry?: WindowGeometryResult,
+    tailHygiene?: TailHygieneStatus,
 ): string {
     // Single source of truth — resolver tells us both the effective percentage AND
     // which config source won (tokens vs percentage). Previously /ctx-status
@@ -148,6 +151,15 @@ export function executeStatus(
             `**Protected tags:** ${protectedTags}`,
             `**Subagent session:** ${meta.isSubagent}`,
         ];
+
+        if (tailHygiene !== undefined) {
+            lines.push(
+                "",
+                "### Tail Hygiene",
+                `- Reclaimable / eligible: ${formatTailHygiene(tailHygiene)}`,
+                "- Reasoning is excluded from both terms.",
+            );
+        }
 
         if (dreamer?.backlog && Object.keys(dreamer.backlog).length > 0) {
             lines.push(

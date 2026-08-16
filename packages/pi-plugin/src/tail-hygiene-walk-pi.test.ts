@@ -716,8 +716,8 @@ describe("TS/Pi/module differential hygiene corpus", () => {
 		),
 	) as { cases: HygieneFixture[] };
 
-	it("keeps Pi as the third leg across all eight shared fixtures", () => {
-		expect(golden.cases).toHaveLength(8);
+	it("keeps Pi as the third leg across the full shared corpus", () => {
+		expect(golden.cases.length).toBeGreaterThanOrEqual(12);
 		for (const fixture of golden.cases) {
 			const adapted = adaptFixtureToPi(fixture);
 			const measured = measurePiTailHygiene({

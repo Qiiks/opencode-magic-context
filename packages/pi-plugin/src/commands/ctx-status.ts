@@ -12,6 +12,8 @@ import { getNotes } from "@magic-context/core/features/magic-context/storage-not
 import { getTagsBySession } from "@magic-context/core/features/magic-context/storage-tags";
 import { executeStatus } from "@magic-context/core/hooks/magic-context/execute-status";
 import { describeError } from "@magic-context/core/shared/error-message";
+import { resolveTailHygieneStatus } from "@magic-context/core/shared/tail-hygiene-status";
+import { getPiChannel1Baseline } from "../ctx-reduce-nudge-pi";
 import { showStatusDialog } from "../dialogs/status-dialog";
 import { resolvePiWindowGeometry } from "../pi-context-limit";
 import { resolveSessionId, sendCtxStatusMessage } from "./pi-command-utils";
@@ -139,6 +141,7 @@ export function registerCtxStatusCommand(
 						),
 					},
 					windowGeometry,
+					resolveTailHygieneStatus(getPiChannel1Baseline(sessionId)),
 				);
 				const details = buildStatusDetails(currentDeps, sessionId);
 				sendCtxStatusMessage(

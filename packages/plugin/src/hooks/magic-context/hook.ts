@@ -275,7 +275,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             const migration = getMigrationOnOpenRefusal();
             const blockingProcesses =
                 migration?.blockingProcesses ??
-                migration?.serverPids.map((pid) => ({ kind: "process" as const, pid })) ?? [];
+                migration?.serverPids.map((pid) => ({ kind: "process" as const, pid })) ??
+                [];
             const fence = getSchemaFenceRejection();
             recordHookInitFailure({
                 type: "storage",
@@ -415,7 +416,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // Channel 1 (ctx_reduce tool-output nudge) per-session metric baseline.
     // Written at the end of each transform pass (post-drop), read in
     // tool.execute.after. Only populated for primary sessions.
-    const channel1StateBySession = new Map<string, import("./ctx-reduce-nudge").Channel1State>();
+    const channel1StateBySession =
+        deps.liveSessionState?.channel1StateBySession ??
+        new Map<string, import("./ctx-reduce-nudge").Channel1State>();
     const channel2DirectiveTextBySession = new Map<string, string>();
 
     /**
@@ -482,6 +485,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // shared live state — and the next transform pass + RPC sidebar see them.
         liveSessionState: {
             liveModelBySession,
+            channel1StateBySession,
             variantBySession,
             agentBySession,
             historyRefreshSessions,
@@ -1275,6 +1279,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             return model ? `${model.providerID}/${model.modelID}` : undefined;
         },
         getDreamerProgress: () => dreamerProgressByProject.get(projectPath) ?? null,
+        getTailHygiene: (sessionId) => channel1StateBySession.get(sessionId),
         getContextLimit: (sessionId) => {
             // Same DB fallback as getLiveModelKey — /ctx-status's "Resolved
             // context limit" and history-budget math depend on the live model.

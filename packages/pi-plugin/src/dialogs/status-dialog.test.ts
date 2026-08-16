@@ -3,6 +3,10 @@ import { resolveProjectIdentity } from "@magic-context/core/features/magic-conte
 import { setSessionWorkMetrics } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
+	clearPiChannel1State,
+	setPiChannel1Baseline,
+} from "../ctx-reduce-nudge-pi";
+import {
 	assistantMessage,
 	createTestDb,
 	fakeContext,
@@ -111,6 +115,68 @@ describe("Pi status dialog", () => {
 			expect(detail.contextLimit).toBe(173_375);
 			expect(detail.usagePercentage).toBe(schedulerPercentage);
 		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("renders the same persisted hygiene ratio used by nudges", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-status-hygiene";
+		try {
+			setPiChannel1Baseline(sessionId, {
+				baselineU: 65_100,
+				baselineT: 100_000,
+				turnDeltaU: 0,
+				turnDeltaT: 0,
+				baselineGeneration: 4,
+				computedAt: 123,
+				evaluable: true,
+				generationInvalidated: false,
+				baselineParts: [],
+				contentSignature: "fixture",
+				reducedSinceRefresh: false,
+				oldestReclaimableToolTags: [],
+			});
+			const rendered: string[][] = [];
+			const ctx = {
+				...fakeContext(sessionId),
+				ui: {
+					async custom(factory: unknown) {
+						const makeComponent = factory as (
+							tui: { requestRender: () => void },
+							theme: {
+								fg: (_name: string, text: string) => string;
+								bold: (text: string) => string;
+							},
+							keybindings: unknown,
+							done: (value: undefined) => void,
+						) => { render: (width: number) => string[]; dispose?: () => void };
+						const component = makeComponent(
+							{ requestRender: () => undefined },
+							{ fg: (_name, text) => text, bold: (text) => text },
+							undefined,
+							() => undefined,
+						);
+						rendered.push(component.render(90));
+						component.dispose?.();
+						return undefined;
+					},
+				},
+				getSystemPrompt: () => "system prompt",
+			};
+
+			await showStatusDialog({ getAllTools: () => [] } as never, ctx as never, {
+				db,
+				projectIdentity: resolveProjectIdentity(process.cwd()),
+			});
+
+			const text = rendered.flat().join("\n");
+			expect(text).toContain("Hygiene 65.1% · 65,100 / 100,000 tok");
+			expect(text).toContain(
+				"Conversation includes model Reasoning; hygiene excludes it",
+			);
+		} finally {
+			clearPiChannel1State(sessionId);
 			closeQuietly(db);
 		}
 	});
