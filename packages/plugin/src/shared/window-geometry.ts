@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { getDataDir } from "./data-path";
 import { modelRefLookupOrder } from "./harness-provider-map";
 import { sessionLog } from "./logger";
-import type { ModelLimit, OutputReserveConfig } from "./models-dev-cache";
+import type { ModelLimit } from "./models-dev-cache";
 
 export const WINDOW_OVERLAY_SCHEMA = "fusiform-window-overlay/v1";
 export const PROMPT_WALL_MARGIN = 4_096;
@@ -88,7 +88,8 @@ export interface DeriveWindowGeometryOptions {
     overlay?: ResolvedWindowOverlayFacts;
     /** A provider/auth hook has higher precedence than the overlay, field by field. */
     providerLimit?: ModelLimit;
-    reserveConfig?: OutputReserveConfig;
+    /** Resolved user override; higher precedence than catalog, overlay, and geometry defaults. */
+    outputReserveOverride?: number;
     harness?: "opencode" | "pi";
     /** Detected overflow remains the final downward cap regardless of other sources. */
     contextCap?: number;
@@ -137,32 +138,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isFinitePositive(value: unknown): value is number {
     return typeof value === "number" && Number.isFinite(value) && value > 0;
-}
-
-function modelKeyLookupOrder(providerID: string, modelID: string): string[] {
-    const candidates = [...modelRefLookupOrder(`${providerID}/${modelID}`), modelID];
-    const colon = modelID.lastIndexOf(":");
-    if (colon > 0) {
-        const bareModel = modelID.slice(0, colon);
-        candidates.push(...modelRefLookupOrder(`${providerID}/${bareModel}`), bareModel);
-    }
-    return [...new Set(candidates)];
-}
-
-function configuredOutputReserve(
-    config: OutputReserveConfig | undefined,
-    providerID: string,
-    modelID: string,
-): number | undefined {
-    if (typeof config === "number") {
-        return Number.isFinite(config) && config >= 0 ? config : undefined;
-    }
-    if (!config) return undefined;
-    for (const candidate of modelKeyLookupOrder(providerID, modelID)) {
-        const value = config[candidate];
-        if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
-    }
-    return Number.isFinite(config.default) && config.default >= 0 ? config.default : undefined;
 }
 
 /** Convert the ratified tagged numeric union into the conservative scalar used by derivation. */
@@ -509,25 +484,46 @@ export function deriveWindowGeometry(
               : (PROVIDER_GEOMETRY[providerID] ?? "shared_upfront");
     const geometryOverride = geometryFact?.kind === "stated" ? geometryFact.value : undefined;
 
+    const preCarvedInput =
+        isFinitePositive(input) && (!isFinitePositive(softContext) || input < softContext);
+    const outputReserveOverride =
+        typeof options.outputReserveOverride === "number" &&
+        Number.isFinite(options.outputReserveOverride) &&
+        options.outputReserveOverride >= 0
+            ? options.outputReserveOverride
+            : undefined;
+    let derivationWindow = softContext ?? input;
     let usableSoft: number;
     let softReserve = 0;
     let reserveSource: WindowReserveSource = "none";
-    if (isFinitePositive(input) && (!isFinitePositive(softContext) || input < softContext)) {
+    if (outputReserveOverride !== undefined) {
+        // An explicit user reserve owns the usable-window carve. When the
+        // provider also publishes a smaller input cap, use that cap as the
+        // window; treating the cap as final would silently ignore the config.
+        const reserveWindow = preCarvedInput ? input : (softContext ?? input);
+        if (!isFinitePositive(reserveWindow)) return undefined;
+        derivationWindow = reserveWindow;
+        softReserve = outputReserveOverride;
+        reserveSource = "output_config";
+        const floor = Math.max(MIN_PLAUSIBLE_CONTEXT_LIMIT, reserveWindow * 0.5);
+        const flooredReserve = Math.min(softReserve, Math.max(0, reserveWindow - floor));
+        if (flooredReserve < softReserve) {
+            logGeometryClampOnce(
+                `soft-floor|${providerID}/${modelID}|${softReserve}|${flooredReserve}`,
+                `output reserve clamped by the half-window floor for ${providerID}/${modelID}: reserve ${softReserve} → ${flooredReserve}`,
+                options.log,
+            );
+        }
+        softReserve = flooredReserve;
+        usableSoft = Math.floor(reserveWindow - softReserve);
+    } else if (preCarvedInput) {
         usableSoft = input;
         if (isFinitePositive(softContext)) {
             softReserve = Math.max(0, softContext - input);
             reserveSource = "output_catalog";
         }
     } else if (isFinitePositive(softContext)) {
-        const configuredReserve = configuredOutputReserve(
-            options.reserveConfig,
-            providerID,
-            modelID,
-        );
-        if (configuredReserve !== undefined) {
-            softReserve = configuredReserve;
-            reserveSource = "output_config";
-        } else if (
+        if (
             geometry === "separate" &&
             (options.overlay === undefined ||
                 options.harness === "pi" ||
@@ -591,13 +587,14 @@ export function deriveWindowGeometry(
         usableHard = usableSoft;
     }
 
+    const resolvedWindow = derivationWindow ?? usableSoft;
     return {
         usableSoft,
         usableHard,
         geometry,
         derivation: {
-            window: Math.floor(softContext ?? usableSoft),
-            reserve: Math.floor(Math.max(0, (softContext ?? usableSoft) - usableSoft)),
+            window: Math.floor(resolvedWindow),
+            reserve: Math.floor(Math.max(0, resolvedWindow - usableSoft)),
             reserveSource,
             geometry,
         },

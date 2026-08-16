@@ -7,6 +7,7 @@ import {
     getModelsDevCacheState,
     getSdkContextLimit,
     getSdkInputLimit,
+    getSdkWindowGeometry,
     refreshModelLimitsAfterAuthOnce,
     refreshModelLimitsFromApi,
     resetAuthRewarmLatchForTest,
@@ -146,6 +147,30 @@ describe("models-dev-cache (SDK-only)", () => {
             /* Ignore EBUSY on Windows */
         }
         clearModelsDevCache();
+    });
+
+    test("honors the reporter's default output_reserve on the SDK geometry path", async () => {
+        await refreshModelLimitsFromApi(
+            makeClient([
+                {
+                    id: "openai-codex",
+                    models: {
+                        "gpt-5.6-sol": {
+                            limit: { context: 400_000, input: 272_000, output: 128_000 },
+                        },
+                    },
+                },
+            ]),
+        );
+        setOutputReserveConfig({ default: 16_384 });
+
+        const geometry = getSdkWindowGeometry("openai-codex", "gpt-5.6-sol");
+        expect(geometry?.usableSoft).toBe(272_000 - 16_384);
+        expect(geometry?.derivation).toMatchObject({
+            window: 272_000,
+            reserve: 16_384,
+            reserveSource: "output_config",
+        });
     });
 
     test("resolves from the SDK and prefers limit.input over limit.context", async () => {
