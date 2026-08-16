@@ -1,7 +1,13 @@
 import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 
-import { assertNoDuplicateManifestIds, extractCompleteManifestBody } from "./manifest-parser";
+import {
+    assertManifestCoversExactly,
+    assertNoDuplicateManifestIds,
+    assertParsedManifestNonEmpty,
+    describeUnrecognizedManifestShape,
+    extractCompleteManifestBody,
+} from "./manifest-parser";
 
 /**
  * map-memories prompt + host-side helpers.
@@ -110,30 +116,90 @@ export interface ParsedMemoryMapping {
     independent: boolean;
 }
 
+// Built fresh per call — a shared /g regex carries lastIndex across inputs.
+const MEMORY_ELEMENT_PATTERN = "<memory\\b([^>]*)(?:\\/>|>([\\s\\S]*?)<\\/memory>)";
+const NESTED_FILE_PATTERN = "<file\\b([^>]*)\\/?>";
+
+function extractNestedFilePaths(inner: string): string[] {
+    const files: string[] = [];
+    for (const match of inner.matchAll(new RegExp(NESTED_FILE_PATTERN, "gi"))) {
+        const pathMatch = match[1].match(/\bpath\s*=\s*"([^"]+)"/);
+        if (pathMatch) files.push(pathMatch[1].trim());
+    }
+    return files.filter(Boolean);
+}
+
+function mappingsBody(text: string): string {
+    try {
+        return extractCompleteManifestBody(text, "mappings");
+    } catch (error) {
+        const described = describeUnrecognizedManifestShape(text, "mappings", "memory");
+        // Wrong root / JSON is a format miss, not truncation. Keep the original
+        // "closing root" error so a length-capped `<mappings>` still looks like
+        // truncation rather than an unrecognized shape.
+        if (!described.startsWith("parsed zero entries")) throw new Error(described);
+        throw error;
+    }
+}
+
 /** Parse the agent's complete `<mappings>` manifest. A missing root close tag is
- *  treated as truncation and rejects the whole batch. */
+ *  treated as truncation and rejects the whole batch. `independent` is honored
+ *  only for the explicit sentinel; a missing `files` attribute is never treated
+ *  as file-independent (that silently excluded memories from verify). Nested
+ *  `<file path="…"/>` children are accepted as an unambiguous alias. */
 export function parseMapMemoriesManifest(text: string): ParsedMemoryMapping[] {
     const out: ParsedMemoryMapping[] = [];
-    const body = extractCompleteManifestBody(text, "mappings");
-    for (const m of body.matchAll(/<memory\b([^>]*)\/?>/g)) {
+    const body = mappingsBody(text);
+    for (const m of body.matchAll(new RegExp(MEMORY_ELEMENT_PATTERN, "gi"))) {
         const attrs = m[1];
+        const inner = m[2];
         const idMatch = attrs.match(/\bid\s*=\s*"(\d+)"/);
         if (!idMatch) throw new Error("mappings manifest entry missing numeric id");
         const id = Number.parseInt(idMatch[1], 10);
         if (!Number.isInteger(id)) throw new Error("mappings manifest entry missing numeric id");
         const independent = /\bindependent\s*=\s*"(?:true|1)"/i.test(attrs);
         const filesMatch = attrs.match(/\bfiles\s*=\s*"([^"]*)"/);
-        const files = filesMatch
+        const attrFiles = filesMatch
             ? filesMatch[1]
                   .split(",")
                   .map((f) => f.trim())
                   .filter(Boolean)
             : [];
-        out.push({ id, files, independent: independent || files.length === 0 });
+        const nestedFiles = inner ? extractNestedFilePaths(inner) : [];
+        const files = attrFiles.length > 0 ? attrFiles : nestedFiles;
+        if (!independent && files.length === 0) {
+            throw new Error(
+                `mappings manifest entry ${id} has neither files nor independent="true"`,
+            );
+        }
+        out.push({
+            id,
+            files: independent && files.length === 0 ? [] : files,
+            independent: independent && files.length === 0,
+        });
+    }
+    if (out.length === 0 && body.trim().length > 0) {
+        throw new Error(describeUnrecognizedManifestShape(text, "mappings", "memory"));
     }
     assertNoDuplicateManifestIds(
         out.map((entry) => entry.id),
         "mappings",
     );
     return out;
+}
+
+/** Retry-time contract: non-empty parse + exact id coverage. Apply still
+ *  re-asserts coverage as the final belt. */
+export function validateMapMemoriesManifest(
+    text: string,
+    expectedIds: ReadonlySet<number>,
+): ParsedMemoryMapping[] {
+    const parsed = parseMapMemoriesManifest(text);
+    assertParsedManifestNonEmpty(parsed.length, expectedIds.size, text, "mappings", "memory");
+    assertManifestCoversExactly(
+        parsed.map((entry) => entry.id),
+        expectedIds,
+        "mappings",
+    );
+    return parsed;
 }

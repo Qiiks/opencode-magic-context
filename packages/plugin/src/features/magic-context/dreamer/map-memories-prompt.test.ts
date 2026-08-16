@@ -7,7 +7,35 @@ import {
     buildMapMemoriesPrompt,
     extractMemoryCandidatePaths,
     parseMapMemoriesManifest,
+    validateMapMemoriesManifest,
 } from "./map-memories-prompt";
+
+/** Real model deviations from the map-memories contract. Each used to parse
+ *  to zero entries (or silently flip independent) and skip the fallback chain. */
+const GEMINI_MAP_CHILDREN = `<mappings>
+<map id="1">
+config/magic-default.jsonc
+</map>
+</mappings>`;
+
+const GLM52_JSON_ARRAY = `<mappings>
+[
+  { "id": "CONFIG_VALUES", "files": ["config/magic-default.jsonc"] }
+]
+</mappings>`;
+
+const GLM53_MAPPING_ELEMENT = `<mappings>
+  <mapping id="CONFIG_VALUES">
+    <files><file path="config/magic-default.jsonc">claim</file></files>
+    <status>confirmed</status>
+  </mapping>
+</mappings>`;
+
+const DEEPSEEK_NESTED_FILE = `<mappings>
+  <memory id="1" name="CONFIG_VALUES">
+    <file path="config/magic-default.jsonc" claim="defaults live here" verified="true" line="14"/>
+  </memory>
+</mappings>`;
 
 describe("parseMapMemoriesManifest", () => {
     it("parses files and independent flags, tolerant of attribute order", () => {
@@ -25,9 +53,49 @@ describe("parseMapMemoriesManifest", () => {
         ]);
     });
 
-    it("treats a memory with no files (and not explicit independent) as independent", () => {
-        const out = parseMapMemoriesManifest(`<mappings><memory id="9"/></mappings>`);
-        expect(out).toEqual([{ id: 9, files: [], independent: true }]);
+    it("rejects a memory that has neither files nor the independent sentinel", () => {
+        // Mutation: flipping the default back to `independent || files.length === 0`
+        // makes this parse succeed as independent=true instead of throwing.
+        expect(() => parseMapMemoriesManifest(`<mappings><memory id="9"/></mappings>`)).toThrow(
+            /neither files nor independent/,
+        );
+    });
+
+    it("honors independent only when the explicit sentinel is present", () => {
+        const out = parseMapMemoriesManifest(
+            `<mappings><memory id="2" independent="true"/></mappings>`,
+        );
+        expect(out).toEqual([{ id: 2, files: [], independent: true }]);
+    });
+
+    it("rescues nested <file path> children instead of marking independent", () => {
+        const out = parseMapMemoriesManifest(DEEPSEEK_NESTED_FILE);
+        expect(out).toEqual([{ id: 1, files: ["config/magic-default.jsonc"], independent: false }]);
+    });
+
+    it("rejects wrong-but-rooted empty parses with a named retry-visible error", () => {
+        expect(() => parseMapMemoriesManifest(GEMINI_MAP_CHILDREN)).toThrow(
+            /root <map> unrecognized; expected <mappings> with <memory> entries/,
+        );
+        expect(() => parseMapMemoriesManifest(GLM52_JSON_ARRAY)).toThrow(
+            /JSON array unrecognized; expected <mappings> with <memory> entries/,
+        );
+        expect(() => parseMapMemoriesManifest(GLM53_MAPPING_ELEMENT)).toThrow(
+            /root <mapping> unrecognized; expected <mappings> with <memory> entries/,
+        );
+    });
+
+    it("rejects a wrong document root and a bare JSON array", () => {
+        expect(() => parseMapMemoriesManifest(`<map><memory id="1" files="a.ts"/></map>`)).toThrow(
+            /root <map> unrecognized; expected <mappings> with <memory> entries/,
+        );
+        expect(() => parseMapMemoriesManifest(`[{ "id": 1, "files": ["a.ts"] }]`)).toThrow(
+            /JSON array unrecognized; expected <mappings> with <memory> entries/,
+        );
+    });
+
+    it("still accepts an empty mappings body (no unrecognized children)", () => {
+        expect(parseMapMemoriesManifest(`<mappings></mappings>`)).toEqual([]);
     });
 
     it("trims file whitespace", () => {
@@ -88,6 +156,37 @@ describe("extractMemoryCandidatePaths", () => {
         expect(a).toEqual(["pkg/file.ts"]);
         expect(b).toEqual(["pkg/file.ts"]);
         rmSync(dir, { recursive: true, force: true });
+    });
+});
+
+describe("validateMapMemoriesManifest", () => {
+    it("rejects an empty parse against a non-empty batch", () => {
+        expect(() => validateMapMemoriesManifest(`<mappings></mappings>`, new Set([1]))).toThrow(
+            /parsed zero entries; expected <mappings> with <memory> entries/,
+        );
+    });
+
+    it("rejects missing and extra ids at retry time", () => {
+        expect(() =>
+            validateMapMemoriesManifest(
+                `<mappings><memory id="1" files="a.ts"/></mappings>`,
+                new Set([1, 2]),
+            ),
+        ).toThrow(/missing id 2/);
+        expect(() =>
+            validateMapMemoriesManifest(
+                `<mappings><memory id="1" files="a.ts"/><memory id="9" independent="true"/></mappings>`,
+                new Set([1]),
+            ),
+        ).toThrow(/unknown id 9/);
+    });
+
+    it("accepts exact coverage", () => {
+        const out = validateMapMemoriesManifest(
+            `<mappings><memory id="1" files="a.ts"/><memory id="2" independent="true"/></mappings>`,
+            new Set([1, 2]),
+        );
+        expect(out).toHaveLength(2);
     });
 });
 

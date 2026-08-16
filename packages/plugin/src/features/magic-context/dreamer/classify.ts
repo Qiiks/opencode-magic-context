@@ -28,6 +28,7 @@ import {
     type ClassifyAnchorMemory,
     type ClassifyPromptMemory,
     parseClassifyManifest,
+    validateClassifyManifest,
 } from "./classify-prompt";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
@@ -391,7 +392,10 @@ async function classifyOneChunk(
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("classify returned no output");
                     try {
-                        parseClassifyManifest(text);
+                        validateClassifyManifest(
+                            text,
+                            new Set(chunk.map((candidate) => candidate.id)),
+                        );
                     } catch (error) {
                         const providerFailure = providerOutputFailureFromInvalidManifest(
                             messages,
@@ -494,11 +498,9 @@ async function runClassifyThroughModule(
     if ((result as { truncated?: unknown }).truncated === true) {
         throw new Error("classify returned length-capped output");
     }
-    const parsed = parseClassifyManifest(manifestText);
-    assertManifestCoversExactly(
-        parsed.map((entry) => entry.id),
+    const parsed = validateClassifyManifest(
+        manifestText,
         new Set(chunk.map((candidate) => candidate.id)),
-        "classify",
     );
     const rows = parsed.map((entry) => {
         const candidate = chunk.find((item) => item.id === entry.id);

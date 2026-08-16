@@ -46,6 +46,7 @@ import {
     parseVerifyManifest,
     VERIFY_SYSTEM_PROMPT,
     type VerifyPromptMemory,
+    validateVerifyManifest,
 } from "./verify-prompt";
 
 /**
@@ -289,7 +290,7 @@ async function verifyOneBatch(
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("verify returned no output");
                     try {
-                        parseVerifyManifest(text);
+                        validateVerifyManifest(text, new Set(batch.map((memory) => memory.id)));
                     } catch (error) {
                         const providerFailure = providerOutputFailureFromInvalidManifest(
                             messages,

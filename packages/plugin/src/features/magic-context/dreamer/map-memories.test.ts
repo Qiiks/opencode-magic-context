@@ -15,7 +15,13 @@ import {
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { acquireLease } from "./lease";
-import { applyBatchMappings, type MapMemoriesArgs, mapMemories } from "./map-memories";
+import {
+    applyBatchMappings,
+    type MapMemoriesArgs,
+    mapMemories,
+    selectMapMemoryInputs,
+    shouldRequeueIndependentMapping,
+} from "./map-memories";
 
 const tempDirs: string[] = [];
 
@@ -63,6 +69,32 @@ function assistantMessages(text: string) {
             parts: [{ type: "text", text }],
         },
     ];
+}
+
+function scriptedMapClient(manifestFor: (promptCall: number, ids: number[]) => string): {
+    client: unknown;
+    promptCalls: () => number;
+} {
+    let promptCalls = 0;
+    let lastIds: number[] = [];
+    return {
+        client: {
+            session: {
+                create: async () => ({ data: { id: "map-child" } }),
+                prompt: async (args: { body?: { parts?: Array<{ text?: string }> } }) => {
+                    promptCalls += 1;
+                    const prompt = args.body?.parts?.[0]?.text ?? "";
+                    lastIds = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) => Number(match[1]));
+                    return {};
+                },
+                messages: async () => ({
+                    data: assistantMessages(manifestFor(promptCalls, lastIds)),
+                }),
+                delete: async () => ({}),
+            },
+        },
+        promptCalls: () => promptCalls,
+    };
 }
 
 function successfulMapClient(onPrompt?: () => void) {
@@ -171,6 +203,77 @@ describe("mapMemories disposition", () => {
     });
 });
 
+describe("mapMemories retry-time validation", () => {
+    test("wrong-but-rooted empty parse fires the fallback model", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-retry-empty";
+            const dir = tempProject();
+            insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Independent fact.",
+                sourceSessionId: "ses",
+            });
+            const args = mapArgs(db, dir, projectIdentity);
+            const scripted = scriptedMapClient((call, ids) =>
+                call === 1
+                    ? `<mappings>\n<map id="1">\nsrc/fact.ts\n</map>\n</mappings>`
+                    : `<mappings>${ids.map((id) => `<memory id="${id}" independent="true"/>`).join("")}</mappings>`,
+            );
+            args.client = scripted.client as never;
+            args.fallbackModels = ["anthropic/claude-sonnet-4-6"];
+
+            const result = await mapMemories(args);
+            expect(scripted.promptCalls()).toBe(2);
+            expect(result).toEqual({
+                mapped: 0,
+                independent: 1,
+                batches: 1,
+                remaining: 0,
+                complete: true,
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("coverage mismatch fires the fallback model", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-retry-coverage";
+            const dir = tempProject();
+            const first = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "First fact.",
+                sourceSessionId: "ses",
+            });
+            insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Second fact.",
+                sourceSessionId: "ses",
+            });
+            const args = mapArgs(db, dir, projectIdentity);
+            const scripted = scriptedMapClient((call, ids) =>
+                call === 1
+                    ? `<mappings><memory id="${first.id}" independent="true"/></mappings>`
+                    : `<mappings>${ids.map((id) => `<memory id="${id}" independent="true"/>`).join("")}</mappings>`,
+            );
+            args.client = scripted.client as never;
+            args.fallbackModels = ["anthropic/claude-sonnet-4-6"];
+
+            const result = await mapMemories(args);
+            expect(scripted.promptCalls()).toBe(2);
+            expect(result.independent).toBe(2);
+            expect(result.complete).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
 describe("applyBatchMappings", () => {
     test("complete manifest writes the mapping", async () => {
         const db = freshDb();
@@ -238,6 +341,141 @@ describe("applyBatchMappings", () => {
             expect(state?.files).toEqual([]);
             expect(state?.hasSentinel).toBe(true);
             expect(state?.mappedAt).toBe(1_000);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("apply-time coverage belt still rejects missing and extra ids", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:test-belt";
+            const dir = tempProject();
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Fact lives in src/fact.ts.",
+                sourceSessionId: "ses",
+            });
+            const extra = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Another fact.",
+                sourceSessionId: "ses",
+            });
+            const batch = [
+                {
+                    id: memory.id,
+                    category: memory.category,
+                    content: memory.content,
+                    candidates: [] as string[],
+                },
+            ];
+            const args = mapArgs(db, dir, projectIdentity);
+
+            await expect(
+                applyBatchMappings(
+                    args,
+                    batch,
+                    `<mappings><memory id="${memory.id}" files="src/fact.ts"/><memory id="${extra.id}" independent="true"/></mappings>`,
+                ),
+            ).rejects.toThrow(/unknown id/);
+            await expect(applyBatchMappings(args, batch, `<mappings></mappings>`)).rejects.toThrow(
+                /missing id|parsed zero entries/,
+            );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("nested file children persist as a real mapping, not independent", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:test-nested";
+            const dir = tempProject();
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Fact lives in src/fact.ts.",
+                sourceSessionId: "ses",
+            });
+
+            const result = await applyBatchMappings(
+                mapArgs(db, dir, projectIdentity),
+                [
+                    {
+                        id: memory.id,
+                        category: memory.category,
+                        content: memory.content,
+                        candidates: [],
+                    },
+                ],
+                `<mappings><memory id="${memory.id}"><file path="src/fact.ts"/></memory></mappings>`,
+            );
+
+            expect(result).toEqual({ mapped: 1, independent: 0 });
+            const state = getMemoryVerifications(db, [memory.id]).get(memory.id);
+            expect(state?.files).toEqual(["src/fact.ts"]);
+            expect(state?.hasSentinel).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("independent re-queue heal", () => {
+    test("predicate selects a path-seeded independent and skips a conceptual bystander", () => {
+        const dir = tempProject();
+        expect(
+            shouldRequeueIndependentMapping(
+                { hasSentinel: true, files: [] },
+                "Fact lives in src/fact.ts.",
+                dir,
+            ),
+        ).toBe(true);
+        expect(
+            shouldRequeueIndependentMapping(
+                { hasSentinel: true, files: [] },
+                "Anthropic returns 400 on empty content.",
+                dir,
+            ),
+        ).toBe(false);
+        expect(
+            shouldRequeueIndependentMapping(
+                { hasSentinel: false, files: ["src/fact.ts"] },
+                "Fact lives in src/fact.ts.",
+                dir,
+            ),
+        ).toBe(false);
+    });
+
+    test("selectMapMemoryInputs re-queues the corrupted row and leaves the bystander mapped", () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-requeue";
+            const dir = tempProject();
+            const corrupted = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Fact lives in src/fact.ts.",
+                sourceSessionId: "ses",
+            });
+            const bystander = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "CONSTRAINTS",
+                content: "Anthropic returns 400 on empty content.",
+                sourceSessionId: "ses",
+            });
+            recordMemoryMapping(db, corrupted.id, [], 1_000);
+            recordMemoryMapping(db, bystander.id, [], 1_000);
+
+            const selected = selectMapMemoryInputs(db, projectIdentity, dir);
+            expect(selected.map((row) => row.id)).toEqual([corrupted.id]);
+            expect(selected[0]?.candidates).toEqual(["src/fact.ts"]);
+
+            const bystanderState = getMemoryVerifications(db, [bystander.id]).get(bystander.id);
+            expect(bystanderState?.hasSentinel).toBe(true);
+            expect(bystanderState?.files).toEqual([]);
         } finally {
             closeQuietly(db);
         }
