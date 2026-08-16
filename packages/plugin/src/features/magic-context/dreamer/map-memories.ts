@@ -320,9 +320,16 @@ export async function applyBatchMappings(
     // normalization does git/realpath I/O). Independent → sentinel (empty set).
     const planned: Array<{ id: number; files: string[]; independent: boolean }> = [];
     for (const p of parsed) {
-        if (p.independent || p.files.length === 0) {
+        if (p.independent) {
             planned.push({ id: p.id, files: [], independent: true });
             continue;
+        }
+        // The parser guarantees independent XOR files-present; a files-empty entry
+        // reaching here means that invariant broke upstream. Refuse rather than
+        // default to independent — a silent independent=true removes the memory
+        // from the verify gate permanently (the #323 corruption shape).
+        if (p.files.length === 0) {
+            throw new Error(`mapping entry ${p.id} has no files and no independent sentinel`);
         }
         const normalized = await normalizeVerificationFiles({
             cwd: args.sessionDirectory,
