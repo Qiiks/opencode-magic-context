@@ -6,9 +6,7 @@ import { fileURLToPath } from "node:url";
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
 
 const SPAWN_SYNC_TESTS = new Set([
-    "src/adapters/omp.test.ts",
     "src/commands/doctor-repair-db.test.ts",
-    "src/commands/setup-omp.test.ts",
     "src/lib/omp-helpers.test.ts",
     "src/lib/opencode-helpers.test.ts",
     "src/lib/pi-helpers.test.ts",
@@ -46,8 +44,9 @@ function runTestFiles(files: string[]): Promise<number> {
 
 // Bun 1.3.14 can lose private event-loop poll references while spawnSync waits
 // (oven-sh/bun#34069). Every later synchronous probe in that VM then hangs.
-// Keep real subprocess coverage, but give each spawn-heavy file a fresh VM until
-// the upstream event-loop accounting fix (oven-sh/bun#37754) ships.
+// Keep explicitly marked real-subprocess integration coverage, but give each
+// spawn-heavy file a fresh VM until the upstream event-loop accounting fix
+// (oven-sh/bun#37754) ships.
 let exitCode = await runTestFiles(regularTestFiles);
 if (exitCode === 0) {
     for (const file of isolatedTestFiles) {

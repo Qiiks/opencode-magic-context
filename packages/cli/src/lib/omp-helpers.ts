@@ -88,10 +88,26 @@ export function detectOmpBinary(): OmpBinaryInfo | null {
     return candidate ? { path: candidate, source: "home" } : null;
 }
 
-export function runOmpCommand(ompPath: string, args: string[], timeout = 30_000): OmpCommandResult {
+export interface OmpCommandExecutionDeps {
+    getInvocation: typeof getOmpCommandInvocation;
+    spawnSync: typeof spawnSync;
+}
+
+const DEFAULT_COMMAND_EXECUTION_DEPS: OmpCommandExecutionDeps = {
+    getInvocation: getOmpCommandInvocation,
+    spawnSync,
+};
+
+export function runOmpCommand(
+    ompPath: string,
+    args: string[],
+    timeout = 30_000,
+    overrides: Partial<OmpCommandExecutionDeps> = {},
+): OmpCommandResult {
+    const deps = { ...DEFAULT_COMMAND_EXECUTION_DEPS, ...overrides };
     try {
-        const invocation = getOmpCommandInvocation(ompPath, args);
-        const result = spawnSync(invocation.command, invocation.args, {
+        const invocation = deps.getInvocation(ompPath, args);
+        const result = deps.spawnSync(invocation.command, invocation.args, {
             encoding: "utf-8",
             timeout,
             maxBuffer: 10 * 1024 * 1024,
