@@ -9,12 +9,12 @@ import {
 } from "solid-js";
 import { getConfig, getProjectConfigs, saveConfig, saveProjectConfig } from "../../lib/api";
 import { jsoncErrorMessage, parseJsonc } from "../../lib/jsonc";
-import { getEffectiveModelIds } from "../../lib/model-ids";
 import { invoke } from "../../lib/platform";
 import type { OpencodeInstallState, ProjectConfigEntry } from "../../lib/types";
 import { configSaveBlocker } from "./config-save-guard";
-import type { DreamTaskConfig } from "./DreamerTasksField";
+import type { DreamTaskConfig, DreamTaskModelConfig } from "./DreamerTasksField";
 import DreamerTasksField from "./DreamerTasksField";
+import HarnessModelFields, { type Harness } from "./HarnessModelFields";
 import ModelSelect from "./ModelSelect";
 import PerModelField from "./PerModelField";
 
@@ -268,7 +268,8 @@ function ConfigForm(props: {
   readError?: string | null;
   onSave: (content: string) => void | Promise<void>;
   saveStatus: string | null;
-  models: string[];
+  opencodeModels: string[];
+  piModels: string[];
   opencodeInstallState: OpencodeInstallState;
   /** "user" or "project". Project configs are untrusted repository input: the
    *  runtime strips embedding endpoint/provider from them, and the Test
@@ -372,7 +373,11 @@ function ConfigForm(props: {
         };
     }
   }
-  const models = () => props.models;
+  const models = () => props.opencodeModels;
+  const piModels = () => props.piModels;
+  const [historianHarness, setHistorianHarness] = createSignal<Harness>("opencode");
+  const [dreamerHarness, setDreamerHarness] = createSignal<Harness>("opencode");
+  const modelsForHarness = (harness: Harness) => (harness === "opencode" ? models() : piModels());
   const showManualModelHint = () =>
     props.opencodeInstallState === "desktop" || models().length === 0;
   // The "Desktop detected" wording is only accurate when detection actually
@@ -983,106 +988,35 @@ function ConfigForm(props: {
                     ) : sectionName === "Historian" ? (
                       <div class="config-card-two-col">
                         <Show when={isUserScope()}>
-                          {/* Historian model selection is user-level only; project configs may
-                               still tune the scheduling and history settings shown on the right. */}
                           <div class="config-card-content">
-                            <div class="config-field">
-                              <div class="config-field-header">
-                                <span class="config-field-label">Model</span>
-                              </div>
-                              <span class="config-field-desc">
-                                Primary model for historian agent
-                              </span>
+                            <div class="tab-pills" style={{ "margin-bottom": "12px" }}>
+                              <button
+                                type="button"
+                                class={`tab-pill ${historianHarness() === "opencode" ? "active" : ""}`}
+                                onClick={() => setHistorianHarness("opencode")}
+                              >
+                                OpenCode
+                              </button>
+                              <button
+                                type="button"
+                                class={`tab-pill ${historianHarness() === "pi" ? "active" : ""}`}
+                                onClick={() => setHistorianHarness("pi")}
+                              >
+                                Pi
+                              </button>
+                            </div>
+                            <Show when={historianHarness() === "opencode"}>
                               {manualModelHint()}
-                              <ModelSelect
-                                models={models() ?? []}
-                                value={
-                                  getNestedValue(formData(), "historian.model") as
-                                    | string
-                                    | undefined
-                                }
-                                onChange={(v) =>
-                                  handleFieldChange("historian.model", v || undefined)
-                                }
-                                placeholder="— Use fallback chain —"
-                              />
-                            </div>
-                            <div class="config-field">
-                              <div class="config-field-header">
-                                <span class="config-field-label">Fallback Models</span>
-                              </div>
-                              <span class="config-field-desc">Models to try if primary fails</span>
-                              <div class="model-chain-list">
-                                <Show
-                                  when={
-                                    readFallbackModels(formData(), "historian.fallback_models")
-                                      .length > 0
-                                  }
-                                  fallback={
-                                    <span class="model-chain-empty">
-                                      Using built-in fallback chain
-                                    </span>
-                                  }
-                                >
-                                  <For
-                                    each={readFallbackModels(
-                                      formData(),
-                                      "historian.fallback_models",
-                                    )}
-                                  >
-                                    {(model, index) => (
-                                      <div class="model-chain-item">
-                                        <span class="mono" style={{ flex: 1 }}>
-                                          {model}
-                                        </span>
-                                        <button
-                                          type="button"
-                                          class="btn sm danger"
-                                          onClick={() => {
-                                            const current = readFallbackModels(
-                                              formData(),
-                                              "historian.fallback_models",
-                                            );
-                                            const next = current.filter((_, i) => i !== index());
-                                            handleFieldChange(
-                                              "historian.fallback_models",
-                                              next.length > 0 ? next : undefined,
-                                            );
-                                          }}
-                                        >
-                                          ✕
-                                        </button>
-                                      </div>
-                                    )}
-                                  </For>
-                                </Show>
-                              </div>
-                              <div class="model-chain-add">
-                                <ModelSelect
-                                  models={(models() ?? []).filter(
-                                    (m) =>
-                                      !readFallbackModels(
-                                        formData(),
-                                        "historian.fallback_models",
-                                      ).includes(m),
-                                  )}
-                                  value={undefined}
-                                  onChange={(v) => {
-                                    if (v) {
-                                      const current = readFallbackModels(
-                                        formData(),
-                                        "historian.fallback_models",
-                                      );
-                                      handleFieldChange("historian.fallback_models", [
-                                        ...current,
-                                        v,
-                                      ]);
-                                    }
-                                  }}
-                                  placeholder="— Add fallback model —"
-                                />
-                              </div>
-                            </div>
+                            </Show>
+                            <HarnessModelFields
+                              agent="historian"
+                              harness={historianHarness()}
+                              models={modelsForHarness(historianHarness())}
+                              value={getNestedValue(formData(), `historian.${historianHarness()}`)}
+                              onChange={(block) =>
+                                handleFieldChange(`historian.${historianHarness()}`, block)
+                              }
+                            />
                           </div>
                         </Show>
                         {/* Right: Settings sliders */}
@@ -1461,95 +1395,42 @@ function ConfigForm(props: {
                 </div>
               </div>
 
-              {/* Right: Model + Fallbacks */}
               <div class="config-card-content">
-                <div class="config-field">
-                  <div class="config-field-header">
-                    <span class="config-field-label">Model</span>
-                  </div>
-                  <span class="config-field-desc">Primary model for dreamer agent</span>
-                  {manualModelHint()}
-                  <ModelSelect
-                    models={models() ?? []}
-                    value={getNestedValue(formData(), "dreamer.model") as string | undefined}
-                    onChange={(v) => handleFieldChange("dreamer.model", v || undefined)}
-                    placeholder="— Use fallback chain —"
-                  />
+                <div class="tab-pills" style={{ "margin-bottom": "12px" }}>
+                  <button
+                    type="button"
+                    class={`tab-pill ${dreamerHarness() === "opencode" ? "active" : ""}`}
+                    onClick={() => setDreamerHarness("opencode")}
+                  >
+                    OpenCode
+                  </button>
+                  <button
+                    type="button"
+                    class={`tab-pill ${dreamerHarness() === "pi" ? "active" : ""}`}
+                    onClick={() => setDreamerHarness("pi")}
+                  >
+                    Pi
+                  </button>
                 </div>
-
-                <div class="config-field">
-                  <div class="config-field-header">
-                    <span class="config-field-label">Fallback Models</span>
-                  </div>
-                  <span class="config-field-desc">Models to try if primary fails</span>
-                  <div class="model-chain-list">
-                    <Show
-                      when={readFallbackModels(formData(), "dreamer.fallback_models").length > 0}
-                      fallback={
-                        <span class="model-chain-empty">Using built-in fallback chain</span>
-                      }
-                    >
-                      <For each={readFallbackModels(formData(), "dreamer.fallback_models")}>
-                        {(model, index) => (
-                          <div class="model-chain-item">
-                            <span class="mono" style={{ flex: 1 }}>
-                              {model}
-                            </span>
-                            <button
-                              type="button"
-                              class="btn sm danger"
-                              onClick={() => {
-                                const current = readFallbackModels(
-                                  formData(),
-                                  "dreamer.fallback_models",
-                                );
-                                const updated = current.filter((_, i) => i !== index());
-                                handleFieldChange(
-                                  "dreamer.fallback_models",
-                                  updated.length > 0 ? updated : undefined,
-                                );
-                              }}
-                            >
-                              ✕
-                            </button>
-                          </div>
-                        )}
-                      </For>
-                    </Show>
-                  </div>
-                  <div class="model-chain-add">
-                    <ModelSelect
-                      models={(models() ?? []).filter(
-                        (m) =>
-                          !readFallbackModels(formData(), "dreamer.fallback_models").includes(m),
-                      )}
-                      value={undefined}
-                      onChange={(v) => {
-                        if (v) {
-                          const current = readFallbackModels(formData(), "dreamer.fallback_models");
-                          handleFieldChange("dreamer.fallback_models", [...current, v]);
-                        }
-                      }}
-                      placeholder="— Add fallback model —"
-                    />
-                  </div>
-                </div>
+                <Show when={dreamerHarness() === "opencode"}>{manualModelHint()}</Show>
+                <HarnessModelFields
+                  agent="dreamer"
+                  harness={dreamerHarness()}
+                  models={modelsForHarness(dreamerHarness())}
+                  value={getNestedValue(formData(), `dreamer.${dreamerHarness()}`)}
+                  onChange={(block) => handleFieldChange(`dreamer.${dreamerHarness()}`, block)}
+                />
               </div>
             </div>
 
-            {/* Dreamer v2 per-task schedules. Replaces the retired v1 single
-                schedule window + user_memories / pin_key_files blocks: each
-                canonical task has its own cron schedule, optional model override,
-                and task-specific params. */}
             <div class="config-field">
               <div class="config-field-header">
-                <span class="config-field-label">Task schedules</span>
-                <span class="config-field-key">dreamer.tasks</span>
+                <span class="config-field-label">Task schedules and model overrides</span>
+                <span class="config-field-key">dreamer.tasks / dreamer.{"<harness>"}.tasks</span>
               </div>
               <span class="config-field-desc">
-                Each dreamer task runs on its own cron schedule. “Disabled” turns a task off while
-                keeping manual /ctx-dream available. Leave models empty to inherit the dreamer model
-                above.
+                Schedules apply once for both harnesses. The selected tab configures only that
+                harness's task model entries and qualifiers.
               </span>
               <DreamerTasksField
                 value={
@@ -1558,7 +1439,23 @@ function ConfigForm(props: {
                     | undefined
                 }
                 onChange={(tasks) => handleFieldChange("dreamer.tasks", tasks)}
-                models={models() ?? []}
+                harness={dreamerHarness()}
+                modelTasks={
+                  getNestedValue(formData(), `dreamer.${dreamerHarness()}.tasks`) as
+                    | Record<string, DreamTaskModelConfig>
+                    | undefined
+                }
+                onModelTasksChange={(tasks) => {
+                  const path = `dreamer.${dreamerHarness()}`;
+                  const current = getNestedValue(formData(), path) as
+                    | Record<string, unknown>
+                    | undefined;
+                  const next = { ...(current ?? {}) };
+                  if (tasks) next.tasks = tasks;
+                  else delete next.tasks;
+                  handleFieldChange(path, next);
+                }}
+                models={modelsForHarness(dreamerHarness())}
               />
             </div>
           </div>
@@ -2364,7 +2261,8 @@ function ConfigForm(props: {
 function ProjectConfigDetail(props: {
   entry: ProjectConfigEntry;
   onBack: () => void;
-  models: string[];
+  opencodeModels: string[];
+  piModels: string[];
   opencodeInstallState: OpencodeInstallState;
 }) {
   const configPath = () => props.entry.config_path;
@@ -2425,7 +2323,8 @@ function ProjectConfigDetail(props: {
               readError={config()?.error}
               onSave={handleSave}
               saveStatus={saveStatus()}
-              models={props.models}
+              opencodeModels={props.opencodeModels}
+              piModels={props.piModels}
               opencodeInstallState={props.opencodeInstallState}
               scope="project"
             />
@@ -2441,7 +2340,7 @@ function ProjectConfigDetail(props: {
 // ── Main ConfigEditor ───────────────────────────────────────
 
 export default function ConfigEditor(props: {
-  models: string[];
+  opencodeModels: string[];
   piModels: string[];
   opencodeInstallState: OpencodeInstallState;
 }) {
@@ -2456,8 +2355,6 @@ export default function ConfigEditor(props: {
       readError: userConfig()?.error,
     }),
   );
-
-  const effectiveModels = createMemo(() => getEffectiveModelIds(props.piModels, props.models));
 
   const selectConfigTarget = (next: ConfigTarget) => {
     setConfigTarget(next);
@@ -2576,7 +2473,8 @@ export default function ConfigEditor(props: {
                     readError={userConfig()?.error}
                     onSave={handleUserSave}
                     saveStatus={saveStatus()}
-                    models={effectiveModels()}
+                    opencodeModels={props.opencodeModels}
+                    piModels={props.piModels}
                     opencodeInstallState={props.opencodeInstallState}
                     scope="user"
                   />
@@ -2633,7 +2531,8 @@ export default function ConfigEditor(props: {
               <ProjectConfigDetail
                 entry={proj()}
                 onBack={() => setSelectedProject(null)}
-                models={effectiveModels()}
+                opencodeModels={props.opencodeModels}
+                piModels={props.piModels}
                 opencodeInstallState={props.opencodeInstallState}
               />
             )}

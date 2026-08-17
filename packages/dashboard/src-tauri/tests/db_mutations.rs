@@ -704,7 +704,6 @@ fn test_update_memory_category_invalid() {
     assert_eq!(category, "CONSTRAINTS");
 }
 
-
 #[test]
 fn managed_memory_update_is_rejected_by_the_database_guard() {
     let dir = tempdir().expect("tempdir");

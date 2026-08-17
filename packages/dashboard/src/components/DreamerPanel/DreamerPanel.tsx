@@ -1,13 +1,14 @@
 import { createMemo, createResource, createSignal, For, Show } from "solid-js";
+
 import {
   formatDateTime,
   formatRelativeTime,
-  getAvailableModels,
   getConfig,
   getDreamerProjects,
   getDreamRunMemoryChanges,
   getDreamRuns,
   getDreamState,
+  getModelCatalogs,
   getProjects,
   saveProjectConfig,
 } from "../../lib/api";
@@ -150,7 +151,7 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
   const [dreamerProjects, { refetch: refetchDreamerProjects }] = createResource(getDreamerProjects);
   const [state, { refetch: refetchState }] = createResource(getDreamState);
   const [projects] = createResource(getProjects);
-  const [models] = createResource(getAvailableModels);
+  const [modelCatalogs] = createResource(getModelCatalogs);
   const [runs, { refetch: refetchRuns }] = createResource(() =>
     getDreamRuns(props.project?.identity ?? undefined, 50),
   );
@@ -1048,7 +1049,8 @@ export default function DreamerPanel(props: DreamerPanelProps = {}) {
         {(project) => (
           <DreamerProjectConfigPanel
             project={project()}
-            models={models() ?? []}
+            opencodeModels={modelCatalogs()?.opencode ?? []}
+            piModels={modelCatalogs()?.pi ?? []}
             onClose={() => setConfigProject(null)}
             onSaved={() => refetchDreamerProjects()}
           />

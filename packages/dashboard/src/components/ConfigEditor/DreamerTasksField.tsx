@@ -1,29 +1,24 @@
 import { createSignal, Index, Show } from "solid-js";
-import { describeCron, isValidCronShape } from "../../lib/cron";
-import ModelSelect from "./ModelSelect";
 
-/**
- * Dreamer v2 per-task editor.
- *
- * Replaces the retired v1 single `schedule` window + `user_memories` /
- * `pin_key_files` blocks. Each canonical task gets its own cron schedule
- * (preset picker + custom escape), an optional per-task model override, and the
- * task-specific params (promotion_threshold for review-user-memories).
- *
- * Self-contained (the dashboard does not import @magic-context/core); the task
- * list, default schedules, and presets mirror the plugin's Zod schema. Plugin-
- * side validation is authoritative on load — the inline cron check here is only
- * for immediate UX feedback.
- */
+import { describeCron, isValidCronShape } from "../../lib/cron";
+import { type Harness, type ModelEntry, modelEntryWithModel, modelId } from "./HarnessModelFields";
+import ModelSelect from "./ModelSelect";
 
 export interface DreamTaskConfig {
   schedule?: string;
-  model?: string;
   promotion_threshold?: number;
   [key: string]: unknown;
 }
 
+export interface DreamTaskModelConfig {
+  model?: ModelEntry;
+  variant?: string;
+  thinking_level?: string;
+  [key: string]: unknown;
+}
+
 type TasksValue = Record<string, DreamTaskConfig> | undefined;
+type ModelTasksValue = Record<string, DreamTaskModelConfig> | undefined;
 
 export interface TaskMeta {
   name: string;
@@ -116,6 +111,7 @@ const PRESETS: { label: string; cron: string }[] = [
   { label: "Hourly", cron: "0 * * * *" },
   { label: "Disabled", cron: "" },
 ];
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const CUSTOM = "__custom__";
 
 function isPresetCron(cron: string): boolean {
@@ -137,49 +133,42 @@ function promotionThresholdDescription(taskName: string): string {
 interface DreamerTasksFieldProps {
   value: TasksValue;
   onChange: (tasks: Record<string, DreamTaskConfig>) => void;
+  harness: Harness;
+  modelTasks: ModelTasksValue;
+  onModelTasksChange: (tasks: Record<string, DreamTaskModelConfig> | undefined) => void;
   models: string[];
 }
 
 export default function DreamerTasksField(props: DreamerTasksFieldProps) {
-  // Explicit "custom cron" mode per task. Derived-from-value snapped the dropdown
-  // back to a preset the instant Custom seeded a preset-shaped cron, so the input
-  // never appeared. This signal makes Custom a sticky, user-chosen mode.
   const [customMode, setCustomMode] = createSignal<Set<string>>(
     new Set(
       TASKS.filter((meta) => {
-        const s = props.value?.[meta.name]?.schedule ?? meta.defaultSchedule;
-        return s.trim() !== "" && !isPresetCron(s);
+        const schedule = props.value?.[meta.name]?.schedule ?? meta.defaultSchedule;
+        return schedule.trim() !== "" && !isPresetCron(schedule);
       }).map((meta) => meta.name),
     ),
   );
   const inCustomMode = (name: string) => customMode().has(name);
   const setTaskCustom = (name: string, on: boolean) =>
-    setCustomMode((prev) => {
-      const next = new Set(prev);
+    setCustomMode((previous) => {
+      const next = new Set(previous);
       if (on) next.add(name);
       else next.delete(name);
       return next;
     });
 
-  // Resolve a task's effective config for DISPLAY (stored override, else schema
-  // defaults). Only reads the fields the UI renders — never used as the basis for
-  // what gets persisted (see `update`, which preserves the full stored object).
   const taskCfg = (meta: TaskMeta): DreamTaskConfig => {
     const stored = props.value?.[meta.name];
     return {
       schedule: stored?.schedule ?? meta.defaultSchedule,
-      model: stored?.model,
       promotion_threshold: stored?.promotion_threshold,
     };
   };
+  const modelCfg = (name: string): DreamTaskModelConfig => props.modelTasks?.[name] ?? {};
 
-  // Merge a partial change into a task, emitting the FULL tasks record so the
-  // plugin always sees every task explicitly (avoids "some default, some set"
-  // ambiguity once the user touches the dashboard). CRITICAL: each task entry is
-  // built from its STORED object (spread first), so advanced per-task keys the UI
-  // doesn't render — timeout_minutes, fallback_models, thinking_level, and any
-  // future field — survive an edit instead of being whitelisted away.
-  const update = (name: string, patch: Partial<DreamTaskConfig>): void => {
+  // Scheduling stays in dreamer.tasks, while model resolution lives under the
+  // selected harness. Start from stored objects so advanced fields survive edits.
+  const updateSchedule = (name: string, patch: Partial<DreamTaskConfig>): void => {
     const next: Record<string, DreamTaskConfig> = {};
     const canonicalNames = new Set(TASKS.map((task) => task.name));
     for (const [taskName, taskConfig] of Object.entries(props.value ?? {})) {
@@ -187,15 +176,11 @@ export default function DreamerTasksField(props: DreamerTasksFieldProps) {
     }
     for (const meta of TASKS) {
       const stored = props.value?.[meta.name];
-      // Start from the full stored object (preserve unknown keys), default the
-      // schedule for a never-stored task, then apply the patch to the edited row.
       const entry: DreamTaskConfig = {
         ...(stored ?? {}),
         schedule: stored?.schedule ?? meta.defaultSchedule,
       };
       if (meta.name === name) Object.assign(entry, patch);
-      // Normalize: schedule must always be a string; drop any key set to undefined
-      // by the patch (e.g. clearing the model) without touching untouched keys.
       entry.schedule = entry.schedule ?? "";
       for (const key of Object.keys(entry)) {
         if (entry[key] === undefined) delete entry[key];
@@ -205,15 +190,28 @@ export default function DreamerTasksField(props: DreamerTasksFieldProps) {
     props.onChange(next);
   };
 
+  const updateModel = (name: string, patch: Partial<DreamTaskModelConfig>) => {
+    const next: Record<string, DreamTaskModelConfig> = { ...(props.modelTasks ?? {}) };
+    const entry = { ...(next[name] ?? {}), ...patch };
+    for (const key of Object.keys(entry)) {
+      if (entry[key] === undefined) delete entry[key];
+    }
+    if (Object.keys(entry).length === 0) delete next[name];
+    else next[name] = entry;
+    props.onModelTasksChange(Object.keys(next).length > 0 ? next : undefined);
+  };
+
+  const qualifierLabel = () => (props.harness === "opencode" ? "Variant" : "Thinking level");
+  const qualifierKey = () => (props.harness === "opencode" ? "variant" : "thinking_level");
+
   return (
-    <div class="dreamer-tasks">
+    <div class="dreamer-tasks" data-harness={props.harness}>
       <Index each={TASKS}>
         {(meta) => {
           const cfg = () => taskCfg(meta());
+          const taskModel = () => modelCfg(meta().name);
           const schedule = () => cfg().schedule ?? "";
           const enabled = () => schedule().trim() !== "";
-          // The dropdown shows CUSTOM when the user picked custom mode OR the
-          // stored cron isn't a preset (and isn't empty). Custom mode is sticky.
           const selectValue = () =>
             inCustomMode(meta().name) || (schedule().trim() !== "" && !isPresetCron(schedule()))
               ? CUSTOM
@@ -231,33 +229,73 @@ export default function DreamerTasksField(props: DreamerTasksFieldProps) {
                   <select
                     class="config-input config-select"
                     value={selectValue()}
-                    onChange={(e) => {
-                      const v = e.currentTarget.value;
-                      if (v === CUSTOM) {
-                        // Enter sticky custom mode; seed the input with the
-                        // current cron (or a sane default) so it's never blank.
+                    onChange={(event) => {
+                      const next = event.currentTarget.value;
+                      if (next === CUSTOM) {
                         setTaskCustom(meta().name, true);
                         if (schedule().trim() === "") {
-                          update(meta().name, { schedule: "0 3 * * *" });
+                          updateSchedule(meta().name, { schedule: "0 3 * * *" });
                         }
                       } else {
                         setTaskCustom(meta().name, false);
-                        update(meta().name, { schedule: v });
+                        updateSchedule(meta().name, { schedule: next });
                       }
                     }}
                   >
                     <Index each={PRESETS}>
-                      {(p) => <option value={p().cron}>{p().label}</option>}
+                      {(preset) => <option value={preset().cron}>{preset().label}</option>}
                     </Index>
                     <option value={CUSTOM}>Custom cron…</option>
                   </select>
                 </div>
                 <ModelSelect
                   models={props.models}
-                  value={cfg().model}
-                  onChange={(v) => update(meta().name, { model: v || undefined })}
-                  placeholder="— inherit dreamer model —"
+                  value={modelId(taskModel().model)}
+                  onChange={(next) =>
+                    updateModel(meta().name, {
+                      model: modelEntryWithModel(
+                        taskModel().model,
+                        props.harness,
+                        next || undefined,
+                      ),
+                    })
+                  }
+                  placeholder="— inherit harness model —"
                 />
+              </div>
+              <div class="dreamer-task-param">
+                <span class="config-field-desc">{qualifierLabel()}</span>
+                <Show
+                  when={props.harness === "opencode"}
+                  fallback={
+                    <select
+                      class="config-input config-select"
+                      value={String(taskModel()[qualifierKey()] ?? "")}
+                      onChange={(event) =>
+                        updateModel(meta().name, {
+                          [qualifierKey()]: event.currentTarget.value || undefined,
+                        })
+                      }
+                    >
+                      <option value="">Use harness default</option>
+                      <Index each={THINKING_LEVELS}>
+                        {(level) => <option value={level()}>{level()}</option>}
+                      </Index>
+                    </select>
+                  }
+                >
+                  <input
+                    class="config-input"
+                    type="text"
+                    value={String(taskModel()[qualifierKey()] ?? "")}
+                    placeholder="Use harness default"
+                    onInput={(event) =>
+                      updateModel(meta().name, {
+                        [qualifierKey()]: event.currentTarget.value || undefined,
+                      })
+                    }
+                  />
+                </Show>
               </div>
               <Show when={selectValue() === CUSTOM}>
                 <div class="dreamer-cron-custom">
@@ -267,7 +305,9 @@ export default function DreamerTasksField(props: DreamerTasksFieldProps) {
                     type="text"
                     value={schedule()}
                     placeholder="0 3 * * *  (min hour day month weekday)"
-                    onInput={(e) => update(meta().name, { schedule: e.currentTarget.value })}
+                    onInput={(event) =>
+                      updateSchedule(meta().name, { schedule: event.currentTarget.value })
+                    }
                   />
                   <span
                     class="dreamer-cron-human"
@@ -279,7 +319,6 @@ export default function DreamerTasksField(props: DreamerTasksFieldProps) {
                   </span>
                 </div>
               </Show>
-              {/* Task-specific params, shown only when scheduled. */}
               <Show when={enabled() && promotionThresholdDefault(meta().name) !== undefined}>
                 <div class="dreamer-task-param">
                   <span class="config-field-desc">
@@ -291,9 +330,9 @@ export default function DreamerTasksField(props: DreamerTasksFieldProps) {
                     min={2}
                     max={20}
                     value={cfg().promotion_threshold ?? promotionThresholdDefault(meta().name) ?? 3}
-                    onInput={(e) =>
-                      update(meta().name, {
-                        promotion_threshold: Number(e.currentTarget.value),
+                    onInput={(event) =>
+                      updateSchedule(meta().name, {
+                        promotion_threshold: Number(event.currentTarget.value),
                       })
                     }
                   />
