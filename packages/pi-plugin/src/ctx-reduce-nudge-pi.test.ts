@@ -5,6 +5,8 @@ import {
 	getChannel2NudgeClaim,
 	getChannel2NudgeClaimedAt,
 	getChannel2NudgeState,
+	getOldestActiveUnprotectedToolTags,
+	insertTag,
 	setChannel2NudgeState,
 } from "@magic-context/core/features/magic-context/storage";
 import * as loggerModule from "@magic-context/core/shared/logger";
@@ -89,6 +91,107 @@ describe("maybeChannel1ReminderForToolResult", () => {
 			content: [{ type: "text", text: "some bash output" }],
 		});
 		expect(block?.text).toContain("oldest reclaimable: §123§ read.");
+		clearPiChannel1State(SESSION);
+	});
+
+	it("uses the shared hint selection to skip control-plane and tiny outputs", () => {
+		const db = createTestDb();
+		const tag = (tagNumber: number, toolName: string, tokenCount: number) =>
+			insertTag(
+				db,
+				SESSION,
+				`msg-${tagNumber}`,
+				"tool",
+				9000,
+				tagNumber,
+				0,
+				toolName,
+				0,
+				null,
+				null,
+				{
+					tokenCount,
+					inputTokenCount: 0,
+					reasoningTokenCount: 0,
+				},
+			);
+		tag(1, "work", 900);
+		tag(2, "board", 900);
+		tag(3, "bash", 40);
+		tag(4, "bash", 2300);
+		tag(5, "bash", 1800);
+		tag(6, "aft_search", 900);
+		tag(7, "read", 900);
+		setPiChannel1Baseline(SESSION, {
+			...channel2BaselineFields(90_000, 120_000),
+			reducedSinceRefresh: false,
+			oldestReclaimableToolTags: getOldestActiveUnprotectedToolTags(
+				db,
+				SESSION,
+			),
+		});
+
+		const block = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "some bash output" }],
+		});
+
+		expect(block?.text).toContain(
+			"oldest reclaimable: §4§ bash · §5§ bash · §6§ aft_search · §7§ read.",
+		);
+		expect(block?.text).not.toContain("§1§ work");
+		expect(block?.text).not.toContain("§2§ board");
+		clearPiChannel1State(SESSION);
+	});
+
+	it("omits the Pi reminder hint when only control-plane candidates remain", () => {
+		const db = createTestDb();
+		for (const [tagNumber, toolName] of [
+			[1, "work"],
+			[2, "board"],
+			[3, "ask"],
+			[4, "ctx_search"],
+			[5, "bash_kill"],
+			[6, "todoread"],
+		] as const) {
+			insertTag(
+				db,
+				SESSION,
+				`msg-${tagNumber}`,
+				"tool",
+				9000,
+				tagNumber,
+				0,
+				toolName,
+				0,
+				null,
+				null,
+				{
+					tokenCount: 900,
+					inputTokenCount: 0,
+					reasoningTokenCount: 0,
+				},
+			);
+		}
+		setPiChannel1Baseline(SESSION, {
+			...channel2BaselineFields(90_000, 120_000),
+			reducedSinceRefresh: false,
+			oldestReclaimableToolTags: getOldestActiveUnprotectedToolTags(
+				db,
+				SESSION,
+			),
+		});
+
+		const block = maybeChannel1ReminderForToolResult({
+			db,
+			sessionId: SESSION,
+			toolName: "bash",
+			content: [{ type: "text", text: "some bash output" }],
+		});
+
+		expect(block?.text).not.toContain("oldest reclaimable");
 		clearPiChannel1State(SESSION);
 	});
 
