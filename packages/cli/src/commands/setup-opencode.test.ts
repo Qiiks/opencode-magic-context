@@ -90,6 +90,74 @@ describe("setup-opencode config safety", () => {
     });
 });
 
+describe("setup-opencode per-harness config", () => {
+    it("writes fresh OpenCode choices only inside OpenCode harness blocks", () => {
+        const path = join(tempDir(), "magic-context.jsonc");
+
+        writeMagicContextConfig(path, {
+            historianModel: "fresh/historian",
+            dreamerEnabled: true,
+            dreamerModel: "fresh/dreamer",
+            sidekickEnabled: false,
+            sidekickModel: null,
+            claudeMax: false,
+        });
+
+        const config = parseJsonc(readFileSync(path, "utf-8")) as {
+            historian?: { model?: string; opencode?: { model?: string } };
+            dreamer?: { model?: string; opencode?: { model?: string } };
+        };
+        expect(config.historian?.opencode?.model).toBe("fresh/historian");
+        expect(config.historian).not.toHaveProperty("model");
+        expect(config.dreamer?.opencode?.model).toBe("fresh/dreamer");
+        expect(config.dreamer).not.toHaveProperty("model");
+    });
+
+    it("migrates flat fields through the shared raw loader before writing OpenCode choices", () => {
+        const path = join(tempDir(), "magic-context.jsonc");
+        writeFileSync(
+            path,
+            JSON.stringify({
+                historian: { model: "legacy/historian" },
+                dreamer: {
+                    model: "legacy/dreamer",
+                    tasks: { curate: { schedule: "0 3 * * *" } },
+                },
+            }),
+        );
+
+        writeMagicContextConfig(path, {
+            historianModel: "new/historian",
+            dreamerEnabled: true,
+            dreamerModel: "new/dreamer",
+            sidekickEnabled: false,
+            sidekickModel: null,
+            claudeMax: false,
+        });
+
+        const config = parseJsonc(readFileSync(path, "utf-8")) as {
+            historian?: {
+                model?: string;
+                opencode?: { model?: string };
+                pi?: { model?: string };
+            };
+            dreamer?: {
+                model?: string;
+                opencode?: { model?: string };
+                pi?: { model?: string };
+                tasks?: { curate?: { schedule?: string } };
+            };
+        };
+        expect(config.historian?.opencode?.model).toBe("new/historian");
+        expect(config.historian?.pi?.model).toBe("legacy/historian");
+        expect(config.historian).not.toHaveProperty("model");
+        expect(config.dreamer?.opencode?.model).toBe("new/dreamer");
+        expect(config.dreamer?.pi?.model).toBe("legacy/dreamer");
+        expect(config.dreamer?.tasks?.curate?.schedule).toBe("0 3 * * *");
+        expect(config.dreamer).not.toHaveProperty("model");
+    });
+});
+
 describe("setup-opencode DCP preflight", () => {
     it("is tuple-safe and only matches canonical opencode-dcp entries", () => {
         const plugins: unknown[] = [
