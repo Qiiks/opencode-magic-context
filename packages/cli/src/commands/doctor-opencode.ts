@@ -49,6 +49,7 @@ import {
     OPENCODE_PLUGIN_ENTRY_WITH_VERSION as PLUGIN_ENTRY_WITH_VERSION,
     OPENCODE_PLUGIN_NAME as PLUGIN_NAME,
 } from "../lib/opencode-plugin-cache";
+import { inspectPinnedOpenCodePluginSchemaFences } from "../lib/opencode-plugin-schema-fence";
 import { detectConfigPaths, getMagicContextLogPath } from "../lib/paths";
 import { confirm, intro, log, outro, selectOne, spinner, text } from "../lib/prompts";
 import {
@@ -1275,6 +1276,35 @@ export async function runDoctor(
                 // Stable storage-version probe: live DB schema vs this binary's fence.
                 const storageVersions = readStorageVersions(db);
                 log.info(formatStorageVersions(storageVersions));
+
+                // The CLI's bundled schema-compatibility check only proves this doctor
+                // can read the database. A health probe must validate the package that
+                // will run, so pinned server and TUI entries are checked against the
+                // compatibility fence shipped in their own distributions.
+                const pinnedPluginFenceFindings = await inspectPinnedOpenCodePluginSchemaFences({
+                    directory: process.cwd(),
+                    databaseVersion: storageVersions.context_db_schema_version,
+                });
+                for (const finding of pinnedPluginFenceFindings) {
+                    const location = `${finding.surface} entry ${finding.specifier} in ${sanitizePathString(finding.configPath)}`;
+                    if (finding.status === "fail") {
+                        fail(
+                            `Pinned plugin schema fence mismatch: ${location} pins plugin v${finding.pinnedVersion}, which supports through schema v${finding.supportedVersion}; shared context.db is v${finding.databaseVersion}. Recovery: unpin the entry (use @latest), or upgrade the pin to a version released after this migration that supports v${finding.databaseVersion} or later.`,
+                        );
+                    } else if (finding.status === "unknown") {
+                        warn(
+                            `UNKNOWN: Pinned plugin schema fence could not be resolved for ${location}; shared context.db is v${finding.databaseVersion}, so doctor cannot verify the plugin that will run. Install the pinned package and rerun doctor, or unpin/upgrade it to a version released after this migration.`,
+                        );
+                        // Unknown compatibility is not healthy: do not let an
+                        // uninspectable pinned artifact produce a successful doctor exit.
+                        issues++;
+                    } else {
+                        pass(
+                            `Pinned plugin schema fence: ${location} pins plugin v${finding.pinnedVersion}, which supports shared context.db v${finding.databaseVersion}.`,
+                        );
+                    }
+                }
+
                 const fenceCheck = checkStorageVersionFence(storageVersions, {
                     blockingProcesses: getLiveMigrationBlockingProcesses(
                         getMagicContextStorageDir(),
