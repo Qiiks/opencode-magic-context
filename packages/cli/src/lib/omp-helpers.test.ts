@@ -6,6 +6,7 @@ import {
     detectOmpBinary,
     getOmpCommandInvocation,
     getOmpFallbackCandidates,
+    type OmpCommandExecutionDeps,
     parseOmpModelsOutput,
     runOmpCommand,
 } from "./omp-helpers";
@@ -124,13 +125,36 @@ describe("OMP model discovery", () => {
 });
 
 describe("OMP command execution", () => {
-    it("preserves spawn timeout errors when stderr is empty", () => {
-        const result = runOmpCommand(process.execPath, ["-e", "while (true) {}"], 10);
+    it("preserves injected spawn timeout errors when stderr is empty", () => {
+        const timeoutError = Object.assign(new Error("spawnSync omp ETIMEDOUT"), {
+            code: "ETIMEDOUT",
+        });
+        let receivedTimeout: number | undefined;
+        const spawnSync = ((
+            _command: string,
+            _args: readonly string[],
+            options: { timeout?: number },
+        ) => {
+            receivedTimeout = options.timeout;
+            return {
+                pid: 1,
+                output: [null, "", ""],
+                stdout: "",
+                stderr: "",
+                status: null,
+                signal: "SIGTERM",
+                error: timeoutError,
+            };
+        }) as OmpCommandExecutionDeps["spawnSync"];
+
+        const result = runOmpCommand(process.execPath, ["--version"], 10, { spawnSync });
+
+        expect(receivedTimeout).toBe(10);
         expect(result.ok).toBe(false);
-        expect(result.stderr.length).toBeGreaterThan(0);
+        expect(result.stderr).toBe(timeoutError.message);
     });
 
-    it("captures JSON-sized output above Node's default buffer", () => {
+    it("[integration: real subprocess] captures JSON-sized output above Node's default buffer", () => {
         const result = runOmpCommand(process.execPath, [
             "-e",
             "process.stdout.write('x'.repeat(2 * 1024 * 1024))",

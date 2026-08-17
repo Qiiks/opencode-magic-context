@@ -21,22 +21,39 @@ import type {
     PluginEntryResult,
 } from "./types";
 
+export interface OmpAdapterDeps {
+    detectOmpBinary: typeof detectOmpBinary;
+    listOmpPlugins: typeof listOmpPlugins;
+    runOmpCommand: typeof runOmpCommand;
+}
+
+const DEFAULT_DEPS: OmpAdapterDeps = {
+    detectOmpBinary,
+    listOmpPlugins,
+    runOmpCommand,
+};
+
 export class OmpAdapter implements HarnessAdapter {
     readonly kind = "omp" as const;
     readonly displayName = "Oh My Pi (OMP)";
     readonly pluginPackageName = OMP_PLUGIN_PACKAGE;
+    private readonly deps: OmpAdapterDeps;
+
+    constructor(deps: Partial<OmpAdapterDeps> = {}) {
+        this.deps = { ...DEFAULT_DEPS, ...deps };
+    }
 
     isInstalled(): boolean {
-        return detectOmpBinary() !== null;
+        return this.deps.detectOmpBinary() !== null;
     }
 
     hasPluginEntry(): boolean {
-        const omp = detectOmpBinary();
+        const omp = this.deps.detectOmpBinary();
         if (!omp) return false;
         return (
-            listOmpPlugins(omp.path)?.some(
-                (plugin) => plugin.name === OMP_PLUGIN_PACKAGE && plugin.enabled,
-            ) ?? false
+            this.deps
+                .listOmpPlugins(omp.path)
+                ?.some((plugin) => plugin.name === OMP_PLUGIN_PACKAGE && plugin.enabled) ?? false
         );
     }
 
@@ -51,9 +68,9 @@ export class OmpAdapter implements HarnessAdapter {
 
     async ensurePluginEntry(): Promise<PluginEntryResult> {
         const configPath = getOmpPluginsLockPath();
-        const omp = detectOmpBinary();
+        const omp = this.deps.detectOmpBinary();
         if (!omp) return this.errorResult(configPath, "OMP binary not found");
-        const plugins = listOmpPlugins(omp.path);
+        const plugins = this.deps.listOmpPlugins(omp.path);
         if (plugins === null) {
             return this.errorResult(configPath, "`omp plugin list --json` failed");
         }
@@ -71,25 +88,29 @@ export class OmpAdapter implements HarnessAdapter {
         const args = installed
             ? ["plugin", "enable", OMP_PLUGIN_PACKAGE]
             : ["plugin", "install", OMP_PLUGIN_PACKAGE];
-        const result = runOmpCommand(omp.path, args, 120_000);
+        const result = this.deps.runOmpCommand(omp.path, args, 120_000);
         if (!result.ok) {
             return this.errorResult(
                 configPath,
                 result.stderr || result.stdout || `omp ${args.join(" ")} failed`,
             );
         }
-        const enabledAfter = listOmpPlugins(omp.path)?.some(
-            (plugin) => plugin.name === OMP_PLUGIN_PACKAGE && plugin.enabled,
-        );
+        const enabledAfter = this.deps
+            .listOmpPlugins(omp.path)
+            ?.some((plugin) => plugin.name === OMP_PLUGIN_PACKAGE && plugin.enabled);
         if (!enabledAfter) {
             // A project override can keep the plugin disabled even when the
             // global install/enable command exits 0. New installs are removed.
             // Existing installs restore the exact lockfile enable state; never
             // infer global state from the project-effective plugin list.
             if (!installed) {
-                runOmpCommand(omp.path, ["plugin", "uninstall", OMP_PLUGIN_PACKAGE], 120_000);
+                this.deps.runOmpCommand(
+                    omp.path,
+                    ["plugin", "uninstall", OMP_PLUGIN_PACKAGE],
+                    120_000,
+                );
             } else if (originalRuntimeEnabled !== undefined) {
-                runOmpCommand(
+                this.deps.runOmpCommand(
                     omp.path,
                     ["plugin", originalRuntimeEnabled ? "enable" : "disable", OMP_PLUGIN_PACKAGE],
                     120_000,
@@ -112,9 +133,9 @@ export class OmpAdapter implements HarnessAdapter {
 
     async removePluginEntry(): Promise<PluginEntryResult> {
         const configPath = getOmpPluginsLockPath();
-        const omp = detectOmpBinary();
+        const omp = this.deps.detectOmpBinary();
         if (!omp) return this.errorResult(configPath, "OMP binary not found");
-        const plugins = listOmpPlugins(omp.path);
+        const plugins = this.deps.listOmpPlugins(omp.path);
         if (plugins === null) {
             return this.errorResult(configPath, "`omp plugin list --json` failed");
         }
@@ -127,7 +148,7 @@ export class OmpAdapter implements HarnessAdapter {
                 configPath,
             };
         }
-        const result = runOmpCommand(
+        const result = this.deps.runOmpCommand(
             omp.path,
             ["plugin", "uninstall", OMP_PLUGIN_PACKAGE],
             120_000,
@@ -162,10 +183,10 @@ export class OmpAdapter implements HarnessAdapter {
     }
 
     getInstalledPluginVersion(): string | null {
-        const omp = detectOmpBinary();
+        const omp = this.deps.detectOmpBinary();
         if (!omp) return null;
         return (
-            listOmpPlugins(omp.path)?.find((plugin) => plugin.name === OMP_PLUGIN_PACKAGE)
+            this.deps.listOmpPlugins(omp.path)?.find((plugin) => plugin.name === OMP_PLUGIN_PACKAGE)
                 ?.version ?? null
         );
     }
