@@ -94,7 +94,9 @@ Session discovery follows the active host. Relative `pi.subagent_extensions` are
   "$schema": "https://raw.githubusercontent.com/cortexkit/magic-context/master/assets/magic-context.schema.json",
   "enabled": true,
   "historian": {
-    "model": "anthropic/claude-haiku-4-5"
+    "pi": {
+      "model": "anthropic/claude-haiku-4-5"
+    }
   },
   "embedding": {
     "provider": "local"
