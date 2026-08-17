@@ -22,11 +22,11 @@
  * Drives the FULL production path: opencode → plugin → subc daemon → ck-mc.
  */
 
-import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { join } from "node:path";
 import { RustTestHarness } from "../src/rust-harness";
 import { driveToSteadyState, rustPrereqs } from "../src/rust-scenario-support";
+import { openTestDb } from "../src/test-db";
 
 /**
  * Mutate the newest user message's text part IN PLACE in opencode.db — same
@@ -35,7 +35,7 @@ import { driveToSteadyState, rustPrereqs } from "../src/rust-scenario-support";
  */
 function mutateNewestUserTailInPlace(h: RustTestHarness, sessionId: string): string {
     const ocPath = join(h.env.dataDir, "opencode", "opencode.db");
-    const db = new Database(ocPath);
+    const db = openTestDb(ocPath, { readwrite: true });
     try {
         const newestUser = db
             .prepare(

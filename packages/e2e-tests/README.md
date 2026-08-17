@@ -75,9 +75,11 @@ current JSON protocol was introduced in `0.16.0`.
   bun run test:rust-e2e
   ```
 
-  Runtime: ~1-2 minutes locally once the binaries are warm (the first run builds
-  `ck-mc` release + reuses a prebuilt `ck-subc`). Each scenario keeps its session
-  small (tens of turns, tiny context limits) so the suite stays fast.
+  Runtime: ~1-2 minutes locally once the binaries are warm. Every invocation asks
+  Cargo to build both release binaries so `ck-mc` and `ck-subc` reflect the same
+  sibling source revision; unchanged builds reuse Cargo's incremental artifacts.
+  Each scenario keeps its session small (tens of turns, tiny context limits) so
+  the suite stays fast.
 
 ### Rust-mode lane: how it works
 
