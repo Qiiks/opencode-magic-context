@@ -1642,18 +1642,21 @@ mod tests {
     }
 
     #[test]
-    fn model_catalogs_serialize_harness_tags_together() {
+    fn model_catalogs_keep_one_generation_pair_harness_scoped() {
         let value = serde_json::to_value(ModelCatalogs {
-            opencode: vec!["openai/gpt-5".to_string()],
-            pi: vec!["anthropic/claude-sonnet".to_string()],
+            opencode: vec!["openai/gpt-5".to_string(), "shared/model".to_string()],
+            pi: vec![
+                "anthropic/claude-sonnet".to_string(),
+                "shared/model".to_string(),
+            ],
         })
         .expect("catalogs serialize");
 
         assert_eq!(
             value,
             serde_json::json!({
-                "opencode": ["openai/gpt-5"],
-                "pi": ["anthropic/claude-sonnet"],
+                "opencode": ["openai/gpt-5", "shared/model"],
+                "pi": ["anthropic/claude-sonnet", "shared/model"],
             })
         );
     }

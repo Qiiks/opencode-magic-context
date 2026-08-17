@@ -10,11 +10,11 @@ import {
 import { getConfig, getProjectConfigs, saveConfig, saveProjectConfig } from "../../lib/api";
 import { jsoncErrorMessage, parseJsonc } from "../../lib/jsonc";
 import { invoke } from "../../lib/platform";
-import type { OpencodeInstallState, ProjectConfigEntry } from "../../lib/types";
+import type { ModelCatalogs, OpencodeInstallState, ProjectConfigEntry } from "../../lib/types";
 import { configSaveBlocker } from "./config-save-guard";
 import type { DreamTaskConfig, DreamTaskModelConfig } from "./DreamerTasksField";
 import DreamerTasksField from "./DreamerTasksField";
-import HarnessModelFields, { type Harness } from "./HarnessModelFields";
+import HarnessModelFields, { type Harness, modelCatalogForHarness } from "./HarnessModelFields";
 import ModelSelect from "./ModelSelect";
 import PerModelField from "./PerModelField";
 
@@ -268,8 +268,7 @@ function ConfigForm(props: {
   readError?: string | null;
   onSave: (content: string) => void | Promise<void>;
   saveStatus: string | null;
-  opencodeModels: string[];
-  piModels: string[];
+  modelCatalogs: ModelCatalogs;
   opencodeInstallState: OpencodeInstallState;
   /** "user" or "project". Project configs are untrusted repository input: the
    *  runtime strips embedding endpoint/provider from them, and the Test
@@ -373,11 +372,11 @@ function ConfigForm(props: {
         };
     }
   }
-  const models = () => props.opencodeModels;
-  const piModels = () => props.piModels;
+  const models = () => modelCatalogForHarness(props.modelCatalogs, "opencode");
   const [historianHarness, setHistorianHarness] = createSignal<Harness>("opencode");
   const [dreamerHarness, setDreamerHarness] = createSignal<Harness>("opencode");
-  const modelsForHarness = (harness: Harness) => (harness === "opencode" ? models() : piModels());
+  const modelsForHarness = (harness: Harness) =>
+    modelCatalogForHarness(props.modelCatalogs, harness);
   const showManualModelHint = () =>
     props.opencodeInstallState === "desktop" || models().length === 0;
   // The "Desktop detected" wording is only accurate when detection actually
@@ -2261,8 +2260,7 @@ function ConfigForm(props: {
 function ProjectConfigDetail(props: {
   entry: ProjectConfigEntry;
   onBack: () => void;
-  opencodeModels: string[];
-  piModels: string[];
+  modelCatalogs: ModelCatalogs;
   opencodeInstallState: OpencodeInstallState;
 }) {
   const configPath = () => props.entry.config_path;
@@ -2323,8 +2321,7 @@ function ProjectConfigDetail(props: {
               readError={config()?.error}
               onSave={handleSave}
               saveStatus={saveStatus()}
-              opencodeModels={props.opencodeModels}
-              piModels={props.piModels}
+              modelCatalogs={props.modelCatalogs}
               opencodeInstallState={props.opencodeInstallState}
               scope="project"
             />
@@ -2340,8 +2337,7 @@ function ProjectConfigDetail(props: {
 // ── Main ConfigEditor ───────────────────────────────────────
 
 export default function ConfigEditor(props: {
-  opencodeModels: string[];
-  piModels: string[];
+  modelCatalogs: ModelCatalogs;
   opencodeInstallState: OpencodeInstallState;
 }) {
   const [configTarget, setConfigTarget] = createSignal<ConfigTarget>(loadConfigTarget());
@@ -2473,8 +2469,7 @@ export default function ConfigEditor(props: {
                     readError={userConfig()?.error}
                     onSave={handleUserSave}
                     saveStatus={saveStatus()}
-                    opencodeModels={props.opencodeModels}
-                    piModels={props.piModels}
+                    modelCatalogs={props.modelCatalogs}
                     opencodeInstallState={props.opencodeInstallState}
                     scope="user"
                   />
@@ -2531,8 +2526,7 @@ export default function ConfigEditor(props: {
               <ProjectConfigDetail
                 entry={proj()}
                 onBack={() => setSelectedProject(null)}
-                opencodeModels={props.opencodeModels}
-                piModels={props.piModels}
+                modelCatalogs={props.modelCatalogs}
                 opencodeInstallState={props.opencodeInstallState}
               />
             )}

@@ -2,6 +2,14 @@ import { For, Show } from "solid-js";
 import ModelSelect from "./ModelSelect";
 
 export type Harness = "opencode" | "pi";
+
+export function modelCatalogForHarness(
+  catalogs: { opencode: string[]; pi: string[] },
+  harness: Harness,
+): string[] {
+  return catalogs[harness];
+}
+
 export type OpenCodeModelEntry = string | { model: string; variant?: string };
 export type PiModelEntry = string | { model: string; thinking_level?: string };
 export type ModelEntry = OpenCodeModelEntry | PiModelEntry;

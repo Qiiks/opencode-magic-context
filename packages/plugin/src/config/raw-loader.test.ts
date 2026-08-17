@@ -1,10 +1,19 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+    chmodSync,
+    mkdtempSync,
+    readdirSync,
+    readFileSync,
+    rmSync,
+    statSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { parseJsonc } from "../shared/jsonc-parser";
 import { hasFlatKeys, loadRawConfigFile, migrateFlatDetailed } from "./raw-loader";
+import { PER_HARNESS_MIGRATION_INVENTORY } from "./schema/magic-context";
 
 const temporaryDirectories: string[] = [];
 
@@ -45,7 +54,7 @@ describe("per-harness raw config migration", () => {
         "thinking_level": "high",\r
         "timeout_minutes": 45\r
       },\r
-      "timeout-only": { "schedule": "", "timeout_minutes": 15 }\r
+      "timeout-only": { "timeout_minutes": 15 }\r
     }\r
   },\r
   "unrelated": { "keep": true }\r
@@ -54,6 +63,7 @@ describe("per-harness raw config migration", () => {
 
         const migrated = migrateFlatDetailed(Buffer.from(input, "utf-8"));
         const repeated = migrateFlatDetailed(Buffer.from(input, "utf-8"));
+        const idempotent = migrateFlatDetailed(migrated.bytes);
         const output = migrated.bytes.toString("utf-8");
         const config = parse(output);
         const historian = config.historian as Record<string, unknown>;
@@ -67,6 +77,9 @@ describe("per-harness raw config migration", () => {
         expect(migrated.hasFlatKeys).toBe(true);
         expect(repeated.bytes).toEqual(migrated.bytes);
         expect(repeated.diagnostics).toEqual(migrated.diagnostics);
+        expect(idempotent.bytes).toEqual(migrated.bytes);
+        expect(idempotent.hasFlatKeys).toBe(false);
+        expect(idempotent.diagnostics).toEqual([]);
         expect(hasFlatKeys(migrated.bytes)).toBe(false);
         expect(output.startsWith("\uFEFF")).toBe(true);
         expect(output).toContain("// preserve this comment");
@@ -87,7 +100,7 @@ describe("per-harness raw config migration", () => {
         expect(opencodeDreamer.fallback_models).toEqual(["provider/dreamer-fallback"]);
         expect(piDreamer.fallback_models).toEqual(["provider/dreamer-fallback"]);
         expect(tasks.review).toEqual({ schedule: "0 3 * * *" });
-        expect(tasks["timeout-only"]).toEqual({ schedule: "" });
+        expect(tasks["timeout-only"]).toEqual({});
         expect((opencodeDreamer.tasks as Record<string, Record<string, unknown>>).review).toEqual({
             model: { model: "provider/task", variant: "task-variant" },
             timeout_minutes: 45,
@@ -105,7 +118,119 @@ describe("per-harness raw config migration", () => {
         ).toEqual({ timeout_minutes: 15 });
     });
 
-    it("keeps new-shape destinations on conflicts and removes redundant flat fields", () => {
+    it("turns a singleton fallback into one entry without changing its spelling", () => {
+        const migrated = migrateFlatDetailed(
+            Buffer.from(
+                JSON.stringify({
+                    historian: { fallback_models: "Vendor/Model:Exact-Spelling" },
+                }),
+            ),
+        );
+        const historian = parse(migrated.bytes.toString("utf-8")).historian as Record<
+            string,
+            Record<string, unknown>
+        >;
+
+        expect(historian.opencode.fallback_models).toEqual(["Vendor/Model:Exact-Spelling"]);
+        expect(historian.pi.fallback_models).toEqual(["Vendor/Model:Exact-Spelling"]);
+    });
+
+    it("preserves every schema-enumerated retained field at its original level", () => {
+        const historianRetained = {
+            temperature: 0.1,
+            top_p: 0.9,
+            prompt: "historian prompt",
+            tools: { read: true },
+            disable: false,
+            description: "historian description",
+            mode: "subagent",
+            color: "blue",
+            maxSteps: 11,
+            permission: { edit: "deny" },
+            maxTokens: 4096,
+            two_pass: true,
+            disallowed_tools: ["bash"],
+        };
+        const dreamerRetained = {
+            temperature: 0.2,
+            top_p: 0.8,
+            prompt: "dreamer prompt",
+            tools: { write: true },
+            disable: false,
+            description: "dreamer description",
+            mode: "subagent",
+            color: "purple",
+            maxSteps: 12,
+            permission: { bash: "deny" },
+            maxTokens: 8192,
+            inject_docs: false,
+        };
+        const taskRetained = {
+            schedule: "0 3 * * *",
+            promotion_threshold: 4,
+        };
+        expect(Object.keys(historianRetained)).toEqual(
+            PER_HARNESS_MIGRATION_INVENTORY.historian.retained,
+        );
+        expect(Object.keys(dreamerRetained)).toEqual(
+            PER_HARNESS_MIGRATION_INVENTORY.dreamer.retained,
+        );
+        expect(Object.keys(taskRetained)).toEqual(PER_HARNESS_MIGRATION_INVENTORY.task.retained);
+
+        const migrated = migrateFlatDetailed(
+            Buffer.from(
+                JSON.stringify({
+                    historian: { ...historianRetained, model: "provider/historian" },
+                    dreamer: {
+                        ...dreamerRetained,
+                        model: "provider/dreamer",
+                        tasks: {
+                            review: {
+                                ...taskRetained,
+                                model: "provider/task",
+                                timeout_minutes: 25,
+                            },
+                        },
+                    },
+                }),
+            ),
+        );
+        const config = parse(migrated.bytes.toString("utf-8"));
+        const historian = config.historian as Record<string, unknown>;
+        const dreamer = config.dreamer as Record<string, unknown>;
+        const task = (dreamer.tasks as Record<string, Record<string, unknown>>).review;
+
+        for (const [field, value] of Object.entries(historianRetained)) {
+            expect(historian[field]).toEqual(value);
+        }
+        for (const [field, value] of Object.entries(dreamerRetained)) {
+            expect(dreamer[field]).toEqual(value);
+        }
+        expect(task).toEqual(taskRetained);
+    });
+
+    it("fills absent destinations and silently removes equal flat sources", () => {
+        const migrated = migrateFlatDetailed(
+            Buffer.from(`{
+  "historian": {
+    "model": "provider/same",
+    "opencode": { "model": "provider/same" },
+    "pi": {}
+  }
+}`),
+        );
+        const historian = parse(migrated.bytes.toString("utf-8")).historian as Record<
+            string,
+            unknown
+        >;
+
+        expect(historian.model).toBeUndefined();
+        expect(historian.opencode).toEqual({ model: "provider/same" });
+        expect(historian.pi).toEqual({ model: "provider/same" });
+        expect(migrated.diagnostics).toEqual([]);
+    });
+
+    it("keeps new-shape destinations on conflicts and names both paths in warnings", () => {
         const input = `{
   "historian": {
     "model": "provider/flat",
@@ -133,6 +258,30 @@ describe("per-harness raw config migration", () => {
             "historian.model",
             "historian.model",
         ]);
+        expect(migrated.diagnostics[0]?.message).toContain("historian.opencode.model");
+        expect(migrated.diagnostics[1]?.message).toContain("historian.pi.model");
+    });
+
+    it("processes flat keys re-added after migration while existing blocks keep winning", () => {
+        const first = migrateFlatDetailed(
+            Buffer.from(JSON.stringify({ historian: { model: "provider/original" } })),
+        );
+        const reintroduced = parse(first.bytes.toString("utf-8"));
+        (reintroduced.historian as Record<string, unknown>).model = "provider/re-added";
+
+        const second = migrateFlatDetailed(Buffer.from(JSON.stringify(reintroduced)));
+        const historian = parse(second.bytes.toString("utf-8")).historian as Record<
+            string,
+            unknown
+        >;
+
+        expect(historian.model).toBeUndefined();
+        expect(historian.opencode).toEqual({ model: "provider/original" });
+        expect(historian.pi).toEqual({ model: "provider/original" });
+        expect(second.diagnostics.map((diagnostic) => diagnostic.message)).toEqual([
+            expect.stringContaining("historian.opencode.model"),
+            expect.stringContaining("historian.pi.model"),
+        ]);
     });
 
     it("rewrites user config atomically with one exact-byte restricted backup", () => {
@@ -143,8 +292,23 @@ describe("per-harness raw config migration", () => {
         );
         writeFileSync(configPath, original);
         chmodSync(configPath, 0o600);
+        const expected = migrateFlatDetailed(original).bytes;
+        let temporaryNamesDuringWrite: string[] = [];
 
-        const first = loadRawConfigFile({ configPath, tier: "user" });
+        const first = loadRawConfigFile({
+            configPath,
+            tier: "user",
+            afterTemporaryWrite: () => {
+                expect(readFileSync(configPath)).toEqual(original);
+                temporaryNamesDuringWrite = readdirSync(directory).filter((name) =>
+                    name.endsWith(".tmp"),
+                );
+                expect(temporaryNamesDuringWrite).toHaveLength(1);
+                expect(
+                    readFileSync(join(directory, temporaryNamesDuringWrite[0] as string)),
+                ).toEqual(expected);
+            },
+        });
         const second = loadRawConfigFile({ configPath, tier: "user" });
         const backupPath = `${configPath}.pre-per-harness.bak`;
 
@@ -154,10 +318,28 @@ describe("per-harness raw config migration", () => {
         );
         expect(readFileSync(backupPath)).toEqual(original);
         expect(readFileSync(configPath)).toEqual(first?.bytes);
+        expect(temporaryNamesDuringWrite).toHaveLength(1);
+        expect(readdirSync(directory).filter((name) => name.endsWith(".tmp"))).toEqual([]);
         expect(statSync(configPath).mode & 0o777).toBe(0o600);
         expect(statSync(backupPath).mode & 0o777).toBe(0o600);
         expect(second?.migrated).toBe(false);
         expect(second?.warnings).toEqual([]);
+    });
+
+    it("never reads, overwrites, or removes an existing migration backup", () => {
+        const directory = temporaryDirectory();
+        const configPath = join(directory, "magic-context.jsonc");
+        const backupPath = `${configPath}.pre-per-harness.bak`;
+        const sentinel = Buffer.from("not config: backup is opaque and permanent\n");
+        writeFileSync(configPath, '{ "historian": { "model": "provider/model" } }');
+        writeFileSync(backupPath, sentinel);
+
+        const first = loadRawConfigFile({ configPath, tier: "user" });
+        const second = loadRawConfigFile({ configPath, tier: "user" });
+
+        expect(first?.migrated).toBe(true);
+        expect(second?.migrated).toBe(false);
+        expect(readFileSync(backupPath)).toEqual(sentinel);
     });
 
     it("reloads the winning candidate when a concurrent loader replaces the target", () => {
@@ -175,10 +357,15 @@ describe("per-harness raw config migration", () => {
             },
         });
 
+        expect([first?.migrated, competing?.migrated].filter(Boolean)).toHaveLength(1);
         expect(competing?.migrated).toBe(true);
         expect(first?.migrated).toBe(false);
         expect(first?.warnings).toEqual([]);
+        expect(competing?.warnings).toEqual([
+            "Migrated flat historian/dreamer model config to per-harness blocks.",
+        ]);
         expect(first?.bytes).toEqual(competing?.bytes);
+        expect(parse(first?.text ?? "{}")).toEqual(parse(competing?.text ?? "{}"));
         expect(readFileSync(configPath)).toEqual(competing?.bytes);
         expect(readFileSync(`${configPath}.pre-per-harness.bak`)).toEqual(original);
     });

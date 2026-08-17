@@ -290,8 +290,9 @@ function parsePluginConfig(
     }
 
     // Full parse failed — recover field-by-field using defaults for invalid fields.
-    // Agent configs (historian, dreamer, sidekick) are dropped on error rather than defaulted
-    // because wrong model config could run expensive models or fail silently.
+    // Invalid nested leaves are pruned from agent blocks; only root-level or
+    // unreachable agent errors drop the block, because guessing a model config
+    // could run an expensive unintended model or fail silently.
     const defaults = MagicContextConfigSchema.parse({});
     const warnings: string[] = [];
 
@@ -314,7 +315,13 @@ function parsePluginConfig(
             const key = String(topKey);
             errorPaths.add(key);
             const paths = issuePathsByKey.get(key) ?? [];
-            paths.push([...issue.path]);
+            if (issue.code === "unrecognized_keys") {
+                for (const unrecognizedKey of issue.keys) {
+                    paths.push([...issue.path, unrecognizedKey]);
+                }
+            } else {
+                paths.push([...issue.path]);
+            }
             issuePathsByKey.set(key, paths);
             const msg = issue.message;
             if (msg && !GENERIC_ZOD_PREFIXES.some((p) => msg.startsWith(p))) {
@@ -329,21 +336,12 @@ function parsePluginConfig(
     for (const key of errorPaths) {
         recoveredTopLevelKeys.push(key);
         const isAgentConfig = key === "historian" || key === "dreamer" || key === "sidekick";
-        if (isAgentConfig) {
-            // Drop agent configs entirely on error — don't default them
-            delete patched[key];
-            warnings.push(
-                `"${key}": invalid agent configuration, ignoring. Check your magic-context.jsonc.`,
-            );
-            continue;
-        }
 
-        // For object-valued keys (e.g. `memory`), prune ONLY the invalid nested
-        // leaves and keep valid siblings, so one bad nested field doesn't wipe the
-        // whole block — which would silently drop already-migrated graduated keys
-        // like memory.auto_search / memory.git_commit_indexing. Falls back to
-        // whole-key deletion when the issue is at the key itself or the value
-        // isn't a prunable object.
+        // For object-valued keys (including agent harness blocks), prune only invalid
+        // nested leaves and keep valid siblings, so one bad field does not remove
+        // already-migrated keys such as memory.auto_search and
+        // memory.git_commit_indexing. Fall back to whole-key deletion when the issue
+        // is at the key itself or the value is not a prunable object.
         const issuePaths = issuePathsByKey.get(key) ?? [];
         const rawValue = rawConfig[key];
         const allNested =
@@ -369,10 +367,22 @@ function parsePluginConfig(
                     prunedLeaves.push(result.removed);
                 }
             }
-            patched[key] = prunedBlock;
-            const reason = customMessagesByKey.get(key);
+            if (prunedLeaves.length === issuePaths.length) {
+                patched[key] = prunedBlock;
+                const reason = customMessagesByKey.get(key);
+                warnings.push(
+                    `"${key}": invalid nested field(s) ${prunedLeaves.map((leaf) => `"${key}.${leaf}"`).join(", ")}, using defaults for those.${reason ? ` ${reason}` : ""}`,
+                );
+                continue;
+            }
+        }
+
+        // Root-level or unreachable agent errors cannot be repaired safely because
+        // guessing a model configuration could select an expensive unintended model.
+        if (isAgentConfig) {
+            delete patched[key];
             warnings.push(
-                `"${key}": invalid nested field(s) ${prunedLeaves.map((l) => `"${l}"`).join(", ")}, using defaults for those.${reason ? ` ${reason}` : ""}`,
+                `"${key}": invalid agent configuration, ignoring. Check your magic-context.jsonc.`,
             );
             continue;
         }
